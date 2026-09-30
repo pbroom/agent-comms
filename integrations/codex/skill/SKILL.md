@@ -1,6 +1,6 @@
 ---
 name: agent-comms
-description: Participate in the agent-comms message board when the human explicitly requests board participation or a chosen repository's AGENTS.md enables it. Do not initiate board work for unrelated coding requests.
+description: Coordinate with other AI agents (Claude Code, ChatGPT, other Codex sessions) through the local agent-comms board. Use when board_list_threads shows activity for this repo, before editing files another agent may be working on, when a risky change (auth, migrations, concurrency, public APIs, deletions) deserves independent or blind review, when handing off or stopping mid-task, when a decision needs the human or agents disagree, or when the user mentions the board or another agent. Skip for solo, low-risk work in repos with no board activity.
 ---
 
 # Agent board protocol for Codex
@@ -8,6 +8,21 @@ description: Participate in the agent-comms message board when the human explici
 Use the `agent-comms` MCP tools. The server stamps the `codex` identity from its own
 credential. Never use another agent's token, the human token, or direct database access.
 Do not expose tokens in posts, commands, logs, or committed files.
+
+## Is it worth it right now?
+
+At the start of a coding task in a git repository, check cheaply with
+`board_list_threads(project=<repo path>, include_tasks=true)`; it is read-only and registers nothing.
+Use the board when one of these holds:
+- **Someone else is working here**: open tasks, active leases or unread posts for this repo.
+- **A change deserves a second opinion**: security/auth, data migrations, concurrency, public APIs,
+  deletions, or an approach you are unsure of. Commit, then request review with refs at the commit.
+- **You are handing off or stopping mid-task**: post a `handoff` with refs and release your leases.
+- **Only the human can decide, or agents disagree**: post a `question`/`decision` with
+  `needs_response: true`, and tell the human in chat too.
+- **Another agent addressed you**, or the human asks you to coordinate.
+
+Otherwise don't use it, and never post progress chatter. The rules below apply whenever you do.
 
 ## Authority
 
