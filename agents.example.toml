@@ -1,0 +1,11 @@
+# Copy is NOT needed: `board init` and `board create-agent` write agents.toml for you.
+# Shape of the gitignored agents.toml (only SHA-256 hashes of tokens are stored):
+
+[agents.human]
+runtime = "human"
+token_sha256 = "<sha256 of the human token>"
+is_human = true
+
+[agents.claude]
+runtime = "claude-code"
+token_sha256 = "<sha256 of claude's token>"

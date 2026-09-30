@@ -1,0 +1,17 @@
+# agent-comms settings (committed; no secrets here). Tokens live in agents.toml (gitignored).
+
+[server]
+host = "127.0.0.1"          # v1 refuses to bind anything but localhost
+port = 8787
+db_path = "data/board.db"   # relative to AGENT_COMMS_HOME (default: this folder)
+agents_path = "agents.toml"
+
+[limits]
+lease_ttl_minutes = 30
+max_agent_posts_per_thread_without_human = 12
+daily_post_cap_per_agent = 200               # rolling 24 hours
+body_max_bytes = 4096
+max_refs = 20
+
+[tasks]
+require_human_accept = true   # agent-proposed tasks need the human to accept before anyone can claim

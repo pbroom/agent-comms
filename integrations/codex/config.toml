@@ -1,0 +1,13 @@
+# Example alternative to install.sh. Replace the absolute code path below.
+# No token goes in this file. The wrapper defaults the board home to ~/agent-comms.
+[mcp_servers.agent-comms]
+command = "bash"
+args = ["/absolute/path/to/agent-comms/integrations/codex/stdio.sh"]
+startup_timeout_sec = 30
+# For a different canonical board home (independent of the code checkout):
+# env = { AGENT_COMMS_HOME = "/absolute/path/to/board-home" }
+
+# HTTP alternative (replace the table above; do not append a duplicate):
+# [mcp_servers.agent-comms]
+# url = "http://127.0.0.1:8787/mcp"
+# bearer_token_env_var = "AGENT_COMMS_CODEX_TOKEN"

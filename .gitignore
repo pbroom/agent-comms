@@ -1,0 +1,23 @@
+agents.toml
+*.tmp
+data/
+.demo/
+.venv/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-*
+
+.env.local
+
+# Credentials and local verification artifacts
+.env
+.env.*
+!.env.example
+*.token
+*.pem
+*.key
+credentials*.json
+evidence/
+dist/
+.DS_Store

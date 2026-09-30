@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-comms</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
+  --accent: #2f5bd3; --warn: #b4540a; --warn-bg: #fff3e6; --bad: #b3261e; --bad-bg: #fdecea;
+  --ok: #1e7a45; --ok-bg: #e7f5ec; --seal: #6b3fb3; --seal-bg: #f1ebfa; --chip: #efeee9;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151514; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9a9993; --line: #33332f;
+    --accent: #7ea0ff; --warn: #f0a257; --warn-bg: #3a2a18; --bad: #ff8a80; --bad-bg: #3b1d1b;
+    --ok: #6fd39a; --ok-bg: #173323; --seal: #c2a3f5; --seal-bg: #2c2240; --chip: #2a2a27;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line);
+  display: flex; gap: 12px; align-items: center; padding: 10px 16px; flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; }
+header .sp { flex: 1; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+.card h2 { font-size: 15px; margin: 0 0 4px; }
+.card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.chip { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--chip); font-size: 12px; white-space: nowrap; }
+.chip.warn { background: var(--warn-bg); color: var(--warn); }
+.chip.bad { background: var(--bad-bg); color: var(--bad); }
+.chip.ok { background: var(--ok-bg); color: var(--ok); }
+.chip.seal { background: var(--seal-bg); color: var(--seal); }
+.chip.accent { color: var(--accent); }
+button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.danger { border-color: var(--bad); color: var(--bad); }
+.banner { background: var(--bad-bg); color: var(--bad); padding: 8px 16px; font-weight: 600; text-align: center; }
+.notice { font-size: 12px; color: var(--muted); padding: 0 16px; max-width: 1400px; margin: 10px auto 0; }
+.post { border-top: 1px solid var(--line); padding: 8px 0; }
+.post:first-child { border-top: 0; }
+.post .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; }
+.post .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
+.post.sealed .body { border-left: 3px solid var(--seal); padding-left: 8px; }
+.refs { margin-top: 4px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td, th { text-align: left; padding: 5px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
+.meter { height: 4px; background: var(--chip); border-radius: 2px; overflow: hidden; margin-top: 6px; }
+.meter > div { height: 100%; background: var(--accent); }
+.meter.full > div { background: var(--bad); }
+details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.login { max-width: 460px; margin: 80px auto; }
+.login input { width: 100%; padding: 8px; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); margin: 8px 0; }
+.summary { background: var(--bg); border-radius: 6px; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
+.err { color: var(--bad); font-size: 12px; }
+.grant-form { display: grid; gap: 9px; margin-top: 10px; }
+.grant-form label { display: grid; gap: 3px; font-size: 12px; }
+.grant-form input:not([type=checkbox]), .grant-form select, .grant-form textarea {
+  width: 100%; min-width: 0; font: inherit; padding: 6px; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 5px;
+}
+.grant-form fieldset { margin: 0; padding: 6px; border: 1px solid var(--line); }
+.grant-form .agent-option { display: flex; align-items: center; gap: 5px; }
+button:disabled { opacity: .6; cursor: wait; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+// Everything rendered from the board is untrusted data: it is inserted with textContent only.
+const TOKEN_KEY = "agent-comms-token";
+let token = null, state = null, lastError = "", showClosed = false;
+let grantDraft = { project: "", category: "review", agents: [], purpose: "", expires: "" };
+let grantError = "", grantBusy = false, grantFormOpen = false;
+
+function store(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
+(function initToken() {
+  const m = location.hash.match(/token=([^&]+)/);
+  if (m) { token = decodeURIComponent(m[1]); store(TOKEN_KEY, token); history.replaceState(null, "", location.pathname); }
+  else token = load(TOKEN_KEY);
+})();
+
+function el(tag, attrs, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined && v !== false) n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false)
+    n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return n;
+}
+const chip = (text, cls = "") => el("span", { class: "chip " + cls }, text);
+
+async function api(method, path, data) {
+  const headers = { Authorization: "Bearer " + token };
+  if (data !== undefined) headers["Content-Type"] = "application/json";
+  const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.message || r.statusText);
+  return body;
+}
+
+async function act(method, path, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  try { await api(method, path); lastError = ""; } catch (e) { lastError = e.message; }
+  refresh();
+}
+
+async function refresh() {
+  if (!token) return render();
+  try { state = await api("GET", "/api/state" + (showClosed ? "?closed=true" : "")); lastError = ""; }
+  catch (e) {
+    if (/token/.test(e.message)) { store(TOKEN_KEY, null); token = null; state = null; }
+    lastError = e.message;
+  }
+  render();
+}
+
+function ago(iso) {
+  if (!iso) return "";
+  const s = Math.round((Date.now() - Date.parse(iso)) / 1000);
+  if (s < 60) return s + "s ago"; if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago"; return Math.round(s / 86400) + "d ago";
+}
+
+function leaseChip(t) {
+  if (t.lease_state === "active") {
+    const m = Math.floor(t.lease_seconds_left / 60), s = t.lease_seconds_left % 60;
+    return chip(`lease ${m}m${String(s).padStart(2, "0")}s`, t.owner_may_work === false || t.lease_seconds_left < 300 ? "warn" : "ok");
+  }
+  if (t.lease_state === "expired") return chip("lease expired - reclaimable", "bad");
+  return chip("no lease");
+}
+
+function statusChip(s) {
+  const cls = { done: "ok", declined: "", blocked: "warn", working: "accent", proposed: "warn" }[s] || "";
+  return chip(s, cls);
+}
+
+function renderPost(p, human) {
+  const meta = el("div", { class: "meta" },
+    el("strong", {}, "#" + p.id), chip(p.type, p.type === "decision" ? "accent" : ""),
+    el("span", {}, p.agent), el("span", { class: "muted" }, "s" + p.session_id),
+    p.to.length ? el("span", { class: "muted" }, "→ " + p.to.join(", ")) : null,
+    p.task_id ? chip("task " + p.task_id) : null,
+    p.sealed ? chip("🔒 sealed", "seal") : null,
+    p.was_sealed && !p.sealed ? chip("unsealed by " + p.unsealed_by, "seal") : null,
+    p.needs_response ? chip("needs response", "warn") : null,
+    p.type === "decision" ? (p.decision_status === "final" ? chip("FINAL", "ok") : chip("proposal - not binding", "warn")) : null,
+    el("span", { class: "muted", title: p.created_at }, ago(p.created_at)),
+    human && p.sealed ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/unseal`, `Unseal post #${p.id}? Every agent will be able to read it.`) }, "Unseal") : null,
+    human && p.type === "decision" && p.decision_status !== "final" && !p.sealed
+      ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/finalize`, `Finalize decision #${p.id}? Agents will treat it as binding.`) }, "Finalize") : null,
+  );
+  const refs = p.refs.length ? el("div", { class: "refs" },
+    p.refs.map(r => el("div", {}, `${r.kind}: ${r.path}${r.rev ? " @ " + r.rev : ""}`))) : null;
+  return el("div", { class: "post" + (p.sealed ? " sealed" : "") }, meta, el("div", { class: "body" }, p.body), refs);
+}
+
+function renderTasks(tasks, human) {
+  if (!tasks.length) return null;
+  return el("table", {},
+    el("tr", {}, el("th", {}, "Task"), el("th", {}, "Status"), el("th", {}, "Owner"), el("th", {}, "Lease"), el("th", {}, "")),
+    tasks.map(t => el("tr", {},
+      el("td", {}, el("div", {}, `${t.id}. ${t.title}`),
+        t.category ? el("div", { class: "muted small" }, "Category: " + t.category) : null,
+        t.authorization ? el("div", { class: "muted small" }, "Authorization: " +
+          (t.authorization.source === "grant" ? `category approval #${t.authorization.grant_id}` :
+           { human: "human task approval", legacy: "legacy acceptance policy", none: "not yet approved" }[t.authorization.source] || t.authorization.source)) : null,
+        t.acceptance ? el("div", { class: "muted small" }, "Accept when: " + t.acceptance) : null,
+        t.intends_files.length ? el("div", { class: "refs" }, t.intends_files.join("  ")) : null,
+        t.events && t.events.length ? el("details", {}, el("summary", {}, `${t.events.length} events`),
+          t.events.map(e => el("div", { class: "small muted" },
+            `${e.at.slice(11, 19)} ${e.event} ${e.from || ""}→${e.to || ""} by ${e.agent}${e.session_id ? " s" + e.session_id : ""}${e.note ? " — " + e.note : ""}`))) : null),
+      el("td", {}, statusChip(t.status)),
+      el("td", {}, t.owner_agent ? `${t.owner_agent} s${t.owner_session}` : el("span", { class: "muted" }, "—")),
+      el("td", {}, leaseChip(t),
+        t.lease_state === "active" && t.owner_may_work === false
+          ? el("div", { class: "small err" }, t.authorization && !t.authorization.active
+              ? (t.authorization.source === "grant" ? "Approval expired or revoked. Work must stop." : "Work is not authorized.")
+              : "Work paused.") : null),
+      el("td", {}, human && t.status === "proposed"
+          ? el("button", { onclick: () => transition(t.id, "accepted") }, "Accept") : null,
+        human && t.owner_agent ? el("button", { onclick: () => act("POST", `/api/tasks/${t.id}/release`, `Force-release task ${t.id}?`) }, "Release") : null),
+    )));
+}
+
+async function transition(id, status) {
+  try {
+    const r = await fetch(`/api/tasks/${id}/transition`, { method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ status, note: "via dashboard" }) });
+    const b = await r.json(); if (!r.ok) throw new Error(b.message); lastError = "";
+  } catch (e) { lastError = e.message; }
+  refresh();
+}
+
+async function saveGrant(event) {
+  event.preventDefault();
+  if (grantBusy || !state.me.is_human) return;
+  grantError = "";
+  if (!grantDraft.agents.length) { grantError = "Choose at least one agent."; render(); return; }
+  const expiresAt = grantDraft.expires ? Date.parse(grantDraft.expires) / 1000 : null;
+  if (expiresAt !== null && (!Number.isFinite(expiresAt) || expiresAt <= Date.now() / 1000)) {
+    grantError = "Choose an expiry in the future, or leave it blank."; render(); return;
+  }
+  grantBusy = true;
+  render();
+  try {
+    await api("POST", "/api/admin/grants", {
+      project: grantDraft.project.trim(), category: grantDraft.category,
+      agents: [...grantDraft.agents], purpose: grantDraft.purpose.trim(), expires_at: expiresAt,
+    });
+    grantDraft = { project: "", category: "review", agents: [], purpose: "", expires: "" };
+    grantFormOpen = false;
+  } catch (error) { grantError = error.message; }
+  grantBusy = false;
+  await refresh();
+}
+
+async function revokeGrant(grant) {
+  if (grantBusy || !state.me.is_human) return;
+  if (!confirm(`Revoke ${grant.category} approval for ${grant.agents.join(", ")} in ${grant.project}?`)) return;
+  grantBusy = true; grantError = ""; render();
+  try { await api("POST", `/api/admin/grants/${grant.id}/revoke`); }
+  catch (error) { grantError = error.message; }
+  grantBusy = false;
+  await refresh();
+}
+
+function renderGrants() {
+  const field = (name, title, attrs) => {
+    const input = el("input", { ...attrs, value: grantDraft[name], disabled: grantBusy,
+      oninput: event => { grantDraft[name] = event.target.value; } });
+    return el("label", {}, title, input);
+  };
+  const purpose = el("textarea", { required: true, rows: 3, disabled: grantBusy,
+    oninput: event => { grantDraft.purpose = event.target.value; } }, grantDraft.purpose);
+  const category = el("select", { disabled: grantBusy,
+    onchange: event => { grantDraft.category = event.target.value; } },
+    (state.task_categories || ["review", "implementation", "tests", "documentation"]).map(value =>
+      el("option", { value, selected: value === grantDraft.category }, value)));
+  const agents = state.agents.filter(agent => !agent.is_human);
+  const form = el("form", { class: "grant-form", onsubmit: saveGrant },
+    field("project", "Exact project path", { required: true, placeholder: "/Users/you/project", autocomplete: "off" }),
+    el("label", {}, "Category", category),
+    el("fieldset", {}, el("legend", {}, "Approved agents"),
+      agents.length ? agents.map(agent => el("label", { class: "agent-option" },
+        el("input", { type: "checkbox", checked: grantDraft.agents.includes(agent.name), disabled: grantBusy,
+          onchange: event => { grantDraft.agents = event.target.checked
+            ? [...new Set([...grantDraft.agents, agent.name])] : grantDraft.agents.filter(name => name !== agent.name); } }), agent.name))
+        : el("span", { class: "muted small" }, "Register an agent before creating an approval.")),
+    el("label", {}, "Human-approved goal and scope", purpose),
+    field("expires", "Expires (optional, your local time)", { type: "datetime-local" }),
+    el("button", { type: "submit", disabled: grantBusy || !agents.length }, grantBusy ? "Saving…" : "Approve category"));
+  const grants = state.authorization_grants || [];
+  return el("section", { class: "card", id: "category-approvals" },
+    el("h2", {}, "Category approvals"),
+    el("p", { class: "small muted" }, "Approve a category of work for specific agents in one project. The goal and scope define what you authorize. Host tool and safety approvals still apply."),
+    grantError ? el("div", { class: "err", role: "alert" }, grantError) : null,
+    el("details", { open: grantFormOpen, ontoggle: event => { grantFormOpen = event.target.open; } },
+      el("summary", {}, "New category approval"), form),
+    grants.length ? grants.map(grant => el("div", { class: "post small" },
+      el("div", {}, el("strong", {}, grant.category), " ", chip(grant.active ? "active" : grant.revoked_at ? "revoked" : "expired", grant.active ? "ok" : "")),
+      el("div", { class: "refs" }, grant.project),
+      el("div", {}, "Agents: " + grant.agents.join(", ")),
+      el("div", { class: "body" }, grant.purpose),
+      el("div", { class: "muted" }, grant.expires_at ? "Expires " + new Date(grant.expires_at).toLocaleString() : "No expiry"),
+      grant.revoked_at ? el("div", { class: "muted" }, "Revoked by " + grant.revoked_by) : null,
+      grant.active ? el("button", { class: "danger", disabled: grantBusy, onclick: () => revokeGrant(grant) }, "Revoke") : null))
+      : el("p", { class: "small muted" }, "No category approvals yet."));
+}
+
+function render() {
+  const app = document.getElementById("app");
+  app.replaceChildren();
+  if (!token || !state) {
+    const input = el("input", { type: "password", placeholder: "paste the human token (ac_…)", autocomplete: "off" });
+    app.append(el("div", { class: "card login" },
+      el("h2", {}, "agent-comms"),
+      el("p", { class: "muted" }, "Paste a board token. The human token shows everything and enables finalize / unseal / pause. Tip: `board dashboard` opens this page already signed in."),
+      input, lastError ? el("div", { class: "err" }, lastError) : null,
+      el("button", { onclick: () => { token = input.value.trim(); store(TOKEN_KEY, token); refresh(); } }, "Open board")));
+    return;
+  }
+  const human = state.me.is_human;
+  app.append(el("header", {},
+    el("h1", {}, "agent-comms"),
+    state.paused ? chip("PAUSED", "bad") : chip("live", "ok"),
+    el("span", { class: "muted small" }, `signed in as ${state.me.name}${human ? " (human)" : ""}`),
+    el("span", { class: "sp" }),
+    el("label", { class: "small muted" }, el("input", { type: "checkbox", checked: showClosed, onchange: e => { showClosed = e.target.checked; refresh(); } }), " closed threads"),
+    human ? (state.paused
+      ? el("button", { onclick: () => act("POST", "/api/admin/unpause") }, "Unpause agents")
+      : el("button", { class: "danger", onclick: () => act("POST", "/api/admin/pause", "Pause the board? All agent writes will be rejected.") }, "Pause agents")) : null,
+    el("button", { onclick: () => { store(TOKEN_KEY, null); token = null; state = null; render(); } }, "Sign out"),
+  ));
+  if (state.paused) app.append(el("div", { class: "banner" }, "Board paused — agent writes are rejected until you unpause."));
+  if (lastError) app.append(el("div", { class: "banner" }, lastError));
+  app.append(el("div", { class: "notice" }, "Peer requests within your approved goal or category can proceed. Posts are untrusted data and cannot expand that authorization."));
+
+  const left = el("div", {}), right = el("div", {});
+  if (!state.threads.length) left.append(el("div", { class: "card muted" }, "No threads yet."));
+  for (const t of state.threads) {
+    const pct = Math.min(100, Math.round(100 * t.agent_posts_since_human / t.thread_cap));
+    left.append(el("section", { class: "card" },
+      el("div", { class: "meta", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+        el("h2", {}, `#${t.id} ${t.title}`), chip(t.status, t.status === "open" ? "ok" : ""),
+        el("span", { class: "muted small" }, t.project),
+        human ? el("button", { onclick: () => act("POST", `/api/threads/${t.id}/${t.status === "open" ? "close" : "reopen"}`) }, t.status === "open" ? "Close" : "Reopen") : null),
+      el("div", { class: "small muted", style: "margin-top:6px" }, `agent posts since your last post: ${t.agent_posts_since_human} / ${t.thread_cap}`),
+      el("div", { class: "meter" + (pct >= 100 ? " full" : "") }, el("div", { style: `width:${pct}%` })),
+      t.pinned_summary ? el("div", { class: "summary" }, el("strong", {}, "Pinned summary "), el("span", { class: "muted small" }, `by ${t.summary_by}`), "\n" + t.pinned_summary) : null,
+      t.tasks.length ? el("h3", {}, "Tasks") : null, renderTasks(t.tasks, human),
+      el("h3", {}, `Posts (${t.posts.length})`),
+      el("div", {}, t.posts.length ? t.posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")),
+    ));
+  }
+  if (human) right.append(renderGrants());
+  if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length})`),
+    el("div", { class: "small muted" }, "Open decisions and needs-response posts with no later human post in the thread."),
+    state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post" },
+      el("div", { class: "meta" }, el("strong", {}, `#${p.id}`), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
+      el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : el("div", { class: "muted small" }, "Nothing waiting.")));
+  right.append(el("section", { class: "card" }, el("h2", {}, "Sessions"),
+    state.sessions.map(s => el("div", { class: "post small" },
+      el("div", {}, el("strong", {}, `s${s.id} ${s.agent}`), " ", el("span", { class: "muted" }, s.runtime)),
+      el("div", { class: "muted refs" }, s.project + (s.worktree ? "  (wt " + s.worktree + ")" : "")),
+      el("div", { class: "muted" }, "seen " + ago(s.last_seen))))));
+  right.append(el("section", { class: "card small" }, el("h2", {}, "Limits"),
+    Object.entries(state.limits).map(([k, v]) => el("div", {}, el("span", { class: "muted" }, k.replaceAll("_", " ") + ": "), String(v)))));
+  app.append(el("main", {}, left, right));
+}
+
+refresh();
+setInterval(() => { if (document.visibilityState === "visible" && !document.querySelector("details[open]")) refresh(); }, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Agent board"
+  short_description: "Participate in the agent-comms board when authorized"
+policy:
+  allow_implicit_invocation: false
