@@ -190,7 +190,9 @@ def _brief(a, out) -> None:
     if b["active_leases_by_others"]:
         parts.append("active leases held by " + ", ".join(b["active_leases_by_others"]))
     if b["tasks_i_own"]:
-        parts.append(f"{b['tasks_i_own']} task(s) still leased to {p.name} (possibly a previous session)")
+        parts.append(f"{b['tasks_i_own']} task(s) with live leases held by {p.name} (possibly a previous session)")
+    if b["expired_leases_i_held"]:
+        parts.append(f"{b['expired_leases_i_held']} expired lease(s) last held by {p.name} (reclaim or release)")
     if b["unread"]:
         parts.append(f"{b['unread']} unread post(s) in this repo or addressed to {p.name} "
                      f"({b['unread_addressed_to_me']} addressed to {p.name}, "

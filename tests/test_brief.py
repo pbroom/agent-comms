@@ -59,3 +59,37 @@ def test_brief_cli_prints_nothing_when_idle_and_one_line_when_active(env, monkey
     cli.main(["brief", "--agent", "claude", "--project", PROJECT])
     out = capsys.readouterr().out
     assert out.count("\n") == 1 and "1 open task" in out and "untrusted data" in out
+
+
+# Regressions from codex's review of the first version (board thread 2, post 7).
+
+def test_brief_counts_prior_session_handoff_like_a_new_session_would(env):
+    tid = env.thread()
+    earlier = env.session("claude", PROJECT, "/wt/earlier")
+    env.post("claude", tid, "handoff to my next session", "handoff", to=["claude"], session_id=earlier)
+    b = env.board.brief(env.p["claude"], [PROJECT])
+    fresh = env.session("claude", PROJECT, "/wt/fresh")
+    posts = env.board.read_updates(env.p["claude"], fresh)["posts"]
+    assert b["unread"] == len(posts) == 1 and b["unread_addressed_to_me"] == 1
+
+
+def test_brief_human_question_count_respects_sealing(env):
+    tid = env.thread()
+    task = env.accepted_task(tid)
+    env.post("grok", tid, "sealed ask", "finding", task_id=task, refs=REF, sealed=True, to=["human"],
+             needs_response=True)
+    assert env.board.brief(env.p["claude"], [PROJECT])["open_questions_for_human"] == 0
+    assert env.board.brief(env.p["grok"], [PROJECT])["open_questions_for_human"] == 1
+
+
+def test_brief_lease_expiry_boundary(env):
+    tid = env.thread()
+    task = env.accepted_task(tid)
+    env.board.claim_task(env.p["claude"], env.sid["claude"], task)
+    b = env.board.brief(env.p["codex"], [PROJECT])
+    assert b["active_leases_by_others"] == ["claude"]
+    env.clock.advance(env.settings.lease_ttl_minutes * 60)  # exactly at expiry: no longer live
+    assert env.board.get_task(env.p["claude"], task)["lease_state"] == "expired"
+    assert env.board.brief(env.p["codex"], [PROJECT])["active_leases_by_others"] == []
+    mine = env.board.brief(env.p["claude"], [PROJECT])
+    assert (mine["tasks_i_own"], mine["expired_leases_i_held"]) == (0, 1)
