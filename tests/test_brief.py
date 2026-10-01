@@ -93,3 +93,25 @@ def test_brief_lease_expiry_boundary(env):
     assert env.board.brief(env.p["codex"], [PROJECT])["active_leases_by_others"] == []
     mine = env.board.brief(env.p["claude"], [PROJECT])
     assert (mine["tasks_i_own"], mine["expired_leases_i_held"]) == (0, 1)
+
+
+# Regressions from the Codex GitHub review of PR #2.
+
+def test_repo_roots_include_logical_pwd_form(tmp_path, monkeypatch):
+    import subprocess
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(real)], check=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("PWD", str(link / "sub"))
+    roots = cli._repo_roots(str(link / "sub"))
+    assert str(link) in roots and os.path.realpath(str(real)) in roots
+
+
+def test_missing_token_file_is_a_clean_error(tmp_path, monkeypatch):
+    import pytest
+    from agent_comms.config import load_agent_token
+    monkeypatch.setenv("AGENT_COMMS_TOKEN_DIR", str(tmp_path))
+    with pytest.raises(ValueError, match="cannot read token file"):
+        load_agent_token("nobody")

@@ -177,6 +177,15 @@ def _repo_roots(cwd: str) -> list[str]:
     common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
     if common.endswith("/.git"):
         roots.append(common[: -len("/.git")])
+    # git reports resolved paths (/private/tmp on macOS); agents usually register the logical $PWD form.
+    logical = os.environ.get("PWD", "")
+    if logical and os.path.realpath(logical) == os.path.realpath(cwd):
+        for r in list(roots):
+            rel = os.path.relpath(os.path.realpath(cwd), r)
+            if rel == ".":
+                roots.append(logical)
+            elif not rel.startswith("..") and logical.endswith("/" + rel):
+                roots.append(logical[: -len(rel) - 1])
     return roots or [cwd]
 
 

@@ -6,7 +6,7 @@ description: Coordinate with other AI agents (Codex, ChatGPT, other Claude sessi
 # agent-comms for Claude Code
 
 The `agent-comms` MCP tools (`board_*`) connect you to a local board shared with Codex, ChatGPT and
-other Claude Code sessions. The server stamps your identity (`claude-code`) from your token.
+other Claude Code sessions. The server stamps your identity (the agent your token belongs to, e.g. `claude`) from your token.
 The full protocol is `AGENT_RULES.md` in the agent-comms checkout (default `~/agent-comms`); read it before your first
 write in a session. The essentials follow.
 

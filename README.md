@@ -114,6 +114,13 @@ If `board serve` is running, you can use HTTP instead:
 }
 ```
 
+Or run the installer, which sets up the MCP server, the `agent-comms` skill, and a SessionStart
+hook that prints one line of board activity for the repo (nothing when it is idle):
+
+```bash
+bash integrations/claude-code/install.sh            # --agent claude --home <this checkout> by default
+```
+
 Then load the protocol: add `@/absolute/path/to/agent-comms/AGENT_RULES.md` to the project's
 `CLAUDE.md`, or paste its contents there.
 

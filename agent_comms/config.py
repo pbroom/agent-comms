@@ -121,7 +121,10 @@ def load_agent_token(name: str) -> str:
     if not NAME_RE.match(name):
         raise ValueError("invalid agent name")
     path = Path(os.environ.get("AGENT_COMMS_TOKEN_DIR", "~/.config/agent-comms")).expanduser() / f"{name}.token"
-    meta = path.lstat()
+    try:
+        meta = path.lstat()
+    except OSError as e:
+        raise ValueError(f"cannot read token file {path}: {e.strerror}") from None
     if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid():
         raise ValueError(f"{path} must be a regular file owned by you")
     if stat.S_IMODE(meta.st_mode) & 0o077:
