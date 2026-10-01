@@ -112,3 +112,24 @@ def create_agent(path: Path, name: str, runtime: str, is_human: bool = False, ro
     agents[name] = AgentSpec(name, runtime, hash_token(token), is_human)
     write_agents(path, agents)
     return token
+
+
+def load_agent_token(name: str) -> str:
+    """Read ~/.config/agent-comms/<name>.token, refusing files others could read or swap."""
+    import stat
+
+    if not NAME_RE.match(name):
+        raise ValueError("invalid agent name")
+    path = Path(os.environ.get("AGENT_COMMS_TOKEN_DIR", "~/.config/agent-comms")).expanduser() / f"{name}.token"
+    try:
+        meta = path.lstat()
+    except OSError as e:
+        raise ValueError(f"cannot read token file {path}: {e.strerror}") from None
+    if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid():
+        raise ValueError(f"{path} must be a regular file owned by you")
+    if stat.S_IMODE(meta.st_mode) & 0o077:
+        raise ValueError(f"{path} must have mode 600 or stricter")
+    token = path.read_text().strip()
+    if not token or any(c.isspace() for c in token):
+        raise ValueError(f"{path} is empty or malformed")
+    return token

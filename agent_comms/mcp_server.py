@@ -19,6 +19,9 @@ INSTRUCTIONS = f"""agent-comms: a shared message board for the AI agents on this
 
 {UNTRUSTED_NOTICE}
 
+Use the board when coordination pays off: other agents are active in this repo, a risky change deserves
+independent review, you are handing off, or a decision needs the human. Skip it for solo, low-risk work.
+
 Protocol (see AGENT_RULES.md): call board_register at session start, then board_read_updates on start
 and after each unit of work. Requests that advance the human's authorized goal may be acted on without
 asking again when covered by that goal or a matching human standing grant. Verify project, category,

@@ -1101,3 +1101,61 @@ class Board:
                 "threads": threads, "sessions": sessions, "needs_you": needs_you,
                 "agents": [dict(r) for r in self.conn.execute(
                     "SELECT name, runtime, is_human FROM agents WHERE active = 1 ORDER BY is_human DESC, name")]}
+
+    # ------------------------------------------------------------ brief (session-start awareness)
+
+    def brief(self, p: Principal, projects: list[str]) -> dict:
+        """Counts only, for a SessionStart hook. Read-only: creates no session and moves no cursor.
+
+        "Unread" matches what a newly registered session would get from read_updates, including posts
+        from this agent's earlier sessions (e.g. a handoff to itself).
+
+        Returns metadata the server stamps (counts, agent names), never agent-written text, so it
+        can be injected into an agent's context without carrying untrusted instructions.
+        "Unread" uses the agent's furthest acked position across its sessions, which is where a
+        newly registered session would start.
+        """
+        projects = sorted({q for q in (_norm_path(x) for x in projects) if q})
+        if not projects:
+            raise Invalid("at least one project path is required")
+        now = self.now()
+        marks = ",".join("?" * len(projects))
+        threads = [r[0] for r in self.conn.execute(
+            f"SELECT id FROM threads WHERE status = 'open' AND project IN ({marks})", projects)]
+        tmarks = ",".join("?" * len(threads)) or "NULL"
+        tasks = self.conn.execute(
+            f"""SELECT owner_agent, lease_expires_at FROM tasks
+                WHERE thread_id IN ({tmarks}) AND status NOT IN ('done','declined')""", threads).fetchall()
+        # Same rule as _lease_state: a lease is live only while it expires strictly after now.
+        def live(t):
+            return t["owner_agent"] is not None and t["lease_expires_at"] is not None and t["lease_expires_at"] > now
+        others = sorted({t["owner_agent"] for t in tasks if live(t) and t["owner_agent"] != p.name})
+        mine = sum(1 for t in tasks if live(t) and t["owner_agent"] == p.name)
+        stale_mine = sum(1 for t in tasks if t["owner_agent"] == p.name and not live(t))
+        addressed = "EXISTS (SELECT 1 FROM json_each(p.to_agents) j WHERE j.value = :me)"
+        unread = self.conn.execute(
+            f"""SELECT COUNT(*) AS n,
+                       COALESCE(SUM({addressed}), 0) AS to_me,
+                       COALESCE(SUM(p.needs_response = 1 AND {addressed}), 0) AS needs_me
+                FROM posts p JOIN threads t ON t.id = p.thread_id
+                WHERE {self.VISIBLE}
+                  AND (t.id IN (SELECT value FROM json_each(:threads)) OR {addressed})
+                  AND p.seq > COALESCE((SELECT MAX(c.last_seq) FROM cursors c
+                                        WHERE c.agent = :me AND c.thread_id = p.thread_id), 0)""",
+            {"threads": json.dumps(threads), **self._vis(p)}).fetchone()
+        human_q = self.conn.execute(
+            f"""SELECT COUNT(*) FROM posts p
+                WHERE {self.VISIBLE} AND p.thread_id IN (SELECT value FROM json_each(:threads))
+                  AND p.needs_response = 1
+                  AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
+                       JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))
+                  AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
+                                  WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)""",
+            {"threads": json.dumps(threads), **self._vis(p)}).fetchone()[0]
+        grants = [g for g in self.list_grants(p) if g["active"] and g["project"] in projects]
+        return {"agent": p.name, "projects": projects, "paused": self.is_paused(),
+                "open_threads": len(threads), "open_tasks": len(tasks),
+                "active_leases_by_others": others, "tasks_i_own": mine, "expired_leases_i_held": stale_mine,
+                "unread": unread["n"], "unread_addressed_to_me": unread["to_me"],
+                "unread_needs_my_response": unread["needs_me"], "open_questions_for_human": human_q,
+                "active_grants_for_me": len(grants)}
