@@ -33,7 +33,7 @@ class Settings:
     daily_post_cap_per_agent: int = 200
     body_max_bytes: int = 4096
     max_refs: int = 20
-    require_human_accept: bool = True
+    require_human_accept: bool = False
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

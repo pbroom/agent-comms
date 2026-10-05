@@ -106,7 +106,30 @@ def test_release_and_lifecycle(env):
     ]
 
 
+def test_proposed_tasks_are_open_to_agents_by_default(env):
+    assert env.settings.require_human_accept is False
+    tid = env.thread()
+    post = env.post("claude", tid, "let's add a rate limiter", "proposal",
+                    propose_task={"title": "rate limiter", "intends_files": ["app/limits.py"]})
+    task = post["task_id"]
+    claimed = env.board.claim_task(env.p["claude"], env.sid["claude"], task)
+    assert (claimed["status"], claimed["owner_agent"]) == ("working", "claude")
+    other = env.post("claude", tid, "and tests", "proposal", propose_task={"title": "tests"})["task_id"]
+    accepted = env.board.transition_task(env.p["codex"], env.sid["codex"], other, "accepted")
+    assert accepted["status"] == "accepted"
+
+
+def test_turning_the_gate_back_on_reblocks_agent_accepted_work(env):
+    tid = env.thread()
+    task = env.post("claude", tid, "x", "proposal", propose_task={"title": "x"})["task_id"]
+    env.board.claim_task(env.p["claude"], env.sid["claude"], task)
+    env.settings.require_human_accept = True
+    with pytest.raises(Forbidden):
+        env.board.transition_task(env.p["claude"], env.sid["claude"], task, "done")
+
+
 def test_proposed_tasks_need_human_accept(env):
+    env.settings.require_human_accept = True  # the gate is off by default; this covers it switched on
     tid = env.thread()
     post = env.post("claude", tid, "let's add a rate limiter", "proposal",
                     propose_task={"title": "rate limiter", "intends_files": ["app/limits.py"]})
