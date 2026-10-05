@@ -1171,7 +1171,7 @@ class Board:
 
     # ------------------------------------------------------------ brief (session-start awareness)
 
-    def brief(self, p: Principal, projects: list[str]) -> dict:
+    def brief(self, p: Principal, projects: list[str], after_seq: int | None = None) -> dict:
         """Counts only, for a SessionStart hook. Read-only: creates no session and moves no cursor.
 
         "Unread" matches what a newly registered session would get from read_updates, including posts
@@ -1181,6 +1181,11 @@ class Board:
         can be injected into an agent's context without carrying untrusted instructions.
         "Unread" uses the agent's furthest acked position across its sessions, which is where a
         newly registered session would start.
+
+        `latest_addressed_unread_seq` is the highest seq among the unread posts counted in
+        `unread_addressed_to_me` (same visibility and unread rules), or None. A caller can remember it
+        and treat anything above it as new. With `after_seq`, `addressed_after_seq` and
+        `needs_response_after_seq` count only the addressed unread posts above that seq.
         """
         projects = sorted({q for q in (_norm_path(x) for x in projects) if q})
         if not projects:
@@ -1203,13 +1208,16 @@ class Board:
         unread = self.conn.execute(
             f"""SELECT COUNT(*) AS n,
                        COALESCE(SUM({addressed}), 0) AS to_me,
-                       COALESCE(SUM(p.needs_response = 1 AND {addressed}), 0) AS needs_me
+                       COALESCE(SUM(p.needs_response = 1 AND {addressed}), 0) AS needs_me,
+                       MAX(CASE WHEN {addressed} THEN p.seq END) AS latest_to_me,
+                       COALESCE(SUM({addressed} AND p.seq > :after), 0) AS to_me_after,
+                       COALESCE(SUM(p.needs_response = 1 AND {addressed} AND p.seq > :after), 0) AS needs_me_after
                 FROM posts p JOIN threads t ON t.id = p.thread_id
                 WHERE {self.VISIBLE}
                   AND (t.id IN (SELECT value FROM json_each(:threads)) OR {addressed})
                   AND p.seq > COALESCE((SELECT MAX(c.last_seq) FROM cursors c
                                         WHERE c.agent = :me AND c.thread_id = p.thread_id), 0)""",
-            {"threads": json.dumps(threads), **self._vis(p)}).fetchone()
+            {"threads": json.dumps(threads), "after": after_seq or 0, **self._vis(p)}).fetchone()
         human_q = self.conn.execute(
             f"""SELECT COUNT(*) FROM posts p
                 WHERE {self.VISIBLE} AND p.thread_id IN (SELECT value FROM json_each(:threads))
@@ -1220,9 +1228,14 @@ class Board:
                                   WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)""",
             {"threads": json.dumps(threads), **self._vis(p)}).fetchone()[0]
         grants = [g for g in self.list_grants(p) if g["active"] and g["project"] in projects]
-        return {"agent": p.name, "projects": projects, "paused": self.is_paused(),
-                "open_threads": len(threads), "open_tasks": len(tasks),
-                "active_leases_by_others": others, "tasks_i_own": mine, "expired_leases_i_held": stale_mine,
-                "unread": unread["n"], "unread_addressed_to_me": unread["to_me"],
-                "unread_needs_my_response": unread["needs_me"], "open_questions_for_human": human_q,
-                "active_grants_for_me": len(grants)}
+        out = {"agent": p.name, "projects": projects, "paused": self.is_paused(),
+               "open_threads": len(threads), "open_tasks": len(tasks),
+               "active_leases_by_others": others, "tasks_i_own": mine, "expired_leases_i_held": stale_mine,
+               "unread": unread["n"], "unread_addressed_to_me": unread["to_me"],
+               "unread_needs_my_response": unread["needs_me"],
+               "latest_addressed_unread_seq": unread["latest_to_me"], "open_questions_for_human": human_q,
+               "active_grants_for_me": len(grants)}
+        if after_seq is not None:
+            out["addressed_after_seq"] = unread["to_me_after"]
+            out["needs_response_after_seq"] = unread["needs_me_after"]
+        return out
