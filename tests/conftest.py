@@ -5,9 +5,16 @@ from dataclasses import dataclass, field
 import pytest
 
 from agent_comms.config import Settings, create_agent
+from agent_comms import notify
 from agent_comms.core import Board, Principal
 
 PROJECT = "/work/repo"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_notifications(monkeypatch):
+    """Tests never spawn osascript; tests that exercise delivery inject their own deliverer."""
+    monkeypatch.setattr(notify.MacOSDeliverer, "available", lambda self: False)
 
 
 class FakeClock:
