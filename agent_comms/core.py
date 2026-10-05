@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from . import db
 from .config import Settings, hash_token, read_agents
+from .notify import CHANNEL as NOTIFY_CHANNEL, DEFAULT_IDLE_MINUTES, DEFAULT_NOTIFY_EVENTS, NOTIFY_EVENTS, HumanNotifier
 
 POST_TYPES = ("question", "proposal", "status", "finding", "handoff", "request", "decision")
 TASK_CATEGORIES = ("review", "implementation", "tests", "documentation")
@@ -104,10 +105,10 @@ def iso(ts: float | None) -> str | None:
 
 
 def notify(event: str, payload: dict[str, Any]) -> None:
-    """Wake hook. v1 is pull-only, so this deliberately does nothing.
+    """A notifier that does nothing: pass `Board(..., notifier=notify)` for a strictly silent board.
 
-    A future dispatcher replaces `Board.notifier`, reads the `subscriptions` table, and wakes
-    subscribed agents. It is called after the write has committed.
+    The default `Board.notifier` is `notify.HumanNotifier`, which tells the human (never an agent)
+    about posts that need them, when the human has subscribed. Called after the write has committed.
     """
     return None
 
@@ -152,10 +153,11 @@ def _norm_path(p: str | None) -> str | None:
 
 class Board:
     def __init__(self, settings: Settings, clock: Callable[[], float] = time.time,
-                 notifier: Callable[[str, dict[str, Any]], None] = notify):
+                 notifier: Callable[[str, dict[str, Any]], None] | None = None):
         self.s = settings
         self.clock = clock
-        self.notifier = notifier
+        # Default: human notifications, configured by the human's `subscriptions` rows (off until then).
+        self.notifier = notifier if notifier is not None else HumanNotifier(self)
         self._local = threading.local()
         self._agents_mtime: float | None = None
         self._sync_lock = threading.Lock()
@@ -235,7 +237,7 @@ class Board:
                    updated_at=excluded.updated_at""",
                 ("1" if paused else "0", p.name, self.now()),
             )
-        self.notifier("board.paused" if paused else "board.unpaused", {"by": p.name})
+        self._notify("board.paused" if paused else "board.unpaused", {"by": p.name})
         return {"paused": paused}
 
     def limits(self) -> dict:
@@ -246,6 +248,71 @@ class Board:
             "body_max_bytes": self.s.body_max_bytes,
             "require_human_accept": self.s.require_human_accept,
         }
+
+    # ------------------------------------------------------------ human notifications
+
+    def _notify(self, event: str, payload: dict[str, Any]) -> None:
+        """Runs after commit. A notifier failure must never fail (or appear to roll back) the write."""
+        try:
+            self.notifier(event, payload)
+        except Exception:
+            pass
+
+    def _subscription_out(self, r: sqlite3.Row) -> dict:
+        try:
+            events, target = json.loads(r["events"]), json.loads(r["target"]) if r["target"] else {}
+        except ValueError:
+            events, target = [], {}  # a malformed row (never written by core) is shown inert, not fatal
+        idle = target.get("idle_minutes") if isinstance(target, dict) and "idle-agent" in events else None
+        return {"id": r["id"], "channel": r["channel"], "project": r["project"], "thread_id": r["thread_id"],
+                "events": events, "idle_minutes": idle, "active": bool(r["active"]), "created_at": iso(r["created_at"])}
+
+    def subscribe_notifications(self, p: Principal, *, events: list[str] | None = None, project: str | None = None,
+                                thread_id: int | None = None, idle_minutes: int | None = None) -> dict:
+        """Turn on macOS notifications for the human. Replaces an active row with the same scope."""
+        self._require_human(p, "manage notifications")
+        events = _str_list(list(DEFAULT_NOTIFY_EVENTS) if events is None else events, "events", max_items=10)
+        if not events or set(events) - set(NOTIFY_EVENTS):
+            raise Invalid(f"events must be a non-empty subset of {NOTIFY_EVENTS}")
+        project = _norm_path(project)
+        if thread_id is not None:
+            self._thread_row(thread_id)
+        target = None
+        if "idle-agent" in events:
+            idle = DEFAULT_IDLE_MINUTES if idle_minutes is None else idle_minutes
+            if isinstance(idle, bool) or not isinstance(idle, int) or not 1 <= idle <= 7 * 24 * 60:
+                raise Invalid("idle_minutes must be a whole number of minutes between 1 and 10080")
+            target = json.dumps({"idle_minutes": idle})
+        elif idle_minutes is not None:
+            raise Invalid("idle_minutes only applies with the idle-agent event")
+        with db.write_tx(self.conn) as c:
+            c.execute("""UPDATE subscriptions SET active = 0 WHERE agent = ? AND channel = ? AND active = 1
+                         AND project IS ? AND thread_id IS ?""", (p.name, NOTIFY_CHANNEL, project, thread_id))
+            sid = c.execute("""INSERT INTO subscriptions(agent, project, thread_id, events, channel, target, active,
+                                 created_at) VALUES (?,?,?,?,?,?,1,?)""",
+                            (p.name, project, thread_id, json.dumps(events), NOTIFY_CHANNEL, target,
+                             self.now())).lastrowid
+        return self._subscription_out(self.conn.execute("SELECT * FROM subscriptions WHERE id = ?", (sid,)).fetchone())
+
+    def unsubscribe_notifications(self, p: Principal, subscription_id: int | None = None) -> list[dict]:
+        """Turn off one notification subscription, or all of them. Returns what was turned off."""
+        self._require_human(p, "manage notifications")
+        q = "SELECT * FROM subscriptions WHERE agent = ? AND channel = ? AND active = 1"
+        args: tuple = (p.name, NOTIFY_CHANNEL)
+        if subscription_id is not None:
+            q, args = q + " AND id = ?", args + (subscription_id,)
+        with db.write_tx(self.conn) as c:
+            rows = c.execute(q, args).fetchall()
+            if subscription_id is not None and not rows:
+                raise NotFound(f"no active notification subscription {subscription_id}")
+            c.executemany("UPDATE subscriptions SET active = 0 WHERE id = ?", [(r["id"],) for r in rows])
+        return [self._subscription_out(r) | {"active": False} for r in rows]
+
+    def list_notification_subscriptions(self, p: Principal) -> list[dict]:
+        self._require_human(p, "manage notifications")
+        return [self._subscription_out(r) for r in self.conn.execute(
+            "SELECT * FROM subscriptions WHERE agent = ? AND channel = ? AND active = 1 ORDER BY id",
+            (p.name, NOTIFY_CHANNEL))]
 
     # ------------------------------------------------------------ standing authorization
 
@@ -424,7 +491,7 @@ class Board:
         with db.write_tx(self.conn) as c:
             self._check_agent_write(p)
             tid = self._insert_thread(c, p, project, title)
-        self.notifier("thread.created", {"thread_id": tid})
+        self._notify("thread.created", {"thread_id": tid})
         return self.get_thread(p, tid)
 
     def _insert_thread(self, c: sqlite3.Connection, p: Principal, project: str, title: str) -> int:
@@ -476,7 +543,7 @@ class Board:
         with db.write_tx(self.conn) as c:
             self._check_agent_write(p)
             c.execute("UPDATE threads SET status = ? WHERE id = ?", (status, thread_id))
-        self.notifier("thread.status", {"thread_id": thread_id, "status": status})
+        self._notify("thread.status", {"thread_id": thread_id, "status": status})
         return self.get_thread(p, thread_id)
 
     def set_summary(self, p: Principal, session_id: int, thread_id: int, summary: str) -> dict:
@@ -492,7 +559,7 @@ class Board:
             self._check_agent_write(p)
             c.execute("UPDATE threads SET pinned_summary=?, summary_by=?, summary_at=? WHERE id=?",
                       (summary or None, p.name, self.now(), thread_id))
-        self.notifier("thread.summary", {"thread_id": thread_id})
+        self._notify("thread.summary", {"thread_id": thread_id})
         return self.get_thread(p, thread_id)
 
     # ------------------------------------------------------------ posts
@@ -613,10 +680,10 @@ class Board:
             if sealed and type == "finding" and task_id is not None:
                 unsealed = self._auto_unseal(c, task_id)
 
-        self.notifier("post.created", {"post_id": post_id, "thread_id": thread_id, "agent": p.name, "to": to,
+        self._notify("post.created", {"post_id": post_id, "thread_id": thread_id, "agent": p.name, "to": to,
                                        "needs_response": bool(needs_response), "sealed": bool(sealed)})
         for pid in unsealed:
-            self.notifier("post.unsealed", {"post_id": pid, "by": "auto:reviewers"})
+            self._notify("post.unsealed", {"post_id": pid, "by": "auto:reviewers"})
         out = self.get_post(p, post_id)
         out["auto_unsealed_post_ids"] = unsealed
         return out
@@ -649,7 +716,7 @@ class Board:
             if not r["sealed"]:
                 raise Conflict("post is not sealed")
             self._reveal(c, post_id, p.name)
-        self.notifier("post.unsealed", {"post_id": post_id, "by": p.name})
+        self._notify("post.unsealed", {"post_id": post_id, "by": p.name})
         return self.get_post(p, post_id)
 
     def finalize(self, p: Principal, post_id: int) -> dict:
@@ -668,7 +735,7 @@ class Board:
             now = self.now()
             c.execute("UPDATE posts SET final = 1, finalized_at = ?, revised_at = ?, seq = ? WHERE id = ?",
                       (now, now, seq, post_id))
-        self.notifier("decision.finalized", {"post_id": post_id})
+        self._notify("decision.finalized", {"post_id": post_id})
         return self.get_post(p, post_id)
 
     # Single visibility rule, used by EVERY read path that returns posts.
@@ -870,7 +937,7 @@ class Board:
         with db.write_tx(self.conn) as c:
             self._check_agent_write(p)
             tid = self._insert_task(c, p, session_id, thread_id, **f)
-        self.notifier("task.created", {"task_id": tid})
+        self._notify("task.created", {"task_id": tid})
         return self.get_task(p, tid)
 
     def _task_row(self, task_id: int, c: sqlite3.Connection | None = None) -> sqlite3.Row:
@@ -986,7 +1053,7 @@ class Board:
                     overlap = set(json.loads(r["intends_files"])) & set(json.loads(t["intends_files"]))
                     if overlap:
                         warnings.append(f"task {r['id']} ({r['owner_agent']}) also intends to edit {sorted(overlap)}")
-        self.notifier("task.claimed", {"task_id": task_id, "agent": p.name, "renewed": renewed})
+        self._notify("task.claimed", {"task_id": task_id, "agent": p.name, "renewed": renewed})
         out = self.get_task(p, task_id, events=False)
         out["renewed"] = renewed
         if warnings:
@@ -1013,7 +1080,7 @@ class Board:
             c.execute("""UPDATE tasks SET owner_agent = NULL, owner_session = NULL, lease_expires_at = NULL,
                          status = ?, updated_at = ? WHERE id = ?""", (new_status, self.now(), task_id))
             self._event(c, task_id, "release", t["status"], new_status, p, session_id, note)
-        self.notifier("task.released", {"task_id": task_id, "agent": p.name})
+        self._notify("task.released", {"task_id": task_id, "agent": p.name})
         return self.get_task(p, task_id, events=False)
 
     def transition_task(self, p: Principal, session_id: int, task_id: int, status: str,
@@ -1067,7 +1134,7 @@ class Board:
             else:
                 c.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", (status, now, task_id))
             self._event(c, task_id, "transition", frm, status, p, session_id, note)
-        self.notifier("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
+        self._notify("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
         return self.get_task(p, task_id, events=False)
 
     # ------------------------------------------------------------ dashboard

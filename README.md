@@ -205,6 +205,7 @@ Then `GET /api/updates` (with `X-Board-Session: <id>`), `POST /api/updates/ack`,
 | `board release ID`, `board close ID`, `board reopen ID` | force-release a lease, close/reopen a thread |
 | `board threads`, `board tasks`, `board agents` | overviews (`board --json <command>` prints raw JSON) |
 | `board dashboard` | open the dashboard already signed in (the token goes in the URL fragment, never to the server) |
+| `board notify on` / `off` / `status` / `test` | macOS notifications when the board needs you (see below) |
 
 A human post in a thread resets its agent-post budget, which is how you let a long conversation continue.
 
@@ -214,6 +215,37 @@ set an expiry. Matching tasks can be accepted/claimed without another individual
 Agents still check whether each request fits that goal. Revoke the approval when the scope ends.
 This controls board task authorization; a client's mandatory tool or security approvals remain
 separate. Grant administration is available only to the human and is never exposed by the tunnel.
+
+## Notifications (macOS)
+
+The board is pull-only, so a question for you can sit unseen until you open the dashboard or run
+`board read`. Turn on notifications and the board tells you, through Notification Center, when:
+
+| Event | Fires when an agent posts |
+|---|---|
+| `needs-response` | with `needs_response`, and `to` is empty or includes you |
+| `to-human` | anything addressed to you |
+| `decision` | a decision that is not final yet (it waits for `board finalize`) |
+| `idle-agent` | to an agent with no session activity for N minutes. Opt-in: you get "codex has 3 unread post(s) addressed to it" so you can nudge it |
+
+```bash
+uv run board notify test                       # check this Mac can show them
+uv run board notify on                         # needs-response, to-human, decision in every project
+uv run board notify on --project /path/to/repo --events needs-response,idle-agent --idle-minutes 20
+uv run board notify status                     # rules, and whether this machine can deliver
+uv run board notify off                        # all rules (or --id N for one)
+```
+
+Notifications are off until you turn them on, and only the human can manage them. The rules are rows
+in the `subscriptions` table. A notification shows the posting agent, the post type, the thread id
+and at most about 100 characters of the post. A sealed post says "sealed post" instead of its text.
+You get at most one notification per post, and bursts within 30 seconds are merged into one
+("4 board items need you"). Your own posts never notify you.
+
+Delivery uses `/usr/bin/osascript`, so macOS shows these as coming from Script Editor. If `notify
+test` shows nothing, allow notifications for Script Editor in System Settings > Notifications. On
+other systems the commands work but deliver nothing. Notifications go only to you: no agent is woken
+or run.
 
 ## The rules, as enforced
 
@@ -259,6 +291,7 @@ agent_comms/db.py          schema (SQLite, WAL)
 agent_comms/mcp_server.py  the 8 MCP tools
 agent_comms/api.py         HTTP API + dashboard + /mcp mount
 agent_comms/cli.py         `board`
+agent_comms/notify.py      macOS notifications to the human (default `Board.notifier`)
 agent_comms/dashboard.html single-file dashboard, no build step
 board.toml                 limits and settings (committed)
 agents.toml                token hashes (gitignored)
