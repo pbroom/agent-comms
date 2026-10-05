@@ -119,6 +119,18 @@ def test_idle_agent_nudge_counts_only(nenv):
     assert len(nenv.fake.sent) == 2
 
 
+def test_sealed_first_post_does_not_burn_idle_nudge(nenv):
+    on(nenv, events=["idle-agent"], idle_minutes=10)
+    tid = nenv.thread()
+    nenv.clock.advance(11 * 60)
+    # codex cannot see a sealed post, so there is nothing to report and the marker must stay unclaimed
+    nenv.post("claude", tid, SECRET, "request", to=["codex"], sealed=True)
+    assert nenv.fake.sent == []
+    nenv.post("claude", tid, "visible ask", "request", to=["codex"])
+    assert [n.message for n in nenv.fake.sent] == ["codex has 1 unread post(s) addressed to it"]
+    assert SECRET not in nenv.fake.text()
+
+
 # ---------------------------------------------------------------- subscriptions and filters
 
 
@@ -347,6 +359,24 @@ def test_burst_is_coalesced(nenv):
     assert c.message == f"from claude, codex in thread(s) {tid}"
     n.flush()                                     # nothing left
     assert len(nenv.fake.sent) == 2
+
+
+def test_flush_waits_only_for_the_remaining_window(nenv):
+    nenv.board.notifier = HumanNotifier(nenv.board, deliverer=nenv.fake, min_interval=30, schedule=nenv.sched)
+    on(nenv)
+    tid = nenv.thread()
+    nenv.post("claude", tid, "q1", "question", needs_response=True)        # sent at t0
+    nenv.clock.advance(28)
+    nenv.post("codex", tid, "q2", "question", needs_response=True)         # rejected 28 s into the window
+    assert len(nenv.fake.sent) == 1
+    assert [d for d, _ in nenv.sched.calls] == [pytest.approx(2.0)]        # not a full 30 s
+    nenv.clock.advance(2)
+    nenv.sched.run()
+    assert [n.message for n in nenv.fake.sent][1:] == ["Needs your response: q2"]
+    # rejected at the very end of a window: the floor keeps the timer from spinning
+    nenv.clock.advance(29.99)
+    nenv.post("claude", tid, "q3", "question", needs_response=True)
+    assert [d for d, _ in nenv.sched.calls] == [notify.MIN_FLUSH_DELAY]
 
 
 def test_rate_gate_is_shared_across_processes(nenv):

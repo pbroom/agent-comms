@@ -40,6 +40,7 @@ DEFAULT_NOTIFY_EVENTS = ("needs-response", "to-human", "decision")
 DEFAULT_IDLE_MINUTES = 30
 TITLE = "agent-comms"
 SNIPPET_CHARS = 100
+MIN_FLUSH_DELAY = 1.0  # seconds; keeps a coalescing flush from spinning
 
 LABELS = {  # most important first; a post gets one label
     "needs-response": "Needs your response",
@@ -256,9 +257,6 @@ class HumanNotifier:
             last = c.execute("SELECT MAX(last_seen) FROM sessions WHERE agent = ?", (agent,)).fetchone()[0]
             if last is not None and last >= cutoff:
                 continue
-            # Once per idle stretch, across processes: keyed by the agent's last activity.
-            if not self._claim(self.IDLE_KEY + agent, "never" if last is None else repr(last), only_if_changed=True):
-                continue
             unread = c.execute(
                 """SELECT COUNT(*) FROM posts p
                    WHERE (p.sealed = 0 OR p.agent = :me) AND p.agent != :me
@@ -266,7 +264,10 @@ class HumanNotifier:
                      AND p.seq > COALESCE((SELECT MAX(c.last_seq) FROM cursors c
                                            WHERE c.agent = :me AND c.thread_id = p.thread_id), 0)""",
                 {"me": agent}).fetchone()[0]
-            if unread:
+            # Once per idle stretch, across processes: keyed by the agent's last activity. Claimed only
+            # when there is something to report, so a post the agent cannot see (sealed) burns nothing.
+            if unread and self._claim(self.IDLE_KEY + agent, "never" if last is None else repr(last),
+                                      only_if_changed=True):
                 parts.append(f"{agent} has {unread} unread post(s) addressed to it")
                 nudged.append(agent)
         if not parts:
@@ -301,6 +302,18 @@ class HumanNotifier:
             log.debug("notify gate unavailable", exc_info=True)
             return False
 
+    def _flush_delay(self) -> float:
+        """Seconds until the shared rate window (last send + min_interval) ends, never below a small floor."""
+        remaining = self.min_interval
+        try:
+            with self._lock:
+                row = self._gate().execute("SELECT value FROM board_state WHERE key = ?", (self.GATE_KEY,)).fetchone()
+            if row is not None:
+                remaining = float(row[0]) + self.min_interval - self.board.now()
+        except Exception:
+            log.debug("notify gate unreadable; using the full window", exc_info=True)
+        return max(MIN_FLUSH_DELAY, min(remaining, self.min_interval))
+
     def _submit(self, n: Notification) -> None:
         with self._lock:
             queued = bool(self._pending.items)
@@ -312,7 +325,7 @@ class HumanNotifier:
             if self._pending.scheduled:
                 return
             self._pending.scheduled = True
-        self.schedule(self.min_interval, self.flush)
+        self.schedule(self._flush_delay(), self.flush)
 
     def flush(self) -> None:
         """Deliver whatever was coalesced during the window (one notification). Called by the timer."""
@@ -328,7 +341,7 @@ class HumanNotifier:
                         self._pending = _Pending()  # another process notified recently; give up quietly
                         return
                     self._pending.scheduled = True
-                self.schedule(self.min_interval, self.flush)
+                self.schedule(self._flush_delay(), self.flush)
                 return
             with self._lock:
                 items, self._pending = self._pending.items, _Pending()
