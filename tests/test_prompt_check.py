@@ -69,6 +69,9 @@ def test_after_seq_counts_only_newer_addressed_posts(env):
     env.post("codex", tid, "newer", to=["claude"], needs_response=True)
     b = env.board.brief(env.p["claude"], [PROJECT], after_seq=old["seq"])
     assert (b["addressed_after_seq"], b["needs_response_after_seq"]) == (2, 1)
+    task = env.accepted_task(tid)
+    env.post("grok", tid, "SEALED", "finding", task_id=task, refs=REF, sealed=True, to=["claude"])
+    assert env.board.brief(env.p["claude"], [PROJECT], after_seq=old["seq"])["addressed_after_seq"] == 2  # sealed hidden
     assert "addressed_after_seq" not in env.board.brief(env.p["claude"], [PROJECT])
 
 
@@ -93,6 +96,39 @@ def test_state_key_prints_once_per_new_post_and_keys_are_independent(env, brief_
     s3 = brief_cli("--state-key", "s3")
     assert "2 new post(s)" in s3 and "(1 needing" in s3
     assert "1 new post(s)" in brief_cli("--state-key", "s2")  # s2 had only seen the first
+
+
+def test_new_post_acked_by_another_session_is_still_reported_once_to_this_one(env, brief_cli):
+    """Regression: brief's unread view uses the agent's furthest ack across sessions, so session A reading a
+    post must not silence session B's prompt check."""
+    session_b = env.session("claude", PROJECT, "/wt/b")
+    assert session_b != env.sid["claude"]
+    tid = env.thread()
+    assert brief_cli("--state-key", "A") == "" and brief_cli("--state-key", "B") == ""  # both initialised, idle
+
+    env.post("codex", tid, "for claude", to=["claude"], needs_response=True)
+    r = env.board.read_updates(env.p["claude"], env.sid["claude"])  # session A reads and acks it
+    env.board.ack(env.p["claude"], env.sid["claude"], r["ack_through"])
+    assert env.board.brief(env.p["claude"], [PROJECT])["unread_addressed_to_me"] == 0  # cursor view: read
+
+    assert "1 new post(s)" in brief_cli("--state-key", "B") and "(1 needing" in brief_cli("--state-key", "A")
+    assert brief_cli("--state-key", "B") == ""  # reported once, then silent
+
+
+def test_first_use_of_a_key_does_not_replay_history(env, brief_cli, tmp_path):
+    tid = env.thread()
+    env.post("codex", tid, "old 1", to=["claude"])
+    env.post("codex", tid, "old 2", to=["claude"])
+    r = env.board.read_updates(env.p["claude"], env.sid["claude"])
+    env.board.ack(env.p["claude"], env.sid["claude"], r["ack_through"])
+    assert brief_cli("--state-key", "fresh") == ""  # history already read: nothing reported, mark initialised
+    assert any((tmp_path / "cache" / "agent-comms").rglob("claude--fresh"))
+    env.post("codex", tid, "new", to=["claude"])
+    assert "1 new post(s)" in brief_cli("--state-key", "fresh")
+    # still-unread history is reported once on first use (the mark starts at the newest already-read post)
+    env.post("codex", tid, "unread history", to=["claude"])
+    assert "2 new post(s)" in brief_cli("--state-key", "other-new-key")  # "new" and "unread history"
+    assert brief_cli("--state-key", "other-new-key") == ""
 
 
 def test_state_key_output_never_carries_agent_text_and_leaves_board_untouched(env, brief_cli):

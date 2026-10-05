@@ -1184,8 +1184,13 @@ class Board:
 
         `latest_addressed_unread_seq` is the highest seq among the unread posts counted in
         `unread_addressed_to_me` (same visibility and unread rules), or None. A caller can remember it
-        and treat anything above it as new. With `after_seq`, `addressed_after_seq` and
-        `needs_response_after_seq` count only the addressed unread posts above that seq.
+        and treat anything above it as new.
+
+        With `after_seq` the result also carries a view that ignores every cursor, for a caller that keeps
+        its own high-water mark (a per-session hook must not be silenced by another session's ack):
+        `addressed_after_seq` / `needs_response_after_seq` count visible posts addressed to this agent with
+        seq above `after_seq`, `latest_addressed_seq` is the highest such seq overall (or None) and
+        `latest_addressed_read_seq` the highest one the agent has already read (or None).
         """
         projects = sorted({q for q in (_norm_path(x) for x in projects) if q})
         if not projects:
@@ -1209,15 +1214,13 @@ class Board:
             f"""SELECT COUNT(*) AS n,
                        COALESCE(SUM({addressed}), 0) AS to_me,
                        COALESCE(SUM(p.needs_response = 1 AND {addressed}), 0) AS needs_me,
-                       MAX(CASE WHEN {addressed} THEN p.seq END) AS latest_to_me,
-                       COALESCE(SUM({addressed} AND p.seq > :after), 0) AS to_me_after,
-                       COALESCE(SUM(p.needs_response = 1 AND {addressed} AND p.seq > :after), 0) AS needs_me_after
+                       MAX(CASE WHEN {addressed} THEN p.seq END) AS latest_to_me
                 FROM posts p JOIN threads t ON t.id = p.thread_id
                 WHERE {self.VISIBLE}
                   AND (t.id IN (SELECT value FROM json_each(:threads)) OR {addressed})
                   AND p.seq > COALESCE((SELECT MAX(c.last_seq) FROM cursors c
                                         WHERE c.agent = :me AND c.thread_id = p.thread_id), 0)""",
-            {"threads": json.dumps(threads), "after": after_seq or 0, **self._vis(p)}).fetchone()
+            {"threads": json.dumps(threads), **self._vis(p)}).fetchone()
         human_q = self.conn.execute(
             f"""SELECT COUNT(*) FROM posts p
                 WHERE {self.VISIBLE} AND p.thread_id IN (SELECT value FROM json_each(:threads))
@@ -1236,6 +1239,16 @@ class Board:
                "latest_addressed_unread_seq": unread["latest_to_me"], "open_questions_for_human": human_q,
                "active_grants_for_me": len(grants)}
         if after_seq is not None:
-            out["addressed_after_seq"] = unread["to_me_after"]
-            out["needs_response_after_seq"] = unread["needs_me_after"]
+            seen = self.conn.execute(
+                f"""SELECT COALESCE(SUM(p.seq > :after), 0) AS n,
+                           COALESCE(SUM(p.needs_response = 1 AND p.seq > :after), 0) AS needs,
+                           MAX(p.seq) AS latest,
+                           MAX(CASE WHEN p.seq <= COALESCE((SELECT MAX(c.last_seq) FROM cursors c
+                                WHERE c.agent = :me AND c.thread_id = p.thread_id), 0) THEN p.seq END) AS latest_read
+                    FROM posts p WHERE {self.VISIBLE} AND {addressed}""",
+                {"after": after_seq, **self._vis(p)}).fetchone()
+            out["addressed_after_seq"] = seen["n"]
+            out["needs_response_after_seq"] = seen["needs"]
+            out["latest_addressed_seq"] = seen["latest"]
+            out["latest_addressed_read_seq"] = seen["latest_read"]
         return out
