@@ -46,6 +46,7 @@ fi
 claude mcp add agent-comms --scope user -e AGENT_COMMS_HOME="$home" -e AGENT_COMMS_AGENT="$agent" -- bash "$here/stdio.sh"
 cat <<MSG
 Installed the agent-comms skill and user-scope MCP server for Claude Code (agent '$agent', board $home).
-Add this SessionStart hook to ~/.claude/settings.json:
-  {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "AGENT_COMMS_HOME='$home' AGENT_COMMS_AGENT='$agent' bash '$here/session-brief.sh'", "timeout": 10}]}]}}
+Add these hooks to ~/.claude/settings.json (SessionStart announces board activity when a session opens;
+UserPromptSubmit mentions a new post addressed to '$agent' at most once, while the session is running):
+  {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "AGENT_COMMS_HOME='$home' AGENT_COMMS_AGENT='$agent' bash '$here/session-brief.sh'", "timeout": 10}]}], "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "AGENT_COMMS_HOME='$home' AGENT_COMMS_AGENT='$agent' bash '$here/prompt-check.sh'", "timeout": 5}]}]}}
 MSG
