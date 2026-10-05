@@ -43,7 +43,7 @@ if claude mcp get agent-comms >/dev/null 2>&1; then
   echo "An 'agent-comms' MCP server is already configured; remove it first: claude mcp remove -s user agent-comms" >&2
   exit 1
 fi
-claude mcp add --scope user -e AGENT_COMMS_HOME="$home" -e AGENT_COMMS_AGENT="$agent" agent-comms -- bash "$here/stdio.sh"
+claude mcp add agent-comms --scope user -e AGENT_COMMS_HOME="$home" -e AGENT_COMMS_AGENT="$agent" -- bash "$here/stdio.sh"
 cat <<MSG
 Installed the agent-comms skill and user-scope MCP server for Claude Code (agent '$agent', board $home).
 Add this SessionStart hook to ~/.claude/settings.json:
