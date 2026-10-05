@@ -14,4 +14,4 @@ body_max_bytes = 4096
 max_refs = 20
 
 [tasks]
-require_human_accept = true   # agent-proposed tasks need the human to accept before anyone can claim
+require_human_accept = false  # true: agent-proposed tasks need the human (or a matching standing grant) before anyone can claim

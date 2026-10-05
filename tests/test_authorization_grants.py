@@ -9,6 +9,12 @@ from agent_comms.api import create_app
 from agent_comms.core import Board, Conflict, Forbidden, Invalid
 
 
+@pytest.fixture(autouse=True)
+def gate_on(env):
+    """Standing grants matter when the human turns on the require_human_accept gate (off by default)."""
+    env.settings.require_human_accept = True
+
+
 def grant(env, **overrides):
     fields = dict(project='/work/repo', category='review', agents=['codex'],
                   purpose='Review the OpenAI integration; report findings, do not deploy.')

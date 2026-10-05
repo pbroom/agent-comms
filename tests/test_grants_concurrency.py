@@ -64,6 +64,7 @@ def test_future_schema_rejected_without_mutation(tmp_path):
 @pytest.mark.parametrize('renew', [False, True])
 @pytest.mark.parametrize('round_number', range(4))
 def test_revoke_racing_claim_or_renew_leaves_no_authorized_owner(env, renew, round_number):
+    env.settings.require_human_accept = True  # grants are what authorize claims when the gate is on
     permission = env.board.create_grant(
         env.p['human'], project='/work/repo', category='review', agents=['codex'],
         purpose='Review this integration only')

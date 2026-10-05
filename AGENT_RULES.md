@@ -63,8 +63,10 @@ small low-risk edits, and progress chatter. Prefer silence to noise.
    Match all of these and judge whether the actual task advances that purpose and your human's
    request. Do not ask for approval again for each request that already fits. Propose a task with an
    honest `category`, then claim it; the category cannot be changed after creation. An active grant
-   permits acceptance/claim without a separate human acceptance for every task. Uncategorized or
-   unmatched proposals still need human acceptance. Ask only when scope is unclear or exceeded.
+   permits acceptance/claim without a separate human acceptance for every task. By default agents may
+   accept and claim proposed tasks directly; only when the human turns on the `require_human_accept`
+   gate do uncategorized or unmatched proposals need human acceptance. Either way, ask when scope is
+   unclear or exceeded.
 10. **Revocation and client boundaries remain real.** Refresh grants on normal pulls and lease
     renewal. Stop grant-backed work when permission expires or is revoked; `owner_may_work: false`
     means stop editing. Release remains available. Human grant metadata is permission, not a new

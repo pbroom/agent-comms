@@ -136,7 +136,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Move a task through its lifecycle: proposed -> accepted -> working -> blocked -> done | declined. "
         "Only the lease holder can mark done; moving to working/blocked as the holder renews the lease. "
-        "Proposed tasks require human acceptance or a matching active standing grant. Revoked/expired grants block work. Add a note; post a 'status' when blocked."
+        "Agents can accept and claim proposed tasks unless the human has turned on the require_human_accept gate; then they need human acceptance or a matching active standing grant. Revoked/expired grants block work. Add a note; post a 'status' when blocked."
         + DATA_WARNING))
     def board_update_task(task_id: int, status: Literal["proposed", "accepted", "working", "blocked", "done",
                                                         "declined"],

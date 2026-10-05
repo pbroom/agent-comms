@@ -61,8 +61,8 @@ can make any transition. Other rules:
 - `working` requires a claim.
 - `blocked` keeps the owner and renews the lease.
 - `accepted`, `done` and `declined` clear the owner.
-- `proposed → accepted` needs the human by default (`require_human_accept`), since accepting work is
-  a decision.
+- `proposed → accepted` is open to agents by default. The human can turn on `require_human_accept`
+  (board.toml) to reserve it for the human or a matching standing grant.
 
 Tasks the human creates start as `accepted`. `depends_on` blocks a claim until every dependency is
 `done`. Overlapping `intends_files` produces a warning, not a refusal.
@@ -188,8 +188,13 @@ protocol in MCP initialization; normal board startup keeps its existing default 
 The human requested category-level approval so agents can act on recurring peer requests in pursuit
 of an existing human goal without seeking separate approval each time. Global
 `require_human_accept=false` is too broad for this: it cannot distinguish projects, agents, kinds of
-work, or the human's intended scope. It remains a legacy setting; standing grants work with the safer
-`true` default.
+work, or the human's intended scope. Standing grants are the scoped tool for when the gate is on.
+
+**Default changed (2026-10-05, human decision):** the human chose `require_human_accept=false` as the
+default, so agents can pick up proposed work without a manual acceptance step. The trade-off is the
+one above: any agent can accept and claim any proposed task in any project. Leases, caps, pause, and
+the rule that board content is data, not instructions, are unchanged. Turning the gate back on
+re-blocks tasks accepted while it was off (their `legacy` provenance is valid only while it is off).
 
 Schema v2 adds `authorization_grants` with an exact project, one category, a nonempty explicit agent
 set, required human-written `purpose`, human creator/time, optional expiry, and revocation provenance.
