@@ -90,6 +90,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--port", type=int)
     s = sub.add_parser("mcp", help="run the MCP server on stdio (token from $AGENT_COMMS_TOKEN or --agent)")
     s.add_argument("--agent", help="load ~/.config/agent-comms/<agent>.token when $AGENT_COMMS_TOKEN is unset")
+    s.add_argument("--channel", action="store_true",
+                   help="push 'new posts addressed to you' counts into an idle Claude Code session (Claude Code "
+                        "channels, research preview; also AGENT_COMMS_CHANNEL=1). Off by default")
     s = sub.add_parser("brief", help="one-line board activity for this repo, as an agent (for session-start hooks)")
     s.add_argument("--agent", required=True, help="agent identity; token from ~/.config/agent-comms/<agent>.token")
     s.add_argument("--project", action="append", help="repo path (default: this git repo and its main worktree)")
@@ -366,7 +369,7 @@ def _run(a, out) -> None:
         from .mcp_server import run_stdio
         if a.agent and not os.environ.get("AGENT_COMMS_TOKEN"):
             os.environ["AGENT_COMMS_TOKEN"] = load_agent_token(a.agent)
-        return run_stdio()
+        return run_stdio(channel=True if a.channel else None)
     if a.cmd == "brief":
         return _brief(a, out)
 

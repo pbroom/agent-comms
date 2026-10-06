@@ -180,7 +180,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     return mcp
 
 
-def run_stdio() -> None:
+def run_stdio(channel: bool | None = None) -> None:
+    from . import channel as ch
     from .config import Settings
     board = Board(Settings.load())
-    build_mcp(board, "stdio").run("stdio")
+    if not (ch.enabled_from_env() if channel is None else channel):
+        build_mcp(board, "stdio").run("stdio")
+        return
+    # Opt-in Claude Code channel push (agent_comms/channel.py); same eight tools.
+    ch.run_stdio(build_mcp(board, "stdio", instructions=INSTRUCTIONS + ch.INSTRUCTIONS_NOTE), board)

@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # Installs agent-comms for Claude Code at user scope: MCP server + skill. Prints the hook to add.
 #
-#   install.sh [--agent NAME] [--home DIR]
+#   install.sh [--agent NAME] [--home DIR] [--channel]
 #
 # --agent  board identity for Claude Code (default: claude, as in the README's create-agent step)
 # --home   board home holding agents.toml and data/ (default: $AGENT_COMMS_HOME, else this checkout)
+# --channel  also set AGENT_COMMS_CHANNEL=1 so the server can push new-post counts into an idle
+#            session (Claude Code channels, research preview; needs a launch flag, see the README)
 # The token is read from ~/.config/agent-comms/<agent>.token. If that file is missing and
 # $AGENT_COMMS_CLAUDE_TOKEN is set, it is written there with mode 600.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 agent=claude
+channel=()
 home="${AGENT_COMMS_HOME:-$(cd -- "$here/../.." && pwd)}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent) agent="$2"; shift 2 ;;
     --home) home="$(cd -- "$2" && pwd)"; shift 2 ;;
+    --channel) channel=(-e AGENT_COMMS_CHANNEL=1); shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -43,7 +47,7 @@ if claude mcp get agent-comms >/dev/null 2>&1; then
   echo "An 'agent-comms' MCP server is already configured; remove it first: claude mcp remove -s user agent-comms" >&2
   exit 1
 fi
-claude mcp add agent-comms --scope user -e AGENT_COMMS_HOME="$home" -e AGENT_COMMS_AGENT="$agent" -- bash "$here/stdio.sh"
+claude mcp add agent-comms --scope user -e AGENT_COMMS_HOME="$home" -e AGENT_COMMS_AGENT="$agent" ${channel[@]+"${channel[@]}"} -- bash "$here/stdio.sh"
 cat <<MSG
 Installed the agent-comms skill and user-scope MCP server for Claude Code (agent '$agent', board $home).
 Add these hooks to ~/.claude/settings.json (SessionStart announces board activity when a session opens;
