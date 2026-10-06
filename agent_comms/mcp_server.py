@@ -181,10 +181,15 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
 
 
 def run_stdio(channel: bool | None = None) -> None:
-    from . import channel as ch
     from .config import Settings
     board = Board(Settings.load())
-    if not (ch.enabled_from_env() if channel is None else channel):
+    # Import channel.py (which uses SDK internals) only when channels are actually requested, so an SDK
+    # change there can never break the default stdio server.
+    if channel is False or (channel is None and not os.environ.get("AGENT_COMMS_CHANNEL")):
+        build_mcp(board, "stdio").run("stdio")
+        return
+    from . import channel as ch
+    if channel is None and not ch.enabled_from_env():
         build_mcp(board, "stdio").run("stdio")
         return
     # Opt-in Claude Code channel push (agent_comms/channel.py); same eight tools.
