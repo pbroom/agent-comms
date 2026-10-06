@@ -28,6 +28,13 @@ TASK_STATUSES = ("proposed", "accepted", "working", "blocked", "done", "declined
 REF_KINDS = ("file", "commit", "url", "artifact")
 TERMINAL = ("done", "declined")
 
+# Long-poll on board_read_updates(wait_seconds=...). The server caps one call at MAX_WAIT_SECONDS; clients have
+# their own tool-call timeouts (Codex's MCP default is about 60 s), so agents should wait ~50 s at a time, in a loop.
+MAX_WAIT_SECONDS = 300
+RECOMMENDED_WAIT_SECONDS = 50
+WAIT_POLL_SECONDS = 1.0   # how often a waiting call re-checks the database
+WAIT_TOUCH_SECONDS = 15   # how often it refreshes sessions.last_seen; the liveness contract promises <= 30
+
 # Allowed agent transitions. The human may make any transition (tiebreaker).
 TRANSITIONS: dict[str, tuple[str, ...]] = {
     "proposed": ("accepted", "declined"),
@@ -151,11 +158,26 @@ def _norm_path(p: str | None) -> str | None:
 # ---------------------------------------------------------------- board
 
 
+@dataclass
+class _Wait:
+    """State of one blocked read_updates call."""
+    p: Principal
+    session_id: int
+    query: dict
+    deadline: float
+    last_touch: float
+    info: dict
+    acked: int | None
+
+
 class Board:
     def __init__(self, settings: Settings, clock: Callable[[], float] = time.time,
-                 notifier: Callable[[str, dict[str, Any]], None] | None = None):
+                 notifier: Callable[[str, dict[str, Any]], None] | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
         self.s = settings
         self.clock = clock
+        self.sleep = sleep  # blocking sleep for the sync wait loop; tests inject a fake that advances the clock
+        self.wait_poll_seconds = WAIT_POLL_SECONDS
         # Default: human notifications, configured by the human's `subscriptions` rows (off until then).
         self.notifier = notifier if notifier is not None else HumanNotifier(self)
         self._local = threading.local()
@@ -816,15 +838,89 @@ class Board:
                 )
         return ack_through
 
+    @staticmethod
+    def _check_wait(wait_seconds: Any) -> tuple[int, bool]:
+        """Validate wait_seconds; returns (applied seconds, was it capped at MAX_WAIT_SECONDS)."""
+        if not isinstance(wait_seconds, int) or isinstance(wait_seconds, bool) or wait_seconds < 0:
+            raise Invalid("wait_seconds must be a non-negative integer")
+        return min(wait_seconds, MAX_WAIT_SECONDS), wait_seconds > MAX_WAIT_SECONDS
+
     def read_updates(self, p: Principal, session_id: int, *, ack_through: int | None = None,
                      thread_id: int | None = None, only: str = "all", limit: int = 50,
-                     history: bool = False) -> dict:
+                     history: bool = False, wait_seconds: int = 0) -> dict:
         """Unread posts for this agent. Idempotent: the cursor moves ONLY when ack_through is given.
 
         Call pattern: read -> handle -> read(ack_through=<previous ack_through>) ...
         A crashed agent that never acked simply gets the same posts again.
+
+        wait_seconds > 0 turns an empty read into a long poll: the call blocks until a post matching the SAME
+        filters (thread_id, only, scope, sealing) appears, the board is paused, or the wait runs out (capped at
+        MAX_WAIT_SECONDS), then returns the normal read result. It returns at once if posts already exist or the
+        board is paused. Waiting never acks: ack_through is applied once, up front, exactly as without a wait.
+
+        LIVENESS CONTRACT: while blocked here the call refreshes sessions.last_seen for this session at least
+        every 30 s (in practice every WAIT_TOUCH_SECONDS), so a session that is waiting counts as live.
         """
-        s = self._session(p, session_id)
+        query = dict(thread_id=thread_id, only=only, limit=limit, history=history)
+        out, w = self._wait_start(p, session_id, wait_seconds, ack_through, query)
+        while w is not None:
+            self.sleep(self._wait_delay(w))
+            done = self._wait_poll(w)
+            if done is not None:
+                return done
+        return out
+
+    async def read_updates_async(self, p: Principal, session_id: int, *, ack_through: int | None = None,
+                                 thread_id: int | None = None, only: str = "all", limit: int = 50,
+                                 history: bool = False, wait_seconds: int = 0) -> dict:
+        """read_updates for servers: identical semantics (including the liveness contract), but a wait never
+        holds a worker thread or the event loop. Each poll runs briefly in a thread (sqlite is blocking); the
+        gap between polls is anyio.sleep."""
+        import anyio
+        from anyio import to_thread
+
+        query = dict(thread_id=thread_id, only=only, limit=limit, history=history)
+        out, w = await to_thread.run_sync(lambda: self._wait_start(p, session_id, wait_seconds, ack_through, query))
+        while w is not None:
+            await anyio.sleep(self._wait_delay(w))
+            done = await to_thread.run_sync(self._wait_poll, w)
+            if done is not None:
+                return done
+        return out
+
+    def _wait_start(self, p: Principal, session_id: int, wait_seconds: int, ack_through: int | None,
+                    query: dict) -> tuple[dict, _Wait | None]:
+        wait, capped = self._check_wait(wait_seconds)
+        out = self._read_updates_once(p, session_id, ack_through=ack_through, touch=True, **query)
+        if wait <= 0:
+            return out, None
+        out["wait"] = {"seconds": wait, "capped": capped, "timed_out": False}
+        if out["posts"] or out["paused"]:
+            return out, None
+        now = self.now()
+        return out, _Wait(p, session_id, query, now + wait, now, out["wait"], out.get("acked_through"))
+
+    def _wait_delay(self, w: _Wait) -> float:
+        return max(0.0, min(self.wait_poll_seconds, w.deadline - self.now()))
+
+    def _wait_poll(self, w: _Wait) -> dict | None:
+        """One poll of a waiting read. Returns the final result, or None to keep waiting."""
+        now = self.now()
+        touch = now - w.last_touch >= WAIT_TOUCH_SECONDS
+        if touch:
+            w.last_touch = now
+        out = self._read_updates_once(w.p, w.session_id, ack_through=None, touch=touch, **w.query)
+        if w.acked is not None:
+            out["acked_through"] = w.acked
+        woke = bool(out["posts"] or out["paused"])
+        if woke or now >= w.deadline:
+            out["wait"] = {**w.info, "timed_out": not woke}
+            return out
+        return None
+
+    def _read_updates_once(self, p: Principal, session_id: int, *, ack_through: int | None, touch: bool,
+                           thread_id: int | None, only: str, limit: int, history: bool) -> dict:
+        s = self._session(p, session_id, touch=touch)
         if only not in ("all", "addressed", "needs_response"):
             raise Invalid("only must be all | addressed | needs_response")
         limit = max(1, min(int(limit), 200))

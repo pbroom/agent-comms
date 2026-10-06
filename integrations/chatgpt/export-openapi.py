@@ -36,7 +36,7 @@ for (path, method), name in operations.items():
     operation['security'] = [{'boardBearer': []}]
     operation['x-openai-isConsequential'] = method != 'get'
     if name == 'readUpdates':
-        operation['parameters'] = [p for p in operation['parameters'] if p['name'] not in ('only', 'history')]
+        operation['parameters'] = [p for p in operation['parameters'] if p['name'] not in ('only', 'history', 'wait_seconds')]
         for p in operation['parameters']:
             if p['name'] == 'session_id':
                 p['required'] = True

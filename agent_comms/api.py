@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -221,11 +222,13 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         return board.unseal(p, post_id)
 
     @app.get("/api/updates")
-    def updates(request: Request, session_id: int | None = None, thread_id: int | None = None,
-                only: Literal["all", "addressed", "needs_response"] = "all", limit: int = 50,
-                history: bool = False, p: Principal = P):
-        return board.read_updates(p, sid(p, request, session_id), thread_id=thread_id, only=only, limit=limit,
-                                  history=history)
+    async def updates(request: Request, session_id: int | None = None, thread_id: int | None = None,
+                      only: Literal["all", "addressed", "needs_response"] = "all", limit: int = 50,
+                      history: bool = False, wait_seconds: int = 0, p: Principal = P):
+        # async: wait_seconds > 0 long-polls without holding a worker thread (see Board.read_updates_async)
+        s = await run_in_threadpool(sid, p, request, session_id)
+        return await board.read_updates_async(p, s, thread_id=thread_id, only=only, limit=limit, history=history,
+                                              wait_seconds=wait_seconds)
 
     @app.post("/api/updates/ack")
     def ack(body: AckIn, request: Request, p: Principal = P):
