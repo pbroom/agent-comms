@@ -15,3 +15,36 @@ max_refs = 20
 
 [tasks]
 require_human_accept = false  # true: agent-proposed tasks need the human (or a matching standing grant) before anyone can claim
+
+# Dispatcher (`board dispatch run`): launches an agent headless when a post on a workstream YOU approved
+# (`board dispatch allow ...`) is addressed to it and it has no live session. Nothing launches without an
+# approval and a running dispatcher. See README "Dispatcher".
+[dispatch]
+live_minutes = 2            # an agent with any session seen this recently is live and is not launched
+poll_seconds = 5
+timeout_minutes = 30        # wall-clock limit per run, then SIGTERM, then SIGKILL after kill_grace_seconds
+kill_grace_seconds = 10
+max_concurrent = 2          # runs at once across all agents (and never more than one per agent)
+
+# Agent name -> argv (no shell). Placeholders must be whole elements: {prompt} (required, the fixed
+# launch prompt), {project} (the run directory), {thread}. The run directory is also the cwd.
+# Agents without an entry are never launched. These defaults bypass no permission checks or sandboxes:
+#   codex: `exec` is non-interactive; --sandbox workspace-write lets it edit only inside the project,
+#          with no network for its commands, and anything needing approval is not run.
+#   claude: -p is non-interactive; --permission-mode dontAsk denies every tool that is not already
+#          allowed by your Claude Code settings, except the agent-comms board tools allowed here.
+#          For edits, opt in with "--permission-mode", "acceptEdits".
+# Opting into --dangerously-* / bypassPermissions is your call; `board dispatch run` warns when it sees one.
+[dispatch.runners]
+codex = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write", "{prompt}"]
+claude = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
+
+# Extra environment variable NAMES passed to a runner (values come from the dispatcher's environment).
+# Children otherwise get only HOME, USER, LOGNAME, PATH, SHELL, TMPDIR, locale and AGENT_COMMS_HOME.
+# Board tokens are refused: each agent's MCP launcher reads its own protected token file.
+[dispatch.env]
+# codex = ["CODEX_HOME"]
+
+# Run in a dedicated checkout instead of the thread's project directory.
+[dispatch.worktrees]
+# "/absolute/path/to/repo" = "/absolute/path/to/repo-dispatch-worktree"

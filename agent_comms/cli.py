@@ -181,6 +181,22 @@ def main(argv: list[str] | None = None) -> None:
     nsub.add_parser("status", help="show notification rules and whether this machine can deliver them")
     nsub.add_parser("test", help="send one test notification")
 
+    s = sub.add_parser("dispatch", help="launch agents headless for workstreams you approve (off until you do)")
+    dsub = s.add_subparsers(dest="dispatch_cmd", required=True)
+    d = dsub.add_parser("allow", help="approve a workstream: launch these agents for posts on this thread")
+    d.add_argument("--thread", type=int, required=True)
+    d.add_argument("--agents", required=True, help="comma-separated exact agent names")
+    d.add_argument("--purpose", required=True, help="the goal and limits; quoted in the fixed launch prompt")
+    d.add_argument("--max-launches", type=int, required=True, help="launch budget for this approval")
+    d.add_argument("--expires-in-hours", type=float)
+    d = dsub.add_parser("list", help="approvals, dispatcher status and recent launches")
+    d.add_argument("--all", action="store_true", help="include revoked approvals")
+    d.add_argument("--limit", type=int, default=20, help="how many recent launches to show")
+    d = dsub.add_parser("revoke", help="revoke a workstream approval (running agents are not stopped)")
+    d.add_argument("rule_id", type=int)
+    dsub.add_parser("run", help="run the dispatcher in the foreground until `board dispatch stop` or Ctrl-C")
+    dsub.add_parser("stop", help="stop the dispatcher and terminate the agents it started")
+
     a = ap.parse_args(argv)
 
     def out(obj, text: str | None = None):
@@ -361,6 +377,89 @@ def _notify_cmd(a, out, board: Board, p) -> None:
                             "in System Settings > Notifications.")
 
 
+def _fmt_rule(r: dict) -> str:
+    exp = f", expires {r['expires_at']}" if r["expires_at"] else ""
+    return (f"rule {r['id']} [{r['state']}]: thread {r['thread_id']} ({r['project']}), agents "
+            f"{', '.join(r['agents'])}, {r['launches_left']}/{r['max_launches']} launches left{exp}\n"
+            f"    purpose: {r['purpose']}")
+
+
+def _fmt_run(x: dict) -> str:
+    end = f", ended {x['ended_at']}" if x.get("ended_at") else ""
+    code = f", exit {x['exit_code']}" if x.get("exit_code") is not None else ""
+    err = f"\n    {x['error']}" if x.get("error") else ""
+    return (f"{x['run_id']} [{x['status']}] {x['agent']} thread {x['thread_id']} rule {x['rule_id']} "
+            f"post seq {x['post_seq']} pid {x.get('pid')} started {x['started_at']}{end}{code}\n"
+            f"    log {x.get('log')}{err}")
+
+
+def _dispatch_cmd(a, out, board: Board, p) -> None:
+    from . import dispatch
+
+    if a.dispatch_cmd == "allow":
+        expires = board.now() + a.expires_in_hours * 3600 if a.expires_in_hours is not None else None
+        r = board.create_dispatch_rule(p, thread_id=a.thread, agents=[x.strip() for x in a.agents.split(",")],
+                                       purpose=a.purpose, max_launches=a.max_launches, expires_at=expires)
+        config = dispatch.DispatchConfig.load()
+        notes = [f"no runner configured for {x}; it will not be launched (add it under [dispatch.runners])"
+                 for x in r["agents"] if x not in config.runners]
+        subs = board.list_notification_subscriptions(p)
+        if not any("agent-launched" in x["events"] for x in subs):
+            notes.append("no notification rule includes agent-launched; run `board notify on` to hear about launches")
+        out(r, "\n".join([f"approved {_fmt_rule(r)}", "the dispatcher acts on this only while "
+                          "`board dispatch run` is running"] + [f"note: {n}" for n in notes]))
+    elif a.dispatch_cmd == "list":
+        config = dispatch.DispatchConfig.load()
+        rules = board.list_dispatch_rules(p, include_inactive=a.all)
+        runs = dispatch.list_runs(board, p, a.limit)
+        status = dispatch.loop_status(board, config)
+        st = (f"dispatcher: running (pid {status['pid']}, heartbeat {status['heartbeat_seconds_ago']}s ago)"
+              if status["running"] else "dispatcher: not running (`board dispatch run`)")
+        runners = [f"runner {x}: {' '.join(t)}" for x, t in sorted(config.runners.items())] or \
+                  ["no runners configured: nothing can be launched"]
+        out({"dispatcher": status, "rules": rules, "runs": runs, "runners": config.runners},
+            "\n".join([st] + runners + [_fmt_rule(r) for r in rules] + (["(no approvals)"] if not rules else [])
+                      + (["recent launches:"] + [_fmt_run(x) for x in runs] if runs else ["(no launches yet)"])))
+    elif a.dispatch_cmd == "revoke":
+        r = board.revoke_dispatch_rule(p, a.rule_id)
+        out(r, f"revoked {_fmt_rule(r)}\n(agents already running are not stopped; `board dispatch stop` stops them)")
+    elif a.dispatch_cmd == "stop":
+        r = dispatch.request_stop(board, p, dispatch.DispatchConfig.load())
+        if r["stopped"]:
+            text = "dispatcher stopped (any agents it had running were terminated)"
+        elif not r["was_running"]:
+            text = "dispatcher is not running"
+            for x in r["orphaned_runs"]:
+                text += f"\nrun {x['run_id']} ({x['agent']}, pid {x.get('pid')}) was left running by a dispatcher " \
+                        "that exited; check that process yourself"
+        else:
+            text = f"stop requested, but the dispatcher (pid {r.get('pid')}) has not exited yet"
+        out(r, text)
+    elif a.dispatch_cmd == "run":
+        import logging
+        import signal
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stderr)
+        config = dispatch.DispatchConfig.load()
+        d = dispatch.Dispatcher(board, p, config)
+        for agent, t in sorted(config.runners.items()):
+            risky = dispatch.risky_flags(t)
+            print(f"runner {agent}: {' '.join(t)}" + (f"  WARNING: bypasses permissions/sandbox ({', '.join(risky)})"
+                                                      if risky else ""), file=sys.stderr)
+        if not config.runners:
+            print("no runners configured in board.toml [dispatch.runners]: nothing will be launched", file=sys.stderr)
+
+        def stop(signum, frame):
+            d.stopping = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        print(f"dispatcher running (pid {os.getpid()}); `board dispatch stop` or Ctrl-C stops it and the agents "
+              "it started", file=sys.stderr)
+        d.run_forever()
+        print("dispatcher stopped", file=sys.stderr)
+
+
 def _run(a, out) -> None:
     if a.cmd == "serve":
         from .api import serve
@@ -451,6 +550,8 @@ def _run(a, out) -> None:
         out(board.revoke_grant(p, a.grant_id))
     elif a.cmd == "notify":
         _notify_cmd(a, out, board, p)
+    elif a.cmd == "dispatch":
+        _dispatch_cmd(a, out, board, p)
     elif a.cmd == "dashboard":
         url = f"http://{settings.host}:{settings.port}/#token={token}"
         print(f"Opening http://{settings.host}:{settings.port}/ (token passed in the URL fragment, never sent "

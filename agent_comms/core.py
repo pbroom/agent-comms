@@ -14,6 +14,7 @@ import math
 import sqlite3
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
@@ -26,6 +27,9 @@ POST_TYPES = ("question", "proposal", "status", "finding", "handoff", "request",
 TASK_CATEGORIES = ("review", "implementation", "tests", "documentation")
 TASK_STATUSES = ("proposed", "accepted", "working", "blocked", "done", "declined")
 REF_KINDS = ("file", "commit", "url", "artifact")
+DISPATCH_CHANNEL = "dispatch"   # subscriptions.channel for human workstream approvals (dispatch.py)
+DISPATCH_PURPOSE_MAX = 1000
+DISPATCH_MAX_LAUNCHES = 1000
 TERMINAL = ("done", "declined")
 
 # Long-poll on board_read_updates(wait_seconds=...). The server caps one call at MAX_WAIT_SECONDS; clients have
@@ -335,6 +339,151 @@ class Board:
         return [self._subscription_out(r) for r in self.conn.execute(
             "SELECT * FROM subscriptions WHERE agent = ? AND channel = ? AND active = 1 ORDER BY id",
             (p.name, NOTIFY_CHANNEL))]
+
+    # ------------------------------------------------------------ dispatcher approvals (human-only)
+    #
+    # A workstream approval is a `subscriptions` row owned by the human with channel='dispatch', a required
+    # thread_id, and `target` holding {"agents", "purpose", "max_launches", "launches_left", "expires_at",
+    # "revoked_at", "revoked_by"}. No schema change. Only the human can create, list or revoke these rows,
+    # and the dispatcher ignores rows not owned by an active human identity (see dispatch.py).
+
+    def _dispatch_rows(self, rule_id: int | None = None, active_only: bool = False) -> list[sqlite3.Row]:
+        q = """SELECT s.* FROM subscriptions s JOIN agents a ON a.name = s.agent
+               WHERE s.channel = ? AND a.is_human = 1 AND a.active = 1 AND s.thread_id IS NOT NULL"""
+        args: list[Any] = [DISPATCH_CHANNEL]
+        if rule_id is not None:
+            q, args = q + " AND s.id = ?", args + [rule_id]
+        if active_only:
+            q += " AND s.active = 1"
+        return self.conn.execute(q + " ORDER BY s.id", args).fetchall()
+
+    @staticmethod
+    def _dispatch_target(r: sqlite3.Row) -> dict | None:
+        """The rule's parsed target, or None for a malformed row (never written by core; treated as inert)."""
+        try:
+            t = json.loads(r["target"]) if r["target"] else None
+            if not isinstance(t, dict) or not isinstance(t.get("purpose"), str) or not t["purpose"].strip():
+                return None
+            agents = t.get("agents")
+            if not isinstance(agents, list) or not agents or not all(isinstance(a, str) for a in agents):
+                return None
+            for k in ("max_launches", "launches_left"):
+                if isinstance(t.get(k), bool) or not isinstance(t.get(k), int):
+                    return None
+            if t.get("expires_at") is not None and not isinstance(t["expires_at"], (int, float)):
+                return None
+            return t
+        except (ValueError, TypeError):
+            return None
+
+    def _dispatch_state(self, r: sqlite3.Row, t: dict | None) -> str:
+        if t is None:
+            return "invalid"
+        if not r["active"] or t.get("revoked_at") is not None:
+            return "revoked"
+        if t.get("expires_at") is not None and t["expires_at"] <= self.now():
+            return "expired"
+        if t["launches_left"] <= 0:
+            return "exhausted"
+        return "active"
+
+    def _dispatch_rule_out(self, r: sqlite3.Row) -> dict:
+        t = self._dispatch_target(r)
+        state = self._dispatch_state(r, t)
+        t = t or {}
+        return {"id": r["id"], "thread_id": r["thread_id"], "project": r["project"], "agents": t.get("agents", []),
+                "purpose": t.get("purpose"), "max_launches": t.get("max_launches"),
+                "launches_left": t.get("launches_left"), "expires_at": iso(t.get("expires_at")),
+                "created_at": iso(r["created_at"]), "created_at_ts": r["created_at"],
+                "revoked_at": iso(t.get("revoked_at")), "revoked_by": t.get("revoked_by"),
+                "state": state, "active": state == "active"}
+
+    def create_dispatch_rule(self, p: Principal, *, thread_id: int, agents: list[str], purpose: str,
+                             max_launches: int, expires_at: float | None = None) -> dict:
+        """Approve a workstream: the dispatcher may launch these agents for posts on this thread."""
+        self._require_human(p, "approve a dispatcher workstream")
+        if isinstance(thread_id, bool) or not isinstance(thread_id, int):
+            raise Invalid("thread_id is required")
+        thread = self._thread_row(thread_id)
+        agents = _str_list(agents, "agents", max_items=20, max_len=32)
+        if not agents:
+            raise Invalid("agents must be a non-empty explicit list")
+        allowed = {r[0] for r in self.conn.execute("SELECT name FROM agents WHERE active = 1 AND is_human = 0")}
+        if set(agents) - allowed:
+            raise Invalid(f"agents must name registered active non-human agents: {sorted(set(agents) - allowed)}")
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise Invalid("purpose is required: describe the human-approved goal and limits of this workstream")
+        purpose = " ".join(purpose.split())
+        if len(purpose) > DISPATCH_PURPOSE_MAX or any(
+                unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn") for ch in purpose):
+            raise Invalid(f"purpose must be plain text of at most {DISPATCH_PURPOSE_MAX} characters "
+                          "(it is quoted in the fixed launch prompt)")
+        if isinstance(max_launches, bool) or not isinstance(max_launches, int) or \
+                not 1 <= max_launches <= DISPATCH_MAX_LAUNCHES:
+            raise Invalid(f"max_launches must be a whole number between 1 and {DISPATCH_MAX_LAUNCHES}")
+        if expires_at is not None and (isinstance(expires_at, bool) or not isinstance(expires_at, (float, int))
+                                       or not math.isfinite(expires_at) or expires_at <= self.now()):
+            raise Invalid("expires_at must be a future Unix timestamp")
+        try:
+            iso(expires_at)
+        except (ValueError, OverflowError, OSError):
+            raise Invalid("expires_at is outside the supported date range") from None
+        target = {"agents": agents, "purpose": purpose, "max_launches": max_launches,
+                  "launches_left": max_launches, "expires_at": expires_at, "revoked_at": None, "revoked_by": None}
+        with db.write_tx(self.conn) as c:
+            rid = c.execute("""INSERT INTO subscriptions(agent, project, thread_id, events, channel, target, active,
+                                 created_at) VALUES (?,?,?,?,?,?,1,?)""",
+                            (p.name, thread["project"], thread_id, json.dumps(["post.created"]), DISPATCH_CHANNEL,
+                             json.dumps(target), self.now())).lastrowid
+        return self._dispatch_rule_out(self._dispatch_rows(rid)[0])
+
+    def list_dispatch_rules(self, p: Principal, include_inactive: bool = False) -> list[dict]:
+        self._require_human(p, "view dispatcher workstream approvals")
+        rules = [self._dispatch_rule_out(r) for r in self._dispatch_rows()]
+        return rules if include_inactive else [r for r in rules if r["state"] not in ("revoked", "invalid")]
+
+    def revoke_dispatch_rule(self, p: Principal, rule_id: int) -> dict:
+        self._require_human(p, "revoke a dispatcher workstream approval")
+        with db.write_tx(self.conn) as c:
+            rows = self._dispatch_rows(rule_id)
+            if not rows:
+                raise NotFound(f"dispatch rule {rule_id} not found")
+            t = self._dispatch_target(rows[0]) or {}
+            if rows[0]["active"]:
+                t |= {"revoked_at": self.now(), "revoked_by": p.name}
+                c.execute("UPDATE subscriptions SET active = 0, target = ? WHERE id = ?", (json.dumps(t), rule_id))
+        return self._dispatch_rule_out(self._dispatch_rows(rule_id)[0])
+
+    def active_dispatch_rules(self, p: Principal) -> list[dict]:
+        """Rules that can launch right now (active, unexpired, budget left). For the dispatcher."""
+        self._require_human(p, "run the dispatcher")
+        return [r for r in (self._dispatch_rule_out(x) for x in self._dispatch_rows(active_only=True))
+                if r["state"] == "active"]
+
+    def take_dispatch_launch(self, p: Principal, rule_id: int, agent: str) -> int | None:
+        """Atomically spend one launch from a rule. Returns the launches left afterwards, or None when the rule
+        is revoked, expired, exhausted, does not allow `agent`, or the board is paused."""
+        self._require_human(p, "run the dispatcher")
+        with db.write_tx(self.conn) as c:
+            rows = self._dispatch_rows(rule_id, active_only=True)
+            if not rows or self.is_paused():
+                return None
+            t = self._dispatch_target(rows[0])
+            if self._dispatch_state(rows[0], t) != "active" or agent not in t["agents"]:
+                return None
+            t["launches_left"] -= 1
+            c.execute("UPDATE subscriptions SET target = ? WHERE id = ?", (json.dumps(t), rule_id))
+            return t["launches_left"]
+
+    def refund_dispatch_launch(self, p: Principal, rule_id: int) -> None:
+        """Give back a launch that never started (the spawn failed). Never exceeds max_launches."""
+        self._require_human(p, "run the dispatcher")
+        with db.write_tx(self.conn) as c:
+            rows = self._dispatch_rows(rule_id)
+            t = self._dispatch_target(rows[0]) if rows else None
+            if t is not None and t["launches_left"] < t["max_launches"]:
+                t["launches_left"] += 1
+                c.execute("UPDATE subscriptions SET target = ? WHERE id = ?", (json.dumps(t), rule_id))
 
     # ------------------------------------------------------------ standing authorization
 
