@@ -401,8 +401,10 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
         r = board.create_dispatch_rule(p, thread_id=a.thread, agents=[x.strip() for x in a.agents.split(",")],
                                        purpose=a.purpose, max_launches=a.max_launches, expires_at=expires)
         config = dispatch.DispatchConfig.load()
-        notes = [f"no runner configured for {x}; it will not be launched (add it under [dispatch.runners])"
-                 for x in r["agents"] if x not in config.runners]
+        runtimes = {x.name: x.runtime for x in read_agents(board.s.agents_path).values()}
+        notes = [f"no runner configured for {x} or its runtime {runtimes.get(x)!r}; it will not be launched "
+                 f"(add \"{x}\" or \"{runtimes.get(x)}\" under [dispatch.runners] in board.local.toml)"
+                 for x in r["agents"] if config.runner_for(x, runtimes.get(x)) is None]
         subs = board.list_notification_subscriptions(p)
         if not any("agent-launched" in x["events"] for x in subs):
             notes.append("no notification rule includes agent-launched; run `board notify on` to hear about launches")
@@ -417,6 +419,7 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
               if status["running"] else "dispatcher: not running (`board dispatch run`)")
         runners = [f"runner {x}: {' '.join(t)}" for x, t in sorted(config.runners.items())] or \
                   ["no runners configured: nothing can be launched"]
+        runners.append("(runners are keyed by agent name, else by the agent's runtime)")
         out({"dispatcher": status, "rules": rules, "runs": runs, "runners": config.runners},
             "\n".join([st] + runners + [_fmt_rule(r) for r in rules] + (["(no approvals)"] if not rules else [])
                       + (["recent launches:"] + [_fmt_run(x) for x in runs] if runs else ["(no launches yet)"])))
@@ -447,7 +450,8 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
             print(f"runner {agent}: {' '.join(t)}" + (f"  WARNING: bypasses permissions/sandbox ({', '.join(risky)})"
                                                       if risky else ""), file=sys.stderr)
         if not config.runners:
-            print("no runners configured in board.toml [dispatch.runners]: nothing will be launched", file=sys.stderr)
+            print("no runners configured in [dispatch.runners] (board.toml / board.local.toml): nothing will be "
+                  "launched", file=sys.stderr)
 
         def stop(signum, frame):
             d.stopping = True

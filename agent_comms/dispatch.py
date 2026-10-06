@@ -12,7 +12,7 @@ Guardrails:
 - The launch prompt is fixed server-side text. Its only variable parts are the thread id, the rule id and
   the human-written purpose. No post text, title, summary or anything else an agent wrote reaches it, and
   the trigger query never selects post bodies (sealed posts trigger only by their existence).
-- Runners are argv templates from board.toml, spawned without a shell, with a minimal environment that
+- Runners are argv templates from board.toml (or board.local.toml), keyed by agent name or runtime, spawned without a shell, with a minimal environment that
   carries no board token (the agent's own MCP launcher reads its protected token file). An agent without
   a configured runner is never launched.
 - One run per agent, a global concurrency cap, a wall-clock timeout per run, no launches while the board is
@@ -27,13 +27,12 @@ import os
 import signal
 import subprocess
 import time
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from . import db
-from .config import NAME_RE, home
+from .config import NAME_RE, RUNTIME_RE, Settings, home
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
 
@@ -79,10 +78,10 @@ def _forbidden_env(name: str) -> bool:
 
 @dataclass
 class DispatchConfig:
-    """The `[dispatch]` section of board.toml."""
+    """The `[dispatch]` section of board.toml, with board.local.toml merged over it."""
 
-    runners: dict[str, list[str]] = field(default_factory=dict)   # agent name -> argv template
-    env: dict[str, list[str]] = field(default_factory=dict)       # agent name -> extra env var NAMES to pass
+    runners: dict[str, list[str]] = field(default_factory=dict)   # agent name or runtime -> argv template
+    env: dict[str, list[str]] = field(default_factory=dict)       # agent name or runtime -> extra env var NAMES
     worktrees: dict[str, str] = field(default_factory=dict)       # thread project -> directory to run in
     live_minutes: float = 2.0
     poll_seconds: float = 5.0
@@ -91,10 +90,19 @@ class DispatchConfig:
     kill_grace_seconds: float = 10.0
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "DispatchConfig":
-        path = path or home() / "board.toml"
-        data = tomllib.loads(path.read_text()) if path.exists() else {}
-        return cls.from_dict(data.get("dispatch", {}))
+    def load(cls, path: Path | None = None, local: bool = True) -> "DispatchConfig":
+        return cls.from_dict(Settings.load(path, local=local).dispatch)
+
+    def runner_for(self, agent: str, runtime: str | None) -> list[str] | None:
+        """The agent's own entry wins; otherwise the entry for its runtime (e.g. codex-cli, claude-code)."""
+        if agent in self.runners:
+            return self.runners[agent]
+        return self.runners.get(runtime) if runtime else None
+
+    def runner_key(self, agent: str, runtime: str | None) -> str | None:
+        if agent in self.runners:
+            return agent
+        return runtime if runtime and runtime in self.runners else None
 
     @classmethod
     def from_dict(cls, d: dict) -> "DispatchConfig":
@@ -131,8 +139,9 @@ class DispatchConfig:
 
 
 def validate_runner(agent: str, template: Any) -> list[str]:
-    if not NAME_RE.match(agent):
-        raise ValueError(f"[dispatch.runners] {agent!r} is not a valid agent name")
+    """`agent` is the runners key: an agent name or a runtime."""
+    if not (NAME_RE.match(agent) or RUNTIME_RE.match(agent)):
+        raise ValueError(f"[dispatch.runners] {agent!r} is not a valid agent name or runtime")
     if not isinstance(template, list) or not template or not all(isinstance(x, str) and x for x in template):
         raise ValueError(f"[dispatch.runners] {agent} must be a non-empty argv list of strings")
     if os.path.basename(template[0]) in SHELLS or "{" in template[0]:
@@ -156,9 +165,11 @@ def risky_flags(template: list[str]) -> list[str]:
     return [x for x in template if any(r in x.lower() for r in RISKY_FLAGS)]
 
 
-def child_env(agent: str, config: DispatchConfig, environ: dict[str, str] | None = None) -> dict[str, str]:
+def child_env(agent: str, config: DispatchConfig, environ: dict[str, str] | None = None,
+              runtime: str | None = None) -> dict[str, str]:
     src = os.environ if environ is None else environ
-    names = list(BASE_ENV) + [n for n in config.env.get(agent, []) if not _forbidden_env(n)]
+    extra = config.env[agent] if agent in config.env else config.env.get(runtime or "", [])
+    names = list(BASE_ENV) + [n for n in extra if not _forbidden_env(n)]
     env = {k: src[k] for k in names if k in src}
     env.setdefault("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin")
     env["AGENT_COMMS_HOME"] = str(home())   # where the board lives (not a secret); MCP launchers read it
@@ -325,6 +336,13 @@ class Dispatcher:
         last = self.board.conn.execute("SELECT MAX(last_seen) FROM sessions WHERE agent = ?", (agent,)).fetchone()[0]
         return last is not None and last >= now - window
 
+    def _runtime(self, agent: str) -> str | None:
+        row = self.board.conn.execute("SELECT runtime FROM agents WHERE name = ?", (agent,)).fetchone()
+        return row["runtime"] if row else None
+
+    def _runner(self, agent: str) -> list[str] | None:
+        return self.config.runner_for(agent, self._runtime(agent))
+
     def _handled(self, agent: str, thread_id: int, seq: int) -> bool:
         acked = self.board.conn.execute("SELECT MAX(last_seq) FROM cursors WHERE agent = ? AND thread_id = ?",
                                         (agent, thread_id)).fetchone()[0]
@@ -343,8 +361,8 @@ class Dispatcher:
             drop = None
             if rule is None:
                 drop = "no active approval (revoked, expired or out of launches)"
-            elif agent not in self.config.runners:
-                drop = "no runner configured for this agent in board.toml [dispatch.runners]"
+            elif self._runner(agent) is None:
+                drop = "no runner configured for this agent or its runtime in [dispatch.runners]"
             elif thread is None or thread["status"] != "open":
                 drop = "thread is closed"
             elif self._handled(agent, thread_id, item["seq"]):
@@ -395,8 +413,12 @@ class Dispatcher:
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.log_dir, 0o700)
             prompt = build_prompt(thread_id, rule["id"], rule["purpose"])
-            argv = render_argv(self.config.runners[agent], prompt=prompt, project=cwd, thread_id=thread_id)
-            child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config), log_path=log_path)
+            template = self._runner(agent)
+            if template is None:
+                raise LookupError(f"no runner configured for {agent}")
+            argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
+            child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
+                                 log_path=log_path)
         except Exception as e:
             self.board.refund_dispatch_launch(self.human, rule["id"])
             record |= {"status": "spawn_failed", "ended_at": now, "error": f"{type(e).__name__}: {e}"[:300]}

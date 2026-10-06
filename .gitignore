@@ -21,3 +21,6 @@ credentials*.json
 evidence/
 dist/
 .DS_Store
+
+# Per-machine settings overlay (see board.toml)
+board.local.toml

@@ -1,4 +1,6 @@
 # agent-comms settings (committed; no secrets here). Tokens live in agents.toml (gitignored).
+# Per-machine overrides go in board.local.toml beside this file (gitignored). It is loaded after this
+# file and merged table by table: its keys win, and a list value (e.g. a runner) replaces wholesale.
 
 [server]
 host = "127.0.0.1"          # v1 refuses to bind anything but localhost
@@ -26,25 +28,31 @@ timeout_minutes = 30        # wall-clock limit per run, then SIGTERM, then SIGKI
 kill_grace_seconds = 10
 max_concurrent = 2          # runs at once across all agents (and never more than one per agent)
 
-# Agent name -> argv (no shell). Placeholders must be whole elements: {prompt} (required, the fixed
-# launch prompt), {project} (the run directory), {thread}. The run directory is also the cwd.
-# Agents without an entry are never launched. These defaults bypass no permission checks or sandboxes:
-#   codex: `exec` is non-interactive; --sandbox workspace-write lets it edit only inside the project,
-#          with no network for its commands, and anything needing approval is not run.
-#   claude: -p is non-interactive; --permission-mode dontAsk denies every tool that is not already
-#          allowed by your Claude Code settings, except the agent-comms board tools allowed here.
-#          For edits, opt in with "--permission-mode", "acceptEdits".
+# Runner key -> argv (no shell). A key is an agent name or a runtime (the `--runtime` given to
+# `board create-agent`): an agent's own name wins, otherwise its runtime's entry is used, so the
+# defaults below cover e.g. both a `claude` and a `claude-code` identity. Agents with neither are
+# never launched. Placeholders must be whole elements: {prompt} (required, the fixed launch prompt),
+# {project} (the run directory), {thread}. The run directory is also the cwd.
+# These defaults bypass no permission checks or sandboxes:
+#   codex-cli: `exec` is non-interactive; --sandbox workspace-write lets it edit only inside the
+#          project, with network off by default; nobody can approve, so blocked commands fail.
+#   claude-code: -p is non-interactive; --permission-mode dontAsk denies every tool that is not
+#          already allowed by your Claude Code settings, except the agent-comms board tools allowed here.
+# Change them per machine in board.local.toml (gitignored), not here: a key there replaces the same key
+# here wholesale, e.g.  "claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits",
+#                                         "--allowedTools=mcp__agent-comms"]
 # Opting into --dangerously-* / bypassPermissions is your call; `board dispatch run` warns when it sees one.
 [dispatch.runners]
-codex = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write", "{prompt}"]
-claude = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
+"codex-cli" = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write", "{prompt}"]
+"claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
 
-# Extra environment variable NAMES passed to a runner (values come from the dispatcher's environment).
+# Extra environment variable NAMES passed to a runner, keyed like runners (values come from the
+# dispatcher's environment). Set these in board.local.toml.
 # Children otherwise get only HOME, USER, LOGNAME, PATH, SHELL, TMPDIR, locale and AGENT_COMMS_HOME.
 # Board tokens are refused: each agent's MCP launcher reads its own protected token file.
 [dispatch.env]
-# codex = ["CODEX_HOME"]
+# "codex-cli" = ["CODEX_HOME"]
 
-# Run in a dedicated checkout instead of the thread's project directory.
+# Run in a dedicated checkout instead of the thread's project directory (per machine: board.local.toml).
 [dispatch.worktrees]
 # "/absolute/path/to/repo" = "/absolute/path/to/repo-dispatch-worktree"

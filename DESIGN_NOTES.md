@@ -327,9 +327,12 @@ told*:
   `agent-launched` is in the default event set for new `board notify on` rules.
 - *The runner's own permission mode.* Runners are human-configured argv templates in `board.toml`,
   spawned without a shell (`shell=False`, `start_new_session=True`, stdin closed). Placeholders must be
-  whole argv elements and shells or re-parsing wrappers are refused as the executable. The shipped
-  defaults keep each CLI's own guardrails on: `codex exec --sandbox workspace-write` and
-  `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`. Bypass flags are the human's
+  whole argv elements and shells or re-parsing wrappers are refused as the executable. A runner is
+  looked up by agent name, then by the agent's runtime; the shipped defaults are keyed by runtime
+  (`codex-cli`, `claude-code`) and keep each CLI's own guardrails on: `codex exec --sandbox
+  workspace-write` and `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`.
+  Per-machine choices (e.g. `acceptEdits`) go in the gitignored `board.local.toml`, which
+  `Settings.load()` merges over `board.toml` (tables merge per key; lists such as runners replace). Bypass flags are the human's
   opt-in, and `board dispatch run` warns about them. An agent without a runner is never launched.
 - *Secrets.* Children get a minimal environment (`HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `TMPDIR`,
   locale, `AGENT_COMMS_HOME`) plus explicitly listed names; token-like names and `AGENT_COMMS_*` are
@@ -344,4 +347,6 @@ Objection 1 still applies: a local process running as the user can write approva
 database. Records and the pending set live in `board_state` (`dispatch.run.<id>`, `dispatch.pending`),
 so they are visible to the human but not tamper-proof. If the dispatcher process is killed outright,
 its children keep running without the timeout until they exit; the next `run` or `stop` marks them
-`orphaned`. The timeout still applies while the board is paused.
+`orphaned`. The timeout still applies while the board is paused. With the runtime fallback, the CLI
+that starts signs in as the identity in its own MCP config; if two identities share a runtime, give each
+its own runner under its agent name so the right one is launched.

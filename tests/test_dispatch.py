@@ -466,9 +466,15 @@ def test_invalid_runner_templates_rejected(template):
 
 
 def test_shipped_board_toml_defaults_are_conservative():
-    cfg = DispatchConfig.load(ROOT / "board.toml")
-    assert set(cfg.runners) == {"codex", "claude"}
-    assert cfg.runners["codex"][:2] == ["codex", "exec"] and cfg.runners["claude"][:3] == ["claude", "-p", "{prompt}"]
+    cfg = DispatchConfig.load(ROOT / "board.toml", local=False)   # ignore this machine's board.local.toml
+    assert set(cfg.runners) == {"codex-cli", "claude-code"}
+    assert cfg.runners["codex-cli"][:2] == ["codex", "exec"]
+    assert cfg.runners["claude-code"][:3] == ["claude", "-p", "{prompt}"]
+    assert cfg.runners["claude-code"][3:5] == ["--permission-mode", "dontAsk"]
+    # the conftest identities resolve through their runtimes
+    assert cfg.runner_for("claude", "claude-code") is cfg.runners["claude-code"]
+    assert cfg.runner_for("codex", "codex-cli") is cfg.runners["codex-cli"]
+    assert cfg.runner_for("grok", "grok") is None
     for t in cfg.runners.values():
         assert dispatch.risky_flags(t) == []
     assert "bypassPermissions" not in json.dumps(cfg.runners)
@@ -628,3 +634,118 @@ def test_cli_allow_list_revoke(denv, monkeypatch, capsys, tmp_path):
     assert json.loads(capsys.readouterr().out)["rules"][0]["state"] == "revoked"
     cli.main(["dispatch", "stop"])
     assert "not running" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- runner lookup: agent name, then runtime
+
+
+def _runtime_env(denv, runners, extra=()):
+    from agent_comms.config import create_agent
+
+    for name, runtime in extra:
+        create_agent(denv.settings.agents_path, name, runtime)
+    denv.board.sync_agents(force=True)
+    denv.config = DispatchConfig.from_dict({"runners": runners, "worktrees": {PROJECT: denv.workdir}})
+    denv.d = Dispatcher(denv.board, denv.p["human"], denv.config, spawner=denv.spawner, log_dir=denv.log_dir)
+
+
+def test_agent_name_runner_wins_over_runtime(denv):
+    _runtime_env(denv, {"claude": ["claude-by-name", "{prompt}"],
+                        "claude-code": ["claude-by-runtime", "{prompt}"]})
+    allow(denv, agents=["claude"])
+    human_post(denv, ["claude"])
+    denv.d.tick()
+    assert denv.spawner.agents() == ["claude-by-name"]
+
+
+def test_runtime_fallback_for_two_agents_with_the_same_runtime(denv):
+    _runtime_env(denv, {"claude-code": ["claude-by-runtime", "{prompt}"]},
+                 extra=[("claude-code", "claude-code")])          # a second identity, named like the runtime
+    allow(denv, agents=["claude", "claude-code"])
+    human_post(denv, ["claude", "claude-code"])
+    denv.d.tick()
+    assert denv.spawner.agents() == ["claude-by-runtime", "claude-by-runtime"]
+    assert {r["agent"] for r in runs(denv)} == {"claude", "claude-code"}
+
+
+def test_no_runner_for_name_or_runtime_means_no_launch(denv):
+    _runtime_env(denv, {"codex-cli": ["codex-by-runtime", "{prompt}"]})
+    allow(denv, agents=["claude", "grok"])                        # runtimes claude-code and grok: no entry
+    human_post(denv, ["claude", "grok"])
+    denv.d.tick()
+    denv.clock.advance(5 * 60)
+    denv.d.tick()
+    assert denv.spawner.calls == []
+    assert runs(denv) == [] and denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 10
+
+
+def test_env_passthrough_falls_back_to_runtime():
+    cfg = DispatchConfig.from_dict({"env": {"codex-cli": ["CODEX_HOME"], "special": ["FOO"]}})
+    src = {"HOME": "/h", "CODEX_HOME": "/c", "FOO": "f"}
+    assert "CODEX_HOME" in child_env("codex", cfg, src, runtime="codex-cli")
+    assert child_env("special", cfg, src, runtime="codex-cli").get("FOO") == "f"
+    assert "CODEX_HOME" not in child_env("special", cfg, src, runtime="codex-cli")   # name key wins
+
+
+# ---------------------------------------------------------------- board.local.toml overlay
+
+
+def test_local_overlay_merge_precedence(tmp_path, monkeypatch):
+    from agent_comms.config import Settings
+
+    monkeypatch.setenv("AGENT_COMMS_HOME", str(tmp_path))
+    (tmp_path / "board.toml").write_text("""
+[server]
+port = 8787
+[limits]
+lease_ttl_minutes = 30
+daily_post_cap_per_agent = 200
+[dispatch]
+live_minutes = 2
+timeout_minutes = 30
+[dispatch.runners]
+"codex-cli" = ["codex", "exec", "--sandbox", "workspace-write", "{prompt}"]
+"claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
+[dispatch.env]
+"codex-cli" = ["CODEX_HOME"]
+""")
+    (tmp_path / "board.local.toml").write_text("""
+[limits]
+lease_ttl_minutes = 45
+[dispatch]
+timeout_minutes = 10
+[dispatch.runners]
+"claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits"]
+[dispatch.worktrees]
+"/work/repo" = "/work/repo-dispatch"
+""")
+    s = Settings.load()
+    assert (s.port, s.lease_ttl_minutes, s.daily_post_cap_per_agent) == (8787, 45, 200)
+    cfg = DispatchConfig.load()
+    assert (cfg.live_minutes, cfg.timeout_minutes) == (2, 10)
+    # a runner key in the local file replaces the shipped one wholesale (no leftover --allowedTools)
+    assert cfg.runners["claude-code"] == ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits"]
+    assert cfg.runners["codex-cli"] == ["codex", "exec", "--sandbox", "workspace-write", "{prompt}"]
+    assert cfg.env == {"codex-cli": ["CODEX_HOME"]} and cfg.worktrees == {"/work/repo": "/work/repo-dispatch"}
+    # without the overlay, the shipped values stand
+    base = DispatchConfig.load(local=False)
+    assert base.runners["claude-code"][-1] == "--allowedTools=mcp__agent-comms" and base.timeout_minutes == 30
+    assert Settings.load(local=False).lease_ttl_minutes == 30
+
+
+def test_local_overlay_validation_names_the_file(tmp_path, monkeypatch):
+    from agent_comms.config import Settings
+
+    monkeypatch.setenv("AGENT_COMMS_HOME", str(tmp_path))
+    (tmp_path / "board.local.toml").write_text("[limits]\nlease_ttl_minutez = 5\n")
+    with pytest.raises(ValueError, match="board.local.toml"):
+        Settings.load()
+    (tmp_path / "board.local.toml").write_text('[dispatch.runners]\n"claude-code" = ["bash", "-c", "{prompt}"]\n')
+    with pytest.raises(ValueError):
+        DispatchConfig.load()
+    (tmp_path / "board.local.toml").unlink()
+    assert Settings.load().lease_ttl_minutes == 30 and DispatchConfig.load().runners == {}
+
+
+def test_local_overlay_is_gitignored():
+    assert "board.local.toml" in (ROOT / ".gitignore").read_text().split()
