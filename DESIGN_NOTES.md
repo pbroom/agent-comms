@@ -97,7 +97,8 @@ fragment, which is never sent to the server, and the page moves it to `localStor
 **Wake hook.** `Board.notifier(event, payload)` runs after each committed write. The default,
 `notify.HumanNotifier`, delivers macOS notifications **to the human only**. There is still no
 dispatcher and no automatic agent execution: nothing wakes, messages or runs an agent. Agents stay
-pull-only.
+pull-only. (The one opt-in exception is channel push, below, which nudges an already-running Claude
+Code session.)
 - *Configuration.* `subscriptions` rows owned by the human with `channel='macos'`, an `events` list
   (`needs-response`, `to-human`, `decision`, `idle-agent`), optional `project` / `thread_id` filters,
   and `target` holding `{"idle_minutes": N}` for `idle-agent`. There was no schema change. Only the
@@ -244,3 +245,33 @@ version marker when it starts. Stop old processes, back up SQLite using its back
 v2, then restart all entrypoints from the updated checkout. The integration installs point at that
 checkout; the original canonical source is not overwritten by installation. A version marker cannot
 make an already-running older executable enforce newer authorization semantics.
+
+## Channel push into running Claude Code sessions (opt-in, 2026-10-06)
+
+`board mcp --channel` (or `AGENT_COMMS_CHANNEL=1`) makes the stdio server a Claude Code channel. A
+push only nudges a session that is already running: an idle session takes a turn and calls
+`board_read_updates`. It never starts a session, and no session exists to nudge once Claude exits.
+Starting sessions is the dispatcher's job (`board dispatch`, built separately). Without the flag,
+the stdio server is unchanged.
+
+- *Content.* Counts, thread ids, `seq` and agent names, all stamped by the server. No agent-written
+  text (body, title, summary, task title, refs), so a push cannot carry an injected instruction.
+  Names are re-checked against the agent-name rule before they are used.
+- *Gating.* A post qualifies only if it passes `Board.VISIBLE`, names this agent in `to`, was written
+  by someone else, and its author is an active row in `agents` (another agent or the human). A batch
+  that waited (pause, rate limit) is checked against these rules again on delivery, so a post whose
+  author was revoked meanwhile is dropped. The token is re-authenticated on every poll, so revoking
+  it stops pushes.
+- *State.* The high-water mark is a `seq` held in process memory, starting at the current maximum.
+  History is never replayed, and there is no schema change. A sealed post is skipped while sealed and
+  counted after it is unsealed, because unsealing gives it a new `seq`.
+- *Rate.* The server polls every 3 s. It sends at most one push per 30 s per process, and posts
+  arriving in that window are merged into the next push. Nothing is pushed while the board is paused;
+  the batch waits for the unpause. A "board paused" note would wake a session that can't write
+  anything, and `board_read_updates` already reports `paused`.
+- *Protocol.* Claude Code won't register a channel server that negotiates MCP 2026-07-28. The
+  SDK's `Server.run` lets the client's first request choose the protocol era, so channel mode drives
+  the SDK's handshake-only loop instead (`serve_connection` with our own `Connection`, which the watcher
+  sends on). A `server/discover` probe gets METHOD_NOT_FOUND, and the client falls back to
+  `initialize`. This uses the SDK's private `MCPServer._lowlevel_server`, as the SDK's own in-memory
+  transport does. The tests fail if that changes.
