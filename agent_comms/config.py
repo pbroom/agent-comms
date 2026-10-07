@@ -15,6 +15,7 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
 SECTIONS = ("server", "limits", "tasks")
+NOT_SETTINGS = {"dispatch", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks] keys
 
 
 def deep_merge(base: dict, over: dict) -> dict:
@@ -47,29 +48,45 @@ class Settings:
     require_human_accept: bool = False
     # The raw [dispatch] table (merged across layers); validated by dispatch.DispatchConfig.
     dispatch: dict = field(default_factory=dict)
+    # The board.toml these settings came from (board.local.toml is beside it), or None when they were built in
+    # code. Not a setting: it lets a running Board hot-reload them (Board.reload_settings) and the Settings page
+    # save edits to board.local.toml.
+    config_path: Path | None = field(default=None, compare=False)
+
+    @classmethod
+    def known_keys(cls) -> set[str]:
+        return {f.name for f in fields(cls)} - NOT_SETTINGS
+
+    @classmethod
+    def read_layer(cls, layer: Path) -> dict:
+        """One settings file, parsed, with its [server]/[limits]/[tasks] keys checked ({} when it is absent)."""
+        if not layer.exists():
+            return {}
+        d = tomllib.loads(layer.read_text())
+        known = cls.known_keys()
+        for section in SECTIONS:
+            table = d.get(section, {})
+            if not isinstance(table, dict):
+                raise ValueError(f"[{section}] must be a table in {layer}")
+            for k in table:
+                if k not in known:
+                    raise ValueError(f"unknown setting [{section}] {k} in {layer}")
+        return d
 
     @classmethod
     def read_layers(cls, path: Path | None = None, local: bool = True) -> dict:
         """board.toml, then board.local.toml beside it (when `local` and present), deep-merged per section.
         Each layer's [server]/[limits]/[tasks] keys are checked, so an error names the file at fault."""
         path = path or home() / "board.toml"
-        known = {f.name for f in fields(cls)} - {"dispatch"}
         data: dict = {}
         for layer in [path] + ([path.with_name(LOCAL_SETTINGS)] if local else []):
-            if not layer.exists():
-                continue
-            d = tomllib.loads(layer.read_text())
-            for section in SECTIONS:
-                for k in d.get(section, {}):
-                    if k not in known:
-                        raise ValueError(f"unknown setting [{section}] {k} in {layer}")
-            data = deep_merge(data, d)
+            data = deep_merge(data, cls.read_layer(layer))
         return data
 
     @classmethod
-    def load(cls, path: Path | None = None, local: bool = True) -> "Settings":
+    def from_data(cls, data: dict) -> "Settings":
+        """Settings from already-merged layers (see read_layers)."""
         s = cls()
-        data = cls.read_layers(path, local)
         for section in SECTIONS:
             for k, v in data.get(section, {}).items():
                 setattr(s, k, Path(v).expanduser() if k.endswith("_path") else v)
@@ -78,6 +95,14 @@ class Settings:
             val = getattr(s, p)
             if not val.is_absolute():
                 setattr(s, p, home() / val)
+        return s
+
+    @classmethod
+    def load(cls, path: Path | None = None, local: bool = True) -> "Settings":
+        path = path or home() / "board.toml"
+        s = cls.from_data(cls.read_layers(path, local))
+        # Only a board that reads the overlay can hot-reload it or save edits to it.
+        s.config_path = path if local else None
         return s
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -12,8 +13,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from . import board_settings, dispatch
 from .config import Settings
-from .core import Board, BoardError, Invalid, Principal
+from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
 
 DASHBOARD = Path(__file__).with_name("dashboard.html")
@@ -94,6 +96,21 @@ class GrantIn(Body):
     expires_at: float | None = None
 
 
+class NotifyRuleIn(Body):
+    events: list[str] | None = None
+    project: str | None = None
+    thread_id: int | None = None
+    idle_minutes: int | None = None
+
+
+class DispatchRuleIn(Body):
+    thread_id: int
+    agents: list[str]
+    purpose: str
+    max_launches: int
+    expires_in_hours: float | None = None
+
+
 class AckIn(Body):
     ack_through: int
     thread_id: int | None = None
@@ -150,6 +167,20 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         raise Invalid("session_id is required (body field or X-Board-Session header); POST /api/sessions first")
 
     P = Depends(principal)
+
+    def human(p: Principal = P) -> Principal:
+        # Settings and admin routes: the human only. Core enforces this again on every call.
+        if not p.is_human:
+            raise Forbidden("only the human can manage board settings")
+        return p
+
+    H = Depends(human)
+
+    def dispatch_config() -> tuple[dispatch.DispatchConfig, str | None]:
+        try:
+            return dispatch.DispatchConfig.from_dict(board.s.dispatch), None
+        except ValueError as e:
+            return dispatch.DispatchConfig(), str(e)
 
     # ---------------------------------------------------------------- misc
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -276,6 +307,82 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/admin/grants/{grant_id}/revoke")
     def revoke_grant(grant_id: int, p: Principal = P):
         return board.revoke_grant(p, grant_id)
+
+    # ---------------------------------------------------------------- settings page (human only)
+    @app.get("/api/settings")
+    def get_settings(p: Principal = H):
+        return board_settings.get_settings(board, p)
+
+    @app.put("/api/settings")
+    def put_settings(changes: dict[str, Any], p: Principal = H):
+        # A partial update of EDITABLE keys only, e.g. {"limits.daily_post_cap_per_agent": 100}; null removes the
+        # board.local.toml override. Host, port, paths, runners, env and worktrees are refused (400).
+        return board_settings.update_settings(board, p, changes)
+
+    @app.get("/api/admin/notifications")
+    def list_notifications(p: Principal = H):
+        return {"deliverable": board_settings.notifier_deliverer(board).available(),
+                "rules": board.list_notification_subscriptions(p)}
+
+    @app.post("/api/admin/notifications")
+    def add_notification(body: NotifyRuleIn, p: Principal = H):
+        return board.subscribe_notifications(p, **body.model_dump())
+
+    @app.post("/api/admin/notifications/{rule_id}/remove")
+    def remove_notification(rule_id: int, p: Principal = H):
+        return {"removed": board.unsubscribe_notifications(p, rule_id)}
+
+    @app.post("/api/admin/notifications/test")
+    def test_notification(p: Principal = H):
+        from .notify import sample_notification
+
+        deliverer = board_settings.notifier_deliverer(board)
+        if not deliverer.available():
+            raise Conflict("cannot notify on this machine (needs macOS with /usr/bin/osascript)")
+        deliverer(sample_notification())
+        return {"sent": True}
+
+    @app.get("/api/admin/dispatch")
+    def dispatch_overview(p: Principal = H):
+        config, error = dispatch_config()
+        return {"status": dispatch.loop_status(board, config),
+                "rules": board.list_dispatch_rules(p),
+                "runs": dispatch.list_runs(board, p, 10),
+                # Read-only: what the files say now. A running dispatcher uses the runners it started with.
+                "runners": config.runners, "env": config.env, "worktrees": config.worktrees,
+                "risky_runners": {k: dispatch.risky_flags(t) for k, t in config.runners.items()
+                                  if dispatch.risky_flags(t)},
+                "config_error": error,
+                "threads": [{"id": t["id"], "title": t["title"], "project": t["project"]}
+                            for t in board.list_threads(p, status="open")],
+                "agents": [{"name": r["name"], "runtime": r["runtime"]} for r in board.conn.execute(
+                    "SELECT name, runtime FROM agents WHERE active = 1 AND is_human = 0 ORDER BY name")]}
+
+    @app.post("/api/admin/dispatch/rules")
+    def approve_workstream(body: DispatchRuleIn, p: Principal = H):
+        expires_at = None
+        if body.expires_in_hours is not None:
+            if not math.isfinite(body.expires_in_hours) or not 0 < body.expires_in_hours <= 24 * 366:
+                raise Invalid("expires_in_hours must be a number of hours between 0 and 8784")
+            expires_at = board.now() + body.expires_in_hours * 3600
+        return board.create_dispatch_rule(p, thread_id=body.thread_id, agents=body.agents, purpose=body.purpose,
+                                          max_launches=body.max_launches, expires_at=expires_at)
+
+    @app.post("/api/admin/dispatch/rules/{rule_id}/revoke")
+    def revoke_workstream(rule_id: int, p: Principal = H):
+        return board.revoke_dispatch_rule(p, rule_id)
+
+    @app.post("/api/admin/dispatch/stop")
+    def stop_dispatcher(p: Principal = H):
+        # Sets the same flag as `board dispatch stop` and returns at once; the loop stops its agents and exits.
+        # Cleaning up runs left by a dispatcher that already exited stays with the CLI.
+        config, _ = dispatch_config()
+        if not dispatch.loop_status(board, config)["running"]:
+            return {"requested": False, "was_running": False,
+                    "message": "the dispatcher is not running (`board dispatch stop` also cleans up runs an "
+                               "earlier dispatcher left)"}
+        dispatch.set_stop_flag(board, p)
+        return {"requested": True, "was_running": True}
 
     # ---------------------------------------------------------------- admin (human only; enforced in core)
     @app.post("/api/admin/pause")

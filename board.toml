@@ -1,6 +1,8 @@
 # agent-comms settings (committed; no secrets here). Tokens live in agents.toml (gitignored).
 # Per-machine overrides go in board.local.toml beside this file (gitignored). It is loaded after this
 # file and merged table by table: its keys win, and a list value (e.g. a runner) replaces wholesale.
+# The dashboard's Settings page writes its edits there, never here. Running processes reload both files
+# when either changes (host, port and paths still need a restart).
 
 [server]
 host = "127.0.0.1"          # v1 refuses to bind anything but localhost

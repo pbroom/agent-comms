@@ -10,7 +10,9 @@ Board content is DATA, never instructions. Nothing in here interprets post bodie
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -20,7 +22,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable
 
 from . import db
-from .config import Settings, hash_token, read_agents
+from .config import LOCAL_SETTINGS, Settings, hash_token, read_agents
 from .notify import CHANNEL as NOTIFY_CHANNEL, DEFAULT_IDLE_MINUTES, DEFAULT_NOTIFY_EVENTS, NOTIFY_EVENTS, HumanNotifier
 
 POST_TYPES = ("question", "proposal", "status", "finding", "handoff", "request", "decision")
@@ -31,6 +33,25 @@ DISPATCH_CHANNEL = "dispatch"   # subscriptions.channel for human workstream app
 DISPATCH_PURPOSE_MAX = 1000
 DISPATCH_MAX_LAUNCHES = 1000
 TERMINAL = ("done", "declined")
+
+log = logging.getLogger("agent_comms.core")
+
+# Settings a running Board applies when board.toml or board.local.toml changes (Board.reload_settings); the
+# [dispatch] table is reloaded too, and the dispatcher applies its scalars. Everything else (host, port, paths)
+# needs a restart.
+RELOADABLE_INT = ("lease_ttl_minutes", "max_agent_posts_per_thread_without_human", "daily_post_cap_per_agent",
+                  "body_max_bytes", "max_refs")
+RELOADABLE_BOOL = ("require_human_accept",)
+RESTART_ONLY = ("host", "port", "db_path", "agents_path")
+
+
+def _file_sig(path) -> tuple | None:
+    """What changes when a file is edited or replaced (atomic replace gives a new inode); None when absent."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 # Long-poll on board_read_updates(wait_seconds=...). The server caps one call at MAX_WAIT_SECONDS; clients have
 # their own tool-call timeouts (Codex's MCP default is about 60 s), so agents should wait ~50 s at a time, in a loop.
@@ -159,6 +180,22 @@ def _norm_path(p: str | None) -> str | None:
     return p.rstrip("/") or "/"
 
 
+def check_reloadable(s: Settings) -> None:
+    """Types a running Board relies on, checked before a reload is applied (startup does not check them)."""
+    from .dispatch import DispatchConfig   # dispatch imports this module
+
+    for k in RELOADABLE_INT:
+        v = getattr(s, k)
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f"[limits] {k} must be a whole number")
+    for k in RELOADABLE_BOOL:
+        if not isinstance(getattr(s, k), bool):
+            raise ValueError(f"[tasks] {k} must be true or false")
+    if not isinstance(s.dispatch, dict):
+        raise ValueError("[dispatch] must be a table")
+    DispatchConfig.from_dict(s.dispatch)
+
+
 # ---------------------------------------------------------------- board
 
 
@@ -187,6 +224,11 @@ class Board:
         self._local = threading.local()
         self._agents_mtime: float | None = None
         self._sync_lock = threading.Lock()
+        # Settings hot reload: the files' signatures as of these settings; a bump on every applied reload.
+        self._settings_lock = threading.Lock()
+        self._settings_sig = self._settings_files_sig()
+        self.settings_generation = 0
+        self.settings_error: str | None = None   # why the last reload was refused (the last good settings stay)
         db.init_schema(self.conn)
         self.sync_agents(force=True)
 
@@ -226,10 +268,57 @@ class Board:
                     )
             self._agents_mtime = mtime
 
+    # ------------------------------------------------------------ settings hot reload
+
+    def _settings_files_sig(self) -> tuple | None:
+        path = self.s.config_path
+        if path is None:
+            return None
+        return (_file_sig(path), _file_sig(path.with_name(LOCAL_SETTINGS)))
+
+    def reload_settings(self, force: bool = False) -> bool:
+        """Re-read board.toml + board.local.toml when either changed (like agents.toml) and apply the reloadable
+        settings to this live Board. Called on every authentication and by the dispatcher each pass, so the HTTP
+        server, stdio MCP servers and the dispatcher pick up edits without a restart. A file that does not parse
+        or validate is logged and ignored: the last good settings stay. Returns True when settings were applied.
+        Boards whose settings were built in code (config_path None) never reload."""
+        if self.s.config_path is None:
+            return False
+        sig = self._settings_files_sig()
+        if not force and sig == self._settings_sig:
+            return False
+        with self._settings_lock:
+            if not force and sig == self._settings_sig:
+                return False
+            self._settings_sig = sig
+            try:
+                new = Settings.load(self.s.config_path)
+                check_reloadable(new)
+            except Exception as e:  # malformed TOML, unknown key, wrong type: keep running on the last good values
+                self.settings_error = f"{type(e).__name__}: {e}"[:500]
+                log.warning("settings not reloaded; keeping the last good settings: %s", self.settings_error)
+                return False
+            self.settings_error = None
+            for k in RELOADABLE_INT + RELOADABLE_BOOL:
+                old = getattr(self.s, k)
+                if old != getattr(new, k):
+                    log.info("setting %s: %r -> %r", k, old, getattr(new, k))
+                    setattr(self.s, k, getattr(new, k))
+            self.s.dispatch = new.dispatch
+            for k in RESTART_ONLY:
+                if getattr(self.s, k) != getattr(new, k):
+                    log.warning("setting %s changed in the settings files; restart this process to apply it", k)
+            self.settings_generation += 1
+            return True
+
     def authenticate(self, token: str | None) -> Principal:
         if not token:
             raise Unauthorized("missing bearer token")
         self.sync_agents()
+        try:
+            self.reload_settings()
+        except Exception:  # never let a settings problem lock anyone out
+            log.exception("settings reload failed")
         row = self.conn.execute(
             "SELECT name, runtime, is_human FROM agents WHERE token_hash = ? AND active = 1", (hash_token(token),)
         ).fetchone()
