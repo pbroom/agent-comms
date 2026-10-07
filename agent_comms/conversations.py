@@ -10,7 +10,12 @@ Both URL schemes were found in the installed apps' bundles; neither is documente
 
 Capture never trusts tool parameters or request bodies (DESIGN_NOTES "Conversation links"):
 - Claude Code: the stdio MCP server inherits CLAUDE_CODE_SESSION_ID from the Claude Code process that launched it
-  (`claude_client_from_env`, called by mcp_server's board_register).
+  (`claude_client_from_env`, called by mcp_server's board_register). For Claude Code sessions that registered
+  without it (before capture existed, or over a path that did not pass it on), `ClaudeResolver` is the fallback:
+  Claude Code writes each conversation to `~/.claude/projects/<slug of its cwd>/<uuid>.jsonl` (a subagent to
+  `<parent uuid>/subagents/*.jsonl`), so the transcript that recorded the board_register tool_result for a board
+  session names the conversation by its file name (a subagent's: its parent's directory name). Only that UUID
+  leaves this module.
 - Codex sets no such variable. Codex writes every MCP tool call and its result to its rollout file
   `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread uuid>.jsonl`, so `CodexResolver` finds the file that
   recorded the board_register result for a board session and takes the thread UUID from the file NAME. Rollout
@@ -21,10 +26,12 @@ Every id is checked against UUID_RE before it is stored and again before a URL i
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -36,9 +43,14 @@ log = logging.getLogger("agent_comms.conversations")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 CLAUDE_ENV = "CLAUDE_CODE_SESSION_ID"
 CLAUDE, CODEX = "claude-code", "codex"
+# A board session registered by a Claude Code subagent: the stored UUID is the PARENT conversation (a subagent has no
+# conversation of its own to resume). Encoded in client_kind so the schema stays v3 and validation stays one
+# allow-list; code that does not know the kind shows no link rather than a wrong one.
+CLAUDE_SUBAGENT = "claude-code-subagent"
 # kind -> (app name, deep link, resume command). Only ever formatted with an id that matched UUID_RE.
 KINDS = {
     CLAUDE: ("Claude", "claude://resume?session={id}", "claude --resume {id}"),
+    CLAUDE_SUBAGENT: ("Claude", "claude://resume?session={id}", "claude --resume {id}"),
     CODEX: ("ChatGPT", "codex://threads/{id}", "codex resume {id}"),
 }
 
@@ -57,6 +69,20 @@ ROLLOUT_RE = re.compile(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(" + UUI
 # result (the agent's own project path, say) from counting.
 _REGISTER_TEXT = re.compile(r'\{\s*\\*"session_id\\*"\s*:\s*(\d{1,12})\s*,\s*\\*"agent\\*"\s*:\s*\\*"([a-z][a-z0-9_-]{0,31})\\*"')
 _RESULT_KEYS = ("content", "text", "output", "result", "Ok", "structuredContent", "structured_content")
+
+# ClaudeResolver bounds. A Claude Code session is looked up while it is unlinked and was seen in the last
+# CLAUDE_RECENT_SECONDS (long, because this backfills sessions that registered before env capture existed), at most
+# once a minute after a miss, over at most CLAUDE_MAX_FILES transcripts written at or after its start minus
+# SLACK_SECONDS, newest first, reading at most the first CLAUDE_MAX_BYTES of each. Transcripts are append-only, so a
+# file is read incrementally: a later lookup reads only what was appended since.
+CLAUDE_RECENT_SECONDS = 7 * 24 * 3600
+CLAUDE_MAX_FILES = 80
+CLAUDE_MAX_BYTES = 16 << 20
+CLAUDE_MAX_ENTRIES = 5000       # directory entries looked at per project directory and per subagents directory
+CLAUDE_MAX_CALLS = 100          # board_register tool_use ids tracked per transcript
+CLAUDE_MAX_SCANS = 2000         # transcripts whose read position is remembered
+TRANSCRIPT_RE = re.compile("(" + UUID_RE.pattern + r")\.jsonl")
+SUBAGENT_FILE_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}\.jsonl")
 
 
 def normalize_uuid(value: Any) -> str | None:
@@ -87,7 +113,10 @@ def conversation(kind: str | None, client_id: str | None, cwd: str | None) -> di
     if kind not in KINDS or cid is None:
         return None
     app, url, command = KINDS[kind]
-    return {"app": app, "url": url.format(id=cid), "resume_command": command.format(id=cid), "cwd": cwd}
+    out = {"app": app, "url": url.format(id=cid), "resume_command": command.format(id=cid), "cwd": cwd}
+    if kind == CLAUDE_SUBAGENT:
+        out["subagent"] = True   # the link opens the parent conversation that ran the subagent
+    return out
 
 
 # ---------------------------------------------------------------- settings
@@ -95,26 +124,35 @@ def conversation(kind: str | None, client_id: str | None, cwd: str | None) -> di
 
 @dataclass(frozen=True)
 class ConversationConfig:
-    """board.toml [conversations]. enabled=false turns off capture, the Codex lookup and the links."""
+    """board.toml [conversations]. enabled=false turns off capture, the Codex and Claude lookups and the links."""
     enabled: bool = True
     codex_home: str = ""        # "" means $CODEX_HOME, else ~/.codex
+    claude_home: str = ""       # "" means $CLAUDE_CONFIG_DIR, else ~/.claude
 
     @classmethod
     def from_dict(cls, d: Any) -> "ConversationConfig":
         if not isinstance(d, dict):
             raise ValueError("[conversations] must be a table")
-        unknown = set(d) - {"enabled", "codex_home"}
+        unknown = set(d) - {"enabled", "codex_home", "claude_home"}
         if unknown:
             raise ValueError(f"unknown setting [conversations] {sorted(unknown)[0]}")
-        enabled, home = d.get("enabled", True), d.get("codex_home", "")
+        enabled = d.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError("[conversations] enabled must be true or false")
-        if not isinstance(home, str) or len(home) > 1024 or (home and not Path(home).expanduser().is_absolute()):
-            raise ValueError("[conversations] codex_home must be an absolute path, or \"\" for the default")
-        return cls(enabled, home)
+        homes = {}
+        for key in ("codex_home", "claude_home"):
+            home = d.get(key, "")
+            if not isinstance(home, str) or len(home) > 1024 or (home and not Path(home).expanduser().is_absolute()):
+                raise ValueError(f"[conversations] {key} must be an absolute path, or \"\" for the default")
+            homes[key] = home
+        return cls(enabled, **homes)
 
     def codex_dir(self, environ: Mapping[str, str] = os.environ) -> Path:
         home = self.codex_home or environ.get("CODEX_HOME") or "~/.codex"
+        return Path(home).expanduser()
+
+    def claude_dir(self, environ: Mapping[str, str] = os.environ) -> Path:
+        home = self.claude_home or environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
         return Path(home).expanduser()
 
 
@@ -135,10 +173,11 @@ def _is_register_name(name: Any) -> bool:
                                                                                    "/board_register")))
 
 
-def _register_ids(x: Any, depth: int = 0) -> set[tuple[int, str]]:
-    """(session_id, agent) of the board_register result documents in a recorded tool result. Follows only the
-    containers results come in (content items, text, output, Ok/structured content) and JSON text inside them,
-    never argument or free-text fields, so text an agent wrote cannot pose as a result."""
+def _register_docs(x: Any, depth: int = 0) -> set[tuple[int, str, str | None]]:
+    """(session_id, agent, runtime) of the board_register result documents in a recorded tool result. Follows only
+    the containers results come in (content items, text, output, Ok/structured content) and JSON text inside them,
+    never argument or free-text fields, so text an agent wrote cannot pose as a result. runtime is None for result
+    text that is not valid JSON (the escape-tolerant pattern reads only session_id and agent) or not a string."""
     if depth > 6:
         return set()
     if isinstance(x, str):
@@ -146,18 +185,23 @@ def _register_ids(x: Any, depth: int = 0) -> set[tuple[int, str]]:
         if not s.startswith(("{", "[")):
             return set()
         try:
-            return _register_ids(json.loads(s), depth + 1)
+            return _register_docs(json.loads(s), depth + 1)
         except ValueError:
             m = _REGISTER_TEXT.match(s)
-            return {(int(m.group(1)), m.group(2))} if m else set()
+            return {(int(m.group(1)), m.group(2), None)} if m else set()
     if isinstance(x, list):
-        return set().union(*(_register_ids(i, depth + 1) for i in x[:20]))
+        return set().union(*(_register_docs(i, depth + 1) for i in x[:20]))
     if isinstance(x, dict):
         sid, agent = x.get("session_id"), x.get("agent")
         if isinstance(sid, int) and not isinstance(sid, bool) and isinstance(agent, str) and "runtime" in x:
-            return {(sid, agent)}
-        return set().union(*(_register_ids(x[k], depth + 1) for k in _RESULT_KEYS if k in x))
+            return {(sid, agent, x["runtime"] if isinstance(x["runtime"], str) else None)}
+        return set().union(*(_register_docs(x[k], depth + 1) for k in _RESULT_KEYS if k in x))
     return set()
+
+
+def _register_ids(x: Any) -> set[tuple[int, str]]:
+    """(session_id, agent) of the board_register result documents in a recorded tool result (see _register_docs)."""
+    return {(sid, agent) for sid, agent, _ in _register_docs(x)}
 
 
 def register_results(lines: Iterable[str]) -> set[tuple[int, str]]:
@@ -320,3 +364,214 @@ class CodexResolver:
             return time.mktime(time.strptime(f.name_ts, "%Y-%m-%dT%H-%M-%S"))
         except (ValueError, OverflowError):
             return f.mtime
+
+
+# ---------------------------------------------------------------- Claude Code transcript lookup (fallback)
+
+
+def project_slug(path: Any) -> str | None:
+    """Claude Code's directory name under <claude home>/projects for a working directory: every character other than
+    an ASCII letter or digit becomes '-' (/Users/me/agent-comms -> -Users-me-agent-comms). The result holds no '/'
+    or '.', so an agent-supplied path can never name a directory outside projects/. None for anything else
+    (Claude Code shortens very long names its own way; those are not guessed)."""
+    if not isinstance(path, str) or not path.startswith("/") or len(path) > 1024:
+        return None
+    slug = re.sub(r"[^A-Za-z0-9]", "-", path)
+    return slug if len(slug) <= 200 else None
+
+
+def transcript_dirs(project: Any, worktree: Any) -> list[str]:
+    """The project directories a board session's Claude Code may have been started in: its worktree, its project,
+    and the project's ancestors at least two levels deep (/Users/me), for a Claude Code started above the repo.
+    A subagent writes under its parent's directory, which is the project when the subagent runs in a worktree."""
+    paths = [worktree, project]
+    if isinstance(project, str) and project.startswith("/"):
+        parts = Path(project).parts               # ('/', 'Users', 'me', 'repo')
+        paths += [str(Path(*parts[:n])) for n in range(len(parts) - 1, 2, -1)]
+    out: list[str] = []
+    for p in paths:
+        slug = project_slug(p)
+        if slug and slug not in out:
+            out.append(slug)
+    return out
+
+
+class _TranscriptScan:
+    """What one transcript has recorded so far: the read position, the ids of board_register tool_use blocks (and
+    whether each was a subagent's), and the register results matched to them as (session_id, agent, runtime,
+    subagent)."""
+
+    __slots__ = ("ident", "offset", "calls", "found")
+
+    def __init__(self, ident: Any = None):
+        self.ident = ident
+        self.offset = 0
+        self.calls: dict[str, bool] = {}
+        self.found: set[tuple[int, str, str, bool]] = set()
+
+    def feed(self, line: bytes | str) -> None:
+        """One JSONL line. Only a line naming board_register, or carrying a tracked tool_use id, is parsed. A result
+        counts only as the tool_result block of a user message that answers, by tool_use_id, a tool_use block named
+        …board_register in an earlier assistant message, and only when it parses to a register document (with a
+        string runtime). Text anywhere else (post bodies read through other tools, tool arguments, the agent's own
+        prose) is never read."""
+        raw = line.encode() if isinstance(line, str) else line
+        if b"board_register" not in raw and not (
+                self.calls and b'"tool_use_id"' in raw and any(c.encode() in raw for c in self.calls)):
+            return
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return
+        msg = d.get("message") if isinstance(d, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            return
+        sidechain = d.get("isSidechain") is True
+        blocks = [b for b in content[:100] if isinstance(b, dict)]
+        if d.get("type") == "assistant" and msg.get("role") == "assistant":
+            for b in blocks:
+                cid = b.get("id")
+                if (b.get("type") == "tool_use" and _is_register_name(b.get("name")) and isinstance(cid, str)
+                        and 0 < len(cid) <= 128 and len(self.calls) < CLAUDE_MAX_CALLS):
+                    self.calls[cid] = sidechain
+        elif d.get("type") == "user" and msg.get("role") == "user":
+            for b in blocks:
+                cid = b.get("tool_use_id")
+                if (b.get("type") != "tool_result" or not isinstance(cid, str) or cid not in self.calls
+                        or b.get("is_error") is True):
+                    continue
+                for sid, agent, runtime in _register_docs(b.get("content")):
+                    if runtime is not None:
+                        self.found.add((sid, agent, runtime, self.calls[cid] or sidechain))
+
+
+def claude_register_results(lines: Iterable[bytes | str]) -> set[tuple[int, str, str, bool]]:
+    """Every board_register result recorded in a Claude Code transcript's lines (see _TranscriptScan.feed)."""
+    scan = _TranscriptScan()
+    for line in lines:
+        scan.feed(line)
+    return scan.found
+
+
+@dataclass
+class _Transcript:
+    path: Path
+    conversation: str     # the UUID to link: the file's own, or its parent's for a subagent transcript
+    mtime: float
+    subagent: bool
+
+
+def _entries(d: Path) -> list[os.DirEntry]:
+    """At most CLAUDE_MAX_ENTRIES entries of a real directory (not a symlink); [] for anything else."""
+    try:
+        if not stat.S_ISDIR(os.lstat(d).st_mode):
+            return []
+        with os.scandir(d) as it:
+            return list(itertools.islice(it, CLAUDE_MAX_ENTRIES))
+    except OSError:
+        return []
+
+
+def _file_mtime(e: os.DirEntry) -> float | None:
+    """A regular file's mtime (a symlink is not followed and counts as nothing)."""
+    try:
+        return e.stat(follow_symlinks=False).st_mtime if e.is_file(follow_symlinks=False) else None
+    except OSError:
+        return None
+
+
+class ClaudeResolver:
+    """Finds the Claude Code conversation behind a board session from Claude Code's own transcripts (lazy, bounded,
+    throttled, incremental). The fallback for sessions that registered without CLAUDE_CODE_SESSION_ID.
+
+    `home` is the Claude home (~/.claude); `clock` returns epoch seconds. Both are injectable for tests."""
+
+    def __init__(self, home: Path, clock: Callable[[], float] = time.time):
+        self.home = Path(home)
+        self.clock = clock
+        self._tried: dict[int, float] = {}               # board session id -> last lookup (a miss), for RETRY_SECONDS
+        self._scans: dict[Path, _TranscriptScan] = {}    # transcript -> what has been read of it so far
+
+    def due(self, session_ids: Iterable[int]) -> list[int]:
+        now = self.clock()
+        return [s for s in session_ids if now - self._tried.get(s, -1e18) >= RETRY_SECONDS]
+
+    def resolve(self, sessions: list[dict]) -> dict[int, tuple[str, str]]:
+        """sessions: [{"id", "agent", "runtime", "project", "worktree", "started_at"}] still unlinked. Returns
+        {board session id: (kind, conversation uuid)} for the ones found; kind is CLAUDE_SUBAGENT when a subagent
+        registered the session, and the uuid is then its parent conversation. Several matches (a resumed or forked
+        conversation): the most recently written file. A session that is not found is not looked up again for
+        RETRY_SECONDS."""
+        now = self.clock()
+        due = set(self.due(s["id"] for s in sessions))
+        todo = [s for s in sessions if s["id"] in due]
+        if not todo:
+            return {}
+        for s in todo:
+            self._tried[s["id"]] = now
+        if len(self._tried) > 1000:   # forget old misses
+            self._tried = {k: v for k, v in self._tried.items() if now - v < CLAUDE_RECENT_SECONDS}
+        listed: dict[str, list[_Transcript]] = {}
+        out: dict[int, tuple[str, str]] = {}
+        for s in todo:
+            since = s["started_at"] - SLACK_SECONDS
+            files: dict[Path, _Transcript] = {}
+            for slug in transcript_dirs(s.get("project"), s.get("worktree")):
+                if slug not in listed:
+                    listed[slug] = self._list(self.home / "projects" / slug)
+                files.update((f.path, f) for f in listed[slug] if f.mtime >= since)
+            for f in sorted(files.values(), key=lambda f: f.mtime, reverse=True)[:CLAUDE_MAX_FILES]:
+                hits = [x for x in self._scan(f.path) if x[:3] == (s["id"], s["agent"], s["runtime"])]
+                if hits:
+                    sub = f.subagent or any(x[3] for x in hits)
+                    out[s["id"]] = (CLAUDE_SUBAGENT if sub else CLAUDE, f.conversation)
+                    self._tried.pop(s["id"], None)
+                    break
+        if len(self._scans) > CLAUDE_MAX_SCANS:
+            present = {f.path for fs in listed.values() for f in fs}
+            self._scans = {k: v for k, v in self._scans.items() if k in present}
+        return out
+
+    @staticmethod
+    def _list(d: Path) -> list[_Transcript]:
+        """<uuid>.jsonl transcripts in a project directory, and <uuid>/subagents/*.jsonl (linked to <uuid>)."""
+        out: list[_Transcript] = []
+        for e in _entries(d):
+            m = TRANSCRIPT_RE.fullmatch(e.name)
+            if m:
+                mtime = _file_mtime(e)
+                if mtime is not None:
+                    out.append(_Transcript(Path(e.path), m.group(1), mtime, False))
+            elif UUID_RE.fullmatch(e.name):
+                for sub in _entries(Path(e.path) / "subagents"):
+                    mtime = _file_mtime(sub) if SUBAGENT_FILE_RE.fullmatch(sub.name) else None
+                    if mtime is not None:
+                        out.append(_Transcript(Path(sub.path), e.name, mtime, True))
+        return out
+
+    def _scan(self, path: Path) -> set[tuple[int, str, str, bool]]:
+        """The register results in a transcript's first CLAUDE_MAX_BYTES. Reads only the complete lines appended
+        since the last scan of the same file (a replaced or truncated file is read again from the start)."""
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return set()
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            ident = (st.st_dev, st.st_ino)
+            scan = self._scans.get(path)
+            if scan is None or scan.ident != ident or st.st_size < scan.offset:
+                scan = self._scans[path] = _TranscriptScan(ident)
+            if scan.offset < min(st.st_size, CLAUDE_MAX_BYTES):
+                f.seek(scan.offset)
+                while scan.offset < CLAUDE_MAX_BYTES:
+                    limit = CLAUDE_MAX_BYTES - scan.offset
+                    raw = f.readline(limit)
+                    if not raw.endswith(b"\n"):
+                        if len(raw) >= limit:
+                            scan.offset = CLAUDE_MAX_BYTES    # a line runs past the cap: this file is done
+                        break                                 # else the end, or a line still being written
+                    scan.offset += len(raw)
+                    scan.feed(raw)
+        return scan.found

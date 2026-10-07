@@ -633,7 +633,42 @@ point a session at another thread by posting text shaped like a register result:
 rollout through `board_read_updates`, and an agent's own tool arguments and project path are recorded too. Those
 fields are never parsed. Nothing read from a rollout file leaves the module except the UUID from the file name.
 
-**Storage.** `sessions.client_kind` (`claude-code` | `codex`) and `client_session_id`, both nullable. Values are
+**Claude Code transcript fallback (2026-10-07, later).** Env capture only covers sessions that registered through
+the new stdio code, so every Claude session from before it had no link. `ClaudeResolver` does for Claude Code what
+`CodexResolver` does for Codex, and env capture stays the primary path (a captured id is never replaced).
+- *Layout* (checked on this machine): Claude Code writes `~/.claude/projects/<slug>/<uuid>.jsonl`, slug = the
+  absolute cwd with every non-alphanumeric character turned into `-`; a subagent writes
+  `<slug>/<parent uuid>/subagents/agent-*.jsonl`, under its parent's cwd even when it works in a worktree. Each line
+  is a message; an assistant message holds `tool_use` blocks, and a later user message holds the
+  `tool_result` with the matching `tool_use_id`, whose content is the board_register JSON.
+- *Strict match.* Only a `tool_result` block in a user message whose `tool_use_id` names a `tool_use` block (in an
+  assistant message, earlier in the same file) called `…board_register`, not marked `is_error`, whose content
+  parses to a register document with this board session's `session_id`, `agent` AND `runtime`, counts. Unlike the
+  Codex lookup there is no regex fallback for unparseable text (it cannot see the runtime). Post bodies read
+  through `board_read_updates`, tool arguments and prose are all in the transcript and are never parsed as
+  results: an agent cannot point another session at its own conversation by posting text shaped like a result.
+- *Link.* A top-level transcript links its own UUID (file name); a subagent transcript (or a call marked
+  `isSidechain`) links the parent UUID (directory name) and is stored as `client_kind = 'claude-code-subagent'`,
+  which `/api/state` exposes as `conversation.subagent = true` and the page labels "Open parent conversation in
+  Claude". Encoding the flag in `client_kind` keeps the schema at v3 and the allow-list a single check
+  (`KINDS`); older code that does not know the kind shows no link rather than a wrong one. Several matches (a
+  resumed or forked conversation): the most recently written file.
+- *Where and how much.* On human dashboard loads only, for sessions whose runtime starts with `claude-code`, that
+  have no id and were seen in the last 7 days (a backfill, so longer than Codex's day). Directories: the slugs of
+  the session's worktree, project, and the project's ancestors at least two levels deep (`/Users/me`, for a Claude
+  started above the repo); the slug cannot contain `/` or `.`, so an agent-chosen path cannot leave `projects/`.
+  At most 80 transcripts written at or after the session start minus 120 s, newest first, the first 16 MB of each,
+  at most once a minute per session after a miss. Files are read as a stream of lines, and only lines containing
+  `board_register` or a tracked tool_use id are parsed. Transcripts are append-only, so each file's read position
+  is remembered (keyed by device and inode, reset if the file shrinks) and a later lookup reads only new complete
+  lines; that is what makes a per-minute retry over multi-megabyte transcripts cheap. Symlinked files and
+  directories are skipped. `[conversations] claude_home` (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`), and
+  `enabled = false` turns it off with the rest.
+- *Residual.* A slug Claude Code shortens (very long paths) is not guessed. A conversation started outside the
+  directories above, or whose register call is past the first 16 MB, gets no link. The transcript format is
+  internal to Claude Code and may change; then the lookup finds nothing rather than guessing.
+
+**Storage.** `sessions.client_kind` (`claude-code` | `claude-code-subagent` | `codex`) and `client_session_id`, both nullable. Values are
 checked against the UUID pattern (lower-cased) on the way in, and anything else is dropped rather than stored. The
 migration is additive: `ALTER TABLE ... ADD COLUMN` when missing, and `user_version` 3. The bump matters: v2 code
 returned every `sessions` column to any token in `/api/state`, so it would show conversation ids to agents; v2
@@ -700,9 +735,26 @@ reads ids, agent names, flags, statuses and times only, like the dispatcher's tr
 existing rules cover everyone), `dispatcher_running` (`dispatch.loop_status`), `paused`, `live_agents` (a session
 seen within `[dispatch] live_minutes`, or a dispatched run in progress: the dispatcher will not launch them, and they
 see the request through their normal read, hook or channel path), `no_runner` (no `[dispatch.runners]` entry, so it
-can never be launched) and `reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
+can never be launched), `sessions` (the target agents' session ids inside the same live window, last seen first:
+where the request will be seen now) and `reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
 pulsing; a blocked task keeps the dot amber until the agent resolves it, but the button is not offered for an agent
 that is running for that thread.
+
+**No confirmation (2026-10-07, later).** The first version asked `window.confirm()` before posting. The human uses
+the dashboard inside an embedded browser that blocks `confirm()` silently (it returns false), so the button did
+nothing; the human also asked for click = send. The click now posts at once. What keeps it bounded is unchanged:
+the page's busy flag (the button is disabled while the request is in flight), the server's 2-minute per-thread
+stamp, the one-shot rule budget, and the button appearing only when a stall waits on an agent. Other human
+actions (pause, unseal, finalize, force-release, revoking approvals, rules and browsers, settings resets) still use
+`confirm()`; an in-page confirmation (a button that turns into "Confirm?" for a few seconds) would work in that
+browser and is the candidate if they need one.
+
+**Where it went.** The page keeps the last Unstick per thread in memory (`{threadId, agents, sessionIds, postId,
+at}`, lost on reload) and marks the sessions that received it: the ids in `sessions`, plus sessions of those agents
+that started at or after the click (a dispatcher launch registers a new one). They get an "Unstick #N" chip in the
+Sessions panel and are listed under the result note with their conversation links, recomputed on every refresh.
+Only ids, agent names and times are compared; nothing an agent wrote is used. The Sessions panel keeps the
+server's order (last seen first); the page never re-sorts it.
 
 **Residual risks.** Each click can spend one launch per stuck agent (their tokens), at most once per 2 minutes per
 thread. The request asks the agent to stay within what the thread already asked for; it grants no new scope, and

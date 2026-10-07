@@ -17,6 +17,14 @@ def _no_real_notifications(monkeypatch):
     monkeypatch.setattr(notify.MacOSDeliverer, "available", lambda self: False)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_conversation_homes(monkeypatch, tmp_path_factory):
+    """Tests never read the machine's real ~/.claude or ~/.codex: the defaults point at empty directories."""
+    empty = tmp_path_factory.mktemp("no-client-homes")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(empty / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(empty / "codex"))
+
+
 class FakeClock:
     def __init__(self, t: float = 1_800_000_000.0):
         self.t = t

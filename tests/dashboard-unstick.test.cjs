@@ -23,14 +23,18 @@ function thread(id, posts, extra = {}) {
 const task = (id, status, lease_state = 'none', owner_agent = 'codex') => ({ id, title: 'T' + id, status, lease_state, owner_agent,
   owner_session: 3, intends_files: [], events: [] });
 
-async function setup({ threads, human = true, runs = [], needsYou = [], reply = () => ok({}), confirmAnswer = true }) {
+// window.confirm/prompt/alert throw (and are recorded): the embedded browser the human uses blocks them, and Unstick
+// must not call any of them. `sessions` may be a function, re-read on every /api/state (sessions appear later).
+async function setup({ threads, human = true, runs = [], needsYou = [], reply = () => ok({}), sessions = [] }) {
   const calls = [], prompts = [];
   const dom = new JSDOM(html, { url: 'http://127.0.0.1:8787/', runScripts: 'dangerously', beforeParse(win) {
-    win.confirm = text => { prompts.push(text); return confirmAnswer; };
+    for (const name of ['confirm', 'prompt', 'alert'])
+      win[name] = text => { prompts.push([name, text]); throw new Error(`window.${name} must not be called`); };
     win.fetch = async (u, opts = {}) => {
       const me = human ? { name: 'human', is_human: true } : { name: 'codex', is_human: false };
       if (u === '/api/whoami') return ok(me);
-      if (u.startsWith('/api/state')) return ok({ me, paused: false, threads, sessions: [], needs_you: needsYou,
+      if (u.startsWith('/api/state')) return ok({ me, paused: false, threads, needs_you: needsYou,
+        sessions: typeof sessions === 'function' ? sessions() : sessions,
         limits: {}, authorization_grants: [], task_categories: [], active_runs: runs,
         agents: [{ name: 'human', is_human: 1 }, { name: 'claude', is_human: 0 }, { name: 'codex', is_human: 0 }] });
       calls.push({ u, method: opts.method, headers: opts.headers });
@@ -63,15 +67,16 @@ test('the button shows only for stalls that wait on an agent', async () => {
   dom.window.close();
 });
 
-test('confirm, call the endpoint, and say what happens next', async () => {
+test('one click sends at once (no confirm), and says what happens next', async () => {
   const t = thread(1, [post(10, 1, { to: ['codex', 'claude'], needs_response: true })]);
   const reply = u => u === '/api/threads/1/unstick' ? ok({ post_id: 51, thread_id: 1, agents: ['codex', 'claude'],
-    rule_id: 7, dispatcher_running: true, paused: false, live_agents: ['claude'], no_runner: [], reasons: [] }) : fail(404, 'nf');
+    rule_id: 7, dispatcher_running: true, paused: false, live_agents: ['claude'], sessions: [], no_runner: [], reasons: [] }) : fail(404, 'nf');
   const { dom, document, calls, prompts, win } = await setup({ threads: [t], reply });
+  assert.match(document.getElementById('unstick').title, /^Ask codex and claude to find and fix why this thread is stuck\. Sends at once/);
   document.getElementById('unstick').click();
   await settle();
-  assert.equal(prompts.length, 1);
-  assert.match(prompts[0], /^Ask codex and claude to find and fix why this thread is stuck\? This posts a request as you and, if codex and claude aren't already running, launches each once \(uses their tokens\)\.$/);
+  assert.deepEqual(prompts, [], 'no window.confirm/prompt/alert');
+  assert.equal(calls.filter(c => c.u === '/api/threads/1/unstick').length, 1);
   const call = calls.find(c => c.u === '/api/threads/1/unstick');
   assert.equal(call.method, 'POST');
   assert.equal(call.headers['X-Board-Request'], '1');
@@ -83,22 +88,23 @@ test('confirm, call the endpoint, and say what happens next', async () => {
   dom.window.close();
 });
 
-test('dispatcher not running, single agent wording, cancel does nothing', async () => {
+test('dispatcher not running, single agent wording, a double click posts once', async () => {
   const t = thread(1, [post(10, 1, { to: ['codex'], needs_response: true })]);
-  const reply = () => ok({ post_id: 52, agents: ['codex'], rule_id: 8, dispatcher_running: false, paused: false,
-    live_agents: [], no_runner: [], reasons: [] });
-  const cancelled = await setup({ threads: [t], reply, confirmAnswer: false });
-  cancelled.document.getElementById('unstick').click();
-  await settle();
-  assert.match(cancelled.prompts[0], /^Ask codex to find .* if codex isn't already running, launches it once \(uses its tokens\)\.$/);
-  assert.equal(cancelled.calls.length, 0);
-  assert.equal(cancelled.document.getElementById('unstick-result'), null);
-  cancelled.dom.window.close();
-  const { dom, document } = await setup({ threads: [t], reply });
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const reply = async () => { await gate; return ok({ post_id: 52, agents: ['codex'], rule_id: 8, dispatcher_running: false,
+    paused: false, live_agents: [], sessions: [], no_runner: [], reasons: [] }); };
+  const { dom, document, calls, prompts } = await setup({ threads: [t], reply });
+  assert.match(document.getElementById('unstick').title, /launches it once if not already running/);
   document.getElementById('unstick').click();
+  document.getElementById('unstick').click();   // busy: disabled and ignored
+  release();
   await settle();
+  assert.deepEqual(prompts, []);
+  assert.equal(calls.filter(c => c.u === '/api/threads/1/unstick').length, 1);
   assert.equal(document.getElementById('unstick-result').firstChild.textContent,
     "Sent to codex (post #52). The dispatcher isn't running — start it with `board dispatch run` to launch codex.");
+  assert.equal(document.getElementById('unstick-sessions').textContent, 'No session has picked it up yet.');
   document.querySelector('#unstick-result button').click();
   assert.equal(document.getElementById('unstick-result'), null, 'dismissed');
   dom.window.close();
@@ -128,7 +134,7 @@ test('the list row offers Unstick under the amber dot; it opens that thread and 
   const stuck = thread(2, [post(20, 2, { to: ['codex'], needs_response: true })]);
   const youOnly = thread(3, [post(30, 3, { needs_response: true })]);
   const reply = u => u === '/api/threads/2/unstick' ? ok({ post_id: 53, agents: ['codex'], rule_id: 9,
-    dispatcher_running: true, paused: false, live_agents: [], no_runner: [], reasons: [] }) : fail(404, 'nf');
+    dispatcher_running: true, paused: false, live_agents: [], sessions: [], no_runner: [], reasons: [] }) : fail(404, 'nf');
   const { dom, document, calls, prompts } = await setup({ threads: [quiet, stuck, youOnly], reply,
     needsYou: [post(30, 3, { needs_response: true })] });
   const buttons = [...document.querySelectorAll('.thread-list button.unstick-row')].map(b => b.dataset.unstick);
@@ -137,9 +143,50 @@ test('the list row offers Unstick under the amber dot; it opens that thread and 
   assert.ok(cell.querySelector('.dot.stalled').compareDocumentPosition(cell.querySelector('.unstick-row')) & 4, 'under the dot');
   document.querySelector('button.unstick-row').click();
   await settle();
-  assert.equal(prompts.length, 1);
+  assert.deepEqual(prompts, [], 'no window.confirm/prompt/alert');
+  assert.equal(calls.filter(c => c.u === '/api/threads/2/unstick').length, 1);
   assert.ok(calls.some(c => c.u === '/api/threads/2/unstick' && c.method === 'POST'));
   assert.ok(document.getElementById('thread-2'), 'the stalled thread is opened');
   assert.match(document.getElementById('unstick-result').textContent, /Sent to codex \(post #53\)/);
   dom.window.close();
+});
+
+test('the note and the Sessions panel show which sessions received it, with their conversation links', async () => {
+  const CLAUDE_ID = '3f2c8a5e-1b7d-4c9e-a0f1-6d5e4c3b2a19', CODEX_ID = '01a11421-ce71-7370-a005-a5179018a42d';
+  const conv = (url) => ({ app: 'x', url, resume_command: 'x', cwd: '/repo/app' });
+  const sess = (id, agent, startedMinAgo, conversation = null) => ({ id, agent, runtime: agent, project: '/repo/app',
+    worktree: null, started_at: new Date(Date.now() - startedMinAgo * 60000).toISOString(), last_seen: MINUTES_AGO(0),
+    conversation });
+  const live = sess(10, 'claude', 60, conv(`claude://resume?session=${CLAUDE_ID}`));
+  const oldCodex = sess(11, 'codex', 90);                 // a target agent's session, neither live nor new
+  const other = sess(12, 'grok', 1);                      // new, but not a target
+  const launched = { ...sess(13, 'codex', 0, conv(`codex://threads/${CODEX_ID}`)),
+    started_at: new Date(Date.now() + 2000).toISOString() };   // the dispatcher's launch registers after the click
+  let sessions = [live, oldCodex, other];
+  const t = thread(1, [post(10, 1, { to: ['codex', 'claude'], needs_response: true })]);
+  const reply = u => u === '/api/threads/1/unstick' ? ok({ post_id: 61, thread_id: 1, agents: ['codex', 'claude'],
+    rule_id: 3, dispatcher_running: true, paused: false, live_agents: ['claude'], sessions: [10], no_runner: [], reasons: [] })
+    : fail(404, 'nf');
+  const { dom, document } = await setup({ threads: [t], reply, sessions: () => sessions });
+  try {
+  const chips = () => [...document.querySelectorAll('#sessions [data-session]')]
+    .map(n => [n.dataset.session, [...n.querySelectorAll('.unstick-chip')].map(c => `${c.textContent} ${c.getAttribute('href')}`)]);
+  assert.deepEqual(chips(), [['10', []], ['11', []], ['12', []]], 'no chips before any Unstick');
+  document.getElementById('unstick').click();
+  await settle();
+  const line = document.getElementById('unstick-sessions');
+  assert.match(line.textContent, /^Received in:\s*s10 claude/);
+  assert.deepEqual([...line.querySelectorAll('a')].map(a => [a.textContent, a.getAttribute('href')]),
+    [['Open in Claude', `claude://resume?session=${CLAUDE_ID}`]]);
+  assert.deepEqual(chips(), [['10', ['Unstick #61 #post-61']], ['11', []], ['12', []]]);
+  assert.ok(document.querySelector('#sessions [data-session="10"] .convo a'), 'its conversation link is shown next to the chip');
+
+  // A dispatcher launch registers a new codex session: it shows up on the next refresh, in the server's order.
+  sessions = [launched, live, oldCodex, other];
+  document.getElementById('show-completed').click();   // any action that refreshes
+  await settle();
+  assert.deepEqual(chips(), [['13', ['Unstick #61 #post-61']], ['10', ['Unstick #61 #post-61']], ['11', []], ['12', []]]);
+  assert.deepEqual([...document.querySelectorAll('#unstick-sessions [data-session]')].map(n => n.dataset.session), ['13', '10']);
+  assert.deepEqual([...document.querySelectorAll('#unstick-sessions a')].map(a => a.textContent), ['Open in ChatGPT', 'Open in Claude']);
+  } finally { dom.window.close(); }   // a failed assertion must not leave the page's refresh timer running
 });

@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     worktree    TEXT,
     started_at  REAL NOT NULL,
     last_seen   REAL NOT NULL,
-    client_kind        TEXT,   -- 'claude-code' | 'codex': whose conversation this session is (conversations.py)
+    client_kind        TEXT,   -- 'claude-code' | 'claude-code-subagent' | 'codex': whose conversation this session is (conversations.py)
     client_session_id  TEXT    -- that conversation's UUID, validated; human-only in /api/state
 );
 

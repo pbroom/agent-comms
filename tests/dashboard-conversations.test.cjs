@@ -122,3 +122,29 @@ test('the header of a thread being worked on lists each working conversation onc
   assert.match(header.textContent, /Working:\s*claude/);
   dom.window.close();
 });
+
+test('a subagent session links its parent conversation, and says so', async () => {
+  const parentConv = { ...claudeConv, subagent: true };
+  const { dom, document } = await setup(stateOf({ sessions: [session(1, 'claude', parentConv), session(2, 'claude', claudeConv)] }));
+  const anchors = [...sessionsCard(document).querySelectorAll('.convo a')];
+  assert.deepEqual(anchors.map(a => a.textContent), ['Open parent conversation in Claude', 'Open in Claude']);
+  assert.equal(anchors[0].getAttribute('aria-label'),
+    'claude: open the parent conversation (this session is one of its subagents) in the Claude app');
+  assert.equal(anchors[0].getAttribute('href'), `claude://resume?session=${CLAUDE}`);
+  dom.window.close();
+  // Only a real `true` is the flag.
+  const odd = await setup(stateOf({ sessions: [session(1, 'claude', { ...claudeConv, subagent: 'yes' })] }));
+  assert.equal(sessionsCard(odd.document).querySelector('.convo a').textContent, 'Open in Claude');
+  odd.dom.window.close();
+});
+
+test('the sessions panel keeps the server order (last seen first) and never re-sorts', async () => {
+  const at = m => new Date(Date.now() - m * 60000).toISOString();
+  // Deliberately not in id, start-time or name order: the page must show exactly the server's order.
+  const sessions = [{ ...session(7, 'codex'), last_seen: at(1) }, { ...session(2, 'claude'), last_seen: at(3) },
+    { ...session(9, 'grok'), last_seen: at(8) }, { ...session(4, 'claude'), last_seen: at(20) }];
+  const { dom, document } = await setup(stateOf({ sessions }));
+  assert.deepEqual([...sessionsCard(document).querySelectorAll('[data-session]')].map(n => n.dataset.session),
+    ['7', '2', '9', '4']);
+  dom.window.close();
+});
