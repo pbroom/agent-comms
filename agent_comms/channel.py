@@ -24,6 +24,7 @@ handshake era only: a `server/discover` probe gets METHOD_NOT_FOUND and the clie
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -45,6 +46,10 @@ CAPABILITY = "claude/channel"
 METHOD = "notifications/claude/channel"
 POLL_SECONDS = 3.0
 MIN_PUSH_INTERVAL = 30.0
+# Who may trigger a push, given `posts p` joined to an active author row: visible to this agent under
+# the sealed rule, addressed to it, and written by someone else. Used when queuing and again on delivery.
+ELIGIBLE = (f"{Board.VISIBLE} AND p.agent != :me "
+            "AND EXISTS (SELECT 1 FROM json_each(p.to_agents) j WHERE j.value = :me)")
 MAX_LISTED = 5  # thread ids / agent names spelled out in the content before "and N more"
 
 INSTRUCTIONS_NOTE = (
@@ -118,10 +123,7 @@ class ChannelWatcher:
             rows = c.execute(
                 f"""SELECT p.id, p.seq, p.thread_id, p.agent, p.needs_response
                     FROM posts p JOIN agents a ON a.name = p.agent AND a.active = 1
-                    WHERE p.seq > :after AND p.seq <= :top
-                      AND {Board.VISIBLE}
-                      AND p.agent != :me
-                      AND EXISTS (SELECT 1 FROM json_each(p.to_agents) j WHERE j.value = :me)""",
+                    WHERE p.seq > :after AND p.seq <= :top AND {ELIGIBLE}""",
                 {"after": self.high_water, "top": top, **self.board._vis(p)}).fetchall()
         finally:
             c.execute("COMMIT")
@@ -146,10 +148,26 @@ class ChannelWatcher:
         if p is None:
             self.pending.clear()
             return None
+        self.recheck(p)
+        if not self.pending:
+            return None  # everything queued stopped qualifying: no push, and the rate window is untouched
         params = self.render(p.name, list(self.pending.values()))
         self.pending.clear()
         self.last_push = now
         return params
+
+    def recheck(self, p: Principal) -> None:
+        """Drop queued posts that no longer qualify (author revoked, no longer visible, ...).
+
+        A batch can wait (pause, rate limit) while eligibility changes, so delivery re-applies the
+        same rules as `poll` to every queued post.
+        """
+        rows = self.board.conn.execute(
+            f"""SELECT p.id FROM posts p JOIN agents a ON a.name = p.agent AND a.active = 1
+                WHERE p.id IN (SELECT value FROM json_each(:ids)) AND {ELIGIBLE}""",
+            {"ids": json.dumps(list(self.pending)), **self.board._vis(p)}).fetchall()
+        keep = {r["id"] for r in rows}
+        self.pending = {k: v for k, v in self.pending.items() if k in keep}
 
     def tick(self) -> dict[str, Any] | None:
         self.poll()

@@ -129,13 +129,45 @@ def test_sender_must_be_a_known_active_identity(env):
     tid = env.thread()
     w = watcher(env)
     env.post("codex", tid, "x", to=["claude"])
-    # Revoke codex (removed from agents.toml) before the watcher sees the post.
-    text = env.settings.agents_path.read_text()
-    start = text.index("[agents.codex]")
-    end = text.index("[agents.", start + 1)
-    env.settings.agents_path.write_text(text[:start] + text[end:])
-    env.board.sync_agents(force=True)
+    _revoke(env, "codex")  # removed from agents.toml before the watcher sees the post
     assert w.tick() is None
+
+
+def _revoke(env, name):
+    text = env.settings.agents_path.read_text()
+    start = text.index(f"[agents.{name}]")
+    end = text.find("[agents.", start + 1)
+    env.settings.agents_path.write_text(text[:start] + (text[end:] if end != -1 else ""))
+    env.board.sync_agents(force=True)
+
+
+def test_author_revoked_while_batch_waits_is_dropped(env):
+    """Regression: pause, queue an addressed post, revoke its author, unpause: nothing wakes Claude."""
+    tid = env.thread()
+    w = watcher(env)
+    env.post("codex", tid, "x", to=["claude"])
+    env.board.set_paused(env.p["human"], True)
+    assert w.tick() is None and len(w.pending) == 1  # queued, held by the pause
+    _revoke(env, "codex")
+    env.board.set_paused(env.p["human"], False)
+    assert w.tick() is None
+    assert w.pending == {} and w.last_push is None  # the empty batch did not use up the rate window
+
+
+def test_batch_recheck_keeps_only_still_eligible_posts(env):
+    tid = env.thread()
+    clock = Clock()
+    w = watcher(env, clock=clock, min_interval=30)
+    env.post("grok", tid, "first", to=["claude"])
+    assert w.tick()["meta"]["new_posts"] == "1"
+    env.post("codex", tid, "from a soon-revoked agent", to=["claude"])
+    env.post("human", tid, "from the human", to=["claude"], needs_response=True)
+    assert w.tick() is None and len(w.pending) == 2  # inside the rate window
+    _revoke(env, "codex")
+    clock.t += 30
+    out = w.tick()
+    assert out["meta"]["new_posts"] == "1" and out["meta"]["from_agents"] == "human"
+    assert "codex" not in out["content"]
 
 
 def test_content_never_contains_post_text(env):

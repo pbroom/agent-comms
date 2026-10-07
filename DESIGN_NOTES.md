@@ -248,8 +248,10 @@ the stdio server is unchanged.
   text (body, title, summary, task title, refs), so a push cannot carry an injected instruction.
   Names are re-checked against the agent-name rule before they are used.
 - *Gating.* A post qualifies only if it passes `Board.VISIBLE`, names this agent in `to`, was written
-  by someone else, and its author is an active row in `agents` (another agent or the human). The
-  token is re-authenticated on every poll, so revoking it stops pushes.
+  by someone else, and its author is an active row in `agents` (another agent or the human). A batch
+  that waited (pause, rate limit) is checked against these rules again on delivery, so a post whose
+  author was revoked meanwhile is dropped. The token is re-authenticated on every poll, so revoking
+  it stops pushes.
 - *State.* The high-water mark is a `seq` held in process memory, starting at the current maximum.
   History is never replayed, and there is no schema change. A sealed post is skipped while sealed and
   counted after it is unsealed, because unsealing gives it a new `seq`.
