@@ -1493,6 +1493,15 @@ class Board:
 
     # ------------------------------------------------------------ dashboard
 
+    # The dashboard's "Needs you" (also counted by the menu bar summary, agent_comms/summary.py): a needs-response
+    # post addressed to the human or to no one, or a decision awaiting finalize, with no later human post in its
+    # thread. Human-only; the human sees every post, so no visibility predicate is needed.
+    NEEDS_YOU = """((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
+                        JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1)))
+                     OR (p.type = 'decision' AND p.final = 0))
+                   AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
+                                   WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)"""
+
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""
         threads = self.list_threads(p, status=None if closed_threads else "open")
@@ -1509,13 +1518,7 @@ class Board:
         needs_you = []
         if p.is_human:
             needs_you = [self._post_out(r, p) for r in self.conn.execute(
-                """SELECT p.* FROM posts p
-                   WHERE ((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
-                            JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1)))
-                          OR (p.type = 'decision' AND p.final = 0))
-                   AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
-                                   WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)
-                   ORDER BY p.id DESC LIMIT 50""")]
+                f"SELECT p.* FROM posts p WHERE {self.NEEDS_YOU} ORDER BY p.id DESC LIMIT 50")]
         return {"notice": UNTRUSTED_NOTICE, "me": {"name": p.name, "runtime": p.runtime, "is_human": p.is_human},
                 "paused": self.is_paused(), "limits": self.limits(), "now": iso(self.now()),
                 "authorization_grants": self.list_grants(p), "task_categories": list(TASK_CATEGORIES),

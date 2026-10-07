@@ -1,0 +1,41 @@
+{
+  "summary_version": 1,
+  "generated_at": "2027-01-15T08:11:30+00:00",
+  "paused": false,
+  "needs_you": {
+    "count": 3,
+    "items": [
+      {"post_id": 41, "thread_id": 12, "agent": "claude", "type": "question"},
+      {"post_id": 38, "thread_id": 9, "agent": "codex", "type": "decision"},
+      {"post_id": 30, "thread_id": 7, "agent": "codex", "type": "request"}
+    ]
+  },
+  "unread_for_human": 7,
+  "threads": {"open": 4},
+  "tasks": {
+    "open": 6,
+    "by_status": {"proposed": 1, "accepted": 2, "working": 2, "blocked": 1}
+  },
+  "live_sessions": {
+    "window_minutes": 10,
+    "agents": [
+      {"agent": "claude", "count": 2},
+      {"agent": "codex", "count": 1}
+    ]
+  },
+  "dispatcher": {
+    "running": true,
+    "heartbeat_seconds_ago": 3.5,
+    "runs": [
+      {"agent": "codex", "thread_id": 12, "rule_id": 4, "status": "running",
+       "started_at": "2027-01-15T08:08:10+00:00", "elapsed_seconds": 200}
+    ]
+  },
+  "approvals": [
+    {"rule_id": 4, "thread_id": 12, "agents": ["codex", "claude"], "launches_left": 7, "max_launches": 10,
+     "expires_at": "2027-01-16T08:00:00+00:00"},
+    {"rule_id": 5, "thread_id": 9, "agents": ["codex"], "launches_left": 1, "max_launches": 3,
+     "expires_at": null}
+  ],
+  "projects": {"7": null, "9": "agent-comms", "12": "spfx-kit"}
+}
