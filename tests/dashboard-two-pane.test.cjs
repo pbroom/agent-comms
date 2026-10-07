@@ -150,3 +150,28 @@ test('status dots: blue for posts this browser has not shown, cleared by opening
   assert.equal(dot(1), null, 'opening the thread marks it seen');
   dom.window.close();
 });
+
+test('sorting: recent activity (default), newest first, priority; the choice is remembered', async () => {
+  const mk = (id, created, last, extra = {}) => Object.assign(thread(id, [post(id * 10, id, last)]),
+    { created_at: `2027-01-15T0${created}:00:00+00:00` }, extra);
+  const onMe = mk(1, 1, 10);                                                   // waiting on the human
+  const onAgent = mk(2, 2, 20); onAgent.tasks = [task(1, 'blocked')];          // stalled on someone else
+  const fresh = mk(3, 3, 30);                                                   // unread
+  const busy = mk(4, 4, 40); busy.tasks = [task(2, 'working', 'active')];       // being worked on
+  const quiet = mk(5, 0, 50);                                                   // nothing to flag; oldest thread
+  const all = [onMe, onAgent, fresh, busy, quiet];
+  const seen = JSON.stringify({ 1: 10, 2: 20, 3: 0, 4: 40, 5: 50 });
+  const { dom, document, win } = await dots({ threads: () => all, needsYou: [post(10, 1, 10)],
+    storage: { 'agent-comms-seen': seen, 'agent-comms-thread': '5' } });
+  assert.deepEqual(rows(document), [5, 4, 3, 2, 1], 'recent activity by default');
+  const pick = v => { const s = document.getElementById('thread-sort'); s.value = v; s.dispatchEvent(new win.Event('change')); };
+  pick('priority');
+  assert.deepEqual(rows(document), [1, 2, 3, 4, 5]);
+  assert.equal(win.localStorage.getItem('agent-comms-sort'), 'priority');
+  pick('created');
+  assert.deepEqual(rows(document), [4, 3, 2, 1, 5]);
+  dom.window.close();
+  const again = await dots({ threads: () => all, storage: { 'agent-comms-sort': 'created', 'agent-comms-thread': '5' } });
+  assert.equal(again.document.getElementById('thread-sort').value, 'created');
+  again.dom.window.close();
+});

@@ -26,7 +26,7 @@ function boardState(threads, me = { name: 'human', is_human: true }) {
 }
 
 // The page may remember non-secret UI state (selected thread, per-thread "seen" marks), never a token.
-const UI_KEYS = new Set(['agent-comms-thread', 'agent-comms-seen']);
+const UI_KEYS = new Set(['agent-comms-thread', 'agent-comms-seen', 'agent-comms-sort']);
 function assertNoStoredSecrets(win) {
   for (let i = 0; i < win.localStorage.length; i++) {
     const k = win.localStorage.key(i);
