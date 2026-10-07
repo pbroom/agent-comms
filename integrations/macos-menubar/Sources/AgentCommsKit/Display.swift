@@ -43,6 +43,39 @@ public enum Display {
         "#\(item.postId) · \(agentName(item.agent)) · \(postType(item.type)) · \(thread(item.threadId, in: summary))"
     }
 
+    static func thread(_ id: Int, project: String?) -> String {
+        if let project, let name = projectName(project) { return "thread \(id) (\(name))" }
+        return "thread \(id)"
+    }
+
+    /// "#51 · claude · proposal · thread 12 (spfx-kit)"
+    public static func needsYouItem(_ item: NeedsYouItem, project: String?) -> String {
+        "#\(item.postId) · \(agentName(item.agent)) · \(postType(item.type)) · \(thread(item.threadId, project: project))"
+    }
+
+    /// The submenu title: the item line, then a short quoted preview when there is one.
+    public static func needsYouTitle(_ item: NeedsYouItem, project: String?) -> String {
+        let line = needsYouItem(item, project: project)
+        let short = preview(item.preview, limit: 40)
+        return short.isEmpty ? line : "\(line) — “\(short)”"
+    }
+
+    /// Agent-written preview text as one plain line: control, format, separator and private-use characters
+    /// (bidi overrides included) become spaces, whitespace collapses, and it is cut to `limit` characters.
+    /// The server does the same; this is the client's own check. Always shown as plain text.
+    public static func preview(_ s: String, limit: Int = 80) -> String {
+        let dropped: Set<Unicode.GeneralCategory> = [.control, .format, .surrogate, .privateUse, .unassigned,
+                                                      .lineSeparator, .paragraphSeparator]
+        var scalars = String.UnicodeScalarView()
+        for u in s.unicodeScalars {
+            scalars.append(dropped.contains(u.properties.generalCategory) ? " " : u)
+        }
+        let line = String(scalars).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard line.count > limit else { return line }
+        let cut = line.prefix(max(1, limit - 1)).trimmingCharacters(in: .whitespaces)
+        return cut + "…"
+    }
+
     /// "codex · thread 12 (spfx-kit) · 3m 20s"
     public static func run(_ run: BoardSummary.Run, in summary: BoardSummary, extraSeconds: Int = 0) -> String {
         var parts = [agentName(run.agent), thread(run.threadId, in: summary)]

@@ -51,7 +51,13 @@ public struct Endpoint: Equatable, Sendable {
     public var base: URL { url(path: "/") }
     public var dashboard: URL { url(path: "/") }
     public var settings: URL { url(path: "/", fragment: "settings") }
+    /// The plain dashboard URL for a page (no sign-in; the fallback when login links are unavailable).
+    public func page(_ page: DashboardPage) -> URL { url(path: "/", fragment: page.fragment) }
     public var summary: URL { url(path: "/api/summary") }
+    public var needsYou: URL { url(path: "/api/needs-you") }
+    public var loginLinks: URL { url(path: "/api/login-links") }
+    public func finalize(postId: Int) -> URL { url(path: "/api/posts/\(postId)/finalize") }
+    public func transition(taskId: Int) -> URL { url(path: "/api/tasks/\(taskId)/transition") }
     public var pause: URL { url(path: "/api/admin/pause") }
     public var unpause: URL { url(path: "/api/admin/unpause") }
     /// The same route the dashboard's Settings page uses to stop the dispatcher.

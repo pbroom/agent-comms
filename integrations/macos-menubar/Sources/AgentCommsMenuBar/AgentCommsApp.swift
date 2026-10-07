@@ -40,14 +40,14 @@ struct MenuContent: View {
             }
             .disabled(model.startingServer)
         case .problem(let text):
-            Text(text)
+            Text(verbatim: text)
         case .online(let summary):
             OnlineSections(summary: summary, extraSeconds: model.secondsSinceFetch, model: model)
         }
 
         if let message = model.message {
             Divider()
-            Button(message) { model.clearMessage() }
+            Button { model.clearMessage() } label: { Text(verbatim: message) }
         }
 
         Divider()
@@ -75,6 +75,40 @@ struct MenuContent: View {
     }
 }
 
+/// One "Needs you" item: a submenu with its preview (plain text) and the actions that apply to it.
+struct NeedsYouSubmenu: View {
+    let item: NeedsYouItem
+    let project: String?
+    @ObservedObject var model: BoardModel
+
+    var body: some View {
+        Menu {
+            let preview = Display.preview(item.preview)
+            if !preview.isEmpty {
+                Text(verbatim: preview)
+                Divider()
+            }
+            ForEach(Array(ItemAction.available(for: item).enumerated()), id: \.offset) { _, action in
+                Button {
+                    model.perform(action, on: item, project: project)
+                } label: {
+                    Text(verbatim: Self.title(action))
+                }
+            }
+        } label: {
+            Text(verbatim: Display.needsYouTitle(item, project: project))
+        }
+    }
+
+    static func title(_ action: ItemAction) -> String {
+        switch action {
+        case .view: return "View in Dashboard"
+        case .finalizeDecision: return "Finalize Decision…"
+        case .acceptTask(let id): return "Accept Task #\(id)…"
+        }
+    }
+}
+
 /// Counts and server-stamped identifiers only; every string comes from `Display`.
 struct OnlineSections: View {
     let summary: BoardSummary
@@ -82,20 +116,23 @@ struct OnlineSections: View {
     @ObservedObject var model: BoardModel
 
     var body: some View {
-        Text(Display.statusLine(summary))
-        Text(Display.dispatcherLine(summary.dispatcher))
+        Text(verbatim: Display.statusLine(summary))
+        Text(verbatim: Display.dispatcherLine(summary.dispatcher))
 
         Divider()
         if summary.needsYou.count == 0 {
             Text("Nothing needs you")
         } else {
-            Section("Needs you (\(summary.needsYou.count))") {
-                ForEach(summary.needsYou.items, id: \.postId) { item in
-                    Button(Display.needsYouItem(item, in: summary)) { model.openDashboard() }
+            let entries = model.needsYouItems(summary)
+            Section(header: Text(verbatim: "Needs you (\(summary.needsYou.count))")) {
+                ForEach(entries, id: \.item.postId) { entry in
+                    NeedsYouSubmenu(item: entry.item, project: entry.project, model: model)
                 }
-                if summary.needsYou.count > summary.needsYou.items.count {
-                    Button("… \(summary.needsYou.count - summary.needsYou.items.count) more in the dashboard") {
+                if summary.needsYou.count > entries.count {
+                    Button {
                         model.openDashboard()
+                    } label: {
+                        Text(verbatim: "… \(summary.needsYou.count - entries.count) more in the dashboard")
                     }
                 }
             }
@@ -105,7 +142,7 @@ struct OnlineSections: View {
             Divider()
             Section("Running agents") {
                 ForEach(Array(summary.dispatcher.runs.enumerated()), id: \.offset) { _, run in
-                    Text(Display.run(run, in: summary, extraSeconds: extraSeconds))
+                    Text(verbatim: Display.run(run, in: summary, extraSeconds: extraSeconds))
                 }
             }
         }
@@ -114,7 +151,7 @@ struct OnlineSections: View {
             Divider()
             Section("Approvals") {
                 ForEach(summary.approvals, id: \.ruleId) { a in
-                    Text(Display.approval(a, in: summary))
+                    Text(verbatim: Display.approval(a, in: summary))
                 }
             }
         }
@@ -125,7 +162,7 @@ struct OnlineSections: View {
         } else {
             Section("Live sessions (last \(summary.liveSessions.windowMinutes) min)") {
                 ForEach(summary.liveSessions.agents, id: \.agent) { s in
-                    Text(Display.liveSession(s))
+                    Text(verbatim: Display.liveSession(s))
                 }
             }
         }

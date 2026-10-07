@@ -200,6 +200,11 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         # For the human's menu bar app: counts and server-stamped ids only, never agent-written text.
         return summary.human_summary(board, p, dispatch_config()[0])
 
+    @app.get("/api/needs-you")
+    def needs_you(p: Principal = H):
+        # The menu bar's "Needs you" submenu: the dashboard's items with a cleaned 80-character preview.
+        return summary.needs_you_list(board, p)
+
     @app.get("/api/state")
     def state(closed: bool = False, p: Principal = P):
         return board.snapshot(p, closed_threads=closed)

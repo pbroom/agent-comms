@@ -51,8 +51,10 @@ public final class BoardClient: NSObject, URLSessionTaskDelegate, @unchecked Sen
         nil
     }
 
-    func request(_ url: URL, method: String, token: BearerToken) -> URLRequest? {
-        guard endpoint.isBoardURL(url) else { return nil }
+    /// Every request is built here: only to `endpoint`, the token only in the Authorization header, and for a POST
+    /// a JSON body (`{}` when there is nothing to send).
+    func request(_ url: URL, method: String, token: BearerToken, json: [String: String]? = nil) -> URLRequest? {
+        guard endpoint.isBoardURL(url), url.fragment == nil else { return nil }
         var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
                            timeoutInterval: BoardClient.requestTimeout)
         r.httpMethod = method
@@ -60,13 +62,31 @@ public final class BoardClient: NSObject, URLSessionTaskDelegate, @unchecked Sen
         r.setValue("application/json", forHTTPHeaderField: "Accept")
         if method == "POST" {
             r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            r.httpBody = Data()
+            r.httpBody = (try? JSONSerialization.data(withJSONObject: json ?? [:], options: [.sortedKeys])) ?? Data("{}".utf8)
         }
         return r
     }
 
+    func finalizeRequest(postId: Int, token: BearerToken) -> URLRequest? {
+        request(endpoint.finalize(postId: postId), method: "POST", token: token)
+    }
+
+    func acceptTaskRequest(taskId: Int, token: BearerToken) -> URLRequest? {
+        request(endpoint.transition(taskId: taskId), method: "POST", token: token,
+                json: ["status": "accepted", "note": "accepted from menu bar"])
+    }
+
+    func loginLinkRequest(page: DashboardPage, token: BearerToken) -> URLRequest? {
+        request(endpoint.loginLinks, method: "POST", token: token, json: ["next": page.next])
+    }
+
     private func send(_ url: URL, method: String, token: BearerToken) async throws -> Data {
         guard let req = request(url, method: method, token: token) else { throw BoardClientError.badResponse }
+        return try await send(req)
+    }
+
+    private func send(_ req: URLRequest?) async throws -> Data {
+        guard let req else { throw BoardClientError.badResponse }
         let data: Data
         let response: URLResponse
         do {
@@ -101,5 +121,33 @@ public final class BoardClient: NSObject, URLSessionTaskDelegate, @unchecked Sen
         let data = try await send(endpoint.stopDispatcher, method: "POST", token: token)
         struct Reply: Decodable { let requested: Bool }
         return (try? JSONDecoder().decode(Reply.self, from: data))?.requested ?? false
+    }
+
+    public func needsYou(token: BearerToken) async throws -> NeedsYouList {
+        let data = try await send(endpoint.needsYou, method: "GET", token: token)
+        do {
+            return try NeedsYouList.decode(data)
+        } catch {
+            throw BoardClientError.badResponse
+        }
+    }
+
+    public func finalize(postId: Int, token: BearerToken) async throws {
+        _ = try await send(finalizeRequest(postId: postId, token: token))
+    }
+
+    public func acceptTask(taskId: Int, token: BearerToken) async throws {
+        _ = try await send(acceptTaskRequest(taskId: taskId, token: token))
+    }
+
+    /// A one-time sign-in link for a dashboard page, or the plain page URL when the server has no login links (404).
+    public func loginLink(page: DashboardPage, token: BearerToken) async throws -> LoginLink.Outcome {
+        let result: Result<Data, BoardClientError>
+        do {
+            result = .success(try await send(loginLinkRequest(page: page, token: token)))
+        } catch let e as BoardClientError {
+            result = .failure(e)
+        }
+        return try LoginLink.resolve(result, page: page, endpoint: endpoint)
     }
 }

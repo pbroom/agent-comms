@@ -14,6 +14,7 @@ final class BoardModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .loading
+    @Published private(set) var needsYou: NeedsYouList?
     @Published private(set) var fetchedAt = Date()
     @Published private(set) var message: String?      // the result of the last action, shown in the menu
     @Published private(set) var startingServer = false
@@ -101,6 +102,7 @@ final class BoardModel: ObservableObject {
         }
         do {
             let s = try await client.summary(token: token)
+            needsYou = s.needsYou.count > 0 ? await fetchNeedsYou(token: token) : nil
             phase = .online(s)
             fetchedAt = Date()
             startingServer = false
@@ -114,6 +116,20 @@ final class BoardModel: ObservableObject {
         }
     }
 
+    /// The items with previews, or nil when the server has no /api/needs-you (the menu then lists the summary's
+    /// items without previews) or the request failed.
+    private func fetchNeedsYou(token: BearerToken) async -> NeedsYouList? {
+        try? await client.needsYou(token: token)
+    }
+
+    /// The items the "Needs you" section lists: with previews when available, else from the summary.
+    func needsYouItems(_ s: BoardSummary) -> [(item: NeedsYouItem, project: String?)] {
+        if let list = needsYou {
+            return list.items.map { ($0, list.project(forThread: $0.threadId)) }
+        }
+        return s.needsYou.items.map { (NeedsYouItem($0), s.project(forThread: $0.threadId)) }
+    }
+
     private func refreshSoon(after seconds: [Double]) {
         for s in seconds {
             Task { [weak self] in
@@ -125,12 +141,74 @@ final class BoardModel: ObservableObject {
 
     // MARK: actions
 
-    func openDashboard() {
-        NSWorkspace.shared.open(endpoint.dashboard)
+    func openDashboard() { open(.home) }
+
+    func openSettings() { open(.settings) }
+
+    /// Opens a dashboard page signed in, through a one-time login link the server mints (POST /api/login-links,
+    /// token in the header). The link, not the token, goes in the URL. A server without login links (404) gets
+    /// the plain page URL, and the browser's own sign-in applies.
+    func open(_ page: DashboardPage) {
+        Task {
+            let fallback = endpoint.page(page)
+            do {
+                switch try await client.loginLink(page: page, token: try loadToken()) {
+                case .signedIn(let url): NSWorkspace.shared.open(url)
+                case .fallback(let url): NSWorkspace.shared.open(url)
+                }
+            } catch BoardClientError.offline {
+                message = "Board server not running"
+            } catch {
+                message = "Could not sign the dashboard in (\(error)); opened it without a sign-in link"
+                NSWorkspace.shared.open(fallback)
+            }
+        }
     }
 
-    func openSettings() {
-        NSWorkspace.shared.open(endpoint.settings)
+    func perform(_ action: ItemAction, on item: NeedsYouItem, project: String?) {
+        switch action {
+        case .view:
+            open(.post(item.postId))
+        case .finalizeDecision(let postId):
+            later {
+                guard self.confirm(title: "Finalize decision #\(postId)?",
+                                   text: self.describe(item, project: project)
+                                       + "\n\nFinalizing makes this decision binding. It cannot be undone; you can only "
+                                       + "reverse it with a new final decision.",
+                                   button: "Finalize") else { return }
+                do {
+                    try await self.client.finalize(postId: postId, token: try self.loadToken())
+                    self.message = "Finalized decision #\(postId)"
+                } catch {
+                    self.message = "Finalize #\(postId) failed: \(error)"
+                }
+                await self.refresh()
+            }
+        case .acceptTask(let taskId):
+            later {
+                guard self.confirm(title: "Accept task #\(taskId)?",
+                                   text: self.describe(item, project: project)
+                                       + "\n\nThe task moves from proposed to accepted, so an agent can claim it.",
+                                   button: "Accept Task") else { return }
+                do {
+                    try await self.client.acceptTask(taskId: taskId, token: try self.loadToken())
+                    self.message = "Accepted task #\(taskId)"
+                } catch {
+                    self.message = "Accept task #\(taskId) failed: \(error)"
+                }
+                await self.refresh()
+            }
+        }
+    }
+
+    /// Plain text for a confirmation alert (NSAlert renders informativeText as plain text, never markup).
+    private func describe(_ item: NeedsYouItem, project: String?) -> String {
+        var text = Display.needsYouItem(item, project: project)
+        let preview = Display.preview(item.preview)
+        if !preview.isEmpty {
+            text += "\n“\(preview)”"
+        }
+        return text
     }
 
     func pauseWithConfirmation() {
