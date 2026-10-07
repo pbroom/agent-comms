@@ -165,7 +165,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--project")
     s = sub.add_parser("revoke-grant", help="revoke a standing authorization and release affected leases")
     s.add_argument("grant_id", type=int)
-    sub.add_parser("dashboard", help="open the dashboard in your browser, logged in as the human")
+    sub.add_parser("dashboard", help="open the dashboard in your browser, signed in as the human (one-time link; "
+                                     "needs `board serve` running)")
+    s = sub.add_parser("logout", help="sign out of the dashboard in browsers")
+    s.add_argument("--all", action="store_true", help="sign out every browser (revokes all dashboard sessions)")
 
     s = sub.add_parser("notify", help="macOS notifications to you when the board needs you (off by default)")
     nsub = s.add_subparsers(dest="notify_cmd", required=True)
@@ -564,10 +567,46 @@ def _run(a, out) -> None:
     elif a.cmd == "dispatch":
         _dispatch_cmd(a, out, board, p)
     elif a.cmd == "dashboard":
-        url = f"http://{settings.host}:{settings.port}/#token={token}"
-        print(f"Opening http://{settings.host}:{settings.port}/ (token passed in the URL fragment, never sent "
-              "to the server as a query string)")
-        webbrowser.open(url)
+        url = _login_link(settings, token)
+        print("Opening the dashboard with a one-time sign-in link (valid for 60 seconds; your token is not in it).")
+        if not webbrowser.open(url):
+            print(f"No browser opened. Open this link within 60 seconds:\n  {url}")
+    elif a.cmd == "logout":
+        if not a.all:
+            raise SystemExit("`board logout --all` signs out every browser (to sign out one, use the dashboard's "
+                             "Settings > Signed-in browsers)")
+        from . import weblogin
+        n = weblogin.revoke_all(board, p)
+        out({"revoked": n}, f"signed out {n} browser(s); run `board dashboard` to sign in again")
+
+
+def _login_link(settings: Settings, token: str) -> str:
+    """Ask the running server for a single-use sign-in link (POST /api/login-links with the human token)."""
+    import urllib.error
+    import urllib.request
+
+    host = f"[{settings.host}]" if ":" in settings.host else settings.host
+    base = f"http://{host}:{settings.port}"
+    req = urllib.request.Request(f"{base}/api/login-links", data=json.dumps({"next": "/"}).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            url = json.loads(r.read().decode())["url"]
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("message", e.reason)
+        except ValueError:
+            msg = e.reason
+        raise SystemExit(f"the board server at {base} refused the sign-in link ({e.code}): {msg}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise SystemExit(f"the board server is not running at {base} ({getattr(e, 'reason', e)}). Start it with "
+                         "`uv run board serve` in another terminal, then run `board dashboard` again.") from None
+    except (ValueError, KeyError, TypeError):
+        raise SystemExit(f"unexpected reply from {base}/api/login-links; is another program using that port?") from None
+    if not isinstance(url, str) or not re.fullmatch(r"http://(127\.0\.0\.1|\[::1\]):\d{1,5}/login/[A-Za-z0-9_-]{8,256}",
+                                                    url):
+        raise SystemExit(f"unexpected sign-in link from {base}; is another program using that port?")
+    return url
 
 
 if __name__ == "__main__":

@@ -77,6 +77,10 @@ del _d
 FILE_ONLY = {"host", "port", "db_path", "agents_path", "runners", "env", "worktrees"}
 FILE_ONLY_WHY = ("is not editable from the dashboard. host, port and paths need a restart, and the dispatcher's "
                  "runners, env and worktrees decide what runs on this machine; edit board.local.toml by hand")
+# [web] sign-in session lifetimes: a signed-in browser must not be able to extend its own sign-in.
+WEB_FILE_ONLY = {"session_days", "session_max_days"}
+WEB_FILE_ONLY_WHY = ("is not editable from the dashboard: a signed-in browser must not be able to lengthen its own "
+                     "sign-in. Edit [web] in board.local.toml by hand")
 
 _lock = threading.Lock()
 
@@ -98,6 +102,8 @@ def validate_changes(changes: Any) -> dict[str, Any]:
         parts = key.split(".") if isinstance(key, str) else []
         if any(x in FILE_ONLY for x in parts) or (parts and parts[0] == "server"):
             raise Invalid(f"{key} {FILE_ONLY_WHY}")
+        if (parts and parts[0] == "web") or any(x in WEB_FILE_ONLY for x in parts):
+            raise Invalid(f"{key} {WEB_FILE_ONLY_WHY}")
         spec = EDITABLE.get(key)
         if spec is None:
             raise Invalid(f"unknown setting {key!r}; editable settings are: {', '.join(EDITABLE)}")

@@ -42,6 +42,8 @@ log = logging.getLogger("agent_comms.core")
 RELOADABLE_INT = ("lease_ttl_minutes", "max_agent_posts_per_thread_without_human", "daily_post_cap_per_agent",
                   "body_max_bytes", "max_refs")
 RELOADABLE_BOOL = ("require_human_accept",)
+RELOADABLE_WEB = ("session_days", "session_max_days")   # [web] sign-in session lifetimes (weblogin.py)
+WEB_DAYS_MAX = 3650
 RESTART_ONLY = ("host", "port", "db_path", "agents_path")
 
 
@@ -191,6 +193,12 @@ def check_reloadable(s: Settings) -> None:
     for k in RELOADABLE_BOOL:
         if not isinstance(getattr(s, k), bool):
             raise ValueError(f"[tasks] {k} must be true or false")
+    for k in RELOADABLE_WEB:
+        v = getattr(s, k)
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= WEB_DAYS_MAX:
+            raise ValueError(f"[web] {k} must be a whole number of days from 1 to {WEB_DAYS_MAX}")
+    if s.session_max_days < s.session_days:
+        raise ValueError("[web] session_max_days must be at least session_days")
     if not isinstance(s.dispatch, dict):
         raise ValueError("[dispatch] must be a table")
     DispatchConfig.from_dict(s.dispatch)
@@ -299,7 +307,7 @@ class Board:
                 log.warning("settings not reloaded; keeping the last good settings: %s", self.settings_error)
                 return False
             self.settings_error = None
-            for k in RELOADABLE_INT + RELOADABLE_BOOL:
+            for k in RELOADABLE_INT + RELOADABLE_BOOL + RELOADABLE_WEB:
                 old = getattr(self.s, k)
                 if old != getattr(new, k):
                     log.info("setting %s: %r -> %r", k, old, getattr(new, k))
@@ -311,14 +319,18 @@ class Board:
             self.settings_generation += 1
             return True
 
-    def authenticate(self, token: str | None) -> Principal:
-        if not token:
-            raise Unauthorized("missing bearer token")
+    def refresh_identities(self) -> None:
+        """Pick up agents.toml and settings edits; run before every authentication (bearer or web session)."""
         self.sync_agents()
         try:
             self.reload_settings()
         except Exception:  # never let a settings problem lock anyone out
             log.exception("settings reload failed")
+
+    def authenticate(self, token: str | None) -> Principal:
+        if not token:
+            raise Unauthorized("missing bearer token")
+        self.refresh_identities()
         row = self.conn.execute(
             "SELECT name, runtime, is_human FROM agents WHERE token_hash = ? AND active = 1", (hash_token(token),)
         ).fetchone()

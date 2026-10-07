@@ -15,7 +15,7 @@ async function setup(human = true, fail = false) {
     task_categories: ['review', 'implementation', 'tests', 'documentation'],
     authorization_grants: [{ id: 7, category: 'review', project: '/repo', agents: ['codex'],
       purpose: '<img src=x onerror=alert(1)>', active: true, expires_at: null, revoked_at: null }] };
-  const dom = new JSDOM(html, { url: 'http://localhost/#token=dummy', runScripts: 'dangerously', beforeParse(win) {
+  const dom = new JSDOM(html, { url: 'http://localhost/', runScripts: 'dangerously', beforeParse(win) {
     win.confirm = () => true;
     win.fetch = async (url, options) => {
       calls.push({ url, ...options });

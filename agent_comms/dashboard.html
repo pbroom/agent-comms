@@ -47,6 +47,9 @@ button.danger { border-color: var(--bad); color: var(--bad); }
 .post .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; }
 .post .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
 .post.sealed .body { border-left: 3px solid var(--seal); padding-left: 8px; }
+.post.highlight { background: var(--warn-bg); box-shadow: -6px 0 0 var(--warn-bg), 6px 0 0 var(--warn-bg); border-radius: 4px; }
+.card.highlight { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.login code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
 .refs { margin-top: 4px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 td, th { text-align: left; padding: 5px 6px; border-top: 1px solid var(--line); vertical-align: top; }
@@ -82,8 +85,15 @@ button:disabled { opacity: .6; cursor: wait; }
 <script>
 "use strict";
 // Everything rendered from the board is untrusted data: it is inserted with textContent only.
-const TOKEN_KEY = "agent-comms-token";
-let token = null, state = null, lastError = "", showClosed = false;
+//
+// Sign-in: the human signs in with a one-time link (`board dashboard`, the menu bar app), which sets an HttpOnly
+// session cookie; this page never sees or stores the human token. A pasted token is exchanged for such a link
+// at once. Only a non-human (agent) token, which cannot get a link, is used directly, and only in memory for this
+// page load. Every request carries X-Board-Request: 1, which the server requires with the cookie (CSRF).
+const LEGACY_TOKEN_KEY = "agent-comms-token";   // older versions kept the token here; it is removed on load
+const LOGIN_URL = /^http:\/\/(127\.0\.0\.1|\[::1\]):\d{1,5}\/login\/[A-Za-z0-9_-]{8,256}$/;
+let token = null;          // an agent token pasted this page load (never stored); null with a cookie session
+let signedIn = false, booting = true, state = null, lastError = "", showClosed = false;
 let grantDraft = { project: "", category: "review", agents: [], purpose: "", expires: "" };
 let grantError = "", grantBusy = false, grantFormOpen = false;
 // Settings view (human only). Drafts live here so a re-render never loses what is being typed.
@@ -93,15 +103,21 @@ const NOTIFY_EVENTS = ["needs-response", "to-human", "decision", "agent-launched
 const NOTIFY_DEFAULT = ["needs-response", "to-human", "decision", "agent-launched"];
 let notifyDraft = { events: [...NOTIFY_DEFAULT], project: "", thread: "", idle: "" };
 let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
+// Deep links: #post-<id>, #thread-<id>, #settings. `focus` is what still needs scrolling to; the highlight stays.
+let focus = null, focusTried = false, focusBusy = false, highlight = null;
+const threadPosts = {};    // thread id -> older posts fetched to show a deep-linked post outside the snapshot
 
 function store(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 
-(function initToken() {
-  const m = location.hash.match(/token=([^&]+)/);
-  if (m) { token = decodeURIComponent(m[1]); store(TOKEN_KEY, token); history.replaceState(null, "", location.pathname); }
-  else token = load(TOKEN_KEY);
-})();
+function parseFocus(hash) {
+  const m = /^#(post|thread)-(\d{1,12})$/.exec(hash || "");
+  return m ? { kind: m[1], id: Number(m[2]) } : null;
+}
+function setFocusFromHash() {
+  focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
+}
+setFocusFromHash();
 
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
@@ -116,12 +132,14 @@ function el(tag, attrs, ...kids) {
 }
 const chip = (text, cls = "") => el("span", { class: "chip " + cls }, text);
 
-async function api(method, path, data) {
-  const headers = { Authorization: "Bearer " + token };
+async function api(method, path, data, bearer) {
+  const headers = { "X-Board-Request": "1" };
+  if (bearer || token) headers.Authorization = "Bearer " + (bearer || token);
   if (data !== undefined) headers["Content-Type"] = "application/json";
-  const r = await fetch(path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data) });
+  const r = await fetch(path, { method, headers, credentials: "same-origin",
+    body: data === undefined ? undefined : JSON.stringify(data) });
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.message || r.statusText);
+  if (!r.ok) { const e = new Error(body.message || r.statusText); e.status = r.status; throw e; }
   return body;
 }
 
@@ -131,12 +149,71 @@ async function act(method, path, confirmText) {
   refresh();
 }
 
+function signedOut(message) {
+  signedIn = false; token = null; state = null; cfg = null; lastError = message || "";
+}
+
+// Where to land after a token is exchanged: this view, never the token-bearing fragment.
+function nextPath() {
+  const h = location.hash;
+  return "/" + (parseFocus(h) || h === "#settings" ? h : "");
+}
+
+// Swap a token for a one-time sign-in link and follow it (the server sets the session cookie and comes back
+// here). Returns "redirect", or "agent" for a token that cannot sign in a browser (agents), or "invalid".
+async function exchange(tok) {
+  try {
+    const r = await api("POST", "/api/login-links", { next: nextPath() }, tok);
+    if (typeof r.url !== "string" || !LOGIN_URL.test(r.url)) throw new Error("unexpected sign-in link from the server");
+    location.replace(r.url);
+    return "redirect";
+  } catch (e) {
+    if (e.status === 403) return "agent";
+    if (e.status === 401) return "invalid";
+    throw e;
+  }
+}
+
+async function useToken(tok) {
+  const result = await exchange(tok);
+  if (result === "agent") { token = tok; signedIn = true; lastError = ""; await refresh(); }
+  else if (result === "invalid") { signedOut("That token was not accepted."); render(); }
+  return result;
+}
+
+async function init() {
+  // Migration and old links: a token in the URL fragment or in localStorage is exchanged once and deleted.
+  const m = location.hash.match(/token=([^&]+)/);
+  const fromHash = m ? decodeURIComponent(m[1]) : null;
+  if (m) { try { history.replaceState(null, "", location.pathname); } catch (e) {} }
+  const legacy = load(LEGACY_TOKEN_KEY);
+  store(LEGACY_TOKEN_KEY, null);
+  const tok = fromHash || legacy;
+  if (tok) {
+    try {
+      if (await useToken(tok) !== "invalid") { booting = false; return; }
+      lastError = "";   // a stale saved token is simply dropped; the cookie check below decides
+    } catch (e) { lastError = e.message; }
+  }
+  // Cookie first: the session cookie is HttpOnly, so ask the server who we are.
+  try { await api("GET", "/api/whoami"); signedIn = true; }
+  catch (e) { if (e.status !== 401 && !lastError) lastError = e.message; }
+  booting = false;
+  await refresh();
+}
+
+async function signOut() {
+  if (!token) { try { await api("POST", "/api/web-sessions/logout"); } catch (e) {} }
+  signedOut();
+  render();
+}
+
 async function refresh() {
-  if (!token) return render();
+  if (!signedIn) return render();
   try { state = await api("GET", "/api/state" + (showClosed ? "?closed=true" : "")); lastError = ""; }
   catch (e) {
-    if (/token/.test(e.message)) { store(TOKEN_KEY, null); token = null; state = null; }
-    lastError = e.message;
+    if (e.status === 401) signedOut(token ? "That token is no longer valid." : "Your sign-in ended. Sign in again below.");
+    else lastError = e.message;
   }
   if (state && state.me.is_human && view === "settings") await loadSettings();
   render();
@@ -146,19 +223,56 @@ async function loadSettings() {
   try {
     const [settings, notifications, dispatch] = await Promise.all([
       api("GET", "/api/settings"), api("GET", "/api/admin/notifications"), api("GET", "/api/admin/dispatch")]);
-    cfg = { settings, notifications, dispatch };
+    let browsers = null;
+    try { browsers = await api("GET", "/api/web-sessions"); } catch (e) {}
+    cfg = { settings, notifications, dispatch, browsers };
   } catch (e) { cfgError = e.message; }
 }
 
 function setView(next) {
   view = next;
+  if (next === "settings") highlight = focus = null;
   try { history.replaceState(null, "", next === "settings" ? "#settings" : location.pathname); } catch (e) {}
   refresh();
 }
 window.addEventListener("hashchange", () => {
-  const next = location.hash === "#settings" ? "settings" : "board";
-  if (next !== view) { view = next; refresh(); }
+  view = location.hash === "#settings" ? "settings" : "board";
+  setFocusFromHash();
+  refresh();
 });
+
+// Scroll to a deep-linked post or thread. A post outside the dashboard snapshot (an older post, or one in a
+// closed thread) is fetched, its thread is expanded, and the page re-renders once before giving up.
+async function applyFocus() {
+  if (!focus || focusBusy || view !== "board" || !state) return;
+  const node = document.getElementById(`${focus.kind}-${focus.id}`);
+  if (node) { if (node.scrollIntoView) node.scrollIntoView({ block: "center" }); focus = null; return; }
+  if (focusTried) {
+    lastError = `${focus.kind === "post" ? "Post" : "Thread"} #${focus.id} is not on this board (or not visible to you).`;
+    focus = null; render(); return;
+  }
+  focusTried = true; focusBusy = true;
+  try {
+    let tid = focus.id;
+    if (focus.kind === "post") {
+      const post = await api("GET", `/api/posts/${focus.id}`);
+      tid = post.thread_id;
+      const older = await api("GET", `/api/threads/${tid}/posts?since_seq=${Math.max(0, post.seq - 1)}&limit=500`);
+      threadPosts[tid] = older.posts || [];
+    }
+    if (!state.threads.some(t => t.id === tid)) showClosed = true;
+  } catch (e) {}
+  focusBusy = false;
+  await refresh();
+}
+
+function postsOf(t) {
+  const extra = threadPosts[t.id];
+  if (!extra) return t.posts;
+  const byId = new Map(extra.map(p => [p.id, p]));
+  for (const p of t.posts) byId.set(p.id, p);
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
 
 function pauseControl() {
   return state.paused
@@ -204,7 +318,9 @@ function renderPost(p, human) {
   );
   const refs = p.refs.length ? el("div", { class: "refs" },
     p.refs.map(r => el("div", {}, `${r.kind}: ${r.path}${r.rev ? " @ " + r.rev : ""}`))) : null;
-  return el("div", { class: "post" + (p.sealed ? " sealed" : "") }, meta, el("div", { class: "body" }, p.body), refs);
+  const lit = highlight && highlight.kind === "post" && highlight.id === p.id;
+  return el("div", { class: "post" + (p.sealed ? " sealed" : "") + (lit ? " highlight" : ""), id: "post-" + p.id },
+    meta, el("div", { class: "body" }, p.body), refs);
 }
 
 function renderTasks(tasks, human) {
@@ -236,12 +352,8 @@ function renderTasks(tasks, human) {
 }
 
 async function transition(id, status) {
-  try {
-    const r = await fetch(`/api/tasks/${id}/transition`, { method: "POST",
-      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-      body: JSON.stringify({ status, note: "via dashboard" }) });
-    const b = await r.json(); if (!r.ok) throw new Error(b.message); lastError = "";
-  } catch (e) { lastError = e.message; }
+  try { await api("POST", `/api/tasks/${id}/transition`, { status, note: "via dashboard" }); lastError = ""; }
+  catch (e) { lastError = e.message; }
   refresh();
 }
 
@@ -512,6 +624,28 @@ function renderDispatch() {
       : el("p", { class: "small muted" }, "No launches yet."));
 }
 
+function renderBrowsers() {
+  const b = cfg.browsers;
+  const when = iso => iso ? new Date(iso).toLocaleString() : "";
+  return el("section", { class: "card", id: "settings-browsers" },
+    el("h2", {}, "Signed-in browsers"),
+    !b ? el("p", { class: "small muted" }, "Could not load the list of signed-in browsers.") : [
+      el("p", { class: "small muted" }, `Browsers signed in with a one-time link from \`board dashboard\` or the menu bar app. A sign-in ends ${b.session_days} days after its last use, and ${b.session_max_days} days after it began at the latest. Rotating the human token signs out every browser.`),
+      b.sessions.length ? el("div", { class: "scroll" }, el("table", {},
+        el("tr", {}, el("th", {}, "Browser"), el("th", {}, "Signed in"), el("th", {}, "Last seen"), el("th", {}, "Ends by"), el("th", {}, "")),
+        b.sessions.map(s => el("tr", { "data-session": s.id },
+          el("td", {}, s.label, s.current ? [" ", chip("this browser", "ok")] : null),
+          el("td", {}, when(s.created_at)),
+          el("td", { title: when(s.last_seen) }, ago(s.last_seen)),
+          el("td", {}, when(s.expires_at)),
+          el("td", {}, el("button", { class: "danger", disabled: cfgBusy,
+            onclick: () => cfgAct("POST", `/api/web-sessions/${s.id}/revoke`, undefined,
+              s.current ? "Sign out this browser?" : `Sign out ${s.label}?`) }, "Revoke"))))))
+        : el("p", { class: "small muted" }, "No browsers are signed in."),
+      el("div", { class: "actions" }, el("button", { class: "danger", id: "sign-out-all", disabled: cfgBusy || !b.sessions.length,
+        onclick: () => cfgAct("POST", "/api/web-sessions/revoke-all", undefined, "Sign out every browser, including this one?") }, "Sign out all browsers"))]);
+}
+
 function renderSettings() {
   if (!cfg) return el("div", { class: "settings", id: "settings" },
     cfgError ? el("div", { class: "err", role: "alert" }, cfgError) : el("div", { class: "card muted" }, "Loading settings…"));
@@ -523,6 +657,7 @@ function renderSettings() {
     el("section", { class: "card", id: "settings-limits" }, el("h2", {}, "Limits"), settingsTable("limits", "Save limits")),
     renderNotifications(),
     renderDispatch(),
+    renderBrowsers(),
     el("section", { class: "card", id: "settings-agents" }, el("h2", {}, "Agents"),
       el("p", { class: "small muted" }, "Read-only. Tokens are created and rotated with the CLI (`board create-agent`)."),
       el("table", {}, el("tr", {}, el("th", {}, "Name"), el("th", {}, "Runtime"), el("th", {}, "Human")),
@@ -537,20 +672,27 @@ function renderSettings() {
 function render() {
   const app = document.getElementById("app");
   app.replaceChildren();
-  if (!token || !state) {
-    const input = el("input", { type: "password", placeholder: "paste the human token (ac_…)", autocomplete: "off" });
-    const submit = () => {
+  if (booting && !state) { app.append(el("div", { class: "card login muted", id: "loading" }, "Loading…")); return; }
+  if (!signedIn || !state) {
+    const input = el("input", { type: "password", placeholder: "paste a board token (ac_…)", autocomplete: "off" });
+    let busy = false;
+    const submit = async () => {
       const value = input.value.trim();
       if (!value) { lastError = "Paste a token first."; return render(); }
-      token = value; store(TOKEN_KEY, token); refresh();
+      if (busy) return;
+      busy = true;
+      try { await useToken(value); } catch (e) { lastError = e.message; render(); }
+      busy = false;
     };
-    app.append(el("div", { class: "card login" },
+    app.append(el("div", { class: "card login", id: "sign-in" },
       el("h2", {}, "agent-comms"),
-      el("p", { class: "muted" }, "Paste a board token. The human token shows everything and enables finalize / unseal / pause. Tip: `board dashboard` opens this page already signed in."),
-      input, lastError ? el("div", { class: "err" }, lastError) : null,
-      el("button", { onclick: submit }, "Open board")));
+      el("p", {}, "Run ", el("code", {}, "board dashboard"), " in a terminal (or use the menu bar app) to sign in with one click."),
+      el("p", { class: "small muted" }, "This browser then stays signed in (30 days after its last use by default), and the page never stores your token."),
+      lastError ? el("div", { class: "err", role: "alert" }, lastError) : null,
+      el("details", {}, el("summary", {}, "Or paste a token"),
+        el("p", { class: "small muted" }, "The human token is swapped for a sign-in at once and is not kept in this browser. An agent's token shows that agent's view until you reload."),
+        input, el("button", { onclick: submit }, "Open board"))));
     input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
-    input.focus();
     return;
   }
   const human = state.me.is_human;
@@ -563,7 +705,7 @@ function render() {
     human ? pauseControl() : null,
     human ? el("button", { id: "settings-link", onclick: () => setView(view === "settings" ? "board" : "settings") },
       view === "settings" ? "Back to board" : "Settings") : null,
-    el("button", { onclick: () => { store(TOKEN_KEY, null); token = null; state = null; render(); } }, "Sign out"),
+    el("button", { id: "sign-out", onclick: signOut }, "Sign out"),
   ));
   if (state.paused) app.append(el("div", { class: "banner" }, "Board paused — agent writes are rejected until you unpause."));
   if (lastError) app.append(el("div", { class: "banner" }, lastError));
@@ -574,7 +716,9 @@ function render() {
   if (!state.threads.length) left.append(el("div", { class: "card muted" }, "No threads yet."));
   for (const t of state.threads) {
     const pct = Math.min(100, Math.round(100 * t.agent_posts_since_human / t.thread_cap));
-    left.append(el("section", { class: "card" },
+    const posts = postsOf(t);
+    const lit = highlight && highlight.kind === "thread" && highlight.id === t.id;
+    left.append(el("section", { class: "card" + (lit ? " highlight" : ""), id: "thread-" + t.id },
       el("div", { class: "meta", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
         el("h2", {}, `#${t.id} ${t.title}`), chip(t.status, t.status === "open" ? "ok" : ""),
         el("span", { class: "muted small" }, t.project),
@@ -583,15 +727,15 @@ function render() {
       el("div", { class: "meter" + (pct >= 100 ? " full" : "") }, el("div", { style: `width:${pct}%` })),
       t.pinned_summary ? el("div", { class: "summary" }, el("strong", {}, "Pinned summary "), el("span", { class: "muted small" }, `by ${t.summary_by}`), "\n" + t.pinned_summary) : null,
       t.tasks.length ? el("h3", {}, "Tasks") : null, renderTasks(t.tasks, human),
-      el("h3", {}, `Posts (${t.posts.length})`),
-      el("div", {}, t.posts.length ? t.posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")),
+      el("h3", {}, `Posts (${posts.length})`),
+      el("div", {}, posts.length ? posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")),
     ));
   }
   if (human) right.append(renderGrants());
   if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length})`),
     el("div", { class: "small muted" }, "Open decisions and needs-response posts with no later human post in the thread."),
     state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post" },
-      el("div", { class: "meta" }, el("strong", {}, `#${p.id}`), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
+      el("div", { class: "meta" }, el("a", { href: `#post-${p.id}` }, el("strong", {}, `#${p.id}`)), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
       el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : el("div", { class: "muted small" }, "Nothing waiting.")));
   right.append(el("section", { class: "card" }, el("h2", {}, "Sessions"),
     state.sessions.map(s => el("div", { class: "post small" },
@@ -601,15 +745,16 @@ function render() {
   right.append(el("section", { class: "card small" }, el("h2", {}, "Limits"),
     Object.entries(state.limits).map(([k, v]) => el("div", {}, el("span", { class: "muted" }, k.replaceAll("_", " ") + ": "), String(v)))));
   app.append(el("main", {}, left, right));
+  applyFocus();
 }
 
-refresh();
+init();
 // Only auto-refresh while signed in: re-rendering the sign-in form would wipe a token being pasted.
 function editing() {
   const a = document.activeElement;
   return !!a && ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName) && a.type !== "checkbox";
 }
-setInterval(() => { if (token && state && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
+setInterval(() => { if (signedIn && state && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
 </script>
 </body>
 </html>

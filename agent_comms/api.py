@@ -8,18 +8,30 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from . import board_settings, dispatch, summary
+from . import board_settings, dispatch, summary, weblogin
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
 
 DASHBOARD = Path(__file__).with_name("dashboard.html")
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1", "testserver"}
+CSRF_HEADER = "x-board-request"   # the dashboard sends "X-Board-Request: 1" on every request
+PAGE_CSP = ("default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-ancestors 'none'")
+LINK_EXPIRED_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link expired</title>
+<style>body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:32rem;margin:15vh auto;
+padding:0 16px;color:#1d1d1b;background:#f6f6f4}@media (prefers-color-scheme:dark){body{color:#ecebe6;background:#151514}}
+code{font-family:ui-monospace,Menlo,monospace}</style></head>
+<body><h1>Link expired</h1><p>Sign-in links work once and only for a minute. Run <code>board dashboard</code>
+again (or use the menu bar app) to get a new one.</p></body></html>
+"""
 
 
 class Body(BaseModel):
@@ -111,6 +123,10 @@ class DispatchRuleIn(Body):
     expires_in_hours: float | None = None
 
 
+class LoginLinkIn(Body):
+    next: str = "/"
+
+
 class AckIn(Body):
     ack_through: int
     thread_id: int | None = None
@@ -151,10 +167,45 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     async def board_error(_: Request, e: BoardError):
         return JSONResponse({"error": e.code, "message": e.message}, status_code=e.status)
 
-    def principal(request: Request) -> Principal:
-        auth = request.headers.get("authorization", "")
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else None
-        return board.authenticate(token)
+    def port_of(request: Request) -> int:
+        return request.url.port or settings.port
+
+    def session_cookie(request: Request) -> str | None:
+        return request.cookies.get(weblogin.cookie_name(port_of(request)))
+
+    def check_csrf(request: Request) -> None:
+        # A cookie rides along on any request the browser makes, so a cookie-authenticated request must also show
+        # it came from this dashboard: a custom header (another origin cannot add one without a CORS preflight,
+        # which this server never grants) and, when the browser sends one, an Origin equal to this server's.
+        if request.headers.get(CSRF_HEADER) != "1":
+            raise Forbidden("cookie-authenticated requests need the X-Board-Request: 1 header")
+        origin = request.headers.get("origin")
+        if origin is not None and origin != f"http://{request.headers.get('host', '')}":
+            raise Forbidden("cross-origin request refused")
+
+    def set_session_cookie(response: Response, request: Request, secret: str, max_age: int) -> None:
+        # Not Secure: Safari does not keep Secure cookies set over http://127.0.0.1 (DESIGN_NOTES "Dashboard sign-in").
+        response.set_cookie(weblogin.cookie_name(port_of(request)), secret, max_age=max_age, path="/",
+                            httponly=True, samesite="strict")
+
+    def clear_session_cookie(response: Response, request: Request) -> None:
+        response.delete_cookie(weblogin.cookie_name(port_of(request)), path="/", httponly=True, samesite="strict")
+
+    def principal(request: Request, response: Response) -> Principal:
+        # A bearer header always wins, and is all that /mcp and the ChatGPT gateway accept. The session cookie is
+        # the dashboard's: it resolves to the human only, and only for the /api routes in this file.
+        auth = request.headers.get("authorization")
+        secret = session_cookie(request)
+        if auth is not None or not secret:
+            request.state.auth = "bearer"
+            token = auth[7:].strip() if auth and auth.lower().startswith("bearer ") else None
+            return board.authenticate(token)
+        check_csrf(request)
+        p, renewed = weblogin.authenticate_session(board, secret)
+        request.state.auth = "cookie"
+        if renewed is not None:
+            set_session_cookie(response, request, secret, renewed)
+        return p
 
     def sid(p: Principal, request: Request, given: int | None) -> int:
         if given is not None:
@@ -185,10 +236,47 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     # ---------------------------------------------------------------- misc
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def dashboard():
-        return HTMLResponse(DASHBOARD.read_text(), headers={
-            "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                                       "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
-            "Cache-Control": "no-store"})
+        return HTMLResponse(DASHBOARD.read_text(), headers={"Content-Security-Policy": PAGE_CSP,
+                                                           "Cache-Control": "no-store"})
+
+    # ---------------------------------------------------------------- dashboard sign-in (see weblogin.py)
+    @app.post("/api/login-links")
+    def create_login_link(request: Request, body: LoginLinkIn | None = None, p: Principal = P):
+        # Bearer only: a cookie session must not be able to mint itself a fresh session past its absolute limit.
+        if request.state.auth != "bearer":
+            raise Forbidden("sign-in links need the human bearer token")
+        code = weblogin.create_link(board, p, body.next if body else "/")
+        # Contract (menu bar app, CLI): exactly http://127.0.0.1:<port>/login/<code>, no query and no fragment.
+        # The cookie is per host, so every sign-in lands on 127.0.0.1. Only a board bound to ::1 differs.
+        host = "[::1]" if settings.host == "::1" else "127.0.0.1"
+        return {"url": f"http://{host}:{port_of(request)}/login/{code}",
+                "expires_in_seconds": weblogin.LINK_TTL_SECONDS}
+
+    @app.get("/login/{code}", include_in_schema=False)
+    def login(code: str, request: Request):
+        headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+        try:
+            secret, target, max_age = weblogin.redeem_link(
+                board, code, weblogin.browser_label(request.headers.get("user-agent")))
+        except BoardError:
+            return HTMLResponse(LINK_EXPIRED_PAGE, status_code=410,
+                                headers=headers | {"Content-Security-Policy": PAGE_CSP})
+        # 303 to the same-origin path stored with the code (never taken from this request); a #fragment is kept.
+        response = Response(status_code=303, headers=headers | {"Location": target})
+        set_session_cookie(response, request, secret, max_age)
+        return response
+
+    @app.post("/api/web-sessions/logout")
+    def logout(request: Request):
+        # Works with an expired session too. The CSRF check keeps other pages from signing you out.
+        secret = session_cookie(request)
+        signed_out = False
+        if secret:
+            check_csrf(request)
+            signed_out = weblogin.sign_out(board, secret)
+        response = JSONResponse({"signed_out": signed_out})
+        clear_session_cookie(response, request)
+        return response
 
     @app.get("/api/whoami")
     def whoami(p: Principal = P):
@@ -328,6 +416,27 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         # A partial update of EDITABLE keys only, e.g. {"limits.daily_post_cap_per_agent": 100}; null removes the
         # board.local.toml override. Host, port, paths, runners, env and worktrees are refused (400).
         return board_settings.update_settings(board, p, changes)
+
+    @app.get("/api/web-sessions")
+    def web_sessions(request: Request, p: Principal = H):
+        current = session_cookie(request) if request.state.auth == "cookie" else None
+        sliding, absolute = weblogin.lifetimes(board.s)
+        return {"sessions": weblogin.list_sessions(board, p, current), "session_days": sliding // weblogin.DAY,
+                "session_max_days": absolute // weblogin.DAY}
+
+    @app.post("/api/web-sessions/revoke-all")
+    def revoke_all_web_sessions(request: Request, response: Response, p: Principal = H):
+        n = weblogin.revoke_all(board, p)
+        if request.state.auth == "cookie":
+            clear_session_cookie(response, request)
+        return {"revoked": n}
+
+    @app.post("/api/web-sessions/{session_id}/revoke")
+    def revoke_web_session(session_id: str, request: Request, response: Response, p: Principal = H):
+        out = weblogin.revoke_session(board, p, session_id)
+        if request.state.auth == "cookie" and weblogin.session_id_of(session_cookie(request)) == session_id:
+            clear_session_cookie(response, request)
+        return out
 
     @app.get("/api/admin/notifications")
     def list_notifications(p: Principal = H):
