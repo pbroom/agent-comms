@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
 
-from . import db
+from . import conversations, db
 from .config import LOCAL_SETTINGS, Settings, hash_token, read_agents
 from .notify import CHANNEL as NOTIFY_CHANNEL, DEFAULT_IDLE_MINUTES, DEFAULT_NOTIFY_EVENTS, NOTIFY_EVENTS, HumanNotifier
 
@@ -202,6 +202,7 @@ def check_reloadable(s: Settings) -> None:
     if not isinstance(s.dispatch, dict):
         raise ValueError("[dispatch] must be a table")
     DispatchConfig.from_dict(s.dispatch)
+    conversations.ConversationConfig.from_dict(s.conversations)
 
 
 # ---------------------------------------------------------------- board
@@ -237,6 +238,7 @@ class Board:
         self._settings_sig = self._settings_files_sig()
         self.settings_generation = 0
         self.settings_error: str | None = None   # why the last reload was refused (the last good settings stay)
+        self._codex: conversations.CodexResolver | None = None   # Codex thread lookup (resolve_conversations)
         db.init_schema(self.conn)
         self.sync_agents(force=True)
 
@@ -313,6 +315,7 @@ class Board:
                     log.info("setting %s: %r -> %r", k, old, getattr(new, k))
                     setattr(self.s, k, getattr(new, k))
             self.s.dispatch = new.dispatch
+            self.s.conversations = new.conversations
             for k in RESTART_ONLY:
                 if getattr(self.s, k) != getattr(new, k):
                     log.warning("setting %s changed in the settings files; restart this process to apply it", k)
@@ -715,11 +718,15 @@ class Board:
     # ------------------------------------------------------------ sessions
 
     def register_session(self, p: Principal, project: str, worktree: str | None = None,
-                         resume_session_id: int | None = None) -> dict:
+                         resume_session_id: int | None = None, client: tuple[str, str] | None = None) -> dict:
+        """`client` = (kind, conversation uuid) of the client conversation this session runs in. Only server-side
+        capture passes it (the stdio MCP server, from its inherited environment); no tool or HTTP parameter maps
+        to it. An invalid value is dropped. Resuming with a client moves the session to that conversation."""
         project = _norm_path(project)
         if not project:
             raise Invalid("project (absolute path of the repo you are working in) is required")
         worktree = _norm_path(worktree)
+        client = conversations.normalize_client(client)
         now = self.now()
         with db.write_tx(self.conn) as c:
             if resume_session_id is not None:
@@ -728,11 +735,15 @@ class Board:
                     raise Forbidden("that session does not belong to you")
                 c.execute("UPDATE sessions SET project=?, worktree=?, last_seen=? WHERE id=?",
                           (project, worktree, now, resume_session_id))
+                if client:
+                    c.execute("UPDATE sessions SET client_kind=?, client_session_id=? WHERE id=?",
+                              (*client, resume_session_id))
                 sid = resume_session_id
             else:
                 sid = c.execute(
-                    "INSERT INTO sessions(agent, runtime, project, worktree, started_at, last_seen) VALUES (?,?,?,?,?,?)",
-                    (p.name, p.runtime, project, worktree, now, now),
+                    """INSERT INTO sessions(agent, runtime, project, worktree, started_at, last_seen, client_kind,
+                       client_session_id) VALUES (?,?,?,?,?,?,?,?)""",
+                    (p.name, p.runtime, project, worktree, now, now, *(client or (None, None))),
                 ).lastrowid
                 # A new session starts where the agent as a whole has read up to, instead of replaying history.
                 c.execute(
@@ -1525,8 +1536,31 @@ class Board:
             t["posts"] = [self._post_out(r, p) for r in rows]
             t["tasks"] = [self._task_out(r, events=True) for r in
                           self.conn.execute("SELECT * FROM tasks WHERE thread_id = ? ORDER BY id", (t["id"],))]
-        sessions = [dict(r) | {"started_at": iso(r["started_at"]), "last_seen": iso(r["last_seen"])}
-                    for r in self.conn.execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 30")]
+        # Conversation links are the human's: agents never see another session's client conversation id.
+        links = p.is_human and conversations.config_of(self.s).enabled
+        if links:
+            self.resolve_conversations()
+        sessions = []
+        for r in self.conn.execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 30"):
+            d = {k: r[k] for k in r.keys() if k not in ("client_kind", "client_session_id")}
+            d |= {"started_at": iso(r["started_at"]), "last_seen": iso(r["last_seen"])}
+            if p.is_human:
+                d["conversation"] = self._conversation(r) if links else None
+            sessions.append(d)
+        if p.is_human:
+            # Task rows link to the owner's conversation while it holds or works the task.
+            owners: dict[int, dict | None] = {}
+            for t in threads:
+                for k in t["tasks"]:
+                    sid = k["owner_session"]
+                    live = k["status"] in ("working", "blocked") or k["lease_state"] == "active"
+                    if not (links and live and sid):
+                        k["owner_conversation"] = None
+                        continue
+                    if sid not in owners:
+                        row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
+                        owners[sid] = self._conversation(row) if row else None
+                    k["owner_conversation"] = owners[sid]
         needs_you = []
         if p.is_human:
             needs_you = [self._post_out(r, p) for r in self.conn.execute(
@@ -1537,6 +1571,41 @@ class Board:
                 "threads": threads, "sessions": sessions, "needs_you": needs_you,
                 "agents": [dict(r) for r in self.conn.execute(
                     "SELECT name, runtime, is_human FROM agents WHERE active = 1 ORDER BY is_human DESC, name")]}
+
+    # ------------------------------------------------------------ conversation links (conversations.py)
+
+    @staticmethod
+    def _conversation(r: sqlite3.Row) -> dict | None:
+        return conversations.conversation(r["client_kind"], r["client_session_id"], r["worktree"] or r["project"])
+
+    def _codex_resolver(self, cfg: conversations.ConversationConfig) -> conversations.CodexResolver:
+        home = cfg.codex_dir()
+        if self._codex is None or self._codex.home != home:
+            self._codex = conversations.CodexResolver(home, self.now)
+        return self._codex
+
+    def resolve_conversations(self) -> int:
+        """Link recent, still unlinked Codex sessions to their Codex threads (CodexResolver: bounded and at most
+        once a minute per session). Runs when the human loads the dashboard; never fails the caller."""
+        cfg = conversations.config_of(self.s)
+        if not cfg.enabled:
+            return 0
+        try:
+            rows = self.conn.execute(
+                """SELECT id, agent, started_at FROM sessions WHERE client_session_id IS NULL AND runtime LIKE 'codex%'
+                   AND last_seen >= ? ORDER BY id DESC LIMIT 50""",
+                (self.now() - conversations.RECENT_SECONDS,)).fetchall()
+            found = self._codex_resolver(cfg).resolve([dict(r) for r in rows]) if rows else {}
+            for sid, thread in found.items():
+                if conversations.normalize_uuid(thread) is None:
+                    continue
+                with db.write_tx(self.conn) as c:
+                    c.execute("""UPDATE sessions SET client_kind = ?, client_session_id = ?
+                                 WHERE id = ? AND client_session_id IS NULL""", (conversations.CODEX, thread, sid))
+            return len(found)
+        except Exception:   # a missing or odd Codex home must never break the dashboard
+            log.exception("codex conversation lookup failed")
+            return 0
 
     # ------------------------------------------------------------ brief (session-start awareness)
 

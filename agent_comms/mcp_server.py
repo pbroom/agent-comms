@@ -15,6 +15,7 @@ import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from . import conversations
 from .core import MAX_WAIT_SECONDS, RECOMMENDED_WAIT_SECONDS, UNTRUSTED_NOTICE, Board, BoardError, Principal
 
 INSTRUCTIONS = f"""agent-comms: a shared message board for the AI agents on this machine.
@@ -64,6 +65,17 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
             return state["session_id"]
         raise ToolError("no session: call board_register first and pass the returned session_id")
 
+    def client_conversation(p: Principal) -> tuple[str, str] | None:
+        # The Claude Code conversation that launched this stdio server, for the human's dashboard link. Read from
+        # the environment Claude Code gave this process, never from tool arguments; HTTP clients are not captured.
+        # A Codex CLI started from a Claude Code terminal inherits the variable too, so Codex identities are
+        # skipped (their thread is found from Codex's own rollout files instead, conversations.CodexResolver).
+        if transport != "stdio" or p.runtime.lower().startswith("codex"):
+            return None
+        if not conversations.config_of(board.s).enabled:
+            return None
+        return conversations.claude_client_from_env(os.environ)
+
     def run(fn):
         try:
             return fn()
@@ -80,7 +92,8 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         p = principal(ctx)
         if project is None and transport == "stdio":
             project = os.getcwd()
-        out = run(lambda: board.register_session(p, project or "", worktree, resume_session_id))
+        out = run(lambda: board.register_session(p, project or "", worktree, resume_session_id,
+                                                 client=client_conversation(p)))
         if transport == "stdio":
             state["session_id"] = out["session_id"]
         return out

@@ -113,6 +113,13 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .settings .toggle { display: flex; gap: 8px; align-items: flex-start; }
 .settings .scroll { overflow-x: auto; }
 button:disabled { opacity: .6; cursor: wait; }
+/* Conversation links (human only): open an agent's own conversation in its desktop app, or copy the resume command. */
+.convo { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; vertical-align: middle; }
+.convo a.chip { text-decoration: none; }
+.convo a.chip:hover { text-decoration: underline; }
+.convo button { padding: 0 7px; border-radius: 999px; }
+td > .convo, .post > .convo { display: flex; margin-top: 3px; }
+.convo-list { display: flex; gap: 6px 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -345,6 +352,54 @@ function leaseChip(t) {
   return chip("no lease");
 }
 
+// Conversation links. The server builds them from validated UUIDs for the human only; they are checked again here
+// against the only two shapes there are, and anything else renders nothing. The app name comes from the URL scheme,
+// not from the data. The copy button copies only the command (built from the UUID), never the agent-supplied
+// directory: a path pasted into a shell could carry a command of its own. The directory is shown as text.
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const CONVERSATION = [
+  { app: "Claude", url: new RegExp(`^claude://resume\\?session=(${UUID})$`), command: id => `claude --resume ${id}` },
+  { app: "ChatGPT", url: new RegExp(`^codex://threads/(${UUID})$`), command: id => `codex resume ${id}` },
+];
+
+function conversationLinks(c, who) {
+  if (!c || typeof c !== "object" || typeof c.url !== "string") return null;
+  for (const kind of CONVERSATION) {
+    const m = kind.url.exec(c.url);
+    if (!m) continue;
+    const cmd = kind.command(m[1]);
+    const cwd = typeof c.cwd === "string" ? c.cwd : "";
+    const label = `${who ? who + ": " : ""}open this conversation in the ${kind.app} app`;
+    const copy = el("button", { class: "copy-resume", "data-command": cmd,
+      title: `Copy “${cmd}”` + (cwd ? ` and run it in ${cwd}` : ""), "aria-label": `Copy resume command${who ? " for " + who : ""}` },
+      "Copy resume");
+    copy.addEventListener("click", e => { e.stopPropagation(); copyText(cmd, copy); });
+    return el("span", { class: "convo" },
+      el("a", { class: "chip accent", href: c.url, rel: "noopener noreferrer", title: label, "aria-label": label }, "Open in " + kind.app),
+      copy);
+  }
+  return null;
+}
+
+async function copyText(text, button) {
+  let done = false;
+  try { await navigator.clipboard.writeText(text); done = true; }
+  catch (e) {
+    const area = el("textarea", { readonly: true, style: "position:fixed;opacity:0" }, text);
+    document.body.append(area); area.select();
+    try { done = document.execCommand("copy"); } catch (e2) {}
+    area.remove();
+  }
+  button.textContent = done ? "Copied" : "Copy failed";
+  setTimeout(() => { button.textContent = "Copy resume"; }, 1500);
+}
+
+// A task's owner is linked while it works on or holds the task (the server applies the same rule).
+function taskConversation(t) {
+  return t.owner_conversation && (["working", "blocked"].includes(t.status) || t.lease_state === "active")
+    ? conversationLinks(t.owner_conversation, t.owner_agent) : null;
+}
+
 function statusChip(s) {
   const cls = { done: "ok", declined: "", blocked: "warn", working: "accent", proposed: "warn" }[s] || "";
   return chip(s, cls);
@@ -388,7 +443,8 @@ function renderTasks(tasks, human) {
           t.events.map(e => el("div", { class: "small muted" },
             `${e.at.slice(11, 19)} ${e.event} ${e.from || ""}→${e.to || ""} by ${e.agent}${e.session_id ? " s" + e.session_id : ""}${e.note ? " — " + e.note : ""}`))) : null),
       el("td", {}, statusChip(t.status)),
-      el("td", {}, t.owner_agent ? `${t.owner_agent} s${t.owner_session}` : el("span", { class: "muted" }, "—")),
+      el("td", {}, t.owner_agent ? `${t.owner_agent} s${t.owner_session}` : el("span", { class: "muted" }, "—"),
+        human ? taskConversation(t) : null),
       el("td", {}, leaseChip(t),
         t.lease_state === "active" && t.owner_may_work === false
           ? el("div", { class: "small err" }, t.authorization && !t.authorization.active
@@ -850,15 +906,25 @@ function renderThreadList(threads, current, human, statuses, hidden) {
       hidden ? `No active threads. ${plural(hidden, "completed thread")} hidden.` : "No threads yet."));
 }
 
-function renderThread(t, human) {
+function renderThread(t, human, st) {
   const pct = Math.min(100, Math.round(100 * t.agent_posts_since_human / t.thread_cap));
   const posts = postsOf(t);
   const lit = highlight && highlight.kind === "thread" && highlight.id === t.id;
+  // Being worked on (the grey pulsing dot): link each working agent's conversation, once per conversation.
+  const working = [], urls = new Set();
+  if (human && st && st.kind === "active") for (const k of t.tasks) {
+    if (k.status !== "working" || k.lease_state !== "active") continue;
+    const links = taskConversation(k);
+    if (!links || urls.has(k.owner_conversation.url)) continue;
+    urls.add(k.owner_conversation.url);
+    working.push(el("span", { class: "convo" }, el("span", {}, k.owner_agent), links));
+  }
   return el("section", { class: "card" + (lit ? " highlight" : ""), id: "thread-" + t.id },
     el("div", { class: "meta", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
       el("h2", {}, `#${t.id} ${t.title}`), chip(t.status, t.status === "open" ? "ok" : ""),
       el("span", { class: "muted small" }, t.project),
       human ? el("button", { onclick: () => act("POST", `/api/threads/${t.id}/${t.status === "open" ? "close" : "reopen"}`) }, t.status === "open" ? "Close" : "Reopen") : null),
+    working.length ? el("div", { class: "convo-list small", id: "working-conversations" }, el("span", { class: "muted" }, "Working:"), working) : null,
     el("div", { class: "small muted", style: "margin-top:6px" }, `agent posts since your last post: ${t.agent_posts_since_human} / ${t.thread_cap}`),
     el("div", { class: "meter" + (pct >= 100 ? " full" : "") }, el("div", { style: `width:${pct}%` })),
     t.pinned_summary ? el("div", { class: "summary" }, el("strong", {}, "Pinned summary "), el("span", { class: "muted small" }, `by ${t.summary_by}`), "\n" + t.pinned_summary) : null,
@@ -955,7 +1021,7 @@ function render() {
   const current = threads.find(t => t.id === selected) || threads[0] || null;
   if (current) { markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
   list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
-  pane.append(current ? renderThread(current, human)
+  pane.append(current ? renderThread(current, human, statuses.get(current.id))
     : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   if (human) right.append(renderGrants());
   if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length})`),
@@ -967,7 +1033,8 @@ function render() {
     state.sessions.map(s => el("div", { class: "post small" },
       el("div", {}, el("strong", {}, `s${s.id} ${s.agent}`), " ", el("span", { class: "muted" }, s.runtime)),
       el("div", { class: "muted refs" }, s.project + (s.worktree ? "  (wt " + s.worktree + ")" : "")),
-      el("div", { class: "muted" }, "seen " + ago(s.last_seen))))));
+      el("div", { class: "muted" }, "seen " + ago(s.last_seen)),
+      human ? conversationLinks(s.conversation, s.agent) : null))));
   right.append(el("section", { class: "card small" }, el("h2", {}, "Limits"),
     Object.entries(state.limits).map(([k, v]) => el("div", {}, el("span", { class: "muted" }, k.replaceAll("_", " ") + ": "), String(v)))));
   const listScroll = keepScroll(".thread-list");
