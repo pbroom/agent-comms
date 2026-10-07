@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from . import board_settings, dispatch
+from . import board_settings, dispatch, summary
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -194,6 +194,16 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def whoami(p: Principal = P):
         return {"name": p.name, "runtime": p.runtime, "is_human": p.is_human, "paused": board.is_paused(),
                 "limits": board.limits()}
+
+    @app.get("/api/summary")
+    def board_summary(p: Principal = H):
+        # For the human's menu bar app: counts and server-stamped ids only, never agent-written text.
+        return summary.human_summary(board, p, dispatch_config()[0])
+
+    @app.get("/api/needs-you")
+    def needs_you(p: Principal = H):
+        # The menu bar's "Needs you" submenu: the dashboard's items with a cleaned 80-character preview.
+        return summary.needs_you_list(board, p)
 
     @app.get("/api/state")
     def state(closed: bool = False, p: Principal = P):
