@@ -22,6 +22,8 @@ function thread(id, posts, status = 'open') {
 const THREADS = [thread(3, [post(30, 3, 10)]), thread(2, [post(20, 2, 40), post(21, 2, 45)]), thread(1, [post(10, 1, 5)])];
 
 async function setup({ url = 'http://127.0.0.1:8787/', storage = {}, needsYou = [] } = {}) {
+  // Every post unread, so no thread has settled (settled threads are hidden); these tests are about layout.
+  storage = { 'agent-comms-seen': '{}', ...storage };
   const dom = new JSDOM(html, { url, runScripts: 'dangerously', beforeParse(win) {
     for (const [k, v] of Object.entries(storage)) win.localStorage.setItem(k, v);
     win.fetch = async u => {
@@ -106,7 +108,7 @@ async function dots({ threads, runs = [], storage = {}, needsYou = [], url = 'ht
 }
 const task = (id, status, lease_state = 'none', owner_agent = 'codex') => ({ id, title: 'T' + id, status, lease_state, owner_agent });
 
-test('status dots: stalled, being worked on, completed (hidden), nothing to flag', async () => {
+test('status dots: stalled, being worked on or waiting to be picked up, completed (hidden)', async () => {
   const blocked = thread(1, [post(10, 1, 1)]); blocked.tasks = [task(1, 'blocked')];
   const working = thread(2, [post(20, 2, 2)]); working.tasks = [task(2, 'working', 'active')];
   const asked = thread(3, [post(30, 3, 3, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
@@ -121,7 +123,7 @@ test('status dots: stalled, being worked on, completed (hidden), nothing to flag
   assert.deepEqual(dot(2), ['active', 'codex working on task 2']);
   assert.match(dot(3)[1], /^#30 waiting on codex for 2h$/);
   assert.equal(dot(3)[0], 'stalled');
-  assert.equal(dot(4), null, 'a fresh ask is not stalled yet');
+  assert.deepEqual(dot(4), ['active', '#40 waiting on codex for 5m'], 'a fresh ask is pending, not stalled yet');
   assert.deepEqual(dot(5), ['active', 'codex running (dispatcher)']);
   assert.ok(!document.querySelector('tr[data-thread="6"]'), 'completed threads are hidden by default');
   assert.match(document.querySelector('.thread-list').textContent, /Show completed/);
@@ -147,7 +149,28 @@ test('status dots: blue for posts this browser has not shown, cleared by opening
   assert.deepEqual(dot(1), ['unread', 'New posts']);
   assert.equal(dot(3), null);
   document.querySelector('tr[data-thread="1"]').click();
-  assert.equal(dot(1), null, 'opening the thread marks it seen');
+  assert.deepEqual(dot(1), ['done', 'Settled: nothing waiting on anyone'], 'opening the thread marks it seen');
+  assert.ok(document.querySelector('tr[data-thread="1"]'), 'the thread being read stays listed');
+  document.querySelector('tr[data-thread="2"]').click();
+  assert.ok(document.querySelector('tr[data-thread="1"]'), 'threads opened on this page stay listed while you browse');
+  const seenNow = dom.window.localStorage.getItem('agent-comms-seen');
+  dom.window.close();
+  const reload = await dots({ threads: () => later, storage: { 'agent-comms-seen': seenNow, 'agent-comms-thread': '2' } });
+  assert.equal(reload.document.querySelector('tr[data-thread="1"]'), null, 'after a reload a settled thread is hidden');
+  assert.ok(reload.document.querySelector('tr[data-thread="2"]'), 'the selected thread is always listed');
+  reload.dom.window.close();
+});
+
+test('status dots: every open thread has one; unclaimed tasks are pending, then stalled', async () => {
+  const fresh = thread(1, [post(10, 1, 1)]); fresh.tasks = [{ ...task(1, 'accepted'), updated_at: MINUTES_AGO(5) }];
+  const old = thread(2, [post(20, 2, 2)]); old.tasks = [{ ...task(2, 'proposed'), updated_at: MINUTES_AGO(90) }];
+  const quiet = thread(3, [post(30, 3, 3)]);
+  const { dom, document, dot } = await dots({ threads: () => [fresh, old, quiet],
+    storage: { 'agent-comms-seen': JSON.stringify({ 1: 10, 2: 20, 3: 30 }), 'agent-comms-thread': '3' } });
+  assert.deepEqual(dot(1), ['active', 'task 1 accepted, not picked up for 5m']);
+  assert.deepEqual(dot(2), ['stalled', 'task 2 proposed, not picked up for 2h']);
+  assert.deepEqual(dot(3), ['done', 'Settled: nothing waiting on anyone']);
+  for (const row of document.querySelectorAll('.thread-list tr')) assert.ok(row.querySelector('.dot'), 'no row without a dot');
   dom.window.close();
 });
 
