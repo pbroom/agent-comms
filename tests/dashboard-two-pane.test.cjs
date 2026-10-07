@@ -198,3 +198,18 @@ test('sorting: recent activity (default), newest first, priority; the choice is 
   assert.equal(again.document.getElementById('thread-sort').value, 'created');
   again.dom.window.close();
 });
+
+test('status dots: the last word went to an agent that never replied (any post type); grace before amber', async () => {
+  const quietFor = (id, minutes) => thread(id, [post(id * 10, id, 1, { agent: 'claude-code' }),
+    post(id * 10 + 1, id, 2, { agent: 'codex', type: 'status', to: ['claude-code'], created_at: MINUTES_AGO(minutes) })]);
+  const answered = thread(4, [post(40, 4, 1, { type: 'status', to: ['claude-code'], created_at: MINUTES_AGO(90) }),
+    post(41, 4, 2, { agent: 'claude-code', created_at: MINUTES_AGO(80) })]);
+  const seen = JSON.stringify({ 1: 11, 2: 21, 3: 31, 4: 41 });
+  const { dom, dot } = await dots({ threads: () => [quietFor(1, 35), quietFor(2, 45), quietFor(3, 300), answered],
+    storage: { 'agent-comms-seen': seen, 'agent-comms-thread': '4' } });
+  assert.deepEqual(dot(1), ['active', '#11 to claude-code, no reply for 35m'], 'inside the window plus grace');
+  assert.deepEqual(dot(2), ['stalled', '#21 to claude-code, no reply for 45m']);
+  assert.deepEqual(dot(3), ['stalled', '#31 to claude-code, no reply for 5h']);
+  assert.deepEqual(dot(4), ['done', 'Settled: nothing waiting on anyone'], 'a reply clears it');
+  dom.window.close();
+});

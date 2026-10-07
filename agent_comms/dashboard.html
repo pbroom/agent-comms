@@ -159,7 +159,8 @@ let seen = null;
 const SORT_KEY = "agent-comms-sort";
 const SORTS = { priority: "Priority", activity: "Recent activity", created: "Newest first" };
 let sortMode = SORTS[load(SORT_KEY)] ? load(SORT_KEY) : "activity";
-const STALL_MINUTES = 30;  // an agent asked for a reply this long ago, has not posted since and is not running
+// Work handed to an agent is "pending" (grey pulse) for STALL_MINUTES plus a short grace, then "stalled" (amber).
+const STALL_MINUTES = 30, GRACE_MINUTES = 10;
 
 setFocusFromHash();
 
@@ -837,13 +838,22 @@ function threadStatus(t, human) {
   // Work handed to agents that nobody has picked up: an ask with no later post from its recipient (and no run
   // in progress for it), or a proposed/accepted task nobody holds. Pending while fresh, stalled after STALL_MINUTES.
   const pending = [];
-  const stale = iso => now - Date.parse(iso) >= STALL_MINUTES * 60000;
+  const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
   for (const p of posts) {
     if (!p.needs_response || !p.to.length || p.sealed) continue;
     for (const agent of p.to) {
       if (agent === "human" || runs.some(r => r.agent === agent)) continue;
       if (posts.some(q => q.id > p.id && q.agent === agent)) continue;
       (stale(p.created_at) ? stalled : pending).push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
+    }
+  }
+  // The thread's last word went to an agent (any post type) and that agent has not posted since: the
+  // conversation is waiting on it, even if nobody flagged needs_response.
+  const last = posts[posts.length - 1];
+  if (last && !last.sealed && !last.needs_response) {
+    for (const agent of last.to) {
+      if (agent === "human" || agent === last.agent || runs.some(r => r.agent === agent)) continue;
+      (stale(last.created_at) ? stalled : pending).push(`#${last.id} to ${agent}, no reply for ${since(last.created_at)}`);
     }
   }
   for (const k of t.tasks) {
