@@ -47,6 +47,8 @@ main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 aut
 .thread-list .when { text-align: right; white-space: nowrap; width: 1%; }
 .thread-list .head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 2px; }
 .thread-list .head h2 { padding: 0; margin: 0; flex: 1; }
+.thread-list select { font: inherit; font-size: 12px; padding: 2px 4px; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 5px; }
 .thread-list .when .dot { display: block; margin: 6px 0 0 auto; }
 /* Thread status dots (after Claude's session indicators): blue = new posts, amber = stalled,
    grey pulsing = being worked on, grey ring = completed. */
@@ -145,6 +147,10 @@ let selected = Number(load(SELECTED_KEY)) || null;
 // Unread dots: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor).
 const SEEN_KEY = "agent-comms-seen";
 let seen = null;
+// Thread list order, remembered per browser: "priority", "activity" (last updated) or "created".
+const SORT_KEY = "agent-comms-sort";
+const SORTS = { priority: "Priority", activity: "Recent activity", created: "Newest first" };
+let sortMode = SORTS[load(SORT_KEY)] ? load(SORT_KEY) : "activity";
 const STALL_MINUTES = 30;  // an agent asked for a reply this long ago, has not posted since and is not running
 
 setFocusFromHash();
@@ -695,10 +701,28 @@ function lastActivity(t) {
 }
 
 // Most recent activity first; the snapshot order (newest thread first) breaks ties.
-function sortedThreads() {
-  const order = new Map(state.threads.map((t, i) => [t.id, i]));
-  return [...state.threads].sort((a, b) =>
-    (Date.parse(lastActivity(b) || 0) || 0) - (Date.parse(lastActivity(a) || 0) || 0) || order.get(a.id) - order.get(b.id));
+const time = iso => Date.parse(iso || 0) || 0;
+
+// Priority buckets: 0 stalled on you, 1 stalled on someone else, 2 new posts, 3 being worked on, 4 the rest.
+function priority(t, st) {
+  if (st && st.kind === "stalled") return st.needsMe ? 0 : 1;
+  if (isUnread(t)) return 2;
+  if (st && st.kind === "active") return 3;
+  return 4;
+}
+
+// Ties (and the order within a priority bucket) fall back to recent activity, then the newest thread.
+function sortedThreads(statuses) {
+  const key = {
+    activity: t => [time(lastActivity(t))],
+    created: t => [time(t.created_at), t.id],
+    priority: t => [-priority(t, statuses.get(t.id)), time(lastActivity(t))],
+  }[sortMode];
+  return [...state.threads].sort((a, b) => {
+    const ka = [...key(a), time(lastActivity(a)), a.id], kb = [...key(b), time(lastActivity(b)), b.id];
+    for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return kb[i] - ka[i];
+    return 0;
+  });
 }
 
 function selectThread(id) {
@@ -729,6 +753,10 @@ function markSeen(t) {
   store(SEEN_KEY, JSON.stringify(seen));
 }
 
+function isUnread(t) {
+  return !!seen && newestId(t, p => p.agent !== state.me.name) > (seen[t.id] || 0);
+}
+
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
 function since(iso) { return ago(iso).replace(/ ago$/, ""); }
 
@@ -740,11 +768,14 @@ function threadStatus(t, human) {
   const runs = (state.active_runs || []).filter(r => r.thread_id === t.id);
   const working = t.tasks.filter(k => k.status === "working" && k.lease_state === "active");
   const stalled = [];
+  let needsMe = false;
   const waiting = (state.needs_you || []).filter(p => p.thread_id === t.id).length;
+  if (human && waiting) needsMe = true;
   if (human && waiting) stalled.push(waiting === 1 ? "Waiting on you" : `${waiting} posts waiting on you`);
   const blocked = t.tasks.filter(k => k.status === "blocked").length;
   if (blocked) stalled.push(plural(blocked, "blocked task"));
   if (t.tasks.some(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status))) stalled.push("A task lease expired");
+  if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
   // Asks addressed to agents that went unanswered: no later post from that agent and no run in progress.
   for (const p of posts) {
@@ -756,13 +787,12 @@ function threadStatus(t, human) {
       stalled.push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
     }
   }
-  if (stalled.length) return { kind: "stalled", label: stalled.join("; ") };
+  if (stalled.length) return { kind: "stalled", label: stalled.join("; "), needsMe };
   if (runs.length || working.length) {
     const who = [...runs.map(r => `${r.agent} running (dispatcher)`), ...working.map(k => `${k.owner_agent} working on task ${k.id}`)];
     return { kind: "active", label: who.join("; ") };
   }
-  const unread = seen && newestId(t, p => p.agent !== state.me.name) > (seen[t.id] || 0);
-  if (unread) return { kind: "unread", label: "New posts" };
+  if (isUnread(t)) return { kind: "unread", label: "New posts" };
   if (t.tasks.length && t.tasks.every(k => ["done", "declined"].includes(k.status))) return { kind: "done", label: "All tasks done" };
   return null;
 }
@@ -813,6 +843,9 @@ function renderThreadList(threads, current, human, statuses, hidden) {
       onchange: e => { showClosed = e.target.checked; refresh(); } }), " Show completed");
   return el("section", { class: "card thread-list" },
     el("div", { class: "head" }, el("h2", {}, `Threads (${threads.length})`), toggle),
+    el("div", { class: "head small muted" }, el("label", { for: "thread-sort" }, "Sort"),
+      el("select", { id: "thread-sort", onchange: e => { sortMode = e.target.value; store(SORT_KEY, sortMode); e.target.blur(); render(); } },
+        Object.entries(SORTS).map(([v, label]) => el("option", { value: v, selected: v === sortMode }, label)))),
     threads.length ? table : el("div", { class: "muted small", style: "padding:8px" },
       hidden ? `No active threads. ${plural(hidden, "completed thread")} hidden.` : "No threads yet."));
 }
@@ -916,7 +949,7 @@ function render() {
   loadSeen();
   const statuses = new Map(state.threads.map(t => [t.id, threadStatus(t, human)]));
   const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
-  const all = sortedThreads();
+  const all = sortedThreads(statuses);
   // Completed threads are hidden unless "Show completed" is on (or a link points at one).
   const threads = all.filter(t => showClosed || t.id === pinned || (statuses.get(t.id) || {}).kind !== "done");
   const current = threads.find(t => t.id === selected) || threads[0] || null;
