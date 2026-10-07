@@ -60,6 +60,10 @@ class Agent:
             self.call("POST", "/api/updates/ack", ack_through=through)
 
 
+def sign_in(human: Agent) -> str:
+    return human.http.post("/api/login-links", json={"next": "/"}).json()["url"]
+
+
 def step(msg: str, delay: float):
     print(f"  - {msg}")
     time.sleep(delay)
@@ -85,11 +89,11 @@ def main():
     while not server.started:
         time.sleep(0.05)
     base = f"http://127.0.0.1:{PORT}"
-    url = f"{base}/#token={tokens['human']}"
-    print(f"\nDemo board running. Dashboard (signed in as the human):\n  {url}\n")
+    human = Agent("human", tokens["human"], base)
+    # A one-time sign-in link (valid 60 s); the token itself never goes in a URL.
+    print(f"\nDemo board running. Dashboard sign-in link (one use, 60 s):\n  {sign_in(human)}\n")
     d = a.delay
 
-    human = Agent("human", tokens["human"], base)
     claude = Agent("claude", tokens["claude"], base)
     codex = Agent("codex", tokens["codex"], base)
 
@@ -171,7 +175,7 @@ def main():
     if a.no_serve:
         server.should_exit = True
         return
-    print(f"Open {url}\nCtrl-C to stop.")
+    print(f"Open {sign_in(human)} (one use, within 60 s)\nCtrl-C to stop.")
     try:
         while True:
             time.sleep(1)

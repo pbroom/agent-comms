@@ -20,6 +20,12 @@ max_refs = 20
 [tasks]
 require_human_accept = false  # true: agent-proposed tasks need the human (or a matching standing grant) before anyone can claim
 
+# Dashboard sign-in (`board dashboard`, the menu bar app): how long a browser stays signed in. Not editable
+# from the Settings page; change it here or in board.local.toml.
+[web]
+session_days = 30           # sliding: ends after this many days unused; each use renews it (at most hourly)
+session_max_days = 90       # absolute: ends this many days after sign-in, however often it is used
+
 # Dispatcher (`board dispatch run`): launches an agent headless when a post on a workstream YOU approved
 # (`board dispatch allow ...`) is addressed to it and it has no live session. Nothing launches without an
 # approval and a running dispatcher. See README "Dispatcher".

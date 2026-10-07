@@ -14,8 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
-SECTIONS = ("server", "limits", "tasks")
-NOT_SETTINGS = {"dispatch", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks] keys
+SECTIONS = ("server", "limits", "tasks", "web")
+NOT_SETTINGS = {"dispatch", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
 
 
 def deep_merge(base: dict, over: dict) -> dict:
@@ -46,6 +46,9 @@ class Settings:
     body_max_bytes: int = 4096
     max_refs: int = 20
     require_human_accept: bool = False
+    # [web]: dashboard sign-in sessions (see weblogin.py). File-only: the Settings page cannot change them.
+    session_days: int = 30        # sliding: a session unused this long ends; use renews it (at most hourly)
+    session_max_days: int = 90    # absolute: a session ends this long after sign-in, however much it is used
     # The raw [dispatch] table (merged across layers); validated by dispatch.DispatchConfig.
     dispatch: dict = field(default_factory=dict)
     # The board.toml these settings came from (board.local.toml is beside it), or None when they were built in
@@ -59,7 +62,7 @@ class Settings:
 
     @classmethod
     def read_layer(cls, layer: Path) -> dict:
-        """One settings file, parsed, with its [server]/[limits]/[tasks] keys checked ({} when it is absent)."""
+        """One settings file, parsed, with its [server]/[limits]/[tasks]/[web] keys checked ({} when it is absent)."""
         if not layer.exists():
             return {}
         d = tomllib.loads(layer.read_text())
@@ -76,7 +79,7 @@ class Settings:
     @classmethod
     def read_layers(cls, path: Path | None = None, local: bool = True) -> dict:
         """board.toml, then board.local.toml beside it (when `local` and present), deep-merged per section.
-        Each layer's [server]/[limits]/[tasks] keys are checked, so an error names the file at fault."""
+        Each layer's [server]/[limits]/[tasks]/[web] keys are checked, so an error names the file at fault."""
         path = path or home() / "board.toml"
         data: dict = {}
         for layer in [path] + ([path.with_name(LOCAL_SETTINGS)] if local else []):

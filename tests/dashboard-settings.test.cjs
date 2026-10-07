@@ -43,21 +43,31 @@ function payloads(human) {
     env: { 'codex-cli': ['CODEX_HOME'] }, worktrees: { '/repo': '/repo-dispatch' }, risky_runners: {},
     threads: [{ id: 3, title: INJECTION, project: '/repo' }, { id: 5, title: 'Docs', project: '/repo' }],
     agents: [{ name: 'claude', runtime: 'claude-code' }, { name: 'codex', runtime: 'codex-cli' }] };
+  const browsers = { session_days: 30, session_max_days: 90, sessions: [
+    { id: 'aaaaaaaaaaaaaaaa', label: 'Safari on macOS', created_at: '2027-01-15T08:00:00+00:00',
+      last_seen: '2027-01-15T08:00:00+00:00', expires_at: '2027-02-14T08:00:00+00:00', current: true },
+    { id: 'bbbbbbbbbbbbbbbb', label: INJECTION, created_at: '2027-01-14T08:00:00+00:00',
+      last_seen: '2027-01-14T08:00:00+00:00', expires_at: '2027-02-13T08:00:00+00:00', current: false }] };
   return { '/api/state': state, '/api/settings': settings, '/api/admin/notifications': notifications,
-    '/api/admin/dispatch': dispatch };
+    '/api/admin/dispatch': dispatch, '/api/web-sessions': browsers, '/api/whoami': state.me };
 }
 
+const forbidden = { ok: false, status: 403, statusText: 'Forbidden', json: async () => ({ message: 'only the human' }) };
+
+// The human is signed in with the session cookie; an agent's token (which cannot get a sign-in link) is used in
+// memory after the login-link exchange is refused.
 async function setup({ human = true, url = 'http://localhost/#settings' } = {}) {
   const calls = [];
   const data = payloads(human);
   const dom = new JSDOM(html, { url, runScripts: 'dangerously', beforeParse(win) {
-    win.localStorage.setItem('agent-comms-token', 'dummy');
+    if (!human) win.localStorage.setItem('agent-comms-token', 'dummy');
     win.confirm = () => true;
     win.fetch = async (u, options) => {
       calls.push({ url: u, ...options });
+      if (u === '/api/login-links') return forbidden;
       if (options.method === 'GET') {
         const key = u.split('?')[0];
-        if (!human && key !== '/api/state') return { ok: false, statusText: 'Forbidden', json: async () => ({ message: 'only the human' }) };
+        if (!human && key !== '/api/state') return forbidden;
         return { ok: true, json: async () => data[key] };
       }
       return { ok: true, json: async () => ({}) };
@@ -207,5 +217,28 @@ test('notification rule form and the require_human_accept toggle send the right 
   await settle();
   const put = calls.find(c => c.method === 'PUT');
   assert.deepEqual(JSON.parse(put.body), { 'tasks.require_human_accept': true });
+  dom.window.close();
+});
+
+test('signed-in browsers: listed as text, revoke one, sign out all', async () => {
+  const { dom, document, calls } = await setup();
+  const section = document.querySelector('#settings-browsers');
+  assert.ok(section);
+  assert.equal(section.querySelectorAll('img').length, 0);
+  assert.match(section.textContent, /Safari on macOS/);
+  assert.match(section.textContent, /this browser/);
+  assert.match(section.textContent, /<img src=x onerror/);
+  assert.match(section.textContent, /30 days after its last use/);
+  section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
+  await settle();
+  assert.ok(calls.some(c => c.url === '/api/web-sessions/bbbbbbbbbbbbbbbb/revoke' && c.method === 'POST'));
+  document.querySelector('#sign-out-all').click();
+  await settle();
+  assert.ok(calls.some(c => c.url === '/api/web-sessions/revoke-all' && c.method === 'POST'));
+  // every request carries the CSRF header, and the human's requests carry no token
+  for (const c of calls) {
+    assert.equal(c.headers['X-Board-Request'], '1', c.url);
+    assert.equal(c.headers.Authorization, undefined, c.url);
+  }
   dom.window.close();
 });
