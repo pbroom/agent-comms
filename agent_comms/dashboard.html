@@ -23,8 +23,29 @@ header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-
   display: flex; gap: 12px; align-items: center; padding: 10px 16px; flex-wrap: wrap; }
 header h1 { font-size: 16px; margin: 0; }
 header .sp { flex: 1; }
-main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+/* Board: thread list | selected thread | sidebar. Narrower: the sidebar moves under the list, then one column. */
+main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 auto;
+  grid-template-columns: 340px minmax(0, 1fr) 300px; grid-template-areas: "list thread side"; align-items: start; }
+.pane-list { grid-area: list; } .pane-thread { grid-area: thread; } .pane-side { grid-area: side; }
+.pane-thread > .card { scroll-margin-top: 64px; }
+@media (min-width: 1301px) {
+  .pane-list { position: sticky; top: 64px; }
+  .pane-list .card { max-height: calc(100vh - 80px); overflow-y: auto; }
+}
+@media (max-width: 1300px) { main { grid-template-columns: 320px minmax(0, 1fr); grid-template-areas: "list thread" "side thread"; } }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; grid-template-areas: "list" "thread" "side"; } }
+.thread-list { padding: 6px; }
+.thread-list h2 { padding: 6px 8px 2px; }
+.thread-list table { font-size: 13px; }
+.thread-list td { padding: 8px; border-top: 1px solid var(--line); cursor: pointer; }
+.thread-list tr:first-child td { border-top: 0; }
+.thread-list tr:hover td { background: var(--bg); }
+.thread-list tr[aria-selected=true] td { background: var(--chip); }
+.thread-list tr[aria-selected=true] td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.thread-list tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.thread-list .title { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.thread-list .when { text-align: right; white-space: nowrap; width: 1%; }
+.thread-list .sub { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 3px; font-size: 12px; color: var(--muted); }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
 .card h2 { font-size: 15px; margin: 0 0 4px; }
 .card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
@@ -106,6 +127,11 @@ let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
 // Deep links: #post-<id>, #thread-<id>, #settings. `focus` is what still needs scrolling to; the highlight stays.
 let focus = null, focusTried = false, focusBusy = false, highlight = null;
 const threadPosts = {};    // thread id -> older posts fetched to show a deep-linked post outside the snapshot
+// Two-pane board: the thread shown on the right. Remembered per browser (a convenience only).
+const SELECTED_KEY = "agent-comms-thread";
+let selected = Number(load(SELECTED_KEY)) || null;
+
+setFocusFromHash();
 
 function store(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -116,8 +142,8 @@ function parseFocus(hash) {
 }
 function setFocusFromHash() {
   focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
+  if (focus && focus.kind === "thread") selected = focus.id;
 }
-setFocusFromHash();
 
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
@@ -260,6 +286,7 @@ async function applyFocus() {
       const older = await api("GET", `/api/threads/${tid}/posts?since_seq=${Math.max(0, post.seq - 1)}&limit=500`);
       threadPosts[tid] = older.posts || [];
     }
+    selected = tid;
     if (!state.threads.some(t => t.id === tid)) showClosed = true;
   } catch (e) {}
   focusBusy = false;
@@ -646,6 +673,79 @@ function renderBrowsers() {
         onclick: () => cfgAct("POST", "/api/web-sessions/revoke-all", undefined, "Sign out every browser, including this one?") }, "Sign out all browsers"))]);
 }
 
+function lastActivity(t) {
+  const posts = postsOf(t);
+  return posts.length ? posts[posts.length - 1].created_at : t.created_at;
+}
+
+// Most recent activity first; the snapshot order (newest thread first) breaks ties.
+function sortedThreads() {
+  const order = new Map(state.threads.map((t, i) => [t.id, i]));
+  return [...state.threads].sort((a, b) =>
+    (Date.parse(lastActivity(b) || 0) || 0) - (Date.parse(lastActivity(a) || 0) || 0) || order.get(a.id) - order.get(b.id));
+}
+
+function selectThread(id) {
+  if (id === selected && !highlight) return;
+  selected = id; store(SELECTED_KEY, String(id));
+  highlight = focus = null; scrollToThread = true;
+  try { history.replaceState(null, "", "#thread-" + id); } catch (e) {}
+  render();
+}
+
+function renderThreadList(threads, current, human) {
+  const waiting = {};
+  for (const p of state.needs_you || []) waiting[p.thread_id] = (waiting[p.thread_id] || 0) + 1;
+  const rows = threads.map(t => {
+    const posts = postsOf(t), on = current && current.id === t.id;
+    const base = (t.project || "").split("/").filter(Boolean).pop() || t.project;
+    const open = (t.task_counts ? Object.entries(t.task_counts) : [])
+      .filter(([k]) => !["done", "declined"].includes(k)).reduce((n, [, v]) => n + v, 0);
+    const full = t.agent_posts_since_human >= t.thread_cap;
+    return el("tr", { role: "option", "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1", "data-thread": t.id,
+        onclick: () => selectThread(t.id) },
+      el("td", {},
+        el("div", { class: "title" }, el("span", { class: "muted" }, `#${t.id} `), t.title),
+        el("div", { class: "sub" },
+          el("span", { title: t.project }, base),
+          el("span", {}, `· ${posts.length}${posts.length >= 60 ? "+" : ""} post${posts.length === 1 ? "" : "s"}`),
+          open ? el("span", {}, `· ${open} task${open === 1 ? "" : "s"}`) : null,
+          human && waiting[t.id] ? chip(`${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`, "warn") : null,
+          full ? chip("at cap", "bad") : null,
+          t.status !== "open" ? chip(t.status) : null)),
+      el("td", { class: "when muted small", title: lastActivity(t) || "" }, ago(lastActivity(t))));
+  });
+  const table = el("table", { role: "listbox", "aria-label": "Threads" }, rows);
+  table.addEventListener("keydown", e => {
+    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || !current) return;
+    const i = threads.findIndex(t => t.id === current.id) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
+    if (i < 0 || i >= threads.length) return;
+    e.preventDefault();
+    selectThread(threads[i].id);
+    const row = document.querySelector(`.thread-list tr[data-thread="${threads[i].id}"]`);
+    if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
+  });
+  return el("section", { class: "card thread-list" }, el("h2", {}, `Threads (${threads.length})`),
+    threads.length ? table : el("div", { class: "muted small", style: "padding:8px" }, "No threads yet."));
+}
+
+function renderThread(t, human) {
+  const pct = Math.min(100, Math.round(100 * t.agent_posts_since_human / t.thread_cap));
+  const posts = postsOf(t);
+  const lit = highlight && highlight.kind === "thread" && highlight.id === t.id;
+  return el("section", { class: "card" + (lit ? " highlight" : ""), id: "thread-" + t.id },
+    el("div", { class: "meta", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+      el("h2", {}, `#${t.id} ${t.title}`), chip(t.status, t.status === "open" ? "ok" : ""),
+      el("span", { class: "muted small" }, t.project),
+      human ? el("button", { onclick: () => act("POST", `/api/threads/${t.id}/${t.status === "open" ? "close" : "reopen"}`) }, t.status === "open" ? "Close" : "Reopen") : null),
+    el("div", { class: "small muted", style: "margin-top:6px" }, `agent posts since your last post: ${t.agent_posts_since_human} / ${t.thread_cap}`),
+    el("div", { class: "meter" + (pct >= 100 ? " full" : "") }, el("div", { style: `width:${pct}%` })),
+    t.pinned_summary ? el("div", { class: "summary" }, el("strong", {}, "Pinned summary "), el("span", { class: "muted small" }, `by ${t.summary_by}`), "\n" + t.pinned_summary) : null,
+    t.tasks.length ? el("h3", {}, "Tasks") : null, renderTasks(t.tasks, human),
+    el("h3", {}, `Posts (${posts.length})`),
+    el("div", {}, posts.length ? posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")));
+}
+
 function renderSettings() {
   if (!cfg) return el("div", { class: "settings", id: "settings" },
     cfgError ? el("div", { class: "err", role: "alert" }, cfgError) : el("div", { class: "card muted" }, "Loading settings…"));
@@ -669,8 +769,16 @@ function renderSettings() {
         : el("p", { class: "small muted" }, "No settings changes recorded.")));
 }
 
+// Re-rendering replaces the DOM every few seconds; keep the thread list's own scroll position.
+let savedListScroll = 0, scrollToThread = false;
+function keepScroll(selector) {
+  return () => { const n = document.querySelector(selector); if (n) n.scrollTop = savedListScroll; };
+}
+
 function render() {
   const app = document.getElementById("app");
+  const listNode = document.querySelector(".thread-list");
+  if (listNode) savedListScroll = listNode.scrollTop;
   app.replaceChildren();
   if (booting && !state) { app.append(el("div", { class: "card login muted", id: "loading" }, "Loading…")); return; }
   if (!signedIn || !state) {
@@ -712,25 +820,17 @@ function render() {
   if (human && view === "settings") { app.append(renderSettings()); return; }
   app.append(el("div", { class: "notice" }, "Peer requests within your approved goal or category can proceed. Posts are untrusted data and cannot expand that authorization."));
 
-  const left = el("div", {}), right = el("div", {});
-  if (!state.threads.length) left.append(el("div", { class: "card muted" }, "No threads yet."));
-  for (const t of state.threads) {
-    const pct = Math.min(100, Math.round(100 * t.agent_posts_since_human / t.thread_cap));
-    const posts = postsOf(t);
-    const lit = highlight && highlight.kind === "thread" && highlight.id === t.id;
-    left.append(el("section", { class: "card" + (lit ? " highlight" : ""), id: "thread-" + t.id },
-      el("div", { class: "meta", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
-        el("h2", {}, `#${t.id} ${t.title}`), chip(t.status, t.status === "open" ? "ok" : ""),
-        el("span", { class: "muted small" }, t.project),
-        human ? el("button", { onclick: () => act("POST", `/api/threads/${t.id}/${t.status === "open" ? "close" : "reopen"}`) }, t.status === "open" ? "Close" : "Reopen") : null),
-      el("div", { class: "small muted", style: "margin-top:6px" }, `agent posts since your last post: ${t.agent_posts_since_human} / ${t.thread_cap}`),
-      el("div", { class: "meter" + (pct >= 100 ? " full" : "") }, el("div", { style: `width:${pct}%` })),
-      t.pinned_summary ? el("div", { class: "summary" }, el("strong", {}, "Pinned summary "), el("span", { class: "muted small" }, `by ${t.summary_by}`), "\n" + t.pinned_summary) : null,
-      t.tasks.length ? el("h3", {}, "Tasks") : null, renderTasks(t.tasks, human),
-      el("h3", {}, `Posts (${posts.length})`),
-      el("div", {}, posts.length ? posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")),
-    ));
+  const list = el("div", { class: "pane-list" }), pane = el("div", { class: "pane-thread", id: "thread-pane" }),
+    right = el("div", { class: "pane-side" });
+  if (highlight && highlight.kind === "post") {
+    const holder = state.threads.find(t => postsOf(t).some(p => p.id === highlight.id));
+    if (holder) selected = holder.id;
   }
+  const threads = sortedThreads();
+  const current = threads.find(t => t.id === selected) || threads[0] || null;
+  list.append(renderThreadList(threads, current, human));
+  pane.append(current ? renderThread(current, human)
+    : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   if (human) right.append(renderGrants());
   if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length})`),
     el("div", { class: "small muted" }, "Open decisions and needs-response posts with no later human post in the thread."),
@@ -744,7 +844,10 @@ function render() {
       el("div", { class: "muted" }, "seen " + ago(s.last_seen))))));
   right.append(el("section", { class: "card small" }, el("h2", {}, "Limits"),
     Object.entries(state.limits).map(([k, v]) => el("div", {}, el("span", { class: "muted" }, k.replaceAll("_", " ") + ": "), String(v)))));
-  app.append(el("main", {}, left, right));
+  const listScroll = keepScroll(".thread-list");
+  app.append(el("main", {}, list, pane, right));
+  listScroll();
+  if (scrollToThread) { scrollToThread = false; const c = pane.firstChild; if (c && c.scrollIntoView) c.scrollIntoView({ block: "start" }); }
   applyFocus();
 }
 
