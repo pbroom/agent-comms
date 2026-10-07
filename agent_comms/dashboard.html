@@ -151,6 +151,7 @@ const threadPosts = {};    // thread id -> older posts fetched to show a deep-li
 // Two-pane board: the thread shown on the right. Remembered per browser (a convenience only).
 const SELECTED_KEY = "agent-comms-thread";
 let selected = Number(load(SELECTED_KEY)) || null;
+const opened = new Set();  // threads shown on the right since this page loaded: kept listed even once settled
 // Unread dots: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor).
 const SEEN_KEY = "agent-comms-seen";
 let seen = null;
@@ -158,7 +159,8 @@ let seen = null;
 const SORT_KEY = "agent-comms-sort";
 const SORTS = { priority: "Priority", activity: "Recent activity", created: "Newest first" };
 let sortMode = SORTS[load(SORT_KEY)] ? load(SORT_KEY) : "activity";
-const STALL_MINUTES = 30;  // an agent asked for a reply this long ago, has not posted since and is not running
+// Work handed to an agent is "pending" (grey pulse) for STALL_MINUTES plus a short grace, then "stalled" (amber).
+const STALL_MINUTES = 30, GRACE_MINUTES = 10;
 
 setFocusFromHash();
 
@@ -833,24 +835,42 @@ function threadStatus(t, human) {
   if (t.tasks.some(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status))) stalled.push("A task lease expired");
   if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
-  // Asks addressed to agents that went unanswered: no later post from that agent and no run in progress.
+  // Work handed to agents that nobody has picked up: an ask with no later post from its recipient (and no run
+  // in progress for it), or a proposed/accepted task nobody holds. Pending while fresh, stalled after STALL_MINUTES.
+  const pending = [];
+  const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
   for (const p of posts) {
     if (!p.needs_response || !p.to.length || p.sealed) continue;
-    if (now - Date.parse(p.created_at) < STALL_MINUTES * 60000) continue;
     for (const agent of p.to) {
       if (agent === "human" || runs.some(r => r.agent === agent)) continue;
       if (posts.some(q => q.id > p.id && q.agent === agent)) continue;
-      stalled.push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
+      (stale(p.created_at) ? stalled : pending).push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
     }
   }
+  // The thread's last word went to an agent (any post type) and that agent has not posted since: the
+  // conversation is waiting on it, even if nobody flagged needs_response.
+  const last = posts[posts.length - 1];
+  if (last && !last.sealed && !last.needs_response) {
+    for (const agent of last.to) {
+      if (agent === "human" || agent === last.agent || runs.some(r => r.agent === agent)) continue;
+      (stale(last.created_at) ? stalled : pending).push(`#${last.id} to ${agent}, no reply for ${since(last.created_at)}`);
+    }
+  }
+  for (const k of t.tasks) {
+    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active") continue;
+    const at = k.updated_at || k.created_at;
+    (at && stale(at) ? stalled : pending).push(`task ${k.id} ${k.status}, not picked up${at ? " for " + since(at) : ""}`);
+  }
   if (stalled.length) return { kind: "stalled", label: stalled.join("; "), needsMe };
-  if (runs.length || working.length) {
-    const who = [...runs.map(r => `${r.agent} running (dispatcher)`), ...working.map(k => `${k.owner_agent} working on task ${k.id}`)];
+  if (runs.length || working.length || pending.length) {
+    const who = [...runs.map(r => `${r.agent} running (dispatcher)`), ...working.map(k => `${k.owner_agent} working on task ${k.id}`), ...pending];
     return { kind: "active", label: who.join("; ") };
   }
   if (isUnread(t)) return { kind: "unread", label: "New posts" };
+  // Nothing open, unread, pending or in progress: the thread has settled. It counts as completed (hidden by
+  // default) until a new post arrives.
   if (t.tasks.length && t.tasks.every(k => ["done", "declined"].includes(k.status))) return { kind: "done", label: "All tasks done" };
-  return null;
+  return { kind: "done", label: "Settled: nothing waiting on anyone" };
 }
 
 function statusDot(st) {
@@ -894,7 +914,7 @@ function renderThreadList(threads, current, human, statuses, hidden) {
     const row = document.querySelector(`.thread-list tr[data-thread="${threads[i].id}"]`);
     if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
   });
-  const toggle = el("label", { class: "small muted", title: "Closed threads and threads whose tasks are all done" },
+  const toggle = el("label", { class: "small muted", title: "Closed threads, and open threads where nothing is waiting on anyone" },
     el("input", { type: "checkbox", id: "show-completed", checked: showClosed,
       onchange: e => { showClosed = e.target.checked; refresh(); } }), " Show completed");
   return el("section", { class: "card thread-list" },
@@ -1017,9 +1037,12 @@ function render() {
   const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
   const all = sortedThreads(statuses);
   // Completed threads are hidden unless "Show completed" is on (or a link points at one).
-  const threads = all.filter(t => showClosed || t.id === pinned || (statuses.get(t.id) || {}).kind !== "done");
+  // Threads opened since the page loaded stay listed even once they settle, so the list does not shift under you
+  // while you read (or arrow through it); a reload tidies them away.
+  const threads = all.filter(t => showClosed || t.id === pinned || t.id === selected || opened.has(t.id)
+    || (statuses.get(t.id) || {}).kind !== "done");
   const current = threads.find(t => t.id === selected) || threads[0] || null;
-  if (current) { markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
+  if (current) { opened.add(current.id); markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
   list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
   pane.append(current ? renderThread(current, human, statuses.get(current.id))
     : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));

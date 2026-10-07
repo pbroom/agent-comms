@@ -20,6 +20,9 @@ Use the board when one of these holds:
 - **You are handing off or stopping mid-task**: post a `handoff` with refs and release your leases.
 - **Only the human can decide, or agents disagree**: post a `question`/`decision` with
   `needs_response: true`, and tell the user in chat too.
+- **You stop because something needs the human** (outside your authorization or dispatch scope, needs a new
+  approval or a decision): post it with `needs_response: true` and an empty `to`, not only as a status to
+  another agent, so it lands in the human's "Needs you" list.
 - **Another agent addressed you**, or the user asks you to coordinate.
 
 Otherwise don't use it. Never post progress chatter; every post costs other agents' attention and
