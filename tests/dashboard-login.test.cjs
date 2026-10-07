@@ -25,6 +25,16 @@ function boardState(threads, me = { name: 'human', is_human: true }) {
     agents: [{ name: 'human', is_human: true }, { name: 'codex', is_human: false }], task_categories: [] };
 }
 
+// The page may remember non-secret UI state (selected thread, per-thread "seen" marks), never a token.
+const UI_KEYS = new Set(['agent-comms-thread', 'agent-comms-seen']);
+function assertNoStoredSecrets(win) {
+  for (let i = 0; i < win.localStorage.length; i++) {
+    const k = win.localStorage.key(i);
+    assert.ok(UI_KEYS.has(k), 'unexpected localStorage key ' + k);
+    assert.doesNotMatch(win.localStorage.getItem(k), /ac_|token/i);
+  }
+}
+
 // routes: (method, url, options) => response | undefined (undefined = 404)
 async function setup({ url = 'http://127.0.0.1:8787/', storage = {}, routes }) {
   const calls = [], navigations = [];
@@ -64,7 +74,7 @@ test('cookie first: whoami with credentials and the CSRF header, no token anywhe
   assert.ok(calls.some(c => c.url === '/api/state'));
   assert.ok(document.querySelector('header'), 'signed in');
   assert.equal(document.querySelector('#sign-in'), null);
-  assert.equal(win.localStorage.length, 0);
+  assertNoStoredSecrets(win);
   dom.window.close();
 });
 
@@ -85,7 +95,7 @@ test('migration: a stored token is exchanged once for a sign-in link and deleted
     storage: { 'agent-comms-token': 'ac_legacy_human' },
     routes: (m, u) => u === '/api/login-links' ? ok({ url: LINK, expires_in_seconds: 60 }) : undefined });
   assert.equal(win.localStorage.getItem('agent-comms-token'), null);
-  assert.equal(win.localStorage.length, 0);
+  assertNoStoredSecrets(win);
   const exchange = calls.filter(c => c.url === '/api/login-links');
   assert.equal(exchange.length, 1);
   assert.equal(exchange[0].method, 'POST');
@@ -100,7 +110,7 @@ test('an old #token= link is exchanged, stripped from the URL and never stored',
     url: 'http://127.0.0.1:8787/#token=ac_from_fragment',
     routes: (m, u) => u === '/api/login-links' ? ok({ url: LINK, expires_in_seconds: 60 }) : undefined });
   assert.equal(win.location.hash, '');
-  assert.equal(win.localStorage.length, 0);
+  assertNoStoredSecrets(win);
   const exchange = calls.find(c => c.url === '/api/login-links');
   assert.equal(exchange.headers.Authorization, 'Bearer ac_from_fragment');
   assert.deepEqual(JSON.parse(exchange.body), { next: '/' });
@@ -129,7 +139,7 @@ test('a pasted human token is exchanged for a cookie session, not stored', async
   const exchange = calls.find(c => c.url === '/api/login-links');
   assert.equal(exchange.headers.Authorization, 'Bearer ac_pasted');
   assert.equal(navigations.length, 1);
-  assert.equal(win.localStorage.length, 0);
+  assertNoStoredSecrets(win);
   dom.window.close();
 });
 
@@ -138,7 +148,7 @@ test('an agent token (no sign-in link) is used in memory only', async () => {
     storage: { 'agent-comms-token': 'ac_agent' },
     routes: (m, u) => u === '/api/login-links' ? fail(403, 'only the human can create sign-in links')
       : u.startsWith('/api/state') ? ok(boardState([], { name: 'codex', is_human: false })) : undefined });
-  assert.equal(win.localStorage.length, 0);
+  assertNoStoredSecrets(win);
   const st = calls.find(c => c.url === '/api/state');
   assert.equal(st.headers.Authorization, 'Bearer ac_agent');
   assert.match(document.querySelector('header').textContent, /signed in as codex/);

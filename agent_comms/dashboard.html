@@ -45,6 +45,18 @@ main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 aut
 .thread-list tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .thread-list .title { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .thread-list .when { text-align: right; white-space: nowrap; width: 1%; }
+.thread-list .head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 2px; }
+.thread-list .head h2 { padding: 0; margin: 0; flex: 1; }
+.thread-list .when .dot { display: block; margin: 6px 0 0 auto; }
+/* Thread status dots (after Claude's session indicators): blue = new posts, amber = stalled,
+   grey pulsing = being worked on, grey ring = completed. */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dot.unread { background: var(--accent); }
+.dot.stalled { background: var(--warn); }
+.dot.active { background: var(--muted); animation: dot-pulse 1.6s ease-in-out infinite; }
+.dot.done { box-shadow: inset 0 0 0 1.5px var(--muted); }
+@keyframes dot-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .3; transform: scale(.75); } }
+@media (prefers-reduced-motion: reduce) { .dot.active { animation: none; opacity: .6; } }
 .thread-list .sub { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 3px; font-size: 12px; color: var(--muted); }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
 .card h2 { font-size: 15px; margin: 0 0 4px; }
@@ -130,6 +142,10 @@ const threadPosts = {};    // thread id -> older posts fetched to show a deep-li
 // Two-pane board: the thread shown on the right. Remembered per browser (a convenience only).
 const SELECTED_KEY = "agent-comms-thread";
 let selected = Number(load(SELECTED_KEY)) || null;
+// Unread dots: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor).
+const SEEN_KEY = "agent-comms-seen";
+let seen = null;
+const STALL_MINUTES = 30;  // an agent asked for a reply this long ago, has not posted since and is not running
 
 setFocusFromHash();
 
@@ -693,7 +709,73 @@ function selectThread(id) {
   render();
 }
 
-function renderThreadList(threads, current, human) {
+function loadSeen() {
+  if (seen) return;
+  try { seen = JSON.parse(load(SEEN_KEY) || "null"); } catch (e) { seen = null; }
+  if (!seen || typeof seen !== "object") {
+    // First visit in this browser: everything already here counts as seen, so nothing lights up at once.
+    seen = {};
+    for (const t of state.threads) seen[t.id] = newestId(t);
+    store(SEEN_KEY, JSON.stringify(seen));
+  }
+}
+function newestId(t, filter = () => true) {
+  return postsOf(t).filter(filter).reduce((m, p) => Math.max(m, p.id), 0);
+}
+function markSeen(t) {
+  const id = newestId(t);
+  if (!seen || (seen[t.id] || 0) >= id) return;
+  seen[t.id] = id;
+  store(SEEN_KEY, JSON.stringify(seen));
+}
+
+function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
+function since(iso) { return ago(iso).replace(/ ago$/, ""); }
+
+// One status per thread, most urgent first: closed > stalled > being worked on > new posts > all tasks done.
+// Returns { kind: done|stalled|active|unread, label } or null (nothing to flag).
+function threadStatus(t, human) {
+  if (t.status !== "open") return { kind: "done", label: "Closed" };
+  const posts = postsOf(t), now = Date.now();
+  const runs = (state.active_runs || []).filter(r => r.thread_id === t.id);
+  const working = t.tasks.filter(k => k.status === "working" && k.lease_state === "active");
+  const stalled = [];
+  const waiting = (state.needs_you || []).filter(p => p.thread_id === t.id).length;
+  if (human && waiting) stalled.push(waiting === 1 ? "Waiting on you" : `${waiting} posts waiting on you`);
+  const blocked = t.tasks.filter(k => k.status === "blocked").length;
+  if (blocked) stalled.push(plural(blocked, "blocked task"));
+  if (t.tasks.some(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status))) stalled.push("A task lease expired");
+  if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
+  // Asks addressed to agents that went unanswered: no later post from that agent and no run in progress.
+  for (const p of posts) {
+    if (!p.needs_response || !p.to.length || p.sealed) continue;
+    if (now - Date.parse(p.created_at) < STALL_MINUTES * 60000) continue;
+    for (const agent of p.to) {
+      if (agent === "human" || runs.some(r => r.agent === agent)) continue;
+      if (posts.some(q => q.id > p.id && q.agent === agent)) continue;
+      stalled.push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
+    }
+  }
+  if (stalled.length) return { kind: "stalled", label: stalled.join("; ") };
+  if (runs.length || working.length) {
+    const who = [...runs.map(r => `${r.agent} running (dispatcher)`), ...working.map(k => `${k.owner_agent} working on task ${k.id}`)];
+    return { kind: "active", label: who.join("; ") };
+  }
+  const unread = seen && newestId(t, p => p.agent !== state.me.name) > (seen[t.id] || 0);
+  if (unread) return { kind: "unread", label: "New posts" };
+  if (t.tasks.length && t.tasks.every(k => ["done", "declined"].includes(k.status))) return { kind: "done", label: "All tasks done" };
+  return null;
+}
+
+function statusDot(st) {
+  if (!st) return null;
+  const n = el("span", { class: "dot " + st.kind, title: st.label, role: "img", "aria-label": st.label });
+  // The board re-renders every few seconds; keep the pulse in phase instead of restarting it.
+  if (st.kind === "active") n.style.animationDelay = `-${(Date.now() % 1600) / 1000}s`;
+  return n;
+}
+
+function renderThreadList(threads, current, human, statuses, hidden) {
   const waiting = {};
   for (const p of state.needs_you || []) waiting[p.thread_id] = (waiting[p.thread_id] || 0) + 1;
   const rows = threads.map(t => {
@@ -713,7 +795,8 @@ function renderThreadList(threads, current, human) {
           human && waiting[t.id] ? chip(`${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`, "warn") : null,
           full ? chip("at cap", "bad") : null,
           t.status !== "open" ? chip(t.status) : null)),
-      el("td", { class: "when muted small", title: lastActivity(t) || "" }, ago(lastActivity(t))));
+      el("td", { class: "when muted small" }, el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
+        statusDot(statuses.get(t.id))));
   });
   const table = el("table", { role: "listbox", "aria-label": "Threads" }, rows);
   table.addEventListener("keydown", e => {
@@ -725,8 +808,13 @@ function renderThreadList(threads, current, human) {
     const row = document.querySelector(`.thread-list tr[data-thread="${threads[i].id}"]`);
     if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
   });
-  return el("section", { class: "card thread-list" }, el("h2", {}, `Threads (${threads.length})`),
-    threads.length ? table : el("div", { class: "muted small", style: "padding:8px" }, "No threads yet."));
+  const toggle = el("label", { class: "small muted", title: "Closed threads and threads whose tasks are all done" },
+    el("input", { type: "checkbox", id: "show-completed", checked: showClosed,
+      onchange: e => { showClosed = e.target.checked; refresh(); } }), " Show completed");
+  return el("section", { class: "card thread-list" },
+    el("div", { class: "head" }, el("h2", {}, `Threads (${threads.length})`), toggle),
+    threads.length ? table : el("div", { class: "muted small", style: "padding:8px" },
+      hidden ? `No active threads. ${plural(hidden, "completed thread")} hidden.` : "No threads yet."));
 }
 
 function renderThread(t, human) {
@@ -809,7 +897,6 @@ function render() {
     state.paused ? chip("PAUSED", "bad") : chip("live", "ok"),
     el("span", { class: "muted small" }, `signed in as ${state.me.name}${human ? " (human)" : ""}`),
     el("span", { class: "sp" }),
-    human && view === "settings" ? null : el("label", { class: "small muted" }, el("input", { type: "checkbox", checked: showClosed, onchange: e => { showClosed = e.target.checked; refresh(); } }), " closed threads"),
     human ? pauseControl() : null,
     human ? el("button", { id: "settings-link", onclick: () => setView(view === "settings" ? "board" : "settings") },
       view === "settings" ? "Back to board" : "Settings") : null,
@@ -826,9 +913,15 @@ function render() {
     const holder = state.threads.find(t => postsOf(t).some(p => p.id === highlight.id));
     if (holder) selected = holder.id;
   }
-  const threads = sortedThreads();
+  loadSeen();
+  const statuses = new Map(state.threads.map(t => [t.id, threadStatus(t, human)]));
+  const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
+  const all = sortedThreads();
+  // Completed threads are hidden unless "Show completed" is on (or a link points at one).
+  const threads = all.filter(t => showClosed || t.id === pinned || (statuses.get(t.id) || {}).kind !== "done");
   const current = threads.find(t => t.id === selected) || threads[0] || null;
-  list.append(renderThreadList(threads, current, human));
+  if (current) { markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
+  list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
   pane.append(current ? renderThread(current, human)
     : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   if (human) right.append(renderGrants());

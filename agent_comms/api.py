@@ -295,7 +295,17 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     @app.get("/api/state")
     def state(closed: bool = False, p: Principal = P):
-        return board.snapshot(p, closed_threads=closed)
+        out = board.snapshot(p, closed_threads=closed)
+        if p.is_human:
+            # For the thread status dots: dispatcher runs in progress. Server-stamped metadata only, and only
+            # while the dispatcher loop is alive (a crashed loop leaves stale "running" records behind).
+            config, _ = dispatch_config()
+            live = dispatch.loop_status(board, config).get("running", False)
+            out["active_runs"] = [{"thread_id": r.get("thread_id"), "agent": r.get("agent"), "run_id": r.get("run_id"),
+                                   "started_at": r.get("started_at")}
+                                  for r in dispatch.list_runs(board, p, 20)
+                                  if live and r.get("status") in ("starting", "running")]
+        return out
 
     # ---------------------------------------------------------------- sessions
     @app.post("/api/sessions")

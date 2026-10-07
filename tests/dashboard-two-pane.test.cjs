@@ -85,3 +85,68 @@ test('a thread with posts waiting on the human is flagged in the list', async ()
   assert.doesNotMatch(document.querySelector('tr[data-thread="2"]').textContent, /needs you/);
   dom.window.close();
 });
+
+// ---------------------------------------------------------------- status dots
+const MINUTES_AGO = m => new Date(Date.now() - m * 60000).toISOString();
+async function dots({ threads, runs = [], storage = {}, needsYou = [], url = 'http://127.0.0.1:8787/' }) {
+  const dom = new JSDOM(html, { url, runScripts: 'dangerously', beforeParse(win) {
+    for (const [k, v] of Object.entries(storage)) win.localStorage.setItem(k, v);
+    win.fetch = async u => {
+      if (u === '/api/whoami') return ok({ name: 'human', is_human: true });
+      if (u.startsWith('/api/state')) return ok({ me: { name: 'human', is_human: true }, paused: false,
+        threads: threads(u), sessions: [], needs_you: needsYou, limits: {}, authorization_grants: [], agents: [],
+        task_categories: [], active_runs: runs });
+      return { ok: false, status: 404, statusText: '404', json: async () => ({ message: 'not found' }) };
+    };
+  } });
+  await settle();
+  const d = dom.window.document;
+  const dot = id => { const n = d.querySelector(`tr[data-thread="${id}"] .dot`); return n ? [n.className.replace('dot ', ''), n.title] : null; };
+  return { dom, document: d, win: dom.window, dot };
+}
+const task = (id, status, lease_state = 'none', owner_agent = 'codex') => ({ id, title: 'T' + id, status, lease_state, owner_agent });
+
+test('status dots: stalled, being worked on, completed (hidden), nothing to flag', async () => {
+  const blocked = thread(1, [post(10, 1, 1)]); blocked.tasks = [task(1, 'blocked')];
+  const working = thread(2, [post(20, 2, 2)]); working.tasks = [task(2, 'working', 'active')];
+  const asked = thread(3, [post(30, 3, 3, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
+  const fresh = thread(4, [post(40, 4, 4, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(5) })]);
+  const running = thread(5, [post(50, 5, 5, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
+  const finished = thread(6, [post(60, 6, 6)]); finished.tasks = [task(3, 'done')];
+  const closed = thread(7, [post(70, 7, 7)], 'closed');
+  const all = [blocked, working, asked, fresh, running, finished, closed];
+  const { dom, document, dot } = await dots({ threads: u => u.includes('closed=true') ? all : all.slice(0, 6),
+    runs: [{ thread_id: 5, agent: 'codex', run_id: 's50-codex' }], storage: { 'agent-comms-thread': '4' } });
+  assert.deepEqual(dot(1), ['stalled', '1 blocked task']);
+  assert.deepEqual(dot(2), ['active', 'codex working on task 2']);
+  assert.match(dot(3)[1], /^#30 waiting on codex for 2h$/);
+  assert.equal(dot(3)[0], 'stalled');
+  assert.equal(dot(4), null, 'a fresh ask is not stalled yet');
+  assert.deepEqual(dot(5), ['active', 'codex running (dispatcher)']);
+  assert.ok(!document.querySelector('tr[data-thread="6"]'), 'completed threads are hidden by default');
+  assert.match(document.querySelector('.thread-list').textContent, /Show completed/);
+  assert.ok(!document.querySelector('header input[type=checkbox]'), 'the toggle moved out of the header');
+  const box = document.getElementById('show-completed');
+  box.checked = true; box.dispatchEvent(new dom.window.Event('change'));
+  await settle();
+  assert.deepEqual(dot(6), ['done', 'All tasks done']);
+  assert.deepEqual(dot(7), ['done', 'Closed']);
+  dom.window.close();
+});
+
+test('status dots: blue for posts this browser has not shown, cleared by opening the thread', async () => {
+  // First visit: nothing lights up.
+  const first = await dots({ threads: () => THREADS });
+  assert.equal(first.dot(1), null); assert.equal(first.dot(3), null);
+  const seen = first.win.localStorage.getItem('agent-comms-seen');
+  first.dom.window.close();
+  // Thread 1 gets a new agent post and thread 3 a new human post (one's own posts are never unread).
+  const later = [thread(3, [post(30, 3, 10), post(31, 3, 50, { agent: 'human' })]), thread(2, [post(20, 2, 40), post(21, 2, 45)]),
+                 thread(1, [post(10, 1, 5), post(11, 1, 55)])];
+  const { dom, document, dot } = await dots({ threads: () => later, storage: { 'agent-comms-seen': seen, 'agent-comms-thread': '2' } });
+  assert.deepEqual(dot(1), ['unread', 'New posts']);
+  assert.equal(dot(3), null);
+  document.querySelector('tr[data-thread="1"]').click();
+  assert.equal(dot(1), null, 'opening the thread marks it seen');
+  dom.window.close();
+});
