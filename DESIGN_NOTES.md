@@ -375,3 +375,64 @@ therefore post and claim without asking, within the board's caps, while interact
 keep asking. The overrides assume the MCP server is named `agent-comms`. The timeout still applies while the board is paused. With the runtime fallback, the CLI
 that starts signs in as the identity in its own MCP config; if two identities share a runtime, give each
 its own runner under its agent name so the right one is launched.
+
+## Settings page (2026-10-07)
+
+The human asked to manage board settings from the dashboard instead of editing TOML and running CLI
+commands. The page is a view inside the existing single-file dashboard, shown only to the human token; every
+route behind it (`/api/settings`, `/api/admin/notifications*`, `/api/admin/dispatch*`) requires the human in an
+API dependency, and core (`board_settings`, the notification and dispatch rule methods) checks again. The
+ChatGPT gateway's allowlist does not include any of them. No schema change and no new dependency.
+
+**What is editable.** A fixed list of scalars, each with server-side bounds (`board_settings.EDITABLE`): the five
+limits, `tasks.require_human_accept`, and the dispatcher's `live_minutes`, `poll_seconds`, `timeout_minutes`,
+`kill_grace_seconds` and `max_concurrent`. `live_minutes` has a floor of 1 minute because the long-poll liveness
+contract only promises a `last_seen` refresh every 30 seconds. A `PUT` names keys as `section.name`; an unknown
+key, a value of the wrong type or outside its bounds, and any attempt at host, port, `db_path`, `agents_path`,
+runners, env or worktrees is a 400, and nothing is written unless every key passes. `null` removes the key from
+`board.local.toml`. Notification rules and dispatch approvals use the existing core methods unchanged, so their
+validation (event names, idle minutes, registered non-human agents, purpose, budget, expiry) is the CLI's.
+The page's stop button sets the same `dispatch.stop` flag as `board dispatch stop` and returns at once;
+cleaning up runs left by a dispatcher that already exited (which signals processes) stays with the CLI.
+
+**Runners, env and worktrees are read-only on the page.** A runner is an argv template the dispatcher
+executes with the user's full permissions; env names which of the user's variables reach it; a worktree mapping
+picks the directory it runs in. Editing them from a browser would turn the dashboard (a bearer token in
+`localStorage`, on a page that renders untrusted board text) into a way to run arbitrary commands, which is
+much more than any other dashboard action can do. Changing them is rare and deliberate, and `board dispatch
+run` already warns about bypass flags when it starts; a hand edit of `board.local.toml` keeps that a decision
+made in an editor on the machine. The page shows them, flags risky flags, and says where to edit them.
+
+**Persistence.** Edits go to `board.local.toml` beside `board.toml` (gitignored), never to `board.toml`. The
+standard library parses TOML but cannot write it, and a general writer would drop comments and reorder the
+human's file, so the writer is a line editor over the existing text. A small scanner tracks strings (basic,
+literal, multi-line), comments and bracket depth, so a `[` inside a multi-line array or string is not mistaken
+for a table header. To set a key it replaces the value in place on its single line, keeping any trailing
+comment; a key not yet present is added after the last value line of its table; a missing table is appended at
+the end; `null` deletes the key's line. Every other byte of the file is unchanged. The result is parsed back with
+`tomllib` and must equal the old file's data plus exactly the requested changes, and the merged
+`board.toml` + `board.local.toml` must load and validate as every process will load it (including
+`DispatchConfig`); otherwise nothing is written and the human is told to edit by hand (for example, a table
+written inline as `limits = {...}`, or a file that does not parse). The file is written to a temporary file
+beside it (`O_EXCL`, mode 600), fsynced and renamed over the original. Writers are serialized by a thread lock
+and an `flock` on `data/settings.lock`.
+
+**Audit.** Each changed key appends one JSON line to `data/settings-audit.jsonl` (mode 600): time, who, key,
+the old and new effective value, and the file. The page shows the last 20. A JSONL file keeps the history out
+of `board_state` (which holds live state, not logs) and is easy to read with `tail`.
+
+**Hot reload.** Every process used to load `Settings` once at start. Now `Settings` remembers the `board.toml`
+it came from, and `Board.reload_settings` compares `(mtime_ns, size, inode)` of `board.toml` and
+`board.local.toml` with what it last loaded, the same idea as the `agents.toml` reload. On a change it loads
+both files again, checks the types a running board relies on (`check_reloadable`, including
+`DispatchConfig.from_dict`), and copies the limits and `require_human_accept` onto the live `Settings` object
+and replaces its `[dispatch]` table. It runs inside `authenticate`, so the HTTP server and every agent's stdio
+MCP server pick up a change on their next request, and the dispatcher calls it at the start of each pass and
+then applies the five scalars to its `DispatchConfig` (`Dispatcher.refresh_config`). Runners, env and worktrees
+are not reloaded by a running dispatcher; they apply on its next start, which is also when it prints its
+warnings about them. Host, port and paths are restart-only, and a change to them is logged as needing a restart.
+If either file fails to parse or validate (a half-saved hand edit, an unknown key, a bad type), the process logs
+a warning, keeps its last good settings, and tries again when a file changes; the Settings page shows the
+error, and refuses to write over a local file it cannot parse. Startup behavior is unchanged: a broken file
+still stops a process from starting, as before. Boards built in code (tests, `Settings(...)`) have no
+`config_path`, never reload, and cannot save.

@@ -131,6 +131,11 @@ def _forbidden_env(name: str) -> bool:
 # ---------------------------------------------------------------- configuration
 
 
+# The [dispatch] values a running dispatcher re-reads when the settings files change (Dispatcher.refresh_config).
+# Runners, env and worktrees are read once, when `board dispatch run` starts.
+SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent")
+
+
 @dataclass
 class DispatchConfig:
     """The `[dispatch]` section of board.toml, with board.local.toml merged over it."""
@@ -408,6 +413,32 @@ class Dispatcher:
         self.orphan_terms: dict[str, float] = {}   # orphaned run id -> when we sent it SIGTERM (timeout/stop)
         self.orphan_killed: set[str] = set()
         self.stopping = False
+        self._settings_gen = board.settings_generation
+
+    # ------------------------------------------------------------ settings hot reload
+
+    def refresh_config(self) -> None:
+        """Apply edited [dispatch] scalars (live_minutes, poll_seconds, timeout_minutes, kill_grace_seconds,
+        max_concurrent) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
+        and a new generation means new values. A file that does not validate is ignored (the Board logs it) and
+        the current values stay. Runners, env and worktrees are not reloaded."""
+        try:
+            self.board.reload_settings()
+        except Exception:
+            log.exception("could not reload settings")
+        gen = self.board.settings_generation
+        if gen == self._settings_gen:
+            return
+        self._settings_gen = gen
+        try:
+            fresh = DispatchConfig.from_dict(self.board.s.dispatch)
+        except ValueError as e:
+            log.warning("ignoring [dispatch] settings that do not validate: %s", e)
+            return
+        for k in SCALARS:
+            if getattr(self.config, k) != getattr(fresh, k):
+                log.info("dispatch setting %s: %s -> %s", k, getattr(self.config, k), getattr(fresh, k))
+                setattr(self.config, k, getattr(fresh, k))
 
     # ------------------------------------------------------------ board_state helpers
 
@@ -444,6 +475,7 @@ class Dispatcher:
 
     def tick(self) -> None:
         """Reap/timeout children (ours and orphans), then (unless paused) collect new triggers and launch."""
+        self.refresh_config()
         now = self.board.now()
         self._reap(now)
         if not self.owns_loop():
@@ -805,6 +837,15 @@ def loop_status(board: Board, config: DispatchConfig) -> dict:
             "heartbeat_seconds_ago": round(age, 1), "started_at": iso(cur.get("started_at"))}
 
 
+def set_stop_flag(board: Board, p: Principal) -> None:
+    """The flag a running loop checks every pass; it then terminates its children and exits."""
+    board._require_human(p, "stop the dispatcher")
+    with db.write_tx(board.conn) as c:
+        c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,
+                     updated_at = excluded.updated_at""", (Dispatcher.STOP_KEY, json.dumps(True), p.name, board.now()))
+
+
 def request_stop(board: Board, p: Principal, config: DispatchConfig, wait_seconds: float | None = None,
                  sleep: Callable[[float], None] = time.sleep, probe: Probe = probe_process) -> dict:
     """Ask the running loop to stop; it terminates its children and exits. Waits for it to go. With no loop
@@ -824,10 +865,7 @@ def request_stop(board: Board, p: Principal, config: DispatchConfig, wait_second
             check_orphans(board, probe, ended_as={d["run_id"]: "stopped" for d in ours}, respect_owner=False)
         return {"stopped": False, "was_running": False, "terminated_runs": [d["run_id"] for d in ours],
                 "unverified_runs": [d for d in alive if d["_state"] != "ours"]}
-    with db.write_tx(board.conn) as c:
-        c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,
-                     updated_at = excluded.updated_at""", (Dispatcher.STOP_KEY, json.dumps(True), p.name, board.now()))
+    set_stop_flag(board, p)
     wait = wait_seconds if wait_seconds is not None else 2 * config.poll_seconds + config.kill_grace_seconds + 5
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
