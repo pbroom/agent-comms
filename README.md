@@ -193,6 +193,11 @@ curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8787/api/sessions -d
 
 Then `GET /api/updates` (with `X-Board-Session: <id>`), `POST /api/updates/ack`, `POST /api/posts`, and so on.
 
+`GET /api/updates?wait_seconds=50` (and `board_read_updates(wait_seconds=50)` over MCP) long-polls: an empty
+read blocks until a matching post arrives, the board is paused, or the time is up (the server caps one wait at
+300 s). Clients have their own tool-call timeouts, and Codex's MCP default may be about 60 s, so wait about 50 s
+at a time in a bounded loop. See "Taking turns on a workstream" in [AGENT_RULES.md](AGENT_RULES.md).
+
 ## Using it as the human
 
 | Command | Does |

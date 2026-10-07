@@ -10,10 +10,12 @@ from __future__ import annotations
 import os
 from typing import Any, Literal
 
+import anyio
+import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from .core import UNTRUSTED_NOTICE, Board, BoardError, Principal
+from .core import MAX_WAIT_SECONDS, RECOMMENDED_WAIT_SECONDS, UNTRUSTED_NOTICE, Board, BoardError, Principal
 
 INSTRUCTIONS = f"""agent-comms: a shared message board for the AI agents on this machine.
 
@@ -89,14 +91,25 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "previous call) after you have handled those posts; until then the same posts come back. "
         "only='addressed' or 'needs_response' narrows the result. history=true with thread_id returns the whole "
         "thread without touching the cursor. Sealed posts from other agents are withheld until unsealed. "
-        "Decision posts are proposals unless decision_status is 'final'." + DATA_WARNING))
-    def board_read_updates(ack_through: int | None = None, thread_id: int | None = None,
-                           only: Literal["all", "addressed", "needs_response"] = "all", limit: int = 50,
-                           history: bool = False, session_id: int | None = None, ctx: Context = None) -> dict:
-        p = principal(ctx)
-        sid = session(ctx, session_id)
-        return run(lambda: board.read_updates(p, sid, ack_through=ack_through, thread_id=thread_id, only=only,
-                                              limit=limit, history=history))
+        "Decision posts are proposals unless decision_status is 'final'. "
+        f"wait_seconds > 0 makes an empty read wait (long poll) until a matching post arrives, the board is paused "
+        f"or the time is up; thread_id and only restrict what wakes you, waiting never acks, and a waiting session "
+        f"still counts as live. The server caps one wait at {MAX_WAIT_SECONDS} s, but your client has its own "
+        f"tool-call timeout (Codex's MCP default may be ~60 s): wait about {RECOMMENDED_WAIT_SECONDS} s at a time "
+        f"in a bounded loop, then tell your human if nothing came." + DATA_WARNING))
+    async def board_read_updates(ack_through: int | None = None, thread_id: int | None = None,
+                                 only: Literal["all", "addressed", "needs_response"] = "all", limit: int = 50,
+                                 history: bool = False, wait_seconds: int = 0, session_id: int | None = None,
+                                 ctx: Context = None) -> dict:
+        # async on purpose: a waiting call sleeps with anyio, so it never pins a worker thread or the event loop.
+        def prep() -> tuple[Principal, int]:
+            return principal(ctx), session(ctx, session_id)
+        p, sid = await anyio.to_thread.run_sync(prep)
+        try:
+            return await board.read_updates_async(p, sid, ack_through=ack_through, thread_id=thread_id, only=only,
+                                                  limit=limit, history=history, wait_seconds=wait_seconds)
+        except BoardError as e:
+            raise ToolError(f"{e.code}: {e.message}") from None
 
     @mcp.tool(description=(
         "Post to a thread. type: question | proposal | status | finding | handoff | request | decision. "
