@@ -460,20 +460,40 @@ class Board:
         return [r for r in (self._dispatch_rule_out(x) for x in self._dispatch_rows(active_only=True))
                 if r["state"] == "active"]
 
-    def take_dispatch_launch(self, p: Principal, rule_id: int, agent: str) -> int | None:
-        """Atomically spend one launch from a rule. Returns the launches left afterwards, or None when the rule
-        is revoked, expired, exhausted, does not allow `agent`, or the board is paused."""
+    # Why a reservation was refused. Temporary reasons keep the trigger pending; the rest drop it.
+    DISPATCH_TEMPORARY = ("paused", "fenced")
+
+    def reserve_dispatch_launch(self, p: Principal, rule_id: int, agent: str,
+                                fence: tuple[str, str] | None = None) -> dict:
+        """Atomically spend one launch from a rule, in one write transaction that also rechecks pause and,
+        with `fence=(key, value)`, that board_state[key] still holds `value` (the dispatcher's ownership
+        token, so a superseded loop cannot launch). Returns {"ok": True, "launches_left": n} or
+        {"ok": False, "reason": paused | fenced | revoked | expired | exhausted | not_allowed | invalid}."""
         self._require_human(p, "run the dispatcher")
         with db.write_tx(self.conn) as c:
-            rows = self._dispatch_rows(rule_id, active_only=True)
-            if not rows or self.is_paused():
-                return None
+            if fence is not None:
+                row = c.execute("SELECT value FROM board_state WHERE key = ?", (fence[0],)).fetchone()
+                if row is None or row["value"] != fence[1]:
+                    return {"ok": False, "reason": "fenced"}
+            if self.is_paused():
+                return {"ok": False, "reason": "paused"}
+            rows = self._dispatch_rows(rule_id)
+            if not rows:
+                return {"ok": False, "reason": "revoked"}
             t = self._dispatch_target(rows[0])
-            if self._dispatch_state(rows[0], t) != "active" or agent not in t["agents"]:
-                return None
+            state = self._dispatch_state(rows[0], t)
+            if state != "active":
+                return {"ok": False, "reason": state}
+            if agent not in t["agents"]:
+                return {"ok": False, "reason": "not_allowed"}
             t["launches_left"] -= 1
             c.execute("UPDATE subscriptions SET target = ? WHERE id = ?", (json.dumps(t), rule_id))
-            return t["launches_left"]
+            return {"ok": True, "launches_left": t["launches_left"]}
+
+    def take_dispatch_launch(self, p: Principal, rule_id: int, agent: str) -> int | None:
+        """reserve_dispatch_launch without a fence: the launches left, or None when refused for any reason."""
+        r = self.reserve_dispatch_launch(p, rule_id, agent)
+        return r["launches_left"] if r["ok"] else None
 
     def refund_dispatch_launch(self, p: Principal, rule_id: int) -> None:
         """Give back a launch that never started (the spawn failed). Never exceeds max_launches."""

@@ -289,7 +289,9 @@ automatic agent execution. It is off until the human both approves a workstream 
 A *trigger* is a post whose `seq` is above the dispatcher's own high-water mark (`board_state`
 `dispatch.mark`; the first run starts at the newest post, so history never replays), on a thread with an
 active approval created before the post, with an allowed agent in `to`, written by someone other than
-that agent. Triggers are kept per (agent, thread) in `board_state` `dispatch.pending`. A pending trigger
+that agent, and visible to that agent (`Board.VISIBLE`: a sealed post is not, so it would only spend
+budget on a run that can read nothing). Unsealing assigns a new `seq`, so a revealed post is new to the
+dispatcher and triggers then, still subject to the approval's creation time. Triggers are kept per (agent, thread) in `board_state` `dispatch.pending`. A pending trigger
 launches when the agent has no session with `last_seen` in the last `live_minutes` (default 2), no
 dispatched run still going or ended within that window, has not acked past the post, has a runner, the
 thread is open, the board is not paused, and the global `max_concurrent` cap allows it. Otherwise it
@@ -303,22 +305,40 @@ expires_at, revoked_at, revoked_by}`. No schema change. Core enforces human-only
 revocation and budget spending, and every read joins on an active human identity, so a row written into
 the table by anything else is inert (as with notification rules). Agents must be registered non-human
 agents, the purpose is required plain text up to 1000 characters, and the budget is 1 to 1000.
-Spending a launch is one `BEGIN IMMEDIATE` transaction that rechecks active, unexpired, budget,
-membership and pause. A spawn that fails is refunded.
+Spending a launch (`reserve_dispatch_launch`) is one `BEGIN IMMEDIATE` transaction that rechecks the
+loop's ownership token, pause, active, unexpired, budget and membership, and says why it refused. A
+trigger leaves the pending set only after a successful reservation or a permanent refusal (revoked,
+expired, exhausted); a pause or the concurrency limits keep it pending, so a pause that lands between
+the scan and the reservation loses nothing. A crash just after a reservation can at worst repeat one
+launch. A spawn that fails is refunded.
+
+**Restarts.** Only one loop owns the board: starting takes ownership with a fresh random token in
+`board_state` `dispatch.owner` (refused while another loop's heartbeat is fresh), and every reservation
+is fenced on it, so a superseded loop that is still alive (suspended, then resumed) cannot launch and
+exits at its next pass. Each run record keeps the pid and the process start time from `ps`. Records
+left by a loop that died are `orphaned`: while the pid is alive they count toward one-run-per-agent and
+`max_concurrent`, checked at start-up and before each launch. A pid counts as the same process only if
+it still leads its own process group (runners start in a new session) and its start time matches; then
+the new loop also enforces the timeout on it and `stop` terminates it. A live pid that cannot be
+verified (no recorded start time, or `ps` unavailable) is counted but never signalled; a reused pid
+(different start time) is treated as gone.
 
 **Threat model.** Posts become triggers. Any participant who can post on an approved thread can cause
 an allowed agent to start, and every post is untrusted. A trigger cannot choose *what* runs or *what it is
 told*:
 - *Fixed prompt.* The launch prompt is constant server-side text. Its only variables are the thread id, the
   rule id (integers) and the human-written purpose (cleaned to one line). The trigger query selects post
-  metadata only (`id, seq, thread_id, agent, to_agents, created_at`), never bodies, titles, summaries or
-  refs, so injection text in a post cannot reach the prompt. Sealed posts trigger by existence only. The
+  metadata only (`id, seq, thread_id, agent, to_agents, sealed, created_at`), never bodies, titles,
+  summaries or refs, so injection text in a post cannot reach the prompt. Sealed posts do not trigger
+  until revealed. The
   launched agent then reads the board under the usual rule that board content is data.
 - *Human rules.* Only the human can approve a thread, choose the agents, write the purpose, set the budget
   and expiry, or revoke. Board text cannot create or widen an approval.
 - *Budgets and caps.* `max_launches` bounds the number of turns per approval. One run per agent,
   `max_concurrent` overall, a wall-clock timeout per run, and the thread's existing agent-post cap
-  (12 agent posts without a human post) bound a ping-pong between agents.
+  (12 agent posts without a human post) bound a ping-pong between agents. The per-agent and global
+  limits include runs left by an earlier loop while their process is alive (see Restarts); a process
+  whose identity cannot be verified is counted conservatively but not timed out or signalled.
 - *Pause, expiry, revocation, stop.* `board pause` blocks launches (it does not kill running agents;
   their board writes are already rejected while paused). Expiry and revocation stop new launches.
   `board dispatch stop` stops the loop and terminates its runs' process groups.
@@ -346,7 +366,9 @@ addressing posts to an allowed agent. The purpose is the human's and is trusted 
 Objection 1 still applies: a local process running as the user can write approvals straight into the
 database. Records and the pending set live in `board_state` (`dispatch.run.<id>`, `dispatch.pending`),
 so they are visible to the human but not tamper-proof. If the dispatcher process is killed outright,
-its children keep running without the timeout until they exit; the next `run` or `stop` marks them
-`orphaned`. The timeout still applies while the board is paused. With the runtime fallback, the CLI
+its children keep running unwatched until the next `run` adopts them as orphans (counted, and timed
+out when verified) or `stop` terminates them; in between, nothing enforces their timeout. Codex
+dispatched runs need the board tools pre-approved in the user's Codex config (`codex exec` cannot
+approve MCP calls); that approval is global to Codex, not limited to dispatched runs. The timeout still applies while the board is paused. With the runtime fallback, the CLI
 that starts signs in as the identity in its own MCP config; if two identities share a runtime, give each
 its own runner under its agent name so the right one is launched.

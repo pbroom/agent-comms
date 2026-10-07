@@ -405,6 +405,8 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
         notes = [f"no runner configured for {x} or its runtime {runtimes.get(x)!r}; it will not be launched "
                  f"(add \"{x}\" or \"{runtimes.get(x)}\" under [dispatch.runners] in board.local.toml)"
                  for x in r["agents"] if config.runner_for(x, runtimes.get(x)) is None]
+        if any(dispatch.uses_codex(config.runner_for(x, runtimes.get(x))) for x in r["agents"]):
+            notes.append(dispatch.CODEX_APPROVAL_REMINDER)
         subs = board.list_notification_subscriptions(p)
         if not any("agent-launched" in x["events"] for x in subs):
             notes.append("no notification rule includes agent-launched; run `board notify on` to hear about launches")
@@ -432,9 +434,11 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
             text = "dispatcher stopped (any agents it had running were terminated)"
         elif not r["was_running"]:
             text = "dispatcher is not running"
-            for x in r["orphaned_runs"]:
-                text += f"\nrun {x['run_id']} ({x['agent']}, pid {x.get('pid')}) was left running by a dispatcher " \
-                        "that exited; check that process yourself"
+            for rid in r["terminated_runs"]:
+                text += f"\nterminated run {rid}, left running by a dispatcher that exited"
+            for x in r["unverified_runs"]:
+                text += f"\nrun {x['run_id']} ({x['agent']}, pid {x.get('pid')}) may still be running, but it could " \
+                        "not be verified as the process the dispatcher started; check it yourself"
         else:
             text = f"stop requested, but the dispatcher (pid {r.get('pid')}) has not exited yet"
         out(r, text)
@@ -449,6 +453,8 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
             risky = dispatch.risky_flags(t)
             print(f"runner {agent}: {' '.join(t)}" + (f"  WARNING: bypasses permissions/sandbox ({', '.join(risky)})"
                                                       if risky else ""), file=sys.stderr)
+        if any(dispatch.uses_codex(t) for t in config.runners.values()):
+            print(f"note: {dispatch.CODEX_APPROVAL_REMINDER}", file=sys.stderr)
         if not config.runners:
             print("no runners configured in [dispatch.runners] (board.toml / board.local.toml): nothing will be "
                   "launched", file=sys.stderr)

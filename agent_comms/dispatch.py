@@ -11,7 +11,7 @@ Guardrails:
   thread, an explicit agent list, a human-written purpose, a launch budget, and an optional expiry.
 - The launch prompt is fixed server-side text. Its only variable parts are the thread id, the rule id and
   the human-written purpose. No post text, title, summary or anything else an agent wrote reaches it, and
-  the trigger query never selects post bodies (sealed posts trigger only by their existence).
+  the trigger query never selects post bodies; a post the recipient cannot read (sealed) never triggers.
 - Runners are argv templates from board.toml (or board.local.toml), keyed by agent name or runtime, spawned without a shell, with a minimal environment that
   carries no board token (the agent's own MCP launcher reads its protected token file). An agent without
   a configured runner is never launched.
@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import signal
 import subprocess
 import time
@@ -66,6 +67,20 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str) -> str:
         if isinstance(v, bool) or not isinstance(v, int):
             raise TypeError("thread_id and rule_id must be integers")
     return PROMPT_TEMPLATE.format(thread=thread_id, rule=rule_id, purpose=clean(purpose, PURPOSE_MAX))
+
+
+# Codex 0.157 run non-interactively (`codex exec`) refuses MCP tool calls that need approval ("approval policy is
+# never"), so dispatched Codex can only use the board once the human pre-approves the board tools in Codex's config.
+BOARD_TOOLS = ("board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
+               "board_release_task", "board_set_summary", "board_list_threads")
+CODEX_APPROVAL_REMINDER = (
+    "a Codex runner is configured: `codex exec` cannot approve MCP tool calls, so pre-approve the "
+    f"{len(BOARD_TOOLS)} agent-comms board tools in your Codex config first (README \"Dispatcher\", or run "
+    "`bash integrations/codex/install.sh --preapprove-board-tools` to print the block)")
+
+
+def uses_codex(template: list[str] | None) -> bool:
+    return bool(template) and os.path.basename(template[0]) == "codex"
 
 
 def _forbidden_env(name: str) -> bool:
@@ -223,6 +238,54 @@ def spawn_process(argv: list[str], *, cwd: str, env: dict[str, str], log_path: P
 
 Spawner = Callable[..., Child]
 
+ACTIVE = ("starting", "running", "orphaned")   # run statuses that may still have a live process
+
+
+# ---------------------------------------------------------------- process identity
+#
+# A run's record keeps its pid and the process start time `ps` reported right after spawning. A record left by an
+# earlier dispatcher (it crashed, was killed, or was superseded) is only trusted to be "our" process when the pid
+# is still a process-group leader (runners are started with start_new_session) AND its start time matches. Such a
+# run counts toward the concurrency limits and may be signalled. A live pid whose identity cannot be checked is
+# still counted (conservative) but never signalled.
+
+
+def process_start(pid: int) -> str | None:
+    """The process's start time as `ps` reports it, or None (no such process, or ps unavailable)."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5,
+                           stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    out = " ".join(r.stdout.split())
+    return out if r.returncode == 0 and out else None
+
+
+def probe_process(pid: Any, recorded_start: str | None) -> str:
+    """'dead', 'ours' (alive and verified) or 'unknown' (alive, identity not verifiable)."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return "dead"
+    try:
+        os.kill(pid, 0)
+        if os.getpgid(pid) != pid:
+            return "dead"   # pid reused by something that is not a runner (runners lead their own group)
+    except (ProcessLookupError, PermissionError):
+        return "dead"       # gone, or another user's process
+    current = process_start(pid)
+    if recorded_start and current:
+        return "ours" if current == recorded_start else "dead"
+    return "unknown"
+
+
+def _signal_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+Probe = Callable[[Any, "str | None"], str]
+
 
 @dataclass
 class _Run:
@@ -239,6 +302,48 @@ class _Run:
     timed_out: bool = False
 
 
+def _active_records(board: Board) -> list[dict]:
+    out = []
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+        try:
+            d = json.loads(value)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("status") in ACTIVE and isinstance(d.get("run_id"), str):
+            out.append(d)
+    return out
+
+
+def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), note: str = "",
+                  ended_as: dict[str, str] | None = None, respect_owner: bool = True) -> list[dict]:
+    """Active run records that no live dispatcher is watching: not in `exclude` (runs the caller owns) and, with
+    `respect_owner`, not started by the loop that currently owns the board. Dead ones are closed ('gone', or the
+    status given in `ended_as`); live ones are marked 'orphaned' and returned with '_state' ('ours'/'unknown')."""
+    owner = board.conn.execute("SELECT value FROM board_state WHERE key = ?", (Dispatcher.OWNER_KEY,)).fetchone()
+    owner_token = json.loads(owner[0]) if owner and respect_owner else None
+    alive, updates = [], []
+    for d in _active_records(board):
+        if d["run_id"] in exclude or (owner_token is not None and d.get("loop") == owner_token):
+            continue
+        state = probe(d.get("pid"), d.get("proc_start"))
+        if state == "dead":
+            status = (ended_as or {}).get(d["run_id"], "gone")
+            updates.append(d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
+                                "note": "ended while no dispatcher was watching it (exit code unknown)"})
+            continue
+        if d["status"] != "orphaned":
+            d = d | {"status": "orphaned", "note": note or "left running by an earlier dispatcher"}
+            updates.append(d)
+        alive.append(d | {"_state": state})
+    if updates:
+        with db.write_tx(board.conn) as c:
+            for d in updates:
+                c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'dispatcher', ?)
+                             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+                          (Dispatcher.RUN_PREFIX + d["run_id"], json.dumps(d), board.now()))
+    return alive
+
+
 # ---------------------------------------------------------------- the dispatcher
 
 
@@ -246,16 +351,22 @@ class Dispatcher:
     MARK_KEY = "dispatch.mark"
     PENDING_KEY = "dispatch.pending"
     LOOP_KEY = "dispatch.loop"
+    OWNER_KEY = "dispatch.owner"   # the running loop's random token; launches are fenced on it
     STOP_KEY = "dispatch.stop"
     RUN_PREFIX = "dispatch.run."
 
     def __init__(self, board: Board, human: Principal, config: DispatchConfig, spawner: Spawner = spawn_process,
-                 log_dir: Path | None = None):
+                 log_dir: Path | None = None, probe: Probe = probe_process,
+                 process_start: Callable[[int], str | None] = process_start):
         board._require_human(human, "run the dispatcher")
         self.board, self.human, self.config, self.spawner = board, human, config, spawner
+        self.probe, self.process_start = probe, process_start
         self.log_dir = log_dir or board.s.db_path.parent / "dispatch"
+        self.token = secrets.token_hex(16)
         self.running: dict[str, _Run] = {}
         self.ended: dict[str, float] = {}   # agent -> when its last dispatched run ended
+        self.orphan_terms: dict[str, float] = {}   # orphaned run id -> when we sent it SIGTERM (timeout/stop)
+        self.orphan_killed: set[str] = set()
         self.stopping = False
 
     # ------------------------------------------------------------ board_state helpers
@@ -283,20 +394,31 @@ class Dispatcher:
         with db.write_tx(self.board.conn) as c:
             self._put(c, self.RUN_PREFIX + run["run_id"], run)
 
+    def owns_loop(self) -> bool:
+        return self._get(self.OWNER_KEY) == self.token
+
+    def _fence(self) -> tuple[str, str]:
+        return (self.OWNER_KEY, json.dumps(self.token))
+
     # ------------------------------------------------------------ one pass
 
     def tick(self) -> None:
-        """Reap/timeout children, then (unless paused) collect new triggers and launch what is due."""
+        """Reap/timeout children (ours and orphans), then (unless paused) collect new triggers and launch."""
         now = self.board.now()
         self._reap(now)
+        if not self.owns_loop():
+            log.warning("another dispatcher owns this board now; this one stops launching")
+            self.stopping = True
+            return  # superseded: leave the mark, pending triggers and orphans to the owner
+        foreign = self._reap_orphans(now)
         if self.board.is_paused():
             return  # no launches while paused; running children are left alone; triggers wait
         pending = self._scan()
-        self._launch_due(pending, now)
+        self._launch_due(pending, now, foreign)
 
     def _scan(self) -> dict[str, dict]:
-        """New posts (seq above our mark) on approved threads, addressed to an allowed agent by someone else.
-        Reads only metadata: never the body, title or summary."""
+        """New posts (seq above our mark) on approved threads, addressed to an allowed agent by someone else, that
+        the agent can see. Reads only metadata: never the body, title or summary."""
         c = self.board.conn
         mark = self._get(self.MARK_KEY)
         pending = self._get(self.PENDING_KEY)
@@ -306,7 +428,7 @@ class Dispatcher:
             # First run: start at the newest post instead of replaying history.
             mark = c.execute("SELECT COALESCE(MAX(seq), 0) FROM posts").fetchone()[0]
             self._save(**{self.MARK_KEY: mark})
-        rows = c.execute("""SELECT id, seq, thread_id, agent, to_agents, created_at FROM posts
+        rows = c.execute("""SELECT id, seq, thread_id, agent, to_agents, sealed, created_at FROM posts
                             WHERE seq > ? ORDER BY seq LIMIT 1000""", (mark,)).fetchall()
         if not rows:
             return pending
@@ -319,11 +441,14 @@ class Dispatcher:
                 if r["created_at"] < rule["created_at_ts"]:
                     continue  # posts written before the human approved the workstream never trigger it
                 for agent in json.loads(r["to_agents"]):
-                    if agent in rule["agents"] and agent != r["agent"]:
-                        key = f"{agent}:{r['thread_id']}"
-                        if key not in pending or pending[key]["seq"] < r["seq"]:
-                            pending[key] = {"agent": agent, "thread_id": r["thread_id"], "seq": r["seq"],
-                                            "post_created_at": r["created_at"]}
+                    if agent not in rule["agents"] or agent == r["agent"]:
+                        continue
+                    if r["sealed"]:
+                        continue  # the recipient cannot read it (Board.VISIBLE); unsealing gives it a new seq
+                    key = f"{agent}:{r['thread_id']}"
+                    if key not in pending or pending[key]["seq"] < r["seq"]:
+                        pending[key] = {"agent": agent, "thread_id": r["thread_id"], "seq": r["seq"],
+                                        "post_created_at": r["created_at"]}
         self._save(**{self.MARK_KEY: rows[-1]["seq"], self.PENDING_KEY: pending})
         return pending
 
@@ -348,15 +473,18 @@ class Dispatcher:
                                         (agent, thread_id)).fetchone()[0]
         return acked is not None and acked >= seq
 
-    def _launch_due(self, pending: dict[str, dict], now: float) -> None:
+    def _rule_for(self, rules: list[dict], item: dict) -> dict | None:
+        return next((r for r in rules if r["thread_id"] == item["thread_id"] and item["agent"] in r["agents"]
+                     and r["created_at_ts"] <= item["post_created_at"]), None)
+
+    def _launch_due(self, pending: dict[str, dict], now: float, foreign: list[dict] | None = None) -> None:
         if not pending:
             return
         rules = self.board.active_dispatch_rules(self.human)
         changed = False
         for key, item in sorted(pending.items(), key=lambda kv: kv[1]["seq"]):
             agent, thread_id = item["agent"], item["thread_id"]
-            rule = next((r for r in rules if r["thread_id"] == thread_id and agent in r["agents"]
-                         and r["created_at_ts"] <= item["post_created_at"]), None)
+            rule = self._rule_for(rules, item)
             thread = self.board.conn.execute("SELECT status FROM threads WHERE id = ?", (thread_id,)).fetchone()
             drop = None
             if rule is None:
@@ -372,19 +500,43 @@ class Dispatcher:
                 del pending[key]
                 changed = True
                 continue
-            # Wait (keep pending) while the agent is busy or live; it may handle the post itself.
-            if agent in self.running or len(self.running) >= self.config.max_concurrent or self._live(agent, now):
+            # Wait (keep pending) while the agent is busy or live; it may handle the post itself. Runs left by an
+            # earlier dispatcher count too, so a restart cannot exceed one-per-agent or max_concurrent.
+            if foreign is None:
+                foreign = check_orphans(self.board, self.probe, self._own_ids())
+            busy = set(self.running) | {r["agent"] for r in foreign}
+            if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
+                    or self._live(agent, now)):
                 continue
+            res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence())
+            if not res["ok"]:
+                if res["reason"] == "fenced":
+                    log.warning("another dispatcher owns this board now; this one stops launching")
+                    self.stopping = True
+                    break
+                if res["reason"] == "paused":
+                    break  # temporary: everything stays pending until the human unpauses
+                rules = self.board.active_dispatch_rules(self.human)
+                if self._rule_for(rules, item) is None:  # permanent, and no other approval covers it
+                    log.info("not launching %s for thread %s: rule %s is %s", agent, thread_id, rule["id"],
+                             res["reason"])
+                    del pending[key]
+                    changed = True
+                continue
+            # Reserved. Only now drop the trigger; a crash right here can repeat one launch but never lose it.
             del pending[key]
             changed = True
-            self._save(**{self.PENDING_KEY: pending})  # dropped before spawning: a failure never retries in a loop
+            self._save(**{self.PENDING_KEY: pending})
             try:
-                self._launch(agent, rule, item, now)
+                self._launch(agent, rule, item, now, res["launches_left"])
             except Exception:
                 log.exception("launch of %s for thread %s failed", agent, thread_id)
             rules = self.board.active_dispatch_rules(self.human)
         if changed:
             self._save(**{self.PENDING_KEY: pending})
+
+    def _own_ids(self) -> set[str]:
+        return {r.run_id for r in self.running.values()}
 
     def _run_id(self, seq: int, agent: str) -> str:
         base, n = f"s{seq}-{agent}", 1
@@ -394,18 +546,15 @@ class Dispatcher:
             run_id = f"{base}-{n}"
         return run_id
 
-    def _launch(self, agent: str, rule: dict, item: dict, now: float) -> None:
-        left = self.board.take_dispatch_launch(self.human, rule["id"], agent)
-        if left is None:
-            log.info("not launching %s: rule %s no longer allows it", agent, rule["id"])
-            return
+    def _launch(self, agent: str, rule: dict, item: dict, now: float, left: int) -> None:
+        """Start a run whose launch is already reserved (`left` launches remain). A failure refunds it."""
         thread_id = item["thread_id"]
         run_id = self._run_id(item["seq"], agent)
         project = rule["project"]
         cwd = self.config.worktrees.get(project, project)
         log_path = self.log_dir / f"{run_id}.log"
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
-                  "post_seq": item["seq"], "pid": None, "cwd": cwd, "log": str(log_path),
+                  "post_seq": item["seq"], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
         try:
             if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
@@ -426,7 +575,11 @@ class Dispatcher:
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
         self.running[agent] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path))
-        record |= {"pid": child.pid, "status": "running", "launches_left": left}
+        try:
+            started = self.process_start(child.pid)
+        except Exception:
+            started = None
+        record |= {"pid": child.pid, "proc_start": started, "status": "running", "launches_left": left}
         self._record(record)
         log.info("launched %s for thread %s (rule %s, %s launch(es) left), pid %s, log %s",
                  agent, thread_id, rule["id"], left, child.pid, log_path)
@@ -460,8 +613,41 @@ class Dispatcher:
             except Exception:
                 log.exception("could not check %s run %s", run.agent, run.run_id)
 
+    def _reap_orphans(self, now: float) -> list[dict]:
+        """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when
+        their identity is verified. Returns the live ones."""
+        try:
+            alive = check_orphans(self.board, self.probe, self._own_ids(),
+                                  ended_as={rid: "timeout" for rid in self.orphan_terms})
+        except Exception:
+            log.exception("could not check orphaned runs")
+            return []
+        timeout = self.config.timeout_minutes * 60
+        for d in alive:
+            rid, started = d["run_id"], d.get("started_at")
+            if d["_state"] != "ours" or not isinstance(started, (int, float)):
+                continue  # unverified: counted, never signalled
+            if rid not in self.orphan_terms and now - started >= timeout:
+                log.warning("orphaned %s run %s exceeded %s min; terminating", d["agent"], rid,
+                            self.config.timeout_minutes)
+                self.orphan_terms[rid] = now
+                _signal_group(d["pid"], signal.SIGTERM)
+            elif (rid in self.orphan_terms and rid not in self.orphan_killed
+                  and now - self.orphan_terms[rid] >= self.config.kill_grace_seconds):
+                self.orphan_killed.add(rid)
+                _signal_group(d["pid"], signal.SIGKILL)
+        return alive
+
     def stop_children(self, sleep: Callable[[float], None] = time.sleep) -> None:
-        """Terminate every running child (process group), wait the grace period, then kill what remains."""
+        """Terminate every running child (process group), wait the grace period, then kill what remains. Verified
+        runs left by an earlier dispatcher are terminated the same way."""
+        try:
+            orphans = [d for d in check_orphans(self.board, self.probe, self._own_ids()) if d["_state"] == "ours"]
+        except Exception:
+            log.exception("could not check orphaned runs")
+            orphans = []
+        for d in orphans:
+            _signal_group(d["pid"], signal.SIGTERM)
         for run in self.running.values():
             run.child.terminate()
         deadline = time.monotonic() + self.config.kill_grace_seconds
@@ -477,6 +663,11 @@ class Dispatcher:
             sleep(0.2)
         for run in list(self.running.values()):
             self._finish(run, "stopped", run.child.poll())
+        for d in orphans:
+            if self.probe(d["pid"], d.get("proc_start")) == "ours":
+                _signal_group(d["pid"], signal.SIGKILL)
+        if orphans:
+            check_orphans(self.board, self.probe, self._own_ids(), ended_as={d["run_id"]: "stopped" for d in orphans})
 
     # ------------------------------------------------------------ the loop
 
@@ -484,32 +675,41 @@ class Dispatcher:
         return max(60.0, 6 * self.config.poll_seconds)
 
     def acquire_loop(self) -> None:
-        """One dispatcher per board. Refuses while another loop's heartbeat is fresh."""
+        """One dispatcher per board. Refuses while another loop's heartbeat is fresh; otherwise takes ownership
+        with a new token, which fences out any earlier loop that is still alive (it can no longer launch)."""
         now = self.board.now()
         with db.write_tx(self.board.conn) as c:
             row = c.execute("SELECT value FROM board_state WHERE key = ?", (self.LOOP_KEY,)).fetchone()
             cur = json.loads(row[0]) if row else None
-            if cur and now - cur.get("heartbeat", 0) < self._stale_after():
+            owner = c.execute("SELECT value FROM board_state WHERE key = ?", (self.OWNER_KEY,)).fetchone()
+            mine = owner is not None and owner[0] == json.dumps(self.token)
+            if cur and not mine and now - cur.get("heartbeat", 0) < self._stale_after():
                 raise Conflict(f"a dispatcher is already running (pid {cur.get('pid')}); "
                                "stop it with `board dispatch stop` first")
             self._put(c, self.LOOP_KEY, {"pid": os.getpid(), "started_at": now, "heartbeat": now})
+            self._put(c, self.OWNER_KEY, self.token)
             c.execute("DELETE FROM board_state WHERE key = ?", (self.STOP_KEY,))
-        mark_orphans(self.board, "dispatcher restarted")
+        check_orphans(self.board, self.probe, note="left running by an earlier dispatcher")
 
-    def heartbeat(self) -> None:
-        loop = self._get(self.LOOP_KEY) or {}
-        if loop.get("pid") == os.getpid():
-            self._save(**{self.LOOP_KEY: loop | {"heartbeat": self.board.now()}})
+    def heartbeat(self) -> bool:
+        """Refresh the heartbeat while this loop still owns the board. False once superseded."""
+        with db.write_tx(self.board.conn) as c:
+            row = c.execute("SELECT value FROM board_state WHERE key = ?", (self.OWNER_KEY,)).fetchone()
+            if row is None or row[0] != json.dumps(self.token):
+                return False
+            loop = self._get(self.LOOP_KEY) or {}
+            self._put(c, self.LOOP_KEY, loop | {"pid": os.getpid(), "heartbeat": self.board.now()})
+        return True
 
     def stop_requested(self) -> bool:
         return self.stopping or self._get(self.STOP_KEY) is not None
 
     def release_loop(self) -> None:
         with db.write_tx(self.board.conn) as c:
-            row = c.execute("SELECT value FROM board_state WHERE key = ?", (self.LOOP_KEY,)).fetchone()
-            if row and json.loads(row[0]).get("pid") == os.getpid():
-                c.execute("DELETE FROM board_state WHERE key = ?", (self.LOOP_KEY,))
-            c.execute("DELETE FROM board_state WHERE key = ?", (self.STOP_KEY,))
+            row = c.execute("SELECT value FROM board_state WHERE key = ?", (self.OWNER_KEY,)).fetchone()
+            if row is not None and row[0] == json.dumps(self.token):
+                c.execute("DELETE FROM board_state WHERE key IN (?, ?, ?)",
+                          (self.LOOP_KEY, self.OWNER_KEY, self.STOP_KEY))
 
     def run_forever(self, sleep: Callable[[float], None] = time.sleep) -> None:
         self.acquire_loop()
@@ -521,7 +721,9 @@ class Dispatcher:
                     log.exception("dispatcher pass failed")
                 if self.stop_requested():
                     break
-                self.heartbeat()
+                if not self.heartbeat():
+                    log.warning("another dispatcher took over this board; stopping")
+                    break
                 waited = 0.0
                 while waited < self.config.poll_seconds and not self.stopping:
                     sleep(min(0.5, self.config.poll_seconds - waited))
@@ -563,31 +765,25 @@ def loop_status(board: Board, config: DispatchConfig) -> dict:
             "heartbeat_seconds_ago": round(age, 1), "started_at": iso(cur.get("started_at"))}
 
 
-def mark_orphans(board: Board, why: str) -> list[dict]:
-    """Runs still marked running with no dispatcher to watch them (it crashed or was killed)."""
-    orphans = []
-    with db.write_tx(board.conn) as c:
-        for key, value in c.execute("SELECT key, value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
-            try:
-                d = json.loads(value)
-            except ValueError:
-                continue
-            if d.get("status") in ("running", "starting"):
-                d |= {"status": "orphaned", "note": why}
-                c.execute("UPDATE board_state SET value = ?, updated_at = ? WHERE key = ?",
-                          (json.dumps(d), board.now(), key))
-                orphans.append(d)
-    return orphans
-
-
 def request_stop(board: Board, p: Principal, config: DispatchConfig, wait_seconds: float | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> dict:
-    """Ask the running loop to stop; it terminates its children and exits. Waits for it to go."""
+                 sleep: Callable[[float], None] = time.sleep, probe: Probe = probe_process) -> dict:
+    """Ask the running loop to stop; it terminates its children and exits. Waits for it to go. With no loop
+    running, terminates verified runs an earlier dispatcher left and reports any it cannot verify."""
     board._require_human(p, "stop the dispatcher")
     status = loop_status(board, config)
     if not status["running"]:
-        orphans = mark_orphans(board, "dispatcher not running at stop")
-        return {"stopped": False, "was_running": False, "orphaned_runs": orphans}
+        alive = check_orphans(board, probe, note="dispatcher not running at stop", respect_owner=False)
+        ours = [d for d in alive if d["_state"] == "ours"]
+        for d in ours:
+            _signal_group(d["pid"], signal.SIGTERM)
+        if ours:
+            sleep(min(config.kill_grace_seconds, 2.0))
+            for d in ours:
+                if probe(d["pid"], d.get("proc_start")) == "ours":
+                    _signal_group(d["pid"], signal.SIGKILL)
+            check_orphans(board, probe, ended_as={d["run_id"]: "stopped" for d in ours}, respect_owner=False)
+        return {"stopped": False, "was_running": False, "terminated_runs": [d["run_id"] for d in ours],
+                "unverified_runs": [d for d in alive if d["_state"] != "ours"]}
     with db.write_tx(board.conn) as c:
         c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,

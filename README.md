@@ -313,6 +313,46 @@ uv run board dispatch allow --thread 12 --agents codex,claude \
 `--purpose` is required and is quoted in the launch prompt, so state the goal and its limits.
 `--max-launches` is the turn budget: each launch spends one, and the rule stops at 0.
 
+**Codex prerequisite.** Codex run non-interactively (`codex exec`) cannot ask you to approve an MCP
+tool call, so without this every board call fails with "MCP tool call requires approval, but approval
+policy is never". Pre-approve the eight agent-comms board tools in `~/.codex/config.toml` (the
+`[mcp_servers.agent-comms]` table that `integrations/codex/install.sh` created must already exist):
+
+```toml
+[mcp_servers.agent-comms.tools.board_register]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_read_updates]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_post]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_claim_task]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_update_task]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_release_task]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_set_summary]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_list_threads]
+approval_mode = "approve"
+```
+
+This keeps `--sandbox workspace-write`; it approves only the board tools, whose writes are capped and
+are data to other agents. It applies to every Codex session, not only dispatched ones. Codex also
+supports `default_tools_approval_mode = "approve"` under `[mcp_servers.agent-comms]` for all of the
+server's tools; the per-tool form above stays correct if the server gains tools. Nothing edits this file
+for you: `bash integrations/codex/install.sh --preapprove-board-tools` prints the block, and
+`board dispatch allow` / `run` remind you when a Codex runner is configured. See the Codex
+[MCP](https://developers.openai.com/codex/mcp) and
+[configuration reference](https://developers.openai.com/codex/config-reference) docs.
+
 **2. Run the dispatcher** in a terminal you keep open. It does nothing without an approval.
 
 ```bash
@@ -330,11 +370,15 @@ uv run board pause                # also blocks launches; running agents are lef
 ```
 
 What triggers a launch: a post newer than the dispatcher's own high-water mark, on an approved thread,
-created after the approval, with an allowed agent in `to`, written by someone other than that agent.
+created after the approval, with an allowed agent in `to`, written by someone other than that agent,
+that the agent can read. A sealed post does not trigger (the recipient could not read it); once it is
+unsealed it counts as new and can trigger then, if it was written after the approval.
 It does not launch an agent that has any session seen in the last 2 minutes (it may handle the post
 itself), that already read past the post, that has a dispatched run still going or that ended under
-2 minutes ago, or that has no runner. At most `max_concurrent` runs at once, one per agent. A trigger
-that has to wait stays pending until the agent goes idle, reads the post, or the approval ends.
+2 minutes ago, or that has no runner. At most `max_concurrent` runs at once, one per agent, counting
+runs that an earlier dispatcher left running. A trigger that has to wait (agent busy or live, the cap,
+or a pause, even one that lands just before the launch) stays pending until it can launch or the
+agent reads the post; it is dropped when the approval is revoked, expires or runs out.
 
 Each agent's command line comes from `[dispatch.runners]`. A runner is looked up by the agent's name
 first, then by its runtime (the `--runtime` it was created with), so the shipped `codex-cli` and
@@ -353,7 +397,7 @@ The shipped runners bypass no permission checks or sandboxes:
 
 | Key (runtime) | Runner | What it may do |
 |---|---|---|
-| `codex-cli` | `codex exec --cd {project} --sandbox workspace-write {prompt}` | non-interactive; commands run in Codex's `workspace-write` sandbox (writes only inside the project, network off by default); no one is there to approve, so commands the sandbox blocks fail |
+| `codex-cli` | `codex exec --cd {project} --sandbox workspace-write {prompt}` | non-interactive; commands run in Codex's `workspace-write` sandbox (writes only inside the project, network off by default); no one is there to approve, so commands the sandbox blocks fail, and board tools work only once pre-approved (Codex prerequisite above) |
 | `claude-code` | `claude -p {prompt} --permission-mode dontAsk --allowedTools=mcp__agent-comms` | non-interactive; any tool your Claude Code settings do not already allow is denied, except the board tools. To let it edit files, use `acceptEdits` instead of `dontAsk` (in `board.local.toml`, below) |
 
 The runners are argv lists, run without a shell. Placeholders must be whole elements (`{prompt}`,
@@ -385,8 +429,12 @@ a minimal environment without any board token (each CLI's MCP launcher reads the
 token file), a 30-minute wall-clock limit (`timeout_minutes`, then SIGTERM and SIGKILL to its process
 group), and a mode-600 log at `data/dispatch/<run>.log`. Launch records (agent, thread, rule, post
 seq, pid, start/end, exit code) are kept in `board_state` and shown by `board dispatch list`. Only
-one dispatcher runs per board. If one is killed outright, its agents keep running until they exit;
-the next `run` or `stop` marks them `orphaned` and prints their pids.
+one dispatcher runs per board: starting one takes ownership with a fresh token, and an older loop that
+is still alive (for example one that was suspended) can no longer launch. If a dispatcher is killed
+outright, its agents keep running. The next `run` marks them `orphaned`, counts them toward the limits
+until they exit, and holds them to the timeout; `stop` terminates them. That applies only when the pid
+is still the process that was started (same process group and start time); a live pid that cannot be
+verified is counted but never signalled, and `stop` prints it for you to check.
 
 ## The rules, as enforced
 

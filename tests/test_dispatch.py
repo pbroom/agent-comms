@@ -63,6 +63,34 @@ class FakeSpawner:
         return [c["argv"][0] for c in self.calls]
 
 
+class FakeProcs:
+    """Process identity for tests: a fake child is 'ours' while it runs; `external` adds other live pids."""
+
+    def __init__(self, spawner):
+        self.spawner = spawner
+        self.external: dict[int, str | None] = {}   # pid -> start time (None: alive but unverifiable)
+
+    def start(self, pid):
+        return f"start-{pid}"
+
+    def probe(self, pid, recorded_start):
+        if any(c.pid == pid and c.code is None for c in self.spawner.children) or pid in self.external:
+            current = self.external.get(pid, f"start-{pid}")
+            if recorded_start and current:
+                return "ours" if current == recorded_start else "dead"
+            return "unknown"
+        return "dead"
+
+
+def new_dispatcher(env, config=None, spawner=None, acquire=True):
+    spawner = spawner or env.spawner
+    d = Dispatcher(env.board, env.p["human"], config or env.config, spawner=spawner, log_dir=env.log_dir,
+                   probe=env.procs.probe, process_start=env.procs.start)
+    if acquire:
+        d.acquire_loop()
+    return d
+
+
 class Recorder:
     """Stands in for Board.notifier; records events and forwards nothing."""
 
@@ -93,7 +121,8 @@ def denv(tmp_path):
     env.rec = Recorder()
     env.board.notifier = env.rec
     env.log_dir = tmp_path / "dispatch-logs"
-    env.d = Dispatcher(env.board, env.p["human"], env.config, spawner=env.spawner, log_dir=env.log_dir)
+    env.procs = FakeProcs(env.spawner)
+    env.d = new_dispatcher(env)
     env.tid = env.thread("THREADTITLE " + INJECTION[:60])
     env.d.tick()                 # first pass sets the high-water mark at the current newest post
     env.clock.advance(5 * 60)    # every agent's setup session is now idle (not live)
@@ -160,7 +189,8 @@ def test_posts_below_the_mark_or_before_the_rule_never_trigger(tmp_path):
     env.clock.advance(1)
     env.board.create_dispatch_rule(env.p["human"], thread_id=tid, agents=["codex"], purpose="p", max_launches=5)
     spawner = FakeSpawner()
-    d = Dispatcher(env.board, env.p["human"], cfg, spawner=spawner, log_dir=tmp_path / "logs")
+    env.log_dir, env.procs = tmp_path / "logs", FakeProcs(spawner)
+    d = new_dispatcher(env, cfg, spawner)
     d.tick()                                                       # first run: mark = newest post, no replay
     assert spawner.calls == []
     d._save(**{Dispatcher.MARK_KEY: 0})                            # even when re-scanned, it predates the rule
@@ -171,16 +201,33 @@ def test_posts_below_the_mark_or_before_the_rule_never_trigger(tmp_path):
     assert len(spawner.calls) == 1
 
 
-def test_sealed_post_triggers_by_existence_only(denv):
-    rule = allow(denv, agents=["codex"])
+def test_sealed_post_does_not_trigger_until_the_recipient_can_read_it(denv):
+    rule = allow(denv, agents=["codex"], max_launches=1)
     task = denv.accepted_task(denv.tid)
-    denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"],
-              refs=[{"kind": "commit", "path": PROJECT, "rev": "abc123"}])
+    sealed = denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"],
+                       refs=[{"kind": "commit", "path": PROJECT, "rev": "abc123"}])
     denv.clock.advance(5 * 60)
+    denv.d.tick()
+    assert denv.spawner.calls == []                                   # codex could not read it: no launch
+    assert denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 1   # budget untouched
+    assert denv.d._get(Dispatcher.PENDING_KEY) == {}
+    denv.board.unseal(denv.p["human"], sealed["id"])                  # new seq: now it is new and readable
     denv.d.tick()
     assert len(denv.spawner.calls) == 1
     assert denv.spawner.calls[0]["argv"][-1] == build_prompt(denv.tid, rule["id"], rule["purpose"])
     assert SECRET not in json.dumps(denv.spawner.calls, default=str) + json.dumps(runs(denv))
+
+
+def test_sealed_post_from_before_the_approval_never_triggers_even_when_unsealed(denv):
+    task = denv.accepted_task(denv.tid)
+    sealed = denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"],
+                       refs=[{"kind": "commit", "path": PROJECT, "rev": "abc123"}])
+    denv.clock.advance(1)
+    allow(denv, agents=["codex"])
+    denv.clock.advance(5 * 60)
+    denv.board.unseal(denv.p["human"], sealed["id"])
+    denv.d.tick()
+    assert denv.spawner.calls == []
 
 
 def test_already_read_post_is_not_launched_for(denv):
@@ -273,6 +320,56 @@ def test_pause_blocks_launches_and_leaves_children_alone(denv):
     denv.board.set_paused(denv.p["human"], False)
     denv.d.tick()
     assert denv.spawner.agents() == ["codex-cli-fake", "claude-fake"]
+
+
+def test_pause_between_scan_and_reservation_keeps_the_trigger(denv, monkeypatch):
+    allow(denv, agents=["codex"])
+    human_post(denv, ["codex"])
+    real_live = denv.d._live
+
+    def live_then_pause(agent, now):              # the human pauses right before the reservation
+        denv.board.set_paused(denv.p["human"], True)
+        return real_live(agent, now)
+
+    monkeypatch.setattr(denv.d, "_live", live_then_pause)
+    denv.d.tick()
+    monkeypatch.setattr(denv.d, "_live", real_live)
+    assert denv.spawner.calls == []
+    assert [v["agent"] for v in denv.d._get(Dispatcher.PENDING_KEY).values()] == ["codex"]
+    assert denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 10
+    denv.d.tick()                                 # still paused
+    assert denv.spawner.calls == []
+    denv.board.set_paused(denv.p["human"], False)
+    denv.d.tick()
+    assert len(denv.spawner.calls) == 1 and denv.d._get(Dispatcher.PENDING_KEY) == {}
+
+
+def test_revocation_between_scan_and_reservation_drops_the_trigger(denv, monkeypatch):
+    rule = allow(denv, agents=["codex"])
+    human_post(denv, ["codex"])
+    real_live = denv.d._live
+
+    def live_then_revoke(agent, now):
+        denv.board.revoke_dispatch_rule(denv.p["human"], rule["id"])
+        return real_live(agent, now)
+
+    monkeypatch.setattr(denv.d, "_live", live_then_revoke)
+    denv.d.tick()
+    assert denv.spawner.calls == [] and denv.d._get(Dispatcher.PENDING_KEY) == {}
+
+
+def test_reservation_reasons(denv):
+    h = denv.p["human"]
+    rule = allow(denv, agents=["codex"], max_launches=1)
+    fence = (Dispatcher.OWNER_KEY, json.dumps(denv.d.token))
+    assert denv.board.reserve_dispatch_launch(h, rule["id"], "codex", fence=(Dispatcher.OWNER_KEY, '"x"')) == \
+        {"ok": False, "reason": "fenced"}
+    assert denv.board.reserve_dispatch_launch(h, rule["id"], "claude", fence=fence)["reason"] == "not_allowed"
+    denv.board.set_paused(h, True)
+    assert denv.board.reserve_dispatch_launch(h, rule["id"], "codex", fence=fence)["reason"] == "paused"
+    denv.board.set_paused(h, False)
+    assert denv.board.reserve_dispatch_launch(h, rule["id"], "codex", fence=fence) == {"ok": True, "launches_left": 0}
+    assert denv.board.reserve_dispatch_launch(h, rule["id"], "codex", fence=fence)["reason"] == "exhausted"
 
 
 def test_expired_rule_does_not_launch(denv):
@@ -428,6 +525,22 @@ def test_real_process_group_is_terminated(tmp_path):
     assert child.poll() is not None
 
 
+def test_probe_process_identity_with_a_real_process(tmp_path):
+    child = dispatch.spawn_process([sys.executable, "-c", "import time; time.sleep(30)"], cwd=str(tmp_path),
+                                   env={"PATH": os.environ.get("PATH", "")}, log_path=tmp_path / "p.log")
+    try:
+        started = dispatch.process_start(child.pid)
+        assert started
+        assert dispatch.probe_process(child.pid, started) == "ours"
+        assert dispatch.probe_process(child.pid, None) == "unknown"
+        assert dispatch.probe_process(child.pid, "Thu Jan  1 00:00:00 1970") == "dead"
+    finally:
+        child.kill()
+        child.proc.wait(timeout=10)
+    assert dispatch.probe_process(child.pid, started) == "dead"
+    assert dispatch.probe_process(None, None) == dispatch.probe_process(1, None) == "dead"
+
+
 def test_child_env_is_minimal_and_tokenless(denv, monkeypatch):
     environ = {"HOME": "/h", "PATH": "/bin", "AGENT_COMMS_TOKEN": "ac_secret", "BOARD_TOKEN": "ac_human",
                "AGENT_COMMS_CODEX_TOKEN": "ac_codex", "OPENAI_API_KEY": "sk-x", "CODEX_HOME": "/c", "FOO": "bar"}
@@ -564,8 +677,8 @@ def test_stop_terminates_children_and_releases_the_loop(denv):
 
 
 def test_only_one_loop_at_a_time(denv):
-    denv.d.acquire_loop()
-    other = Dispatcher(denv.board, denv.p["human"], denv.config, spawner=denv.spawner, log_dir=denv.log_dir)
+    denv.d.acquire_loop()                       # the owner may re-acquire
+    other = new_dispatcher(denv, acquire=False)
     with pytest.raises(Conflict):
         other.acquire_loop()
     denv.clock.advance(120)            # the first loop's heartbeat went stale (it crashed)
@@ -573,14 +686,114 @@ def test_only_one_loop_at_a_time(denv):
     other.release_loop()
 
 
-def test_runs_left_by_a_dead_dispatcher_are_marked_orphaned(denv):
+# ---------------------------------------------------------------- restarts: orphans and fencing
+
+
+def restart(denv):
+    """The current loop dies without cleaning up (crash/kill); a new one takes over once its heartbeat is stale."""
+    denv.clock.advance(120)
+    denv.d = new_dispatcher(denv)
+    return denv.d
+
+
+def test_surviving_child_of_a_dead_loop_blocks_a_second_run_of_that_agent(denv):
+    allow(denv, agents=["codex", "claude"])
+    human_post(denv, ["codex"])
+    denv.d.tick()
+    [old] = denv.spawner.children
+    restart(denv)
+    assert runs(denv)[0]["status"] == "orphaned"
+    human_post(denv, ["codex"], "another turn")
+    denv.clock.advance(5 * 60)
+    denv.d.tick()
+    assert len(denv.spawner.children) == 1          # no second live codex
+    old.code = 0                                    # the orphan finishes
+    denv.d.tick()
+    assert len(denv.spawner.children) == 2
+    statuses = {r["run_id"]: r["status"] for r in runs(denv)}
+    assert sorted(statuses.values()) == ["gone", "running"]
+
+
+def test_orphans_count_toward_max_concurrent(denv):
+    denv.config.max_concurrent = 1
+    allow(denv, agents=["codex", "claude"])
+    human_post(denv, ["codex"])
+    denv.d.tick()
+    restart(denv)
+    human_post(denv, ["claude"])
+    denv.clock.advance(5 * 60)
+    denv.d.tick()
+    assert denv.spawner.agents() == ["codex-cli-fake"]
+    denv.spawner.children[0].code = 0
+    denv.d.tick()
+    assert denv.spawner.agents() == ["codex-cli-fake", "claude-fake"]
+
+
+def test_unverifiable_live_pid_is_counted_but_never_signalled(denv, monkeypatch):
+    signals = []
+    monkeypatch.setattr(dispatch, "_signal_group", lambda pid, sig: signals.append((pid, sig)))
+    allow(denv, agents=["codex"])
+    with dispatch.db.write_tx(denv.board.conn) as c:   # a record from an older loop, without a start time
+        denv.d._put(c, Dispatcher.RUN_PREFIX + "s0-codex", {
+            "run_id": "s0-codex", "agent": "codex", "thread_id": denv.tid, "rule_id": 1, "post_seq": 0,
+            "pid": 4321, "status": "running", "started_at": denv.clock.t - 3 * 3600})
+    denv.procs.external[4321] = None
+    human_post(denv, ["codex"])
+    denv.clock.advance(5 * 60)
+    denv.d.tick()
+    denv.clock.advance(60)
+    denv.d.tick()
+    denv.d.stop_children(sleep=lambda s: None)
+    assert denv.spawner.calls == [] and signals == []
+    assert {r["run_id"]: r["status"] for r in runs(denv)} == {"s0-codex": "orphaned"}
+
+
+def test_verified_orphan_is_held_to_the_timeout(denv, monkeypatch):
+    signals = []
+    monkeypatch.setattr(dispatch, "_signal_group", lambda pid, sig: signals.append((pid, sig)))
     allow(denv, agents=["codex"])
     human_post(denv, ["codex"])
     denv.d.tick()
-    fresh = Dispatcher(denv.board, denv.p["human"], denv.config, spawner=denv.spawner, log_dir=denv.log_dir)
-    fresh.acquire_loop()
-    assert runs(denv)[0]["status"] == "orphaned"
-    fresh.release_loop()
+    [old] = denv.spawner.children
+    restart(denv)                                   # 2 minutes into the run
+    denv.clock.advance(27 * 60)
+    denv.d.tick()
+    assert signals == []
+    denv.clock.advance(60)
+    denv.d.tick()
+    assert signals == [(old.pid, dispatch.signal.SIGTERM)]
+    denv.clock.advance(10)
+    denv.d.tick()
+    assert signals[-1] == (old.pid, dispatch.signal.SIGKILL)
+    old.code = -9
+    denv.d.tick()
+    assert runs(denv)[0]["status"] == "timeout"
+
+
+def test_reused_pid_is_not_mistaken_for_an_orphan(denv):
+    allow(denv, agents=["codex"])
+    human_post(denv, ["codex"])
+    denv.d.tick()
+    [old] = denv.spawner.children
+    old.code = 0                                    # it exited while no loop watched...
+    denv.procs.external[old.pid] = "a different start time"   # ...and the OS reused its pid
+    restart(denv)
+    assert runs(denv)[0]["status"] == "gone"
+
+
+def test_superseded_loop_cannot_launch(denv):
+    allow(denv, agents=["codex"])
+    zombie = denv.d
+    newer = restart(denv)                           # took over while the old loop was stalled
+    human_post(denv, ["codex"])
+    denv.clock.advance(5 * 60)
+    zombie.tick()                                   # the stalled loop wakes up first
+    assert denv.spawner.calls == [] and zombie.stopping
+    assert zombie.heartbeat() is False
+    zombie.release_loop()                           # does not remove the new owner
+    assert newer.owns_loop()
+    newer.tick()                                    # the trigger was kept for the owner
+    assert len(denv.spawner.calls) == 1
 
 
 # ---------------------------------------------------------------- human notification
@@ -617,6 +830,7 @@ def test_launch_notification_respects_rules(denv):
 
 
 def test_cli_allow_list_revoke(denv, monkeypatch, capsys, tmp_path):
+    denv.d.release_loop()                            # the CLI's Board uses the real clock
     monkeypatch.setattr(cli, "Settings", type("S", (), {"load": staticmethod(lambda: denv.settings)}))
     monkeypatch.setenv("BOARD_TOKEN", denv.tokens["human"])
     monkeypatch.setenv("AGENT_COMMS_HOME", str(tmp_path / "home"))   # no board.toml there: no runners
@@ -646,7 +860,8 @@ def _runtime_env(denv, runners, extra=()):
         create_agent(denv.settings.agents_path, name, runtime)
     denv.board.sync_agents(force=True)
     denv.config = DispatchConfig.from_dict({"runners": runners, "worktrees": {PROJECT: denv.workdir}})
-    denv.d = Dispatcher(denv.board, denv.p["human"], denv.config, spawner=denv.spawner, log_dir=denv.log_dir)
+    denv.d.release_loop()
+    denv.d = new_dispatcher(denv)
 
 
 def test_agent_name_runner_wins_over_runtime(denv):
@@ -749,3 +964,50 @@ def test_local_overlay_validation_names_the_file(tmp_path, monkeypatch):
 
 def test_local_overlay_is_gitignored():
     assert "board.local.toml" in (ROOT / ".gitignore").read_text().split()
+
+
+# ---------------------------------------------------------------- Codex board-tool pre-approval
+
+
+def _documented_tools(text: str) -> list[str]:
+    import re
+    return re.findall(r'^\[mcp_servers\.agent-comms\.tools\.(\w+)\]\napproval_mode = "approve"$', text, re.M)
+
+
+def test_codex_preapproval_block_lists_exactly_the_board_tools():
+    import re
+    import tomllib
+
+    served = re.findall(r"^    def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
+    assert sorted(served) == sorted(dispatch.BOARD_TOOLS) and len(served) == 8
+    for doc in ("README.md", "integrations/codex/README.md"):
+        text = (ROOT / doc).read_text()
+        assert _documented_tools(text) == list(dispatch.BOARD_TOOLS), doc
+        block = text.split("```toml\n[mcp_servers.agent-comms.tools.")[1].split("```")[0]
+        parsed = tomllib.loads("[mcp_servers.agent-comms.tools." + block)
+        assert parsed["mcp_servers"]["agent-comms"]["tools"] == {t: {"approval_mode": "approve"}
+                                                                for t in dispatch.BOARD_TOOLS}
+    script = (ROOT / "integrations/codex/install.sh").read_text()
+    listed = script.split("for tool in ")[1].split("; do")[0].replace("\\\n", " ").split()
+    assert listed == list(dispatch.BOARD_TOOLS)
+    assert "--preapprove-board-tools" in script
+    assert ">>" not in script and "tee " not in script          # it prints the block; it never writes config
+
+
+def test_allow_reminds_about_codex_preapproval(denv, monkeypatch, capsys, tmp_path):
+    denv.d.release_loop()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "board.toml").write_text('[dispatch.runners]\n"codex-cli" = ["codex", "exec", "{prompt}"]\n'
+                                     '"claude-code" = ["claude", "-p", "{prompt}"]\n')
+    monkeypatch.setattr(cli, "Settings", type("S", (), {"load": staticmethod(lambda: denv.settings)}))
+    monkeypatch.setenv("BOARD_TOKEN", denv.tokens["human"])
+    monkeypatch.setenv("AGENT_COMMS_HOME", str(home))
+    cli.main(["dispatch", "allow", "--thread", str(denv.tid), "--agents", "claude", "--purpose", "p",
+              "--max-launches", "1"])
+    assert "pre-approve" not in capsys.readouterr().out          # claude only: no Codex reminder
+    cli.main(["dispatch", "allow", "--thread", str(denv.tid), "--agents", "codex", "--purpose", "p",
+              "--max-launches", "1"])
+    out = capsys.readouterr().out
+    assert "pre-approve the 8 agent-comms board tools" in out and "--preapprove-board-tools" in out
+    assert dispatch.uses_codex(["/opt/homebrew/bin/codex", "exec"]) and not dispatch.uses_codex(["claude"])
