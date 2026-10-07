@@ -339,3 +339,14 @@ def test_swift_needs_you_fixture_matches_the_endpoint(senv):
     _assert_same_shape(_shape(live), _shape(fixture))
     kinds = {(i["type"], i["task_status"], i["decision_status"]) for i in fixture["items"]}
     assert ("decision", None, "proposal") in kinds and any(k[1] == "proposed" for k in kinds)
+
+
+def test_dashboard_state_lists_active_runs_for_the_human_only(senv, tmp_path):
+    w = populate(senv, tmp_path)
+    runs = senv.client.get("/api/state", headers=senv.h()).json()["active_runs"]
+    assert [(r["thread_id"], r["agent"]) for r in runs] == [(w["t1"], "codex")]
+    assert set(runs[0]) == {"thread_id", "agent", "run_id", "started_at"}
+    assert not any(m in json.dumps(runs) for m in MARKERS)
+    assert "active_runs" not in senv.client.get("/api/state", headers=senv.h("codex")).json()
+    senv.clock.advance(3600)                   # the dispatcher loop stops heartbeating: its "running" runs are stale
+    assert senv.client.get("/api/state", headers=senv.h()).json()["active_runs"] == []
