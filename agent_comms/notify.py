@@ -2,7 +2,8 @@
 
 The board stays pull-only for agents. This module only tells the *human* (via macOS Notification
 Center) that something on the board is waiting for them, so a question or an unfinalized decision
-does not sit unseen. It never wakes, runs or messages an agent.
+does not sit unseen. It never wakes, runs or messages an agent. (The separate, human-approved
+dispatcher in dispatch.py does launch agents; it reports each launch here as `agent-launched`.)
 
 Configuration lives in the `subscriptions` table: rows owned by the human with `channel='macos'`,
 an `events` json list (see NOTIFY_EVENTS) and optional `project` / `thread_id` filters. With no such
@@ -35,8 +36,8 @@ from typing import Any, Callable
 log = logging.getLogger("agent_comms.notify")
 
 CHANNEL = "macos"
-NOTIFY_EVENTS = ("needs-response", "to-human", "decision", "idle-agent")
-DEFAULT_NOTIFY_EVENTS = ("needs-response", "to-human", "decision")
+NOTIFY_EVENTS = ("needs-response", "to-human", "decision", "idle-agent", "agent-launched")
+DEFAULT_NOTIFY_EVENTS = ("needs-response", "to-human", "decision", "agent-launched")
 DEFAULT_IDLE_MINUTES = 30
 TITLE = "agent-comms"
 SNIPPET_CHARS = 100
@@ -160,7 +161,7 @@ class HumanNotifier:
         self.schedule = schedule
         self.max_flush_attempts = max_flush_attempts
         self._lock = threading.Lock()
-        self._seen: OrderedDict[int, None] = OrderedDict()
+        self._seen: OrderedDict[Any, None] = OrderedDict()
         self._pending = _Pending()
         self._gate_conn = None
         self._available: bool | None = None
@@ -171,6 +172,8 @@ class HumanNotifier:
         try:
             if event == "post.created":
                 self._post_created(int(payload["post_id"]))
+            elif event == "dispatch.launched":
+                self._dispatch_launched(payload)
         except Exception:  # a notifier failure must never surface on the write path
             log.debug("notifier failed for %s", event, exc_info=True)
 
@@ -240,6 +243,31 @@ class HumanNotifier:
                                         min(s["idle_minutes"] for s in idle_subs))
             if n is not None:
                 self._submit(n)
+
+    def _dispatch_launched(self, payload: dict[str, Any]) -> None:
+        """The dispatcher started an agent. Server-side metadata only: agent, thread, rule, budget left."""
+        if not self.available():
+            return
+        subs = [s for s in self._subscriptions() if "agent-launched" in s["events"]]
+        if not subs:
+            return
+        run_key = ("run", str(payload["run_id"]))
+        with self._lock:
+            if run_key in self._seen:
+                return
+            self._seen[run_key] = None
+            while len(self._seen) > 2000:
+                self._seen.popitem(last=False)
+        thread_id, rule_id, left = int(payload["thread_id"]), int(payload["rule_id"]), int(payload["launches_left"])
+        row = self.board.conn.execute("SELECT project FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        project = row["project"] if row else None
+        if not any((s["project"] is None or s["project"] == project)
+                   and (s["thread_id"] is None or s["thread_id"] == thread_id) for s in subs):
+            return
+        agent = clean(payload["agent"], 32)
+        self._submit(Notification(TITLE, f"dispatcher · thread {thread_id}",
+                                  f"Started {agent} (rule {rule_id}, {left} launch(es) left)",
+                                  agents=(agent,), thread_ids=(thread_id,), kind="agent-launched"))
 
     def _human_notification(self, post, kinds: set[str]) -> Notification:
         kind = next(k for k in LABELS if k in kinds)

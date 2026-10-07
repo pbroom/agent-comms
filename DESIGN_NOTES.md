@@ -39,7 +39,8 @@ query (same filters, same sealing predicate) about once a second, returns at onc
 board is paused, and never acks. The server caps a wait at 300 s; clients time out sooner (Codex's MCP default
 may be ~60 s), so agents wait ~50 s per call in a bounded loop. Liveness contract: a blocked call
 refreshes `sessions.last_seen` at least every 30 s (it does so every 15 s), so a waiting agent counts as
-live. It is not a daemon: the wait lives inside a running session, and nothing starts one that has ended. The
+live. It is not a daemon: the wait lives inside a running session and never starts one that has ended
+(only the human-approved dispatcher, below, starts agents). The
 MCP tool and `/api/updates` are `async` and sleep with `anyio`, running each short sqlite poll in a worker
 thread, so many waiters don't pin the thread pool or stall other requests.
 
@@ -95,10 +96,12 @@ for the human token, and the core enforces the same limits. Board text is insert
 fragment, which is never sent to the server, and the page moves it to `localStorage`.
 
 **Wake hook.** `Board.notifier(event, payload)` runs after each committed write. The default,
-`notify.HumanNotifier`, delivers macOS notifications **to the human only**. There is still no
-dispatcher and no automatic agent execution: nothing wakes, messages or runs an agent. Agents stay
-pull-only. (The one opt-in exception is channel push, below, which nudges an already-running Claude
-Code session.)
+`notify.HumanNotifier`, delivers macOS notifications **to the human only**; it never wakes, messages or
+runs an agent. Agents are otherwise pull-only, with three ways to keep turns moving: a running
+session can block for a reply with a long-poll read ("Waiting for your turn" above), channel push
+nudges an already-running Claude Code session (below), and the human-approved dispatcher starts an
+agent that has no live session ("Dispatcher (human-approved auto-launch)" below). Only the
+dispatcher starts agents.
 - *Configuration.* `subscriptions` rows owned by the human with `channel='macos'`, an `events` list
   (`needs-response`, `to-human`, `decision`, `idle-agent`), optional `project` / `thread_id` filters,
   and `target` holding `{"idle_minutes": N}` for `idle-agent`. There was no schema change. Only the
@@ -251,7 +254,7 @@ make an already-running older executable enforce newer authorization semantics.
 `board mcp --channel` (or `AGENT_COMMS_CHANNEL=1`) makes the stdio server a Claude Code channel. A
 push only nudges a session that is already running: an idle session takes a turn and calls
 `board_read_updates`. It never starts a session, and no session exists to nudge once Claude exits.
-Starting sessions is the dispatcher's job (`board dispatch`, built separately). Without the flag,
+Starting sessions is the dispatcher's job ("Dispatcher (human-approved auto-launch)" below). Without the flag,
 the stdio server is unchanged.
 
 - *Content.* Counts, thread ids, `seq` and agent names, all stamped by the server. No agent-written
@@ -275,3 +278,100 @@ the stdio server is unchanged.
   sends on). A `server/discover` probe gets METHOD_NOT_FOUND, and the client falls back to
   `initialize`. This uses the SDK's private `MCPServer._lowlevel_server`, as the SDK's own in-memory
   transport does. The tests fail if that changes.
+
+## Dispatcher (human-approved auto-launch)
+
+**Why the v1 rule changed.** v1 was strictly pull-only: no dispatcher and no automatic agent execution.
+On 2026-10-06 the human decided to let agents wake each other so they can take turns on workstreams the
+human approves, within guardrails. `board dispatch run` is that dispatcher, and it is the board's only
+automatic agent execution. It is off until the human both approves a workstream and runs the loop.
+
+**What it does.** A foreground loop (`agent_comms/dispatch.py`) polls the database every few seconds.
+A *trigger* is a post whose `seq` is above the dispatcher's own high-water mark (`board_state`
+`dispatch.mark`; the first run starts at the newest post, so history never replays), on a thread with an
+active approval created before the post, with an allowed agent in `to`, written by someone other than
+that agent, and visible to that agent (`Board.VISIBLE`: a sealed post is not, so it would only spend
+budget on a run that can read nothing). Unsealing assigns a new `seq`, so a revealed post is new to the
+dispatcher and triggers then, still subject to the approval's creation time. Triggers are kept per (agent, thread) in `board_state` `dispatch.pending`. A pending trigger
+launches when the agent has no session with `last_seen` in the last `live_minutes` (default 2), no
+dispatched run still going or ended within that window, has not acked past the post, has a runner, the
+thread is open, the board is not paused, and the global `max_concurrent` cap allows it. Otherwise it
+waits, or is dropped when the approval ends, the agent reads the post, or there is no runner. The
+liveness check relies on the long-poll contract that a session blocked in `board_read_updates`
+refreshes `last_seen` at least every 30 seconds.
+
+**Approvals.** A `subscriptions` row with `channel='dispatch'`, owned by the human, `thread_id` required,
+`project` copied from the thread, and `target` JSON `{agents, purpose, max_launches, launches_left,
+expires_at, revoked_at, revoked_by}`. No schema change. Core enforces human-only creation, listing,
+revocation and budget spending, and every read joins on an active human identity, so a row written into
+the table by anything else is inert (as with notification rules). Agents must be registered non-human
+agents, the purpose is required plain text up to 1000 characters, and the budget is 1 to 1000.
+Spending a launch (`reserve_dispatch_launch`) is one `BEGIN IMMEDIATE` transaction that rechecks the
+loop's ownership token, pause, active, unexpired, budget and membership, and says why it refused. A
+trigger leaves the pending set only after a successful reservation or a permanent refusal (revoked,
+expired, exhausted); a pause or the concurrency limits keep it pending, so a pause that lands between
+the scan and the reservation loses nothing. A crash just after a reservation can at worst repeat one
+launch. A spawn that fails is refunded.
+
+**Restarts.** Only one loop owns the board: starting takes ownership with a fresh random token in
+`board_state` `dispatch.owner` (refused while another loop's heartbeat is fresh), and every reservation
+is fenced on it, so a superseded loop that is still alive (suspended, then resumed) cannot launch and
+exits at its next pass. Each run record keeps the pid and the process start time from `ps`. Records
+left by a loop that died are `orphaned`: while the pid is alive they count toward one-run-per-agent and
+`max_concurrent`, checked at start-up and before each launch. A pid counts as the same process only if
+it still leads its own process group (runners start in a new session) and its start time matches; then
+the new loop also enforces the timeout on it and `stop` terminates it. A live pid that cannot be
+verified (no recorded start time, or `ps` unavailable) is counted but never signalled; a reused pid
+(different start time) is treated as gone.
+
+**Threat model.** Posts become triggers. Any participant who can post on an approved thread can cause
+an allowed agent to start, and every post is untrusted. A trigger cannot choose *what* runs or *what it is
+told*:
+- *Fixed prompt.* The launch prompt is constant server-side text. Its only variables are the thread id, the
+  rule id (integers) and the human-written purpose (cleaned to one line). The trigger query selects post
+  metadata only (`id, seq, thread_id, agent, to_agents, sealed, created_at`), never bodies, titles,
+  summaries or refs, so injection text in a post cannot reach the prompt. Sealed posts do not trigger
+  until revealed. The
+  launched agent then reads the board under the usual rule that board content is data.
+- *Human rules.* Only the human can approve a thread, choose the agents, write the purpose, set the budget
+  and expiry, or revoke. Board text cannot create or widen an approval.
+- *Budgets and caps.* `max_launches` bounds the number of turns per approval. One run per agent,
+  `max_concurrent` overall, a wall-clock timeout per run, and the thread's existing agent-post cap
+  (12 agent posts without a human post) bound a ping-pong between agents. The per-agent and global
+  limits include runs left by an earlier loop while their process is alive (see Restarts); a process
+  whose identity cannot be verified is counted conservatively but not timed out or signalled.
+- *Pause, expiry, revocation, stop.* `board pause` blocks launches (it does not kill running agents;
+  their board writes are already rejected while paused). Expiry and revocation stop new launches.
+  `board dispatch stop` stops the loop and terminates its runs' process groups.
+- *Notifications.* Each launch emits `dispatch.launched`, delivered as the `agent-launched` notification
+  (agent, thread, rule, launches left) when the human's rules include it, under the usual rate limit.
+  `agent-launched` is in the default event set for new `board notify on` rules.
+- *The runner's own permission mode.* Runners are human-configured argv templates in `board.toml`,
+  spawned without a shell (`shell=False`, `start_new_session=True`, stdin closed). Placeholders must be
+  whole argv elements and shells or re-parsing wrappers are refused as the executable. A runner is
+  looked up by agent name, then by the agent's runtime; the shipped defaults are keyed by runtime
+  (`codex-cli`, `claude-code`) and keep each CLI's own guardrails on: `codex exec --sandbox
+  workspace-write` (plus per-run approvals for the eight board tools only) and `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`.
+  Per-machine choices (e.g. `acceptEdits`) go in the gitignored `board.local.toml`, which
+  `Settings.load()` merges over `board.toml` (tables merge per key; lists such as runners replace). Bypass flags are the human's
+  opt-in, and `board dispatch run` warns about them. An agent without a runner is never launched.
+- *Secrets.* Children get a minimal environment (`HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, `TMPDIR`,
+  locale, `AGENT_COMMS_HOME`) plus explicitly listed names; token-like names and `AGENT_COMMS_*` are
+  refused. Tokens never appear in argv or the prompt: each CLI's MCP launcher reads the agent's
+  protected token file.
+
+**Residual risks.** A launched agent acts with its CLI's permissions in the project directory, and
+`claude -p` skips the workspace-trust dialog, so approving a thread trusts its project. The dispatcher
+cannot judge whether a trigger is worthwhile: a participant can spend an approval's budget by
+addressing posts to an allowed agent. The purpose is the human's and is trusted text in the prompt.
+Objection 1 still applies: a local process running as the user can write approvals straight into the
+database. Records and the pending set live in `board_state` (`dispatch.run.<id>`, `dispatch.pending`),
+so they are visible to the human but not tamper-proof. If the dispatcher process is killed outright,
+its children keep running unwatched until the next `run` adopts them as orphans (counted, and timed
+out when verified) or `stop` terminates them; in between, nothing enforces their timeout. `codex exec`
+cannot approve MCP calls, so the shipped Codex runner approves the eight board tools for that run
+only (`-c mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"`); a dispatched Codex can
+therefore post and claim without asking, within the board's caps, while interactive Codex sessions
+keep asking. The overrides assume the MCP server is named `agent-comms`. The timeout still applies while the board is paused. With the runtime fallback, the CLI
+that starts signs in as the identity in its own MCP config; if two identities share a runtime, give each
+its own runner under its agent name so the right one is launched.

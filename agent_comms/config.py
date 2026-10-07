@@ -1,4 +1,4 @@
-"""Paths, settings (board.toml) and agent tokens (agents.toml)."""
+"""Paths, settings (board.toml, plus an optional per-machine board.local.toml) and agent tokens (agents.toml)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,22 @@ import os
 import re
 import secrets
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
+SECTIONS = ("server", "limits", "tasks")
+
+
+def deep_merge(base: dict, over: dict) -> dict:
+    """`over` wins. Tables merge key by key, recursively; any other value (including a list) replaces wholesale."""
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
 
 
 def home() -> Path:
@@ -34,18 +45,35 @@ class Settings:
     body_max_bytes: int = 4096
     max_refs: int = 20
     require_human_accept: bool = False
+    # The raw [dispatch] table (merged across layers); validated by dispatch.DispatchConfig.
+    dispatch: dict = field(default_factory=dict)
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "Settings":
+    def read_layers(cls, path: Path | None = None, local: bool = True) -> dict:
+        """board.toml, then board.local.toml beside it (when `local` and present), deep-merged per section.
+        Each layer's [server]/[limits]/[tasks] keys are checked, so an error names the file at fault."""
         path = path or home() / "board.toml"
+        known = {f.name for f in fields(cls)} - {"dispatch"}
+        data: dict = {}
+        for layer in [path] + ([path.with_name(LOCAL_SETTINGS)] if local else []):
+            if not layer.exists():
+                continue
+            d = tomllib.loads(layer.read_text())
+            for section in SECTIONS:
+                for k in d.get(section, {}):
+                    if k not in known:
+                        raise ValueError(f"unknown setting [{section}] {k} in {layer}")
+            data = deep_merge(data, d)
+        return data
+
+    @classmethod
+    def load(cls, path: Path | None = None, local: bool = True) -> "Settings":
         s = cls()
-        if path.exists():
-            data = tomllib.loads(path.read_text())
-            for section in ("server", "limits", "tasks"):
-                for k, v in data.get(section, {}).items():
-                    if not hasattr(s, k):
-                        raise ValueError(f"unknown setting [{section}] {k} in {path}")
-                    setattr(s, k, Path(v).expanduser() if k.endswith("_path") else v)
+        data = cls.read_layers(path, local)
+        for section in SECTIONS:
+            for k, v in data.get(section, {}).items():
+                setattr(s, k, Path(v).expanduser() if k.endswith("_path") else v)
+        s.dispatch = data.get("dispatch", {})
         for p in ("db_path", "agents_path"):
             val = getattr(s, p)
             if not val.is_absolute():
