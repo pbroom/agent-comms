@@ -50,6 +50,8 @@ main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 aut
 .thread-list select { font: inherit; font-size: 12px; padding: 2px 4px; color: var(--ink); background: var(--bg);
   border: 1px solid var(--line); border-radius: 5px; }
 .thread-list .when .dot { display: block; margin: 6px 0 0 auto; }
+.thread-list .when .unstick-row { display: block; margin: 6px 0 0 auto; font-size: 11px; padding: 1px 7px;
+  border-color: var(--warn); color: var(--warn); }
 /* Thread status dots (after Claude's session indicators): blue = new posts, amber = stalled,
    grey pulsing = being worked on, grey ring = completed. */
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
@@ -897,6 +899,15 @@ function statusDot(st) {
   return n;
 }
 
+// The same Unstick as the thread header, under the amber dot in the list. It opens the thread first so the
+// result note (shown in the thread pane) is in view.
+function unstickRowButton(t, st, human) {
+  if (!human || !st || st.kind !== "stalled" || !st.agents || !st.agents.length) return null;
+  return el("button", { class: "unstick-row", "data-unstick": t.id, disabled: unstickBusy,
+    title: `Ask ${names(st.agents)} to find and fix why this thread is stuck`,
+    onclick: e => { e.stopPropagation(); selectThread(t.id); unstickThread(t, st.agents); } }, "Unstick");
+}
+
 function renderThreadList(threads, current, human, statuses, hidden) {
   const waiting = {};
   for (const p of state.needs_you || []) waiting[p.thread_id] = (waiting[p.thread_id] || 0) + 1;
@@ -918,7 +929,7 @@ function renderThreadList(threads, current, human, statuses, hidden) {
           full ? chip("at cap", "bad") : null,
           t.status !== "open" ? chip(t.status) : null)),
       el("td", { class: "when muted small" }, el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
-        statusDot(statuses.get(t.id))));
+        statusDot(statuses.get(t.id)), unstickRowButton(t, statuses.get(t.id), human)));
   });
   const table = el("table", { role: "listbox", "aria-label": "Threads" }, rows);
   table.addEventListener("keydown", e => {

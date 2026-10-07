@@ -122,3 +122,24 @@ test('hidden for an agent viewing the board', async () => {
   assert.equal(document.getElementById('unstick'), null);
   dom.window.close();
 });
+
+test('the list row offers Unstick under the amber dot; it opens that thread and shows the result there', async () => {
+  const quiet = thread(1, [post(10, 1, { to: ['claude'], needs_response: true, created_at: MINUTES_AGO(1) })]);
+  const stuck = thread(2, [post(20, 2, { to: ['codex'], needs_response: true })]);
+  const youOnly = thread(3, [post(30, 3, { needs_response: true })]);
+  const reply = u => u === '/api/threads/2/unstick' ? ok({ post_id: 53, agents: ['codex'], rule_id: 9,
+    dispatcher_running: true, paused: false, live_agents: [], no_runner: [], reasons: [] }) : fail(404, 'nf');
+  const { dom, document, calls, prompts } = await setup({ threads: [quiet, stuck, youOnly], reply,
+    needsYou: [post(30, 3, { needs_response: true })] });
+  const buttons = [...document.querySelectorAll('.thread-list button.unstick-row')].map(b => b.dataset.unstick);
+  assert.deepEqual(buttons, ['2'], 'only rows stalled on an agent get the button');
+  const cell = document.querySelector('tr[data-thread="2"] td.when');
+  assert.ok(cell.querySelector('.dot.stalled').compareDocumentPosition(cell.querySelector('.unstick-row')) & 4, 'under the dot');
+  document.querySelector('button.unstick-row').click();
+  await settle();
+  assert.equal(prompts.length, 1);
+  assert.ok(calls.some(c => c.u === '/api/threads/2/unstick' && c.method === 'POST'));
+  assert.ok(document.getElementById('thread-2'), 'the stalled thread is opened');
+  assert.match(document.getElementById('unstick-result').textContent, /Sent to codex \(post #53\)/);
+  dom.window.close();
+});
