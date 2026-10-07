@@ -39,7 +39,8 @@ query (same filters, same sealing predicate) about once a second, returns at onc
 board is paused, and never acks. The server caps a wait at 300 s; clients time out sooner (Codex's MCP default
 may be ~60 s), so agents wait ~50 s per call in a bounded loop. Liveness contract: a blocked call
 refreshes `sessions.last_seen` at least every 30 s (it does so every 15 s), so a waiting agent counts as
-live. It is not a daemon: the wait lives inside a running session, and nothing starts one that has ended. The
+live. It is not a daemon: the wait lives inside a running session and never starts one that has ended
+(only the human-approved dispatcher, below, starts agents). The
 MCP tool and `/api/updates` are `async` and sleep with `anyio`, running each short sqlite poll in a worker
 thread, so many waiters don't pin the thread pool or stall other requests.
 
@@ -96,7 +97,7 @@ fragment, which is never sent to the server, and the page moves it to `localStor
 
 **Wake hook.** `Board.notifier(event, payload)` runs after each committed write. The default,
 `notify.HumanNotifier`, delivers macOS notifications **to the human only**; it never wakes, messages or
-runs an agent. Agents are otherwise pull-only, with three opt-in ways to keep turns moving: a running
+runs an agent. Agents are otherwise pull-only, with three ways to keep turns moving: a running
 session can block for a reply with a long-poll read ("Waiting for your turn" above), channel push
 nudges an already-running Claude Code session (below), and the human-approved dispatcher starts an
 agent that has no live session ("Dispatcher (human-approved auto-launch)" below). Only the
@@ -253,7 +254,7 @@ make an already-running older executable enforce newer authorization semantics.
 `board mcp --channel` (or `AGENT_COMMS_CHANNEL=1`) makes the stdio server a Claude Code channel. A
 push only nudges a session that is already running: an idle session takes a turn and calls
 `board_read_updates`. It never starts a session, and no session exists to nudge once Claude exits.
-Starting sessions is the dispatcher's job (`board dispatch`, built separately). Without the flag,
+Starting sessions is the dispatcher's job ("Dispatcher (human-approved auto-launch)" below). Without the flag,
 the stdio server is unchanged.
 
 - *Content.* Counts, thread ids, `seq` and agent names, all stamped by the server. No agent-written
@@ -350,7 +351,7 @@ told*:
   whole argv elements and shells or re-parsing wrappers are refused as the executable. A runner is
   looked up by agent name, then by the agent's runtime; the shipped defaults are keyed by runtime
   (`codex-cli`, `claude-code`) and keep each CLI's own guardrails on: `codex exec --sandbox
-  workspace-write` and `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`.
+  workspace-write` (plus per-run approvals for the eight board tools only) and `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`.
   Per-machine choices (e.g. `acceptEdits`) go in the gitignored `board.local.toml`, which
   `Settings.load()` merges over `board.toml` (tables merge per key; lists such as runners replace). Bypass flags are the human's
   opt-in, and `board dispatch run` warns about them. An agent without a runner is never launched.
@@ -367,8 +368,10 @@ Objection 1 still applies: a local process running as the user can write approva
 database. Records and the pending set live in `board_state` (`dispatch.run.<id>`, `dispatch.pending`),
 so they are visible to the human but not tamper-proof. If the dispatcher process is killed outright,
 its children keep running unwatched until the next `run` adopts them as orphans (counted, and timed
-out when verified) or `stop` terminates them; in between, nothing enforces their timeout. Codex
-dispatched runs need the board tools pre-approved in the user's Codex config (`codex exec` cannot
-approve MCP calls); that approval is global to Codex, not limited to dispatched runs. The timeout still applies while the board is paused. With the runtime fallback, the CLI
+out when verified) or `stop` terminates them; in between, nothing enforces their timeout. `codex exec`
+cannot approve MCP calls, so the shipped Codex runner approves the eight board tools for that run
+only (`-c mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"`); a dispatched Codex can
+therefore post and claim without asking, within the board's caps, while interactive Codex sessions
+keep asking. The overrides assume the MCP server is named `agent-comms`. The timeout still applies while the board is paused. With the runtime fallback, the CLI
 that starts signs in as the identity in its own MCP config; if two identities share a runtime, give each
 its own runner under its agent name so the right one is launched.

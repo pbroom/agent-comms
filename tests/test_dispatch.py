@@ -974,12 +974,21 @@ def _documented_tools(text: str) -> list[str]:
     return re.findall(r'^\[mcp_servers\.agent-comms\.tools\.(\w+)\]\napproval_mode = "approve"$', text, re.M)
 
 
-def test_codex_preapproval_block_lists_exactly_the_board_tools():
+def test_codex_board_tool_lists_match_the_mcp_server():
+    """The served tools, the shipped runner's per-run -c approvals, both docs' optional global block and the
+    installer's printed block all name exactly the same eight board tools."""
     import re
     import tomllib
 
-    served = re.findall(r"^    def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
+    served = re.findall(r"^    (?:async )?def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
     assert sorted(served) == sorted(dispatch.BOARD_TOOLS) and len(served) == 8
+    runner = DispatchConfig.load(ROOT / "board.toml", local=False).runners["codex-cli"]
+    overrides = [runner[i + 1] for i, x in enumerate(runner) if x == "-c"]
+    assert overrides == [dispatch.codex_approval_override(t) for t in dispatch.BOARD_TOOLS]
+    assert overrides[0] == 'mcp_servers.agent-comms.tools.board_register.approval_mode="approve"'
+    assert dispatch.codex_unapproved_tools(runner) == [] and dispatch.codex_approval_reminder(runner) is None
+    assert runner[:6] == ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write"]
+    assert runner[-1] == "{prompt}" and dispatch.risky_flags(runner) == []
     for doc in ("README.md", "integrations/codex/README.md"):
         text = (ROOT / doc).read_text()
         assert _documented_tools(text) == list(dispatch.BOARD_TOOLS), doc
@@ -987,6 +996,7 @@ def test_codex_preapproval_block_lists_exactly_the_board_tools():
         parsed = tomllib.loads("[mcp_servers.agent-comms.tools." + block)
         assert parsed["mcp_servers"]["agent-comms"]["tools"] == {t: {"approval_mode": "approve"}
                                                                 for t in dispatch.BOARD_TOOLS}
+        assert "optional" in text.lower()
     script = (ROOT / "integrations/codex/install.sh").read_text()
     listed = script.split("for tool in ")[1].split("; do")[0].replace("\\\n", " ").split()
     assert listed == list(dispatch.BOARD_TOOLS)
@@ -994,20 +1004,38 @@ def test_codex_preapproval_block_lists_exactly_the_board_tools():
     assert ">>" not in script and "tee " not in script          # it prints the block; it never writes config
 
 
-def test_allow_reminds_about_codex_preapproval(denv, monkeypatch, capsys, tmp_path):
+def test_codex_unapproved_tools_parsing():
+    full = ["codex", "exec"] + [a for t in dispatch.BOARD_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
+    assert dispatch.codex_unapproved_tools(full + ["{prompt}"]) == []
+    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == ["board_list_threads"]
+    assert dispatch.codex_unapproved_tools(
+        ["codex", "exec", "--config=mcp_servers.agent-comms.default_tools_approval_mode='approve'", "{prompt}"]) == []
+    other = ["codex", "exec", "-c", 'mcp_servers.other.tools.board_post.approval_mode="approve"',
+             "-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="prompt"', "{prompt}"]
+    assert "board_post" in dispatch.codex_unapproved_tools(other)
+    assert dispatch.codex_approval_reminder(["claude", "-p", "{prompt}"]) is None
+    assert "board_list_threads" in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
+
+
+def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, capsys, tmp_path):
     denv.d.release_loop()
     home = tmp_path / "home"
     home.mkdir()
-    (home / "board.toml").write_text('[dispatch.runners]\n"codex-cli" = ["codex", "exec", "{prompt}"]\n'
-                                     '"claude-code" = ["claude", "-p", "{prompt}"]\n')
     monkeypatch.setattr(cli, "Settings", type("S", (), {"load": staticmethod(lambda: denv.settings)}))
     monkeypatch.setenv("BOARD_TOKEN", denv.tokens["human"])
     monkeypatch.setenv("AGENT_COMMS_HOME", str(home))
-    cli.main(["dispatch", "allow", "--thread", str(denv.tid), "--agents", "claude", "--purpose", "p",
-              "--max-launches", "1"])
-    assert "pre-approve" not in capsys.readouterr().out          # claude only: no Codex reminder
-    cli.main(["dispatch", "allow", "--thread", str(denv.tid), "--agents", "codex", "--purpose", "p",
-              "--max-launches", "1"])
-    out = capsys.readouterr().out
-    assert "pre-approve the 8 agent-comms board tools" in out and "--preapprove-board-tools" in out
+
+    def allow_cli(agent):
+        cli.main(["dispatch", "allow", "--thread", str(denv.tid), "--agents", agent, "--purpose", "p",
+                  "--max-launches", "1"])
+        return capsys.readouterr().out
+
+    (home / "board.toml").write_text('[dispatch.runners]\n"codex-cli" = ["codex", "exec", "{prompt}"]\n'
+                                     '"claude-code" = ["claude", "-p", "{prompt}"]\n')
+    assert "does not approve" not in allow_cli("claude")          # claude only: no Codex warning
+    out = allow_cli("codex")
+    assert "does not approve the agent-comms board tools" in out and "board_list_threads" in out
+    shipped = (ROOT / "board.toml").read_text()                   # the shipped runner approves all eight
+    (home / "board.toml").write_text(shipped)
+    assert "does not approve" not in allow_cli("codex")
     assert dispatch.uses_codex(["/opt/homebrew/bin/codex", "exec"]) and not dispatch.uses_codex(["claude"])

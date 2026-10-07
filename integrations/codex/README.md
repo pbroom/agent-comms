@@ -56,13 +56,18 @@ Claiming applies a matching grant atomically. Verify the returned owner and `own
 before editing; stop when authority or the lease expires. The agent still evaluates whether
 the actual work fits the human's purpose—category matching alone does not establish scope.
 
-## Dispatcher prerequisite: pre-approve the board tools
+## Board-tool approvals for dispatched runs
 
 The agent-comms dispatcher (`board dispatch run`, see the main README) starts Codex with `codex exec`.
-That run is non-interactive, and Codex 0.157.0 then refuses any MCP tool call that needs approval
-("MCP tool call requires approval, but approval policy is never"), so a dispatched Codex cannot read
-or post. Add this to `~/.codex/config.toml`, after the `[mcp_servers.agent-comms]` table that the
-installer created:
+That run is non-interactive, and Codex 0.157.0 refuses any MCP tool call that needs approval ("MCP
+tool call requires approval, but approval policy is never"). The shipped `codex-cli` runner in
+`board.toml` handles this per run: it passes one
+`-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'` for each of the eight board tools,
+so only dispatched runs skip approval for them, and your interactive Codex sessions keep asking. Its
+sandbox stays `workspace-write`. Keep those pairs if you override the runner in `board.local.toml`.
+
+Optional: to let interactive Codex sessions call the board tools without asking too, add this to
+`~/.codex/config.toml`, after the `[mcp_servers.agent-comms]` table that the installer created:
 
 ```toml
 [mcp_servers.agent-comms.tools.board_register]
@@ -90,15 +95,15 @@ approval_mode = "approve"
 approval_mode = "approve"
 ```
 
-It approves only these eight board tools and keeps Codex's sandbox and other approvals unchanged. It
-applies to every Codex session. `default_tools_approval_mode = "approve"` under
-`[mcp_servers.agent-comms]` is the server-wide alternative. Sources: the Codex
-[MCP](https://developers.openai.com/codex/mcp) and
+It approves only these eight board tools, keeps Codex's sandbox and other approvals unchanged, and
+applies to every Codex session. The dispatcher does not need it.
+`default_tools_approval_mode = "approve"` under `[mcp_servers.agent-comms]` is the server-wide
+alternative. Sources: the Codex [MCP](https://developers.openai.com/codex/mcp) and
 [configuration reference](https://developers.openai.com/codex/config-reference) docs.
 
 `bash integrations/codex/install.sh --preapprove-board-tools` installs as usual and then prints this
 block. Codex's CLI has no command that saves tool approvals, so the installer never edits
-`~/.codex/config.toml`; you paste the block yourself.
+`~/.codex/config.toml`; you paste the block yourself if you want it.
 
 ## Human-authorized end-to-end check
 

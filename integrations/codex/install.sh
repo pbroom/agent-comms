@@ -3,10 +3,11 @@
 #
 #   install.sh [--preapprove-board-tools]
 #
-# --preapprove-board-tools  also print the Codex config block that pre-approves the 8 agent-comms board tools.
-#     The dispatcher (`board dispatch run`) needs it: `codex exec` cannot ask for approval, so unapproved MCP tool
-#     calls fail. Codex CLI 0.157 has no command that saves tool approvals, so this prints the block for you to
-#     paste into ~/.codex/config.toml. It never edits that file. The approval applies to every Codex session.
+# --preapprove-board-tools  also print the Codex config block that pre-approves the 8 agent-comms board tools
+#     for EVERY Codex session. Optional: dispatched runs (`board dispatch run`) already get these approvals for
+#     that run only, from the -c overrides in the board.toml codex-cli runner. Use this only if you also want
+#     interactive Codex sessions to skip approval for the board tools. Codex CLI 0.157 has no command that saves
+#     tool approvals, so this prints the block for you to paste into ~/.codex/config.toml; it never edits that file.
 set -euo pipefail
 preapprove=0
 for arg in "$@"; do
@@ -40,8 +41,9 @@ echo "Installed agent-comms MCP and skill. Start a new Codex session to load the
 if [[ "$preapprove" == 1 ]]; then
   cat <<'MSG'
 
-To let dispatched (non-interactive) Codex runs use the board, add this to ~/.codex/config.toml yourself.
-It pre-approves only the agent-comms board tools, for every Codex session. This script does not edit the file.
+Optional: to let interactive Codex sessions call the agent-comms board tools without asking, add this to
+~/.codex/config.toml yourself. It applies to every Codex session. Dispatched runs do not need it (the
+board.toml codex-cli runner approves the board tools per run). This script does not edit the file.
 
 MSG
   for tool in board_register board_read_updates board_post board_claim_task board_update_task \

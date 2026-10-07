@@ -35,7 +35,9 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 # {project} (the run directory), {thread}. The run directory is also the cwd.
 # These defaults bypass no permission checks or sandboxes:
 #   codex-cli: `exec` is non-interactive; --sandbox workspace-write lets it edit only inside the
-#          project, with network off by default; nobody can approve, so blocked commands fail.
+#          project, with network off by default; nobody can approve, so blocked commands fail. Each
+#          `-c` approves one agent-comms board tool for this run only (`codex exec` cannot ask), so
+#          interactive Codex sessions still ask. Keep all eight if you override this runner.
 #   claude-code: -p is non-interactive; --permission-mode dontAsk denies every tool that is not
 #          already allowed by your Claude Code settings, except the agent-comms board tools allowed here.
 # Change them per machine in board.local.toml (gitignored), not here: a key there replaces the same key
@@ -43,7 +45,18 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 #                                         "--allowedTools=mcp__agent-comms"]
 # Opting into --dangerously-* / bypassPermissions is your call; `board dispatch run` warns when it sees one.
 [dispatch.runners]
-"codex-cli" = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write", "{prompt}"]
+"codex-cli" = [
+  "codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write",
+  "-c", 'mcp_servers.agent-comms.tools.board_register.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_read_updates.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_claim_task.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_update_task.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_release_task.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_set_summary.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_list_threads.approval_mode="approve"',
+  "{prompt}",
+]
 "claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
 
 # Extra environment variable NAMES passed to a runner, keyed like runners (values come from the

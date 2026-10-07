@@ -70,17 +70,57 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str) -> str:
 
 
 # Codex 0.157 run non-interactively (`codex exec`) refuses MCP tool calls that need approval ("approval policy is
-# never"), so dispatched Codex can only use the board once the human pre-approves the board tools in Codex's config.
+# never"). The shipped codex-cli runner therefore approves the board tools for that run only, with one
+# `-c mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"` override per tool; interactive Codex sessions
+# keep asking. (A global pre-approval in ~/.codex/config.toml also works, but is optional.)
 BOARD_TOOLS = ("board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
                "board_release_task", "board_set_summary", "board_list_threads")
-CODEX_APPROVAL_REMINDER = (
-    "a Codex runner is configured: `codex exec` cannot approve MCP tool calls, so pre-approve the "
-    f"{len(BOARD_TOOLS)} agent-comms board tools in your Codex config first (README \"Dispatcher\", or run "
-    "`bash integrations/codex/install.sh --preapprove-board-tools` to print the block)")
+CODEX_SERVER = "agent-comms"
+
+
+def codex_approval_override(tool: str) -> str:
+    return f'mcp_servers.{CODEX_SERVER}.tools.{tool}.approval_mode="approve"'
 
 
 def uses_codex(template: list[str] | None) -> bool:
     return bool(template) and os.path.basename(template[0]) == "codex"
+
+
+def codex_unapproved_tools(template: list[str]) -> list[str]:
+    """Board tools a Codex runner does not approve through `-c`/`--config` overrides in its own argv."""
+    values = []
+    for i, x in enumerate(template):
+        if x in ("-c", "--config") and i + 1 < len(template):
+            values.append(template[i + 1])
+        elif x.startswith("--config="):
+            values.append(x[len("--config="):])
+        elif x.startswith("-c") and len(x) > 2:
+            values.append(x[2:].lstrip("="))
+    approved = set()
+    for v in values:
+        key, _, val = v.partition("=")
+        key, val = key.strip(), val.strip().strip("\"'")
+        if val != "approve":
+            continue
+        if key == f"mcp_servers.{CODEX_SERVER}.default_tools_approval_mode":
+            return []
+        prefix, suffix = f"mcp_servers.{CODEX_SERVER}.tools.", ".approval_mode"
+        if key.startswith(prefix) and key.endswith(suffix):
+            approved.add(key[len(prefix):-len(suffix)])
+    return [t for t in BOARD_TOOLS if t not in approved]
+
+
+def codex_approval_reminder(template: list[str] | None) -> str | None:
+    """A warning when a Codex runner would start without approvals for the board tools, else None."""
+    if not uses_codex(template):
+        return None
+    missing = codex_unapproved_tools(template)
+    if not missing:
+        return None
+    return ("a Codex runner does not approve the agent-comms board tools for its run (missing: "
+            f"{', '.join(missing)}). `codex exec` cannot ask for approval, so those calls will fail. Add "
+            "`\"-c\", \"mcp_servers.agent-comms.tools.<tool>.approval_mode=\\\"approve\\\"\"` per tool, as the shipped "
+            "board.toml codex-cli runner does (README \"Dispatcher\")")
 
 
 def _forbidden_env(name: str) -> bool:

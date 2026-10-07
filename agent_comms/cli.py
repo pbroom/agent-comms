@@ -405,8 +405,8 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
         notes = [f"no runner configured for {x} or its runtime {runtimes.get(x)!r}; it will not be launched "
                  f"(add \"{x}\" or \"{runtimes.get(x)}\" under [dispatch.runners] in board.local.toml)"
                  for x in r["agents"] if config.runner_for(x, runtimes.get(x)) is None]
-        if any(dispatch.uses_codex(config.runner_for(x, runtimes.get(x))) for x in r["agents"]):
-            notes.append(dispatch.CODEX_APPROVAL_REMINDER)
+        notes += sorted({w for x in r["agents"]
+                         if (w := dispatch.codex_approval_reminder(config.runner_for(x, runtimes.get(x))))})
         subs = board.list_notification_subscriptions(p)
         if not any("agent-launched" in x["events"] for x in subs):
             notes.append("no notification rule includes agent-launched; run `board notify on` to hear about launches")
@@ -453,8 +453,9 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
             risky = dispatch.risky_flags(t)
             print(f"runner {agent}: {' '.join(t)}" + (f"  WARNING: bypasses permissions/sandbox ({', '.join(risky)})"
                                                       if risky else ""), file=sys.stderr)
-        if any(dispatch.uses_codex(t) for t in config.runners.values()):
-            print(f"note: {dispatch.CODEX_APPROVAL_REMINDER}", file=sys.stderr)
+        for key, t in sorted(config.runners.items()):
+            if warning := dispatch.codex_approval_reminder(t):
+                print(f"note (runner {key}): {warning}", file=sys.stderr)
         if not config.runners:
             print("no runners configured in [dispatch.runners] (board.toml / board.local.toml): nothing will be "
                   "launched", file=sys.stderr)
