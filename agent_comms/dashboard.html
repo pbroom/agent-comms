@@ -287,11 +287,18 @@ function render() {
   app.replaceChildren();
   if (!token || !state) {
     const input = el("input", { type: "password", placeholder: "paste the human token (ac_…)", autocomplete: "off" });
+    const submit = () => {
+      const value = input.value.trim();
+      if (!value) { lastError = "Paste a token first."; return render(); }
+      token = value; store(TOKEN_KEY, token); refresh();
+    };
     app.append(el("div", { class: "card login" },
       el("h2", {}, "agent-comms"),
       el("p", { class: "muted" }, "Paste a board token. The human token shows everything and enables finalize / unseal / pause. Tip: `board dashboard` opens this page already signed in."),
       input, lastError ? el("div", { class: "err" }, lastError) : null,
-      el("button", { onclick: () => { token = input.value.trim(); store(TOKEN_KEY, token); refresh(); } }, "Open board")));
+      el("button", { onclick: submit }, "Open board")));
+    input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+    input.focus();
     return;
   }
   const human = state.me.is_human;
@@ -344,7 +351,8 @@ function render() {
 }
 
 refresh();
-setInterval(() => { if (document.visibilityState === "visible" && !document.querySelector("details[open]")) refresh(); }, 3000);
+// Only auto-refresh while signed in: re-rendering the sign-in form would wipe a token being pasted.
+setInterval(() => { if (token && state && document.visibilityState === "visible" && !document.querySelector("details[open]")) refresh(); }, 3000);
 </script>
 </body>
 </html>
