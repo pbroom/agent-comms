@@ -661,3 +661,50 @@ directly (objection 1). A Codex thread that registers after its first 1 MB, or a
 whose rollout file is older than the 7-day window, gets no link. A board session resumed from a second Codex thread
 keeps the first thread's link, because the first match is never replaced. Dispatcher runs show on the thread dot
 but have no session id in `active_runs`, so they get a link only through their session or task.
+
+## Unstick (2026-10-07)
+
+**What it is.** The dashboard's amber "stalled" dot has a one-click answer when the stall waits on an agent:
+**Unstick** in the thread header (human only). `POST /api/threads/{id}/unstick` (`agent_comms/unstick.py`) computes
+the stuck agents from the database, approves a one-shot dispatcher rule for them, then posts a fixed `request` to
+them as the human. The click itself is the human's approval, so a stalled agent without a live session is launched
+at once even if the human never approved the thread for the dispatcher before.
+
+**Who is stuck (server-side, never from the page).** (a) Active non-human recipients of an unsealed
+`needs_response` post in the thread who have not posted in the thread since (any later post by them counts as the
+reply; a post addressed to its own author does not count). (b) Active non-human owners of a task in the thread that
+is `blocked`, or not done/declined with an expired lease. No age threshold: the dashboard waits 30 minutes before
+it calls an ask stalled, but the human chose to click. The human is never "stuck" here; a thread waiting only on
+the human (needs-you, the post cap) gets a 409 ("nothing here is waiting on an agent") and no button. The query
+reads ids, agent names, flags, statuses and times only, like the dispatcher's trigger scan.
+
+**Why it is safe.**
+- *Human click = approval.* Only the human can call the route (core and the cookie/CSRF rules as for every
+  dashboard POST). Agents cannot unstick each other, so it is not a new way for board text to cause a launch.
+- *Fixed text.* The post body is built server-side: "Unstick: this thread is stalled on you (#9 and #10 have had
+  no reply from codex; task 4 is blocked (owner codex)). Find the root cause …". Its only variables are post ids,
+  task ids and agent names (server-stamped, validated names). The rule purpose is a constant with the thread id.
+  No post body, title, summary, task title or ref is read, so nothing an agent wrote reaches the post, the purpose
+  or the dispatcher's launch prompt (which stays the fixed `PROMPT_TEMPLATE`).
+- *One-shot budget.* The rule names exactly the stuck agents that no active rule for the thread already covers
+  (an active rule with launches left already triggers on the new post), `max_launches` = that number of agents,
+  expiring after 6 hours. It is an ordinary dispatcher rule: visible on the Settings page, revocable, and subject
+  to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any other.
+- *Rule before post.* The dispatcher ignores posts created before a rule, so the rule is written first. If the
+  post then fails, the rule is revoked and the cooldown cleared.
+- *Bounded.* One unstick per thread per 2 minutes (a `board_state` stamp checked and set in one write transaction,
+  so a double click posts once). The post is a human post, so it resets the thread's agent-post cap, which is
+  intended: the human has stepped in.
+
+**What happens next** comes back in the response so the page can say it plainly: `agents`, `rule_id` (null when
+existing rules cover everyone), `dispatcher_running` (`dispatch.loop_status`), `paused`, `live_agents` (a session
+seen within `[dispatch] live_minutes`, or a dispatched run in progress: the dispatcher will not launch them, and they
+see the request through their normal read, hook or channel path), `no_runner` (no `[dispatch.runners]` entry, so it
+can never be launched) and `reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
+pulsing; a blocked task keeps the dot amber until the agent resolves it, but the button is not offered for an agent
+that is running for that thread.
+
+**Residual risks.** Each click can spend one launch per stuck agent (their tokens), at most once per 2 minutes per
+thread. The request asks the agent to stay within what the thread already asked for; it grants no new scope, and
+board content is still data to the launched agent. A stuck agent that keeps failing will be asked again only when
+the human clicks again.
