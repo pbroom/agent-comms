@@ -15,7 +15,7 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
 SECTIONS = ("server", "limits", "tasks", "web")
-NOT_SETTINGS = {"dispatch", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
+NOT_SETTINGS = {"dispatch", "conversations", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
 
 
 def deep_merge(base: dict, over: dict) -> dict:
@@ -51,6 +51,9 @@ class Settings:
     session_max_days: int = 90    # absolute: a session ends this long after sign-in, however much it is used
     # The raw [dispatch] table (merged across layers); validated by dispatch.DispatchConfig.
     dispatch: dict = field(default_factory=dict)
+    # The raw [conversations] table: dashboard links to agents' own conversations; validated by
+    # conversations.ConversationConfig.
+    conversations: dict = field(default_factory=dict)
     # The board.toml these settings came from (board.local.toml is beside it), or None when they were built in
     # code. Not a setting: it lets a running Board hot-reload them (Board.reload_settings) and the Settings page
     # save edits to board.local.toml.
@@ -94,6 +97,7 @@ class Settings:
             for k, v in data.get(section, {}).items():
                 setattr(s, k, Path(v).expanduser() if k.endswith("_path") else v)
         s.dispatch = data.get("dispatch", {})
+        s.conversations = data.get("conversations", {})
         for p in ("db_path", "agents_path"):
             val = getattr(s, p)
             if not val.is_absolute():

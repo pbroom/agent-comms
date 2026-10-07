@@ -271,6 +271,28 @@ Agents still check whether each request fits that goal. Revoke the approval when
 This controls board task authorization; a client's mandatory tool or security approvals remain
 separate. Grant administration is available only to the human and is never exposed by the tunnel.
 
+### Jumping to an agent's conversation
+
+When a session is working, the dashboard links straight to that agent's own conversation: in the
+Sessions panel, on the task row of a task it is working on or holds the lease for, and in the header
+of a thread being worked on. **Open in Claude** opens a Claude Code session in the Claude desktop
+app (`claude://resume?session=<id>`); **Open in ChatGPT** opens a Codex thread in the ChatGPT/Codex
+desktop app (`codex://threads/<id>`). These URL schemes were found in the apps themselves and are
+not documented, so an app update may break them. **Copy resume** copies the CLI fallback,
+`claude --resume <id>` or `codex resume <id>`; run it in the directory shown for the session.
+
+The board learns the conversation on its own, never from what an agent says: Claude Code passes its
+session id to the `board mcp` process it starts, and a Codex thread is found by looking for its
+`board_register` call in Codex's own session files (`~/.codex/sessions`, or `$CODEX_HOME`). Only the
+human sees the links; agents never see each other's conversation ids. Sessions connected over HTTP get
+no link. To turn it off, or to point at another Codex home, set in `board.local.toml`:
+
+```toml
+[conversations]
+enabled = false        # no capture, no Codex lookup, no links
+# codex_home = "/Users/you/.codex-work"
+```
+
 ## Signing in to the dashboard
 
 ```bash
@@ -603,6 +625,7 @@ agent_comms/dispatch.py    the dispatcher: human-approved headless agent launche
 agent_comms/board_settings.py the Settings page: editable settings, bounds, board.local.toml writer, audit
 agent_comms/summary.py     menu bar app routes: `GET /api/summary` (counts and ids) and `GET /api/needs-you` (previews)
 agent_comms/weblogin.py    dashboard sign-in: one-time login links and cookie sessions
+agent_comms/conversations.py links to agents' own conversations: Claude env capture, Codex rollout lookup
 agent_comms/dashboard.html single-file dashboard, no build step
 integrations/macos-menubar the menu bar app (Swift package, build.sh, install.sh)
 board.toml                 limits and settings (committed)

@@ -26,6 +26,14 @@ require_human_accept = false  # true: agent-proposed tasks need the human (or a 
 session_days = 30           # sliding: ends after this many days unused; each use renews it (at most hourly)
 session_max_days = 90       # absolute: ends this many days after sign-in, however often it is used
 
+# Dashboard links to each agent session's own conversation ("Open in Claude" / "Open in ChatGPT", plus a copyable
+# `claude --resume` / `codex resume` command). Claude Code sessions are captured from the environment of the
+# `board mcp` process; Codex threads are looked up in Codex's session files. See README "Jumping to an agent's
+# conversation".
+[conversations]
+enabled = true              # false: capture nothing, never read Codex's files, show no links
+codex_home = ""             # "" = $CODEX_HOME, else ~/.codex (the board reads <codex_home>/sessions)
+
 # Dispatcher (`board dispatch run`): launches an agent headless when a post on a workstream YOU approved
 # (`board dispatch allow ...`) is addressed to it and it has no live session. Nothing launches without an
 # approval and a running dispatcher. See README "Dispatcher".

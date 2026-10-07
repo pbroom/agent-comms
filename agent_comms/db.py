@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3   # v3: sessions.client_kind / client_session_id (conversation links)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     project     TEXT NOT NULL,
     worktree    TEXT,
     started_at  REAL NOT NULL,
-    last_seen   REAL NOT NULL
+    last_seen   REAL NOT NULL,
+    client_kind        TEXT,   -- 'claude-code' | 'codex': whose conversation this session is (conversations.py)
+    client_session_id  TEXT    -- that conversation's UUID, validated; human-only in /api/state
 );
 
 CREATE TABLE IF NOT EXISTS threads (
@@ -175,6 +177,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
                 WHEN status != 'proposed' THEN 'legacy' ELSE 'none' END""")
         if "authorization_grant_id" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN authorization_grant_id INTEGER REFERENCES authorization_grants(id)")
+        # v3: additive; existing sessions simply have no conversation link.
+        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        for column in ("client_kind", "client_session_id"):
+            if column not in session_columns:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
