@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from . import board_settings, dispatch, summary, weblogin
+from . import board_settings, dispatch, summary, unstick, weblogin
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -332,6 +332,12 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/threads/{thread_id}/reopen")
     def reopen_thread(thread_id: int, p: Principal = P):
         return board.set_thread_status(p, thread_id, "open")
+
+    @app.post("/api/threads/{thread_id}/unstick")
+    def unstick_thread(thread_id: int, p: Principal = P):
+        # Posts a fixed request as the human to the agents the thread is waiting on, after approving a one-shot
+        # dispatcher rule for them (see unstick.py). Human only (core checks). The agents come from the database.
+        return unstick.unstick(board, p, thread_id, dispatch_config()[0])
 
     @app.put("/api/threads/{thread_id}/summary")
     def set_summary(thread_id: int, body: SummaryIn, request: Request, p: Principal = P):
