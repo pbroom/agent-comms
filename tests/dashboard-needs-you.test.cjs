@@ -64,7 +64,7 @@ const badges = (d, id) => [...d.querySelectorAll(`#needs-you [data-post="${id}"]
 const card = (d, id, value) => d.querySelector(`#needs-you [data-post="${id}"] input[type="radio"][value="${value}"]`);
 const primary = (d, id) => d.querySelector(`#needs-you [data-post="${id}"] .ny-primary`);
 const button = (d, id, action) => d.querySelector(`#needs-you [data-post="${id}"] button[data-action="${action}"]`);
-const pick = async (d, id) => { d.querySelector(`tr[data-thread="${id}"]`).click(); await settle(10); };
+const pick = async (d, id) => { d.querySelector(`li[data-thread="${id}"]`).click(); await settle(10); };
 
 test('the card sits at the top of the thread, only for items that need you, newest first, saying what each blocks', async () => {
   const q = post(10, 1, { type: 'question', agent: 'claude-code', needs_response: true });
@@ -86,7 +86,7 @@ test('the card sits at the top of the thread, only for items that need you, newe
     assert.equal(first.querySelector('.ask-label').textContent, 'Question (from the post)');
     assert.equal(first.querySelector('h3').textContent, 'post 14 ' + INJECTION);
     assert.equal(document.querySelector('#needs-you h2').textContent, 'Needs you (3)');
-    assert.match(document.querySelector('tr[data-thread="1"] .dot').getAttribute('aria-label'), /3 posts waiting on you: #10, #12, #14/);
+    assert.match(document.querySelector('li[data-thread="1"] .dot').getAttribute('aria-label'), /3 posts waiting on you: #10, #12, #14/);
     document.getElementById('show-completed').click();
     await settle();
     await pick(document, 3);
@@ -304,8 +304,8 @@ test('an answered linked issue is not shown as the blocker; the card names the p
     assert.equal(card7.querySelector('.ny-explain').textContent, 'Issue #4 is answered; this thread is still waiting on post #221.');
     assert.deepEqual(contexts(document), ['Blocking thread #7 · post #221 by claude-code']);
     assert.match(document.querySelector('#thread-issues').textContent, /Human answered · unresolved/);
-    assert.match(document.querySelector('tr[data-thread="7"] .dot').getAttribute('aria-label'), /Waiting on you: post #221/);
-    assert.match(document.querySelector('tr[data-thread="7"] .needs-chip').title, /post #221/);
+    assert.match(document.querySelector('li[data-thread="7"] .dot').getAttribute('aria-label'), /Waiting on you: post #221/);
+    assert.match(document.querySelector('li[data-thread="7"] .needs-chip').title, /post #221/);
   } finally { dom.window.close(); }
 });
 
@@ -368,19 +368,19 @@ test('the "needs you" chip in the list opens the thread at the callout; so do th
     needsYou: [q, r], storage: { 'agent-comms-thread': '1' } });
   try {
     assert.equal(document.getElementById('needs-you'), null);
-    const chip = document.querySelector('tr[data-thread="2"] button.needs-chip');
+    const chip = document.querySelector('li[data-thread="2"] button.needs-chip');
     assert.equal(chip.textContent, '1 needs you');
     win.scrolled = [];
     chip.click();
     await settle(10);
-    assert.equal(document.querySelector('tr[aria-selected=true]').dataset.thread, '2');
+    assert.equal(document.querySelector('li[data-selected=true]').dataset.thread, '2');
     assert.deepEqual(items(document), [20]);
     assert.deepEqual(win.scrolled, ['needs-you'], 'the callout is brought into view');
     assert.equal(win.location.hash, '#thread-2');
     win.scrolled = [];
     document.querySelector('.ny-side[data-post="30"]').click();
     await settle(10);
-    assert.equal(document.querySelector('tr[aria-selected=true]').dataset.thread, '3');
+    assert.equal(document.querySelector('li[data-selected=true]').dataset.thread, '3');
     assert.deepEqual(items(document), [30]);
     assert.deepEqual(win.scrolled, ['30'], 'scrolled to that item in the callout');
     document.querySelector('.ny-side[data-post="20"] a').click();   // the #N link does the same, not a hash jump
@@ -396,7 +396,7 @@ test('a #post-N deep link to a needs-you post shows the callout and lands on its
     url: 'http://127.0.0.1:8787/#post-20' });
   try {
     await settle();
-    assert.equal(document.querySelector('tr[aria-selected=true]').dataset.thread, '2');
+    assert.equal(document.querySelector('li[data-selected=true]').dataset.thread, '2');
     assert.equal(document.getElementById('thread-pane').firstElementChild.id, 'needs-you');
     assert.deepEqual(items(document), [20]);
     assert.ok(win.scrolled.includes('20'), 'scrolled to the callout block');

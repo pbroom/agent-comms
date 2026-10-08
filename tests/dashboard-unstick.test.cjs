@@ -44,7 +44,7 @@ async function setup({ threads, human = true, runs = [], needsYou = [], reply = 
   await settle();
   return { dom, win: dom.window, document: dom.window.document, calls, prompts };
 }
-const pick = async (document, id) => { document.querySelector(`tr[data-thread="${id}"]`).click(); await settle(10); };
+const pick = async (document, id) => { document.querySelector(`li[data-thread="${id}"]`).click(); await settle(10); };
 
 test('the button shows only for stalls that wait on an agent', async () => {
   const asked = thread(1, [post(10, 1, { to: ['codex'], needs_response: true })]);
@@ -139,7 +139,7 @@ test('the list row offers Unstick under the amber dot; it opens that thread and 
     needsYou: [post(30, 3, { needs_response: true })] });
   const buttons = [...document.querySelectorAll('.thread-list button.unstick-row')].map(b => b.dataset.unstick);
   assert.deepEqual(buttons, ['2'], 'only rows stalled on an agent get the button');
-  const cell = document.querySelector('tr[data-thread="2"] td.when');
+  const cell = document.querySelector('li[data-thread="2"] .when');
   assert.ok(cell.querySelector('.dot.stalled').compareDocumentPosition(cell.querySelector('.unstick-row')) & 4, 'under the dot');
   document.querySelector('button.unstick-row').click();
   await settle();
@@ -240,7 +240,7 @@ for (const type of ['status', 'finding', 'request']) {
       const { dom, document } = await setup({ threads: [t] });
       try {
         const shouldStall = needs_response || type === 'request';
-        assert.equal(Boolean(document.querySelector('tr[data-thread="1"] .dot.stalled')), shouldStall);
+        assert.equal(Boolean(document.querySelector('li[data-thread="1"] .dot.stalled')), shouldStall);
         assert.equal(Boolean(document.getElementById('unstick')), shouldStall);
       } finally {
         dom.window.close();
@@ -253,7 +253,7 @@ test('human approval statuses still wait on their recipient', async () => {
   const t = thread(1, [post(10, 1, { agent: 'human', type: 'status', to: ['codex'] })]);
   const { dom, document } = await setup({ threads: [t] });
   try {
-    assert.ok(document.querySelector('tr[data-thread="1"] .dot.stalled'));
+    assert.ok(document.querySelector('li[data-thread="1"] .dot.stalled'));
     assert.ok(document.getElementById('unstick'));
   } finally {
     dom.window.close();

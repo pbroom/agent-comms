@@ -46,7 +46,7 @@ async function setup({ board, url = 'http://127.0.0.1:8787/', storage = {}, rout
 }
 const rowSel = id => `.thread-list [data-thread="${id}"]`;
 const dotOf = (d, id) => { const n = d.querySelector(`${rowSel(id)} .dot`); return n ? [n.className.replace('dot ', ''), n.title] : null; };
-const shown = d => [...d.querySelectorAll('#thread-pane > section[id^="thread-"]')].map(s => s.id);
+const shown = d => [...d.querySelectorAll('#thread-pane > section[id^="thread-"]:not(#thread-issues)')].map(s => s.id);
 
 // ---------------------------------------------------------------- 2. new posts bring a settled thread back
 test('a completed thread comes back with a blue dot when a new post arrives, until it is opened', async () => {
@@ -256,4 +256,52 @@ test('an Unstick receiver outside the 30 recent sessions is still shown, never a
       if (reply.sessions_detail) assert.ok(d.querySelector('#unstick-sessions [data-session="77"] a[href^="codex://threads/"]'), 'its conversation link');
     } finally { dom.window.close(); }
   }
+});
+
+// ---------------------------------------------------------------- 14. list semantics: rows, not listbox options
+test('thread and issue lists are lists of rows whose title link selects; buttons are siblings; keys still move', async () => {
+  const waiting = post(30, 3, { type: 'question', needs_response: true, to: ['human'] });
+  const stuck = thread(2, [post(20, 2, { created_at: ago(2) })], { tasks: [task(1, 'blocked')] });
+  const board = { threads: [thread(1, [post(10, 1, { created_at: ago(1) })]), stuck, thread(3, [waiting])], needs_you: [waiting],
+    issues: [issue(1, 'Flaky login'), issue(2, 'Disk full')] };
+  const { dom, win, d } = await setup({ board });
+  try {
+    assert.equal(d.querySelectorAll('[role=listbox], [role=option]').length, 0, 'no listbox or option roles');
+    const list = d.querySelector('.thread-list ul[role=list]');
+    assert.ok(list, 'a list');
+    assert.deepEqual([...list.children].map(n => n.tagName), ['LI', 'LI', 'LI']);
+    for (const b of d.querySelectorAll('.thread-list button[data-unstick], .thread-list button.needs-chip'))
+      assert.equal(b.closest('a, [role=option], [aria-selected]'), null, 'buttons are not inside the selecting element');
+    assert.ok(d.querySelector(`${rowSel(2)} button[data-unstick]`) && d.querySelector(`${rowSel(3)} button.needs-chip`));
+    const link = id => d.getElementById(`thread-row-${id}`);
+    assert.equal(link(1).getAttribute('aria-current'), 'true');
+    assert.equal(link(1).tabIndex, 0);
+    assert.equal(link(2).tabIndex, -1, 'roving tabindex: only the selected row is in the Tab order');
+    assert.match(link(1).getAttribute('aria-describedby'), /thread-row-1-sub/);
+    link(1).focus();
+    link(1).dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    assert.deepEqual(shown(d), ['thread-2']);
+    assert.equal(d.activeElement, link(2), 'focus moves with the selection');
+    assert.equal(link(2).getAttribute('aria-current'), 'true');
+    d.activeElement.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'j', bubbles: true }));
+    assert.deepEqual(shown(d), ['thread-3']);
+    d.activeElement.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'k', bubbles: true }));
+    assert.deepEqual(shown(d), ['thread-2']);
+    await win.refresh();
+    assert.equal(d.activeElement, link(2), 'focus survives the 3-second refresh');
+    link(3).click();
+    assert.deepEqual(shown(d), ['thread-3'], 'the link selects');
+    assert.equal(win.location.hash, '#thread-3');
+    d.querySelector(`${rowSel(1)} .when`).click();
+    assert.deepEqual(shown(d), ['thread-1'], 'so does a click elsewhere on the row');
+    // Issues: the same structure.
+    d.getElementById('tab-issues').click(); await settle();
+    assert.ok(d.querySelector('.issue-list ul[role=list] li.issue-row[data-issue="1"]'));
+    const issueLink = d.getElementById('issue-row-1');
+    assert.equal(issueLink.getAttribute('aria-current'), 'true');
+    issueLink.focus();
+    issueLink.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    assert.ok(d.getElementById('issue-2'));
+    assert.equal(d.activeElement, d.getElementById('issue-row-2'));
+  } finally { dom.window.close(); }
 });

@@ -209,15 +209,18 @@ main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 aut
 @media (max-width: 480px) { main { padding: 12px; gap: 12px; } header { padding: 8px 12px; } }
 .thread-list { padding: 6px; }
 .thread-list h2 { padding: 6px 8px 2px; }
-.thread-list table { font-size: 13px; }
-.thread-list td { padding: 8px; border-top: 1px solid var(--border); cursor: pointer; }
-.thread-list tr:first-child td { border-top: 0; }
-.thread-list tr:hover td { background: var(--accent); }
-.thread-list tr[aria-selected=true] td { background: var(--muted); }
-.thread-list tr[aria-selected=true] td:first-child { box-shadow: inset 3px 0 0 var(--primary); }
-.thread-list tr:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+/* List rows (see listRow): the title link selects; the focus ring is drawn on the whole row. */
+.thread-list .rows { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.thread-list .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 16px; padding: 8px;
+  border-top: 1px solid var(--border); cursor: pointer; }
+.thread-list .row:first-child { border-top: 0; }
+.thread-list .row:hover { background: var(--accent); }
+.thread-list .row[data-selected=true] { background: var(--muted); box-shadow: inset 3px 0 0 var(--primary); }
+.thread-list .row:has(.row-link:focus-visible) { outline: 2px solid var(--ring); outline-offset: -2px; }
+.thread-list .row-link { color: inherit; text-decoration: none; }
+.thread-list .row-link:focus-visible { outline: none; }
 .thread-list .title { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.thread-list .when { text-align: right; white-space: nowrap; width: 1%; }
+.thread-list .when { text-align: right; white-space: nowrap; }
 .thread-list .head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 2px; }
 .thread-list .head h2 { padding: 0; margin: 0; flex: 1; }
 .thread-list .head.tabs { padding: 2px 2px 6px; }
@@ -1436,6 +1439,31 @@ function sessionsDetail(r) {
     .map(s => ({ id: s.id, agent: s.agent, conversation: s.conversation, started_at: typeof s.started_at === "string" ? s.started_at : null }));
 }
 
+// The thread and issue lists: a plain list of rows (not a listbox, whose options cannot hold buttons). In each row
+// the title is a link, the one element that selects the row: it carries aria-current on the selected row, and only
+// that row's link is in the Tab order (roving tabindex); the row's buttons (needs you, Unstick) are its siblings.
+// A click anywhere else on the row selects it too. Arrow keys and j/k move the selection and focus with it.
+function listRow(attrs, id, href, on, select, title, sub, when) {
+  const link = el("a", { class: "row-link", id, href, tabindex: on ? "0" : "-1", "aria-current": on ? "true" : null,
+    "aria-describedby": sub && sub.id ? sub.id : null, onclick: e => e.preventDefault() }, title);
+  return el("li", { ...attrs, class: ((attrs.class || "") + " row").trim(), "data-selected": on ? "true" : "false", onclick: () => select() },
+    el("div", { class: "main" }, el("div", { class: "title" }, link), sub),
+    el("div", { class: "when muted small" }, when));
+}
+function listRows(label, rows, ids, currentId, select, linkId) {
+  const list = el("ul", { class: "rows", role: "list", "aria-label": label }, rows);
+  list.addEventListener("keydown", e => {
+    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || currentId === null || currentId === undefined) return;
+    const i = ids.indexOf(currentId) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
+    if (i < 0 || i >= ids.length) return;
+    e.preventDefault();
+    select(ids[i]);
+    const link = document.getElementById(linkId(ids[i]));
+    if (link) { link.focus({ preventScroll: true }); if (link.scrollIntoView) link.scrollIntoView({ block: "nearest" }); }
+  });
+  return list;
+}
+
 function renderThreadList(threads, current, human, statuses, hidden) {
   const waiting = {}, waitingPosts = {};
   for (const p of state.needs_you || []) {
@@ -1448,11 +1476,9 @@ function renderThreadList(threads, current, human, statuses, hidden) {
     const open = (t.task_counts ? Object.entries(t.task_counts) : [])
       .filter(([k]) => !["done", "declined"].includes(k)).reduce((n, [, v]) => n + v, 0);
     const full = t.agent_posts_since_human >= t.thread_cap;
-    return el("tr", { role: "option", "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1", "data-thread": t.id,
-        onclick: () => selectThread(t.id) },
-      el("td", {},
-        el("div", { class: "title" }, el("span", { class: "muted" }, `#${t.id} `), t.title),
-        el("div", { class: "sub" },
+    return listRow({ "data-thread": t.id }, `thread-row-${t.id}`, `#thread-${t.id}`, on, () => selectThread(t.id),
+      [el("span", { class: "muted" }, `#${t.id} `), t.title],
+        el("div", { class: "sub", id: `thread-row-${t.id}-sub` },
           el("span", { title: t.project }, base),
           el("span", {}, `· ${posts.length}${posts.length >= 60 ? "+" : ""} post${posts.length === 1 ? "" : "s"}`),
           open ? el("span", {}, `· ${open} task${open === 1 ? "" : "s"}`) : null,
@@ -1460,20 +1486,11 @@ function renderThreadList(threads, current, human, statuses, hidden) {
             title: `Open this thread at what needs you: ${waitingPosts[t.id].map(id => "post #" + id).join(", ")}`,
             onclick: e => { e.stopPropagation(); openNeedsYou(t.id); } }, `${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`) : null,
           full ? chip("at cap", "bad") : null,
-          t.status !== "open" ? chip(t.status) : null)),
-      el("td", { class: "when muted small" }, el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
-        statusDot(statuses.get(t.id)), unstickButton(t, statuses.get(t.id), human, "row")));
+          t.status !== "open" ? chip(t.status) : null),
+      [el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
+        statusDot(statuses.get(t.id)), unstickButton(t, statuses.get(t.id), human, "row")]);
   });
-  const table = el("table", { role: "listbox", "aria-label": "Threads" }, rows);
-  table.addEventListener("keydown", e => {
-    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || !current) return;
-    const i = threads.findIndex(t => t.id === current.id) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
-    if (i < 0 || i >= threads.length) return;
-    e.preventDefault();
-    selectThread(threads[i].id);
-    const row = document.querySelector(`.thread-list tr[data-thread="${threads[i].id}"]`);
-    if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
-  });
+  const table = listRows("Threads", rows, threads.map(t => t.id), current && current.id, id => selectThread(id), id => `thread-row-${id}`);
   const toggle = el("label", { class: "small muted", title: "Closed threads, and open threads where nothing is waiting on anyone" },
     el("input", { type: "checkbox", id: "show-completed", checked: showClosed,
       onchange: e => { showClosed = e.target.checked; refresh(); } }), "Show completed");
@@ -2273,26 +2290,16 @@ function renderIssueResults(box, current) {
   const rows = list.map(i => {
     const st = issueState(i), on = !!current && current.id === i.id, threads = issueThreads(i);
     const names = [...new Set(threads.map(l => baseName(l.project)))];
-    return el("tr", { class: "issue-row", role: "option", "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1",
-        "data-issue": i.id, onclick: () => openIssue(i.id) },
-      el("td", {},
-        el("div", { class: "title" }, el("span", { class: "muted" }, `#${i.id} `), i.title),
-        el("div", { class: "sub" }, el("span", {}, plural(threads.length, "thread")),
-          names.length ? el("span", { title: [...new Set(threads.map(l => l.project))].join("\n") },
-            "· " + names.slice(0, 2).join(", ") + (names.length > 2 ? ` +${names.length - 2}` : "")) : null)),
-      el("td", { class: "when muted small" }, el("span", { title: i.updated_at || "" }, ago(i.updated_at)),
-        statusDot({ kind: st.kind, label: st.tip })));
+    return listRow({ class: "issue-row", "data-issue": i.id }, `issue-row-${i.id}`, `#issue-${i.id}`, on, () => openIssue(i.id),
+      [el("span", { class: "muted" }, `#${i.id} `), i.title],
+      el("div", { class: "sub", id: `issue-row-${i.id}-sub` }, el("span", {}, plural(threads.length, "thread")),
+        names.length ? el("span", { title: [...new Set(threads.map(l => l.project))].join("\n") },
+          "· " + names.slice(0, 2).join(", ") + (names.length > 2 ? ` +${names.length - 2}` : "")) : null),
+      [el("span", { title: i.updated_at || "" }, ago(i.updated_at)), statusDot({ kind: st.kind, label: st.tip })]);
   });
-  const table = el("table", { role: "listbox", "aria-label": "Issues" }, rows);
-  table.addEventListener("keydown", e => {
-    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || !current) return;
-    const n = list.findIndex(i => i.id === current.id) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
-    if (n < 0 || n >= list.length) return;
-    e.preventDefault();
-    scrollToIssue = false; openIssue(list[n].id); scrollToIssue = false;
-    const row = document.querySelector(`.thread-list tr[data-issue="${list[n].id}"]`);
-    if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
-  });
+  // Arrowing does not scroll the pane into view (openIssue would on one column): the list keeps the keyboard.
+  const table = listRows("Issues", rows, list.map(i => i.id), current && current.id,
+    id => { scrollToIssue = false; openIssue(id); scrollToIssue = false; }, id => `issue-row-${id}`);
   box.replaceChildren(table);
   if (list.length >= 200) box.append(el("p", { class: "muted small", style: "padding:0 8px" },
     searching ? "Showing up to 200 matches. Refine your search for older issues." : "Showing recent issues. Search to find older discussions."));
