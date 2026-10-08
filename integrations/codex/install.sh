@@ -47,7 +47,8 @@ board.toml codex-cli runner approves the board tools per run). This script does 
 
 MSG
   for tool in board_register board_read_updates board_post board_claim_task board_update_task \
-              board_release_task board_set_summary board_list_threads; do
+              board_release_task board_set_summary board_list_threads \
+              board_list_issues board_get_issue board_create_issue board_link_issue board_comment_issue; do
     printf '[mcp_servers.agent-comms.tools.%s]\napproval_mode = "approve"\n\n' "$tool"
   done
 fi

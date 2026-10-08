@@ -168,7 +168,7 @@ final class BoardModel: ObservableObject {
     func perform(_ action: ItemAction, on item: NeedsYouItem, project: String?) {
         switch action {
         case .view:
-            open(.post(item.postId))
+            open(item.dashboardPage)
         case .finalizeDecision(let postId):
             later {
                 guard self.confirm(title: "Finalize decision #\(postId)?",

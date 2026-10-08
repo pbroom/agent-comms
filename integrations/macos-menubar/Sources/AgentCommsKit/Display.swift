@@ -40,7 +40,8 @@ public enum Display {
 
     /// "#41 · claude · question · thread 12 (spfx-kit)"
     public static func needsYouItem(_ item: BoardSummary.Item, in summary: BoardSummary) -> String {
-        "#\(item.postId) · \(agentName(item.agent)) · \(postType(item.type)) · \(thread(item.threadId, in: summary))"
+        if let id = item.issueId { return "Issue #\(id) · awaiting your decision" }
+        return "#\(item.postId ?? 0) · \(agentName(item.agent)) · \(postType(item.type)) · \(thread(item.threadId, in: summary))"
     }
 
     static func thread(_ id: Int, project: String?) -> String {
@@ -50,7 +51,8 @@ public enum Display {
 
     /// "#51 · claude · proposal · thread 12 (spfx-kit)"
     public static func needsYouItem(_ item: NeedsYouItem, project: String?) -> String {
-        "#\(item.postId) · \(agentName(item.agent)) · \(postType(item.type)) · \(thread(item.threadId, project: project))"
+        if let id = item.issueId { return "Issue #\(id) · awaiting your decision" }
+        return "#\(item.postId ?? 0) · \(agentName(item.agent)) · \(postType(item.type)) · \(thread(item.threadId, project: project))"
     }
 
     /// The submenu title: the item line, then a short quoted preview when there is one.

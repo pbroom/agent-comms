@@ -125,7 +125,7 @@ struct OnlineSections: View {
         } else {
             let entries = model.needsYouItems(summary)
             Section(header: Text(verbatim: "Needs you (\(summary.needsYou.count))")) {
-                ForEach(entries, id: \.item.postId) { entry in
+                ForEach(entries, id: \.item.identity) { entry in
                     NeedsYouSubmenu(item: entry.item, project: entry.project, model: model)
                 }
                 if summary.needsYou.count > entries.count {

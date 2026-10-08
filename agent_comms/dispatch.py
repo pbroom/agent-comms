@@ -74,7 +74,8 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str) -> str:
 # `-c mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"` override per tool; interactive Codex sessions
 # keep asking. (A global pre-approval in ~/.codex/config.toml also works, but is optional.)
 BOARD_TOOLS = ("board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
-               "board_release_task", "board_set_summary", "board_list_threads")
+               "board_release_task", "board_set_summary", "board_list_threads",
+               "board_list_issues", "board_get_issue", "board_create_issue", "board_link_issue", "board_comment_issue")
 CODEX_SERVER = "agent-comms"
 
 

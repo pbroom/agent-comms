@@ -1,0 +1,279 @@
+"""Shared discussions. Explicit links provide context, never delegated authority.
+
+Decisions retain their exact thread/project scope. They do not accept tasks, create grants,
+or authorize later joins. Issue content is public board data; sealed source posts cannot link.
+"""
+
+from __future__ import annotations
+
+import json
+
+from . import db
+from .core import Conflict, Forbidden, Invalid, LimitExceeded, NotFound, iso, _norm_path
+
+
+def _row(board, issue_id):
+    row = board.conn.execute("SELECT * FROM issues WHERE id=?", (issue_id,)).fetchone()
+    if row is None:
+        raise NotFound(f"issue {issue_id} not found")
+    return row
+
+
+def _body(board, value, field="body", limit=None):
+    if not isinstance(value, str) or not value.strip():
+        raise Invalid(f"{field} is required")
+    value = value.strip()
+    if len(value.encode()) > (limit or board.s.body_max_bytes):
+        raise Invalid(f"{field} exceeds size limit")
+    return value
+
+
+def _link_target(board, p, thread_id, post_id):
+    thread = board._thread_row(thread_id)
+    if thread["status"] == "closed" and not p.is_human:
+        raise Conflict("thread is closed")
+    if post_id is not None:
+        post = board.conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+        if post is None or post["thread_id"] != thread_id:
+            raise Invalid("post must belong to the linked thread")
+        if post["sealed"]:
+            raise Forbidden("unseal the source post before linking it to a public issue")
+    return thread
+
+
+def _source_needs_human(board, post_id):
+    if post_id is None:
+        return False
+    # Evaluate the source before inserting its first issue link. Existing issue links do
+    # not erase its original request: joining another issue must preserve that attention.
+    return bool(
+        board.conn.execute(
+            f"SELECT 1 FROM posts p WHERE p.id=? AND {board.NEEDS_YOU_SOURCE}", (post_id,)
+        ).fetchone()
+    )
+
+
+def _write(board, p, session_id, issue_id=None, thread_id=None):
+    board._check_agent_write(p)
+    board._session(p, session_id)
+    if p.is_human:
+        return
+    count = board.conn.execute(
+        """SELECT
+        (SELECT COUNT(*) FROM posts WHERE agent=? AND created_at>?) +
+        (SELECT COUNT(*) FROM issue_comments WHERE agent=? AND created_at>?)""",
+        (p.name, board.now() - 86400, p.name, board.now() - 86400),
+    ).fetchone()[0]
+    if count >= board.s.daily_post_cap_per_agent:
+        raise LimitExceeded("daily post cap reached; ask the human in your own chat")
+    if (
+        thread_id is not None
+        and board._agent_posts_since_human(thread_id) >= board.s.max_agent_posts_per_thread_without_human
+    ):
+        raise LimitExceeded("thread post cap reached; ask the human in your own chat")
+    if issue_id is not None:
+        count = board.conn.execute(
+            """SELECT COUNT(*) FROM issue_comments c JOIN agents a ON a.name=c.agent
+            WHERE c.issue_id=? AND a.is_human=0 AND c.id>COALESCE((SELECT MAX(h.id)
+            FROM issue_comments h JOIN agents ha ON ha.name=h.agent WHERE h.issue_id=? AND ha.is_human=1),0)""",
+            (issue_id, issue_id),
+        ).fetchone()[0]
+        if count >= board.s.max_agent_posts_per_thread_without_human:
+            raise LimitExceeded("issue discussion cap reached; ask the human in your own chat")
+
+
+def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None):
+    board.conn.execute(
+        """INSERT INTO issue_comments(issue_id,session_id,agent,kind,body,outcome,scope,created_at)
+        VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            issue_id,
+            session_id,
+            p.name,
+            kind,
+            body,
+            outcome,
+            json.dumps(scope) if scope else None,
+            board.now(),
+        ),
+    )
+    board.conn.execute("UPDATE issues SET updated_at=? WHERE id=?", (board.now(), issue_id))
+
+
+def get_issue(board, p, issue_id):
+    out = dict(_row(board, issue_id))
+    out["needs_human"] = bool(out["needs_human"])
+    for key in ("created_at", "updated_at"):
+        out[key] = iso(out[key])
+    out["links"] = [
+        dict(r)
+        for r in board.conn.execute(
+            """SELECT l.thread_id,l.post_id,l.needs_human,t.project,t.title
+        FROM issue_links l JOIN threads t ON t.id=l.thread_id WHERE l.issue_id=? ORDER BY l.id""",
+            (issue_id,),
+        )
+    ]
+    for link in out["links"]:
+        link["needs_human"] = bool(link["needs_human"])
+    out["comments"], out["decisions"], out["resolutions"] = [], [], []
+    out["resolution"] = None
+    for r in board.conn.execute("SELECT * FROM issue_comments WHERE issue_id=? ORDER BY id", (issue_id,)):
+        event = {
+            "id": r["id"],
+            "kind": r["kind"],
+            "body": r["body"],
+            "agent": r["agent"],
+            "created_at": iso(r["created_at"]),
+        }
+        if r["kind"] == "decision":
+            scope = json.loads(r["scope"])
+            event.update(
+                outcome=r["outcome"],
+                thread_ids=[s["thread_id"] for s in scope],
+                projects=sorted({s["project"] for s in scope}),
+                scope=scope,
+            )
+            out["decisions"].append(event)
+        elif r["kind"] == "resolution":
+            out["resolutions"].append(event)
+            out["resolution"] = event
+        else:
+            out["comments"].append(event)
+    return out
+
+
+def list_issues(board, p, project=None, status=None, query=None, thread_id=None, needs_human=None):
+    sql, args = "SELECT i.id FROM issues i WHERE 1=1", []
+    if needs_human is not None:
+        sql += " AND i.needs_human=?"
+        args.append(int(needs_human))
+    if status:
+        if status not in ("open", "resolved"):
+            raise Invalid("status must be open or resolved")
+        sql += " AND i.status=?"
+        args.append(status)
+    if project:
+        sql += " AND EXISTS(SELECT 1 FROM issue_links l JOIN threads t ON t.id=l.thread_id WHERE l.issue_id=i.id AND t.project=?)"
+        args.append(_norm_path(project))
+    if thread_id is not None:
+        sql += " AND EXISTS(SELECT 1 FROM issue_links l WHERE l.issue_id=i.id AND l.thread_id=?)"
+        args.append(thread_id)
+    if query:
+        sql += """ AND (instr(lower(i.title),lower(?))>0 OR instr(lower(i.body),lower(?))>0
+            OR EXISTS(SELECT 1 FROM issue_links l JOIN threads t ON t.id=l.thread_id
+                WHERE l.issue_id=i.id AND (instr(lower(t.project),lower(?))>0
+                    OR instr(lower(t.title),lower(?))>0)))"""
+        args.extend([query, query, query, query])
+    return [
+        get_issue(board, p, r[0])
+        for r in board.conn.execute(sql + " ORDER BY i.updated_at DESC,i.id DESC LIMIT 200", args)
+    ]
+
+
+def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, needs_human=True):
+    title, body = _body(board, title, "title", 200), _body(board, body)
+    if not isinstance(needs_human, bool):
+        raise Invalid("needs_human must be boolean")
+    with db.write_tx(board.conn) as c:
+        _write(board, p, session_id, thread_id=thread_id)
+        _link_target(board, p, thread_id, post_id)
+        pending = int(needs_human or _source_needs_human(board, post_id))
+        issue_id = c.execute(
+            "INSERT INTO issues(title,body,needs_human,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (title, body, pending, p.name, board.now(), board.now()),
+        ).lastrowid
+        c.execute(
+            "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at) VALUES(?,?,?,?,?,?)",
+            (issue_id, thread_id, post_id, pending, p.name, board.now()),
+        )
+        _event(board, p, session_id, issue_id, "created", body)
+    board._notify("issue.created", {"issue_id": issue_id})
+    return get_issue(board, p, issue_id)
+
+
+def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
+    with db.write_tx(board.conn) as c:
+        _row(board, issue_id)
+        board._check_agent_write(p)
+        board._session(p, session_id)
+        _link_target(board, p, thread_id, post_id)
+        exists = c.execute(
+            "SELECT 1 FROM issue_links WHERE issue_id=? AND thread_id=? AND post_id IS ?",
+            (issue_id, thread_id, post_id),
+        ).fetchone()
+        if not exists:
+            _write(board, p, session_id, issue_id, thread_id)
+            pending = int(post_id is None or _source_needs_human(board, post_id))
+            c.execute(
+                "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at) VALUES(?,?,?,?,?,?)",
+                (issue_id, thread_id, post_id, pending, p.name, board.now()),
+            )
+            if pending:
+                c.execute("UPDATE issues SET status='open',needs_human=1 WHERE id=?", (issue_id,))
+            _event(
+                board,
+                p,
+                session_id,
+                issue_id,
+                "linked",
+                f"Linked thread #{thread_id}" + (f" post #{post_id}" if post_id else ""),
+            )
+    return get_issue(board, p, issue_id)
+
+
+def comment_issue(board, p, session_id, issue_id, body, kind="comment"):
+    if kind not in ("comment", "evidence", "proposal", "request"):
+        raise Invalid("kind must be comment, evidence, proposal, or request")
+    body = _body(board, body)
+    with db.write_tx(board.conn) as c:
+        _row(board, issue_id)
+        _write(board, p, session_id, issue_id)
+        _event(board, p, session_id, issue_id, kind, body)
+        if kind == "request":
+            c.execute("UPDATE issue_links SET needs_human=1 WHERE issue_id=?", (issue_id,))
+            c.execute("UPDATE issues SET status='open',needs_human=1 WHERE id=?", (issue_id,))
+    return get_issue(board, p, issue_id)
+
+
+def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answered"):
+    board._require_human(p, "decide a shared issue")
+    body = _body(board, body)
+    if outcome not in ("answered", "approved", "declined"):
+        raise Invalid("outcome must be answered, approved, or declined")
+    if not isinstance(thread_ids, list) or not thread_ids or any(type(t) is not int for t in thread_ids):
+        raise Invalid("thread_ids must explicitly select linked threads")
+    with db.write_tx(board.conn) as c:
+        _row(board, issue_id)
+        _write(board, p, session_id, issue_id)
+        linked = {
+            r["thread_id"]: r["project"]
+            for r in c.execute(
+                "SELECT l.thread_id,t.project FROM issue_links l JOIN threads t ON t.id=l.thread_id WHERE issue_id=?",
+                (issue_id,),
+            )
+        }
+        if not set(thread_ids) <= linked.keys():
+            raise Invalid("decision scope must contain only linked threads")
+        scope = [{"thread_id": t, "project": linked[t]} for t in sorted(set(thread_ids))]
+        _event(board, p, session_id, issue_id, "decision", body, outcome, scope)
+        c.execute(
+            "UPDATE issue_links SET needs_human=0 WHERE issue_id=? AND thread_id IN (SELECT value FROM json_each(?))",
+            (issue_id, json.dumps(thread_ids)),
+        )
+        c.execute(
+            "UPDATE issues SET needs_human=EXISTS(SELECT 1 FROM issue_links WHERE issue_id=? AND needs_human=1) WHERE id=?",
+            (issue_id, issue_id),
+        )
+    return get_issue(board, p, issue_id)
+
+
+def resolve_issue(board, p, session_id, issue_id, body):
+    board._require_human(p, "resolve a shared issue")
+    body = _body(board, body)
+    with db.write_tx(board.conn) as c:
+        _row(board, issue_id)
+        _write(board, p, session_id, issue_id)
+        _event(board, p, session_id, issue_id, "resolution", body)
+        c.execute("UPDATE issue_links SET needs_human=0 WHERE issue_id=?", (issue_id,))
+        c.execute("UPDATE issues SET status='resolved',needs_human=0 WHERE id=?", (issue_id,))
+    return get_issue(board, p, issue_id)

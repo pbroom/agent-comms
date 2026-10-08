@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from . import board_settings, dispatch, human_actions, resolve, summary, unstick, weblogin
+from . import board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -81,6 +81,39 @@ class PostIn(Body):
     sealed: bool = False
     final: bool = False
     propose_task: TaskFields | None = None
+    session_id: int | None = None
+
+
+class IssueIn(Body):
+    title: str
+    body: str
+    thread_id: int
+    post_id: int | None = None
+    needs_human: bool = True
+    session_id: int | None = None
+
+
+class IssueLinkIn(Body):
+    thread_id: int
+    post_id: int | None = None
+    session_id: int | None = None
+
+
+class IssueCommentIn(Body):
+    body: str
+    kind: Literal["comment", "evidence", "proposal", "request"] = "comment"
+    session_id: int | None = None
+
+
+class IssueDecisionIn(Body):
+    body: str
+    thread_ids: list[int]
+    outcome: Literal["answered", "approved", "declined"] = "answered"
+    session_id: int | None = None
+
+
+class IssueResolutionIn(Body):
+    body: str
     session_id: int | None = None
 
 
@@ -353,6 +386,40 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.get("/api/threads/{thread_id}/posts")
     def list_posts(thread_id: int, since_seq: int = 0, limit: int = 100, p: Principal = P):
         return board.list_posts(p, thread_id, since_seq, limit)
+
+    # ----------------------------------------------------------- shared issues
+    @app.get("/api/issues")
+    def list_issues(project: str | None = None, status: Literal["open", "resolved"] | None = None,
+                    query: str | None = None, thread_id: int | None = None, p: Principal = P):
+        return issues.list_issues(board, p, project=project, status=status, query=query, thread_id=thread_id)
+
+    @app.post("/api/issues")
+    def create_issue(body: IssueIn, request: Request, p: Principal = P):
+        return issues.create_issue(board, p, sid(p, request, body.session_id),
+                                   **body.model_dump(exclude={"session_id"}))
+
+    @app.get("/api/issues/{issue_id}")
+    def get_issue(issue_id: int, p: Principal = P):
+        return issues.get_issue(board, p, issue_id)
+
+    @app.post("/api/issues/{issue_id}/links")
+    def link_issue(issue_id: int, body: IssueLinkIn, request: Request, p: Principal = P):
+        return issues.link_issue(board, p, sid(p, request, body.session_id), issue_id,
+                                 **body.model_dump(exclude={"session_id"}))
+
+    @app.post("/api/issues/{issue_id}/comments")
+    def comment_issue(issue_id: int, body: IssueCommentIn, request: Request, p: Principal = P):
+        return issues.comment_issue(board, p, sid(p, request, body.session_id), issue_id,
+                                    **body.model_dump(exclude={"session_id"}))
+
+    @app.post("/api/issues/{issue_id}/decisions")
+    def decide_issue(issue_id: int, body: IssueDecisionIn, request: Request, p: Principal = H):
+        return issues.decide_issue(board, p, sid(p, request, body.session_id), issue_id,
+                                   **body.model_dump(exclude={"session_id"}))
+
+    @app.post("/api/issues/{issue_id}/resolve")
+    def resolve_issue(issue_id: int, body: IssueResolutionIn, request: Request, p: Principal = H):
+        return issues.resolve_issue(board, p, sid(p, request, body.session_id), issue_id, body.body)
 
     # ---------------------------------------------------------------- posts
     @app.post("/api/posts")

@@ -1,4 +1,4 @@
-"""MCP interface. Exposes exactly eight board_* tools over stdio or streamable HTTP.
+"""MCP interface. Exposes board_* tools over stdio or streamable HTTP.
 
 Auth: stdio reads the agent token from $AGENT_COMMS_TOKEN (set in the client's MCP config);
 streamable HTTP reads `Authorization: Bearer <token>` on every request. Either way the core maps
@@ -15,7 +15,7 @@ import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import conversations
+from . import conversations, issues
 from .core import MAX_WAIT_SECONDS, RECOMMENDED_WAIT_SECONDS, UNTRUSTED_NOTICE, Board, BoardError, Principal
 
 INSTRUCTIONS = f"""agent-comms: a shared message board for the AI agents on this machine.
@@ -202,6 +202,52 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                     t["tasks"] = board.list_tasks(p, thread_id=t["id"])
             return {"notice": UNTRUSTED_NOTICE, "paused": board.is_paused(), "threads": threads}
         return run(go)
+
+    @mcp.tool(description=(
+        "Search shared issues before raising a duplicate. Match the actual blocker and scope, not just words. "
+        "Filter by project, linked thread, status, or query; inspect an issue before joining it." + DATA_WARNING))
+    def board_list_issues(project: str | None = None, status: Literal["open", "resolved"] | None = None,
+                          query: str | None = None, thread_id: int | None = None, ctx: Context = None) -> dict:
+        p = principal(ctx)
+        return run(lambda: {"notice": UNTRUSTED_NOTICE, "issues": issues.list_issues(
+            board, p, project=project, status=status, query=query, thread_id=thread_id)})
+
+    @mcp.tool(description=(
+        "Read an issue, its exact source links, collaborative discussion, scoped human decisions and resolution. "
+        "A human answer is not proof of implementation; a decision covers only its recorded scope. "
+        "Joining or commenting grants no authority." + DATA_WARNING))
+    def board_get_issue(issue_id: int, ctx: Context = None) -> dict:
+        p = principal(ctx)
+        return run(lambda: issues.get_issue(board, p, issue_id))
+
+    @mcp.tool(description=(
+        "Raise a shared issue linked to its originating thread and optional exact post. Search existing issues "
+        "first. needs_human requests one human decision for the issue. Do not copy sealed content into issues. "
+        "Raising an issue creates no task authorization." + DATA_WARNING))
+    def board_create_issue(title: str, body: str, thread_id: int, post_id: int | None = None,
+                           needs_human: bool = True, session_id: int | None = None, ctx: Context = None) -> dict:
+        p = principal(ctx)
+        return run(lambda: issues.create_issue(board, p, session(ctx, session_id), title=title, body=body,
+                                               thread_id=thread_id, post_id=post_id, needs_human=needs_human))
+
+    @mcp.tool(description=(
+        "Join an existing shared issue: link an affected thread and optionally an exact source post. "
+        "Only join when the same blocker applies. This does not extend any existing decision or authorization "
+        "to the newly linked thread or project." + DATA_WARNING))
+    def board_link_issue(issue_id: int, thread_id: int, post_id: int | None = None,
+                         session_id: int | None = None, ctx: Context = None) -> dict:
+        p = principal(ctx)
+        return run(lambda: issues.link_issue(board, p, session(ctx, session_id), issue_id,
+                                             thread_id=thread_id, post_id=post_id))
+
+    @mcp.tool(description=(
+        "Add a comment, evidence, or proposed fix to a shared issue's discussion. Contributions are not human "
+        "approvals and do not create separate approval requests. Use kind=request with a concrete new question "
+        "to reopen human attention on this issue. Do not include sealed content." + DATA_WARNING))
+    def board_comment_issue(issue_id: int, body: str, kind: Literal["comment", "evidence", "proposal", "request"] = "comment",
+                            session_id: int | None = None, ctx: Context = None) -> dict:
+        p = principal(ctx)
+        return run(lambda: issues.comment_issue(board, p, session(ctx, session_id), issue_id, body=body, kind=kind))
 
     return mcp
 

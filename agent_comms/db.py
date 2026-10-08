@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 3   # v3: sessions.client_kind / client_session_id (conversation links)
+SCHEMA_VERSION = 4   # v4: shared issues and scoped decisions
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -138,6 +138,29 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at  REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS issues (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved')),
+ needs_human INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL REFERENCES agents(name),
+ created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS issue_links (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id INTEGER NOT NULL REFERENCES issues(id),
+ thread_id INTEGER NOT NULL REFERENCES threads(id), post_id INTEGER REFERENCES posts(id),
+ needs_human INTEGER NOT NULL DEFAULT 0,
+ agent TEXT NOT NULL REFERENCES agents(name), created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS issue_link_unique ON issue_links(issue_id,thread_id,COALESCE(post_id,0));
+CREATE INDEX IF NOT EXISTS issue_links_post ON issue_links(post_id);
+CREATE TABLE IF NOT EXISTS issue_comments (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id INTEGER NOT NULL REFERENCES issues(id),
+ session_id INTEGER NOT NULL REFERENCES sessions(id), agent TEXT NOT NULL REFERENCES agents(name),
+ kind TEXT NOT NULL CHECK(kind IN ('comment','evidence','proposal','request','decision','resolution','created','linked')),
+ body TEXT NOT NULL, outcome TEXT, scope TEXT, created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS issue_comments_issue ON issue_comments(issue_id,id);
+CREATE INDEX IF NOT EXISTS issue_comments_agent ON issue_comments(agent,created_at);
+
 CREATE TABLE IF NOT EXISTS board_state (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
@@ -165,6 +188,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     with write_tx(conn):
         if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             raise RuntimeError("database schema is newer than this server")
+        link_columns = {row[1] for row in conn.execute("PRAGMA table_info(issue_links)")}
+        if "needs_human" not in link_columns:
+            conn.execute("ALTER TABLE issue_links ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE issue_links SET needs_human=(SELECT needs_human FROM issues WHERE id=issue_id)")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         if "category" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN category TEXT")
