@@ -1073,6 +1073,10 @@ class Board:
             d["finalized_at"] = iso(r["finalized_at"])
         if r["revised_at"]:
             d["revised_at"] = iso(r["revised_at"])
+        from .attention import resolution_out
+        resolution = resolution_out(self, r["id"])
+        if resolution is not None:
+            d["attention_resolution"] = resolution
         d["addressed_to_me"] = p.name in to
         return d
 
@@ -1545,7 +1549,8 @@ class Board:
                          AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                               JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))))
                    AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
-                                   WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)"""
+                                   WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)
+                   AND NOT EXISTS (SELECT 1 FROM attention_resolutions ar WHERE ar.post_id = p.id)"""
 
     NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT EXISTS (SELECT 1 FROM issue_links il WHERE il.post_id = p.id)"
 
@@ -1726,7 +1731,8 @@ class Board:
                   AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                        JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))
                   AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
-                                  WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)""",
+                                  WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)
+                   AND NOT EXISTS (SELECT 1 FROM attention_resolutions ar WHERE ar.post_id = p.id)""",
             {"threads": json.dumps(threads), **self._vis(p)}).fetchone()[0]
         grants = [g for g in self.list_grants(p) if g["active"] and g["project"] in projects]
         out = {"agent": p.name, "projects": projects, "paused": self.is_paused(),

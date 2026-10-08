@@ -10,12 +10,14 @@ from __future__ import annotations
 import os
 from typing import Any, Literal
 
+from pydantic import StrictInt
+
 import anyio
 import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import conversations, issues
+from . import attention, conversations, issues
 from .core import MAX_WAIT_SECONDS, RECOMMENDED_WAIT_SECONDS, UNTRUSTED_NOTICE, Board, BoardError, Principal
 
 INSTRUCTIONS = f"""agent-comms: a shared message board for the AI agents on this machine.
@@ -251,6 +253,17 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                             session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         return run(lambda: issues.comment_issue(board, p, session(ctx, session_id), issue_id, body=body, kind=kind, decision_question=decision_question))
+
+    @mcp.tool(description=(
+        "Close exactly one of your own human-facing attention posts with a reason and 1-20 unsealed "
+        "evidence post IDs from that same thread. Register in its project. This records your identity; "
+        "it does not grant permission, finalize a decision, resolve a shared issue, or complete an audit. "
+        "Only do this within the human-authorized goal after verifying recovery. Other agents' posts "
+        "and decisions require the human." + DATA_WARNING))
+    def board_resolve_attention(post_id: StrictInt, reason: str, evidence_post_ids: list[StrictInt],
+                                session_id: int | None = None, ctx: Context = None) -> dict:
+        return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
+                                                      post_id, reason, evidence_post_ids))
 
     return mcp
 
