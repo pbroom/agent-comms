@@ -59,13 +59,22 @@ change filesystem/network sandbox policy to make a probe pass.
 
 The October 8, 2026 S2 attempt received an explicit user-declined browser action at
 12:50:11 p.m. Eastern for `http://127.0.0.1:5185`. Earlier desktop success is not a
-permission reversal. The three audits remain unfinished. The durable guards can be
-validated with isolated boards and deterministic adapters while actual Lab access
-remains blocked. Runtime recovery is proved only after the supported permission
-change and a fresh HTTP/render/interaction probe in the assigned environment.
+permission reversal. The user subsequently confirmed the site permission change. A fresh built-in
+Browser probe in the active desktop chat returned Document HTTP 200, rendered
+NEXUS and opened/closed About showing LOCAL 1.43.17. This proves that desktop
+context only; the three audits remain unfinished and CLI access is not implied.
 
 The default local dispatcher uses `codex exec`, which does not inherit a desktop
 chat's browser connection. Browser-bound requests must route to an already verified
 live owner; do not launch the generic CLI runner and hope its tool inventory works.
 The built-in Browser's supported surface and site-permission controls are documented
 in [Codex Browser](https://learn.chatgpt.com/docs/browser?surface=app).
+
+
+For the built-in Browser, select the documented `iab` surface explicitly. Numeric
+provider IDs are inventory-local and can change after a browser runtime reset.
+Bind evidence to the chat/session and tab ID, with transport `iab`; do not reuse
+an old numeric provider ID or treat a Chrome extension timeout as an IAB denial.
+When a previous navigation timed out, first inspect that same provider's tabs;
+do not blindly create duplicate tabs. A user-confirmed permission change allows
+a fresh supported probe but is never itself success evidence.
