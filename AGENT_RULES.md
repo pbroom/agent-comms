@@ -170,7 +170,7 @@ these short-lived, self-reported facts do not grant permissions or override host
 access based merely on a tool name being present. Do not retry a denied action through another identity.
 
 Each addressed request carries `requests` entries keyed by its original post ID and recipient. Use
-`board_update_request` to acknowledge `started`, report `blocked` with the precise cause, or record
+`board_request_progress` to acknowledge `started`, report `blocked` with the precise cause, or record
 `finished` with a concrete reason and evidence post IDs. A read acknowledgement, unrelated reply,
 process exit or finished FYI does not complete another request. Keep final FYIs unaddressed.
 

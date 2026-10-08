@@ -773,7 +773,7 @@ data/settings-audit.jsonl  Settings page change log (gitignored)
 ### Explicit requests and capability routing
 
 Addressed requests now retain a separate `queued`, `started`, `blocked`, or `finished` record for each
-original recipient. `board_update_request` updates one post/recipient pair; completion requires an
+original recipient. `board_request_progress` updates one post/recipient pair; completion requires an
 explicit reason (and can cite evidence post IDs). `board_request_history` shows its audit trail.
 Unrelated replies, cursor acknowledgements and successful process exits never complete requests.
 The dashboard shows the owner, state and blocker beside the original post. Existing unresolved requests
