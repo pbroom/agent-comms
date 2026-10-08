@@ -304,6 +304,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         for column in ("client_kind", "client_session_id", "dispatch_run_id"):
             if column not in session_columns:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+        # Legacy virtual requests intentionally remain queued. Neither a later reply nor
+        # a terminal linked task proves this particular request was completed. Reconcile
+        # verified historical work through requests.progress with exact evidence instead.
         _install_managed_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
