@@ -3,7 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_comms import dispatch, unstick
+from agent_comms import dispatch, unstick, requests
 from agent_comms.api import create_app
 from agent_comms.core import Conflict, Forbidden
 from agent_comms.dispatch import DispatchConfig, build_prompt
@@ -82,8 +82,9 @@ def test_cookie_session_needs_the_csrf_header_like_other_admin_posts(uenv):
 
 def test_agent_computation(uenv):
     e = uenv
-    ask(e, "codex", ["claude"])
-    e.post("claude", e.tid, "done " + INJECTION)             # claude replied later: not stuck for that ask
+    old = ask(e, "codex", ["claude"])
+    evidence = e.post("claude", e.tid, "done " + INJECTION)
+    requests.progress(e.board, e.p["claude"], e.sid["claude"], old["id"], "claude", "finished", "Verified complete", [evidence["id"]])
     a1 = ask(e, "claude", ["codex"])                         # codex never replied: stuck
     a2 = ask(e, "claude", ["codex", "human"])                # the human is never "stuck" here
     ask(e, "claude", ["grok"], sealed=True)                  # sealed: grok cannot read it
@@ -104,11 +105,11 @@ def test_agent_computation(uenv):
                        {"kind": "expired_lease", "agent": "claude", "task_id": expired}]
 
 
-def test_own_post_and_later_reply_do_not_count(uenv):
+def test_own_post_ignored_but_unrelated_reply_does_not_complete(uenv):
     ask(uenv, "codex", ["codex"])                            # addressed to its own author
-    ask(uenv, "claude", ["codex"])
+    original = ask(uenv, "claude", ["codex"])
     uenv.post("codex", uenv.tid, "on it")
-    assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == (["codex"], [{"kind": "unanswered", "agent": "codex", "post_ids": [original["id"]]}])
 
 
 def test_409_when_nothing_waits_on_an_agent(uenv):
@@ -254,7 +255,8 @@ def test_sessions_are_the_target_agents_live_sessions_last_seen_first(uenv):
 # ---------------------------------------------------------------- end to end with the dispatcher
 
 
-def test_a_dispatcher_tick_after_unstick_launches_the_stuck_agent(tmp_path):
+def test_a_dispatcher_tick_after_unstick_launches_the_stuck_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
     env = make_env(tmp_path)
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -280,7 +282,7 @@ def test_a_dispatcher_tick_after_unstick_launches_the_stuck_agent(tmp_path):
     d.tick()
     [launch] = env.spawner.calls
     assert launch["argv"] == ["codex-cli-fake", "exec",
-                              build_prompt(tid, out["rule_id"], unstick.PURPOSE.format(thread=tid))]
+                              build_prompt(tid, out["rule_id"], unstick.PURPOSE.format(thread=tid), [out["post_id"]])]
     assert not any(m in " ".join(launch["argv"]) for m in MARKERS)
     [run] = dispatch.list_runs(env.board, env.p["human"])
     assert (run["agent"], run["thread_id"], run["rule_id"]) == ("codex", tid, out["rule_id"])
@@ -292,10 +294,12 @@ def test_a_dispatcher_tick_after_unstick_launches_the_stuck_agent(tmp_path):
 
 
 def test_last_request_to_an_agent_counts_even_without_needs_response(uenv):
-    uenv.post("codex", uenv.tid, "please reply " + INJECTION, "request", to=["claude"])
+    original = uenv.post("codex", uenv.tid, "please reply " + INJECTION, "request", to=["claude"])
     agents, reasons = unstick.stuck_agents(uenv.board, uenv.tid)
     assert agents == ["claude"] and reasons[0]["kind"] == "unanswered"
-    uenv.post("claude", uenv.tid, "replied")                  # claude has the last word now: nothing waits
+    evidence = uenv.post("claude", uenv.tid, "replied")
+    assert unstick.stuck_agents(uenv.board, uenv.tid)[0] == ["claude"]
+    requests.progress(uenv.board, uenv.p["claude"], uenv.sid["claude"], original["id"], "claude", "finished", "Answered request", [evidence["id"]])
     assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])
 
 

@@ -68,7 +68,7 @@ test('the button shows only for stalls that wait on an agent', async () => {
 });
 
 test('one click sends at once (no confirm), and says what happens next', async () => {
-  const t = thread(1, [post(10, 1, { to: ['codex', 'claude'], needs_response: true })]);
+  const t = thread(1, [post(10, 1, { agent: 'human', to: ['codex', 'claude'], needs_response: true })]);
   const reply = u => u === '/api/threads/1/unstick' ? ok({ post_id: 51, thread_id: 1, agents: ['codex', 'claude'],
     rule_id: 7, dispatcher_running: true, paused: false, live_agents: ['claude'], sessions: [], no_runner: [], reasons: [] }) : fail(404, 'nf');
   const { dom, document, calls, prompts, win } = await setup({ threads: [t], reply });
@@ -163,7 +163,7 @@ test('the note and the Sessions panel show which sessions received it, with thei
   const launched = { ...sess(13, 'codex', 0, conv(`codex://threads/${CODEX_ID}`)),
     started_at: new Date(Date.now() + 2000).toISOString() };   // the dispatcher's launch registers after the click
   let sessions = [live, oldCodex, other];
-  const t = thread(1, [post(10, 1, { to: ['codex', 'claude'], needs_response: true })]);
+  const t = thread(1, [post(10, 1, { agent: 'human', to: ['codex', 'claude'], needs_response: true })]);
   const reply = u => u === '/api/threads/1/unstick' ? ok({ post_id: 61, thread_id: 1, agents: ['codex', 'claude'],
     rule_id: 3, dispatcher_running: true, paused: false, live_agents: ['claude'], sessions: [10], no_runner: [], reasons: [] })
     : fail(404, 'nf');
@@ -258,4 +258,26 @@ test('human approval statuses still wait on their recipient', async () => {
   } finally {
     dom.window.close();
   }
+});
+
+test('unrelated replies leave each request open; explicit completion closes only its recipient', async () => {
+  const t = thread(1, [post(10, 1, { to: ['codex', 'claude'], needs_response: true,
+    requests: [{ recipient: 'codex', assigned_agent: 'codex', state: 'finished', reason: 'Verified', evidence_post_ids: [11] },
+      { recipient: 'claude', assigned_agent: 'claude', state: 'blocked', reason: 'Browser unavailable' }] }),
+    post(11, 1, { agent: 'claude', type: 'status', body: 'Unrelated update' })]);
+  const { dom, document } = await setup({ threads: [t] });
+  try {
+    assert.match(document.getElementById('unstick').title, /Ask claude to/);
+    assert.match(document.querySelector('[data-request-recipient="codex"]').textContent, /finished/);
+    assert.match(document.querySelector('[data-request-recipient="claude"]').textContent, /Browser unavailable/);
+  } finally { dom.window.close(); }
+});
+
+test('completion followed by an addressed FYI stays settled', async () => {
+  const t = thread(1, [post(10, 1, { to: ['codex'], needs_response: true,
+    requests: [{ recipient: 'codex', assigned_agent: 'codex', state: 'finished', reason: 'Verified', evidence_post_ids: [11] }] }),
+    post(11, 1, { agent: 'codex', type: 'status', to: ['claude'], body: 'Completed' })]);
+  const { dom, document } = await setup({ threads: [t] });
+  try { assert.equal(document.getElementById('unstick'), null); }
+  finally { dom.window.close(); }
 });

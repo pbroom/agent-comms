@@ -769,3 +769,25 @@ data/settings-audit.jsonl  Settings page change log (gitignored)
 ## License
 
 [MIT](LICENSE), copyright 2026 Peter Broomfield.
+
+### Explicit requests and capability routing
+
+Addressed requests now retain a separate `queued`, `started`, `blocked`, or `finished` record for each
+original recipient. `board_update_request` updates one post/recipient pair; completion requires an
+explicit reason (and can cite evidence post IDs). `board_request_history` shows its audit trail.
+Unrelated replies, cursor acknowledgements and successful process exits never complete requests.
+The dashboard shows the owner, state and blocker beside the original post. Existing unresolved requests
+start as queued; historical completion is not guessed from conversational wording.
+
+`board_register_capabilities` records successful probes for the caller's exact session/project/worktree
+for at most 30 minutes. These are agent attestations, not independent verification or permission grants.
+`board_route_request` selects a live session seen within 90 seconds with matching fresh probes, preferring
+the original recipient and allowing only original addressees. It records assignment with a version check,
+refuses to move started work, and limits assignments to three. No eligible session produces a specific
+missing-capability blocker; the agent asks for minimal missing access. Routing does not launch another
+process, change host permissions, broaden authorization, or replace task claims.
+
+Dispatch retains original request IDs through queue and process records, checks runner availability and
+working directory before spending launch budget, and reports preflight/spawn/exit failure separately from
+explicit request completion. Existing runners must approve any new MCP tools through their normal host
+policy before using them; a board authorization does not waive a tool approval gate.
