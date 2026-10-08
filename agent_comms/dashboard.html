@@ -137,6 +137,33 @@ td > .convo, .post > .convo { display: flex; margin-top: 3px; }
 .unstick-note > .convo-list { flex-basis: 100%; margin-top: 0; }
 a.unstick-chip { text-decoration: none; }
 .convo-list { display: flex; gap: 6px 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+/* Needs you callout (human only): at the top of the selected thread, one block per item that waits on the human. */
+.needs-you { border-color: var(--warn); box-shadow: inset 4px 0 0 var(--warn); scroll-margin-top: 64px; }
+.needs-you > h2 { color: var(--warn); display: flex; gap: 8px; align-items: center; }
+.ny-item { border-top: 1px solid var(--line); padding: 10px 0 4px; scroll-margin-top: 64px; }
+.ny-item:first-of-type { border-top: 0; }
+.ny-cta { font-weight: 600; font-size: 14px; }
+.ny-item .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; margin-top: 2px; }
+.ny-body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
+.ny-body.clamped { max-height: calc(1.45em * 6); overflow: hidden;
+  -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+.ny-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+.ny-actions button { padding: 4px 11px; }
+.ny-actions button.primary { background: var(--warn); border-color: var(--warn); color: var(--panel); font-weight: 600; }
+.ny-actions button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+.ny-actions .linkish, .linkish { border: 0; background: none; color: var(--accent); padding: 0 2px; }
+.ny-actions .linkish:hover, .linkish:hover { text-decoration: underline; }
+.ny-reply { display: grid; gap: 6px; margin-top: 8px; }
+.ny-reply textarea { width: 100%; min-height: 72px; font: inherit; padding: 6px; color: var(--ink); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 5px; resize: vertical; }
+.ny-reply .row { display: flex; gap: 8px; align-items: center; }
+.ny-result { margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: var(--ok-bg); color: var(--ok);
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.ny-result.failed { color: var(--bad); background: var(--bad-bg); }
+button.needs-chip { border: 0; padding: 1px 7px; font-size: 12px; }
+button.needs-chip:hover { box-shadow: 0 0 0 1px var(--warn); }
+.ny-side { cursor: pointer; }
+.ny-side:hover { background: var(--bg); }
 </style>
 </head>
 <body>
@@ -191,6 +218,11 @@ const unsticking = {};
 const UNSTICK_WAIT_MS = 10 * 60000;
 const lastUnstick = {};
 let lastUnstickReply = null;   // thread id -> { threadId, agents, sessionIds, postId, at }
+// Needs you callout (human only): the post being resolved (one at a time), the last result per page load, which
+// bodies are expanded, and Reply drafts (kept across the 3-second re-render). A click acts at once (no confirm).
+let resolveBusy = null, resolveNote = null;     // resolveNote: { threadId, text, failed }
+const nyExpanded = new Set(), nyReplying = new Set(), nyDrafts = {};
+let scrollToNeedsYou = null;   // after the chip or a sidebar item: the post id (or true) to bring into view
 
 setFocusFromHash();
 
@@ -203,6 +235,7 @@ function parseFocus(hash) {
 }
 function setFocusFromHash() {
   focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
+  if (focus) focus.viaLink = true;   // a link to a post that needs you lands on its callout block
   if (focus && focus.kind === "thread") selected = focus.id;
 }
 
@@ -334,8 +367,9 @@ window.addEventListener("hashchange", () => {
 // closed thread) is fetched, its thread is expanded, and the page re-renders once before giving up.
 async function applyFocus() {
   if (!focus || focusBusy || view !== "board" || !state) return;
-  const node = document.getElementById(`${focus.kind}-${focus.id}`);
-  if (node) { if (node.scrollIntoView) node.scrollIntoView({ block: "center" }); focus = null; return; }
+  const callout = focus.viaLink && focus.kind === "post" ? document.querySelector(`#needs-you [data-post="${focus.id}"]`) : null;
+  const node = callout || document.getElementById(`${focus.kind}-${focus.id}`);
+  if (node) { if (node.scrollIntoView) node.scrollIntoView({ block: callout ? "start" : "center" }); focus = null; return; }
   if (focusTried) {
     lastError = `${focus.kind === "post" ? "Post" : "Thread"} #${focus.id} is not on this board (or not visible to you).`;
     focus = null; render(); return;
@@ -995,7 +1029,9 @@ function renderThreadList(threads, current, human, statuses, hidden) {
           el("span", { title: t.project }, base),
           el("span", {}, `· ${posts.length}${posts.length >= 60 ? "+" : ""} post${posts.length === 1 ? "" : "s"}`),
           open ? el("span", {}, `· ${open} task${open === 1 ? "" : "s"}`) : null,
-          human && waiting[t.id] ? chip(`${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`, "warn") : null,
+          human && waiting[t.id] ? el("button", { class: "chip warn needs-chip", "data-needs": t.id,
+            title: "Open this thread at what needs you",
+            onclick: e => { e.stopPropagation(); openNeedsYou(t.id); } }, `${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`) : null,
           full ? chip("at cap", "bad") : null,
           t.status !== "open" ? chip(t.status) : null)),
       el("td", { class: "when muted small" }, el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
@@ -1064,6 +1100,152 @@ async function unstickThread(t) {
   if (!live(lastUnstickReply) && !canLaunch(lastUnstickReply)) delete unsticking[t.id];
   unstickBusy = false;
   refresh();
+}
+
+// ---------------------------------------------------------------- Needs you callout (human only)
+// The items of the selected thread that wait on the human (state.needs_you, the server's rule), newest first, at the
+// top of the thread pane with a call to action and one-click buttons. The call to action is built from server
+// metadata only (type, author name, flags); the post body is shown as text, never parsed.
+
+function needsYouOf(threadId) {
+  return (state.needs_you || []).filter(p => p.thread_id === threadId).sort((a, b) => b.id - a.id);
+}
+
+function callToAction(p) {
+  const who = isHumanName(p.agent) ? "You" : p.agent;
+  switch (p.type) {
+    case "decision": return `${who} ${who === "You" ? "propose" : "proposes"} a decision — finalize it or reply`;
+    case "question": return `${who} ${who === "You" ? "asked" : "asks you"} a question — reply`;
+    case "proposal": return `${who} ${who === "You" ? "made" : "makes"} a proposal — approve or reply`;
+    case "handoff": return `${who} ${who === "You" ? "handed" : "hands"} work to you — approve or reply`;
+    default: return `${who} ${who === "You" ? "are" : "is"} waiting on you (${p.type}) — approve or reply`;
+  }
+}
+
+// A body is collapsed to about six lines; "Show more" opens it. Decided from the text (no layout needed).
+const NY_LINES = 6;
+function longBody(text) { return text.split("\n").length > NY_LINES || text.length > NY_LINES * 80; }
+
+// UTF-8 length, as the server counts the body limit.
+function bytes(text) {
+  let n = 0;
+  for (const ch of text) { const c = ch.codePointAt(0); n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4; }
+  return n;
+}
+function bodyLimit() { return (state.limits && state.limits.body_max_bytes) || 4096; }
+
+// Opens the thread and brings its callout (and the given item) into view. Used by the list chip and the sidebar.
+function openNeedsYou(threadId, postId) {
+  selected = threadId; store(SELECTED_KEY, String(threadId));
+  highlight = focus = null; scrollToNeedsYou = postId || true;
+  try { history.replaceState(null, "", "#thread-" + threadId); } catch (e) {}
+  render();
+}
+
+function jumpToPost(id) {
+  highlight = { kind: "post", id }; focus = { kind: "post", id }; focusTried = false;
+  render();
+}
+
+// What happened, from the server's answer (ids, agent names and flags only).
+function resolveMessage(action, item, r) {
+  const n = `#${item.id}`, to = Array.isArray(r.to) && r.to.length ? r.to.join(", ") : null;
+  const mine = Number.isInteger(r.post_id) ? ` (post #${r.post_id})` : "";
+  if (action === "finalize") return `Finalized decision ${n}.`;
+  if (action === "reject") return `Rejected decision ${n}${to ? "; told " + to : ""}${mine}.`;
+  if (action === "not_now") return `Parked ${n}${to ? "; told " + to + " not now" : ""}${mine}.`;
+  if (action === "reply") return `Replied to ${n}${to ? " (to " + to + ")" : ""}${mine}.`;
+  if (action === "approve") return `Approved ${n}${to ? "; told " + to + " to go ahead" : ""}${mine}.`;
+  const a = typeof r.agent === "string" ? r.agent : item.agent;
+  if (r.live) return `Approved ${n}${mine}. ${a} is active in a session and will see it there (no launch needed).`;
+  if (r.no_runner) return `Approved ${n}${mine}. No runner is configured for ${a}, so the dispatcher cannot launch it.`;
+  if (r.paused) return `Approved ${n}${mine}. The board is paused: the dispatcher launches ${a} after you unpause.`;
+  if (r.dispatcher_running) return `Approved ${n} and launched ${a} (dispatcher running; it starts within seconds)${mine}.`;
+  return `Approved ${n}${mine}. The dispatcher isn't running — start it with \`board dispatch run\` to launch ${a}.`;
+}
+
+// One click, one request: no window.confirm (the human's embedded browser blocks it). The busy flag disables the
+// item's buttons while in flight; the server refuses an item that no longer needs you, and a second resolve within 10 s.
+async function resolveItem(item, action, text) {
+  if (resolveBusy) return;
+  resolveBusy = item.id; render();
+  try {
+    const r = action === "finalize" ? await api("POST", `/api/posts/${item.id}/finalize`)
+      : await api("POST", `/api/posts/${item.id}/resolve`, action === "reply" ? { action, text } : { action });
+    resolveNote = { threadId: item.thread_id, text: resolveMessage(action, item, r || {}), failed: false };
+    if (action === "reply") { delete nyDrafts[item.id]; nyReplying.delete(item.id); }
+    lastError = "";
+  } catch (e) {
+    resolveNote = { threadId: item.thread_id, text: `Couldn't resolve #${item.id}: ${e.message}`, failed: true };
+  }
+  resolveBusy = null;
+  await refresh();
+}
+
+function renderReply(item) {
+  const limit = bodyLimit(), draft = nyDrafts[item.id] || "";
+  const count = el("span", { class: "small muted ny-count" });
+  const send = el("button", { class: "primary ny-send", disabled: true }, "Send");
+  const sync = () => {
+    const v = nyDrafts[item.id] || "", n = bytes(v.trim());
+    count.textContent = `${n} / ${limit} bytes` + (n > limit ? " — too long" : "");
+    count.classList.toggle("err", n > limit);
+    send.disabled = !!resolveBusy || !v.trim() || n > limit;
+  };
+  const area = el("textarea", { class: "ny-textarea", "aria-label": `Reply to #${item.id}`, rows: 3,
+    placeholder: `Reply to ${item.agent} (sent as you, addressed to ${item.agent})`, disabled: !!resolveBusy,
+    oninput: e => { nyDrafts[item.id] = e.target.value; sync(); },
+    onkeydown: e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !send.disabled) { e.preventDefault(); send.click(); } } }, draft);
+  send.addEventListener("click", () => {
+    const v = (nyDrafts[item.id] || "").trim();
+    if (v && bytes(v) <= limit) resolveItem(item, "reply", v);
+  });
+  sync();
+  return el("div", { class: "ny-reply" }, area,
+    el("div", { class: "row" }, send,
+      el("button", { class: "linkish", onclick: () => { nyReplying.delete(item.id); render(); } }, "Cancel"), count));
+}
+
+function renderNeedsYouItem(item) {
+  const busy = !!resolveBusy, open = nyExpanded.has(item.id), long = longBody(item.body || "");
+  const launchable = (state.launchable_agents || []).includes(item.agent) && !isHumanName(item.agent);
+  const btn = (action, label, attrs = {}) => el("button", { "data-action": action, disabled: busy,
+    "aria-busy": resolveBusy === item.id ? "true" : null, ...attrs, onclick: () => resolveItem(item, action) }, label);
+  const decision = item.type === "decision";
+  const actions = el("div", { class: "ny-actions" },
+    decision && !item.sealed ? btn("finalize", "Finalize", { class: "primary", title: "Make this decision final and binding" }) : null,
+    decision ? btn("reject", "Reject", { class: "danger", title: `Post “Not approved: decision #${item.id} is rejected.” to ${item.agent}` }) : null,
+    btn("approve", "Approve", { class: decision ? "" : "primary", title: `Post “Approved: go ahead with #${item.id}.” to ${item.agent}` }),
+    launchable ? btn("approve_launch", `Approve & launch ${item.agent}`, { class: "unstick-btn",
+      title: `Approve, and let the dispatcher launch ${item.agent} once on this thread now (uses tokens)` }) : null,
+    btn("not_now", "Not now", { title: `Post “Not now: parking #${item.id}.” to ${item.agent}` }),
+    el("button", { "data-action": "reply-open", disabled: busy, "aria-expanded": nyReplying.has(item.id) ? "true" : "false",
+      onclick: () => { nyReplying.add(item.id); render(); const a = document.querySelector(`#needs-you [data-post="${item.id}"] textarea`); if (a) a.focus(); } }, "Reply…"),
+    el("button", { class: "linkish", "data-action": "jump", onclick: () => jumpToPost(item.id) }, `Jump to post #${item.id}`));
+  const refs = item.refs && item.refs.length ? el("div", { class: "refs" },
+    item.refs.map(r => el("div", {}, `${r.kind}: ${r.path}${r.rev ? " @ " + r.rev : ""}`))) : null;
+  return el("div", { class: "ny-item", "data-post": item.id },
+    el("div", { class: "ny-cta" }, callToAction(item)),
+    el("div", { class: "meta" }, el("strong", {}, "#" + item.id), chip(item.type, decision ? "accent" : ""),
+      el("span", {}, item.agent), item.sealed ? chip("🔒 sealed", "seal") : null,
+      el("span", { class: "muted", title: item.created_at }, ago(item.created_at))),
+    el("div", { class: "ny-body" + (long && !open ? " clamped" : "") }, item.body),
+    long ? el("button", { class: "linkish small", "data-action": "more", "aria-expanded": open ? "true" : "false",
+      onclick: () => { open ? nyExpanded.delete(item.id) : nyExpanded.add(item.id); render(); } }, open ? "Show less" : "Show more") : null,
+    refs, actions, nyReplying.has(item.id) ? renderReply(item) : null);
+}
+
+function renderNeedsYou(t, human) {
+  if (!human || !t) return null;
+  const items = needsYouOf(t.id);
+  const note = resolveNote && resolveNote.threadId === t.id ? resolveNote : null;
+  if (!items.length && !note) return null;
+  return el("aside", { class: "card needs-you", id: "needs-you", "aria-label": "Needs you" },
+    el("h2", {}, el("span", { class: "dot stalled", "aria-hidden": "true" }),
+      items.length ? `Needs you (${items.length})` : "Needs you: nothing left here"),
+    items.map(renderNeedsYouItem),
+    note ? el("div", { class: "ny-result small" + (note.failed ? " failed" : ""), id: "needs-you-result", role: "status" },
+      el("span", {}, note.text), el("button", { onclick: () => { resolveNote = null; render(); } }, "Dismiss")) : null);
 }
 
 function renderThread(t, human, st) {
@@ -1189,12 +1371,16 @@ function render() {
   const current = threads.find(t => t.id === selected) || threads[0] || null;
   if (current) { opened.add(current.id); markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
   list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
+  if (current && human) { const ny = renderNeedsYou(current, human); if (ny) pane.append(ny); }
   pane.append(current ? renderThread(current, human, statuses.get(current.id))
     : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   if (human) right.append(renderGrants());
   if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length})`),
     el("div", { class: "small muted" }, "Open decisions and needs-response posts with no later human post in the thread."),
-    state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post" },
+    state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post ny-side", "data-post": p.id, role: "button", tabindex: "0",
+        title: `Open thread ${p.thread_id} at #${p.id}`,
+        onclick: e => { e.preventDefault(); openNeedsYou(p.thread_id, p.id); },
+        onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNeedsYou(p.thread_id, p.id); } } },
       el("div", { class: "meta" }, el("a", { href: `#post-${p.id}` }, el("strong", {}, `#${p.id}`)), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
       el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : el("div", { class: "muted small" }, "Nothing waiting.")));
   // Sessions, in the server's order (last seen first); never re-sorted here. A session that received an Unstick
@@ -1217,6 +1403,12 @@ function render() {
   app.append(el("main", {}, list, pane, right));
   listScroll();
   if (scrollToThread) { scrollToThread = false; const c = pane.firstChild; if (c && c.scrollIntoView) c.scrollIntoView({ block: "start" }); }
+  if (scrollToNeedsYou) {
+    const target = (scrollToNeedsYou !== true && document.querySelector(`#needs-you [data-post="${scrollToNeedsYou}"]`))
+      || document.getElementById("needs-you") || pane.firstChild;
+    scrollToNeedsYou = null;
+    if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" });
+  }
   applyFocus();
 }
 

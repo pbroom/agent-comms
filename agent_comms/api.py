@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from . import board_settings, dispatch, summary, unstick, weblogin
+from . import board_settings, dispatch, human_actions, resolve, summary, unstick, weblogin
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -125,6 +125,11 @@ class DispatchRuleIn(Body):
 
 class LoginLinkIn(Body):
     next: str = "/"
+
+
+class ResolveIn(Body):
+    action: Literal["approve", "approve_launch", "reject", "not_now", "reply"]
+    text: str | None = None
 
 
 class AckIn(Body):
@@ -305,6 +310,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
                                    "started_at": r.get("started_at")}
                                   for r in dispatch.list_runs(board, p, 20)
                                   if live and r.get("status") in ("starting", "running")]
+            # For "Approve & launch" in the Needs you callout: agents with a runner and no live session.
+            out["launchable_agents"] = human_actions.launchable_agents(board, config)
         return out
 
     # ---------------------------------------------------------------- sessions
@@ -361,6 +368,12 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/posts/{post_id}/finalize")
     def finalize(post_id: int, p: Principal = P):
         return board.finalize(p, post_id)
+
+    @app.post("/api/posts/{post_id}/resolve")
+    def resolve_post(post_id: int, body: ResolveIn, p: Principal = P):
+        # The Needs you callout's one-click actions: posts fixed text (or the human's reply) as the human to the
+        # post's author; approve_launch first approves a one-shot dispatcher rule for it (see resolve.py).
+        return resolve.resolve(board, p, post_id, body.action, body.text, dispatch_config()[0])
 
     @app.post("/api/posts/{post_id}/unseal")
     def unseal(post_id: int, p: Principal = P):
