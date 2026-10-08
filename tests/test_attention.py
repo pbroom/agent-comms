@@ -121,3 +121,22 @@ def test_http_requires_auth_and_returns_authentic_audit(env):
     assert r.status_code == 200, r.text
     assert r.json()["attention_resolution"]["resolved_by"] == "codex"
     assert c.post(url, json=body, headers=headers).status_code == 409
+
+
+def test_mcp_closeout_uses_credential_and_reports_audit(env, monkeypatch):
+    import asyncio
+    import json
+    from mcp import Client
+    from agent_comms.mcp_server import build_mcp
+    _, post, proof = setup(env)
+    monkeypatch.setenv("AGENT_COMMS_TOKEN", env.tokens["codex"])
+
+    async def run():
+        async with Client(build_mcp(env.board, "stdio")) as client:
+            await client.call_tool("board_register", {"project": "/work/repo"})
+            return await client.call_tool("board_resolve_attention", {
+                "post_id": post["id"], "reason": "Verified desktop browser; audit remains open",
+                "evidence_post_ids": [proof["id"]]})
+    result = asyncio.run(run())
+    assert not result.is_error
+    assert json.loads(result.content[0].text)["attention_resolution"]["resolved_by"] == "codex"

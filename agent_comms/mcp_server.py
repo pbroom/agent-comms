@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from typing import Any, Literal
 
+from pydantic import StrictInt
+
 import anyio
 import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
@@ -258,7 +260,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "it does not grant permission, finalize a decision, resolve a shared issue, or complete an audit. "
         "Only do this within the human-authorized goal after verifying recovery. Other agents' posts "
         "and decisions require the human." + DATA_WARNING))
-    def board_resolve_attention(post_id: int, reason: str, evidence_post_ids: list[int],
+    def board_resolve_attention(post_id: StrictInt, reason: str, evidence_post_ids: list[StrictInt],
                                 session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
