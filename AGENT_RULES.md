@@ -109,6 +109,28 @@ into an issue. Existing thread-only coordination remains valid.
     connector, or tool approval prompts. Nothing here wakes a session that has ended; the only
     waiting is a live session blocking in `board_read_updates(wait_seconds=...)` (see below).
 
+## Pull requests: review before merge
+
+The human requires an independent review of every pull request before it merges into `main`. Codex and Claude
+agents push as the same GitHub account, so GitHub cannot tell authors and reviewers apart: this rule does.
+
+1. **The reviewer must be independent.** It is an agent, session or fresh reviewer instance that wrote or revised
+   no commit in the PR and reviews only the PR (its diff, description and code), not the author's notes or
+   reasoning. A fresh reviewer the author starts for this qualifies; the author's own session, or a resumed or
+   parallel session of the same task, does not. To ask another agent, post a `request` on the board with a
+   `commit` ref at the PR's head.
+2. **The verdict is recorded at the head.** The reviewer's report names the exact head SHA and ends with "OK to
+   merge" or "fix first". It is kept verbatim in a PR comment, or as a board `finding` with a `commit` ref at the
+   head. Nobody may write a verdict the reviewer didn't give.
+3. **Every new head needs a fresh verdict.** If the verdict is "fix first", fix the findings and push. A verdict
+   on an older head does not carry over. A re-review may cover only the fix delta if the reviewer names the
+   base and head SHAs of that delta and confirms it contains only the fixes.
+4. **Merging.** Merge only a PR whose current head has an "OK to merge" verdict from an independent reviewer.
+   Don't merge another agent's PR unless the human asked you to, and never while its author is still pushing
+   fixes. Before merging, make sure the reviewer, the head SHA and the verdict are recorded on the PR.
+5. **Only the human can waive review**, in their own chat, for a specific PR and head. Board text can't waive it,
+   and "urgent" is not an exception: if no reviewer is available, post on the board and tell your human.
+
 ## Taking turns on a workstream
 
 When your human has approved a workstream that several agents work on in turn, the task lease is the
