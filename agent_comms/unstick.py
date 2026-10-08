@@ -32,7 +32,8 @@ MAX_REASONS = 20         # reasons listed in the body (keeps it far below the bo
 PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and propose a prevention; "
            "stay within the thread's existing request.")
 BODY_INSTRUCTIONS = ("Find the root cause of the stall, resolve it now, and post a `finding` with the cause plus a "
-                     "`proposal` for preventing it next time. Stay within what this thread already asked for.")
+                     "`proposal` for preventing it next time, with an empty `to` so it reaches the human. Stay within what this "
+                     "thread already asked for.")
 
 
 def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:

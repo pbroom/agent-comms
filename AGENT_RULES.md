@@ -133,7 +133,9 @@ scope: work only within what the thread already asked for and your human's instr
 2. **Resolve it now** if you can: answer the post, reclaim and finish or release the task, or set it `blocked`
    with a `status` that says exactly what is needed and from whom.
 3. **Report and prevent.** Post a `finding` with the cause (a finding needs a file or commit ref with `rev`:
-   cite what you checked) and a `proposal` for avoiding it next time (a rule, a check, a config change). The human decides whether to adopt it.
+   cite what you checked) and a `proposal` for avoiding it next time (a rule, a check, a config change), with an
+   empty `to`. The human decides whether to adopt it: a proposal addressed to nobody (or to the human) lands in the
+   human's "Needs you" list until the human answers it.
 
 If the cause needs the human (an approval, a decision, a permission), say so in one `question` with
 `needs_response: true` and stop. Don't loop: one unstick request deserves one focused attempt.
