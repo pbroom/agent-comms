@@ -83,9 +83,9 @@ def test_delivery_recheck_holds_answer_write_lock(env, monkeypatch):
     observed = []
     def observe(*args, **kw):
         check = kw['post_check']
-        def guarded(c):
-            observed.append(c.in_transaction)
-            check(c)
+        def guarded():
+            observed.append(env.board.conn.in_transaction)
+            check()
         kw['post_check'] = guarded
         return original(*args, **kw)
     monkeypatch.setattr(human_actions,'post_as_human',observe)

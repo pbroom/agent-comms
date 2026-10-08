@@ -63,7 +63,10 @@ work: normal task, request, host and dispatcher checks remain responsible for th
                 'requires_choice': recipient is None, 'reason': reason, 'evidence': evidence}
 
     recipient = post['agent'] if active_agent(post['agent']) else None
+    author = board.conn.execute('SELECT is_human FROM agents WHERE name=?', (post['agent'],)).fetchone()
+    unavailable = recipient is None and author is not None and not author['is_human']
     return {'recipient': recipient, 'candidates': [recipient] if recipient else [],
-            'source': 'proposer' if recipient else 'none', 'requires_choice': False,
-            'reason': 'Proposer; no implementer recorded' if recipient else 'No active agent recorded',
+            'source': 'proposer' if recipient else 'none', 'requires_choice': unavailable,
+            'reason': ('Proposer; no implementer recorded' if recipient else
+                       'No active agent recorded; choose an active agent' if unavailable else 'No active agent recorded'),
             'evidence': []}

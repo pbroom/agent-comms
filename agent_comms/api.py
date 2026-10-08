@@ -152,6 +152,7 @@ class IssueCommentIn(Body):
 
 
 class IssueDecisionIn(Body):
+    delivery_agents: dict[str, str] | None = None
     selected_option_id: str | None = None
     expected_question_version: int | None = None
     body: str | None = None

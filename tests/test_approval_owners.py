@@ -135,3 +135,11 @@ def test_task_owner_takes_precedence_over_unassigned_addressee(env):
     result = approval_owners.delivery(env.board, post)
     assert result['recipient'] == 'codex' and not result['requires_choice']
     assert result['candidates'] == ['codex']
+
+
+def test_unavailable_proposer_requires_recipient_choice(env):
+    post = source(env)
+    with db.write_tx(env.board.conn) as c:
+        c.execute("UPDATE agents SET active=0 WHERE name='claude'")
+    result = approval_owners.delivery(env.board, post)
+    assert result['recipient'] is None and result['requires_choice']
