@@ -63,3 +63,9 @@ permission reversal. The three audits remain unfinished. The durable guards can 
 validated with isolated boards and deterministic adapters while actual Lab access
 remains blocked. Runtime recovery is proved only after the supported permission
 change and a fresh HTTP/render/interaction probe in the assigned environment.
+
+The default local dispatcher uses `codex exec`, which does not inherit a desktop
+chat's browser connection. Browser-bound requests must route to an already verified
+live owner; do not launch the generic CLI runner and hope its tool inventory works.
+The built-in Browser's supported surface and site-permission controls are documented
+in [Codex Browser](https://learn.chatgpt.com/docs/browser?surface=app).
