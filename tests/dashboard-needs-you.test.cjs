@@ -491,10 +491,10 @@ test('an issue answer leaves linked posts that ask their own question in Needs y
   const issue = () => ({ id: 5, title: 'Detector', body: 'b', status: 'open', needs_human: flagged[1] || flagged[2],
     created_by: 'codex', created_at: MINUTES_AGO(9), updated_at: MINUTES_AGO(9), comments: [], decisions: [], resolution: null,
     question_version: 1, decision_question: { ...QUESTION(), question: 'Issue question?' },
-    links: [{ thread_id: 1, post_id: 30, needs_human: flagged[1], project: '/repo/app', title: 'T1' },
-      { thread_id: 1, post_id: 31, needs_human: flagged[1], project: '/repo/app', title: 'T1' },
-      { thread_id: 1, post_id: 32, needs_human: flagged[1], project: '/repo/app', title: 'T1' },
-      { thread_id: 2, post_id: 40, needs_human: flagged[2], project: '/repo/app', title: 'T2' }] });
+    links: [{ thread_id: 1, post_id: 30, needs_human: flagged[1], covers_post: false, project: '/repo/app', title: 'T1' },
+      { thread_id: 1, post_id: 31, needs_human: flagged[1], covers_post: false, project: '/repo/app', title: 'T1' },
+      { thread_id: 1, post_id: 32, needs_human: flagged[1], covers_post: true, project: '/repo/app', title: 'T1' },
+      { thread_id: 2, post_id: 40, needs_human: flagged[2], covers_post: true, project: '/repo/app', title: 'T2' }] });
   const { dom, document, calls } = await setup({ threads: [thread(1, [own1, own2, post(32, 1)]), thread(2, [post(40, 2)])],
     needsYou: () => open, issues: () => [issue()],
     reply: (u, opts) => {
@@ -508,7 +508,7 @@ test('an issue answer leaves linked posts that ask their own question in Needs y
     const ny = document.getElementById('needs-you');
     assert.equal(ny.querySelector('h2').textContent, 'Needs you (3)', 'the issue and both posts with their own question');
     assert.equal(ny.querySelector('[data-separate]').textContent,
-      'Linked posts #30, #31 each ask their own question: this answer does not answer them. They stay in Needs you, to answer separately.');
+      'Linked posts #30, #31 each ask their own question: this answer does not answer them. Answer each on their own (each is its own Needs you item until answered).');
     const form = ny.querySelector('[data-decision-form="5"]');
     form.querySelector('input[value="option:ship"]').click();
     form.querySelector('.scope input[value="2"]').click();     // this thread only
@@ -523,5 +523,8 @@ test('an issue answer leaves linked posts that ask their own question in Needs y
     card(document, 31, 'option:ship').click(); primary(document, 31).click(); await settle();
     assert.deepEqual(items(document).filter(Boolean), []);
     assert.deepEqual(calls.slice(1).map(c => c.u), ['/api/posts/30/resolve', '/api/posts/31/resolve']);
+    // The note comes from the issue's own link data, not from the (capped) Needs you list: it still names them.
+    await pick(document, 2);
+    assert.equal(document.querySelector('#needs-you [data-decision-form="5"] [data-separate]').textContent, 'Linked posts #30, #31 each ask their own question: this answer does not answer them. Answer each on their own (each is its own Needs you item until answered).');
   } finally { dom.window.close(); }
 });

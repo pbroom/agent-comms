@@ -6,6 +6,9 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+# Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
+# question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
+ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question = i.decision_question)"
 SCHEMA_VERSION = 10  # v10: exact human-answer links and conservative legacy attention boundary
 
 SCHEMA = """
@@ -159,7 +162,8 @@ CREATE TABLE IF NOT EXISTS issue_links (
  id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id INTEGER NOT NULL REFERENCES issues(id),
  thread_id INTEGER NOT NULL REFERENCES threads(id), post_id INTEGER REFERENCES posts(id),
  needs_human INTEGER NOT NULL DEFAULT 0,
- agent TEXT NOT NULL REFERENCES agents(name), created_at REAL NOT NULL
+ agent TEXT NOT NULL REFERENCES agents(name), created_at REAL NOT NULL,
+ covers_post INTEGER NOT NULL DEFAULT 1
 );
 CREATE UNIQUE INDEX IF NOT EXISTS issue_link_unique ON issue_links(issue_id,thread_id,COALESCE(post_id,0));
 CREATE INDEX IF NOT EXISTS issue_links_post ON issue_links(post_id);
@@ -287,6 +291,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if "needs_human" not in link_columns:
             conn.execute("ALTER TABLE issue_links ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0")
             conn.execute("UPDATE issue_links SET needs_human=(SELECT needs_human FROM issues WHERE id=issue_id)")
+        if "covers_post" not in link_columns:
+            # Whether the issue's question covers the linked post, fixed when the link is made (issues._covers).
+            # Existing post links get the rule against the issue's current question; thread links cover nothing
+            # and keep 1. The default is 1 so a link written by an older server keeps that server's meaning.
+            conn.execute("ALTER TABLE issue_links ADD COLUMN covers_post INTEGER NOT NULL DEFAULT 1")
+            conn.execute(f'''UPDATE issue_links SET covers_post=COALESCE((SELECT {ISSUE_COVERS}
+                FROM posts p JOIN issues i ON i.id=issue_links.issue_id WHERE p.id=issue_links.post_id),1)''')
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
         if "category" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN category TEXT")

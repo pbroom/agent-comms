@@ -1712,13 +1712,14 @@ class Board:
                    AND NOT EXISTS (SELECT 1 FROM legacy_attention_answers la WHERE la.source_post_id=p.id)
                    AND NOT EXISTS (SELECT 1 FROM attention_resolutions ar WHERE ar.post_id = p.id)"""
 
-    # Which linked source posts an issue's question covers (`p` the source post, `i` the issue): a post without a
-    # structured question of its own, or one whose question is exactly the issue's. A linked post that asks its own,
-    # different question is not answered by the issue's answer: it stays its own Needs you item, answered on its own.
-    ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question = i.decision_question)"
-
-    NEEDS_YOU = NEEDS_YOU_SOURCE + f""" AND NOT EXISTS (SELECT 1 FROM issue_links il JOIN issues i ON i.id = il.issue_id
-                   WHERE il.post_id = p.id AND {ISSUE_COVERS})"""
+    # A linked post is represented by its issue (hidden here, answered by the issue's decision) only while the issue
+    # is unresolved and its question covers the post (issue_links.covers_post, set from db.ISSUE_COVERS when linked).
+    # A linked post asking its own, different question stays its own item. A covered post the issue never answered
+    # comes back once the issue is resolved, rather than staying hidden and unanswered for good.
+    ISSUE_COVERS = db.ISSUE_COVERS
+    ISSUE_GOVERNS = """EXISTS (SELECT 1 FROM issue_links il JOIN issues i ON i.id = il.issue_id
+                   WHERE il.post_id = p.id AND il.covers_post = 1 AND i.status != 'resolved')"""
+    NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT " + ISSUE_GOVERNS
 
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""

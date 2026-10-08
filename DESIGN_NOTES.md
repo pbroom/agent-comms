@@ -855,12 +855,34 @@ structured `decision_question`, to one issue therefore turned several questions 
 issue answer marked all of them answered (and let completion reconciliation close the thread). The agent brief's
 `open_questions_for_human` still used the pre-v10 "any later human post" rule, so one reply zeroed the whole thread.
 
-**Rule.** An issue's question covers a linked source post (`Board.ISSUE_COVERS`) only when the post has no structured
-question of its own, or its question is exactly the issue's (same stored JSON). Covered posts are still represented by
-the issue in Needs you and answered by its decision, as before. A linked post asking its own, different question stays
-its own Needs you item (resolve works on it), and an issue decision neither links nor clears it. The decision still
-sets `needs_human=0` only on the links of the selected threads ("Applies to" is unchanged), so other threads' links
-keep waiting. If the issue's question changes later, a post that no longer matches reappears unless it was answered.
-No schema change or backfill: legacy suppression (`legacy_attention_answers`) and attention resolutions apply as before.
-The brief counts with `NEEDS_YOU_SOURCE`. The decision panel names linked posts that stay in Needs you
-("Linked posts #30, #31 each ask their own question …"). Dashboard drafts and choices were already per item.
+**Rule.** An issue's question covers a linked source post (`db.ISSUE_COVERS`) only when the post has no structured
+question of its own, or its question is exactly the issue's (same stored JSON). Coverage is decided once, when the post
+is linked, and stored in `issue_links.covers_post`.
+- *Covered* posts are represented by the issue while it is unresolved (`Board.ISSUE_GOVERNS` hides them from Needs you)
+  and are answered by its decision, as before. Only the links of the selected threads are set `needs_human=0`
+  ("Applies to" is unchanged), so other threads' links keep waiting.
+- *Uncovered* posts (asking their own, different question) stay their own Needs you items: resolve works on them, an
+  agent may close their attention, and an issue decision neither links nor clears them. Their own attention never
+  makes the link wait: `create_issue`/`link_issue` set a post link's `needs_human` from the source only when covered,
+  so answering such a post cannot leave its issue card waiting on nothing. The issue still waits when it asks the
+  human itself (`needs_human=true` at creation, a thread link, or a `request` comment); then its answer is a separate,
+  real answer to the issue's own question.
+- *A refined question* (`request` comment) asks every linked thread again but does not move posts in or out: a post the
+  issue covered when linked stays covered (it was linked as part of this issue's question), and a post with its own
+  question stays separate even if the new question happens to match it. Deciding against the link-time version avoids
+  posts appearing and disappearing from Needs you as an agent rewords the issue.
+- *Resolving an issue* ("Mark implementation resolved") records no answer. A covered post the issue never answered is
+  no longer hidden once the issue is resolved: it comes back as its own Needs you item, rather than staying hidden and
+  unanswered for good (which also blocked completion reconciliation). We chose bringing it back over recording it as
+  answered or closed, because the resolution text verifies an implementation and does not answer that post's question;
+  silently closing it could drop a question nobody answered. Posts the issue's decisions answered stay answered.
+
+**Upgrade.** `covers_post` is added by `db.init_schema` (no version bump, like `issue_links.needs_human`) and
+backfilled with `ISSUE_COVERS` against each issue's current question; thread links get 1, which nothing reads. Its
+default is 1, so a link written by an older server keeps that server's meaning (the issue covers the post). Existing
+links' `needs_human` is left as it was: we cannot tell whether it came from the source or from the issue asking.
+Legacy suppression (`legacy_attention_answers`) and attention resolutions apply as before.
+
+The brief counts with `NEEDS_YOU_SOURCE`. The decision panel names the linked posts the issue does not cover, from the
+issue's own link data (`links[].covers_post`), not from the capped Needs you list ("Linked posts #30, #31 each ask
+their own question …"). Dashboard drafts and choices were already per item.

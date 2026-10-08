@@ -1875,10 +1875,10 @@ function renderDecisionPanel(i, where, onSuccess) {
     draft.scopes = (flagged.length ? flagged : threads).map(l => l.thread_id);
   }
   const uid = `${where}-${i.id}`, limit = bodyLimit();
-  // Linked posts that ask their own, different question are their own Needs you items (the server's rule,
-  // Board.ISSUE_COVERS): this issue's answer does not answer them.
-  const separate = [...new Set((i.links || []).filter(l => l.post_id && (state.needs_you || []).some(p => p.id === l.post_id))
-    .map(l => l.post_id))].sort((a, b) => a - b);
+  // Linked posts this issue's question does not cover (the server's `covers_post`, fixed when each was linked): they
+  // ask their own question, so this answer does not answer them; each is its own Needs you item until answered.
+  const separate = [...new Set((i.links || []).filter(l => l.post_id && l.covers_post === false).map(l => l.post_id))]
+    .sort((a, b) => a - b);
   const option = id => q && id.startsWith("option:") ? q.options.find(o => "option:" + o.id === id) : null;
   const problem = () => !draft.choice ? "Choose an option or write your own answer."
     : draft.choice === "custom" && !draft.decision.trim() ? "Write your answer, or choose an option."
@@ -1957,7 +1957,7 @@ function renderDecisionPanel(i, where, onSuccess) {
     choices, custom, scopes,
     el("p", { class: "note" }, "Options are suggestions until you send. Your answer applies only to the selected threads, grants no other authority, and does not mark the implementation resolved."),
     separate.length ? el("p", { class: "note", "data-separate": separate.join(",") },
-      `${separate.length === 1 ? "Linked post" : "Linked posts"} ${separate.map(id => "#" + id).join(", ")} ${separate.length === 1 ? "asks its" : "each ask their"} own question: this answer does not answer ${separate.length === 1 ? "it" : "them"}. ${separate.length === 1 ? "It stays" : "They stay"} in Needs you, to answer separately.`) : null,
+      `${separate.length === 1 ? "Linked post" : "Linked posts"} ${separate.map(id => "#" + id).join(", ")} ${separate.length === 1 ? "asks its" : "each ask their"} own question: this answer does not answer ${separate.length === 1 ? "it" : "them"}. Answer ${separate.length === 1 ? "it" : "each"} on ${separate.length === 1 ? "its" : "their"} own (${separate.length === 1 ? "it is its" : "each is its"} own Needs you item until answered).`) : null,
     el("div", { class: "footer" }, hint, send),
     issueNote(key));
   sync();
