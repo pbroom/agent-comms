@@ -37,21 +37,21 @@ async function setup({ url = 'http://127.0.0.1:8787/', storage = {}, needsYou = 
   await settle();
   return { dom, win: dom.window, document: dom.window.document };
 }
-const rows = d => [...d.querySelectorAll('.thread-list tr')].map(r => Number(r.dataset.thread));
+const rows = d => [...d.querySelectorAll('.thread-list li.row')].map(r => Number(r.dataset.thread));
 const shown = d => [...d.querySelectorAll('#thread-pane > section')].map(s => s.id);
 
 test('lists every thread by latest activity and shows only the newest one', async () => {
   const { dom, document } = await setup();
   assert.deepEqual(rows(document), [2, 3, 1]);
   assert.deepEqual(shown(document), ['thread-2']);
-  assert.equal(document.querySelector('tr[aria-selected=true]').dataset.thread, '2');
-  assert.match(document.querySelector('tr[data-thread="2"]').textContent, /app-2\s*· 2 posts/);
+  assert.equal(document.querySelector('li[data-selected=true]').dataset.thread, '2');
+  assert.match(document.querySelector('li[data-thread="2"]').textContent, /app-2\s*· 2 posts/);
   dom.window.close();
 });
 
 test('clicking a row shows that thread, updates the hash and is remembered', async () => {
   const { dom, document, win } = await setup();
-  document.querySelector('tr[data-thread="1"]').click();
+  document.querySelector('li[data-thread="1"]').click();
   assert.deepEqual(shown(document), ['thread-1']);
   assert.equal(win.location.hash, '#thread-1');
   assert.equal(win.localStorage.getItem('agent-comms-thread'), '1');
@@ -64,10 +64,10 @@ test('clicking a row shows that thread, updates the hash and is remembered', asy
 
 test('arrow keys move the selection', async () => {
   const { dom, document, win } = await setup();
-  const table = document.querySelector('.thread-list table');
+  const table = document.querySelector('.thread-list ul.rows');
   table.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
   assert.deepEqual(shown(document), ['thread-3']);
-  document.querySelector('.thread-list table').dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+  document.querySelector('.thread-list ul.rows').dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
   assert.deepEqual(shown(document), ['thread-2']);
   dom.window.close();
 });
@@ -84,8 +84,8 @@ test('#post-<id> and #thread-<id> pick the thread that holds them', async () => 
 
 test('a thread with posts waiting on the human is flagged in the list', async () => {
   const { dom, document } = await setup({ needsYou: [post(10, 1, 5, { needs_response: true })] });
-  assert.match(document.querySelector('tr[data-thread="1"]').textContent, /1 needs you/);
-  assert.doesNotMatch(document.querySelector('tr[data-thread="2"]').textContent, /needs you/);
+  assert.match(document.querySelector('li[data-thread="1"]').textContent, /1 needs you/);
+  assert.doesNotMatch(document.querySelector('li[data-thread="2"]').textContent, /needs you/);
   dom.window.close();
 });
 
@@ -104,7 +104,7 @@ async function dots({ threads, runs = [], storage = {}, needsYou = [], url = 'ht
   } });
   await settle();
   const d = dom.window.document;
-  const dot = id => { const n = d.querySelector(`tr[data-thread="${id}"] .dot`); return n ? [n.className.replace('dot ', ''), n.title] : null; };
+  const dot = id => { const n = d.querySelector(`li[data-thread="${id}"] .dot`); return n ? [n.className.replace('dot ', ''), n.title] : null; };
   return { dom, document: d, win: dom.window, dot };
 }
 const task = (id, status, lease_state = 'none', owner_agent = 'codex') => ({ id, title: 'T' + id, status, lease_state, owner_agent });
@@ -126,7 +126,7 @@ test('status dots: stalled, being worked on or waiting to be picked up, complete
   assert.equal(dot(3)[0], 'stalled');
   assert.deepEqual(dot(4), ['unread', '#40 · codex: awaiting agent pickup'], 'a fresh ask is pending, not stalled yet');
   assert.deepEqual(dot(5), ['stalled', '#50 · codex: agent pickup overdue']);
-  assert.ok(!document.querySelector('tr[data-thread="6"]'), 'completed threads are hidden by default');
+  assert.ok(!document.querySelector('li[data-thread="6"]'), 'completed threads are hidden by default');
   assert.match(document.querySelector('.thread-list').textContent, /Show completed/);
   assert.ok(!document.querySelector('header input[type=checkbox]'), 'the toggle moved out of the header');
   const box = document.getElementById('show-completed');
@@ -145,9 +145,9 @@ test('status dots: opening or reloading preserves agent pickup until explicit co
   const page = await dots({ threads: () => all, storage: { 'agent-comms-thread': '2' } });
   try {
     assert.deepEqual(page.dot(1), ['unread', '#11 · claude: awaiting agent pickup']);
-    page.document.querySelector('tr[data-thread="1"]').click();
+    page.document.querySelector('li[data-thread="1"]').click();
     assert.equal(page.dot(1)[0], 'unread', 'human reading does not acknowledge agent work');
-    page.document.querySelector('tr[data-thread="2"]').click();
+    page.document.querySelector('li[data-thread="2"]').click();
     assert.equal(page.dot(1)[0], 'unread', 'navigating away preserves pickup');
   } finally { page.dom.window.close(); }
   const reload = await dots({ threads: () => all,
@@ -156,8 +156,8 @@ test('status dots: opening or reloading preserves agent pickup until explicit co
     assert.equal(reload.dot(1)[0], 'unread', 'legacy browser read marks cannot settle a request');
     request.state = 'finished';
     await reload.win.refresh();
-    assert.equal(reload.document.querySelector('tr[data-thread="1"]'), null, 'explicit completion hides settled work');
-    assert.ok(reload.document.querySelector('tr[data-thread="2"]'), 'the selected thread stays listed');
+    assert.equal(reload.document.querySelector('li[data-thread="1"]'), null, 'explicit completion hides settled work');
+    assert.ok(reload.document.querySelector('li[data-thread="2"]'), 'the selected thread stays listed');
   } finally { reload.dom.window.close(); }
 });
 
@@ -170,7 +170,7 @@ test('status dots: unclaimed tasks await pickup then stall; quiet discussion is 
   assert.deepEqual(dot(1), ['unread', 'task 1 accepted, awaiting agent pickup for 5m']);
   assert.deepEqual(dot(2), ['stalled', 'task 2 proposed, awaiting agent pickup for 2h']);
   assert.equal(dot(3), null, 'quiet discussion is not evidence of completion or processing');
-  assert.ok(document.querySelector('tr[data-thread="3"]'), 'unclassified discussion stays visible');
+  assert.ok(document.querySelector('li[data-thread="3"]'), 'unclassified discussion stays visible');
   dom.window.close();
 });
 

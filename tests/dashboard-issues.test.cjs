@@ -167,13 +167,13 @@ test('linked unresolved issues keep read threads visible without duplicating dec
   const data = issue(); data.links[0].needs_human = false; data.links[1].needs_human = true;
   const { dom, d, win } = await setup({ issues: [data], hash: '' });
   try {
-    assert.ok(d.querySelector('tr[data-thread="10"]'));
-    assert.equal(d.querySelector('tr[data-thread="10"] .dot'), null, 'a shared discussion alone is neither processing nor complete');
+    assert.ok(d.querySelector('li[data-thread="10"]'));
+    assert.equal(d.querySelector('li[data-thread="10"] .dot'), null, 'a shared discussion alone is neither processing nor complete');
     assert.ok(d.querySelector('#thread-issues a[href="#issue-1"]'), 'the unresolved issue remains reachable');
     assert.equal(d.querySelector('#needs-you'), null);
     d.getElementById('tab-issues').click(); await settle();
     d.getElementById('tab-threads').click(); await settle();
-    assert.ok(d.querySelector('tr[data-thread="10"]'));
+    assert.ok(d.querySelector('li[data-thread="10"]'));
     assert.equal(d.querySelectorAll('.pane-side [data-issue="1"]').length, 1);
   } finally { dom.window.close(); }
 });
@@ -500,14 +500,14 @@ test('issue list: awaiting first then recent activity, with status dots and proj
     assert.equal(dot(4).className, 'dot stalled'); assert.equal(dot(2).className, 'dot answered'); assert.equal(dot(1).className, 'dot done');
     assert.match(dot(2).getAttribute('aria-label'), /Answered/);
     assert.match(d.querySelector('.issue-row[data-issue="4"] .sub').textContent, /2 threads· one, two/);
-    assert.equal(d.querySelector('.issue-row[aria-selected="true"]').dataset.issue, '4');   // the first one is shown
+    assert.equal(d.querySelector('.issue-row[data-selected="true"]').dataset.issue, '4');   // the first one is shown
     assert.match(d.getElementById('tab-issues').textContent, /2 awaiting/);
     const sort = d.getElementById('issue-sort'); sort.value = 'activity'; sort.dispatchEvent(new win.Event('change'));
     assert.deepEqual(order(), [1, 2, 4, 3]);
     assert.equal(win.localStorage.getItem('agent-comms-issue-sort'), 'activity');
     // Arrow keys move the selection like the thread list.
-    d.querySelector('.issue-list table').dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    assert.equal(d.querySelector('.issue-row[aria-selected="true"]').dataset.issue, '2');
+    d.querySelector('.issue-list ul.rows').dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    assert.equal(d.querySelector('.issue-row[data-selected="true"]').dataset.issue, '2');
     assert.equal(win.location.hash, '#issue-2');
   } finally { dom.window.close(); }
 });
@@ -570,14 +570,14 @@ test('tabs switch the list in place, keep the thread selection, and are remember
   try {
     assert.equal(d.getElementById('issues-link'), null);
     assert.equal(d.getElementById('tab-threads').getAttribute('aria-selected'), 'true');
-    assert.ok(d.querySelector('tr[data-thread="10"][aria-selected="true"]'));
+    assert.ok(d.querySelector('li[data-thread="10"][data-selected="true"]'));
     d.getElementById('tab-issues').click(); await settle();
     assert.ok(d.querySelector('.issue-list')); assert.ok(d.querySelector('.pane-thread #issue-1'));
     assert.ok(d.querySelector('.pane-side'));                    // the sidebar stays
     assert.equal(win.localStorage.getItem('agent-comms-tab'), 'issues');
     assert.equal(win.location.hash, '#issues');
     d.getElementById('tab-threads').click(); await settle();
-    assert.ok(d.querySelector('tr[data-thread="10"][aria-selected="true"]'));
+    assert.ok(d.querySelector('li[data-thread="10"][data-selected="true"]'));
     assert.equal(win.location.hash, '#thread-10');
   } finally { dom.window.close(); }
   const again = await setup({ hash: '', storage: { 'agent-comms-tab': 'issues' } });
@@ -594,7 +594,7 @@ test('thread and issue link to each other across the tabs', async () => {
     assert.ok(d.getElementById('issue-1')); assert.equal(win.location.hash, '#issue-1');
     d.querySelector('#issue-1-threads a[href="#thread-10"]').click(); await settle();
     assert.equal(d.getElementById('tab-threads').getAttribute('aria-selected'), 'true');
-    assert.ok(d.querySelector('tr[data-thread="10"][aria-selected="true"]'));
+    assert.ok(d.querySelector('li[data-thread="10"][data-selected="true"]'));
     assert.equal(win.location.hash, '#thread-10');
   } finally { dom.window.close(); }
   const deep = await setup({ issues: [data], hash: '#issue-1', storage: { 'agent-comms-tab': 'threads' } });

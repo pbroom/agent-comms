@@ -75,6 +75,9 @@ button[aria-busy=true]:disabled { cursor: progress; }
 .btn-ghost:hover:not(:disabled) { background: var(--accent); }
 .btn-destructive, button.danger { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
 .btn-destructive:hover:not(:disabled), button.danger:hover:not(:disabled) { background: var(--destructive-bg); }
+/* A two-click confirm button while armed (see confirmButton): the solid destructive fill. */
+button.btn-confirm, button.danger.btn-confirm { background: var(--destructive); border-color: var(--destructive); color: var(--destructive-foreground); font-weight: 600; }
+button.btn-confirm:hover:not(:disabled) { background: var(--destructive); filter: brightness(1.08); }
 @media (prefers-color-scheme: dark) { .btn-secondary:hover:not(:disabled) { filter: brightness(1.15); } }
 
 /* Input, textarea, select. Zero specificity, so the few older layout rules (widths) still apply. */
@@ -206,15 +209,18 @@ main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 aut
 @media (max-width: 480px) { main { padding: 12px; gap: 12px; } header { padding: 8px 12px; } }
 .thread-list { padding: 6px; }
 .thread-list h2 { padding: 6px 8px 2px; }
-.thread-list table { font-size: 13px; }
-.thread-list td { padding: 8px; border-top: 1px solid var(--border); cursor: pointer; }
-.thread-list tr:first-child td { border-top: 0; }
-.thread-list tr:hover td { background: var(--accent); }
-.thread-list tr[aria-selected=true] td { background: var(--muted); }
-.thread-list tr[aria-selected=true] td:first-child { box-shadow: inset 3px 0 0 var(--primary); }
-.thread-list tr:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+/* List rows (see listRow): the title link selects; the focus ring is drawn on the whole row. */
+.thread-list .rows { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.thread-list .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 16px; padding: 8px;
+  border-top: 1px solid var(--border); cursor: pointer; }
+.thread-list .row:first-child { border-top: 0; }
+.thread-list .row:hover { background: var(--accent); }
+.thread-list .row[data-selected=true] { background: var(--muted); box-shadow: inset 3px 0 0 var(--primary); }
+.thread-list .row:has(.row-link:focus-visible) { outline: 2px solid var(--ring); outline-offset: -2px; }
+.thread-list .row-link { color: inherit; text-decoration: none; }
+.thread-list .row-link:focus-visible { outline: none; }
 .thread-list .title { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.thread-list .when { text-align: right; white-space: nowrap; width: 1%; }
+.thread-list .when { text-align: right; white-space: nowrap; }
 .thread-list .head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 2px; }
 .thread-list .head h2 { padding: 0; margin: 0; flex: 1; }
 .thread-list .head.tabs { padding: 2px 2px 6px; }
@@ -479,11 +485,18 @@ let notifyDraft = { events: [...NOTIFY_DEFAULT], project: "", thread: "", idle: 
 let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
 // Deep links: #post-<id>, #thread-<id>, #settings. `focus` is what still needs scrolling to; the highlight stays.
 let focus = null, focusTried = false, focusBusy = false, highlight = null;
+// Bumped by every navigation (a click, a link): deep-link work started before it is dropped (see applyFocus).
+let focusVersion = 0;
 const threadPosts = {};    // thread id -> older posts fetched to show a deep-linked post outside the snapshot
 // Two-pane board: the thread shown on the right. Remembered per browser (a convenience only).
 const SELECTED_KEY = "agent-comms-thread";
 let selected = Number(load(SELECTED_KEY)) || null;
 const opened = new Set();  // threads shown on the right since this page loaded: kept listed even once settled
+// New posts: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor). It
+// only brings a settled or completed thread back with a blue dot until it is opened; it never acknowledges agent
+// work (pickup and completion come from the server's request records).
+const SEEN_KEY = "agent-comms-seen";
+let seen = null;
 // Thread list order, remembered per browser: "priority", "activity" (last updated) or "created".
 const SORT_KEY = "agent-comms-sort";
 const SORTS = { priority: "Priority", activity: "Recent activity", created: "Newest first" };
@@ -520,6 +533,7 @@ function parseFocus(hash) {
   return m ? { kind: m[1], id: Number(m[2]) } : null;
 }
 function setFocusFromHash() {
+  focusVersion++;
   focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
   if (focus) focus.viaLink = true;   // a link to a post that needs you lands on its callout block
   if (focus && focus.kind === "thread") selected = focus.id;
@@ -550,13 +564,51 @@ async function api(method, path, data, bearer) {
   return body;
 }
 
-// Only pausing the board and signing browsers out still ask first (window.confirm). Every other action happens on
-// click: the human asked for that, and embedded browsers that block confirm() would otherwise make them dead buttons.
-async function act(method, path, confirmText) {
-  if (confirmText && !confirm(confirmText)) return;
+// Every action happens on click, except pausing the board and signing browsers out, which take a second click (see
+// confirmButton). Never window.confirm/alert/prompt: the human's embedded browser blocks them, which would make
+// those buttons do nothing.
+async function act(method, path) {
   try { await api(method, path); lastError = ""; } catch (e) { lastError = e.message; }
   refresh();
 }
+
+// Click twice to confirm. The first click arms the button: it reads `confirmLabel` in the destructive style for
+// CONFIRM_MS, and a second click within that window runs `action`. The timeout, Escape and leaving the button (blur)
+// disarm it. A screen reader hears the hint through the page's one live region (#confirm-live, outside #app, so a
+// re-render never replaces it). The armed key lives here, so a re-render keeps the armed state (and render() keeps
+// focus on it); arming and disarming update the button in place, so a click elsewhere is never lost to a re-render.
+const CONFIRM_MS = 4000;
+let armed = null;   // { key, timer }
+function announce(text) {
+  let n = document.getElementById("confirm-live");
+  if (!n) { n = el("div", { id: "confirm-live", class: "sr-only", "aria-live": "polite", role: "status" }); document.body.append(n); }
+  n.textContent = text;
+}
+function confirmButtons(key) { return [...document.querySelectorAll("button[data-confirm]")].filter(b => b.dataset.confirm === key); }
+function disarm() {
+  if (!armed) return;
+  const { key, timer } = armed;
+  clearTimeout(timer); armed = null; announce("");
+  for (const b of confirmButtons(key)) { b.textContent = b.dataset.label; b.classList.remove("btn-confirm"); b.removeAttribute("aria-describedby"); }
+}
+function confirmButton(key, label, confirmLabel, hint, action, attrs = {}) {
+  const on = !!armed && armed.key === key;
+  const n = el("button", { ...attrs, type: "button", class: ((attrs.class || "") + (on ? " btn-confirm" : "")).trim(),
+    "data-confirm": key, "data-label": label, "aria-describedby": on ? "confirm-live" : null }, on ? confirmLabel : label);
+  n.addEventListener("click", e => {
+    e.stopPropagation();
+    if (armed && armed.key === key) { disarm(); action(); return; }
+    disarm();
+    armed = { key, timer: setTimeout(() => { if (armed && armed.key === key) disarm(); }, CONFIRM_MS) };
+    announce(`${hint} Activate “${confirmLabel}” again within ${CONFIRM_MS / 1000} seconds to confirm, or press Escape to cancel.`);
+    for (const b of confirmButtons(key)) { b.textContent = confirmLabel; b.classList.add("btn-confirm"); b.setAttribute("aria-describedby", "confirm-live"); }
+  });
+  n.addEventListener("keydown", e => { if (e.key === "Escape" && armed && armed.key === key) { e.preventDefault(); disarm(); } });
+  // A blur caused by render() swapping the DOM is not the human leaving the button.
+  n.addEventListener("blur", () => { if (!rendering && armed && armed.key === key) disarm(); });
+  return n;
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape" && armed) disarm(); });
 
 function signedOut(message) {
   signedIn = false; token = null; state = null; cfg = null; lastError = message || "";
@@ -654,6 +706,7 @@ async function loadSettings() {
 }
 
 function setView(next) {
+  focusVersion++;
   view = next;
   if (next !== "board") highlight = focus = null;
   const back = listTab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : location.pathname;
@@ -679,6 +732,8 @@ async function applyFocus() {
     focus = null; render(); return;
   }
   focusTried = true; focusBusy = true;
+  // A click (or a newer link) while this fetches wins: the stale result must not change the selection.
+  const version = focusVersion;
   try {
     let tid = focus.id;
     if (focus.kind === "post") {
@@ -687,10 +742,13 @@ async function applyFocus() {
       const older = await api("GET", `/api/threads/${tid}/posts?since_seq=${Math.max(0, post.seq - 1)}&limit=500`);
       threadPosts[tid] = older.posts || [];
     }
-    selected = tid;
-    if (!state.threads.some(t => t.id === tid)) showClosed = true;
+    if (version === focusVersion) {
+      selected = tid;
+      if (!state.threads.some(t => t.id === tid)) showClosed = true;
+    }
   } catch (e) {}
   focusBusy = false;
+  if (version !== focusVersion) { if (focus) render(); return; }   // let the newer focus work run
   await refresh();
 }
 
@@ -702,10 +760,11 @@ function postsOf(t) {
   return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
-function pauseControl() {
+function pauseControl(where) {
   return state.paused
     ? el("button", { onclick: () => act("POST", "/api/admin/unpause") }, "Unpause agents")
-    : el("button", { class: "danger", onclick: () => act("POST", "/api/admin/pause", "Pause the board? All agent writes will be rejected.") }, "Pause agents");
+    : confirmButton("pause-" + where, "Pause agents", "Confirm pause?", "Pausing rejects all agent writes until you unpause.",
+        () => act("POST", "/api/admin/pause"), { class: "danger" });
 }
 
 function ago(iso) {
@@ -929,9 +988,8 @@ function renderGrants() {
 // ---------------------------------------------------------------- settings view (human only)
 // Every value shown here comes from the board and goes in through el(), i.e. textContent.
 
-async function cfgAct(method, path, data, confirmText) {
+async function cfgAct(method, path, data) {
   if (cfgBusy) return false;
-  if (confirmText && !confirm(confirmText)) return false;
   cfgBusy = true; cfgError = ""; render();
   let ok = true;
   try { await api(method, path, data); } catch (e) { cfgError = e.message; ok = false; }
@@ -956,7 +1014,8 @@ function settingRow(item) {
     el("td", {}, sourceChip(item.source)),
     el("td", {}, item.source === "board.local.toml"
       ? el("button", { disabled: cfgBusy, title: "Remove the board.local.toml override",
-          onclick: () => cfgAct("PUT", "/api/settings", { [item.key]: null }) }, "Reset")
+          // Drop the unsaved draft too, or the next Save would write the override straight back.
+          onclick: () => { delete cfgDraft[item.key]; cfgAct("PUT", "/api/settings", { [item.key]: null }); } }, "Reset")
       : null));
 }
 
@@ -992,7 +1051,7 @@ function renderBoardSection() {
   const f = cfg.settings.files;
   return el("section", { class: "card", id: "settings-board" },
     el("h2", {}, "Board"),
-    el("div", { class: "actions" }, state.paused ? chip("PAUSED", "bad") : chip("live", "ok"), pauseControl()),
+    el("div", { class: "actions" }, state.paused ? chip("PAUSED", "bad") : chip("live", "ok"), pauseControl("settings")),
     accept ? el("div", { class: "toggle", style: "margin-top:12px" },
       el("input", { type: "checkbox", id: "require-human-accept", checked: accept.value, disabled: cfgBusy || !f.writable,
         onchange: e => {
@@ -1129,12 +1188,13 @@ function renderBrowsers() {
           el("td", {}, when(s.created_at)),
           el("td", { title: when(s.last_seen) }, ago(s.last_seen)),
           el("td", {}, when(s.expires_at)),
-          el("td", {}, el("button", { class: "danger", disabled: cfgBusy,
-            onclick: () => cfgAct("POST", `/api/web-sessions/${s.id}/revoke`, undefined,
-              s.current ? "Sign out this browser?" : `Sign out ${s.label}?`) }, "Revoke"))))))
+          el("td", {}, confirmButton("revoke-session-" + s.id, "Revoke", "Confirm revoke?",
+            s.current ? "Revoking signs out this browser." : `Revoking signs out ${s.label}.`,
+            () => cfgAct("POST", `/api/web-sessions/${s.id}/revoke`), { class: "danger", disabled: cfgBusy }))))))
         : el("p", { class: "small muted" }, "No browsers are signed in."),
-      el("div", { class: "actions" }, el("button", { class: "danger", id: "sign-out-all", disabled: cfgBusy || !b.sessions.length,
-        onclick: () => cfgAct("POST", "/api/web-sessions/revoke-all", undefined, "Sign out every browser, including this one?") }, "Sign out all browsers"))]);
+      el("div", { class: "actions" }, confirmButton("sign-out-all", "Sign out all browsers", "Confirm sign out?",
+        "Signing out all browsers includes this one.", () => cfgAct("POST", "/api/web-sessions/revoke-all"),
+        { class: "danger", id: "sign-out-all", disabled: cfgBusy || !b.sessions.length }))]);
 }
 
 function lastActivity(t) {
@@ -1168,11 +1228,43 @@ function sortedThreads(statuses) {
 }
 
 function selectThread(id) {
+  focusVersion++;
   if (id === selected && !highlight) return;
   selected = id; store(SELECTED_KEY, String(id));
   highlight = focus = null; scrollToThread = true;
   try { history.replaceState(null, "", "#thread-" + id); } catch (e) {}
   render();
+}
+
+function loadSeen() {
+  if (seen) return;
+  try { seen = JSON.parse(load(SEEN_KEY) || "null"); } catch (e) { seen = null; }
+  if (!seen || typeof seen !== "object" || Array.isArray(seen)) {
+    // First visit in this browser: everything already here counts as seen, so nothing lights up at once.
+    seen = {};
+    for (const t of state.threads) seen[t.id] = newestId(t);
+    store(SEEN_KEY, JSON.stringify(seen));
+  }
+}
+function newestId(t, filter = () => true) {
+  return postsOf(t).filter(filter).reduce((m, p) => Math.max(m, p.id), 0);
+}
+function markSeen(t) {
+  const id = newestId(t);
+  if (!seen || (Number(seen[t.id]) || 0) >= id) return;
+  seen[t.id] = id;
+  store(SEEN_KEY, JSON.stringify(seen));
+}
+// A post by someone else that this browser has not shown yet, in an open thread.
+function hasNewPosts(t) {
+  return !!seen && t.status === "open" && newestId(t, p => p.agent !== state.me.name) > (Number(seen[t.id]) || 0);
+}
+// The work status, unless the thread has settled (completed, or nothing to flag) and has new posts: then a blue
+// "New posts" dot, which brings a completed thread back into the list until it is opened.
+function listStatus(t, human) {
+  const st = threadStatus(t, human);
+  if ((!st || st.kind === "done") && hasNewPosts(t)) return { kind: "unread", label: "New posts", newPosts: true };
+  return st;
 }
 
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
@@ -1213,7 +1305,8 @@ function threadStatus(t, human) {
   const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status));
   if (expired.length) stalled.push("A task lease expired");
   for (const k of [...blocked, ...expired]) involve(k.owner_agent);
-  if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
+  // Only a human post lifts the cap: it is "on you" for the human only (an agent's view sorts it as someone else's).
+  if (human && t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
   // Request completion is explicit; reading or unrelated replies never close it.
   const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
@@ -1242,8 +1335,13 @@ function threadStatus(t, human) {
       else pickup.push(`${label}: awaiting agent pickup`);
     } else pending.push(`${label}: in progress${r.reason ? ": " + r.reason : ""}`);
   }
+  // A task waiting on unfinished prerequisites (depends_on) cannot be claimed yet (the server refuses the claim), so
+  // it is neither awaiting pickup nor stalled. A prerequisite counts as finished only when it is "done" (the server's
+  // rule); one this snapshot does not show is treated as unfinished.
+  const taskStatus = new Map(state.threads.flatMap(x => x.tasks.map(k => [k.id, k.status])));
+  const waitsOnPrerequisites = k => Array.isArray(k.depends_on) && k.depends_on.some(id => taskStatus.get(id) !== "done");
   for (const k of t.tasks) {
-    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active") continue;
+    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active" || waitsOnPrerequisites(k)) continue;
     const at = k.updated_at || k.created_at;
     (at && stale(at) ? stalled : pickup).push(`task ${k.id} ${k.status}, awaiting agent pickup${at ? " for " + since(at) : ""}`);
   }
@@ -1284,7 +1382,8 @@ function unstickRestarted(t) {
 function unstickSending(t) {
   const w = unsticking[t.id];
   if (!w) return false;
-  if (Date.now() > w.until || (!unstickBusy && unstickRestarted(t))) { delete unsticking[t.id]; return false; }
+  // A thread closed meanwhile will not restart: stop waiting at once (not after UNSTICK_WAIT_MS).
+  if (Date.now() > w.until || t.status !== "open" || (!unstickBusy && unstickRestarted(t))) { delete unsticking[t.id]; return false; }
   return true;
 }
 
@@ -1311,18 +1410,58 @@ function unstickTitle(agents) {
 
 // The sessions that received a thread's last Unstick: the live ones the server named, plus sessions of the same
 // agents that started at or after the click (a dispatcher launch). In the server's order (last seen first).
+// The snapshot lists only the 30 most recently seen sessions, so a session the server named can be missing from it:
+// it is taken from the Unstick reply's `sessions_detail` when the server sends one, else shown by id alone. It still
+// received the request, so it never reads as "no session".
 function unstickReceivers(u) {
   if (!u || !state) return [];
-  return state.sessions.filter(s => u.agents.includes(s.agent)
+  const listed = state.sessions.filter(s => u.agents.includes(s.agent)
     && (u.sessionIds.includes(s.id) || Date.parse(s.started_at) >= u.at));
+  const ids = new Set(listed.map(s => s.id));
+  const unlisted = u.sessionIds.filter(id => !ids.has(id))
+    .map(id => (u.sessionsDetail || []).find(s => s.id === id) || { id, agent: null, unlisted: true });
+  return [...listed, ...unlisted];
 }
 
 function unstickSessionsLine(u) {
   const got = unstickReceivers(u);
   return el("div", { class: "convo-list", id: "unstick-sessions" },
     el("span", { class: "muted" }, got.length ? "Received in:" : "No session has picked it up yet."),
-    got.map(s => el("span", { class: "convo", "data-session": s.id }, el("span", {}, `s${s.id} ${s.agent}`),
-      conversationLinks(s.conversation, s.agent))));
+    got.map(s => el("span", { class: "convo", "data-session": s.id },
+      el("span", {}, s.unlisted ? `s${s.id} (not in the recent list)` : `s${s.id} ${s.agent}`),
+      s.unlisted ? null : conversationLinks(s.conversation, s.agent))));
+}
+// `sessions_detail` from the Unstick reply, if the server sends it: { id, agent, conversation? } per session. Only
+// well-formed entries are kept; the conversation link is checked again by conversationLinks().
+function sessionsDetail(r) {
+  if (!Array.isArray(r.sessions_detail)) return [];
+  return r.sessions_detail.filter(s => s && typeof s === "object" && Number.isInteger(s.id) && typeof s.agent === "string")
+    .map(s => ({ id: s.id, agent: s.agent, conversation: s.conversation, started_at: typeof s.started_at === "string" ? s.started_at : null }));
+}
+
+// The thread and issue lists: a plain list of rows (not a listbox, whose options cannot hold buttons). In each row
+// the title is a link, the one element that selects the row: it carries aria-current on the selected row, and only
+// that row's link is in the Tab order (roving tabindex); the row's buttons (needs you, Unstick) are its siblings.
+// A click anywhere else on the row selects it too. Arrow keys and j/k move the selection and focus with it.
+function listRow(attrs, id, href, on, select, title, sub, when) {
+  const link = el("a", { class: "row-link", id, href, tabindex: on ? "0" : "-1", "aria-current": on ? "true" : null,
+    "aria-describedby": sub && sub.id ? sub.id : null, onclick: e => e.preventDefault() }, title);
+  return el("li", { ...attrs, class: ((attrs.class || "") + " row").trim(), "data-selected": on ? "true" : "false", onclick: () => select() },
+    el("div", { class: "main" }, el("div", { class: "title" }, link), sub),
+    el("div", { class: "when muted small" }, when));
+}
+function listRows(label, rows, ids, currentId, select, linkId) {
+  const list = el("ul", { class: "rows", role: "list", "aria-label": label }, rows);
+  list.addEventListener("keydown", e => {
+    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || currentId === null || currentId === undefined) return;
+    const i = ids.indexOf(currentId) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
+    if (i < 0 || i >= ids.length) return;
+    e.preventDefault();
+    select(ids[i]);
+    const link = document.getElementById(linkId(ids[i]));
+    if (link) { link.focus({ preventScroll: true }); if (link.scrollIntoView) link.scrollIntoView({ block: "nearest" }); }
+  });
+  return list;
 }
 
 function renderThreadList(threads, current, human, statuses, hidden) {
@@ -1337,11 +1476,9 @@ function renderThreadList(threads, current, human, statuses, hidden) {
     const open = (t.task_counts ? Object.entries(t.task_counts) : [])
       .filter(([k]) => !["done", "declined"].includes(k)).reduce((n, [, v]) => n + v, 0);
     const full = t.agent_posts_since_human >= t.thread_cap;
-    return el("tr", { role: "option", "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1", "data-thread": t.id,
-        onclick: () => selectThread(t.id) },
-      el("td", {},
-        el("div", { class: "title" }, el("span", { class: "muted" }, `#${t.id} `), t.title),
-        el("div", { class: "sub" },
+    return listRow({ "data-thread": t.id }, `thread-row-${t.id}`, `#thread-${t.id}`, on, () => selectThread(t.id),
+      [el("span", { class: "muted" }, `#${t.id} `), t.title],
+        el("div", { class: "sub", id: `thread-row-${t.id}-sub` },
           el("span", { title: t.project }, base),
           el("span", {}, `· ${posts.length}${posts.length >= 60 ? "+" : ""} post${posts.length === 1 ? "" : "s"}`),
           open ? el("span", {}, `· ${open} task${open === 1 ? "" : "s"}`) : null,
@@ -1349,20 +1486,11 @@ function renderThreadList(threads, current, human, statuses, hidden) {
             title: `Open this thread at what needs you: ${waitingPosts[t.id].map(id => "post #" + id).join(", ")}`,
             onclick: e => { e.stopPropagation(); openNeedsYou(t.id); } }, `${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`) : null,
           full ? chip("at cap", "bad") : null,
-          t.status !== "open" ? chip(t.status) : null)),
-      el("td", { class: "when muted small" }, el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
-        statusDot(statuses.get(t.id)), unstickButton(t, statuses.get(t.id), human, "row")));
+          t.status !== "open" ? chip(t.status) : null),
+      [el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
+        statusDot(statuses.get(t.id)), unstickButton(t, statuses.get(t.id), human, "row")]);
   });
-  const table = el("table", { role: "listbox", "aria-label": "Threads" }, rows);
-  table.addEventListener("keydown", e => {
-    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || !current) return;
-    const i = threads.findIndex(t => t.id === current.id) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
-    if (i < 0 || i >= threads.length) return;
-    e.preventDefault();
-    selectThread(threads[i].id);
-    const row = document.querySelector(`.thread-list tr[data-thread="${threads[i].id}"]`);
-    if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
-  });
+  const table = listRows("Threads", rows, threads.map(t => t.id), current && current.id, id => selectThread(id), id => `thread-row-${id}`);
   const toggle = el("label", { class: "small muted", title: "Closed threads, and open threads where nothing is waiting on anyone" },
     el("input", { type: "checkbox", id: "show-completed", checked: showClosed,
       onchange: e => { showClosed = e.target.checked; refresh(); } }), "Show completed");
@@ -1403,9 +1531,11 @@ async function unstickThread(t) {
   try {
     const r = lastUnstickReply = await api("POST", `/api/threads/${t.id}/unstick`);
     unstickNote = { threadId: t.id, text: unstickMessage(r), failed: false }; lastError = "";
+    const detail = sessionsDetail(r);
     lastUnstick[t.id] = { threadId: t.id, at, postId: Number.isInteger(r.post_id) ? r.post_id : null,
       agents: Array.isArray(r.agents) ? r.agents.filter(a => typeof a === "string") : [],
-      sessionIds: Array.isArray(r.sessions) ? r.sessions.filter(Number.isInteger) : [] };
+      sessionIds: [...new Set([...(Array.isArray(r.sessions) ? r.sessions.filter(Number.isInteger) : []), ...detail.map(s => s.id)])],
+      sessionsDetail: detail };
   } catch (e) {
     lastError = e.message; unstickNote = { threadId: t.id, text: `Unstick failed: ${e.message}`, failed: true };
     delete unsticking[t.id];
@@ -1484,14 +1614,22 @@ function bytes(text) {
 function bodyLimit() { return (state.limits && state.limits.body_max_bytes) || 4096; }
 
 // Opens the thread and brings its callout (and the given item) into view. Used by the list chip and the sidebar.
+// A thread that is not in the snapshot (closed, with "Show completed" off) goes through applyFocus, which fetches
+// it and turns "Show completed" on; otherwise the pane would fall back to some other thread.
 function openNeedsYou(threadId, postId) {
+  focusVersion++;
   selected = threadId; store(SELECTED_KEY, String(threadId));
   highlight = focus = null; scrollToNeedsYou = postId || true;
   try { history.replaceState(null, "", "#thread-" + threadId); } catch (e) {}
+  if (!state.threads.some(t => t.id === threadId)) {
+    scrollToNeedsYou = null; focusTried = false;
+    focus = postId ? { kind: "post", id: postId, viaLink: true } : { kind: "thread", id: threadId };
+  }
   render();
 }
 
 function jumpToPost(id) {
+  focusVersion++;
   highlight = { kind: "post", id }; focus = { kind: "post", id }; focusTried = false;
   render();
 }
@@ -1618,6 +1756,7 @@ function renderNeedsYouItem(item) {
   const noteBox = el("div", { class: "custom ny-note-box" }, el("label", { class: "field-label", for: note.id }, "Note (optional)"), note);
 
   const activeAgents = (state.agents || []).filter(a => !a.is_human && a.active !== false && a.active !== 0);
+  const assigns = c => !!c && !!(c.deliver || ["approve", "approve_launch"].includes(c.action));
   const delivery = item.approval_delivery;
   const preferred = nyAssignees[item.id] ?? (delivery ? delivery.recipient : item.agent);
   const selectedAgent = activeAgents.some(a => a.name === preferred) ? preferred : "";
@@ -1637,6 +1776,7 @@ function renderNeedsYouItem(item) {
     if (c.value === "custom" && !text) return "Write your reply, or choose an option.";
     if (c.value === "custom" && n > limit) return `Your reply is too long (${n} / ${limit} bytes).`;
     if (c.action === "choose" && nn > noteLimit) return `Your note is too long (${nn} / ${noteLimit} bytes).`;
+    if (assigns(c) && !assigned()) return "No active agent can take the approved work. Write your own reply instead.";
     return "";
   };
   const sync = () => {
@@ -1647,7 +1787,7 @@ function renderNeedsYouItem(item) {
     hint.classList.toggle("err", !!(c && p));
     custom.hidden = !c || c.value !== "custom";
     noteBox.hidden = !c || c.action !== "choose";
-    assignBox.hidden = !c || !(c.deliver || ["approve", "approve_launch"].includes(c.action));
+    assignBox.hidden = !assigns(c);
     count.textContent = `${n} / ${limit} bytes` + (n > limit ? " — too long" : "");
     count.classList.toggle("err", n > limit);
   };
@@ -1806,6 +1946,7 @@ function currentIssue() {
 }
 
 function openIssue(id) {
+  focusVersion++;
   view = "board"; listTab = "issues"; selectedIssue = id; issueError = ""; highlight = focus = null; scrollToIssue = true;
   const found = issueSearchResults.find(i => i.id === id);
   if (found) selectedIssueDetail = found;
@@ -1814,6 +1955,7 @@ function openIssue(id) {
 }
 // From an issue to one of its threads: the Threads tab with that thread selected.
 function openThread(id) {
+  focusVersion++;
   view = "board"; listTab = "threads"; selected = id; store(SELECTED_KEY, String(id));
   highlight = null; scrollToThread = true;
   focus = state && state.threads.some(t => t.id === id) ? null : { kind: "thread", id };   // fetch a closed one
@@ -1823,6 +1965,7 @@ function openThread(id) {
 }
 // "Link issue" on a post: the Issues tab, with a banner for linking that exact post.
 function beginIssue(p) {
+  focusVersion++;
   issueSource = { thread_id: p.thread_id, post_id: p.id };
   issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
   issueSearch = ""; selectedIssue = null; issueError = ""; issueCreateOpen = false; delete issueNotes.link; delete issueNotes.create;
@@ -2174,26 +2317,16 @@ function renderIssueResults(box, current) {
   const rows = list.map(i => {
     const st = issueState(i), on = !!current && current.id === i.id, threads = issueThreads(i);
     const names = [...new Set(threads.map(l => baseName(l.project)))];
-    return el("tr", { class: "issue-row", role: "option", "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1",
-        "data-issue": i.id, onclick: () => openIssue(i.id) },
-      el("td", {},
-        el("div", { class: "title" }, el("span", { class: "muted" }, `#${i.id} `), i.title),
-        el("div", { class: "sub" }, el("span", {}, plural(threads.length, "thread")),
-          names.length ? el("span", { title: [...new Set(threads.map(l => l.project))].join("\n") },
-            "· " + names.slice(0, 2).join(", ") + (names.length > 2 ? ` +${names.length - 2}` : "")) : null)),
-      el("td", { class: "when muted small" }, el("span", { title: i.updated_at || "" }, ago(i.updated_at)),
-        statusDot({ kind: st.kind, label: st.tip })));
+    return listRow({ class: "issue-row", "data-issue": i.id }, `issue-row-${i.id}`, `#issue-${i.id}`, on, () => openIssue(i.id),
+      [el("span", { class: "muted" }, `#${i.id} `), i.title],
+      el("div", { class: "sub", id: `issue-row-${i.id}-sub` }, el("span", {}, plural(threads.length, "thread")),
+        names.length ? el("span", { title: [...new Set(threads.map(l => l.project))].join("\n") },
+          "· " + names.slice(0, 2).join(", ") + (names.length > 2 ? ` +${names.length - 2}` : "")) : null),
+      [el("span", { title: i.updated_at || "" }, ago(i.updated_at)), statusDot({ kind: st.kind, label: st.tip })]);
   });
-  const table = el("table", { role: "listbox", "aria-label": "Issues" }, rows);
-  table.addEventListener("keydown", e => {
-    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || !current) return;
-    const n = list.findIndex(i => i.id === current.id) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
-    if (n < 0 || n >= list.length) return;
-    e.preventDefault();
-    scrollToIssue = false; openIssue(list[n].id); scrollToIssue = false;
-    const row = document.querySelector(`.thread-list tr[data-issue="${list[n].id}"]`);
-    if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
-  });
+  // Arrowing does not scroll the pane into view (openIssue would on one column): the list keeps the keyboard.
+  const table = listRows("Issues", rows, list.map(i => i.id), current && current.id,
+    id => { scrollToIssue = false; openIssue(id); scrollToIssue = false; }, id => `issue-row-${id}`);
   box.replaceChildren(table);
   if (list.length >= 200) box.append(el("p", { class: "muted small", style: "padding:0 8px" },
     searching ? "Showing up to 200 matches. Refine your search for older issues." : "Showing recent issues. Search to find older discussions."));
@@ -2203,7 +2336,16 @@ async function searchIssues(value) {
   const version = ++issueSearchVersion;
   issueSearchResults = []; issueSearchError = "";
   issueSearchLoading = Boolean(value.trim());
-  const update = () => { const box = document.getElementById("issue-results"); if (box) renderIssueResults(box); };
+  // Only the list and the pane are redrawn (a full render would take focus from the search box). With no issue
+  // picked, the first match is the current one: the pane must follow the list's selection.
+  const update = () => {
+    const box = document.getElementById("issue-results");
+    if (!box) return;
+    const current = currentIssue();
+    renderIssueResults(box, current);
+    const pane = document.getElementById("thread-pane");
+    if (pane && state && view === "board" && listTab === "issues" && !issueSearchLoading) pane.replaceChildren(...renderIssuePane(current, state.me.is_human));
+  };
   update();
   if (!issueSearchLoading) return;
   try {
@@ -2235,6 +2377,7 @@ function renderListTabs(threadCount) {
       : el("span", { class: "count" }, String(allIssues().length)))));
 }
 function setTab(tab) {
+  focusVersion++;
   if (listTab === tab && view === "board") return;
   listTab = tab; view = "board"; store(TAB_KEY, tab); highlight = focus = null;
   const hash = tab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : "";
@@ -2362,8 +2505,30 @@ function keepScroll(selector) {
   return () => { const n = document.querySelector(selector); if (n) n.scrollTop = savedListScroll[listTab] || 0; };
 }
 
+// Re-rendering replaces the DOM; put keyboard focus back on the same control (by id, or a confirm button's key), so
+// the 3-second refresh, a tab switch or an armed confirm button never drops it. Text fields are left alone (the
+// refresh skips while one is being edited).
+let rendering = false;
+function focusTarget(n) {
+  if (!n || !n.tagName || ["INPUT", "TEXTAREA", "SELECT", "BODY", "HTML"].includes(n.tagName)) return null;
+  if (n.id) { const id = n.id; return () => document.getElementById(id); }
+  if (n.dataset && n.dataset.confirm) { const key = n.dataset.confirm; return () => confirmButtons(key)[0]; }
+  return null;
+}
 function render() {
   const app = document.getElementById("app");
+  const refocus = app.contains(document.activeElement) ? focusTarget(document.activeElement) : null;
+  rendering = true;
+  try { draw(app); }
+  finally {
+    rendering = false;
+    if (refocus && !app.contains(document.activeElement)) {
+      const n = refocus();
+      if (n && n.focus) n.focus({ preventScroll: true });
+    }
+  }
+}
+function draw(app) {
   const listNode = document.querySelector(".thread-list");
   if (listNode && listNode.dataset.tab) savedListScroll[listNode.dataset.tab] = listNode.scrollTop;
   app.replaceChildren();
@@ -2396,7 +2561,7 @@ function render() {
     state.paused ? chip("PAUSED", "bad") : chip("live", "ok"),
     el("span", { class: "muted small" }, `signed in as ${state.me.name}${human ? " (human)" : ""}`),
     el("span", { class: "sp" }),
-    human ? pauseControl() : null,
+    human ? pauseControl("header") : null,
     human ? el("button", { id: "settings-link", onclick: () => setView(view === "settings" ? "board" : "settings") },
       view === "settings" ? "Back to board" : "Settings") : null,
     el("button", { id: "sign-out", class: "btn-ghost", onclick: signOut }, "Sign out"),
@@ -2414,7 +2579,14 @@ function render() {
     const holder = state.threads.find(t => postsOf(t).some(p => p.id === highlight.id));
     if (holder) selected = holder.id;
   }
-  const statuses = new Map(state.threads.map(t => [t.id, threadStatus(t, human)]));
+  loadSeen();
+  // "Sending…" ends for a thread that is no longer open: closed in this snapshot, or gone from a snapshot of open
+  // threads (every open thread is in it), so reopening it later does not bring a stale "Sending…" back.
+  for (const id of Object.keys(unsticking)) {
+    const t = state.threads.find(x => x.id === Number(id));
+    if (t ? t.status !== "open" : !showClosed && !unstickBusy) delete unsticking[id];
+  }
+  const statuses =new Map(state.threads.map(t => [t.id, listStatus(t, human)]));
   const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
   const all = sortedThreads(statuses);
   // Completed threads are hidden unless "Show completed" is on (or a link points at one).
@@ -2429,7 +2601,13 @@ function render() {
     pane.append(...renderIssuePane(current, human));
   } else {
     const current = threads.find(t => t.id === selected) || threads[0] || null;
-    if (current) opened.add(current.id);
+    // The default (first) thread becomes the selection once, so a post elsewhere that re-sorts the list does not
+    // swap the pane. Not while a deep link is still fetching its thread.
+    if (current && current.id !== selected && !focus) selected = current.id;
+    if (current) {
+      opened.add(current.id); markSeen(current);
+      if ((statuses.get(current.id) || {}).newPosts) statuses.set(current.id, listStatus(current, human));
+    }
     list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
     if (current) {
       const linked = allIssues().filter(i => i.links.some(l => l.thread_id === current.id));
@@ -2503,7 +2681,8 @@ function editing() {
   const a = document.activeElement;
   return !!a && ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName) && a.type !== "checkbox";
 }
-setInterval(() => { if (signedIn && state && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
+// Signed in is enough: a first /api/state that failed is retried here (gating on `state` stopped that for good).
+setInterval(() => { if (signedIn && !armed && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
 </script>
 </body>
 </html>
