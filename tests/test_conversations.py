@@ -132,7 +132,7 @@ def test_v2_database_migrates_and_keeps_sessions(env):
     conn.execute("PRAGMA user_version=2")
     before = conn.execute("SELECT id, agent, project FROM sessions ORDER BY id").fetchall()
     migrated = Board(env.settings, clock=env.clock)
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 8
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 9
     cols = {r[1] for r in migrated.conn.execute("PRAGMA table_info(sessions)")}
     assert {"client_kind", "client_session_id"} <= cols
     assert [tuple(r) for r in migrated.conn.execute("SELECT id, agent, project FROM sessions ORDER BY id")] == \

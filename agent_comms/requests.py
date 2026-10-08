@@ -11,6 +11,14 @@ STATES = ('queued', 'started', 'blocked', 'finished')
 
 def for_post(board, post):
     """Legacy requests have virtual queued rows until their first explicit update."""
+    from . import workstreams
+    managed = workstreams.get_for_post(board, post['id'])
+    if managed is not None:
+        row = dict(board.conn.execute('SELECT * FROM request_progress WHERE post_id=? AND recipient=?',
+                                     (post['id'], managed['recipient'])).fetchone())
+        row['evidence_post_ids'] = json.loads(row['evidence_post_ids'])
+        row['updated_at'] = iso(row['updated_at'])
+        return [row]
     author = board.conn.execute('SELECT is_human FROM agents WHERE name=?', (post['agent'],)).fetchone()
     if post['type'] == 'decision' or not (post['needs_response'] or post['type'] in ('request','handoff','question') or (author and author['is_human'])):
         return []
@@ -62,7 +70,9 @@ def _save(board, p, session_id, row, state, reason, evidence, assigned_agent, as
     board.conn.execute('UPDATE posts SET seq=?,revised_at=? WHERE id=?',(seq,now,row['post_id']))
 
 
-def progress(board, p, session_id, post_id, recipient, state, reason='', evidence_post_ids=None, expected_version=None):
+def progress(board, p, session_id, post_id, recipient, state, reason='', evidence_post_ids=None, expected_version=None,
+             completion=None):
+    from . import workstreams
     if expected_version is not None and (type(expected_version) is not int or expected_version < 0):
         raise Invalid('expected_version must be a nonnegative integer')
     if state not in STATES:
@@ -77,6 +87,12 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         raise Invalid('blocked and finished require an explicit reason')
     with db.write_tx(board.conn):
         post,row = _context(board,p,session_id,post_id,recipient)
+        if state == 'started':
+            from . import browser_readiness
+            browser_readiness.assert_request_ready(board,post_id,recipient,session_id)
+        managed = workstreams.get_for_post(board, post_id)
+        if managed is not None and state == 'finished' and not evidence:
+            raise Invalid('managed completion requires same-thread evidence post IDs')
         if not p.is_human and p.name not in (post['agent'],row['assigned_agent']):
             raise Forbidden('only the author or assigned recipient may update a request')
         if not p.is_human and p.name == post['agent'] and p.name != row['assigned_agent'] and state not in ('finished','blocked'):
@@ -90,6 +106,13 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             if pid == post_id or item['thread_id'] != post['thread_id'] or item['sealed']:
                 raise Invalid('evidence must be another unsealed post in the same thread')
         if row['state']==state and row['reason']==reason and row['evidence_post_ids']==evidence:
+            if managed is not None:
+                if p.name != row['assigned_agent'] or session_id != row['assigned_session']:
+                    raise Forbidden('only the assigned continuation session may report progress')
+                if expected_version != row['version']:
+                    raise Conflict('managed continuation requires the current request version')
+                if state == 'finished' and completion != json.loads(managed['completion']):
+                    raise Conflict('completion evidence differs from the recorded result')
             return row
         if expected_version is not None and expected_version != row['version']:
             raise Conflict('request changed; reread before updating')
@@ -97,10 +120,12 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             raise Conflict('request is already finished; create a new request')
         if state == 'queued' and row['state'] != 'queued':
             raise Conflict('use explicit reassignment to queue a request again')
+        workstreams.guard_progress(board,p,session_id,row,state,expected_version,completion)
         owner = row['assigned_session']
         if p.name == row['assigned_agent']:
             owner = session_id
         _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner)
+        workstreams.after_save(board,p,session_id,row,state)
     return next(r for r in board.get_post(p,post_id)['requests'] if r['recipient']==recipient)
 
 
@@ -119,6 +144,9 @@ def history(board,p,post_id,recipient):
 
 def assign(board,p,session_id,post_id,recipient,target_session_id,expected_version,reason,required_capabilities):
     from . import capabilities
+    from . import workstreams
+    if workstreams.get_for_post(board, post_id) is not None:
+        raise Conflict('managed continuations require ownership inspection through board_route_request')
     if type(expected_version) is not int or expected_version < 0:
         raise Invalid('expected_version is required for reassignment')
     if not isinstance(reason,str) or not reason.strip() or len(reason.encode())>board.s.body_max_bytes:
@@ -143,6 +171,8 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         project=board._thread_row(post['thread_id'])['project']
         if not capabilities.eligible(board,target_session_id,project,required_capabilities):
             raise Conflict('target lacks fresh verified capabilities in this project')
+        from . import browser_readiness
+        browser_readiness.assert_request_ready(board,post_id,recipient,target_session_id)
         if row['assigned_session']==target_session_id and row['state']=='queued':
             return row
         attempts=board.conn.execute("SELECT COUNT(*) FROM request_events WHERE post_id=? AND recipient=? AND state='queued'",(post_id,recipient)).fetchone()[0]

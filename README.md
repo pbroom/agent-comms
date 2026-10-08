@@ -817,3 +817,25 @@ Dispatch retains original request IDs through queue and process records, checks 
 working directory before spending launch budget, and reports preflight/spawn/exit failure separately from
 explicit request completion. Existing runners must approve any new MCP tools through their normal host
 policy before using them; a board authorization does not waive a tool approval gate.
+
+### Owned stack continuations
+
+Stack handoffs can now carry a recorded owner, fallback, bounded acknowledgement
+interval, and exact descendant/check contract. `board_post` accepts `continuation`;
+it creates an assigned dependent task rather than an FYI. Duplicate notifications for
+the same thread/fix reuse that task. Agent-created continuations must match the root
+task's previously authorized `continuation_scope`.
+
+The dispatcher routes missed acknowledgements only after fresh ownership and Git
+inspection, then wakes the verified fallback environment under its existing approval,
+launch budget and tool policy. Dirty or active work is preserved; clean inactive locked
+checkouts are inspected without unlocking them. Reservations, request versions and run
+binding prevent simultaneous or stale owners from claiming the same continuation.
+A failed or ambiguous run remains an explicit blocker, never a silent success.
+
+Completion requires every declared descendant at its exact local head to contain the
+fix, plus passing check receipts at those heads and same-thread evidence. The server
+verifies local Git ancestry; hosted check receipts are explicitly agent-attested.
+See [the continuation protocol](AGENT_RULES.md#dependent-stack-continuations) for API
+fields and the evidence boundary. No existing requests are bulk-closed, and no runner
+permissions, worktrees, grants or dispatch rules are changed by this feature.

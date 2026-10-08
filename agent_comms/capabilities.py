@@ -23,9 +23,11 @@ def _names(value):
     return sorted(set(value))
 
 
-def register(board, p, session_id, capabilities, evidence, ttl_seconds=MAX_TTL_SECONDS):
+def register(board, p, session_id, capabilities, evidence, ttl_seconds=MAX_TTL_SECONDS, activity='unknown'):
     """Record the caller's successful probes without creating any authority."""
     names = _names(capabilities)
+    if activity not in ('idle', 'active', 'unknown'):
+        raise Invalid('activity must be idle, active, or unknown')
     if not isinstance(evidence, str) or not evidence.strip() or len(evidence.encode()) > board.s.body_max_bytes:
         raise Invalid("successful probe evidence is required within the body size limit")
     if (isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
@@ -35,6 +37,9 @@ def register(board, p, session_id, capabilities, evidence, ttl_seconds=MAX_TTL_S
         board._check_agent_write(p)
         s = board._session(p, session_id)
         now = board.now()
+        c.execute('''INSERT INTO session_activity(session_id,state,recorded_at) VALUES (?,?,?)
+            ON CONFLICT(session_id) DO UPDATE SET state=excluded.state,recorded_at=excluded.recorded_at''',
+            (session_id,activity,now))
         c.execute("""INSERT INTO session_capabilities
             (session_id,attested_agent,project,worktree,capabilities,evidence,verified_at,expires_at)
             VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
@@ -44,12 +49,17 @@ def register(board, p, session_id, capabilities, evidence, ttl_seconds=MAX_TTL_S
             (session_id,s["agent"],s["project"],s["worktree"],json.dumps(names),evidence.strip(),now,now+ttl_seconds))
     return {"session_id": session_id, "agent": s["agent"], "project": s["project"], "worktree": s["worktree"],
             "capabilities": names, "evidence": evidence.strip(), "verified_at": iso(now),
-            "expires_at": iso(now + ttl_seconds), "authority": "self_reported_probe_not_authorization"}
+            "expires_at": iso(now + ttl_seconds), "activity": activity,
+            "authority": "self_reported_probe_not_authorization"}
 
 
 def eligible(board, target_session_id, project, required_capabilities):
     """Rechecked by request assignment under its write lock, avoiding stale selection."""
     required = _names(required_capabilities)
+    if any(name.lower() == 'browser' or name.lower().startswith(('browser:', 'browser.')) for name in required):
+        from . import browser_readiness
+        if not browser_readiness.has_ready_probe(board, target_session_id):
+            return False
     r = board.conn.execute("""SELECT s.*, c.capabilities, c.verified_at, c.expires_at,
         c.attested_agent,c.project AS attested_project,c.worktree AS attested_worktree,a.active
         FROM sessions s JOIN agents a ON a.name=s.agent
@@ -68,7 +78,7 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
     Only original addressees can be selected. The lifecycle owns authorization,
     assignment limits, compare-and-swap, and the final transactional preflight.
     """
-    from . import requests
+    from . import requests, workstreams, browser_readiness
     required = _names(required_capabilities)
     if type(expected_version) is not int or expected_version < 0:
         raise Invalid("expected_version is required for routing")
@@ -81,6 +91,16 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
     row = next((r for r in post["requests"] if r["recipient"] == recipient), None)
     if row is None:
         raise NotFound("request recipient not found")
+    blocker = browser_readiness.request_blocker(board, post_id, recipient)
+    if blocker:
+        raise Conflict(blocker)
+    if (any(name.lower() == 'browser' or name.lower().startswith(('browser:', 'browser.')) for name in required)
+            and browser_readiness.requirement(board, post_id, recipient) is None):
+        raise Conflict('bind the exact browser target before routing browser work')
+    if workstreams.get_for_post(board, post_id) is not None:
+        managed = workstreams.reconcile(board, p, session_id, post_id, expected_version)
+        current = next(r for r in board.get_post(p, post_id)['requests'] if r['recipient'] == recipient)
+        return {**current, 'continuation': managed}
     if not p.is_human and p.name not in (post["agent"], row["assigned_agent"]):
         raise Forbidden("only the author or assigned recipient may route a request")
     if (not p.is_human and p.name == row["assigned_agent"]
@@ -104,7 +124,8 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
         if not allowed:
             raise Forbidden("no original recipient has active authorization for the linked task")
     for candidate in candidates:
-        if candidate["agent"] in allowed and eligible(board, candidate["id"], thread["project"], required):
+        if (candidate["agent"] in allowed and eligible(board, candidate["id"], thread["project"], required)
+                and browser_readiness.eligible(board, candidate['id'], post_id, recipient)):
             return requests.assign(board, p, session_id, post_id, recipient, candidate["id"],
                                    expected_version=expected_version,
                                    reason="Capability preflight: " + ", ".join(required),

@@ -752,6 +752,15 @@ class Board:
                 if row["dispatch_run_id"] and (row["project"] != project or row["worktree"] != worktree
                                                 or dispatch_run_id not in (None, row["dispatch_run_id"])):
                     raise Conflict("a dispatch-bound session cannot change environment or run")
+                if row['project'] != project or row['worktree'] != worktree:
+                    pinned = c.execute('''SELECT 1 FROM continuations w
+                        JOIN request_progress r ON r.post_id=w.post_id AND r.recipient=w.recipient
+                        WHERE r.state!='finished' AND (w.owner_session=? OR w.fallback_session=?
+                            OR r.assigned_session=?) LIMIT 1''',
+                        (resume_session_id,resume_session_id,resume_session_id)).fetchone()
+                    if pinned:
+                        raise Conflict('an unfinished continuation pins this session environment; register a separate session')
+                    c.execute('DELETE FROM session_activity WHERE session_id=?',(resume_session_id,))
                 c.execute("UPDATE sessions SET project=?, worktree=?, last_seen=?, dispatch_run_id=COALESCE(?,dispatch_run_id) WHERE id=?",
                           (project, worktree, now, dispatch_run_id, resume_session_id))
                 if client:
@@ -770,6 +779,9 @@ class Board:
                        SELECT ?, thread_id, agent, MAX(last_seq), ? FROM cursors WHERE agent = ? GROUP BY thread_id""",
                     (sid, now, p.name),
                 )
+            if dispatch_run_id is not None:
+                from . import workstreams
+                workstreams.bind_delivery(self, p, sid, dispatch_run_id)
         return {"session_id": sid, "agent": p.name, "runtime": p.runtime, "is_human": p.is_human,
                 "project": project, "worktree": worktree, "paused": self.is_paused(), "limits": self.limits(),
                 "notice": UNTRUSTED_NOTICE, "authorization_grants": self.list_grants(p, project)}
@@ -937,7 +949,9 @@ class Board:
                     thread_id: int | None = None, new_thread_title: str | None = None,
                     to: list[str] | None = None, needs_response: bool = False, task_id: int | None = None,
                     refs: list[dict] | None = None, sealed: bool = False, final: bool = False,
-                    propose_task: dict | None = None, decision_question: dict | None = None) -> dict:
+                    propose_task: dict | None = None, decision_question: dict | None = None,
+                    continuation: dict | None = None) -> dict:
+        from . import workstreams
         self._check_agent_write(p)
         s = self._session(p, session_id)
         if type not in POST_TYPES:
@@ -965,6 +979,9 @@ class Board:
         if (thread_id is None) == (not new_thread_title):
             raise Invalid("give exactly one of thread_id or new_thread_title")
         question = self._post_question(decision_question, type, to, needs_response)
+        if continuation is not None and (thread_id is None or sealed or type not in ('request', 'handoff')
+                                         or task_id is not None or propose_task is not None):
+            raise Invalid('continuation requires an unsealed request or handoff in an existing thread, without task_id/propose_task')
 
         now = self.now()
         with db.write_tx(self.conn) as c:
@@ -977,6 +994,21 @@ class Board:
                     raise Conflict("thread is closed; only the human can post to or reopen it")
             else:
                 thread_id = self._insert_thread(c, p, s["project"], new_thread_title.strip()[:200])
+
+            if continuation is not None:
+                continuation = workstreams.prepare(self, p, session_id, thread_id, continuation)
+                existing = c.execute('SELECT * FROM continuations WHERE thread_id=? AND fix_commit=?',
+                                     (thread_id, continuation['fix_commit'])).fetchone()
+                if existing is not None:
+                    stored = workstreams.out(existing)
+                    if any(stored[key] != value for key, value in continuation.items()):
+                        raise Conflict('this fix already has a continuation with a different contract')
+                    return self.get_post(p, existing['post_id'])
+                targets = [c.execute('SELECT agent FROM sessions WHERE id=?', (continuation[key],)).fetchone()[0]
+                           for key in ('owner_session', 'fallback_session')]
+                if to and set(to) != set(targets):
+                    raise Invalid('continuation recipients must be its recorded owner and fallback')
+                to = list(dict.fromkeys(targets))
 
             if not p.is_human:
                 n_day = c.execute("""SELECT (SELECT COUNT(*) FROM posts WHERE agent = ? AND created_at > ?)
@@ -1010,6 +1042,8 @@ class Board:
                  task_id, json.dumps(refs), int(bool(sealed)), int(bool(sealed)), int(bool(final)),
                  now if final else None, now, json.dumps(question) if question else None),
             ).lastrowid
+            if continuation is not None:
+                workstreams.create(self, p, session_id, post_id, continuation)
             unsealed: list[int] = []
             if sealed and type == "finding" and task_id is not None:
                 unsealed = self._auto_unseal(c, task_id)
@@ -1118,6 +1152,10 @@ class Board:
             d["attention_resolution"] = resolution
         from .requests import for_post
         d["requests"] = for_post(self, r)
+        from . import workstreams
+        managed = workstreams.get_for_post(self, r['id'])
+        if managed is not None:
+            d['continuation'] = workstreams.out(managed)
         d["addressed_to_me"] = p.name in to
         return d
 
@@ -1329,7 +1367,7 @@ class Board:
     def _task_fields(self, d: dict) -> dict:
         if not isinstance(d, dict):
             raise Invalid("task must be an object {title, acceptance, intends_files, depends_on}")
-        extra = set(d) - {"title", "acceptance", "intends_files", "depends_on", "category"}
+        extra = set(d) - {"title", "acceptance", "intends_files", "depends_on", "category", "continuation_scope"}
         if extra:
             raise Invalid(f"unknown task fields: {sorted(extra)}")
         title = (d.get("title") or "").strip()
@@ -1341,12 +1379,18 @@ class Board:
         category = d.get("category")
         if category is not None and category not in TASK_CATEGORIES:
             raise Invalid(f"category must be one of {TASK_CATEGORIES}")
+        scope = d.get('continuation_scope')
+        if scope is not None:
+            from .workstreams import validate_scope
+            scope = validate_scope(scope)
         return {"title": title, "acceptance": acceptance, "category": category,
+                "continuation_scope": scope,
                 "intends_files": _str_list(d.get("intends_files"), "intends_files", max_items=100),
                 "depends_on": _int_list(d.get("depends_on"), "depends_on")}
 
     def _insert_task(self, c: sqlite3.Connection, p: Principal, session_id: int, thread_id: int, *, title: str,
-                     acceptance: str, intends_files: list[str], depends_on: list[int], category: str | None = None) -> int:
+                     acceptance: str, intends_files: list[str], depends_on: list[int], category: str | None = None,
+                     continuation_scope: dict | None = None) -> int:
         for dep in depends_on:
             if c.execute("SELECT 1 FROM tasks WHERE id = ?", (dep,)).fetchone() is None:
                 raise NotFound(f"depends_on task {dep} not found")
@@ -1357,6 +1401,8 @@ class Board:
                  created_at, updated_at, category, authorization_source) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (thread_id, title, acceptance, status, json.dumps(intends_files), json.dumps(depends_on), p.name, now, now, category, "human" if p.is_human else "none"),
         ).lastrowid
+        if continuation_scope is not None:
+            c.execute('UPDATE tasks SET continuation_scope=? WHERE id=?', (json.dumps(continuation_scope),tid))
         self._event(c, tid, "create", None, status, p, session_id)
         return tid
 
@@ -1398,6 +1444,7 @@ class Board:
              "intends_files": json.loads(r["intends_files"]), "depends_on": json.loads(r["depends_on"]),
              "created_by": r["created_by"], "created_at": iso(r["created_at"]), "updated_at": iso(r["updated_at"])}
         d['category'] = r['category']
+        d['continuation_scope'] = json.loads(r['continuation_scope']) if r['continuation_scope'] else None
         d['authorization'] = {'source': r['authorization_source'], 'grant_id': r['authorization_grant_id'],
                               'active': self._task_authorization_active(r, r['owner_agent'])}
         d['owner_may_work'] = (state == 'active' and d['authorization']['active'] and not self.is_paused())
@@ -1437,6 +1484,26 @@ class Board:
             now = self.now()
             exp = now + self.s.lease_ttl_minutes * 60
             t = self._task_row(task_id, c)
+            from . import workstreams
+            managed = workstreams.get_for_task(self, task_id)
+            if managed is not None:
+                assigned = c.execute('SELECT * FROM request_progress WHERE post_id=? AND recipient=?',
+                                     (managed['post_id'], managed['recipient'])).fetchone()
+                if assigned['assigned_session'] != session_id or assigned['assigned_agent'] != p.name:
+                    raise Conflict('claim requires the current continuation assignment; route with fresh ownership evidence first')
+                if managed['dispatch_run_id']:
+                    owner = c.execute('SELECT dispatch_run_id FROM sessions WHERE id=?', (session_id,)).fetchone()
+                    if owner['dispatch_run_id'] != managed['dispatch_run_id']:
+                        raise Conflict('continuation is reserved for its dispatched worker')
+                root = self._task_row(managed['root_task_id'])
+                if not self._task_authorization_active(root, p.name):
+                    raise Forbidden('root workstream authorization is inactive')
+                from . import capabilities
+                project = self._thread_row(managed['thread_id'])['project']
+                if not capabilities.eligible(self, session_id, project, json.loads(managed['required_capabilities'])):
+                    raise Conflict('continuation claim requires fresh capability probes in this session')
+                from . import browser_readiness
+                browser_readiness.assert_request_ready(self,managed['post_id'],managed['recipient'],session_id)
             if _renew_only and (t['owner_agent'] != p.name or t['owner_session'] != session_id
                                 or t['lease_expires_at'] is None or t['lease_expires_at'] <= now):
                 raise Conflict('you do not hold a live lease; claim the task explicitly')
@@ -1490,6 +1557,7 @@ class Board:
                     overlap = set(json.loads(r["intends_files"])) & set(json.loads(t["intends_files"]))
                     if overlap:
                         warnings.append(f"task {r['id']} ({r['owner_agent']}) also intends to edit {sorted(overlap)}")
+            c.execute('DELETE FROM session_activity WHERE session_id=?', (session_id,))
         self._notify("task.claimed", {"task_id": task_id, "agent": p.name, "renewed": renewed})
         out = self.get_task(p, task_id, events=False)
         out["renewed"] = renewed
@@ -1533,6 +1601,13 @@ class Board:
             now = self.now()
             t = self._task_row(task_id, c)
             frm = t["status"]
+            from . import workstreams
+            managed = workstreams.get_for_task(self, task_id)
+            if managed is not None and status == 'done':
+                progress = c.execute('SELECT state FROM request_progress WHERE post_id=? AND recipient=?',
+                                     (managed['post_id'], managed['recipient'])).fetchone()
+                if managed['completion'] is None or progress['state'] != 'finished':
+                    raise Conflict('finish the managed request with descendant and check evidence first')
             if p.is_human and status == 'proposed':
                 c.execute("UPDATE tasks SET authorization_source='none', authorization_grant_id=NULL WHERE id=?",
                           (task_id,))

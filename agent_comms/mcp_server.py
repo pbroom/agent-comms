@@ -147,19 +147,26 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "empty or the human. The dashboard shows Recommended, Alternative and Write your own reply; the human "
         "can always answer in their own words. Plain needs_response questions are for open questions only. "
         "A human reply 'Chose option <id> (\"<label>\", recommended|alternative) for #N.' means the human picked "
-        "that option of post #N (an optional 'Note:' line follows); it covers only what that option said." + DATA_WARNING))
+        "that option of post #N (an optional 'Note:' line follows); it covers only what that option said. "
+        "For an authorized stack fix use an unsealed request/handoff with continuation={root_task_id, "
+        "owner_session, fallback_session, fix_commit: full SHA, descendants: full refs/heads names, "
+        "required_checks, required_capabilities, ack_seconds: 10..3600}. This atomically creates one "
+        "dependent task and request, deduplicated by thread/fix. Agent-created continuations must match "
+        "the root task's immutable continuation_scope={fix_ref, descendants, agents, required_checks, "
+        "required_capabilities}, proposed before its authorization. Recipients are the recorded owners." + DATA_WARNING))
     def board_post(body: str, type: Literal["question", "proposal", "status", "finding", "handoff", "request",
                                             "decision"],
                    thread_id: int | None = None, new_thread_title: str | None = None, to: list[str] | None = None,
                    needs_response: bool = False, task_id: int | None = None, refs: list[dict] | None = None,
                    sealed: bool = False, propose_task: dict | None = None, decision_question: dict | None = None,
+                   continuation: dict | None = None,
                    session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         sid = session(ctx, session_id)
         return run(lambda: board.create_post(
             p, sid, body=body, type=type, thread_id=thread_id, new_thread_title=new_thread_title, to=to,
             needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task,
-            decision_question=decision_question))
+            decision_question=decision_question, continuation=continuation))
 
     @mcp.tool(description=(
         "Claim a task lease before editing its files (atomic: only one session wins). Calling it again on a task "
@@ -275,29 +282,33 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
 
-    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests." + DATA_WARNING)
+    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
     def board_request_progress(post_id: StrictInt, recipient: str,
                                state: Literal["queued", "started", "blocked", "finished"],
                                reason: str = "", evidence_post_ids: list[StrictInt] | None = None,
                                expected_version: StrictInt | None = None,
+                               completion: dict | None = None,
                                session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
-                   recipient, state, reason, evidence_post_ids, expected_version))
+                   recipient, state, reason, evidence_post_ids, expected_version, completion))
 
     @mcp.tool(description="Read explicit progress history for exactly one original request recipient." + DATA_WARNING)
     def board_request_history(post_id: StrictInt, recipient: str, ctx: Context = None) -> dict:
         return run(lambda: {"events": requests.history(board, principal(ctx), post_id, recipient)})
 
-    @mcp.tool(description="Register access verified in this exact session environment, with concrete evidence. This attestation grants no authorization and expires within 30 minutes." + DATA_WARNING)
+    @mcp.tool(description="Register access verified in this exact session environment, with concrete evidence. This attestation grants no authorization and expires within 30 minutes. activity='idle' explicitly attests no ongoing edits or unsaved work in this environment; activity defaults to unknown. Idle evidence expires in 90 seconds and is invalidated by task claims or request starts. Never report idle merely because a heartbeat is old." + DATA_WARNING)
     def board_register_capabilities(capabilities_list: list[str], evidence: str, ttl_seconds: int = 1800,
+                                    activity: Literal['idle', 'active', 'unknown'] = 'unknown',
                                     session_id: int | None = None, ctx: Context = None) -> dict:
-        return run(lambda: capabilities.register(board, principal(ctx), session(ctx, session_id), capabilities_list, evidence, ttl_seconds))
+        return run(lambda: capabilities.register(board, principal(ctx), session(ctx, session_id), capabilities_list, evidence, ttl_seconds, activity))
 
-    @mcp.tool(description="Route one queued or blocked request to a verified existing session of an originally addressed agent in this project. Preserves host policies and scope; never grants permissions or starts a process. Bounded to three assignments." + DATA_WARNING)
+    @mcp.tool(description="Route one queued or blocked request to a verified existing session of an originally addressed agent in this project. Preserves host policies and scope; never grants permissions. Bounded to three assignments. Managed continuations use their frozen owner/fallback contract, acknowledgement deadline, fresh inactivity and all descendant checkout inspections; one fenced fallback is permitted. An existing human-approved dispatcher rule may separately wake its verified fallback environment; this call never creates approval or directly starts a process." + DATA_WARNING)
     def board_route_request(post_id: StrictInt, recipient: str, required_capabilities: list[str],
                             expected_version: StrictInt, session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: capabilities.route(board, principal(ctx), session(ctx, session_id), post_id, recipient, required_capabilities, expected_version))
 
+    from . import browser_mcp
+    browser_mcp.install(mcp, board, principal, session, run, DATA_WARNING)
     return mcp
 
 

@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 8   # v8: optional structured decision_question on posts that need the human
+SCHEMA_VERSION = 9   # v9: fenced dependent continuations and explicit session activity
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title             TEXT NOT NULL,
     acceptance        TEXT NOT NULL DEFAULT '',
     category          TEXT,
+    continuation_scope TEXT,
     authorization_source TEXT NOT NULL DEFAULT 'none',
     authorization_grant_id INTEGER REFERENCES authorization_grants(id),
     status            TEXT NOT NULL DEFAULT 'proposed'
@@ -191,6 +192,24 @@ CREATE TABLE IF NOT EXISTS request_events (
  UNIQUE(post_id,recipient,version)
 );
 
+CREATE TABLE IF NOT EXISTS session_activity (
+ session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+ state TEXT NOT NULL CHECK(state IN ('idle','active','unknown')), recorded_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS continuations (
+ post_id INTEGER PRIMARY KEY REFERENCES posts(id),
+ thread_id INTEGER NOT NULL REFERENCES threads(id),
+ task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
+ root_task_id INTEGER NOT NULL REFERENCES tasks(id),
+ owner_session INTEGER NOT NULL REFERENCES sessions(id),
+ fallback_session INTEGER NOT NULL REFERENCES sessions(id),
+ recipient TEXT NOT NULL, fix_commit TEXT NOT NULL, descendants TEXT NOT NULL,
+ required_checks TEXT NOT NULL, required_capabilities TEXT NOT NULL,
+ ack_seconds INTEGER NOT NULL, deadline REAL NOT NULL, epoch INTEGER NOT NULL DEFAULT 0,
+ blocker TEXT NOT NULL DEFAULT '', completion TEXT, dispatch_run_id TEXT, created_at REAL NOT NULL,
+ UNIQUE(thread_id,fix_commit)
+);
+
 CREATE TABLE IF NOT EXISTS board_state (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
@@ -212,9 +231,10 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
+    from . import browser_readiness
     if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
         raise RuntimeError("database schema is newer than this server")
-    conn.executescript(SCHEMA)
+    conn.executescript(SCHEMA + browser_readiness.SCHEMA)
     with write_tx(conn):
         if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             raise RuntimeError("database schema is newer than this server")
@@ -223,6 +243,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             "issue_comments": {"decision": "TEXT"},
             # v8: a post that asks the human to choose carries the same structured question as an issue.
             "posts": {"decision_question": "TEXT"},
+            "tasks": {"continuation_scope": "TEXT"},
         }.items():
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, definition in additions.items():
