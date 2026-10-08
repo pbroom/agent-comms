@@ -1,86 +1,99 @@
-"""v11 backfill: answered pre-tracking requests are finished with an audit event; nothing else changes."""
+"""Schema upgrades preserve history; only explicit reconciliation completes work."""
+import pytest
+
 from agent_comms import db, requests, unstick
 
 
-def states(env, post):
-    return {r['recipient']: r['state'] for r in env.board.get_post(env.p['human'], post['id'])['requests']}
+def request(env, post):
+    return env.board.get_post(env.p['human'], post['id'])['requests'][0]
 
 
-def upgrade(env):
-    env.board.conn.execute('PRAGMA user_version=10')
+def upgrade(env, version=10):
+    env.board.conn.execute(f'PRAGMA user_version={version}')
     db.init_schema(env.board.conn)
 
 
-def legacy_board(env):
-    """Pre-tracking posts, then tracking starts (first explicit event), then a strict post-cutoff request."""
-    thread = env.thread()
-    answered = env.post('codex', thread, type='request', to=['claude'])
-    unanswered = env.post('human', thread, type='request', to=['codex'])
-    env.clock.advance(1)
-    env.post('claude', thread, 'review done')
+def begin_tracking(env, thread):
     env.clock.advance(60)
-    tracked = env.post('human', thread, type='request', to=['claude'])
-    requests.progress(env.board, env.p['claude'], env.sid['claude'], tracked['id'], 'claude', 'started')
-    env.clock.advance(1)
-    strict = env.post('human', thread, type='request', to=['claude'])
-    env.clock.advance(1)
-    env.post('claude', thread, 'unrelated later reply')
-    return thread, answered, unanswered, strict
+    post = env.post('human', thread, type='request', to=['claude'])
+    requests.progress(env.board, env.p['claude'], env.sid['claude'], post['id'], 'claude', 'started')
 
 
-def test_answered_legacy_request_is_finished_with_audit(env):
-    thread, answered, unanswered, strict = legacy_board(env)
-    assert 'claude' in unstick.stuck_agents(env.board, thread)[0]
-    upgrade(env)
-    assert states(env, answered) == {'claude': 'finished'}
-    assert states(env, unanswered) == {'codex': 'queued'}
-    assert states(env, strict) == {'claude': 'queued'}
-    row = env.board.get_post(env.p['human'], answered['id'])['requests'][0]
-    assert row['reason'].startswith('legacy: answered by #') and len(row['evidence_post_ids']) == 1
-    [event] = env.board.conn.execute("SELECT * FROM request_events WHERE post_id=?", (answered['id'],)).fetchall()
-    assert event['event_source'] == 'migration' and event['actor'] is None and event['state'] == 'finished'
-    # The unanswered legacy request keeps its virtual row: no routing attempt is spent.
-    assert not env.board.conn.execute('SELECT 1 FROM request_progress WHERE post_id=?', (unanswered['id'],)).fetchone()
+@pytest.mark.parametrize('version', [6, 10])
+@pytest.mark.parametrize('body', [
+    'Blocked: missing credentials; work has not started',
+    'An unrelated review is complete',
+    'Review done',
+])
+def test_later_post_never_proves_legacy_completion(env, version, body):
+    thread = env.thread()
+    source = env.post('human', thread, 'Implement fix and verify tests', type='request', to=['codex'])
+    env.post('codex', thread, body)
+    begin_tracking(env, thread)
+    upgrade(env, version)
+    assert request(env, source)['state'] == 'queued'
+    assert not env.board.conn.execute('SELECT 1 FROM request_progress WHERE post_id=?', (source['id'],)).fetchone()
     reasons = unstick.stuck_agents(env.board, thread)[1]
-    stalled = {(x['agent'], i) for x in reasons if x['kind'] == 'unanswered' for i in x['post_ids']}
-    assert (('claude', answered['id']) not in stalled and ('codex', unanswered['id']) in stalled
-            and ('claude', strict['id']) in stalled)
+    assert any(r['kind'] == 'unanswered' and source['id'] in r['post_ids'] for r in reasons)
 
 
-def test_terminal_task_finishes_legacy_request(env):
+@pytest.mark.parametrize('status', ['done', 'declined'])
+def test_terminal_linked_task_does_not_complete_separate_request(env, status):
     thread = env.thread()
     task = env.accepted_task(thread)
-    post = env.post('codex', thread, type='request', to=['claude'], task_id=task)
-    env.board.conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task,))
-    env.clock.advance(60)
-    later = env.post('human', thread, type='request', to=['claude'])
-    requests.progress(env.board, env.p['claude'], env.sid['claude'], later['id'], 'claude', 'started')
+    source = env.post('human', thread, 'Verify this specific follow-up', type='request', to=['codex'], task_id=task)
+    env.board.conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, task))
+    begin_tracking(env, thread)
     upgrade(env)
-    assert states(env, post) == {'claude': 'finished'}
-    assert env.board.get_post(env.p['human'], post['id'])['requests'][0]['reason'] == f'legacy: task {task} is done'
+    assert request(env, source)['state'] == 'queued'
 
 
-def test_backfill_is_idempotent(env):
-    thread, answered, *_ = legacy_board(env)
-    upgrade(env)
-    count = env.board.conn.execute('SELECT COUNT(*) FROM request_events').fetchone()[0]
-    upgrade(env)
-    db.init_schema(env.board.conn)
-    assert env.board.conn.execute('SELECT COUNT(*) FROM request_events').fetchone()[0] == count
-
-
-def test_v10_board_without_events_is_unchanged(env):
+def test_sealed_and_full_history_preserved(env):
     thread = env.thread()
-    post = env.post('codex', thread, type='request', to=['claude'])
-    env.post('claude', thread, 'reply')
+    source = env.post('human', thread, 'Unfinished request', type='request', to=['codex'])
+    env.post('codex', thread, 'Private partial work', sealed=True)
+    env.post('human', thread, 'Historical decision', type='decision')
+    env.post('codex', thread, 'Unrelated work finished')
+    begin_tracking(env, thread)
+    # Schema initialization must not rewrite post bodies, sequence numbers, visibility,
+    # decisions, or existing audit records, even when run repeatedly.
+    tables = ('posts', 'request_progress', 'request_events', 'answer_links', 'legacy_attention_answers')
+    before = {name: [tuple(r) for r in env.board.conn.execute(f'SELECT * FROM {name}')] for name in tables}
     upgrade(env)
-    assert states(env, post) == {'claude': 'queued'}
+    upgrade(env)
+    after = {name: [tuple(r) for r in env.board.conn.execute(f'SELECT * FROM {name}')] for name in tables}
+    assert after == before
+    assert request(env, source)['state'] == 'queued'
 
 
-def test_pre_v7_board_backfills_everything(env):
+def test_explicit_evidence_closeout_survives_upgrade_without_closing_other_work(env):
     thread = env.thread()
-    post = env.post('codex', thread, type='request', to=['claude'])
-    env.post('claude', thread, 'reply')
-    env.board.conn.execute('PRAGMA user_version=6')
-    db.init_schema(env.board.conn)
-    assert states(env, post) == {'claude': 'finished'}
+    finished = env.post('human', thread, 'Verified work', type='request', to=['codex'])
+    unfinished = env.post('human', thread, 'Separate unfinished work', type='request', to=['codex'])
+    proof = env.post('codex', thread, 'Verified exact requested outcome, checks passed')
+    requests.progress(env.board, env.p['codex'], env.sid['codex'], finished['id'], 'codex',
+                      'finished', reason='Verified this request only', evidence_post_ids=[proof['id']])
+    before = request(env, finished)
+    upgrade(env)
+    assert request(env, finished) == before
+    assert request(env, unfinished)['state'] == 'queued'
+
+
+def test_board_without_events_remains_unresolved(env):
+    thread = env.thread()
+    source = env.post('human', thread, type='request', to=['codex'])
+    env.post('codex', thread, 'reply')
+    upgrade(env)
+    assert request(env, source)['state'] == 'queued'
+    assert not env.board.conn.execute('SELECT 1 FROM request_events').fetchone()
+
+
+def test_exact_human_answer_is_authorization_not_execution(env):
+    thread = env.thread()
+    source = env.post('codex', thread, 'May I implement this change?', type='question', needs_response=True)
+    approved = env.post('human', thread, 'Approved; implement it', to=['codex'], answer_to=[source['id']])
+    env.post('codex', thread, 'Acknowledged; implementation still pending')
+    begin_tracking(env, thread)
+    upgrade(env)
+    assert request(env, approved)['state'] == 'queued'
+    assert env.board.get_post(env.p['human'], approved['id'])['answer_to'] == [source['id']]
