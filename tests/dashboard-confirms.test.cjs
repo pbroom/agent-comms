@@ -55,6 +55,7 @@ test('unseal, finalize and release act on click; pause takes a second click and 
   assert.ok(armed.classList.contains('btn-confirm'), 'in the destructive style');
   assert.match(dom.window.document.getElementById('confirm-live').textContent, /again within 4 seconds/);
   assert.equal(dom.window.document.getElementById('confirm-live').getAttribute('aria-live'), 'polite');
+  await settle(520);   // the confirming click must come at least 500 ms after arming
   armed.click(); await settle(20);
   assert.equal(calls.filter(c => c === 'POST /api/admin/pause').length, 1, 'the second click pauses');
   assert.deepEqual(dialogs, [], 'no window.confirm/alert/prompt');
@@ -95,12 +96,12 @@ test('revoke a browser session and sign out all browsers take a second click', a
   assert.deepEqual(calls, [], 'the first click only arms Revoke');
   const armed = d.querySelector('#settings-browsers tr[data-session="aaaaaaaaaaaaaaaa"] button');
   assert.equal(armed.textContent, 'Confirm revoke?');
-  armed.click(); await settle(40);
+  await settle(520); armed.click(); await settle(40);
   assert.deepEqual(calls, ['POST /api/web-sessions/aaaaaaaaaaaaaaaa/revoke']);
   d.getElementById('sign-out-all').click(); await settle(20);
   assert.equal(d.getElementById('sign-out-all').textContent, 'Confirm sign out?');
   assert.equal(calls.length, 1);
-  d.getElementById('sign-out-all').click(); await settle(40);
+  await settle(520); d.getElementById("sign-out-all").click(); await settle(40);
   assert.deepEqual(calls, ['POST /api/web-sessions/aaaaaaaaaaaaaaaa/revoke', 'POST /api/web-sessions/revoke-all']);
   assert.ok(button('Pause agents'));
   assert.deepEqual(dialogs, [], 'no window.confirm/alert/prompt');
@@ -109,4 +110,23 @@ test('revoke a browser session and sign out all browsers take a second click', a
 
 test('the page has no window.confirm, alert or prompt calls left', () => {
   assert.doesNotMatch(html, /\b(?:window\.)?(?:confirm|alert|prompt)\(/);
+});
+
+
+test('a double-click or a fast second click never arms and confirms in one go', async () => {
+  const { dom, win, calls, button } = page();
+  await settle();
+  const pause = button('Pause agents');
+  pause.dispatchEvent(new win.MouseEvent('click', { bubbles: true, detail: 1 }));
+  button('Confirm pause?').dispatchEvent(new win.MouseEvent('click', { bubbles: true, detail: 2 }));   // the dblclick's 2nd click
+  assert.ok(!calls.includes('POST /api/admin/pause'), 'a double-click does not pause');
+  button('Confirm pause?').click();                                                                   // < 500 ms after arming
+  assert.ok(!calls.includes('POST /api/admin/pause'), 'nor does a second click right away');
+  const held = new win.KeyboardEvent('keydown', { key: 'Enter', repeat: true, bubbles: true, cancelable: true });
+  button('Confirm pause?').dispatchEvent(held);
+  assert.ok(held.defaultPrevented, 'a held Enter is swallowed, so key repeat cannot confirm');
+  await settle(520);
+  button('Confirm pause?').click(); await settle(20);
+  assert.equal(calls.filter(c => c === 'POST /api/admin/pause').length, 1, 'a deliberate second click still pauses');
+  dom.window.close();
 });
