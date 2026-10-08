@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
 # question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
-ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question = i.decision_question)"
+ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question IS i.decision_question)"
 SCHEMA_VERSION = 10  # v10: exact human-answer links and conservative legacy attention boundary
 
 SCHEMA = """

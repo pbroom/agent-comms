@@ -229,3 +229,16 @@ def test_upgrade_backfills_coverage_from_the_issue_question(env):
     db.init_schema(conn)
     assert links(env, issue) == {plain: (True, True), same: (True, True), own: (False, False), None: (None, True)}
     assert needs_you(env) == [own]
+
+
+def test_upgrade_backfill_does_not_cover_a_post_question_when_the_issue_has_none(env):
+    # Review of #42: `p.q = i.q` is NULL when the issue has no question, and COALESCE(NULL, 1) marked the post covered.
+    tid = env.thread()
+    own = ask(env, tid, decision_question=q(2))
+    issue = issues.create_issue(env.board, env.p["codex"], env.sid["codex"], title="No question", body="b",
+                                thread_id=tid, post_id=own, needs_human=False)["id"]
+    conn = env.board.conn
+    conn.execute("ALTER TABLE issue_links DROP COLUMN covers_post")
+    db.init_schema(conn)
+    assert links(env, issue)[own][1] is False, "a post with its own question is not covered by a question-less issue"
+    assert own in needs_you(env)
