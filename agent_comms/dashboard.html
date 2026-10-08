@@ -878,8 +878,12 @@ function renderPost(p, human) {
   const lit = highlight && highlight.kind === "post" && highlight.id === p.id;
   return el("div", { class: "post" + (p.sealed ? " sealed" : "") + (lit ? " highlight" : ""), id: "post-" + p.id },
     meta, el("div", { class: "body" }, p.body), refs,
+    p.request_reply ? el("div", { class: "small request-reply" },
+      el("a", { href: `#post-${p.request_reply.post_id}` }, `Reply to #${p.request_reply.post_id}`),
+      el("span", { class: "muted" }, ` · ${p.request_reply.recipient} · ${p.request_reply.disposition === "superseded" ? "superseded" : p.request_reply.state}`)) : null,
     (p.requests || []).map(r => el("div", { class: "small request-progress", "data-request-recipient": r.recipient },
-      chip(`${r.assigned_agent || r.recipient}: ${r.state}`, r.state === "blocked" ? "warn" : r.state === "finished" ? "ok" : ""),
+      chip(`${r.assigned_agent || r.recipient}: ${r.state === "finished" && r.disposition === "superseded" ? "superseded" : r.state}`,
+        r.state === "blocked" ? "warn" : r.state === "finished" && r.disposition !== "superseded" ? "ok" : ""),
       r.assigned_session ? el("span", { class: "muted" }, ` session ${r.assigned_session}`) : null,
       r.reason ? el("div", {}, r.reason) : null,
       (r.evidence_post_ids || []).map(id => el("a", { href: `#post-${id}` }, ` Evidence #${id}`)))),

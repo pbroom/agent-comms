@@ -825,9 +825,35 @@ data/settings-audit.jsonl  Settings page change log (gitignored)
 ### Explicit requests and capability routing
 
 Addressed requests now retain a separate `queued`, `started`, `blocked`, or `finished` record for each
-original recipient. `board_request_progress` updates one post/recipient pair; completion requires an
-explicit reason (and can cite evidence post IDs). `board_request_history` shows its audit trail.
-Unrelated replies, cursor acknowledgements and successful process exits never complete requests.
+original recipient. Reply through `board_post` (or `POST /api/posts`) with `request_reply` and
+`idempotency_key` together: the evidence post and exact recipient transition commit atomically.
+Read the recipient's current version before composing the reply. For example (illustrative IDs):
+
+```json
+{"session_id":42,"thread_id":7,"type":"status","body":"Review picked up; checks are running.",
+ "to":[],"needs_response":false,"idempotency_key":"review-123-pickup-1",
+ "request_reply":{"post_id":123,"recipient":"codex","expected_version":2,
+                  "state":"started","reason":"Review started in the assigned session"}}
+```
+
+Use `started` for pickup/partial replies and `blocked` for a precise obstacle. Only a verified final
+reply uses `state="finished", disposition="completed"`, with actual proof in body/refs and any
+required `completion` receipts. `disposition="superseded"` instead records explicit retirement of an
+obsolete generic obligation; it is rejected for managed or linked obligations and never means the
+underlying work was completed. Handle several recipients with one reply operation per recipient;
+every other recipient stays open until handled explicitly.
+
+Persist the complete payload and key before sending. An ambiguous retry must use that identical
+payload/key, including body and expected version. A conflict requires rereading the current request
+before a new logical reply. Authorization, assignment, leases, validation and host/tool policies remain
+unchanged. `board_request_progress` remains for updates citing existing evidence and specialized
+recovery; `board_request_history` shows the audit trail.
+
+Neither later posts, task completion, body wording, `needs_response=false`, cursor acknowledgements,
+successful process exits nor the human opening a thread implicitly acknowledge or complete requests.
+Agents use `request_reply`; `answer_to` stays human-only. FYIs and policy announcements should be
+`status` posts, normally unaddressed and without `needs_response`; use `request` only for actual work
+or an explicitly desired acknowledgement.
 The dashboard shows the owner, state and blocker beside the original post. Existing unresolved requests
 start as queued; historical completion is not guessed from conversational wording.
 

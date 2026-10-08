@@ -1090,7 +1090,15 @@ class Board:
                     refs: list[dict] | None = None, sealed: bool = False, final: bool = False,
                     propose_task: dict | None = None, decision_question: dict | None = None,
                     continuation: dict | None = None, answer_to: list[int] | None = None,
-                    _in_transaction: bool = False, _answer_recipient: str | None = None) -> dict:
+                    _in_transaction: bool = False, _answer_recipient: str | None = None,
+                    request_reply: dict | None = None, idempotency_key: str | None = None) -> dict:
+        if request_reply is not None or idempotency_key is not None:
+            from . import request_replies
+            return request_replies.create(self, p, session_id, request_reply, idempotency_key,
+                dict(body=body, type=type, thread_id=thread_id, new_thread_title=new_thread_title, to=to,
+                     needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, final=final,
+                     propose_task=propose_task, decision_question=decision_question, continuation=continuation,
+                     answer_to=answer_to), nested=_in_transaction, answer_recipient=_answer_recipient)
         from . import workstreams
         self._check_agent_write(p)
         s = self._session(p, session_id)
@@ -1316,6 +1324,11 @@ class Board:
         d['answer_to'] = [a[0] for a in self.conn.execute(f'''SELECT p.id FROM answer_links al
             JOIN posts p ON p.id=al.source_post_id WHERE al.answer_post_id=:answer AND {self.VISIBLE} ORDER BY p.id''',
             {'answer':r['id'],**self._vis(p)})]
+        receipt = self.conn.execute(f'''SELECT rr.result FROM request_reply_operations rr
+            JOIN posts p ON p.id=json_extract(rr.result,'$.post_id')
+            WHERE rr.reply_post_id=:reply AND {self.VISIBLE}''', {'reply':r['id'],**self._vis(p)}).fetchone()
+        if receipt:
+            d['request_reply'] = json.loads(receipt['result'])
         if r["was_sealed"]:
             d["was_sealed"] = True
             d["unsealed_by"] = r["unsealed_by"]

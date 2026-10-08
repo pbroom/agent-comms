@@ -9,7 +9,7 @@ from pathlib import Path
 # Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
 # question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
 ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question IS i.decision_question)"
-SCHEMA_VERSION = 10  # v10: exact human-answer links and conservative legacy attention boundary
+SCHEMA_VERSION = 11  # v11: atomic request replies and explicit terminal dispositions
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
@@ -217,6 +217,11 @@ CREATE TABLE IF NOT EXISTS request_events (
  UNIQUE(post_id,recipient,version)
 );
 
+CREATE TABLE IF NOT EXISTS request_reply_operations (
+ actor TEXT NOT NULL REFERENCES agents(name), session_id INTEGER NOT NULL REFERENCES sessions(id),
+ idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL, reply_post_id INTEGER NOT NULL REFERENCES posts(id),
+ result TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(actor,session_id,idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS session_activity (
  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
  state TEXT NOT NULL CHECK(state IN ('idle','active','unknown')), recorded_at REAL NOT NULL
@@ -280,6 +285,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         for table, additions in {
             "issues": {"decision_question": "TEXT", "question_version": "INTEGER NOT NULL DEFAULT 0"},
             "issue_comments": {"decision": "TEXT"},
+            "request_progress": {"disposition": "TEXT"},
+            "request_events": {"disposition": "TEXT"},
             # v8: a post that asks the human to choose carries the same structured question as an issue.
             "posts": {"decision_question": "TEXT"},
             "tasks": {"continuation_scope": "TEXT"},

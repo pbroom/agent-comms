@@ -8,9 +8,9 @@ the token to the agent; tools never accept a sender name.
 from __future__ import annotations
 
 import os
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 import anyio
 import anyio.to_thread
@@ -33,9 +33,33 @@ asking again when covered by that goal or a matching human standing grant. Verif
 agent membership, active state and purpose; category labels alone do not prove semantic fit. Claim a
 task before editing its files. Stop when owner_may_work is false and refresh permission on each pull. Post 'status' when blocked, 'finding'
 with refs at a commit for reviews. Set needs_response=true to ask the human when unsure; when the human must
-choose, attach a decision_question (a recommended option and one alternative, each with what it does and costs)."""
+choose, attach a decision_question (a recommended option and one alternative, each with what it does and costs).
+
+Request lifecycle: reading, cursor acknowledgement, and ordinary replies never acknowledge or complete a
+request. On authorized pickup, use board_post with request_reply naming the exact source post_id, original
+recipient and current expected_version, state='started', and a factual reason. Use state='blocked' when blocked.
+When the exact requested work is verified complete, post the evidence with state='finished' and
+disposition='completed'; use disposition='superseded' only for an explicitly obsolete obligation, never to
+claim its unfinished underlying work is complete. Supply completion evidence required by a managed request.
+Every request_reply needs an idempotency_key: keep the identical key and payload when retrying an uncertain
+result, and use a new key for a different lifecycle action. Check the returned request_reply source, state and
+version. Ownership, human authorization, project/host gates and task leases still apply. answer_to remains
+human-only; agents use request_reply for exact request lifecycle replies, not human approval links."""
 
 DATA_WARNING = " SECURITY: " + UNTRUSTED_NOTICE
+
+
+class RequestReplyIn(BaseModel):
+    """Explicit source lifecycle action; core revalidates scope and authority."""
+    model_config = ConfigDict(extra="forbid")
+
+    post_id: Annotated[StrictInt, Field(gt=0)]
+    recipient: str
+    expected_version: Annotated[StrictInt, Field(ge=0)]
+    state: Literal["started", "blocked", "finished"]
+    reason: str
+    disposition: Literal["completed", "superseded"] | None = None
+    completion: dict[str, Any] | None = None
 
 
 def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions: str = INSTRUCTIONS) -> MCPServer:
@@ -150,6 +174,14 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "creates a task in state 'proposed'. category is review|implementation|tests|documentation; immutable once created. "
         "Human standing grants returned by register/read can authorize matching task categories within their purpose. "
         "Choose a category honestly; a label does not authorize work outside the human goal. "
+        "Ordinary replies and cursor acknowledgement never acknowledge or finish requests. For an authorized "
+        "pickup, blockage or verified finish, include request_reply={post_id: exact source ID, recipient: original "
+        "recipient, expected_version: current request version, state: started|blocked|finished, reason}. "
+        "For finished only, disposition is required: completed for verified exact work, superseded only for an "
+        "explicitly obsolete obligation (not its unfinished underlying work). Include completion for managed "
+        "requests when required. Pair request_reply with idempotency_key; retry uncertain results with the "
+        "identical key and payload, never invent completion from a reply. The returned request_reply identifies "
+        "the source and resulting state/version. answer_to is human-only and does not replace request_reply. "
         "When you ask the human to CHOOSE, attach decision_question={question, context, options: exactly two "
         "[{id (lowercase slug, ^[a-z0-9][a-z0-9_-]{0,31}$), label, description, outcome: answered|approved|declined}], "
         "recommended_option_id}: your recommended "
@@ -172,13 +204,16 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                    sealed: bool = False, propose_task: dict | None = None, decision_question: dict | None = None,
                    continuation: dict | None = None,
                    answer_to: list[StrictInt] | None = None,
+                   request_reply: RequestReplyIn | None = None, idempotency_key: str | None = None,
                    session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         sid = session(ctx, session_id)
         return run(lambda: board.create_post(
             p, sid, body=body, type=type, thread_id=thread_id, new_thread_title=new_thread_title, to=to,
             needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task,
-            decision_question=decision_question, continuation=continuation, answer_to=answer_to))
+            decision_question=decision_question, continuation=continuation, answer_to=answer_to,
+            request_reply=request_reply.model_dump(exclude_none=True) if request_reply is not None else None,
+            idempotency_key=idempotency_key))
 
     @mcp.tool(description=(
         "Claim a task lease before editing its files (atomic: only one session wins). Calling it again on a task "
