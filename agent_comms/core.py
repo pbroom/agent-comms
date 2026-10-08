@@ -16,6 +16,7 @@ from pathlib import Path
 import logging
 import math
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -854,9 +855,24 @@ class Board:
                 from . import workstreams
                 workstreams.bind_delivery(self, p, sid, dispatch_run_id)
         return {"session_id": sid, "agent": p.name, "runtime": p.runtime, "is_human": p.is_human,
+                "board_id": self.board_identity()[0],
                 "project": project, "worktree": worktree, "paused": self.is_paused(), "limits": self.limits(),
                 "configuration": self.configuration_status(),
                 "notice": UNTRUSTED_NOTICE, "authorization_grants": self.list_grants(p, project)}
+
+    BOARD_ID_KEY = "board.id"
+
+    def board_identity(self) -> tuple[str, float]:
+        """This board's stable random id and when it was first issued. Returned by register so the Codex rollout
+        lookup can tell this board's register results from another board's sharing the same CODEX_HOME."""
+        row = self.conn.execute("SELECT value, updated_at FROM board_state WHERE key = ?", (self.BOARD_ID_KEY,)).fetchone()
+        if row is None:
+            with db.write_tx(self.conn) as c:
+                c.execute("INSERT OR IGNORE INTO board_state(key, value, updated_by, updated_at) VALUES (?,?,?,?)",
+                          (self.BOARD_ID_KEY, json.dumps(secrets.token_hex(16)), "server", self.now()))
+            row = self.conn.execute("SELECT value, updated_at FROM board_state WHERE key = ?",
+                                    (self.BOARD_ID_KEY,)).fetchone()
+        return json.loads(row["value"]), row["updated_at"]
 
     def _session(self, p: Principal, session_id: int | None, touch: bool = True) -> sqlite3.Row:
         if session_id is None:
@@ -1909,7 +1925,9 @@ class Board:
                 """SELECT id, agent, started_at FROM sessions WHERE client_session_id IS NULL AND runtime LIKE 'codex%'
                    AND last_seen >= ? ORDER BY id DESC LIMIT 50""",
                 (self.now() - conversations.RECENT_SECONDS,)).fetchall()
-            found = self._codex_resolver(cfg).resolve([dict(r) for r in rows]) if rows else {}
+            board_id, issued_at = self.board_identity()
+            found = self._codex_resolver(cfg).resolve([dict(r) for r in rows], board_id=board_id,
+                                                      legacy_before=issued_at) if rows else {}
             for sid, thread in found.items():
                 if conversations.normalize_uuid(thread) is None:
                     continue

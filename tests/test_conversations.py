@@ -156,9 +156,16 @@ def iso(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).isoformat().replace("+00:00", "Z")
 
 
-def register_result(sid, agent="codex", project=PROJECT) -> dict:
-    return {"session_id": sid, "agent": agent, "runtime": "codex-cli", "is_human": False, "project": project,
-            "worktree": None, "paused": False, "notice": "untrusted"}
+BOARD = {"id": None}   # the board under test's id (set by the `codex` fixture), as its register results carry it
+
+
+def register_result(sid, agent="codex", project=PROJECT, board_id="this board") -> dict:
+    out = {"session_id": sid, "agent": agent, "runtime": "codex-cli", "is_human": False,
+           "board_id": BOARD["id"] if board_id == "this board" else board_id, "project": project,
+           "worktree": None, "paused": False, "notice": "untrusted"}
+    if out["board_id"] is None:
+        del out["board_id"]   # a result written by a server from before board ids
+    return out
 
 
 def mcp_call(tool, result: dict | str, arguments=None) -> str:
@@ -194,7 +201,9 @@ def rollout(home: Path, thread: str, started: float, lines: list[str], mtime: fl
 def codex(env, tmp_path):
     home = tmp_path / "codex-home"
     env.settings.conversations = {"codex_home": str(home)}
-    return home
+    BOARD["id"] = env.board.board_identity()[0]
+    yield home
+    BOARD["id"] = None
 
 
 def linked(env, sid=None):
@@ -216,10 +225,39 @@ def test_function_call_output_layout_with_double_escaping(env, codex):
 
 
 def test_unparseable_result_text_uses_the_escape_tolerant_pattern(env, codex):
-    text = '{\\"session_id\\": %d, \\"agent\\": \\"codex\\", \\"runtime\\": \\"codex-cli\\", ...truncated' % env.sid["codex"]
+    text = ('{\\"session_id\\": %d, \\"agent\\": \\"codex\\", \\"runtime\\": \\"codex-cli\\", \\"board_id\\": \\"%s\\", '
+            '...truncated' % (env.sid["codex"], BOARD["id"]))
     rollout(codex, THREAD_C, env.clock() - 5, [mcp_call("board_register", text)])
     env.board.resolve_conversations()
     assert linked(env) == ("codex", THREAD_C)
+
+
+def test_register_results_from_another_board_sharing_codex_home_do_not_link(env, codex):
+    other = "0" * 32
+    sid = env.sid["codex"]
+    rollout(codex, THREAD_A, env.clock() - 5, [mcp_call("board_register", register_result(sid, board_id=other))])
+    text = ('{\\"session_id\\": %d, \\"agent\\": \\"codex\\", \\"runtime\\": \\"codex-cli\\", \\"board_id\\": \\"%s\\", '
+            '...truncated' % (sid, other))
+    rollout(codex, THREAD_C, env.clock() - 4, [mcp_call("board_register", text)])
+    # Nor does a result without a board id, for a session that started after this board issued its id.
+    rollout(codex, THREAD_B, env.clock() - 3, [mcp_call("board_register", register_result(sid, board_id=None))])
+    assert env.board.resolve_conversations() == 0 and linked(env) == (None, None)
+    rollout(codex, THREAD_B, env.clock() - 2, [mcp_call("board_register", register_result(sid))])
+    env.clock.advance(conv.RETRY_SECONDS)
+    assert env.board.resolve_conversations() == 1 and linked(env) == ("codex", THREAD_B)
+
+
+def test_a_session_from_before_board_ids_still_matches_a_legacy_result(env, codex):
+    with db.write_tx(env.board.conn) as c:   # the board issued its id after this session registered
+        c.execute("UPDATE board_state SET updated_at = updated_at + 10 WHERE key = 'board.id'")
+    rollout(codex, THREAD_A, env.clock() - 5, [mcp_call("board_register", register_result(env.sid["codex"], board_id=None))])
+    assert env.board.resolve_conversations() == 1 and linked(env) == ("codex", THREAD_A)
+
+
+def test_register_returns_a_stable_board_id(env):
+    a = env.board.register_session(env.p["codex"], PROJECT)["board_id"]
+    assert conv.BOARD_ID_RE.fullmatch(a) and a == env.board.register_session(env.p["claude"], PROJECT)["board_id"]
+    assert Board(env.settings, clock=env.clock).board_identity()[0] == a
 
 
 def test_no_match_leaves_the_session_unlinked(env, codex):

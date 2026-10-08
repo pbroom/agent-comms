@@ -633,6 +633,13 @@ point a session at another thread by posting text shaped like a register result:
 rollout through `board_read_updates`, and an agent's own tool arguments and project path are recorded too. Those
 fields are never parsed. Nothing read from a rollout file leaves the module except the UUID from the file name.
 
+*Board id (2026-10-08).* Session ids are per board, and two boards (the live one and a test board, or two checkouts)
+can share one CODEX_HOME, so `(session_id, agent)` alone could link a session to another board's Codex thread.
+`board_register` now returns `board_id`, a random 128-bit hex id the board issues once (`board_state['board.id']`).
+A rollout result counts only when it carries this board's id. A result without one was written by a server from
+before board ids, and counts only for a session that started before this board issued its id (every later
+registration here returned it), so old sessions still backfill while new ones cannot be matched across boards.
+
 **Claude Code transcript fallback (2026-10-07, later).** Env capture only covers sessions that registered through
 the new stdio code, so every Claude session from before it had no link. `ClaudeResolver` does for Claude Code what
 `CodexResolver` does for Codex, and env capture stays the primary path (a captured id is never replaced).
