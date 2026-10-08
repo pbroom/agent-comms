@@ -232,3 +232,30 @@ test('"Sending…" stops at once when nothing can restart (dispatcher not runnin
   assert.ok(err.document.querySelector('button.unstick-row'), 'the button is back to "Unstick" so you can retry');
   err.dom.window.close();
 });
+
+for (const type of ['status', 'finding', 'request']) {
+  for (const needs_response of [false, true]) {
+    test(`${type} response intent ${needs_response} controls reply stalls`, async () => {
+      const t = thread(1, [post(10, 1, { type, to: ['codex'], needs_response })]);
+      const { dom, document } = await setup({ threads: [t] });
+      try {
+        const shouldStall = needs_response || type === 'request';
+        assert.equal(Boolean(document.querySelector('tr[data-thread="1"] .dot.stalled')), shouldStall);
+        assert.equal(Boolean(document.getElementById('unstick')), shouldStall);
+      } finally {
+        dom.window.close();
+      }
+    });
+  }
+}
+
+test('human approval statuses still wait on their recipient', async () => {
+  const t = thread(1, [post(10, 1, { agent: 'human', type: 'status', to: ['codex'] })]);
+  const { dom, document } = await setup({ threads: [t] });
+  try {
+    assert.ok(document.querySelector('tr[data-thread="1"] .dot.stalled'));
+    assert.ok(document.getElementById('unstick'));
+  } finally {
+    dom.window.close();
+  }
+});

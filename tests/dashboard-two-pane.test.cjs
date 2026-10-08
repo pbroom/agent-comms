@@ -199,10 +199,10 @@ test('sorting: recent activity (default), newest first, priority; the choice is 
   again.dom.window.close();
 });
 
-test('status dots: the last word went to an agent that never replied (any post type); grace before amber', async () => {
+test('status dots: the last word went to an agent that never replied (request); grace before amber', async () => {
   const quietFor = (id, minutes) => thread(id, [post(id * 10, id, 1, { agent: 'claude-code' }),
-    post(id * 10 + 1, id, 2, { agent: 'codex', type: 'status', to: ['claude-code'], created_at: MINUTES_AGO(minutes) })]);
-  const answered = thread(4, [post(40, 4, 1, { type: 'status', to: ['claude-code'], created_at: MINUTES_AGO(90) }),
+    post(id * 10 + 1, id, 2, { agent: 'codex', type: 'request', to: ['claude-code'], created_at: MINUTES_AGO(minutes) })]);
+  const answered = thread(4, [post(40, 4, 1, { type: 'request', to: ['claude-code'], created_at: MINUTES_AGO(90) }),
     post(41, 4, 2, { agent: 'claude-code', created_at: MINUTES_AGO(80) })]);
   const seen = JSON.stringify({ 1: 11, 2: 21, 3: 31, 4: 41 });
   const { dom, dot } = await dots({ threads: () => [quietFor(1, 35), quietFor(2, 45), quietFor(3, 300), answered],

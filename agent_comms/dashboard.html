@@ -977,10 +977,10 @@ function threadStatus(t, human) {
       else pending.push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
     }
   }
-  // The thread's last word went to an agent (any post type) and that agent has not posted since: the
-  // conversation is waiting on it, even if nobody flagged needs_response.
+  // Preserve implicit asks, but agent status/finding posts require needs_response.
+  // Addressing a completion update alone does not create a reply obligation.
   const last = posts[posts.length - 1];
-  if (last && !last.sealed && !last.needs_response) {
+  if (last && !last.sealed && !last.needs_response && (!["status", "finding"].includes(last.type) || isHumanName(last.agent))) {
     for (const agent of last.to) {
       if (agent === "human" || agent === last.agent || runs.some(r => r.agent === agent)) continue;
       if (stale(last.created_at)) { stalled.push(`#${last.id} to ${agent}, no reply for ${since(last.created_at)}`); involve(agent); }
