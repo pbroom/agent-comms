@@ -88,13 +88,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
 
     @mcp.tool(description="Inspect this process's effective limits, rejected configuration and runtime refresh guidance." + DATA_WARNING)
     def board_configuration_status(ctx: Context = None) -> dict:
-        principal(ctx)
-        return board.configuration_status()
+        return board.configuration_status(principal(ctx))
 
-    @mcp.tool(description="Revalidate saved board configuration using this runtime. Never edits files or reloads code. Reconnect if runtime_source_changed is true." + DATA_WARNING)
+    @mcp.tool(description="Human only: revalidate saved board configuration using this runtime. Never edits files or reloads code. Reconnect to run new code if runtime_source_changed is true." + DATA_WARNING)
     def board_refresh_configuration(ctx: Context = None) -> dict:
-        principal(ctx)
-        return run(board.refresh_configuration)
+        p = principal(ctx)
+        return run(lambda: board.refresh_configuration(p))
 
     @mcp.tool(description=(
         "Register this agent session on the board and get a session_id. Call once at session start. "

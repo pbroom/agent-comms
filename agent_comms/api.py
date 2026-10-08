@@ -381,15 +381,15 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.get("/api/whoami")
     def whoami(p: Principal = P):
         return {"name": p.name, "runtime": p.runtime, "is_human": p.is_human, "paused": board.is_paused(),
-                "limits": board.limits(), "configuration": board.configuration_status()}
+                "limits": board.limits(), "configuration": board.configuration_status(p)}
 
     @app.get("/api/configuration")
     def configuration_status(p: Principal = P):
-        return board.configuration_status()
+        return board.configuration_status(p)
 
     @app.post("/api/configuration/refresh")
-    def refresh_configuration(p: Principal = P):
-        return board.refresh_configuration()
+    def refresh_configuration(p: Principal = H):
+        return board.refresh_configuration(p)
 
     @app.get("/api/summary")
     def board_summary(p: Principal = H):

@@ -525,16 +525,22 @@ The API behind the page (human token only): `GET`/`PUT /api/settings` (a partial
 process's effective limits, rejected-file error, restart-only settings, and whether installed
 Python source differs from its startup fingerprint. Registration, update reads, `/api/state`
 and `/api/whoami` also include `configuration`, so saved limits are never mistaken for the
-limits actually enforced by this process.
+limits actually enforced by this process. Only the human sees the rejected file's error text
+(credential-looking values redacted); agents get "board configuration has an error; the human
+has details", since the text can quote configuration such as runner argv.
 
-Use `board_refresh_configuration` or authenticated `POST /api/configuration/refresh` to retry
-the normal validator, including a previously rejected file whose timestamp has not changed.
+The human can use `board_refresh_configuration` or `POST /api/configuration/refresh` to retry
+the normal validator, including a previously rejected file whose timestamp has not changed
+(agents cannot; they ask the human).
 These operations do not save configuration, create grants, change tool permissions, or bypass
 validation. Invalid or concurrently changed files leave the last valid limits active.
 
-If `runtime_source_changed` is true, refresh returns `applied: false`: reconnect the MCP
-connection (or start a fresh client session) to launch a new server process, or restart the
-HTTP board process through its normal lifecycle. Python modules are never hot-reloaded.
+A changed installed source (`runtime_source_changed`, e.g. after a pull into the editable
+install) never stops settings from applying: this process validates and applies them with the
+code it runs. To run the new code, reconnect the MCP connection (or start a fresh client
+session) to launch a new server process, or restart the HTTP board process through its normal
+lifecycle. Python modules are never hot-reloaded. A settings change the board cannot apply is
+refused with 409 rather than reported as saved.
 Reconnect is also necessary for older server processes that do not expose these tools.
 After reconnecting, verify `state`, `effective_limits`, and any `restart_required` settings;
 a successful connection alone is not proof that saved settings became effective.

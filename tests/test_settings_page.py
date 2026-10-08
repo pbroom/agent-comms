@@ -8,7 +8,7 @@ import stat
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_comms import board_settings, dispatch
+from agent_comms import board_settings, core, dispatch
 from agent_comms.api import create_app
 from agent_comms.config import Settings, create_agent
 from agent_comms.core import Board, Conflict, Forbidden, LimitExceeded
@@ -474,9 +474,11 @@ def test_configuration_rejected_reload_is_visible_and_refresh_preserves_bytes(se
     before = senv.local.read_bytes()
     status = senv.client.get('/api/configuration', headers=senv.h('codex')).json()
     assert status['state'] == 'stale'
-    assert status['error']
+    assert status['error'] == core.CONFIG_ERROR_FOR_AGENTS             # agents get the generic message
     assert status['effective_limits']['daily_post_cap_per_agent'] == 200
-    result = senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).json()
+    human = senv.client.get('/api/configuration', headers=senv.h()).json()
+    assert 'unknown_future_option' in human['error']                 # the human gets the details
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h()).json()
     assert result['applied'] is False and result['state'] == 'stale'
     assert senv.local.read_bytes() == before
     registered = senv.board.register_session(senv.p['codex'], PROJECT)
@@ -486,30 +488,22 @@ def test_configuration_rejected_reload_is_visible_and_refresh_preserves_bytes(se
     updates = senv.board.read_updates(senv.p['codex'], registered['session_id'])
     assert updates['configuration']['state'] == 'stale'
     senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
-    result = senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).json()
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h()).json()
     assert result['applied'] is True and result['state'] == 'current'
     assert result['effective_limits']['daily_post_cap_per_agent'] == 1000
 
 
-def test_refresh_retries_unchanged_signature_but_never_reload_source(senv, monkeypatch):
-    from agent_comms import core
+def test_refresh_retries_unchanged_signature(senv, monkeypatch):
     original = senv.board._settings_files_sig()
     monkeypatch.setattr(senv.board, '_settings_files_sig', lambda: original)
     senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
     assert senv.board.reload_settings() is False
-    assert senv.board.refresh_configuration()['effective_limits']['daily_post_cap_per_agent'] == 1000
-    monkeypatch.setattr(core, '_runtime_source_fingerprint', lambda: 'new-install')
-    generation = senv.board.settings_generation
-    result = senv.board.refresh_configuration()
-    assert result['applied'] is False and result['runtime_source_changed'] is True
-    assert result['refresh_supported'] is False
-    assert 'Reconnect' in result['recovery']
-    assert senv.board.settings_generation == generation
+    assert senv.board.refresh_configuration(senv.p['human'])['effective_limits']['daily_post_cap_per_agent'] == 1000
 
 
 def test_configuration_restart_only_and_authenticated_routes(senv):
     senv.local.write_text('[server]\nport = 9898\n')
-    result = senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).json()
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h()).json()
     assert result['state'] == 'restart_required'
     assert result['restart_required'] == ['port']
     assert senv.board.s.port == 8787
@@ -518,24 +512,28 @@ def test_configuration_restart_only_and_authenticated_routes(senv):
     assert senv.client.get('/api/whoami', headers=senv.h('codex')).json()['configuration']['state'] == 'restart_required'
 
 
-def test_configuration_mcp_refresh_uses_authenticated_runtime(senv, monkeypatch):
+def test_configuration_refresh_is_human_only(senv, monkeypatch):
     import asyncio
     from mcp import Client
     from agent_comms.mcp_server import build_mcp
+    assert senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).status_code == 403
+    with pytest.raises(Forbidden):
+        senv.board.refresh_configuration(senv.p['codex'])
     monkeypatch.setenv('AGENT_COMMS_TOKEN', senv.tokens['codex'])
+
     async def run():
         async with Client(build_mcp(senv.board, 'stdio')) as client:
-            for name in ['board_configuration_status', 'board_refresh_configuration']:
-                result = await client.call_tool(name, {})
-                assert not result.is_error
-                status = json.loads(result.content[0].text)
-                assert status['state'] == 'current'
-                assert status['effective_limits']['daily_post_cap_per_agent'] == 200
+            result = await client.call_tool('board_configuration_status', {})
+            assert not result.is_error
+            status = json.loads(result.content[0].text)
+            assert status['state'] == 'current'
+            assert status['effective_limits']['daily_post_cap_per_agent'] == 200
+            refused = await client.call_tool('board_refresh_configuration', {})
+            assert refused.is_error and 'forbidden' in refused.content[0].text
     asyncio.run(run())
 
 
 def test_configuration_refresh_retries_rejected_unchanged_file(senv, monkeypatch):
-    from agent_comms import core
     validator = core.check_reloadable
     senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
     def incompatible(settings):
@@ -545,13 +543,12 @@ def test_configuration_refresh_retries_rejected_unchanged_file(senv, monkeypatch
     assert senv.board.configuration_status()['state'] == 'stale'
     monkeypatch.setattr(core, 'check_reloadable', validator)
     assert senv.board.reload_settings() is False
-    result = senv.board.refresh_configuration()
+    result = senv.board.refresh_configuration(senv.p['human'])
     assert result['applied'] and result['error'] is None
     assert result['effective_limits']['daily_post_cap_per_agent'] == 1000
 
 
 def test_configuration_changed_during_validation_is_not_applied(senv, monkeypatch):
-    from agent_comms import core
     validator = core.check_reloadable
     senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
     def changing(settings):
@@ -564,51 +561,80 @@ def test_configuration_changed_during_validation_is_not_applied(senv, monkeypatc
     assert 'changed while being read' in senv.board.settings_error
 
 
+# ---------------------------------------------------------------- a changed installed source never blocks settings
+
+
 @pytest.mark.parametrize("source_unavailable", [False, True])
-def test_authenticated_http_refresh_does_not_apply_config_with_changed_runtime(senv, monkeypatch, source_unavailable):
-    from agent_comms import core
-    generation = senv.board.settings_generation
-    limits = senv.board.limits()
-    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
-    saved = senv.local.read_bytes()
+def test_settings_still_apply_when_the_installed_source_changed(senv, monkeypatch, source_unavailable):
+    """The board runs from an editable install, so any pull or edit changes the source. Settings must still apply
+    (via PUT, file edit + authentication, and refresh); the stale code is reported separately."""
     def fingerprint():
         if source_unavailable:
             raise OSError('source unavailable')
         return 'new-runtime-source'
     monkeypatch.setattr(core, '_runtime_source_fingerprint', fingerprint)
-    for method, path in [('GET', '/api/configuration'), ('POST', '/api/configuration/refresh')]:
-        response = senv.client.request(method, path, headers=senv.h('codex'))
-        assert response.status_code == 200
-        status = response.json()
-        assert status['runtime_source_changed'] is True
-        assert status['effective_limits'] == limits
-        assert status['generation'] == generation
-        if method == 'POST':
-            assert status['applied'] is False
-    assert senv.board.reload_settings(force=True) is False
-    assert senv.board.limits() == limits
-    assert senv.local.read_bytes() == saved
+    monkeypatch.setattr(core, '_SOURCE_CHECK', {'stat': ('force a recheck',), 'changed': False})
+    r = senv.put({'tasks.require_human_accept': True})
+    assert r.status_code == 200, r.text
+    assert senv.board.s.require_human_accept is True and r.json()['changed'] == ['tasks.require_human_accept']
+    senv.local.write_text(senv.local.read_text().replace('[limits]', '[limits]\ndaily_post_cap_per_agent = 1000', 1))
+    touch_later(senv.local)
+    status = senv.client.get('/api/configuration', headers=senv.h('codex')).json()   # authentication reloads
+    assert status['effective_limits']['daily_post_cap_per_agent'] == 1000
+    assert status['runtime_source_changed'] is True and status['refresh_supported'] is True
+    assert 'restart' in status['recovery']
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h()).json()
+    assert result['applied'] is True and result['runtime_source_changed'] is True
 
 
-def test_authenticated_mcp_refresh_does_not_apply_config_with_changed_runtime(senv, monkeypatch):
-    import asyncio
-    from mcp import Client
-    from agent_comms import core
-    from agent_comms.mcp_server import build_mcp
-    monkeypatch.setenv('AGENT_COMMS_TOKEN', senv.tokens['codex'])
-    generation, limits = senv.board.settings_generation, senv.board.limits()
-    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+def test_dispatcher_applies_dispatch_changes_after_a_source_change(senv, monkeypatch):
+    d = Dispatcher(senv.board, senv.p['human'], DispatchConfig.from_dict(senv.board.s.dispatch))
     monkeypatch.setattr(core, '_runtime_source_fingerprint', lambda: 'new-runtime-source')
-    async def run():
-        async with Client(build_mcp(senv.board, 'stdio')) as client:
-            for tool in ['board_configuration_status', 'board_refresh_configuration']:
-                result = await client.call_tool(tool, {})
-                assert not result.is_error
-                status = json.loads(result.content[0].text)
-                assert status['runtime_source_changed'] is True
-                assert status['effective_limits'] == limits
-                assert status['generation'] == generation
-                if tool == 'board_refresh_configuration':
-                    assert status['applied'] is False
-    asyncio.run(run())
-    assert senv.board.limits() == limits
+    monkeypatch.setattr(core, '_SOURCE_CHECK', {'stat': ('force a recheck',), 'changed': False})
+    assert senv.put({'dispatch.max_concurrent': 3}).status_code == 200
+    d.refresh_config()
+    assert d.config.max_concurrent == 3
+
+
+def test_settings_put_reports_a_setting_it_could_not_apply(senv, monkeypatch):
+    monkeypatch.setattr(senv.board, 'reload_settings', lambda force=False: False)
+    senv.board.settings_error = 'ValueError: simulated'
+    r = senv.put({'tasks.require_human_accept': True})
+    assert r.status_code == 409 and 'could not apply' in r.json()['message']
+
+
+def test_source_change_check_rehashes_only_when_a_file_changes(monkeypatch):
+    calls = []
+    real = core._runtime_source_fingerprint
+    monkeypatch.setattr(core, '_runtime_source_fingerprint', lambda: calls.append(1) or real())
+    for _ in range(5):
+        assert core._runtime_source_changed() is False
+    assert calls == []
+
+
+# ---------------------------------------------------------------- configuration errors never leak to agents
+
+
+def test_configuration_error_text_is_generic_for_agents_and_redacted_for_the_human(senv):
+    senv.local.write_text('[dispatch.runners]\ncodex = ["codex", "--api-key=sk-SECRET-{x}", "{prompt}"]\n')
+    touch_later(senv.local)
+    texts = [senv.client.get('/api/configuration', headers=senv.h('codex')).text,
+             senv.client.get('/api/whoami', headers=senv.h('codex')).text,
+             senv.client.get('/api/state', headers=senv.h('codex')).text,
+             json.dumps(senv.board.register_session(senv.p['codex'], PROJECT)),
+             json.dumps(senv.board.read_updates(senv.p['codex'], senv.sid['codex']))]
+    for text in texts:
+        assert 'SECRET' not in text and 'api-key' not in text
+    assert core.CONFIG_ERROR_FOR_AGENTS in texts[0]
+    human = senv.client.get('/api/configuration', headers=senv.h()).json()['error']
+    assert human and 'dispatch.runners' in human and 'SECRET' not in human
+    assert 'SECRET' not in json.dumps(senv.get().json())
+
+
+@pytest.mark.parametrize('text,leak', [('--api-key=sk-SECRET-1', 'SECRET'), ('run --token hunter2', 'hunter2'),
+                                       ('Authorization: Bearer abc.def', 'abc.def'), ('password=hunter2', 'hunter2'),
+                                       ('ghp_1234567890abcdef', '1234567890')])
+def test_redact_secrets(text, leak):
+    assert leak not in core.redact_secrets(text)
+    assert core.redact_secrets('unknown setting [dispatch] unknown_future_option') == \
+        'unknown setting [dispatch] unknown_future_option'

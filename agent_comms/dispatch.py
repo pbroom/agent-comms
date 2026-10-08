@@ -232,10 +232,12 @@ def validate_runner(agent: str, template: Any) -> list[str]:
                          "or wrapper that re-parses arguments")
     if template.count("{prompt}") != 1:
         raise ValueError(f"[dispatch.runners] {agent} must contain the element \"{{prompt}}\" exactly once")
-    for x in template:
+    for i, x in enumerate(template):
         if ("{" in x or "}" in x) and x not in PLACEHOLDERS:
+            # Name the element by position, never by value: runner argv can carry credentials, and this message
+            # reaches the configuration status.
             raise ValueError(f"[dispatch.runners] {agent}: placeholders must be whole argv elements, one of "
-                             f"{PLACEHOLDERS} (got {x!r})")
+                             f"{PLACEHOLDERS} (element {i} is not)")
     return list(template)
 
 
