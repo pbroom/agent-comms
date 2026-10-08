@@ -1407,18 +1407,33 @@ function unstickTitle(agents) {
 
 // The sessions that received a thread's last Unstick: the live ones the server named, plus sessions of the same
 // agents that started at or after the click (a dispatcher launch). In the server's order (last seen first).
+// The snapshot lists only the 30 most recently seen sessions, so a session the server named can be missing from it:
+// it is taken from the Unstick reply's `sessions_detail` when the server sends one, else shown by id alone. It still
+// received the request, so it never reads as "no session".
 function unstickReceivers(u) {
   if (!u || !state) return [];
-  return state.sessions.filter(s => u.agents.includes(s.agent)
+  const listed = state.sessions.filter(s => u.agents.includes(s.agent)
     && (u.sessionIds.includes(s.id) || Date.parse(s.started_at) >= u.at));
+  const ids = new Set(listed.map(s => s.id));
+  const unlisted = u.sessionIds.filter(id => !ids.has(id))
+    .map(id => (u.sessionsDetail || []).find(s => s.id === id) || { id, agent: null, unlisted: true });
+  return [...listed, ...unlisted];
 }
 
 function unstickSessionsLine(u) {
   const got = unstickReceivers(u);
   return el("div", { class: "convo-list", id: "unstick-sessions" },
     el("span", { class: "muted" }, got.length ? "Received in:" : "No session has picked it up yet."),
-    got.map(s => el("span", { class: "convo", "data-session": s.id }, el("span", {}, `s${s.id} ${s.agent}`),
-      conversationLinks(s.conversation, s.agent))));
+    got.map(s => el("span", { class: "convo", "data-session": s.id },
+      el("span", {}, s.unlisted ? `s${s.id} (not in the recent list)` : `s${s.id} ${s.agent}`),
+      s.unlisted ? null : conversationLinks(s.conversation, s.agent))));
+}
+// `sessions_detail` from the Unstick reply, if the server sends it: { id, agent, conversation? } per session. Only
+// well-formed entries are kept; the conversation link is checked again by conversationLinks().
+function sessionsDetail(r) {
+  if (!Array.isArray(r.sessions_detail)) return [];
+  return r.sessions_detail.filter(s => s && typeof s === "object" && Number.isInteger(s.id) && typeof s.agent === "string")
+    .map(s => ({ id: s.id, agent: s.agent, conversation: s.conversation, started_at: typeof s.started_at === "string" ? s.started_at : null }));
 }
 
 function renderThreadList(threads, current, human, statuses, hidden) {
@@ -1499,9 +1514,11 @@ async function unstickThread(t) {
   try {
     const r = lastUnstickReply = await api("POST", `/api/threads/${t.id}/unstick`);
     unstickNote = { threadId: t.id, text: unstickMessage(r), failed: false }; lastError = "";
+    const detail = sessionsDetail(r);
     lastUnstick[t.id] = { threadId: t.id, at, postId: Number.isInteger(r.post_id) ? r.post_id : null,
       agents: Array.isArray(r.agents) ? r.agents.filter(a => typeof a === "string") : [],
-      sessionIds: Array.isArray(r.sessions) ? r.sessions.filter(Number.isInteger) : [] };
+      sessionIds: [...new Set([...(Array.isArray(r.sessions) ? r.sessions.filter(Number.isInteger) : []), ...detail.map(s => s.id)])],
+      sessionsDetail: detail };
   } catch (e) {
     lastError = e.message; unstickNote = { threadId: t.id, text: `Unstick failed: ${e.message}`, failed: true };
     delete unsticking[t.id];

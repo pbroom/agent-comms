@@ -235,3 +235,25 @@ test('a task waiting on an unfinished prerequisite is neither awaiting pickup no
     assert.deepEqual(dotOf(d, 1), ['stalled', 'task 2 proposed, awaiting agent pickup for 2h'], 'once its prerequisite is done it can stall');
   } finally { dom.window.close(); }
 });
+
+// ---------------------------------------------------------------- 13. Unstick receivers beyond the recent sessions
+test('an Unstick receiver outside the 30 recent sessions is still shown, never as "no session"', async () => {
+  const session = id => ({ id, agent: 'codex', runtime: 'codex-cli', project: '/repo', worktree: null, last_seen: ago(1), started_at: ago(60) });
+  for (const [reply, expect] of [
+    [{ ...UNSTICK_REPLY, live_agents: ['codex'], sessions: [77, 5] }, /Received in:\s*s5 codex\s*s77 \(not in the recent list\)/],
+    [{ ...UNSTICK_REPLY, live_agents: ['codex'], sessions: [77],
+       sessions_detail: [{ id: 77, agent: 'codex', conversation: { url: 'codex://threads/0f0e0d0c-0b0a-4908-8706-050403020100' } }, { id: 'x' }] },
+     /Received in:\s*s77 codex/],
+  ]) {
+    const stuck = thread(1, [post(10, 1)], { tasks: [task(1, 'blocked')] });
+    const { dom, d } = await setup({ board: { threads: [stuck], sessions: [session(5)] },
+      routes: { '/api/threads/1/unstick': () => ok(reply) } });
+    try {
+      d.getElementById('unstick').click(); await settle();
+      const line = d.getElementById('unstick-sessions').textContent;
+      assert.doesNotMatch(line, /No session/);
+      assert.match(line, expect);
+      if (reply.sessions_detail) assert.ok(d.querySelector('#unstick-sessions [data-session="77"] a[href^="codex://threads/"]'), 'its conversation link');
+    } finally { dom.window.close(); }
+  }
+});
