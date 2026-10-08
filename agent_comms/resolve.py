@@ -11,8 +11,10 @@ Guardrails (DESIGN_NOTES "Needs you actions"):
   id (and, for the rule purpose, the thread id). Nothing an agent wrote is read or copied. Reply posts the human's
   own text.
 - Choose posts `Chose option <id> ("<label>", recommended|alternative) for #N.` plus the human's optional note. The
-  option id and label are the only agent-written text it copies: looked up by the id the human picked, folded onto
-  one line and quoted, so they cannot pose as a separate line of the human's post. Nothing else (question, context,
+  option id and label are the only agent-written text it copies, looked up by the id the human picked. The id is a
+  slug (`^[a-z0-9][a-z0-9_-]{0,31}$`, checked when the question is stored and again before rendering; a legacy
+  question with any other id cannot be chosen). The label is folded onto one line and quoted, so neither can pose as
+  more of the human's post. Nothing else (question, context,
   descriptions, body) is copied.
 - Approve & launch approves a one-shot dispatcher rule (one launch, RULE_HOURS) for the author on this thread,
   before posting, unless an active rule for that agent on this thread already has launches left. The dispatcher's
@@ -26,7 +28,7 @@ from __future__ import annotations
 from typing import Any
 import json
 
-from . import dispatch, human_actions, db, decision_actions, requests, approval_owners
+from . import dispatch, human_actions, db, decision_actions, issues, requests, approval_owners
 from .core import Board, Conflict, Invalid, Principal
 
 ACTIONS = ("approve", "approve_launch", "reject", "not_now", "reply", "choose", "ask_options")
@@ -42,6 +44,14 @@ ASK_OPTIONS = ("Please restate #{post} as a structured decision_question (a reco
 CHOSE = 'Chose option {id} ("{label}", {rank}) for #{post}.'
 PURPOSE = ("Carry out what post #{post} on thread {thread} asked for, which the human approved; "
            "stay within that request.")
+
+
+def _option_id(value: str) -> str:
+    """The option id as copied into the human's reply. Ids are slugs (issues.OPTION_ID_RE), checked again here so a
+    stored legacy id is never rendered raw."""
+    if not issues.option_id_ok(value):
+        raise Invalid("option id cannot be quoted safely; use Approve, Not now or Reply instead")
+    return value
 
 
 def _one_line(text: str) -> str:
@@ -90,6 +100,10 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
         option = next((o for o in question["options"] if o["id"] == option_id), None)
         if option is None:
             raise Invalid(f"option_id must be one of post #{post_id}'s options")
+        if not all(issues.option_id_ok(o.get("id")) for o in question["options"]):
+            # Stored before ids were restricted: the id would be copied into the human's reply unescaped.
+            raise Invalid(f"post #{post_id}'s options were stored with ids that cannot be quoted safely; "
+                          "use Approve, Not now or Reply instead")
     if action == "ask_options":
         if question:
             raise Invalid(f"post #{post_id} already has structured options; choose one or reply")
@@ -141,7 +155,7 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
         body, type_ = text, ("question" if text.endswith("?") else "status")
     elif action == "choose":
         rank = "recommended" if option["id"] == question["recommended_option_id"] else "alternative"
-        body = CHOSE.format(id=_one_line(option["id"]), label=_one_line(option["label"]), rank=rank, post=post_id)
+        body = CHOSE.format(id=_option_id(option["id"]), label=_one_line(option["label"]), rank=rank, post=post_id)
         body, type_ = body + (f"\nNote: {note}" if note else ""), "status"
     elif action == "ask_options":
         body, type_, needs_response = ASK_OPTIONS.format(post=post_id), "request", True
@@ -195,7 +209,7 @@ def _mechanical(board, p, item, option, question, note):
         receipt = board.create_post(p, session_id, thread_id=item['thread_id'], type='status',
             body=f"Server executed the choice on #{item['id']}. {detail}", _in_transaction=True)
         rank = 'recommended' if option['id'] == question['recommended_option_id'] else 'alternative'
-        body = CHOSE.format(id=_one_line(option['id']), label=_one_line(option['label']), rank=rank, post=item['id'])
+        body = CHOSE.format(id=_option_id(option['id']), label=_one_line(option['label']), rank=rank, post=item['id'])
         answer = board.create_post(p, session_id, thread_id=item['thread_id'], type='status',
             body=body + (f'\nNote: {note}' if note else ''), answer_to=[item['id']], _in_transaction=True)
         for row in answer['requests']:

@@ -151,7 +151,8 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Human standing grants returned by register/read can authorize matching task categories within their purpose. "
         "Choose a category honestly; a label does not authorize work outside the human goal. "
         "When you ask the human to CHOOSE, attach decision_question={question, context, options: exactly two "
-        "[{id, label, description, outcome: answered|approved|declined}], recommended_option_id}: your recommended "
+        "[{id (lowercase slug, ^[a-z0-9][a-z0-9_-]{0,31}$), label, description, outcome: answered|approved|declined}], "
+        "recommended_option_id}: your recommended "
         "option and one alternative, each description saying what it does and what it costs. Allowed on "
         "question/proposal/decision/request posts with needs_response=true (a decision always waits) and `to` "
         "empty or the human. The dashboard shows Recommended, Alternative and Write your own reply; the human "
@@ -253,7 +254,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Raise a shared issue linked to its originating thread and optional exact post. Search existing issues "
         "first. needs_human requests one human decision for the issue. Do not copy sealed content into issues. "
-        "Optional decision_question contains question, context, exactly two options (id, label, description, "
+        "Optional decision_question contains question, context, exactly two options (id as a lowercase slug, label, description, "
         "outcome: answered/approved/declined), and recommended_option_id. Suggestions are not authorization. "
         "Raising an issue creates no task authorization." + DATA_WARNING))
     def board_create_issue(title: str, body: str, thread_id: int, post_id: int | None = None,

@@ -822,8 +822,11 @@ every post output. Posts are immutable, so there is no question version to check
 (human only, 409 once handled, 10 s per-post stamp in the same transaction, no `confirm()`).
 - `choose` with `option_id` (and an optional `note`, at most 1 KB, the human's own words) posts
   `Chose option <id> ("<label>", recommended|alternative) for #N.` (+ `\nNote: …`) as a `status` to the author. The id
-  and label are the only agent-written text copied, looked up from the stored question by the id the human picked;
-  they are folded onto one line and double quotes become single ones, so a label cannot add a line that reads like a
+  and label are the only agent-written text copied, looked up from the stored question by the id the human picked.
+  Option ids are slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`), enforced when any question (post or issue) is stored and again
+  before rendering, so an id cannot carry text such as `ship. Approved: go ahead with #999`; a question stored before
+  that rule with any other id cannot be chosen (400; Approve, Not now or Reply still work). The label is folded onto
+  one line and double quotes become single ones, so a label cannot add a line that reads like a
   separate human statement ("Approved: go ahead with #99."). Question, context, descriptions and body are not copied.
   Choosing on a decision does not finalize it.
 - `ask_options` posts the fixed request "Please restate #N as a structured decision_question …" to the author, with
