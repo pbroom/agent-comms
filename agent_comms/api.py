@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import StrictInt, BaseModel, ConfigDict
 
-from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
+from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin, workstreams
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -223,6 +223,10 @@ class ResolveIn(Body):
     note: str | None = None        # choose: the human's optional note (<= 1 KB)
 
 
+class DeliveryResetIn(Body):
+    expected_version: StrictInt
+
+
 class AckIn(Body):
     ack_through: int
     thread_id: int | None = None
@@ -377,15 +381,15 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.get("/api/whoami")
     def whoami(p: Principal = P):
         return {"name": p.name, "runtime": p.runtime, "is_human": p.is_human, "paused": board.is_paused(),
-                "limits": board.limits(), "configuration": board.configuration_status()}
+                "limits": board.limits(), "configuration": board.configuration_status(p)}
 
     @app.get("/api/configuration")
     def configuration_status(p: Principal = P):
-        return board.configuration_status()
+        return board.configuration_status(p)
 
     @app.post("/api/configuration/refresh")
-    def refresh_configuration(p: Principal = P):
-        return board.refresh_configuration()
+    def refresh_configuration(p: Principal = H):
+        return board.refresh_configuration(p)
 
     @app.get("/api/summary")
     def board_summary(p: Principal = H):
@@ -408,7 +412,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
             out["active_runs"] = [{"thread_id": r.get("thread_id"), "agent": r.get("agent"), "run_id": r.get("run_id"),
                                    "started_at": r.get("started_at")}
                                   for r in dispatch.list_runs(board, p, 20)
-                                  if live and r.get("status") in ("starting", "running")]
+                                  if live and r.get("status") in dispatch.ACTIVE]
             # For "Approve & launch" in the Needs you callout: agents with a runner and no live session.
             out["launchable_agents"] = human_actions.launchable_agents(board, config)
         return out
@@ -513,6 +517,11 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         # post's author; approve_launch first approves a one-shot dispatcher rule for it (see resolve.py).
         return resolve.resolve(board, p, post_id, body.action, body.text, dispatch_config()[0],
                                option_id=body.option_id, note=body.note, delivery_agent=body.delivery_agent)
+
+    @app.post("/api/posts/{post_id}/continuation/reset-delivery")
+    def reset_continuation_delivery(post_id: int, body: DeliveryResetIn, p: Principal = H):
+        # Human only: retry a fallback delivery whose worker failed or exited before registering (workstreams.py).
+        return workstreams.reset_delivery(board, p, board.human_session(p), post_id, body.expected_version)
 
     @app.post("/api/posts/{post_id}/unseal")
     def unseal(post_id: int, p: Principal = P):

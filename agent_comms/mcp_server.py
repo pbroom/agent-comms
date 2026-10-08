@@ -71,9 +71,10 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     def client_conversation(p: Principal) -> tuple[str, str] | None:
         # The Claude Code conversation that launched this stdio server, for the human's dashboard link. Read from
         # the environment Claude Code gave this process, never from tool arguments; HTTP clients are not captured.
-        # A Codex CLI started from a Claude Code terminal inherits the variable too, so Codex identities are
-        # skipped (their thread is found from Codex's own rollout files instead, conversations.CodexResolver).
-        if transport != "stdio" or p.runtime.lower().startswith("codex"):
+        # Any client started from a Claude Code terminal (Codex, Grok, a custom runtime) inherits the variable too,
+        # so only claude-code identities are captured (Codex threads are found from Codex's own rollout files
+        # instead, conversations.CodexResolver; other runtimes get no link rather than a wrong one).
+        if transport != "stdio" or not p.runtime.lower().startswith(conversations.CLAUDE):
             return None
         if not conversations.config_of(board.s).enabled:
             return None
@@ -87,13 +88,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
 
     @mcp.tool(description="Inspect this process's effective limits, rejected configuration and runtime refresh guidance." + DATA_WARNING)
     def board_configuration_status(ctx: Context = None) -> dict:
-        principal(ctx)
-        return board.configuration_status()
+        return board.configuration_status(principal(ctx))
 
-    @mcp.tool(description="Revalidate saved board configuration using this runtime. Never edits files or reloads code. Reconnect if runtime_source_changed is true." + DATA_WARNING)
+    @mcp.tool(description="Human only: revalidate saved board configuration using this runtime. Never edits files or reloads code. Reconnect to run new code if runtime_source_changed is true." + DATA_WARNING)
     def board_refresh_configuration(ctx: Context = None) -> dict:
-        principal(ctx)
-        return run(board.refresh_configuration)
+        p = principal(ctx)
+        return run(lambda: board.refresh_configuration(p))
 
     @mcp.tool(description=(
         "Register this agent session on the board and get a session_id. Call once at session start. "
@@ -151,7 +151,8 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Human standing grants returned by register/read can authorize matching task categories within their purpose. "
         "Choose a category honestly; a label does not authorize work outside the human goal. "
         "When you ask the human to CHOOSE, attach decision_question={question, context, options: exactly two "
-        "[{id, label, description, outcome: answered|approved|declined}], recommended_option_id}: your recommended "
+        "[{id (lowercase slug, ^[a-z0-9][a-z0-9_-]{0,31}$), label, description, outcome: answered|approved|declined}], "
+        "recommended_option_id}: your recommended "
         "option and one alternative, each description saying what it does and what it costs. Allowed on "
         "question/proposal/decision/request posts with needs_response=true (a decision always waits) and `to` "
         "empty or the human. The dashboard shows Recommended, Alternative and Write your own reply; the human "
@@ -253,7 +254,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Raise a shared issue linked to its originating thread and optional exact post. Search existing issues "
         "first. needs_human requests one human decision for the issue. Do not copy sealed content into issues. "
-        "Optional decision_question contains question, context, exactly two options (id, label, description, "
+        "Optional decision_question contains question, context, exactly two options (id as a lowercase slug, label, description, "
         "outcome: answered/approved/declined), and recommended_option_id. Suggestions are not authorization. "
         "Raising an issue creates no task authorization." + DATA_WARNING))
     def board_create_issue(title: str, body: str, thread_id: int, post_id: int | None = None,

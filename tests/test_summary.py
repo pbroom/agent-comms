@@ -352,3 +352,16 @@ def test_dashboard_state_lists_active_runs_for_the_human_only(senv, tmp_path):
     assert "active_runs" not in senv.client.get("/api/state", headers=senv.h("codex")).json()
     senv.clock.advance(3600)                   # the dispatcher loop stops heartbeating: its "running" runs are stale
     assert senv.client.get("/api/state", headers=senv.h()).json()["active_runs"] == []
+
+
+def test_active_runs_include_a_live_orphaned_run(senv, tmp_path):
+    from agent_comms.dispatch import Dispatcher
+    w = populate(senv, tmp_path)
+    key, value = senv.board.conn.execute(
+        "SELECT key, value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchone()
+    from agent_comms import db
+    with db.write_tx(senv.board.conn) as c:  # a restarted dispatcher found the run still alive
+        c.execute("UPDATE board_state SET value=? WHERE key=?", (json.dumps(json.loads(value) | {"status": "orphaned"}), key))
+    assert key.startswith(Dispatcher.RUN_PREFIX)
+    runs = senv.client.get("/api/state", headers=senv.h()).json()["active_runs"]
+    assert [(r["thread_id"], r["agent"]) for r in runs] == [(w["t1"], "codex")]

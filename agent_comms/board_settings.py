@@ -443,7 +443,10 @@ def update_settings(board: Board, p: Principal, changes: Any) -> dict:
         if new_text != old_text:
             atomic_write(local_path, new_text)
             _append_audit(board, entries)
-    board.reload_settings(force=True)
+    if not board.reload_settings(force=True):
+        # Never report success for settings this board is not running with.
+        raise Conflict("the settings were saved to " + LOCAL_SETTINGS + " but this board could not apply them ("
+                       + (board.settings_error or "unknown error") + "); the last valid settings remain active")
     out = get_settings(board, p)
     out["changed"] = [e["key"] for e in entries]
     return out

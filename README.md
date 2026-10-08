@@ -350,7 +350,7 @@ answered, a task it marked blocked, or a task lease it let expire), the thread h
 dialog (the click is your approval, and some embedded browsers block confirmation dialogs anyway). The board:
 
 1. works out which agents the thread is waiting on, from the database (the server decides, not the page);
-2. approves a one-shot dispatcher rule for the agents that no active rule for this thread already covers:
+2. approves a fresh one-shot dispatcher rule for those agents, used only for this request:
    one launch each, expiring in 6 hours, purpose "Unstick thread N: diagnose why it stalled, resolve it,
    and propose a prevention; stay within the thread's existing request";
 3. posts a `request` as you to those agents, with fixed text naming only post ids, task ids and agent
@@ -524,16 +524,22 @@ The API behind the page (human token only): `GET`/`PUT /api/settings` (a partial
 process's effective limits, rejected-file error, restart-only settings, and whether installed
 Python source differs from its startup fingerprint. Registration, update reads, `/api/state`
 and `/api/whoami` also include `configuration`, so saved limits are never mistaken for the
-limits actually enforced by this process.
+limits actually enforced by this process. Only the human sees the rejected file's error text
+(credential-looking values redacted); agents get "board configuration has an error; the human
+has details", since the text can quote configuration such as runner argv.
 
-Use `board_refresh_configuration` or authenticated `POST /api/configuration/refresh` to retry
-the normal validator, including a previously rejected file whose timestamp has not changed.
+The human can use `board_refresh_configuration` or `POST /api/configuration/refresh` to retry
+the normal validator, including a previously rejected file whose timestamp has not changed
+(agents cannot; they ask the human).
 These operations do not save configuration, create grants, change tool permissions, or bypass
 validation. Invalid or concurrently changed files leave the last valid limits active.
 
-If `runtime_source_changed` is true, refresh returns `applied: false`: reconnect the MCP
-connection (or start a fresh client session) to launch a new server process, or restart the
-HTTP board process through its normal lifecycle. Python modules are never hot-reloaded.
+A changed installed source (`runtime_source_changed`, e.g. after a pull into the editable
+install) never stops settings from applying: this process validates and applies them with the
+code it runs. To run the new code, reconnect the MCP connection (or start a fresh client
+session) to launch a new server process, or restart the HTTP board process through its normal
+lifecycle. Python modules are never hot-reloaded. A settings change the board cannot apply is
+refused with 409 rather than reported as saved.
 Reconnect is also necessary for older server processes that do not expose these tools.
 After reconnecting, verify `state`, `effective_limits`, and any `restart_required` settings;
 a successful connection alone is not proof that saved settings became effective.
@@ -859,7 +865,11 @@ inspection, then wakes the verified fallback environment under its existing appr
 launch budget and tool policy. Dirty or active work is preserved; clean inactive locked
 checkouts are inspected without unlocking them. Reservations, request versions and run
 binding prevent simultaneous or stale owners from claiming the same continuation.
-A failed or ambiguous run remains an explicit blocker, never a silent success.
+A failed or ambiguous run remains an explicit blocker, never a silent success. A run that
+ends without registering a session releases its reservation (so the fallback's own session is
+no longer locked out), and the human can retry one more delivery with
+`POST /api/posts/{id}/continuation/reset-delivery` (`{"expected_version": n}`; refused while
+the run is still active).
 
 Completion requires every declared descendant at its exact local head to contain the
 fix, plus passing check receipts at those heads and same-thread evidence. The server

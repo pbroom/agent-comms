@@ -16,6 +16,12 @@ Capture never trusts tool parameters or request bodies (DESIGN_NOTES "Conversati
   `<parent uuid>/subagents/*.jsonl`), so the transcript that recorded the board_register tool_result for a board
   session names the conversation by its file name (a subagent's: its parent's directory name). Only that UUID
   leaves this module.
+  An env-captured session is always stored as `claude-code`, never `claude-code-subagent`: Claude Code starts one
+  stdio MCP server per conversation and its subagents call tools through that same process, so the environment
+  (fixed when the process started) is identical for the parent and every subagent and offers no signal to tell
+  them apart. The stored UUID is still right for a subagent (its parent conversation, which is what a subagent
+  link opens); only the "subagent" label is missing. Telling them apart would need per-call metadata from Claude
+  Code, which it does not send, and is not inferred from tool arguments an agent controls.
 - Codex sets no such variable. Codex writes every MCP tool call and its result to its rollout file
   `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread uuid>.jsonl`, so `CodexResolver` finds the file that
   recorded the board_register result for a board session and takes the thread UUID from the file NAME. Rollout
@@ -68,6 +74,8 @@ ROLLOUT_RE = re.compile(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(" + UUI
 # start of the result, where register's first two keys are. Anchoring is what keeps a JSON-looking string inside the
 # result (the agent's own project path, say) from counting.
 _REGISTER_TEXT = re.compile(r'\{\s*\\*"session_id\\*"\s*:\s*(\d{1,12})\s*,\s*\\*"agent\\*"\s*:\s*\\*"([a-z][a-z0-9_-]{0,31})\\*"')
+_REGISTER_BOARD_TEXT = re.compile(r'\\*"board_id\\*"\s*:\s*\\*"([0-9a-f]{32})\\*"')
+BOARD_ID_RE = re.compile(r"[0-9a-f]{32}")
 _RESULT_KEYS = ("content", "text", "output", "result", "Ok", "structuredContent", "structured_content")
 
 # ClaudeResolver bounds. A Claude Code session is looked up while it is unlinked and was seen in the last
@@ -173,11 +181,12 @@ def _is_register_name(name: Any) -> bool:
                                                                                    "/board_register")))
 
 
-def _register_docs(x: Any, depth: int = 0) -> set[tuple[int, str, str | None]]:
-    """(session_id, agent, runtime) of the board_register result documents in a recorded tool result. Follows only
-    the containers results come in (content items, text, output, Ok/structured content) and JSON text inside them,
-    never argument or free-text fields, so text an agent wrote cannot pose as a result. runtime is None for result
-    text that is not valid JSON (the escape-tolerant pattern reads only session_id and agent) or not a string."""
+def _register_full(x: Any, depth: int = 0) -> set[tuple[int, str, str | None, str | None]]:
+    """(session_id, agent, runtime, board_id) of the board_register result documents in a recorded tool result.
+    Follows only the containers results come in (content items, text, output, Ok/structured content) and JSON text
+    inside them, never argument or free-text fields, so text an agent wrote cannot pose as a result. runtime is None
+    for result text that is not valid JSON (the escape-tolerant pattern reads only session_id, agent and board_id)
+    or not a string; board_id is None when the result has none (a server from before board ids) or it is malformed."""
     if depth > 6:
         return set()
     if isinstance(x, str):
@@ -185,32 +194,43 @@ def _register_docs(x: Any, depth: int = 0) -> set[tuple[int, str, str | None]]:
         if not s.startswith(("{", "[")):
             return set()
         try:
-            return _register_docs(json.loads(s), depth + 1)
+            return _register_full(json.loads(s), depth + 1)
         except ValueError:
             m = _REGISTER_TEXT.match(s)
-            return {(int(m.group(1)), m.group(2), None)} if m else set()
+            if not m:
+                return set()
+            b = _REGISTER_BOARD_TEXT.search(s)
+            return {(int(m.group(1)), m.group(2), None, b.group(1) if b else None)}
     if isinstance(x, list):
-        return set().union(*(_register_docs(i, depth + 1) for i in x[:20]))
+        return set().union(*(_register_full(i, depth + 1) for i in x[:20]))
     if isinstance(x, dict):
         sid, agent = x.get("session_id"), x.get("agent")
         if isinstance(sid, int) and not isinstance(sid, bool) and isinstance(agent, str) and "runtime" in x:
-            return {(sid, agent, x["runtime"] if isinstance(x["runtime"], str) else None)}
-        return set().union(*(_register_docs(x[k], depth + 1) for k in _RESULT_KEYS if k in x))
+            board = x.get("board_id")
+            return {(sid, agent, x["runtime"] if isinstance(x["runtime"], str) else None,
+                     board if isinstance(board, str) and BOARD_ID_RE.fullmatch(board) else None)}
+        return set().union(*(_register_full(x[k], depth + 1) for k in _RESULT_KEYS if k in x))
     return set()
 
 
-def _register_ids(x: Any) -> set[tuple[int, str]]:
-    """(session_id, agent) of the board_register result documents in a recorded tool result (see _register_docs)."""
-    return {(sid, agent) for sid, agent, _ in _register_docs(x)}
+def _register_docs(x: Any) -> set[tuple[int, str, str | None]]:
+    """(session_id, agent, runtime) of the board_register result documents in a recorded tool result."""
+    return {(sid, agent, runtime) for sid, agent, runtime, _ in _register_full(x)}
 
 
-def register_results(lines: Iterable[str]) -> set[tuple[int, str]]:
+def _register_ids(x: Any) -> set[tuple[int, str, str | None]]:
+    """(session_id, agent, board_id) of the board_register result documents in a recorded tool result."""
+    return {(sid, agent, board) for sid, agent, _, board in _register_full(x)}
+
+
+def register_results(lines: Iterable[str]) -> set[tuple[int, str, str | None]]:
     """Every board_register result recorded in a rollout file's lines. Two layouts are recognized:
     - one record per call with its result: `payload.item` (or `payload`, `payload.msg`) carrying `tool` (or
       `invocation.tool`) == board_register and `result` (Codex's McpToolCall item, mcp_tool_call_end);
     - a call record with `name` ending in board_register and a `call_id`, then an output record with that
-      `call_id` and `output` (function_call / function_call_output)."""
-    found: set[tuple[int, str]] = set()
+      `call_id` and `output` (function_call / function_call_output).
+    Each is (session_id, agent, board_id or None)."""
+    found: set[tuple[int, str, str | None]] = set()
     call_ids: set[str] = set()
     for line in lines:
         if "board_register" not in line and not (call_ids and '"call_id"' in line and any(c in line for c in call_ids)):
@@ -266,9 +286,15 @@ class CodexResolver:
         now = self.clock()
         return [s for s in session_ids if now - self._tried.get(s, -1e18) >= RETRY_SECONDS]
 
-    def resolve(self, sessions: list[dict]) -> dict[int, str]:
+    def resolve(self, sessions: list[dict], board_id: str | None = None,
+                legacy_before: float | None = None) -> dict[int, str]:
         """sessions: [{"id", "agent", "started_at"}] still unlinked. Returns {board session id: thread uuid} for the
-        ones found. A session that is not found is not looked up again for RETRY_SECONDS."""
+        ones found. A session that is not found is not looked up again for RETRY_SECONDS.
+
+        Session ids are per board, and several boards (a test board, a second checkout) can share one CODEX_HOME, so
+        with `board_id` a result counts only when it carries this board's id. A result without one was written by a
+        server from before board ids; it counts only for a session that started before `legacy_before` (when this
+        board first issued its id), since every later registration on this board returned the id."""
         now = self.clock()
         due = set(self.due(s["id"] for s in sessions))
         todo = [s for s in sessions if s["id"] in due]
@@ -279,16 +305,23 @@ class CodexResolver:
         if len(self._tried) > 1000:   # forget old misses
             self._tried = {k: v for k, v in self._tried.items() if now - v < RECENT_SECONDS}
         files = self._candidates(min(s["started_at"] for s in todo) - SLACK_SECONDS)
-        parsed: dict[Path, set[tuple[int, str]]] = {}
+        parsed: dict[Path, set[tuple[int, str, str | None]]] = {}
         out: dict[int, str] = {}
         for s in todo:
             mine = sorted((f for f in files if f.mtime >= s["started_at"] - SLACK_SECONDS),
                           key=lambda f: f.mtime, reverse=True)[:MAX_FILES]
             hits = []
+            if board_id is None:
+                keys = {(s["id"], s["agent"])}
+            else:
+                keys = {(s["id"], s["agent"], board_id)}
+                if legacy_before is not None and s["started_at"] < legacy_before:
+                    keys.add((s["id"], s["agent"], None))
             for f in mine:
                 if f.path not in parsed:
                     parsed[f.path] = self._read(f.path)
-                if (s["id"], s["agent"]) in parsed[f.path]:
+                found = parsed[f.path] if board_id is not None else {r[:2] for r in parsed[f.path]}
+                if keys & found:
                     hits.append(f)
             if hits:
                 out[s["id"]] = self._pick(hits, s["started_at"])
@@ -326,7 +359,7 @@ class CodexResolver:
         return out
 
     @staticmethod
-    def _read(path: Path) -> set[tuple[int, str]]:
+    def _read(path: Path) -> set[tuple[int, str, str | None]]:
         try:
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(fd, "rb") as f:

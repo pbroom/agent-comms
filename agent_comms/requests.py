@@ -133,9 +133,15 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         raise Invalid('internal request mutation requires an active transaction')
     with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)):
         post,row = _context(board,p,session_id,post_id,recipient)
+        # The assigned agent finishing work it never started (queued or blocked -> finished) executed it all the
+        # same, so it passes the same browser and tool-preflight gates as a start; otherwise self-posted evidence
+        # could skip them. A finish after a start was gated at the start (its probe may have expired since).
+        unstarted_finish = (state == 'finished' and not recover_blocked and not p.is_human
+                            and p.name == row['assigned_agent'] and row['state'] not in ('started', 'finished'))
         if state == 'started':
             from . import decision_actions
             decision_actions.assert_execution_authorized(board, post_id, row['assigned_agent'])
+        if state == 'started' or unstarted_finish:
             from . import browser_readiness
             browser_readiness.assert_request_ready(board,post_id,recipient,session_id)
             from . import runner_preflight
@@ -238,7 +244,7 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         decision_actions.assert_execution_authorized(board, post_id, target['agent'])
         if post['task_id'] is not None:
             task=board.conn.execute('SELECT * FROM tasks WHERE id=?',(post['task_id'],)).fetchone()
-            if task is None or not board._task_authorization_active(task,target['agent']):
+            if task is None or not board._task_authorizable(task,target['agent']):
                 raise Forbidden('target lacks active authorization for the linked task')
         project=board._thread_row(post['thread_id'])['project']
         if not capabilities.eligible(board,target_session_id,project,required_capabilities):

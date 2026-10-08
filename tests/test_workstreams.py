@@ -173,6 +173,83 @@ def test_takeover_preserves_active_unknown_or_dirty_owner(stack, obstacle):
     assert git(stack["owner_path"], "status", "--porcelain") == before
 
 
+def _tick_rule(stack):
+    env = stack["env"]
+    return env.board.create_dispatch_rule(env.p["human"], thread_id=stack["thread"], agents=["codex", "claude"],
+                                          purpose="Propagate this approved stack fix", max_launches=2)
+
+
+def test_a_healthy_lease_owner_is_neither_blocked_nor_resequenced(stack, monkeypatch):
+    from agent_comms import workstreams
+    env = stack["env"]
+    _tick_rule(stack)
+    post = create(stack)
+    progress(stack, post, "started")                         # started, then claimed: a live lease
+    env.clock.advance(121)                                   # past the acknowledgement deadline, within the lease
+    env.board.heartbeat(env.p["codex"], env.sid["codex"])
+    seq = env.board.get_post(env.p["human"], post["id"])["seq"]
+    calls = []
+    monkeypatch.setattr(workstreams, "_run_git", lambda *a: calls.append(a) or "")
+    workstreams.tick(env.board, env.p["human"])
+    managed = workstreams.get_for_post(env.board, post["id"])
+    lease = env.board._task_row(post["task_id"])["lease_expires_at"]
+    assert managed["blocker"] == "" and calls == []
+    assert env.board.get_post(env.p["human"], post["id"])["seq"] == seq
+    assert managed["deadline"] == lease and current(stack, post)["assigned_session"] == env.sid["codex"]
+
+
+def test_git_runs_outside_the_write_transaction_and_blocked_ticks_back_off(stack, monkeypatch):
+    from agent_comms import workstreams
+    env = stack["env"]
+    _tick_rule(stack)
+    post = create(stack)
+    (stack["owner_path"] / "unfinished").write_text("keep me\n")    # a lasting blocker
+    env.clock.advance(121)
+    probe(stack, "codex")
+    probe(stack, "claude")
+    real, calls = workstreams._run_git, []
+
+    def spy(path, *args):
+        assert not env.board.conn.in_transaction, "git ran inside the write transaction"
+        calls.append(args)
+        return real(path, *args)
+    monkeypatch.setattr(workstreams, "_run_git", spy)
+    workstreams.tick(env.board, env.p["human"])
+    assert "unfinished changes" in workstreams.get_for_post(env.board, post["id"])["blocker"]
+    first = len(calls)
+    assert first > 0
+    seq = env.board.get_post(env.p["human"], post["id"])["seq"]
+    passes = 0
+    for _ in range(60):                                      # five minutes of 5-second dispatcher ticks
+        before = len(calls)
+        env.clock.advance(5)
+        probe(stack, "codex")                                # the owner stays idle: the same blocker throughout
+        workstreams.tick(env.board, env.p["human"])
+        passes += len(calls) > before
+    assert passes <= 7, passes                               # 5, 10, 20, 40, 80, 160 s ...: not 60 passes
+    assert env.board.get_post(env.p["human"], post["id"])["seq"] == seq
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]
+
+
+def test_takeover_rechecks_git_live_when_the_checkout_changed_after_inspection(stack, monkeypatch):
+    from agent_comms import workstreams
+    env = stack["env"]
+    post = create(stack)
+    env.clock.advance(121)
+    probe(stack, "codex")
+    probe(stack, "claude")
+    real = workstreams._inspect
+
+    def inspect_then_dirty(board, post_id):
+        real(board, post_id)                                  # recorded: the owner checkout is clean
+        (stack["owner_path"] / "unfinished").write_text("written after the inspection\n")
+    monkeypatch.setattr(workstreams, "_inspect", inspect_then_dirty)
+    route(stack, post)
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]      # no takeover on stale results
+    assert "unfinished changes" in workstreams.get_for_post(env.board, post["id"])["blocker"]
+    assert (stack["owner_path"] / "unfinished").exists()
+
+
 def test_simultaneous_takeover_has_one_winner_and_fences_old_owner(stack):
     post = create(stack)
     env = stack["env"]
@@ -286,6 +363,7 @@ def test_dispatch_active_or_unresolved_run_blocks_idle_takeover(stack, status):
 def test_server_confirmed_ended_dispatch_can_replace_missing_idle_attestation(stack):
     env = stack["env"]
     dispatch_record(stack, "running")
+    earlier = env.sid["codex"]                    # the codex session already registered at the owner checkout
     env.sid["codex"] = env.board.register_session(env.p["codex"], str(stack["repo"]), str(stack["owner_path"]),
                                                  dispatch_run_id="owner-run")["session_id"]
     stack["spec"]["owner_session"] = env.sid["codex"]
@@ -293,6 +371,12 @@ def test_server_confirmed_ended_dispatch_can_replace_missing_idle_attestation(st
     env.clock.advance(121)
     dispatch_record(stack, "exited", ended_at=env.clock())
     probe(stack, "claude")
+    # The ended run vouches only for its own session: the earlier session at the same checkout must be shown
+    # inactive too (finding: one ended session must not hide a possibly active one).
+    assert route(stack, post)["assigned_session"] == env.sid["codex"]
+    env.board.heartbeat(env.p["codex"], earlier)
+    capabilities.register(env.board, env.p["codex"], earlier, ["git:write"], "Idle at the owner checkout",
+                          activity="idle")
     routed = route(stack, post)
     assert routed["assigned_session"] == env.sid["claude"]
 
@@ -426,6 +510,30 @@ def test_takeover_inspects_every_checked_out_descendant(stack, tmp_path, checkou
     expected = "claude" if checkout_state == "idle" else "codex"
     assert current(stack, post)["assigned_session"] == env.sid[expected]
     assert git(peer_path, "status", "--porcelain") == before
+
+
+def test_one_idle_session_cannot_vouch_for_another_possibly_active_one_at_a_checkout(stack, tmp_path):
+    env = stack["env"]
+    peer_path = tmp_path / "other-descendant"
+    git(stack["repo"], "worktree", "add", "-b", "child-two", str(peer_path), "child")
+    post = create(stack, descendants=["refs/heads/child", "refs/heads/child-two"])
+    # A second grok session at the checkout, quiet for five minutes with unknown activity: possibly still working.
+    quiet = env.board.register_session(env.p["grok"], str(stack["repo"]), str(peer_path))["session_id"]
+    env.board.register_session(env.p["grok"], str(stack["repo"]), str(peer_path), resume_session_id=env.sid["grok"])
+    env.clock.advance(300)
+    for name in ("codex", "claude", "grok"):
+        probe(stack, name)                                    # the other grok session is freshly idle
+    route(stack, post)
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]
+    assert "Owner activity is unknown" in env.board.conn.execute(
+        "SELECT blocker FROM continuations WHERE post_id=?", (post["id"],)).fetchone()[0]
+    # Once that session has been silent for a whole lease TTL it is long ended and no longer blocks.
+    env.clock.advance(env.settings.lease_ttl_minutes * 60)
+    for name in ("codex", "claude", "grok"):
+        probe(stack, name)
+    route(stack, post)
+    assert current(stack, post)["assigned_session"] == env.sid["claude"]
+    assert quiet != env.sid["grok"]
 
 
 def test_unscoped_root_cannot_expand_into_agent_created_continuation(stack):

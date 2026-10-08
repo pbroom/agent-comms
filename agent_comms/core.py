@@ -16,6 +16,8 @@ from pathlib import Path
 import logging
 import math
 import os
+import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -52,11 +54,59 @@ def _runtime_source_fingerprint() -> str:
 _LOADED_SOURCE_FINGERPRINT = _runtime_source_fingerprint()
 
 
+def _source_stat_signature() -> tuple:
+    return tuple((p.name, st.st_mtime_ns, st.st_size) for p in sorted(Path(__file__).parent.glob("*.py"))
+                 for st in (p.stat(),))
+
+
+# The last source stat signature and whether the source then differed from what this process loaded. The ~0.5 MB
+# source is hashed again only when a file's mtime or size changes, so status reads stay cheap.
+_SOURCE_CHECK: dict = {"stat": _source_stat_signature(), "changed": False}
+
+
 def _runtime_source_changed() -> bool:
+    """Whether the installed agent_comms source differs from what this process loaded (it needs a restart to run the
+    new code). Reported in configuration_status only: it never stops settings from being applied."""
     try:
-        return _runtime_source_fingerprint() != _LOADED_SOURCE_FINGERPRINT
+        sig = _source_stat_signature()
+        if sig != _SOURCE_CHECK["stat"]:
+            _SOURCE_CHECK.update(stat=sig, changed=_runtime_source_fingerprint() != _LOADED_SOURCE_FINGERPRINT)
+        return _SOURCE_CHECK["changed"]
     except OSError:
         return True  # unavailable source cannot prove compatibility
+
+
+_SECRET_WORD = (r"(?:api[_-]?key|access[_-]?key|private[_-]?key|session[_-]?key|key|token|secret|passw(?:or)?d|pwd|"
+                r"auth(?:orization)?|bearer|credential|cookie)s?")
+# A value: double- or single-quoted (kept quoted, contents replaced) or bare.
+_VALUE = r"""(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;'"]+)"""
+# name = value / name: value, the name possibly quoted (`token = "x"`, `'KEY': 'x'`, `"api_key": "x"`).
+_SECRET_ASSIGNMENT = re.compile(r"(?i)((?<![\w-])[\"']?[\w.-]*" + _SECRET_WORD + r"[\w.-]*[\"']?\s*[=:]\s*)(" + _VALUE + ")")
+# --flag value, --flag=value, and an argv pair written as list items (`"--api-key", "x"`).
+_SECRET_FLAG = re.compile(r"(?i)((?<![\w-])[\"']?--?[\w-]*" + _SECRET_WORD + r"[\w-]*[\"']?(?:\s*,\s*|\s+|=))(" + _VALUE + ")")
+_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+(?!\[redacted\])\S+")
+_SECRET_VALUE = re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghs|xox[abp]|glpat|AKIA)[-_A-Za-z0-9]{6,}|"
+                           r"\b[A-Za-z0-9+/_-]{32,}={0,2}")
+
+
+def _redact_value(m: re.Match) -> str:
+    value = m.group(2)
+    if value == "[redacted]" or value.startswith(("[redacted]", '"[redacted]"', "'[redacted]'")):
+        return m.group(0)
+    quote = value[0] if value[:1] in "\"'" and len(value) > 1 and value[-1] == value[0] else ""
+    return m.group(1) + quote + "[redacted]" + quote
+
+
+CONFIG_ERROR_FOR_AGENTS = "board configuration has an error; the human has details"
+
+
+def redact_secrets(text: str) -> str:
+    """Configuration error text with values that look like credentials replaced (`--api-key=...`, `token: ...`,
+    `sk-...`, long opaque strings). Applied before the text is stored or shown, even to the human."""
+    text = _BEARER.sub(r"\1 [redacted]", text)
+    text = _SECRET_FLAG.sub(_redact_value, text)
+    text = _SECRET_ASSIGNMENT.sub(_redact_value, text)
+    return _SECRET_VALUE.sub("[redacted]", text)
 
 
 # Settings a running Board applies when board.toml or board.local.toml changes (Board.reload_settings); the
@@ -320,8 +370,9 @@ class Board:
         if self.s.config_path is None:
             return False
         with self._settings_lock:
-            if _runtime_source_changed():
-                return False
+            # A changed installed source (any pull or edit of the editable install) does not stop settings from
+            # applying: they are validated by this process's own code, and configuration_status reports the
+            # stale code separately (runtime_source_changed).
             sig = self._settings_files_sig()
             if not force and sig == self._settings_sig:
                 return False
@@ -332,10 +383,8 @@ class Board:
                 if self._settings_files_sig() != sig:
                     raise ValueError("configuration changed while being read; retry refresh")
             except Exception as e:  # malformed TOML, unknown key, wrong type: keep running on the last good values
-                self.settings_error = f"{type(e).__name__}: {e}"[:500]
+                self.settings_error = redact_secrets(f"{type(e).__name__}: {e}")[:500]
                 log.warning("settings not reloaded; keeping the last good settings: %s", self.settings_error)
-                return False
-            if _runtime_source_changed():
                 return False
             self.settings_error = None
             for k in RELOADABLE_INT + RELOADABLE_BOOL + RELOADABLE_WEB:
@@ -352,8 +401,10 @@ class Board:
             self.settings_generation += 1
             return True
 
-    def configuration_status(self) -> dict:
-        """Safe process-local status: effective limits only, never dispatch commands or credentials."""
+    def configuration_status(self, p: Principal | None = None) -> dict:
+        """Safe process-local status: effective limits only, never dispatch commands or credentials. The detailed
+        `error` (credential-looking values redacted) goes to the human only; anyone else (p None or an agent) gets
+        CONFIG_ERROR_FOR_AGENTS, since the text can quote configuration such as runner argv."""
         source_changed = _runtime_source_changed()
         with self._settings_lock:
             stale = self.settings_error is not None
@@ -362,23 +413,24 @@ class Board:
                      "current" if self.s.config_path else "unmanaged")
             return {
                 "state": state, "generation": self.settings_generation,
-                "error": self.settings_error, "effective_limits": self.limits(),
+                "error": (None if self.settings_error is None else self.settings_error
+                          if p is not None and p.is_human else CONFIG_ERROR_FOR_AGENTS),
+                "effective_limits": self.limits(),
                 "restart_required": restart, "runtime_source_changed": source_changed,
                 "loaded_source_fingerprint": _LOADED_SOURCE_FINGERPRINT,
-                "refresh_supported": self.s.config_path is not None and not source_changed,
-                "recovery": ("Reconnect this MCP session or restart this board process to load the installed code; "
-                             "refresh cannot reload Python modules." if source_changed else
-                             "Correct the saved configuration or update this runtime, then refresh; the last valid limits remain active."
-                             if stale else "Restart this process to apply the listed settings." if restart else None),
+                "refresh_supported": self.s.config_path is not None,
+                "recovery": ("Correct the saved configuration, then refresh; the last valid limits remain active."
+                             if stale else "Restart this process to apply the listed settings." if restart else
+                             "Settings still apply; reconnect this MCP session or restart this board process to run "
+                             "the installed code (refresh cannot reload Python modules)." if source_changed else None),
             }
 
-    def refresh_configuration(self) -> dict:
-        """Retry the normal validator only; no configuration writes, module reloads, or policy overrides."""
-        status = self.configuration_status()
-        if status["runtime_source_changed"]:
-            return {**status, "applied": False}
+    def refresh_configuration(self, p: Principal) -> dict:
+        """Human only. Retry the normal validator only; no configuration writes, module reloads, or policy
+        overrides. Settings apply even when the installed source changed (status reports that separately)."""
+        self._require_human(p, "refresh the board configuration")
         applied = self.reload_settings(force=True)
-        return {**self.configuration_status(), "applied": applied}
+        return {**self.configuration_status(p), "applied": applied}
 
     def refresh_identities(self) -> None:
         """Pick up agents.toml and settings edits; run before every authentication (bearer or web session)."""
@@ -730,14 +782,22 @@ class Board:
                                 f'grant {grant_id} revoked')
         return self._grant_out(self.conn.execute('SELECT * FROM authorization_grants WHERE id=?', (grant_id,)).fetchone())
 
-    def _matching_grant(self, p: Principal, task: sqlite3.Row) -> sqlite3.Row | None:
+    def _matching_grant(self, p: Principal | str, task: sqlite3.Row) -> sqlite3.Row | None:
         if not task['category']:
             return None
+        name = p if isinstance(p, str) else p.name
         project = self._thread_row(task['thread_id'])['project']
         rows = self.conn.execute('''SELECT * FROM authorization_grants WHERE project=? AND category=?
             AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?) ORDER BY id DESC''',
             (project, task['category'], self.now()))
-        return next((r for r in rows if p.name in json.loads(r['agents'])), None)
+        return next((r for r in rows if name in json.loads(r['agents'])), None)
+
+    def _task_authorizable(self, task: sqlite3.Row, agent: str) -> bool:
+        """Whether `agent` holds, or would gain on its explicit claim, authorization for this task: an active
+        recorded authorization, or a matching active human standing grant for a task that can still be claimed.
+        Routing uses this so a granted agent is not refused before it has had the chance to claim."""
+        return self._task_authorization_active(task, agent) or (
+            task['status'] not in TERMINAL and self._matching_grant(agent, task) is not None)
 
     def _task_authorization_active(self, task: sqlite3.Row, agent: str | None = None) -> bool:
         if task['authorization_source'] == 'human':
@@ -797,7 +857,13 @@ class Board:
                 except (ValueError, TypeError):
                     run = {}
                 thread = c.execute("SELECT project FROM threads WHERE id=?", (run.get("thread_id"),)).fetchone()
-                if run.get("agent") != p.name or run.get("status") not in ("starting", "running") or not thread or thread["project"] != project:
+                from . import dispatch
+                # dispatch.ACTIVE: a run a restarted dispatcher marked 'orphaned' is still a live run (its worker may
+                # register late), as long as its process is still there.
+                live = run.get("status") in dispatch.ACTIVE and (
+                    run.get("status") != "orphaned"
+                    or dispatch.probe_process(run.get("pid"), run.get("proc_start")) != "dead")
+                if run.get("agent") != p.name or not live or not thread or thread["project"] != project:
                     raise Forbidden("dispatch run does not match this active agent and project")
                 existing = c.execute("SELECT id FROM sessions WHERE dispatch_run_id=?", (dispatch_run_id,)).fetchone()
                 if existing and existing["id"] != resume_session_id:
@@ -840,9 +906,24 @@ class Board:
                 from . import workstreams
                 workstreams.bind_delivery(self, p, sid, dispatch_run_id)
         return {"session_id": sid, "agent": p.name, "runtime": p.runtime, "is_human": p.is_human,
+                "board_id": self.board_identity()[0],
                 "project": project, "worktree": worktree, "paused": self.is_paused(), "limits": self.limits(),
-                "configuration": self.configuration_status(),
+                "configuration": self.configuration_status(p),
                 "notice": UNTRUSTED_NOTICE, "authorization_grants": self.list_grants(p, project)}
+
+    BOARD_ID_KEY = "board.id"
+
+    def board_identity(self) -> tuple[str, float]:
+        """This board's stable random id and when it was first issued. Returned by register so the Codex rollout
+        lookup can tell this board's register results from another board's sharing the same CODEX_HOME."""
+        row = self.conn.execute("SELECT value, updated_at FROM board_state WHERE key = ?", (self.BOARD_ID_KEY,)).fetchone()
+        if row is None:
+            with db.write_tx(self.conn) as c:
+                c.execute("INSERT OR IGNORE INTO board_state(key, value, updated_by, updated_at) VALUES (?,?,?,?)",
+                          (self.BOARD_ID_KEY, json.dumps(secrets.token_hex(16)), "server", self.now()))
+            row = self.conn.execute("SELECT value, updated_at FROM board_state WHERE key = ?",
+                                    (self.BOARD_ID_KEY,)).fetchone()
+        return json.loads(row["value"]), row["updated_at"]
 
     def _session(self, p: Principal, session_id: int | None, touch: bool = True) -> sqlite3.Row:
         if session_id is None:
@@ -1079,8 +1160,9 @@ class Board:
                 if to and _answer_recipient is None and not intended.issubset(set(to)):
                     raise Invalid('answer recipients must include every source author')
                 to = to or sorted(intended)
-                if to and t['status']=='closed':
-                    raise Conflict('reopen the thread before assigning an exact answer for agent pickup')
+                # Only the human can post here when the thread is closed (checked above). Their answer is recorded
+                # and clears the Needs you item; the request it makes for the source authors stays dormant (agents
+                # cannot update requests, post or be launched on a closed thread) until the human reopens it.
 
             if continuation is not None:
                 continuation = workstreams.prepare(self, p, session_id, thread_id, continuation)
@@ -1129,6 +1211,8 @@ class Board:
                  task_id, json.dumps(refs), int(bool(sealed)), int(bool(sealed)), int(bool(final)),
                  now if final else None, now, json.dumps(question) if question else None),
             ).lastrowid
+            if propose_task is not None:
+                c.execute("UPDATE tasks SET proposed_by_post = ? WHERE id = ?", (post_id, task_id))
             if continuation is not None:
                 workstreams.create(self, p, session_id, post_id, continuation)
             for source_id in answer_to or []:
@@ -1453,7 +1537,7 @@ class Board:
             "my_tasks": my_tasks,
             "issues": issues.list_issues(self, p, project=None if p.is_human else s["project"], thread_id=thread_id),
             "issues_notice": "Issues are a current snapshot, independent of the post cursor. Decisions apply only to their recorded scope; links and comments grant no authority.",
-            "configuration": self.configuration_status(),
+            "configuration": self.configuration_status(p),
             "authorization_grants": self.list_grants(p, s["project"]),
         }
         if acked is not None:
@@ -1761,11 +1845,13 @@ class Board:
     # Human-only; the human sees every post, so no visibility predicate is needed.
     # Waiting on the human: needs-response posts addressed to nobody or to the human; open (unfinalized) decisions;
     # and agents' proposals addressed to nobody or to the human, which need the human's yes or no (a proposal
-    # that only proposes a task is left to the task flow, and one addressed to agents is between agents).
+    # that created its task via propose_task is left to the task flow, and one addressed to agents is between
+    # agents). A proposal that merely refers to an existing task (task_id) still needs the human's answer.
     NEEDS_YOU_SOURCE = """((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                         JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1)))
                      OR (p.type = 'decision' AND p.final = 0)
-                     OR (p.type = 'proposal' AND p.task_id IS NULL
+                     OR (p.type = 'proposal'
+                         AND NOT EXISTS (SELECT 1 FROM tasks pt WHERE pt.id = p.task_id AND pt.proposed_by_post = p.id)
                          AND EXISTS (SELECT 1 FROM agents pa WHERE pa.name = p.agent AND pa.is_human = 0)
                          AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                               JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))))
@@ -1781,6 +1867,26 @@ class Board:
     ISSUE_GOVERNS = """EXISTS (SELECT 1 FROM issue_links il JOIN issues i ON i.id = il.issue_id
                    WHERE il.post_id = p.id AND il.covers_post = 1 AND i.status != 'resolved')"""
     NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT " + ISSUE_GOVERNS
+
+    def _session_out(self, r: sqlite3.Row, p: Principal, links: bool) -> dict:
+        """One session as the dashboard shows it (snapshot `sessions`; Unstick / Approve & launch `sessions_detail`)."""
+        d = {k: r[k] for k in r.keys() if k not in ("client_kind", "client_session_id")}
+        d |= {"started_at": iso(r["started_at"]), "last_seen": iso(r["last_seen"])}
+        if p.is_human:
+            d["conversation"] = self._conversation(r) if links else None
+        return d
+
+    def session_details(self, p: Principal, session_ids: list[int]) -> list[dict]:
+        """These sessions in the snapshot's session shape, in the given order (human only). For the one-click
+        actions' receivers, which the snapshot's capped `sessions` list may not include."""
+        self._require_human(p, "view session details")
+        ids = [i for i in session_ids if isinstance(i, int) and not isinstance(i, bool)]
+        if not ids:
+            return []
+        links = conversations.config_of(self.s).enabled
+        rows = {r["id"]: r for r in self.conn.execute(
+            f"SELECT * FROM sessions WHERE id IN ({','.join('?' * len(ids))})", ids)}
+        return [self._session_out(rows[i], p, links) for i in ids if i in rows]
 
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""
@@ -1799,13 +1905,8 @@ class Board:
         links = p.is_human and conversations.config_of(self.s).enabled
         if links:
             self.resolve_conversations()
-        sessions = []
-        for r in self.conn.execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 30"):
-            d = {k: r[k] for k in r.keys() if k not in ("client_kind", "client_session_id")}
-            d |= {"started_at": iso(r["started_at"]), "last_seen": iso(r["last_seen"])}
-            if p.is_human:
-                d["conversation"] = self._conversation(r) if links else None
-            sessions.append(d)
+        sessions = [self._session_out(r, p, links)
+                    for r in self.conn.execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 30")]
         if p.is_human:
             # Task rows link to the owner's conversation while it holds or works the task.
             owners: dict[int, dict | None] = {}
@@ -1828,7 +1929,7 @@ class Board:
                 f"SELECT p.* FROM posts p WHERE {self.NEEDS_YOU} ORDER BY p.id DESC LIMIT 50")]
         return {"notice": UNTRUSTED_NOTICE, "me": {"name": p.name, "runtime": p.runtime, "is_human": p.is_human},
                 "paused": self.is_paused(), "limits": self.limits(), "now": iso(self.now()),
-                "configuration": self.configuration_status(),
+                "configuration": self.configuration_status(p),
                 "authorization_grants": self.list_grants(p), "task_categories": list(TASK_CATEGORIES),
                 "threads": threads, "sessions": sessions, "needs_you": needs_you,
                 "issues": shared_issues,
@@ -1891,7 +1992,9 @@ class Board:
                 """SELECT id, agent, started_at FROM sessions WHERE client_session_id IS NULL AND runtime LIKE 'codex%'
                    AND last_seen >= ? ORDER BY id DESC LIMIT 50""",
                 (self.now() - conversations.RECENT_SECONDS,)).fetchall()
-            found = self._codex_resolver(cfg).resolve([dict(r) for r in rows]) if rows else {}
+            board_id, issued_at = self.board_identity()
+            found = self._codex_resolver(cfg).resolve([dict(r) for r in rows], board_id=board_id,
+                                                      legacy_before=issued_at) if rows else {}
             for sid, thread in found.items():
                 if conversations.normalize_uuid(thread) is None:
                     continue

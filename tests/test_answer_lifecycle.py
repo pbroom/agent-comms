@@ -181,23 +181,43 @@ def test_empty_or_only_informational_thread_cannot_autoclose(env):
     assert result=={'closed_thread_ids':[],'resolved_issue_ids':[]}
 
 
-def test_closed_issue_target_rolls_back_every_selected_answer(env):
+def test_issue_answer_reaches_a_closed_linked_thread_and_waits_there(env):
     first,second=env.thread(),env.thread()
     issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=first)
     issues.link_issue(env.board,env.p['claude'],env.sid['claude'],issue['id'],second)
     env.board.set_thread_status(env.p['human'],second,'closed')
-    with pytest.raises(Conflict,match='reopen'):
-        issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Both',[first,second])
-    assert not env.board.conn.execute('SELECT 1 FROM posts').fetchone()
-    assert not env.board.conn.execute("SELECT 1 FROM issue_comments WHERE kind='decision'").fetchone()
+    issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Both',[first,second])
+    answers={p['thread_id']:p for p in env.board.conn.execute("SELECT * FROM posts WHERE agent='human'")}
+    assert set(answers)=={first,second}
+    assert env.board.get_thread(env.p['human'],second)['status']=='closed'   # answering does not reopen it
 
 
-def test_closed_thread_rejects_new_answer_assignment(env):
+def test_human_may_answer_on_a_closed_thread_and_its_request_waits_for_a_reopen(env):
+    """Closed-thread Needs you items: the human answers (not only dismisses); agents still cannot post or act
+    there, and the answer's request becomes actionable when the human reopens the thread."""
+    source=question(env,env.thread())
+    tid=source['thread_id']
+    env.board.set_thread_status(env.p['human'],tid,'closed')
+    assert source['id'] in pending(env)
+    linked=answer(env,source)
+    assert linked['answer_to']==[source['id']] and linked['to']==['codex']
+    assert source['id'] not in pending(env)
+    with pytest.raises(Conflict,match='closed'):
+        env.post('codex',tid,'Working on it')
+    with pytest.raises(Conflict,match='closed'):
+        requests.progress(env.board,env.p['codex'],env.sid['codex'],linked['id'],'codex','started')
+    env.board.set_thread_status(env.p['human'],tid,'open')
+    assert requests.progress(env.board,env.p['codex'],env.sid['codex'],linked['id'],'codex','started')['state']=='started'
+
+
+def test_resolve_on_a_closed_thread_answers_without_approving_a_launch(env):
     source=question(env,env.thread())
     env.board.set_thread_status(env.p['human'],source['thread_id'],'closed')
-    with pytest.raises(Conflict,match='reopen'):
-        answer(env,source)
-    assert not env.board.conn.execute('SELECT 1 FROM answer_links').fetchone()
+    out=resolve.resolve(env.board,env.p['human'],source['id'],'approve',None,DispatchConfig())
+    assert out['to']==['codex'] and source['id'] not in pending(env)
+    assert env.board.list_dispatch_rules(env.p['human'])==[]
+    with pytest.raises(Conflict,match='closed'):
+        env.post('codex',source['thread_id'],'agents still cannot post')
 
 
 def test_last_task_completion_reconciles_previously_finished_answer(env):
@@ -289,3 +309,37 @@ def test_only_latest_decision_can_match_a_retry(env):
     for body in ('First instruction','Second instruction','First instruction'):
         issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],body,[tid])
     assert env.board.conn.execute("SELECT COUNT(*) FROM issue_comments WHERE kind='decision'").fetchone()[0]==3
+
+
+def test_proposal_about_an_existing_task_needs_the_human_but_propose_task_does_not(env):
+    tid = env.thread()
+    created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
+    task_id = env.accepted_task(tid, title='Existing task')
+    about = env.post('codex', tid, 'Change the approach on the existing task?', 'proposal', task_id=task_id)
+    to_agents = env.post('codex', tid, 'Between us', 'proposal', task_id=task_id, to=['claude'])
+    # The second proposal on the propose_task task is not the one that created it.
+    again = env.post('codex', tid, 'And on the new one too?', 'proposal', task_id=created['task_id'])
+    assert pending(env) == {about['id'], again['id']}
+    assert created['id'] not in pending(env) and to_agents['id'] not in pending(env)
+
+
+def test_migration_records_which_proposal_created_its_task(env):
+    tid = env.thread()
+    created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
+    env.clock.advance(60)
+    about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'])
+    c = env.board.conn
+    done = env.accepted_task(tid, title='Finished long ago')
+    old_done = env.post('claude', tid, 'Old proposal on a finished task', 'proposal', task_id=done)
+    env.board.transition_task(env.p['human'], env.sid['human'], done, 'done')
+    c = env.board.conn
+    c.execute('ALTER TABLE tasks DROP COLUMN proposed_by_post')
+    db.init_schema(c)
+    assert c.execute('SELECT proposed_by_post FROM tasks WHERE id=?', (created['task_id'],)).fetchone()[0] == created['id']
+    # The upgrade changes nothing visible: proposals the old rule hid stay out of Needs you.
+    assert pending(env) == set()
+    assert {about['id'], old_done['id']} <= {r[0] for r in c.execute('SELECT source_post_id FROM legacy_attention_answers')}
+    db.init_schema(c)                                    # idempotent
+    # A proposal about an existing task posted after the upgrade does need the human.
+    fresh = env.post('codex', tid, 'And now this?', 'proposal', task_id=created['task_id'])
+    assert pending(env) == {fresh['id']}

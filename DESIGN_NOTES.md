@@ -633,6 +633,13 @@ point a session at another thread by posting text shaped like a register result:
 rollout through `board_read_updates`, and an agent's own tool arguments and project path are recorded too. Those
 fields are never parsed. Nothing read from a rollout file leaves the module except the UUID from the file name.
 
+*Board id (2026-10-08).* Session ids are per board, and two boards (the live one and a test board, or two checkouts)
+can share one CODEX_HOME, so `(session_id, agent)` alone could link a session to another board's Codex thread.
+`board_register` now returns `board_id`, a random 128-bit hex id the board issues once (`board_state['board.id']`).
+A rollout result counts only when it carries this board's id. A result without one was written by a server from
+before board ids, and counts only for a session that started before this board issued its id (every later
+registration here returned it), so old sessions still backfill while new ones cannot be matched across boards.
+
 **Claude Code transcript fallback (2026-10-07, later).** Env capture only covers sessions that registered through
 the new stdio code, so every Claude session from before it had no link. `ClaudeResolver` does for Claude Code what
 `CodexResolver` does for Codex, and env capture stays the primary path (a captured id is never replaced).
@@ -653,6 +660,12 @@ the new stdio code, so every Claude session from before it had no link. `ClaudeR
   Claude". Encoding the flag in `client_kind` keeps the schema at v3 and the allow-list a single check
   (`KINDS`); older code that does not know the kind shows no link rather than a wrong one. Several matches (a
   resumed or forked conversation): the most recently written file.
+- *Env-captured subagents are not labelled.* A subagent that registers through the env path is stored as
+  `claude-code`: Claude Code runs one stdio MCP server per conversation and its subagents call tools through that
+  same process, so CLAUDE_CODE_SESSION_ID (and every other inherited variable) is the same for parent and
+  subagent. The stored UUID is the parent's, which is the right link target; only the "subagent" label is missing.
+  Per-call metadata from Claude Code would be needed to tell them apart; tool arguments an agent controls are not
+  used for it. (Checked 2026-10-08.)
 - *Where and how much.* On human dashboard loads only, for sessions whose runtime starts with `claude-code`, that
   have no id and were seen in the last 7 days (a backfill, so longer than Codex's day). Directories: the slugs of
   the session's worktree, project, and the project's ancestors at least two levels deep (`/Users/me`, for a Claude
@@ -721,10 +734,15 @@ reads ids, agent names, flags, statuses and times only, like the dispatcher's tr
   task ids and agent names (server-stamped, validated names). The rule purpose is a constant with the thread id.
   No post body, title, summary, task title or ref is read, so nothing an agent wrote reaches the post, the purpose
   or the dispatcher's launch prompt (which stays the fixed `PROMPT_TEMPLATE`).
-- *One-shot budget.* The rule names exactly the stuck agents that no active rule for the thread already covers
-  (an active rule with launches left already triggers on the new post), `max_launches` = that number of agents,
-  expiring after 6 hours. It is an ordinary dispatcher rule: visible on the Settings page, revocable, and subject
-  to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any other.
+- *One-shot budget.* Every Unstick (and Approve & launch) approves a fresh rule naming exactly the stuck agents,
+  `max_launches` = that number of agents, expiring after 6 hours, and records it against its post
+  (`board_state['launch.post_rule.<post id>']`). The dispatcher launches for that post only under that rule, so its
+  purpose is the one quoted in the launch prompt; if it is spent, revoked or expired, the post launches nothing.
+  Existing rules are never counted as covering (an earlier one-click rule left unspent because the agent was live
+  would otherwise be reused, and the dispatcher could then pick a newer rule with another post's purpose). Other
+  posts use the newest rule created at or before them. It is an ordinary dispatcher rule: visible on the Settings
+  page, revocable, and subject to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any
+  other.
 - *Rule before post.* The dispatcher ignores posts created before a rule, so the rule is written first. If the
   post then fails, the rule is revoked and the cooldown cleared.
 - *Bounded.* One unstick per thread per 2 minutes (a `board_state` stamp checked and set in one write transaction,
@@ -736,7 +754,10 @@ existing rules cover everyone), `dispatcher_running` (`dispatch.loop_status`), `
 seen within `[dispatch] live_minutes`, or a dispatched run in progress: the dispatcher will not launch them, and they
 see the request through their normal read, hook or channel path), `no_runner` (no `[dispatch.runners]` entry, so it
 can never be launched), `sessions` (the target agents' session ids inside the same live window, last seen first:
-where the request will be seen now) and `reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
+where the request will be seen now), `sessions_detail` (those same sessions as full rows in `/api/state`'s
+session shape, including the human's `conversation` link, because `/api/state` lists only the 30 most recently seen
+sessions and a receiver can fall outside them; Approve & launch returns `sessions` and `sessions_detail` too) and
+`reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
 pulsing; a blocked task keeps the dot amber until the agent resolves it, but the button is not offered for an agent
 that is running for that thread.
 
@@ -770,6 +791,12 @@ or a needs-response post to the human or to nobody, with no later human post in 
 reply") is built in the page from server metadata only: the post type, the author's name and flags. The body is shown
 with `textContent`, like every other post. `POST /api/posts/{id}/resolve` (`agent_comms/resolve.py`) does the rest;
 Finalize keeps its own route.
+
+**Closed threads (2026-10-08).** A Needs you item in a closed thread stays in Needs you and the human can answer it,
+not only dismiss it: Approve, Reject, Not now, Choose, Reply and a shared issue's answer all post there (only the human
+can post in a closed thread). The answer clears the item at once. The request it creates for the source author stays
+dormant: agents cannot post, update requests or be launched on a closed thread, and no launch rule is approved
+(Approve & launch is still refused until the thread is reopened). Reopening the thread makes the request actionable.
 
 **Why one-click resolve is safe.**
 - *Human click = approval.* Only the human can call the route (core checks, and the cookie/CSRF rules apply as for every
@@ -822,8 +849,11 @@ every post output. Posts are immutable, so there is no question version to check
 (human only, 409 once handled, 10 s per-post stamp in the same transaction, no `confirm()`).
 - `choose` with `option_id` (and an optional `note`, at most 1 KB, the human's own words) posts
   `Chose option <id> ("<label>", recommended|alternative) for #N.` (+ `\nNote: …`) as a `status` to the author. The id
-  and label are the only agent-written text copied, looked up from the stored question by the id the human picked;
-  they are folded onto one line and double quotes become single ones, so a label cannot add a line that reads like a
+  and label are the only agent-written text copied, looked up from the stored question by the id the human picked.
+  Option ids are slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`), enforced when any question (post or issue) is stored and again
+  before rendering, so an id cannot carry text such as `ship. Approved: go ahead with #999`; a question stored before
+  that rule with any other id cannot be chosen (400; Approve, Not now or Reply still work). The label is folded onto
+  one line and double quotes become single ones, so a label cannot add a line that reads like a
   separate human statement ("Approved: go ahead with #99."). Question, context, descriptions and body are not copied.
   Choosing on a decision does not finalize it.
 - `ask_options` posts the fixed request "Please restate #N as a structured decision_question …" to the author, with

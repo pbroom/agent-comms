@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 
 from . import capabilities, db, requests
 from .core import Conflict, Forbidden, Invalid, iso
@@ -59,7 +60,38 @@ def validate_scope(scope):
     return value
 
 
+# Reconciliation runs its Git inspections outside the write transaction (they can take seconds), recording each
+# result, then re-evaluates under the lock replaying only those recorded results: the database checks see current
+# state, and a decision that would need a Git call not recorded raises _NeedsInspection and is retried.
+_git_memo = threading.local()
+
+
+class _NeedsInspection(Exception):
+    pass
+
+
 def _git(path, *args):
+    mode = getattr(_git_memo, 'mode', None)
+    key = (str(path), args)
+    if mode is not None and mode[0] == 'replay':
+        if key not in mode[1]:
+            raise _NeedsInspection()
+        result = mode[1][key]
+        if isinstance(result, Conflict):
+            raise Conflict(result.message)
+        return result
+    try:
+        out = _run_git(path, *args)
+    except Conflict as exc:
+        if mode is not None:
+            mode[1][key] = exc
+        raise
+    if mode is not None:
+        mode[1][key] = out
+    return out
+
+
+def _run_git(path, *args):
     try:
         result = subprocess.run(['git', '-C', path, *args], capture_output=True, text=True,
                                 timeout=10, env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'})
@@ -232,6 +264,9 @@ def after_save(board, p, sid, row, state):
         board._event(board.conn,task['id'],'transition',task['status'],'done',p,sid,'Continuation descendants and check receipts accepted')
 
 
+UNKNOWN_ACTIVITY = 'Owner activity is unknown; fresh explicit idle evidence is required'
+
+
 def _inactive(board, session, managed):
     now = board.now()
     path = os.path.realpath(session['worktree'] or session['project'])
@@ -275,7 +310,7 @@ def _inactive(board, session, managed):
     minimum = max(last_start or 0,last_work or 0)
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
     if not ended and not idle:
-        return 'Owner activity is unknown; fresh explicit idle evidence is required'
+        return UNKNOWN_ACTIVITY
     if not path or not os.path.isdir(path):
         return 'Owner worktree cannot be inspected'
     try:
@@ -333,13 +368,71 @@ def _descendant_checkouts(board, managed):
                     if os.path.realpath(s['worktree'] or s['project'])==path]
         if not sessions:
             return label+'checkout ownership is unknown; registered idle or ended owner evidence is required'
-        reasons = [_inactive(board,s,managed) for s in sessions]
-        if all(reasons):
-            return label+reasons[0]
+        # Every session at the checkout must be shown inactive: one idle or ended session says nothing about
+        # another. The only ones skipped are long ended: unknown activity, yet not seen for a whole lease TTL
+        # (so it holds no lease; _inactive has already ruled out a live lease, live peer or active run).
+        stale_before = board.now() - board.s.lease_ttl_minutes * 60
+        for s in sessions:
+            reason = _inactive(board,s,managed)
+            if reason == UNKNOWN_ACTIVITY and s['last_seen'] < stale_before:
+                continue
+            if reason:
+                return label+reason
     return None
 
 
 def reconcile(board, p, sid, post_id, expected_version, fence=None):
+    """Route a due continuation: keep a healthy owner, record a blocker, or hand it to the verified fallback. The
+    Git inspections run before the write transaction (see _git_memo); the decision is made under the lock."""
+    memo: dict = {}
+    for _ in range(3):
+        _git_memo.mode = ('replay', memo)
+        try:
+            return _reconcile(board, p, sid, post_id, expected_version, fence)
+        except _NeedsInspection:
+            pass
+        finally:
+            _git_memo.mode = None
+        memo.clear()   # each replay uses only the results of the inspection pass just before it
+        _git_memo.mode = ('record', memo)
+        try:
+            _inspect(board, post_id)
+        finally:
+            _git_memo.mode = None
+    return out(get_for_post(board, post_id))   # the state kept changing under inspection; the next pass retries
+
+
+def _inspect(board, post_id):
+    """Outside any transaction: run the Git inspections a reconciliation of this post can need (results recorded)."""
+    managed = get_for_post(board, post_id)
+    if managed is None:
+        return
+    row = board.conn.execute('SELECT assigned_session FROM request_progress WHERE post_id=? AND recipient=?',
+                             (post_id, managed['recipient'])).fetchone()
+    source = board.conn.execute('SELECT * FROM sessions WHERE id=?', (row['assigned_session'],)).fetchone() if row else None
+    if source is not None:
+        _inactive(board, source, managed)
+    _descendant_checkouts(board, managed)
+
+
+def _recheck_live(board, source, managed):
+    """The owner and descendant Git checks again, live (not replayed), inside the caller's transaction. Only on the
+    takeover path, which is rare; blocker outcomes rely on the recorded results and are re-inspected next pass."""
+    mode, _git_memo.mode = getattr(_git_memo, 'mode', None), None
+    try:
+        return _inactive(board, source, managed) or _descendant_checkouts(board, managed)
+    finally:
+        _git_memo.mode = mode
+
+
+def _healthy_owner(board, row, task):
+    """The assigned session is working the task under a live lease: nothing to route or report."""
+    return (row['state'] == 'started' and task['status'] == 'working' and row['assigned_session'] is not None
+            and task['owner_session'] == row['assigned_session'] and task['lease_expires_at'] is not None
+            and task['lease_expires_at'] > board.now())
+
+
+def _reconcile(board, p, sid, post_id, expected_version, fence):
     with db.write_tx(board.conn):
         board._check_agent_write(p)
         if fence is not None:
@@ -383,6 +476,11 @@ def reconcile(board, p, sid, post_id, expected_version, fence=None):
         if row['state']!='blocked' and board.now() < managed['deadline']:
             return out(managed)
         task = board._task_row(managed['task_id'])
+        if _healthy_owner(board, row, task):
+            # Not a blocker and not news: follow the lease (no seq bump) and drop a stale blocker.
+            board.conn.execute("UPDATE continuations SET deadline=?,blocker='' WHERE post_id=?",
+                               (task['lease_expires_at'], post_id))
+            return out(get_for_post(board, post_id))
         root = board._task_row(managed['root_task_id'])
         source = board.conn.execute('SELECT * FROM sessions WHERE id=?',(row['assigned_session'],)).fetchone()
         reason = _inactive(board,source,managed) if source else 'Assigned owner session is missing'
@@ -405,6 +503,10 @@ def reconcile(board, p, sid, post_id, expected_version, fence=None):
             reason = 'Fallback lacks active continuation authorization'
         if not reason and not capabilities.eligible(board,fallback['id'],thread['project'],json.loads(managed['required_capabilities'])):
             reason = 'Fallback needs fresh successful capability probes in the exact project'
+        if not reason:
+            # A takeover moves work off a checkout: the Git results recorded before the lock may be stale, so the
+            # owner and descendant checks run once more, live, under the lock right before deciding.
+            reason = _recheck_live(board, source, managed)
         if reason:
             if managed['blocker'] != reason:
                 board.conn.execute('UPDATE continuations SET blocker=? WHERE post_id=?',(reason,post_id))
@@ -422,13 +524,30 @@ def reconcile(board, p, sid, post_id, expected_version, fence=None):
         return out(get_for_post(board,post_id))
 
 
+# Automatic reconciliation of a continuation that stays blocked for the same reason backs off (per process): the
+# dispatcher ticks every few seconds, and each pass inspects Git. A new reason, a takeover or a cleared blocker resets it.
+TICK_BACKOFF_MIN, TICK_BACKOFF_MAX = 5, 300
+def _backoff(board) -> dict:
+    """post_id -> (next attempt, delay, blocker), kept on the Board (one per process and database)."""
+    if not hasattr(board, "_continuation_backoff"):
+        board._continuation_backoff = {}
+    return board._continuation_backoff
+
+
 def tick(board, p, fence=None):
     """Reconcile only continuations covered by current explicit dispatch approval."""
     if board.is_paused():
         return
     rules = board.active_dispatch_rules(p)
-    due = board.conn.execute('SELECT * FROM continuations WHERE deadline<=? AND completion IS NULL',(board.now(),)).fetchall()
+    now = board.now()
+    due = board.conn.execute('SELECT * FROM continuations WHERE deadline<=? AND completion IS NULL',(now,)).fetchall()
+    _tick_backoff = _backoff(board)
+    for post_id in set(_tick_backoff) - {m["post_id"] for m in due}:
+        del _tick_backoff[post_id]
     for managed in due:
+        held = _tick_backoff.get(managed['post_id'])
+        if held is not None and now < held[0] and managed['blocker'] == held[2]:
+            continue
         agents = {r['agent'] for r in board.conn.execute('SELECT agent FROM sessions WHERE id IN (?,?)',
                   (managed['owner_session'],managed['fallback_session']))}
         if not any(rule['thread_id']==managed['thread_id'] and agents.issubset(set(rule['agents'])) for rule in rules):
@@ -437,9 +556,18 @@ def tick(board, p, fence=None):
                                  (managed['post_id'],managed['recipient'])).fetchone()
         if row:
             try:
-                reconcile(board,p,None,managed['post_id'],row['version'],fence=fence)
+                result = reconcile(board,p,None,managed['post_id'],row['version'],fence=fence)
             except (Conflict,Forbidden):
                 continue
+            blocker = (result or {}).get('blocker') or ''
+            if blocker and held is not None and held[2] == blocker:
+                delay = min(held[1] * 2, TICK_BACKOFF_MAX)
+            elif blocker:
+                delay = TICK_BACKOFF_MIN
+            else:
+                _tick_backoff.pop(managed['post_id'], None)
+                continue
+            _tick_backoff[managed['post_id']] = (now + delay, delay, blocker)
 
 
 def delivery(board, post_id, agent):
@@ -514,6 +642,86 @@ def reserve_delivery(board, p, post_id, run_record, fence):
         board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,'dispatcher',?)",
                            ('dispatch.run.'+run_id,json.dumps(run_record),board.now()))
         board.conn.execute('UPDATE continuations SET dispatch_run_id=? WHERE post_id=?',(run_id,post_id))
+
+
+def _run_record(board, run_id):
+    record = board.conn.execute('SELECT value FROM board_state WHERE key=?', ('dispatch.run.'+run_id,)).fetchone()
+    try:
+        run = json.loads(record['value']) if record else None
+    except (TypeError, ValueError):
+        run = None
+    return run if isinstance(run, dict) else None
+
+
+def _reservation_ended(board, run_id):
+    """A delivery reservation whose run is over (or has no record) and never registered a session: nothing can
+    bind it any more, so it only locks every other session out of the continuation."""
+    from .dispatch import ACTIVE
+    run = _run_record(board, run_id)
+    if run is not None and run.get('status') in ACTIVE:
+        return False
+    return board.conn.execute('SELECT 1 FROM sessions WHERE dispatch_run_id=?', (run_id,)).fetchone() is None
+
+
+def release_ended_deliveries(board, p):
+    """Dispatcher tick: clear delivery reservations whose worker exited (or failed to start) before registering, so
+    the assigned fallback session is no longer refused as 'reserved for another dispatcher delivery'. It does not
+    relaunch: the failed run still counts as this delivery's attempt (see reset_delivery)."""
+    board._require_human(p, 'run the dispatcher')
+    with db.write_tx(board.conn) as c:
+        released = 0
+        for managed in c.execute('SELECT post_id,dispatch_run_id FROM continuations WHERE dispatch_run_id IS NOT NULL').fetchall():
+            if _reservation_ended(board, managed['dispatch_run_id']):
+                released += c.execute('UPDATE continuations SET dispatch_run_id=NULL WHERE post_id=? AND dispatch_run_id=?',
+                                      (managed['post_id'], managed['dispatch_run_id'])).rowcount
+        return released
+
+
+def reset_delivery(board, p, session_id, post_id, expected_version):
+    """Human only: retry a failed fallback delivery. Refused while its run is still active. Clears the reservation,
+    marks the failed run as reset (so the dispatcher may make one new delivery attempt under its existing approval
+    and budget), and puts a blocked assignment back in the fallback's queue with a fresh acknowledgement deadline.
+    Ownership, authorization, capability and browser checks all run again before any launch."""
+    board._require_human(p, 'reset a continuation delivery')
+    with db.write_tx(board.conn) as c:
+        board._session(p, session_id)
+        managed = get_for_post(board, post_id)
+        if managed is None:
+            raise Invalid('post has no managed continuation')
+        row = dict(c.execute('SELECT * FROM request_progress WHERE post_id=? AND recipient=?',
+                             (post_id, managed['recipient'])).fetchone())
+        if type(expected_version) is not int or row['version'] != expected_version:
+            raise Conflict('continuation changed; reread before resetting its delivery')
+        if row['state'] == 'finished':
+            raise Conflict('continuation is already finished')
+        if board._thread_row(managed['thread_id'])['status'] != 'open':
+            raise Conflict('continuation thread must be open')
+        if managed['epoch'] < 1:
+            raise Conflict('no fallback delivery has been assigned yet')
+        run_ids = [managed['dispatch_run_id']] if managed['dispatch_run_id'] else []
+        for (value,) in c.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+            try:
+                run = json.loads(value)
+            except ValueError:
+                continue
+            if isinstance(run, dict) and post_id in run.get('request_ids', []) and run.get('run_id') not in run_ids:
+                run_ids.append(run.get('run_id'))
+        for run_id in run_ids:
+            if isinstance(run_id, str) and not _reservation_ended(board, run_id):
+                raise Conflict('the delivery run is still active or registered a session; stop it or let it finish first')
+        for run_id in run_ids:
+            run = _run_record(board, run_id) if isinstance(run_id, str) else None
+            if run is not None and not run.get('reset_by_human'):
+                run['reset_by_human'] = True
+                c.execute('UPDATE board_state SET value=?,updated_at=? WHERE key=?',
+                          (json.dumps(run), board.now(), 'dispatch.run.' + run_id))
+        c.execute("UPDATE continuations SET dispatch_run_id=NULL,blocker='',deadline=? WHERE post_id=?",
+                  (board.now() + managed['ack_seconds'], post_id))
+        if row['state'] == 'blocked':
+            fallback = c.execute('SELECT agent FROM sessions WHERE id=?', (managed['fallback_session'],)).fetchone()
+            requests._save(board, p, session_id, row, 'queued', 'Human reset the failed fallback delivery', [],
+                           fallback['agent'], managed['fallback_session'])
+    return out(get_for_post(board, post_id))
 
 
 def bind_delivery(board, p, sid, run_id):

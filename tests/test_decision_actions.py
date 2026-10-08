@@ -1,6 +1,6 @@
 """Mechanical human choices preserve exact ownership and require completion proof."""
 import pytest
-from agent_comms import requests, resolve
+from agent_comms import db, requests, resolve
 from agent_comms.core import Conflict, Forbidden, Invalid
 from agent_comms.dispatch import DispatchConfig
 
@@ -149,6 +149,20 @@ def test_human_assigns_approval_to_implementer_without_proposer_request(env):
     assert answer['requests'][0]['state'] == 'queued'
     assert not resolve._needs_you(env.board.conn,q['id'])
     assert env.board.list_dispatch_rules(env.p['human'])[0]['agents'] == ['codex']
+
+
+def test_approve_launch_launches_the_chosen_assignee_when_the_author_is_inactive(env):
+    tid = env.thread()
+    q = env.post('claude',tid,'Please implement','proposal',needs_response=True)
+    with db.write_tx(env.board.conn) as c:
+        c.execute("UPDATE agents SET active=0 WHERE name='claude'")
+    with pytest.raises(Invalid, match='choose an active agent'):
+        resolve.resolve(env.board,env.p['human'],q['id'],'approve_launch',None,DispatchConfig())
+    out = resolve.resolve(env.board,env.p['human'],q['id'],'approve_launch',None,DispatchConfig(),delivery_agent='codex')
+    assert out['agent'] == 'codex' and out['to'] == ['codex'] and out['rule_id'] is not None
+    [rule] = env.board.list_dispatch_rules(env.p['human'])
+    assert rule['agents'] == ['codex'] and rule['id'] == out['rule_id']
+    assert env.board.get_post(env.p['human'],out['post_id'])['to'] == ['codex']
 
 
 def test_route_rejects_active_owner_lease(env):

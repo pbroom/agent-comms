@@ -79,7 +79,7 @@ def execute(board, p, session_id, question, action, *, _authorization_decision_i
     # Agent-initiated routing still uses requests.assign and its existing gates.
     if source['task_id'] is not None:
         task = board.conn.execute('SELECT * FROM tasks WHERE id=?', (source['task_id'],)).fetchone()
-        if not task or not board._task_authorization_active(task, row['assigned_agent']):
+        if not task or not board._task_authorizable(task, row['assigned_agent']):
             raise Forbidden('linked task authorization is no longer active')
     target_post = board.create_post(p, session_id, thread_id=target['id'], type='request', to=[row['assigned_agent']],
         needs_response=True, body=f"Routed request #{source['id']}/{action['recipient']} from thread #{source['thread_id']}. {reason}. Read that exact source and its existing authorization; no new scope or access is granted.",

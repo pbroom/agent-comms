@@ -10,8 +10,8 @@ Guardrails (DESIGN_NOTES "Unstick"):
 - The post body and the rule purpose are fixed server-side text. Their only variable parts are the thread id,
   post ids, task ids and agent names (all server-stamped). No post body, title, summary or other agent-written text
   is read or copied.
-- The rule names exactly the stuck agents that no active rule for the thread already covers, with a budget of one
-  launch each, and expires after UNSTICK_RULE_HOURS. The rule is created before the post, because the dispatcher
+- The rule is always a fresh one naming exactly the stuck agents, recorded against the post (the dispatcher launches
+  for this post only under it, so its purpose is the one in the prompt), with a budget of one launch each, and expires after UNSTICK_RULE_HOURS. The rule is created before the post, because the dispatcher
   ignores posts older than a rule.
 - One unstick per thread per UNSTICK_COOLDOWN_SECONDS, so a double click cannot post twice.
 """
@@ -141,7 +141,10 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         human_actions.release_cooldown(board, key)
         raise
     # Where the request will be seen now (`sessions`): the target agents' sessions inside the dispatcher's live
-    # window, most recently seen first. Sessions a launch registers later are found by the page from their start time.
+    # window, most recently seen first, and `sessions_detail`: those sessions in the snapshot's session shape (the
+    # snapshot lists only the 30 most recently seen). Sessions a launch registers later are found by the page from
+    # their start time.
+    outlook = human_actions.launch_outlook(board, config, agents)
     return {"post_id": post["id"], "thread_id": thread_id, "agents": agents,
-            "rule_id": rule["id"] if rule else None,
-            **human_actions.launch_outlook(board, config, agents), "reasons": reasons}
+            "rule_id": rule["id"] if rule else None, **outlook,
+            "sessions_detail": board.session_details(p, outlook["sessions"]), "reasons": reasons}

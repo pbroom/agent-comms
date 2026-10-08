@@ -232,10 +232,12 @@ def validate_runner(agent: str, template: Any) -> list[str]:
                          "or wrapper that re-parses arguments")
     if template.count("{prompt}") != 1:
         raise ValueError(f"[dispatch.runners] {agent} must contain the element \"{{prompt}}\" exactly once")
-    for x in template:
+    for i, x in enumerate(template):
         if ("{" in x or "}" in x) and x not in PLACEHOLDERS:
+            # Name the element by position, never by value: runner argv can carry credentials, and this message
+            # reaches the configuration status.
             raise ValueError(f"[dispatch.runners] {agent}: placeholders must be whole argv elements, one of "
-                             f"{PLACEHOLDERS} (got {x!r})")
+                             f"{PLACEHOLDERS} (element {i} is not)")
     return list(template)
 
 
@@ -507,6 +509,10 @@ class Dispatcher:
             return  # superseded: leave the mark, pending triggers and orphans to the owner
         foreign = self._reap_orphans(now)
         self._reconcile_ended_requests()
+        try:   # a worker that exited before registering must not keep its continuation reserved forever
+            workstreams.release_ended_deliveries(self.board, self.human)
+        except Exception:
+            log.exception("could not release ended continuation deliveries")
         if self.board.is_paused():
             return  # no launches while paused; running children are left alone; triggers wait
         # Ownership reconciliation has its own per-request deadline. Generic agent
@@ -524,6 +530,8 @@ class Dispatcher:
         """
         if not rules:
             return []
+        from . import human_actions
+        one_click = human_actions.one_click_rule_ids(self.board)
         result = []
         for post in self.board.conn.execute("""SELECT p.* FROM posts p JOIN threads t ON t.id=p.thread_id
                 WHERE p.sealed=0 AND t.status='open'
@@ -532,7 +540,9 @@ class Dispatcher:
             for row in requests.for_post(self.board, post):
                 if row['state'] == 'queued' and any(
                         rule['thread_id'] == post['thread_id'] and row['assigned_agent'] in rule['agents']
-                        and post['created_at'] >= rule['created_at_ts'] for rule in rules):
+                        and post['created_at'] >= rule['created_at_ts']
+                        and (rule['id'] not in one_click
+                             or human_actions.post_rule_id(self.board, post['id']) == rule['id']) for rule in rules):
                     result.append((post, row))
         return result
 
@@ -679,8 +689,20 @@ class Dispatcher:
         return acked is not None and acked >= seq
 
     def _rule_for(self, rules: list[dict], item: dict) -> dict | None:
-        return next((r for r in rules if r["thread_id"] == item["thread_id"] and item["agent"] in r["agents"]
-                     and r["created_at_ts"] <= item["post_created_at"]), None)
+        # A one-click action (Unstick, Approve & launch) records the rule it approved for its post: that post launches
+        # only under that rule (its purpose belongs in the prompt; none other, even when that rule is spent or
+        # revoked). Any other post: the newest approval at or before it that is not such a one-click rule (those
+        # belong to their own post only).
+        from . import human_actions
+        mapped = human_actions.post_rule_id(self.board, item["post_id"]) if item.get("post_id") else None
+        if mapped is not None:
+            return next((r for r in rules if r["id"] == mapped and r["thread_id"] == item["thread_id"]
+                         and item["agent"] in r["agents"]), None)
+        one_click = human_actions.one_click_rule_ids(self.board)
+        return max((r for r in rules if r["thread_id"] == item["thread_id"] and item["agent"] in r["agents"]
+                    and r["id"] not in one_click
+                    and r["created_at_ts"] <= item["post_created_at"]),
+                   key=lambda r: (r["created_at_ts"], r["id"]), default=None)
 
     def _launch_due(self, pending: dict[str, dict], now: float, foreign: list[dict] | None = None) -> None:
         if not pending:
@@ -771,7 +793,9 @@ class Dispatcher:
                 record = json.loads(value)
             except ValueError:
                 continue
-            if isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", []):
+            # A run the human reset (workstreams.reset_delivery) no longer counts: the human allowed one new attempt.
+            if (isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", [])
+                    and not record.get("reset_by_human")):
                 return True
         return False
 

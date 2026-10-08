@@ -214,7 +214,7 @@ def test_approve_launch_rule_before_post(renv, monkeypatch):
     [rule] = rules(e)
     assert seen == [[rule["id"]]]
     assert set(out) == {"action", "post_id", "resolved_post_id", "thread_id", "to", "agent", "rule_id",
-                        "dispatcher_running", "paused", "live", "no_runner"}
+                        "dispatcher_running", "paused", "live", "no_runner", "sessions", "sessions_detail"}
     assert (out["rule_id"], out["agent"], out["live"], out["no_runner"], out["dispatcher_running"], out["paused"]) == \
         (rule["id"], "codex", False, True, False, False)
     assert rule["agents"] == ["codex"] and rule["max_launches"] == rule["launches_left"] == 1
@@ -240,25 +240,17 @@ def test_approve_launch_rolls_back_the_rule_when_the_post_fails(renv, monkeypatc
     assert renv.board.active_dispatch_rules(renv.p["human"]) == []
 
 
-def test_approve_launch_reuses_an_active_rule_with_launches_left(renv):
+def test_approve_launch_always_approves_its_own_rule(renv):
+    from agent_comms import human_actions
     e = renv
-    existing = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="parser work",
-                                            max_launches=2)
     a = ask(e)
+    same = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"],
+                                        purpose=resolve.PURPOSE.format(post=a["id"], thread=e.tid), max_launches=2)
     out = call(e, a["id"], "approve_launch").json()
-    assert out["rule_id"] is None and [r["id"] for r in rules(e)] == [existing["id"]]
-    # An exhausted rule no longer counts: a fresh one-shot rule is approved.
-    e.board.take_dispatch_launch(e.p["human"], existing["id"], "codex")
-    e.board.take_dispatch_launch(e.p["human"], existing["id"], "codex")
-    b = ask(e)
-    out = call(e, b["id"], "approve_launch").json()
+    assert out["rule_id"] not in (None, same["id"])
     new = next(r for r in rules(e) if r["id"] == out["rule_id"])
     assert new["agents"] == ["codex"] and new["max_launches"] == 1
-    # A rule on another thread does not cover this one.
-    other = e.thread("other")
-    e.board.create_dispatch_rule(e.p["human"], thread_id=other, agents=["claude"], purpose="x", max_launches=3)
-    c = ask(e, frm="claude")
-    assert call(e, c["id"], "approve_launch").json()["rule_id"] is not None
+    assert human_actions.post_rule_id(e.board, out["post_id"]) == new["id"]
 
 
 def test_approve_launch_on_a_closed_thread_is_refused(renv):

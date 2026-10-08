@@ -124,9 +124,9 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
     if post["task_id"] is not None:
         task = board.conn.execute("SELECT * FROM tasks WHERE id=?", (post["task_id"],)).fetchone()
         allowed = {agent for agent in allowed
-                   if task is not None and board._task_authorization_active(task, agent)}
+                   if task is not None and board._task_authorizable(task, agent)}
         if not allowed:
-            raise Forbidden("no original recipient has active authorization for the linked task")
+            raise Forbidden("no original recipient has active authorization or a matching standing grant for the linked task")
     for candidate in candidates:
         if (candidate["agent"] in allowed and eligible(board, candidate["id"], thread["project"], required)
                 and browser_readiness.eligible(board, candidate['id'], post_id, recipient)):

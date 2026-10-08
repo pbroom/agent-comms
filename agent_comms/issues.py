@@ -7,6 +7,7 @@ or authorize later joins. Issue content is public board data; sealed source post
 from __future__ import annotations
 
 import json
+import re
 
 from . import db
 from .core import Conflict, Forbidden, Invalid, LimitExceeded, NotFound, iso, _norm_path
@@ -28,6 +29,15 @@ def _body(board, value, field="body", limit=None):
     return value
 
 
+# Option ids are copied verbatim into the human's server-built "Chose option <id> ..." reply, so they are a short
+# slug: no spaces, quotes, punctuation or newlines that could pose as more of the human's text.
+OPTION_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+
+def option_id_ok(value) -> bool:
+    return isinstance(value, str) and OPTION_ID_RE.fullmatch(value) is not None
+
+
 def _question(board, value):
     if value is None:
         return None
@@ -46,7 +56,9 @@ def _question(board, value):
         description = option.get("description", "")
         if not isinstance(description, str):
             raise Invalid("option description must be text")
-        normalized.append({"id": _body(board, option.get("id"), "option id", 100),
+        if not option_id_ok(option.get("id")):
+            raise Invalid("option id must match ^[a-z0-9][a-z0-9_-]{0,31}$ (lowercase letters, digits, '_' or '-')")
+        normalized.append({"id": option["id"],
                            "label": _body(board, option.get("label"), "option label", 200),
                            "description": description.strip(), "outcome": outcome})
         if "action" in option:
@@ -373,8 +385,6 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
                 and json.loads(latest['scope'] or 'null')==scope
                 and json.loads(latest['decision'] or 'null')==decision):
             return get_issue(board,p,issue_id)
-        if any(board._thread_row(tid)['status'] != 'open' for tid in thread_ids):
-            raise Conflict('reopen every selected thread before delivering an issue answer')
         event_id = _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
         for tid in sorted(set(thread_ids)):
             selected = [link for link in frozen_links if link['thread_id']==tid]
