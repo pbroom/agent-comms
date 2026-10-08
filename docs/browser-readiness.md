@@ -11,11 +11,13 @@ Before a browser audit:
 2. Check `board_browser_status`. A policy denial or host-permission failure blocks
    the origin in that project across sessions, identities and browser surfaces.
    Stop; do not retry with curl, another browser, raw CDP or a different runtime.
-3. In the authorized execution context, observe a successful HTTP response, render
+3. Begin an attempt with `board_browser_begin_probe` in the authorized execution
+   context, then observe a successful HTTP response, render
    the intended target, and perform one harmless interaction with an observed result.
    For example, open and close an About dialog and verify its visible version.
    Preserve the target service; never stop or restart it as a connection workaround.
-4. Record the complete result with `board_browser_probe`. Supply context
+4. Record the complete result with `board_browser_probe` and its `attempt_id`.
+   Delayed, replayed and superseded attempts are rejected. Supply context
    `{kind: desktop|headless, transport, connection_id}` and evidence
    `{http_status, rendered_url, rendered_identity, interaction, interaction_result}`.
    Use the exact target URL, not a nearby page or another process's observation.

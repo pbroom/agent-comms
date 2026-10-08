@@ -6,6 +6,7 @@ browser adapter and report its result from the context that will execute the wor
 from __future__ import annotations
 
 import json
+import secrets
 from urllib.parse import urlsplit
 
 from . import db, requests
@@ -29,6 +30,12 @@ CREATE TABLE IF NOT EXISTS browser_probes (
 CREATE TABLE IF NOT EXISTS browser_permission_gates (
  project TEXT NOT NULL, origin TEXT NOT NULL, denied INTEGER NOT NULL,
  epoch INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(project,origin)
+);
+CREATE TABLE IF NOT EXISTS browser_probe_attempts (
+ session_id INTEGER NOT NULL REFERENCES sessions(id), target_url TEXT NOT NULL,
+ attempt_id TEXT NOT NULL, context TEXT NOT NULL, execution_key TEXT NOT NULL,
+ project TEXT NOT NULL, worktree TEXT, permission_epoch INTEGER NOT NULL, started_at REAL NOT NULL,
+ PRIMARY KEY(session_id,target_url)
 );
 CREATE TABLE IF NOT EXISTS browser_events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, origin TEXT NOT NULL,
@@ -81,6 +88,8 @@ def _request(board, p, sid, post_id, recipient):
     post, row = requests._context(board, p, sid, post_id, recipient)
     if not p.is_human and p.name not in (post['agent'], row['assigned_agent']):
         raise Forbidden('only the author or assigned recipient may configure browser readiness')
+    if not p.is_human and p.name == row['assigned_agent'] and row['assigned_session'] not in (None,sid):
+        raise Conflict('request is owned by another session')
     if row['state'] == 'finished':
         raise Conflict('request is already finished')
     return post, row
@@ -115,7 +124,24 @@ def _context(value, session):
     return {k: _text(v, k, 200) for k, v in value.items()}
 
 
-def report_probe(board, p, session_id, target_url, context, evidence):
+def begin_probe(board, p, session_id, target_url, context):
+    """Issue a short-lived attempt fence before any authorized browser observation."""
+    url, origin = target(target_url)
+    with db.write_tx(board.conn):
+        board._check_agent_write(p)
+        s = board._session(p,session_id)
+        ctx = _context(context,s)
+        gate = _gate(board,s['project'],origin)
+        if gate['denied']:
+            raise Conflict('browser permission denied; do not probe or reconnect')
+        attempt = secrets.token_hex(16)
+        now = board.now()
+        board.conn.execute('INSERT OR REPLACE INTO browser_probe_attempts VALUES (?,?,?,?,?,?,?,?,?)',
+            (session_id,url,attempt,json.dumps(ctx),_key(s),s['project'],s['worktree'],gate['epoch'],now))
+    return {'attempt_id': attempt, 'expires_at': now+PROBE_TTL, 'permission_granted_by_board': False}
+
+
+def report_probe(board, p, session_id, target_url, context, evidence, attempt_id):
     url, origin = target(target_url)
     with db.write_tx(board.conn):
         board._check_agent_write(p)
@@ -124,6 +150,15 @@ def report_probe(board, p, session_id, target_url, context, evidence):
         gate = _gate(board, s['project'], origin)
         if gate['denied']:
             raise Conflict('browser permission denied; supported human permission change must be recorded first')
+        attempt = board.conn.execute('SELECT * FROM browser_probe_attempts WHERE session_id=? AND target_url=?',
+                                     (session_id,url)).fetchone()
+        now = board.now()
+        if (not attempt or attempt['attempt_id'] != attempt_id
+                or attempt['permission_epoch'] != gate['epoch']
+                or attempt['execution_key'] != _key(s) or attempt['project'] != s['project']
+                or attempt['worktree'] != s['worktree'] or json.loads(attempt['context']) != ctx
+                or not now-PROBE_TTL < attempt['started_at'] <= now):
+            raise Conflict('probe attempt superseded, expired or context changed; begin a new authorized probe')
         if not isinstance(evidence, dict) or set(evidence) != {'http_status', 'rendered_url', 'rendered_identity', 'interaction', 'interaction_result'}:
             raise Invalid('probe requires HTTP status, rendered URL/identity and harmless interaction/result')
         if type(evidence['http_status']) is not int or not 200 <= evidence['http_status'] < 300:
@@ -132,15 +167,16 @@ def report_probe(board, p, session_id, target_url, context, evidence):
             raise Invalid('rendered target must match the requested URL exactly')
         for k in ('rendered_identity', 'interaction', 'interaction_result'):
             _text(evidence[k], k, 1000)
-        now = board.now()
+        expires = attempt['started_at'] + PROBE_TTL
         board.conn.execute('''INSERT INTO browser_probes VALUES (?,?,?,?,?,?,?,?,?,?,0,?)
             ON CONFLICT(session_id,target_url) DO UPDATE SET project=excluded.project,worktree=excluded.worktree,
             execution_key=excluded.execution_key,context=excluded.context,status=excluded.status,evidence=excluded.evidence,
             verified_at=excluded.verified_at,expires_at=excluded.expires_at,reconnects=0,permission_epoch=excluded.permission_epoch''',
-            (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),'ready',json.dumps(evidence),now,now+PROBE_TTL,gate['epoch']))
+            (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),'ready',json.dumps(evidence),now,expires,gate['epoch']))
+        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,url))
         _event(board,p,session_id,s['project'],origin,'probe',json.dumps(evidence))
     return {'status': 'ready', 'session_id': session_id, 'target_url': url,
-            'expires_at': now + PROBE_TTL, 'authority': 'self_reported_probe_not_authorization'}
+            'expires_at': expires, 'authority': 'self_reported_probe_not_authorization'}
 
 
 def report_failure(board, p, session_id, target_url, context, failure, evidence):
@@ -159,8 +195,9 @@ def report_failure(board, p, session_id, target_url, context, failure, evidence)
                 (s['project'],origin,detail))
         board.conn.execute('''INSERT INTO browser_probes VALUES (?,?,?,?,?,?,?,?,?,?,0,?)
             ON CONFLICT(session_id,target_url) DO UPDATE SET project=excluded.project,worktree=excluded.worktree,
-            execution_key=excluded.execution_key,context=excluded.context,status=excluded.status,evidence=excluded.evidence,expires_at=0''',
+            execution_key=excluded.execution_key,context=excluded.context,status=excluded.status,evidence=excluded.evidence,expires_at=0,permission_epoch=excluded.permission_epoch''',
             (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),failure,detail,board.now(),0,gate['epoch']))
+        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,url))
         _event(board,p,session_id,s['project'],origin,failure,detail)
         # Invalidate running work for this context; a denial affects every context at this origin.
         affected = board.conn.execute('''SELECT b.post_id,b.recipient FROM browser_requirements b
@@ -217,7 +254,11 @@ def readiness(board, session_id, target_url):
 
 def eligible(board, session_id, post_id, recipient):
     req = requirement(board,post_id,recipient)
-    return not req or readiness(board,session_id,req['target_url']) == 'ready'
+    if not req:
+        return True
+    project = board.conn.execute('SELECT t.project FROM posts p JOIN threads t ON t.id=p.thread_id WHERE p.id=?',(post_id,)).fetchone()[0]
+    s = board.conn.execute('SELECT project FROM sessions WHERE id=?',(session_id,)).fetchone()
+    return bool(s and s['project'] == project and readiness(board,session_id,req['target_url']) == 'ready')
 
 
 def assert_request_ready(board, post_id, recipient, session_id):

@@ -10,10 +10,15 @@ def install(mcp, board, principal, session, run):
                                    session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: br.bind_request(board,principal(ctx),session(ctx,session_id),post_id,recipient,target_url))
 
+    @mcp.tool(description='Begin a short-lived probe attempt in this exact context before an authorized browser observation. Does not grant permission or run a browser. Denied origins cannot begin probes.')
+    def board_browser_begin_probe(target_url: str, context: dict,
+                                  session_id: int | None = None, ctx: Context = None) -> dict:
+        return run(lambda: br.begin_probe(board,principal(ctx),session(ctx,session_id),target_url,context))
+
     @mcp.tool(description='Record a successful HTTP response, rendered target identity and harmless interaction/result from this exact executing browser context. Never infer success from tool inventory or reuse another process desktop browser. Host permissions still apply.')
-    def board_browser_probe(target_url: str, context: dict, evidence: dict,
+    def board_browser_probe(target_url: str, context: dict, evidence: dict, attempt_id: str,
                             session_id: int | None = None, ctx: Context = None) -> dict:
-        return run(lambda: br.report_probe(board,principal(ctx),session(ctx,session_id),target_url,context,evidence))
+        return run(lambda: br.report_probe(board,principal(ctx),session(ctx,session_id),target_url,context,evidence,attempt_id))
 
     @mcp.tool(description='Record browser failure immediately. policy_denied/host_permission persist across identities and contexts; never reroute or retry denied access. Other failures invalidate readiness. This reports evidence, not authority.')
     def board_browser_failure(target_url: str, context: dict, failure: str, evidence: str,

@@ -17,6 +17,7 @@ class Bind(Input):
 class Probe(Input):
     context: dict
     evidence: dict
+    attempt_id: str
 
 
 class Failure(Input):
@@ -42,9 +43,13 @@ def install(app, board, principal, sid):
     def bind(post_id: int, body: Bind, request: Request, p=P):
         return br.bind_request(board,p,sid(p,request,body.session_id),post_id,body.recipient,body.target_url)
 
+    @app.post('/api/browser/begin-probe')
+    def begin_probe(body: Reconnect, request: Request, p=P):
+        return br.begin_probe(board,p,sid(p,request,body.session_id),body.target_url,body.context)
+
     @app.post('/api/browser/probe')
     def probe(body: Probe, request: Request, p=P):
-        return br.report_probe(board,p,sid(p,request,body.session_id),body.target_url,body.context,body.evidence)
+        return br.report_probe(board,p,sid(p,request,body.session_id),body.target_url,body.context,body.evidence,body.attempt_id)
 
     @app.post('/api/browser/failure')
     def failure(body: Failure, request: Request, p=P):

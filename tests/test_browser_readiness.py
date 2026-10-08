@@ -20,8 +20,9 @@ def browser_schema(env):
 
 
 def probe(env, actor='codex', sid=None, context=None, evidence=None):
+    attempt = br.begin_probe(env.board, env.p[actor], sid or env.sid[actor], URL, context or CTX)
     return br.report_probe(env.board, env.p[actor], sid or env.sid[actor], URL,
-                           context or CTX, EVIDENCE if evidence is None else evidence)
+                           context or CTX, EVIDENCE if evidence is None else evidence, attempt['attempt_id'])
 
 
 def fail(env, failure='disconnected', actor='codex', sid=None):
@@ -175,3 +176,38 @@ def test_disconnect_in_changed_connection_cannot_reconnect_old_context(env):
         return  # Rejecting mismatched failure evidence is also safe.
     with pytest.raises(Conflict):
         br.claim_reconnect(env.board, env.p['codex'], env.sid['codex'], URL, CTX)
+
+
+def test_post_permission_change_disconnect_can_reconnect_without_old_epoch(env):
+    probe(env)
+    fail(env, 'policy_denied')
+    br.record_permission_change(env.board, env.p['human'], env.sid['human'], PROJECT,
+                                URL, 'Supported host permission changed', 1)
+    fail(env, 'disconnected')
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'disconnected'
+    result = br.claim_reconnect(env.board, env.p['codex'], env.sid['codex'], URL, CTX)
+    assert result['fresh_probe_required'] is True
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'disconnected'
+    probe(env)
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'ready'
+
+
+@pytest.mark.parametrize('invalidation', ['disconnect', 'permission_epoch', 'expired', 'replayed', 'superseded'])
+def test_delayed_or_replayed_probe_cannot_restore_readiness(env, invalidation):
+    sid = env.sid['codex']
+    attempt = br.begin_probe(env.board, env.p['codex'], sid, URL, CTX)['attempt_id']
+    if invalidation == 'disconnect':
+        fail(env)
+    elif invalidation == 'permission_epoch':
+        fail(env, 'policy_denied')
+        br.record_permission_change(env.board, env.p['human'], env.sid['human'], PROJECT,
+                                    URL, 'Supported host permission changed', 1)
+    elif invalidation == 'expired':
+        env.clock.advance(br.PROBE_TTL)
+        env.board.heartbeat(env.p['codex'], sid)
+    elif invalidation == 'replayed':
+        br.report_probe(env.board, env.p['codex'], sid, URL, CTX, EVIDENCE, attempt)
+    else:
+        br.begin_probe(env.board, env.p['codex'], sid, URL, CTX)
+    with pytest.raises(Conflict, match='attempt'):
+        br.report_probe(env.board, env.p['codex'], sid, URL, CTX, EVIDENCE, attempt)
