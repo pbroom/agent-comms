@@ -730,14 +730,22 @@ class Board:
                                 f'grant {grant_id} revoked')
         return self._grant_out(self.conn.execute('SELECT * FROM authorization_grants WHERE id=?', (grant_id,)).fetchone())
 
-    def _matching_grant(self, p: Principal, task: sqlite3.Row) -> sqlite3.Row | None:
+    def _matching_grant(self, p: Principal | str, task: sqlite3.Row) -> sqlite3.Row | None:
         if not task['category']:
             return None
+        name = p if isinstance(p, str) else p.name
         project = self._thread_row(task['thread_id'])['project']
         rows = self.conn.execute('''SELECT * FROM authorization_grants WHERE project=? AND category=?
             AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?) ORDER BY id DESC''',
             (project, task['category'], self.now()))
-        return next((r for r in rows if p.name in json.loads(r['agents'])), None)
+        return next((r for r in rows if name in json.loads(r['agents'])), None)
+
+    def _task_authorizable(self, task: sqlite3.Row, agent: str) -> bool:
+        """Whether `agent` holds, or would gain on its explicit claim, authorization for this task: an active
+        recorded authorization, or a matching active human standing grant for a task that can still be claimed.
+        Routing uses this so a granted agent is not refused before it has had the chance to claim."""
+        return self._task_authorization_active(task, agent) or (
+            task['status'] not in TERMINAL and self._matching_grant(agent, task) is not None)
 
     def _task_authorization_active(self, task: sqlite3.Row, agent: str | None = None) -> bool:
         if task['authorization_source'] == 'human':

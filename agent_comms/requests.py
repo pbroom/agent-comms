@@ -238,7 +238,7 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         decision_actions.assert_execution_authorized(board, post_id, target['agent'])
         if post['task_id'] is not None:
             task=board.conn.execute('SELECT * FROM tasks WHERE id=?',(post['task_id'],)).fetchone()
-            if task is None or not board._task_authorization_active(task,target['agent']):
+            if task is None or not board._task_authorizable(task,target['agent']):
                 raise Forbidden('target lacks active authorization for the linked task')
         project=board._thread_row(post['thread_id'])['project']
         if not capabilities.eligible(board,target_session_id,project,required_capabilities):

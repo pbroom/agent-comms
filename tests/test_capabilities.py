@@ -180,6 +180,33 @@ def test_route_skips_capable_but_unauthorized_preferred_recipient(env):
     assert queued["assigned_session"] == env.sid["claude"]
 
 
+def test_route_honours_a_matching_standing_grant_before_the_task_is_claimed(env):
+    from agent_comms import requests
+    env.board.create_grant(env.p["human"], project=PROJECT, category="review", agents=["codex"],
+                           purpose="Review this project")
+    post = env.post("grok", env.thread(), type="proposal", to=["codex"], needs_response=True,
+                    propose_task={"title": "Review", "category": "review"})
+    probe(env, "codex")
+    queued = route(env, post, as_="grok")                      # unclaimed: the grant still authorizes codex
+    assert (queued["assigned_agent"], queued["assigned_session"]) == ("codex", env.sid["codex"])
+    other = env.post("grok", env.thread(), type="proposal", to=["codex"], needs_response=True,
+                     propose_task={"title": "Review 2", "category": "review"})
+    out = requests.assign(env.board, env.p["grok"], env.sid["grok"], other["id"], "codex", env.sid["codex"],
+                          expected_version=0, reason="route", required_capabilities=["files:read"])
+    assert out["assigned_session"] == env.sid["codex"]
+    # A grant for another category, or a revoked grant, does not count.
+    tests = env.post("grok", env.thread(), type="proposal", to=["codex"], needs_response=True,
+                     propose_task={"title": "Tests", "category": "tests"})
+    with pytest.raises(Forbidden, match="authoriz"):
+        route(env, tests, as_="grok")
+    for g in env.board.list_grants(env.p["human"]):
+        env.board.revoke_grant(env.p["human"], g["id"])
+    third = env.post("grok", env.thread(), type="proposal", to=["codex"], needs_response=True,
+                     propose_task={"title": "Review 3", "category": "review"})
+    with pytest.raises(Forbidden, match="authoriz"):
+        route(env, third, as_="grok")
+
+
 def test_unrelated_caller_denied_before_candidate_selection(env):
     post = request(env)
     with pytest.raises(Forbidden, match="author or assigned"):
