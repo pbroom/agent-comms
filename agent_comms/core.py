@@ -869,13 +869,23 @@ class Board:
     # ------------------------------------------------------------ posts
 
     def _agent_posts_since_human(self, thread_id: int) -> int:
-        return self.conn.execute(
+        posts = self.conn.execute(
             """SELECT COUNT(*) FROM posts p JOIN agents a ON a.name = p.agent
                WHERE p.thread_id = :t AND a.is_human = 0 AND p.id > COALESCE(
                  (SELECT MAX(p2.id) FROM posts p2 JOIN agents a2 ON a2.name = p2.agent
                   WHERE p2.thread_id = :t AND a2.is_human = 1), 0)""",
             {"t": thread_id},
         ).fetchone()[0]
+        # Each link is one creation/join event, including joins to distinct issues.
+        # Include ties conservatively so a coarse clock cannot bypass the cap.
+        links = self.conn.execute(
+            """SELECT COUNT(*) FROM issue_links l JOIN agents a ON a.name=l.agent
+               WHERE l.thread_id=:t AND a.is_human=0 AND l.created_at >= COALESCE(
+                 (SELECT MAX(p.created_at) FROM posts p JOIN agents h ON h.name=p.agent
+                  WHERE p.thread_id=:t AND h.is_human=1), 0)""",
+            {"t": thread_id},
+        ).fetchone()[0]
+        return posts + links
 
     def _validate_refs(self, refs: Any) -> list[dict]:
         if refs is None:
