@@ -408,7 +408,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
             out["active_runs"] = [{"thread_id": r.get("thread_id"), "agent": r.get("agent"), "run_id": r.get("run_id"),
                                    "started_at": r.get("started_at")}
                                   for r in dispatch.list_runs(board, p, 20)
-                                  if live and r.get("status") in ("starting", "running")]
+                                  if live and r.get("status") in dispatch.ACTIVE]
             # For "Approve & launch" in the Needs you callout: agents with a runner and no live session.
             out["launchable_agents"] = human_actions.launchable_agents(board, config)
         return out

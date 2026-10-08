@@ -698,6 +698,27 @@ def restart(denv):
     return denv.d
 
 
+def test_a_live_orphaned_run_can_still_bind_its_session(denv, monkeypatch):
+    allow(denv, agents=["codex"])
+    human_post(denv, ["codex"])
+    denv.d.tick()
+    [child] = denv.spawner.children
+    restart(denv)
+    denv.d.tick()
+    record = runs(denv)[0]
+    assert record["status"] == "orphaned"
+    monkeypatch.setattr(dispatch, "probe_process", denv.procs.probe)
+    sid = denv.board.register_session(denv.p["codex"], PROJECT, dispatch_run_id=record["run_id"])["session_id"]
+    assert denv.board.conn.execute("SELECT dispatch_run_id FROM sessions WHERE id=?", (sid,)).fetchone()[0] \
+        == record["run_id"]
+    # Once its process is gone, an orphaned record no longer binds a session, even before the dispatcher notices.
+    child.code = 0
+    with pytest.raises(Forbidden, match="dispatch run does not match"):
+        denv.board.register_session(denv.p["claude"], PROJECT, dispatch_run_id=record["run_id"])
+    with pytest.raises(Forbidden, match="dispatch run does not match"):
+        denv.board.register_session(denv.p["codex"], PROJECT, dispatch_run_id=record["run_id"])
+
+
 def test_surviving_child_of_a_dead_loop_blocks_a_second_run_of_that_agent(denv):
     allow(denv, agents=["codex", "claude"])
     human_post(denv, ["codex"])

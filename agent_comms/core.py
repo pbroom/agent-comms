@@ -805,7 +805,13 @@ class Board:
                 except (ValueError, TypeError):
                     run = {}
                 thread = c.execute("SELECT project FROM threads WHERE id=?", (run.get("thread_id"),)).fetchone()
-                if run.get("agent") != p.name or run.get("status") not in ("starting", "running") or not thread or thread["project"] != project:
+                from . import dispatch
+                # dispatch.ACTIVE: a run a restarted dispatcher marked 'orphaned' is still a live run (its worker may
+                # register late), as long as its process is still there.
+                live = run.get("status") in dispatch.ACTIVE and (
+                    run.get("status") != "orphaned"
+                    or dispatch.probe_process(run.get("pid"), run.get("proc_start")) != "dead")
+                if run.get("agent") != p.name or not live or not thread or thread["project"] != project:
                     raise Forbidden("dispatch run does not match this active agent and project")
                 existing = c.execute("SELECT id FROM sessions WHERE dispatch_run_id=?", (dispatch_run_id,)).fetchone()
                 if existing and existing["id"] != resume_session_id:
