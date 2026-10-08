@@ -1358,6 +1358,10 @@ function issueField(label, key, draft, multiline = false) {
   }, multiline ? draft[key] : null));
 }
 function issueQuestion(i) { return i.decision_question?.question || `How would you like to handle ${i.title}?`; }
+function issueContext(i) {
+  if (i.decision_question) return i.decision_question.context || i.body;
+  return [...(i.comments || [])].reverse().find(c => c.kind === "request")?.body || i.body;
+}
 function renderIssueAnswer(i, draft, threads, submit) {
   const q = i.decision_question;
   const version = i.question_version || 0;
@@ -1410,10 +1414,10 @@ function renderIssueDetail(i, human) {
   return el("section", { class: "card", id: `issue-${i.id}` },
     el("div", { class: "meta" }, el("span", { class: "muted small" }, `Issue #${i.id}`), " ", issueStatus(i)),
     el("h2", {}, issueQuestion(i)),
-    el("p", { class: "issue-discussion" }, i.decision_question?.context || i.body),
+    el("p", { class: "issue-discussion" }, issueContext(i)),
     human && i.status !== "resolved" ? renderIssueAnswer(i, draft, threads, submit) : null,
     el("h3", {}, "Issue context"), el("p", { class: "small muted" }, i.title),
-    i.decision_question ? el("p", { class: "issue-discussion" }, i.body) : null,
+    issueContext(i) !== i.body ? el("p", { class: "issue-discussion" }, i.body) : null,
     issueSource && human ? el("div", { class: "card" },
       el("p", {}, `Link post #${issueSource.post_id} from thread #${issueSource.thread_id} to this issue?`),
       el("p", { class: "small muted" }, "Compare the cause and required fix before linking. Similar wording alone may describe a different blocker."),

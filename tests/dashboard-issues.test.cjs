@@ -260,3 +260,22 @@ test('Needs you question opens its decision directly', async () => {
     assert.ok(button(d, 'Submit answer'));
   } finally { dom.window.close(); }
 });
+
+test('legacy reopened issues lead with the latest request and retain original context below', async () => {
+  const data = issue();
+  data.comments = [
+    { id: 1, kind: 'request', body: 'Earlier request', agent: 'codex', created_at: at },
+    { id: 2, kind: 'request', body: 'Can we retry after the new failure?', agent: 'codex', created_at: at },
+    { id: 3, kind: 'comment', body: 'Routine follow-up', agent: 'codex', created_at: at }
+  ];
+  const { dom, d } = await setup({ issues: [data], hash: '#issue-1' });
+  try {
+    assert.equal(d.querySelector('#issue-1 h2 + .issue-discussion').textContent, 'Can we retry after the new failure?');
+    assert.ok([...d.querySelectorAll('#issue-1 .issue-discussion')].some(n => n.textContent === 'Shared evidence'));
+  } finally { dom.window.close(); }
+  const question = structured(); question.comments = data.comments;
+  const current = await setup({ issues: [question], hash: '#issue-1' });
+  try {
+    assert.equal(current.d.querySelector('#issue-1 h2 + .issue-discussion').textContent, question.decision_question.context);
+  } finally { current.dom.window.close(); }
+});
