@@ -1776,7 +1776,6 @@ function renderNeedsYouItem(item) {
     if (c.value === "custom" && !text) return "Write your reply, or choose an option.";
     if (c.value === "custom" && n > limit) return `Your reply is too long (${n} / ${limit} bytes).`;
     if (c.action === "choose" && nn > noteLimit) return `Your note is too long (${nn} / ${noteLimit} bytes).`;
-    if (assigns(c) && !assigned()) return "No active agent can take the approved work. Write your own reply instead.";
     return "";
   };
   const sync = () => {

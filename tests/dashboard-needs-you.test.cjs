@@ -459,8 +459,11 @@ test('an inactive author: the assignee the select shows is the one sent; with no
   try {
     card(document, 11, 'approve').click();
     const select = document.querySelector('#needs-you [data-post="11"] select');
-    assert.equal(select.value, 'claude-code', 'the first active agent is preselected');
-    assert.equal(select.querySelector('option[selected]').value, 'claude-code');
+    assert.equal(select.value, '', 'an inactive owner requires an explicit replacement');
+    assert.equal(primary(document, 11).disabled, true);
+    select.value = 'claude-code';
+    select.dispatchEvent(new dom.window.Event('change'));
+    assert.equal(primary(document, 11).disabled, false);
     primary(document, 11).click(); await settle();
     assert.deepEqual(calls.find(c => c.u.endsWith('/11/resolve')).body, { action: 'approve', delivery_agent: 'claude-code' });
   } finally { dom.window.close(); }
