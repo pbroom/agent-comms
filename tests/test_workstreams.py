@@ -173,6 +173,64 @@ def test_takeover_preserves_active_unknown_or_dirty_owner(stack, obstacle):
     assert git(stack["owner_path"], "status", "--porcelain") == before
 
 
+def _tick_rule(stack):
+    env = stack["env"]
+    return env.board.create_dispatch_rule(env.p["human"], thread_id=stack["thread"], agents=["codex", "claude"],
+                                          purpose="Propagate this approved stack fix", max_launches=2)
+
+
+def test_a_healthy_lease_owner_is_neither_blocked_nor_resequenced(stack, monkeypatch):
+    from agent_comms import workstreams
+    env = stack["env"]
+    _tick_rule(stack)
+    post = create(stack)
+    progress(stack, post, "started")                         # started, then claimed: a live lease
+    env.clock.advance(121)                                   # past the acknowledgement deadline, within the lease
+    env.board.heartbeat(env.p["codex"], env.sid["codex"])
+    seq = env.board.get_post(env.p["human"], post["id"])["seq"]
+    calls = []
+    monkeypatch.setattr(workstreams, "_run_git", lambda *a: calls.append(a) or "")
+    workstreams.tick(env.board, env.p["human"])
+    managed = workstreams.get_for_post(env.board, post["id"])
+    lease = env.board._task_row(post["task_id"])["lease_expires_at"]
+    assert managed["blocker"] == "" and calls == []
+    assert env.board.get_post(env.p["human"], post["id"])["seq"] == seq
+    assert managed["deadline"] == lease and current(stack, post)["assigned_session"] == env.sid["codex"]
+
+
+def test_git_runs_outside_the_write_transaction_and_blocked_ticks_back_off(stack, monkeypatch):
+    from agent_comms import workstreams
+    env = stack["env"]
+    _tick_rule(stack)
+    post = create(stack)
+    (stack["owner_path"] / "unfinished").write_text("keep me\n")    # a lasting blocker
+    env.clock.advance(121)
+    probe(stack, "codex")
+    probe(stack, "claude")
+    real, calls = workstreams._run_git, []
+
+    def spy(path, *args):
+        assert not env.board.conn.in_transaction, "git ran inside the write transaction"
+        calls.append(args)
+        return real(path, *args)
+    monkeypatch.setattr(workstreams, "_run_git", spy)
+    workstreams.tick(env.board, env.p["human"])
+    assert "unfinished changes" in workstreams.get_for_post(env.board, post["id"])["blocker"]
+    first = len(calls)
+    assert first > 0
+    seq = env.board.get_post(env.p["human"], post["id"])["seq"]
+    passes = 0
+    for _ in range(60):                                      # five minutes of 5-second dispatcher ticks
+        before = len(calls)
+        env.clock.advance(5)
+        probe(stack, "codex")                                # the owner stays idle: the same blocker throughout
+        workstreams.tick(env.board, env.p["human"])
+        passes += len(calls) > before
+    assert passes <= 7, passes                               # 5, 10, 20, 40, 80, 160 s ...: not 60 passes
+    assert env.board.get_post(env.p["human"], post["id"])["seq"] == seq
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]
+
+
 def test_simultaneous_takeover_has_one_winner_and_fences_old_owner(stack):
     post = create(stack)
     env = stack["env"]
