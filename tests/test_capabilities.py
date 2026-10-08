@@ -147,3 +147,20 @@ def test_preflight_rechecked_at_assignment(env, monkeypatch):
     with pytest.raises(Conflict, match="capabilit"):
         route(env, post)
     assert env.board.conn.execute("SELECT COUNT(*) FROM request_events").fetchone()[0] == 0
+
+
+def test_author_can_record_failed_preflight(env):
+    post = env.post("claude", env.thread(), type="request", to=["codex"])
+    blocked = route(env, post, as_="claude")
+    assert blocked["state"] == "blocked"
+    assert blocked["assigned_session"] is None
+    assert blocked["blocker"] == "missing_capability"
+
+
+def test_capability_does_not_override_task_authorization(env):
+    post = env.post("codex", env.thread(), type="proposal", to=["claude"], needs_response=True,
+                    propose_task={"title": "Unapproved task"})
+    probe(env, "claude")
+    with pytest.raises(Forbidden, match="authoriz"):
+        capabilities.route(env.board, env.p["codex"], env.sid["codex"], post["id"], "claude",
+                           ["browser:desktop"], 0)
