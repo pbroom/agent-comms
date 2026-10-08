@@ -217,6 +217,10 @@ CREATE TABLE IF NOT EXISTS request_events (
  UNIQUE(post_id,recipient,version)
 );
 
+CREATE TABLE IF NOT EXISTS supersession_close_permit (
+ kind TEXT NOT NULL CHECK(kind IN ('thread','issue')), entity_id INTEGER NOT NULL,
+ PRIMARY KEY(kind,entity_id)
+);
 CREATE TABLE IF NOT EXISTS request_reply_operations (
  actor TEXT NOT NULL REFERENCES agents(name), session_id INTEGER NOT NULL REFERENCES sessions(id),
  idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL, reply_post_id INTEGER NOT NULL REFERENCES posts(id),
@@ -345,6 +349,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         # verified historical work through requests.progress with exact evidence instead.
         browser_readiness.canonicalize_stored(conn)
         _install_managed_writer_fence(conn)
+        _install_supersession_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -418,3 +423,39 @@ def write_tx(conn: sqlite3.Connection):
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         raise
+
+
+def _install_supersession_writer_fence(conn: sqlite3.Connection) -> None:
+    """Fence legacy completion inference without disrupting unrelated writers.
+
+    A different marker from managed_write_permit is essential: live v10 writers
+    already set the latter. SQLite serializes writers; the scoped marker exists
+    only during an explicitly authorized action and is removed before commit.
+    """
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS supersession_thread_close
+        BEFORE UPDATE OF status ON threads
+        WHEN NEW.status='closed' AND OLD.status!='closed'
+          AND NOT EXISTS (SELECT 1 FROM supersession_close_permit WHERE kind='thread' AND entity_id=OLD.id)
+          AND EXISTS (SELECT 1 FROM posts p JOIN request_progress r ON r.post_id=p.id
+                      WHERE p.thread_id=OLD.id AND r.disposition='superseded')
+        BEGIN SELECT RAISE(ABORT, 'superseded work is not completion; refresh this client and use the explicit thread close action'); END""")
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS supersession_issue_resolve
+        BEFORE UPDATE OF status ON issues
+        WHEN NEW.status='resolved' AND OLD.status!='resolved'
+          AND NOT EXISTS (SELECT 1 FROM supersession_close_permit WHERE kind='issue' AND entity_id=OLD.id)
+          AND EXISTS (SELECT 1 FROM issue_links l JOIN posts p ON p.thread_id=l.thread_id
+                      JOIN request_progress r ON r.post_id=p.id
+                      WHERE l.issue_id=OLD.id AND r.disposition='superseded')
+        BEGIN SELECT RAISE(ABORT, 'superseded work is not completion; refresh this client and use an explicit human resolution'); END""")
+
+
+@contextmanager
+def explicit_supersession_close(conn: sqlite3.Connection, kind: str, entity_id: int):
+    """Internal authorized explicit-action scope, never used by automatic completion."""
+    if not conn.in_transaction or kind not in ('thread','issue'):
+        raise ValueError('explicit close permit requires an active transaction and exact entity')
+    conn.execute('INSERT INTO supersession_close_permit(kind,entity_id) VALUES (?,?)', (kind,entity_id))
+    try:
+        yield
+    finally:
+        conn.execute('DELETE FROM supersession_close_permit WHERE kind=? AND entity_id=?', (kind,entity_id))

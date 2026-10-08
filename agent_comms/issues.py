@@ -442,7 +442,8 @@ def resolve_issue(board, p, session_id, issue_id, body):
         _write(board, p, session_id, issue_id)
         _event(board, p, session_id, issue_id, "resolution", body)
         c.execute("UPDATE issue_links SET needs_human=0 WHERE issue_id=?", (issue_id,))
-        c.execute("UPDATE issues SET status='resolved',needs_human=0 WHERE id=?", (issue_id,))
+        with db.explicit_supersession_close(c, 'issue', issue_id):
+            c.execute("UPDATE issues SET status='resolved',needs_human=0 WHERE id=?", (issue_id,))
     return get_issue(board, p, issue_id)
 
 
@@ -475,7 +476,9 @@ def _completed_answer_work(board, thread_id):
             return False
         for row in rows:
             obligations += 1
-            if row['state'] != 'finished' or not row['evidence_post_ids']:
+            # Supersession settles an obligation; it is never proof that its work
+            # completed, even if answer/issue links were added after retirement.
+            if row['state'] != 'finished' or row.get('disposition') == 'superseded' or not row['evidence_post_ids']:
                 return False
             for evidence_id in row['evidence_post_ids']:
                 evidence = c.execute('SELECT thread_id,sealed FROM posts WHERE id=?',(evidence_id,)).fetchone()

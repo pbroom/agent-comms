@@ -1015,7 +1015,11 @@ class Board:
             raise Invalid("status must be open or closed")
         with db.write_tx(self.conn) as c:
             self._check_agent_write(p)
-            c.execute("UPDATE threads SET status = ? WHERE id = ?", (status, thread_id))
+            if status == 'closed':
+                with db.explicit_supersession_close(c, 'thread', thread_id):
+                    c.execute("UPDATE threads SET status = ? WHERE id = ?", (status, thread_id))
+            else:
+                c.execute("UPDATE threads SET status = ? WHERE id = ?", (status, thread_id))
         self._notify("thread.status", {"thread_id": thread_id, "status": status})
         return self.get_thread(p, thread_id)
 

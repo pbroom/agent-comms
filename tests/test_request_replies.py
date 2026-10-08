@@ -163,3 +163,114 @@ def test_replay_does_not_touch_heartbeat(env):
     env.clock.advance(10);reply(env,tid,source)
     after=env.board.conn.execute('SELECT last_seen FROM sessions WHERE id=?',(env.sid['codex'],)).fetchone()[0]
     assert after==before
+
+
+def test_later_unrelated_answer_completion_does_not_complete_superseded_work(env):
+    from agent_comms import issues,pickup
+    tid=env.thread(); source=env.post('human',tid,'Original work','request',to=['codex'])
+    reply(env,tid,source,disposition='superseded')
+    question=env.post('codex',tid,'Approve separate work?',type='question',needs_response=True,to=['human'])
+    answer=env.post('human',tid,'Approved separate work',answer_to=[question['id']],to=['codex'])
+    evidence=env.post('codex',tid,'Separate work verified')
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],answer['id'],'codex','finished',
+                      'Verified separate work',[evidence['id']])
+    assert not issues._completed_answer_work(env.board,tid)
+    assert env.board._thread_row(tid)['status']=='open'
+    assert rows(env,source)[0]['disposition']=='superseded'
+    # Settled visual pickup status is separate from completion propagation.
+    assert pickup.for_thread(env.board,env.p['human'],tid)['complete']
+
+
+def test_human_answer_link_added_after_supersession_cannot_make_original_complete(env):
+    from agent_comms import issues
+    tid=env.thread(); source=env.post('human',tid,'Original work','request',to=['codex'])
+    reply(env,tid,source,disposition='superseded')
+    answer=env.post('human',tid,'Newly linked answer',answer_to=[source['id']],to=['codex'])
+    evidence=env.post('codex',tid,'Answer complete')
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],answer['id'],'codex','finished',
+                      'Verified answer',[evidence['id']])
+    assert not issues._completed_answer_work(env.board,tid)
+    assert env.board._thread_row(tid)['status']=='open'
+
+
+def superseded_thread(e):
+    tid=e.thread(); source=e.post('human',tid,'Original work','request',to=['codex'])
+    reply(e,tid,source,disposition='superseded')
+    return tid
+
+
+def test_legacy_thread_autoclose_is_fenced_and_prior_writes_roll_back(env):
+    import sqlite3
+    from agent_comms import db
+    tid=superseded_thread(env)
+    old=db.connect(env.settings.db_path)  # Already-running writer: deliberately no schema init.
+    with pytest.raises(sqlite3.IntegrityError,match='refresh this client'):
+        with db.write_tx(old):  # v10 also used managed_write_permit; it cannot bypass the new fence.
+            old.execute("UPDATE threads SET pinned_summary='unsafe completion inference' WHERE id=?",(tid,))
+            old.execute("UPDATE threads SET status='closed' WHERE id=?",(tid,))
+    assert env.board._thread_row(tid)['status']=='open'
+    assert env.board._thread_row(tid)['pinned_summary'] is None
+    assert old.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
+    # Ordinary old-client traffic on unaffected threads keeps working.
+    other=env.thread()
+    with db.write_tx(old): old.execute("UPDATE threads SET status='closed' WHERE id=?",(other,))
+    assert env.board._thread_row(other)['status']=='closed'
+    old.close()
+
+
+def test_legacy_issue_resolve_is_fenced_even_when_other_issue_prevents_thread_close(env):
+    import sqlite3
+    from agent_comms import db,issues
+    tid=superseded_thread(env)
+    first=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='one',body='one',thread_id=tid,needs_human=False)
+    other=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='two',body='two',thread_id=tid,needs_human=True)
+    old=db.connect(env.settings.db_path)
+    with pytest.raises(sqlite3.IntegrityError,match='refresh this client'):
+        with db.write_tx(old):
+            # Old auto-reconciliation resolves an eligible issue before considering
+            # thread closure. Another open issue would suppress that later close.
+            old.execute("UPDATE issues SET title='incorrectly completed' WHERE id=?",(first['id'],))
+            old.execute("UPDATE issues SET status='resolved',needs_human=0 WHERE id=?",(first['id'],))
+            if not old.execute("SELECT 1 FROM issue_links l JOIN issues i ON i.id=l.issue_id WHERE l.thread_id=? AND i.status!='resolved'",(tid,)).fetchone():
+                old.execute("UPDATE threads SET status='closed' WHERE id=?",(tid,))
+    assert issues.get_issue(env.board,env.p['human'],first['id'])['status']=='open'
+    assert issues.get_issue(env.board,env.p['human'],first['id'])['title']=='one'
+    assert issues.get_issue(env.board,env.p['human'],other['id'])['status']=='open'
+    assert old.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
+    old.close()
+
+
+def test_explicit_human_close_and_resolution_get_scoped_transient_permits(env):
+    from agent_comms import issues
+    tid=superseded_thread(env)
+    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='one',body='one',thread_id=tid)
+    resolved=issues.resolve_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Human accepts retirement')
+    assert resolved['status']=='resolved'
+    assert env.board.conn.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
+    assert env.board.set_thread_status(env.p['human'],tid,'closed')['status']=='closed'
+    assert env.board.conn.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
+
+
+def test_human_permit_rolls_back_on_failure_and_does_not_cover_other_entity(env):
+    import sqlite3
+    from agent_comms import db
+    tid=superseded_thread(env)
+    other=env.thread(); source=env.post('human',other,'work','request',to=['codex'])
+    reply(env,other,source,disposition='superseded',key='other-thread')
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.write_tx(env.board.conn):
+            with db.explicit_supersession_close(env.board.conn,'thread',tid):
+                env.board.conn.execute("UPDATE threads SET status='closed' WHERE id=?",(other,))
+    assert env.board.conn.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
+    env.board.conn.execute("CREATE TRIGGER fail_manual_close BEFORE UPDATE OF status ON threads BEGIN SELECT RAISE(ABORT,'fail'); END")
+    with pytest.raises(sqlite3.IntegrityError): env.board.set_thread_status(env.p['human'],tid,'closed')
+    assert env.board._thread_row(tid)['status']=='open'
+    assert env.board.conn.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
+
+
+def test_existing_authorized_thread_creator_can_explicitly_close_superseded_thread(env):
+    tid=env.thread(as_='codex'); source=env.post('human',tid,'work','request',to=['codex'])
+    reply(env,tid,source,disposition='superseded')
+    with pytest.raises(Forbidden): env.board.set_thread_status(env.p['claude'],tid,'closed')
+    assert env.board.set_thread_status(env.p['codex'],tid,'closed')['status']=='closed'
+    assert env.board.conn.execute('SELECT COUNT(*) FROM supersession_close_permit').fetchone()[0]==0
