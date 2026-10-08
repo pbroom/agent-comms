@@ -229,9 +229,12 @@ test('signed-in browsers: listed as text, revoke one, sign out all', async () =>
   assert.match(section.textContent, /this browser/);
   assert.match(section.textContent, /<img src=x onerror/);
   assert.match(section.textContent, /30 days after its last use/);
+  // Both take a second click (the first arms the button; see dashboard-confirms.test.cjs).
+  section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
   section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
   await settle();
   assert.ok(calls.some(c => c.url === '/api/web-sessions/bbbbbbbbbbbbbbbb/revoke' && c.method === 'POST'));
+  document.querySelector('#sign-out-all').click();
   document.querySelector('#sign-out-all').click();
   await settle();
   assert.ok(calls.some(c => c.url === '/api/web-sessions/revoke-all' && c.method === 'POST'));

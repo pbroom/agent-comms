@@ -75,6 +75,9 @@ button[aria-busy=true]:disabled { cursor: progress; }
 .btn-ghost:hover:not(:disabled) { background: var(--accent); }
 .btn-destructive, button.danger { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
 .btn-destructive:hover:not(:disabled), button.danger:hover:not(:disabled) { background: var(--destructive-bg); }
+/* A two-click confirm button while armed (see confirmButton): the solid destructive fill. */
+button.btn-confirm, button.danger.btn-confirm { background: var(--destructive); border-color: var(--destructive); color: var(--destructive-foreground); font-weight: 600; }
+button.btn-confirm:hover:not(:disabled) { background: var(--destructive); filter: brightness(1.08); }
 @media (prefers-color-scheme: dark) { .btn-secondary:hover:not(:disabled) { filter: brightness(1.15); } }
 
 /* Input, textarea, select. Zero specificity, so the few older layout rules (widths) still apply. */
@@ -550,13 +553,51 @@ async function api(method, path, data, bearer) {
   return body;
 }
 
-// Only pausing the board and signing browsers out still ask first (window.confirm). Every other action happens on
-// click: the human asked for that, and embedded browsers that block confirm() would otherwise make them dead buttons.
-async function act(method, path, confirmText) {
-  if (confirmText && !confirm(confirmText)) return;
+// Every action happens on click, except pausing the board and signing browsers out, which take a second click (see
+// confirmButton). Never window.confirm/alert/prompt: the human's embedded browser blocks them, which would make
+// those buttons do nothing.
+async function act(method, path) {
   try { await api(method, path); lastError = ""; } catch (e) { lastError = e.message; }
   refresh();
 }
+
+// Click twice to confirm. The first click arms the button: it reads `confirmLabel` in the destructive style for
+// CONFIRM_MS, and a second click within that window runs `action`. The timeout, Escape and leaving the button (blur)
+// disarm it. A screen reader hears the hint through the page's one live region (#confirm-live, outside #app, so a
+// re-render never replaces it). The armed key lives here, so a re-render keeps the armed state (and render() keeps
+// focus on it); arming and disarming update the button in place, so a click elsewhere is never lost to a re-render.
+const CONFIRM_MS = 4000;
+let armed = null;   // { key, timer }
+function announce(text) {
+  let n = document.getElementById("confirm-live");
+  if (!n) { n = el("div", { id: "confirm-live", class: "sr-only", "aria-live": "polite", role: "status" }); document.body.append(n); }
+  n.textContent = text;
+}
+function confirmButtons(key) { return [...document.querySelectorAll("button[data-confirm]")].filter(b => b.dataset.confirm === key); }
+function disarm() {
+  if (!armed) return;
+  const { key, timer } = armed;
+  clearTimeout(timer); armed = null; announce("");
+  for (const b of confirmButtons(key)) { b.textContent = b.dataset.label; b.classList.remove("btn-confirm"); b.removeAttribute("aria-describedby"); }
+}
+function confirmButton(key, label, confirmLabel, hint, action, attrs = {}) {
+  const on = !!armed && armed.key === key;
+  const n = el("button", { ...attrs, type: "button", class: ((attrs.class || "") + (on ? " btn-confirm" : "")).trim(),
+    "data-confirm": key, "data-label": label, "aria-describedby": on ? "confirm-live" : null }, on ? confirmLabel : label);
+  n.addEventListener("click", e => {
+    e.stopPropagation();
+    if (armed && armed.key === key) { disarm(); action(); return; }
+    disarm();
+    armed = { key, timer: setTimeout(() => { if (armed && armed.key === key) disarm(); }, CONFIRM_MS) };
+    announce(`${hint} Activate “${confirmLabel}” again within ${CONFIRM_MS / 1000} seconds to confirm, or press Escape to cancel.`);
+    for (const b of confirmButtons(key)) { b.textContent = confirmLabel; b.classList.add("btn-confirm"); b.setAttribute("aria-describedby", "confirm-live"); }
+  });
+  n.addEventListener("keydown", e => { if (e.key === "Escape" && armed && armed.key === key) { e.preventDefault(); disarm(); } });
+  // A blur caused by render() swapping the DOM is not the human leaving the button.
+  n.addEventListener("blur", () => { if (!rendering && armed && armed.key === key) disarm(); });
+  return n;
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape" && armed) disarm(); });
 
 function signedOut(message) {
   signedIn = false; token = null; state = null; cfg = null; lastError = message || "";
@@ -702,10 +743,11 @@ function postsOf(t) {
   return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
-function pauseControl() {
+function pauseControl(where) {
   return state.paused
     ? el("button", { onclick: () => act("POST", "/api/admin/unpause") }, "Unpause agents")
-    : el("button", { class: "danger", onclick: () => act("POST", "/api/admin/pause", "Pause the board? All agent writes will be rejected.") }, "Pause agents");
+    : confirmButton("pause-" + where, "Pause agents", "Confirm pause?", "Pausing rejects all agent writes until you unpause.",
+        () => act("POST", "/api/admin/pause"), { class: "danger" });
 }
 
 function ago(iso) {
@@ -929,9 +971,8 @@ function renderGrants() {
 // ---------------------------------------------------------------- settings view (human only)
 // Every value shown here comes from the board and goes in through el(), i.e. textContent.
 
-async function cfgAct(method, path, data, confirmText) {
+async function cfgAct(method, path, data) {
   if (cfgBusy) return false;
-  if (confirmText && !confirm(confirmText)) return false;
   cfgBusy = true; cfgError = ""; render();
   let ok = true;
   try { await api(method, path, data); } catch (e) { cfgError = e.message; ok = false; }
@@ -992,7 +1033,7 @@ function renderBoardSection() {
   const f = cfg.settings.files;
   return el("section", { class: "card", id: "settings-board" },
     el("h2", {}, "Board"),
-    el("div", { class: "actions" }, state.paused ? chip("PAUSED", "bad") : chip("live", "ok"), pauseControl()),
+    el("div", { class: "actions" }, state.paused ? chip("PAUSED", "bad") : chip("live", "ok"), pauseControl("settings")),
     accept ? el("div", { class: "toggle", style: "margin-top:12px" },
       el("input", { type: "checkbox", id: "require-human-accept", checked: accept.value, disabled: cfgBusy || !f.writable,
         onchange: e => {
@@ -1129,12 +1170,13 @@ function renderBrowsers() {
           el("td", {}, when(s.created_at)),
           el("td", { title: when(s.last_seen) }, ago(s.last_seen)),
           el("td", {}, when(s.expires_at)),
-          el("td", {}, el("button", { class: "danger", disabled: cfgBusy,
-            onclick: () => cfgAct("POST", `/api/web-sessions/${s.id}/revoke`, undefined,
-              s.current ? "Sign out this browser?" : `Sign out ${s.label}?`) }, "Revoke"))))))
+          el("td", {}, confirmButton("revoke-session-" + s.id, "Revoke", "Confirm revoke?",
+            s.current ? "Revoking signs out this browser." : `Revoking signs out ${s.label}.`,
+            () => cfgAct("POST", `/api/web-sessions/${s.id}/revoke`), { class: "danger", disabled: cfgBusy }))))))
         : el("p", { class: "small muted" }, "No browsers are signed in."),
-      el("div", { class: "actions" }, el("button", { class: "danger", id: "sign-out-all", disabled: cfgBusy || !b.sessions.length,
-        onclick: () => cfgAct("POST", "/api/web-sessions/revoke-all", undefined, "Sign out every browser, including this one?") }, "Sign out all browsers"))]);
+      el("div", { class: "actions" }, confirmButton("sign-out-all", "Sign out all browsers", "Confirm sign out?",
+        "Signing out all browsers includes this one.", () => cfgAct("POST", "/api/web-sessions/revoke-all"),
+        { class: "danger", id: "sign-out-all", disabled: cfgBusy || !b.sessions.length }))]);
 }
 
 function lastActivity(t) {
@@ -2306,8 +2348,30 @@ function keepScroll(selector) {
   return () => { const n = document.querySelector(selector); if (n) n.scrollTop = savedListScroll[listTab] || 0; };
 }
 
+// Re-rendering replaces the DOM; put keyboard focus back on the same control (by id, or a confirm button's key), so
+// the 3-second refresh, a tab switch or an armed confirm button never drops it. Text fields are left alone (the
+// refresh skips while one is being edited).
+let rendering = false;
+function focusTarget(n) {
+  if (!n || !n.tagName || ["INPUT", "TEXTAREA", "SELECT", "BODY", "HTML"].includes(n.tagName)) return null;
+  if (n.id) { const id = n.id; return () => document.getElementById(id); }
+  if (n.dataset && n.dataset.confirm) { const key = n.dataset.confirm; return () => confirmButtons(key)[0]; }
+  return null;
+}
 function render() {
   const app = document.getElementById("app");
+  const refocus = app.contains(document.activeElement) ? focusTarget(document.activeElement) : null;
+  rendering = true;
+  try { draw(app); }
+  finally {
+    rendering = false;
+    if (refocus && !app.contains(document.activeElement)) {
+      const n = refocus();
+      if (n && n.focus) n.focus({ preventScroll: true });
+    }
+  }
+}
+function draw(app) {
   const listNode = document.querySelector(".thread-list");
   if (listNode && listNode.dataset.tab) savedListScroll[listNode.dataset.tab] = listNode.scrollTop;
   app.replaceChildren();
@@ -2340,7 +2404,7 @@ function render() {
     state.paused ? chip("PAUSED", "bad") : chip("live", "ok"),
     el("span", { class: "muted small" }, `signed in as ${state.me.name}${human ? " (human)" : ""}`),
     el("span", { class: "sp" }),
-    human ? pauseControl() : null,
+    human ? pauseControl("header") : null,
     human ? el("button", { id: "settings-link", onclick: () => setView(view === "settings" ? "board" : "settings") },
       view === "settings" ? "Back to board" : "Settings") : null,
     el("button", { id: "sign-out", class: "btn-ghost", onclick: signOut }, "Sign out"),
@@ -2445,7 +2509,7 @@ function editing() {
   const a = document.activeElement;
   return !!a && ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName) && a.type !== "checkbox";
 }
-setInterval(() => { if (signedIn && state && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
+setInterval(() => { if (signedIn && state && !armed && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
 </script>
 </body>
 </html>
