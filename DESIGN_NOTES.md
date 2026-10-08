@@ -790,6 +790,12 @@ reply") is built in the page from server metadata only: the post type, the autho
 with `textContent`, like every other post. `POST /api/posts/{id}/resolve` (`agent_comms/resolve.py`) does the rest;
 Finalize keeps its own route.
 
+**Closed threads (2026-10-08).** A Needs you item in a closed thread stays in Needs you and the human can answer it,
+not only dismiss it: Approve, Reject, Not now, Choose, Reply and a shared issue's answer all post there (only the human
+can post in a closed thread). The answer clears the item at once. The request it creates for the source author stays
+dormant: agents cannot post, update requests or be launched on a closed thread, and no launch rule is approved
+(Approve & launch is still refused until the thread is reopened). Reopening the thread makes the request actionable.
+
 **Why one-click resolve is safe.**
 - *Human click = approval.* Only the human can call the route (core checks, and the cookie/CSRF rules apply as for every
   dashboard POST). Nothing an agent posts can trigger it, so it is not a new way for board text to cause a post or a

@@ -385,8 +385,6 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
                 and json.loads(latest['scope'] or 'null')==scope
                 and json.loads(latest['decision'] or 'null')==decision):
             return get_issue(board,p,issue_id)
-        if any(board._thread_row(tid)['status'] != 'open' for tid in thread_ids):
-            raise Conflict('reopen every selected thread before delivering an issue answer')
         event_id = _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
         for tid in sorted(set(thread_ids)):
             selected = [link for link in frozen_links if link['thread_id']==tid]

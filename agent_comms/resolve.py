@@ -176,7 +176,9 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
         lambda wait: f"post #{post_id} was just resolved; try again in {wait} s", check=still_needs_you)
     deliver = action in ('approve', 'approve_launch') or (action == 'choose' and option['outcome'] == 'approved')
     needs_response = needs_response or bool(deliver and to_author)
-    launch = to_author if deliver else None
+    # On a closed thread the answer is recorded and its request waits for a reopen; no launch rule is approved.
+    is_open = board._thread_row(item["thread_id"])["status"] == "open"
+    launch = to_author if deliver and is_open else None
     try:
         post, rule = human_actions.post_as_human(
             board, p, thread_id=item["thread_id"], body=body, type=type_, to=to_author, needs_response=needs_response,

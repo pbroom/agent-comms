@@ -181,23 +181,43 @@ def test_empty_or_only_informational_thread_cannot_autoclose(env):
     assert result=={'closed_thread_ids':[],'resolved_issue_ids':[]}
 
 
-def test_closed_issue_target_rolls_back_every_selected_answer(env):
+def test_issue_answer_reaches_a_closed_linked_thread_and_waits_there(env):
     first,second=env.thread(),env.thread()
     issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=first)
     issues.link_issue(env.board,env.p['claude'],env.sid['claude'],issue['id'],second)
     env.board.set_thread_status(env.p['human'],second,'closed')
-    with pytest.raises(Conflict,match='reopen'):
-        issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Both',[first,second])
-    assert not env.board.conn.execute('SELECT 1 FROM posts').fetchone()
-    assert not env.board.conn.execute("SELECT 1 FROM issue_comments WHERE kind='decision'").fetchone()
+    issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Both',[first,second])
+    answers={p['thread_id']:p for p in env.board.conn.execute("SELECT * FROM posts WHERE agent='human'")}
+    assert set(answers)=={first,second}
+    assert env.board.get_thread(env.p['human'],second)['status']=='closed'   # answering does not reopen it
 
 
-def test_closed_thread_rejects_new_answer_assignment(env):
+def test_human_may_answer_on_a_closed_thread_and_its_request_waits_for_a_reopen(env):
+    """Closed-thread Needs you items: the human answers (not only dismisses); agents still cannot post or act
+    there, and the answer's request becomes actionable when the human reopens the thread."""
+    source=question(env,env.thread())
+    tid=source['thread_id']
+    env.board.set_thread_status(env.p['human'],tid,'closed')
+    assert source['id'] in pending(env)
+    linked=answer(env,source)
+    assert linked['answer_to']==[source['id']] and linked['to']==['codex']
+    assert source['id'] not in pending(env)
+    with pytest.raises(Conflict,match='closed'):
+        env.post('codex',tid,'Working on it')
+    with pytest.raises(Conflict,match='closed'):
+        requests.progress(env.board,env.p['codex'],env.sid['codex'],linked['id'],'codex','started')
+    env.board.set_thread_status(env.p['human'],tid,'open')
+    assert requests.progress(env.board,env.p['codex'],env.sid['codex'],linked['id'],'codex','started')['state']=='started'
+
+
+def test_resolve_on_a_closed_thread_answers_without_approving_a_launch(env):
     source=question(env,env.thread())
     env.board.set_thread_status(env.p['human'],source['thread_id'],'closed')
-    with pytest.raises(Conflict,match='reopen'):
-        answer(env,source)
-    assert not env.board.conn.execute('SELECT 1 FROM answer_links').fetchone()
+    out=resolve.resolve(env.board,env.p['human'],source['id'],'approve',None,DispatchConfig())
+    assert out['to']==['codex'] and source['id'] not in pending(env)
+    assert env.board.list_dispatch_rules(env.p['human'])==[]
+    with pytest.raises(Conflict,match='closed'):
+        env.post('codex',source['thread_id'],'agents still cannot post')
 
 
 def test_last_task_completion_reconciles_previously_finished_answer(env):

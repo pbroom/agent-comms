@@ -1146,8 +1146,9 @@ class Board:
                 if to and _answer_recipient is None and not intended.issubset(set(to)):
                     raise Invalid('answer recipients must include every source author')
                 to = to or sorted(intended)
-                if to and t['status']=='closed':
-                    raise Conflict('reopen the thread before assigning an exact answer for agent pickup')
+                # Only the human can post here when the thread is closed (checked above). Their answer is recorded
+                # and clears the Needs you item; the request it makes for the source authors stays dormant (agents
+                # cannot update requests, post or be launched on a closed thread) until the human reopens it.
 
             if continuation is not None:
                 continuation = workstreams.prepare(self, p, session_id, thread_id, continuation)
