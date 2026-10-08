@@ -198,8 +198,11 @@ def list_issues(board, p, project=None, status=None, query=None, thread_id=None,
         sql += " AND EXISTS(SELECT 1 FROM issue_links l WHERE l.issue_id=i.id AND l.thread_id=?)"
         args.append(thread_id)
     if query:
-        sql += " AND (instr(lower(i.title),lower(?))>0 OR instr(lower(i.body),lower(?))>0)"
-        args.extend([query, query])
+        sql += """ AND (instr(lower(i.title),lower(?))>0 OR instr(lower(i.body),lower(?))>0
+            OR EXISTS(SELECT 1 FROM issue_links l JOIN threads t ON t.id=l.thread_id
+                WHERE l.issue_id=i.id AND (instr(lower(t.project),lower(?))>0
+                    OR instr(lower(t.title),lower(?))>0)))"""
+        args.extend([query, query, query, query])
     return [
         get_issue(board, p, r[0])
         for r in board.conn.execute(sql + " ORDER BY i.updated_at DESC,i.id DESC LIMIT 200", args)

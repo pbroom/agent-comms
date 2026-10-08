@@ -206,6 +206,7 @@ let view = location.hash === "#settings" ? "settings" : /^#issues?(?:-|$)/.test(
 let selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null;
 let selectedIssueDetail = null;
 let issueSource = null, issueSearch = "", issueBusy = false, issueError = "";
+let issueSearchResults = [], issueSearchLoading = false, issueSearchError = "", issueSearchVersion = 0;
 let issueCreate = { title: "", body: "", needs_human: true };
 const issueDrafts = {};
 let cfg = null, cfgError = "", cfgBusy = false, cfgDraft = {};
@@ -298,6 +299,7 @@ async function act(method, path, confirmText) {
 function signedOut(message) {
   signedIn = false; token = null; state = null; cfg = null; lastError = message || "";
   issueSource = null; issueSearch = ""; issueError = ""; selectedIssueDetail = null;
+  issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
   issueCreate = { title: "", body: "", needs_human: true };
   for (const id of Object.keys(issueDrafts)) delete issueDrafts[id];
 }
@@ -364,6 +366,7 @@ async function refresh() {
     if (e.status === 401) signedOut(token ? "That token is no longer valid." : "Your sign-in ended. Sign in again below.");
     else lastError = e.message;
   }
+  if (state && view === "issues" && issueSearch.trim()) await searchIssues(issueSearch);
   selectedIssueDetail = null;
   if (state && view === "issues" && selectedIssue && !allIssues().some(i => i.id === selectedIssue)) {
     const requested = selectedIssue;
@@ -1338,10 +1341,12 @@ function issueStatus(i) {
 }
 function openIssue(id) {
   selectedIssue = id; view = "issues"; issueError = "";
+  selectedIssueDetail = issueSearchResults.find(i => i.id === id) || null;
   history.replaceState(null, "", `#issue-${id}`); render();
 }
 function beginIssue(p) {
   issueSource = { thread_id: p.thread_id, post_id: p.id };
+  issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
   issueSearch = ""; selectedIssue = null; issueError = ""; setView("issues");
 }
 async function issueWrite(path, payload, done) {
@@ -1410,6 +1415,7 @@ function renderIssueAnswer(i, draft, threads, submit) {
 function renderIssueDetail(i, human) {
   const draft = issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: [], resolution: "" };
   const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
+  const resolutions = i.resolutions?.length ? i.resolutions : i.resolution ? [i.resolution] : [];
   const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);
   return el("section", { class: "card", id: `issue-${i.id}` },
     el("div", { class: "meta" }, el("span", { class: "muted small" }, `Issue #${i.id}`), " ", issueStatus(i)),
@@ -1446,8 +1452,8 @@ function renderIssueDetail(i, human) {
       el("div", { class: "small" }, "Applies to: ", d.thread_ids.map((id, n) => el("span", {}, n ? ", " : "",
         el("a", { href: `#thread-${id}` }, `thread #${id}`)))))),
     el("h3", {}, "Resolution"),
-    i.resolution ? el("div", { class: "issue-discussion" }, i.resolution.body,
-      el("p", { class: "small muted" }, `${i.status === "resolved" ? "Resolved" : "Previous resolution"} by ${i.resolution.agent} · ${ago(i.resolution.created_at)}`)) :
+    resolutions.length ? resolutions.map((r, index) => el("div", { class: "post issue-discussion", "data-resolution": r.id || index }, r.body,
+      el("p", { class: "small muted" }, `${i.status === "resolved" && index === resolutions.length - 1 ? "Resolved" : "Previous resolution"} by ${r.agent} · ${ago(r.created_at)}`))) :
       el("p", { class: "small muted" }, "Implementation remains unresolved until its result is verified."),
     human && i.status !== "resolved" ? el("details", {}, el("summary", {}, "Mark implementation resolved"),
       el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
@@ -1455,23 +1461,48 @@ function renderIssueDetail(i, human) {
         issueField("Verified result or resolution evidence", "resolution", draft, true),
         el("button", { type: "submit", disabled: issueBusy }, "Mark resolved"))) : null);
 }
-function renderIssues(human) {
-  const issues = allIssues();
-  const current = issues.find(i => i.id === selectedIssue);
-  const list = el("div", { id: "issue-results" });
-  function results() {
-    const q = issueSearch.toLocaleLowerCase().trim();
-    const matches = issues.filter(i => !q || `${i.title} ${i.body} ${i.links.map(l => l.project + " " + l.title).join(" ")}`.toLocaleLowerCase().includes(q));
-    list.replaceChildren(...(matches.length ? matches.map(i => el("button", { class: "issue-row", "aria-current": i.id === selectedIssue ? "true" : "false",
-      onclick: () => openIssue(i.id) }, el("strong", {}, `#${i.id} ${i.title}`),
-      el("div", { class: "small muted" }, plural(new Set(i.links.map(l => l.thread_id)).size, "thread")), issueStatus(i))) :
-      [el("p", { class: "muted small" }, q ? "No matching issues. Try the project or cause before creating one." : "No shared issues yet.")]));
+function renderIssueResults(list) {
+  const searching = Boolean(issueSearch.trim());
+  if (searching && (issueSearchLoading || issueSearchError)) {
+    list.replaceChildren(el("p", { class: "muted small", role: issueSearchError ? "alert" : "status" },
+      issueSearchError ? `Search failed: ${issueSearchError}. Try again before creating an issue.` : "Searching issues…"));
+    return;
   }
-  results();
+  const matches = searching ? issueSearchResults : allIssues();
+  list.replaceChildren(...(matches.length ? matches.map(i => el("button", { class: "issue-row", "aria-current": i.id === selectedIssue ? "true" : "false",
+    onclick: () => openIssue(i.id) }, el("strong", {}, `#${i.id} ${i.title}`),
+    el("div", { class: "small muted" }, plural(new Set(i.links.map(l => l.thread_id)).size, "thread")), issueStatus(i))) :
+    [el("p", { class: "muted small" }, searching ? "No matching issues. Try the project or cause before creating one." : "No shared issues yet.")]));
+  if (matches.length >= 200) list.append(el("p", { class: "muted small" },
+    searching ? "Showing up to 200 matches. Refine your search for older issues." : "Showing recent issues. Search to find older discussions."));
+}
+async function searchIssues(value) {
+  issueSearch = value;
+  const version = ++issueSearchVersion;
+  issueSearchResults = []; issueSearchError = "";
+  issueSearchLoading = Boolean(value.trim());
+  const update = () => { const list = document.getElementById("issue-results"); if (list) renderIssueResults(list); };
+  update();
+  if (!issueSearchLoading) return;
+  try {
+    const found = await api("GET", `/api/issues?query=${encodeURIComponent(value.trim())}`);
+    if (version !== issueSearchVersion) return;
+    issueSearchResults = found;
+  } catch (e) {
+    if (version !== issueSearchVersion) return;
+    issueSearchError = e.message || "Unable to load issues";
+  } finally {
+    if (version === issueSearchVersion) { issueSearchLoading = false; update(); }
+  }
+}
+function renderIssues(human) {
+  const current = allIssues().find(i => i.id === selectedIssue);
+  const list = el("div", { id: "issue-results" });
+  renderIssueResults(list);
   const sidebar = el("section", { class: "card" }, el("h2", {}, "Issues"),
     el("p", { class: "small muted" }, "One discussion for a shared blocker or fix."),
     el("input", { class: "issue-search", type: "search", "aria-label": "Search issues", placeholder: "Search issues or projects", value: issueSearch,
-      oninput: e => { issueSearch = e.target.value; results(); } }), list);
+      oninput: e => { searchIssues(e.target.value); } }), list);
   const content = el("div", {}, issueError ? el("p", { class: "banner", role: "alert" }, issueError) : null);
   if (issueSource) content.append(el("section", { class: "card" },
     el("h2", {}, `Link post #${issueSource.post_id} to an issue`),
