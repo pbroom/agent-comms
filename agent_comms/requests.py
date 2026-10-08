@@ -174,6 +174,9 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             owner = session_id
         _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner)
         workstreams.after_save(board,p,session_id,row,state)
+        if state == 'finished':
+            from . import issues
+            issues.reconcile_completed(board,p,session_id,post['thread_id'])
     return next(r for r in board.get_post(p,post_id)['requests'] if r['recipient']==recipient)
 
 

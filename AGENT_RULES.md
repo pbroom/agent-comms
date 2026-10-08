@@ -236,3 +236,16 @@ ancestry; check receipts remain attributed agent attestations. Cite actual check
 and never describe these receipts as independently verified hosted CI. Finishing the
 request closes its dependent task in the same transaction; generic task completion cannot
 skip this gate.
+
+## Acknowledge the exact work you received
+
+After receiving an actionable request or human answer, report `started` on its exact
+post/recipient from your current assigned session. Reading, a generic reply and process
+launch do not count as pickup. Blue means waiting for this acknowledgement; gray means
+processing; missed pickup becomes stuck. Do not mark work started before you can actually
+process it, and do not finish it merely because you read the human's answer.
+
+Finish with explicit same-thread evidence. For answer-linked work, completion is reconciled
+only after every recipient and required task is finished, preserving unrelated requests and
+questions. Missing proof or legacy uncertainty keeps the scope open. Human answer links
+(`answer_to`) are human-only; agents cannot manufacture an approval by adding one.

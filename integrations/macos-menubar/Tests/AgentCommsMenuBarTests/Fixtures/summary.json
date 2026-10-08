@@ -11,6 +11,7 @@
     ]
   },
   "unread_for_human": 7,
+  "agent_pickup": {"waiting": 2, "overdue": 1, "processing": 1, "blocked": 0},
   "threads": {"open": 4},
   "tasks": {
     "open": 6,

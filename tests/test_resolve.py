@@ -116,7 +116,7 @@ def test_reject_is_for_decisions_only_and_does_not_finalize(renv):
     assert (post["body"], post["to"], post["type"]) == (f"Not approved: decision #{d['id']} is rejected.",
                                                         ["claude"], "status")
     assert renv.board.get_post(renv.p["human"], d["id"])["decision_status"].startswith("proposal")
-    assert needs_you(renv) == []
+    assert needs_you(renv) == [q['id']]  # rejecting this decision cannot answer the other question
 
 
 def test_reply_posts_the_humans_own_text(renv):
@@ -326,5 +326,5 @@ def test_agent_proposals_to_nobody_or_the_human_need_the_human(renv):
     ids = {p["id"] for p in e.board.snapshot(e.p["human"])["needs_you"]}
     assert {mine["id"], to_me["id"]} <= ids
     assert between["id"] not in ids and task["id"] not in ids
-    e.post("human", e.tid, "ok")                                                              # the human answered
+    e.post("human", e.tid, "ok", answer_to=[mine['id'],to_me['id']])  # exact human answer
     assert not ({mine["id"], to_me["id"]} & {p["id"] for p in e.board.snapshot(e.p["human"])["needs_you"]})

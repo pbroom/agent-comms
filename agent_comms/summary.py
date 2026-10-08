@@ -18,7 +18,7 @@ import json
 import re
 from typing import Any
 
-from . import dispatch
+from . import dispatch, pickup
 from .config import NAME_RE
 from .core import TASK_STATUSES, TERMINAL, Board, Principal, iso
 from .notify import clean
@@ -139,6 +139,12 @@ def human_summary(board: Board, p: Principal, config: dispatch.DispatchConfig) -
         {"me": p.name}).fetchone()[0]
 
     open_threads = conn.execute("SELECT COUNT(*) FROM threads WHERE status = 'open'").fetchone()[0]
+    agent_pickup = {"waiting": 0, "overdue": 0, "processing": 0, "blocked": 0}
+    for thread in conn.execute("SELECT id FROM threads WHERE status = 'open'"):
+        progress = pickup.for_thread(board, p, thread["id"])
+        for key in ("waiting", "processing", "blocked"):
+            agent_pickup[key] += len(progress[key])
+        agent_pickup["overdue"] += sum(row["overdue"] for row in progress["waiting"])
     marks = ",".join("?" * len(TERMINAL))
     by_status = {s: 0 for s in TASK_STATUSES if s not in TERMINAL}
     for r in conn.execute(f"SELECT status, COUNT(*) n FROM tasks WHERE status NOT IN ({marks}) GROUP BY status",
@@ -172,6 +178,7 @@ def human_summary(board: Board, p: Principal, config: dispatch.DispatchConfig) -
     return {"summary_version": SUMMARY_VERSION, "generated_at": iso(now), "paused": board.is_paused(),
             "needs_you": {"count": needs_count, "items": needs_items},
             "unread_for_human": unread,
+            "agent_pickup": agent_pickup,
             "threads": {"open": open_threads},
             "tasks": {"open": sum(by_status.values()), "by_status": by_status},
             "live_sessions": {"window_minutes": LIVE_SESSION_MINUTES, "agents": live},
