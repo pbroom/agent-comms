@@ -27,7 +27,12 @@ async function setup({ issues = [issue()], human = true, hash = '#thread-10', pe
       if (u.startsWith('/api/state')) return ok({ me, issues, needs_you_issues: pendingIssues, threads: [thread], needs_you: [], sessions: [], paused: false,
         authorization_grants: [], task_categories: [], active_runs: [], launchable_agents: [], agents: [], limits: {} });
       calls.push({ path: u, body: opts.body && JSON.parse(opts.body), method: opts.method });
-      return reply ? reply(u, calls.at(-1).body) : ok({ id: 1 });
+      if (reply) return reply(u, calls.at(-1).body);
+      if (u.startsWith('/api/issues?query=')) {
+        const q = new URL(u, 'http://localhost').searchParams.get('query').toLowerCase();
+        return ok((issues || []).filter(i => `${i.title} ${i.body} ${i.links.map(l => l.project + ' ' + l.title).join(' ')}`.toLowerCase().includes(q)));
+      }
+      return ok({ id: 1 });
     };
   } });
   await settle();
@@ -59,13 +64,14 @@ test('post reuse requires explicit linking and never silently merges a search ma
   const { dom, d, win, calls } = await setup();
   try {
     d.querySelector('[data-link-issue="100"]').click(); await settle();
-    const search = d.querySelector('[type="search"]'); search.value = 'metadata'; search.dispatchEvent(new win.Event('input'));
+    const search = d.querySelector('[type="search"]'); search.value = 'metadata'; search.dispatchEvent(new win.Event('input')); await settle();
     assert.equal(d.querySelectorAll('.issue-row').length, 1);
-    assert.equal(calls.length, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].path, '/api/issues?query=metadata');
     d.querySelector('.issue-row').click();
-    assert.equal(calls.length, 0);
+    assert.equal(calls.filter(c => c.method === 'POST').length, 0);
     button(d, 'Link this post').click(); await settle();
-    assert.deepEqual(calls[0], { path: '/api/issues/1/links', method: 'POST', body: { thread_id: 10, post_id: 100 } });
+    assert.deepEqual(calls.find(c => c.method === 'POST'), { path: '/api/issues/1/links', method: 'POST', body: { thread_id: 10, post_id: 100 } });
   } finally { dom.window.close(); }
 });
 
@@ -181,5 +187,60 @@ test('a deep link fetches an older resolved issue outside both snapshots', async
     assert.ok(d.getElementById('issue-7'));
     assert.deepEqual(calls[0], { path: '/api/issues/7', method: 'GET', body: undefined });
     assert.match(d.getElementById('issue-7').textContent, /Resolved/);
+  } finally { dom.window.close(); }
+});
+
+
+test('search finds and opens older issues outside snapshots without losing focus', async () => {
+  const old = issue(999); old.needs_human = false;
+  const { dom, d, win, calls } = await setup({ issues: [], hash: '#issues', reply: () => ok([old]) });
+  try {
+    const input = d.querySelector('[type="search"]'); input.focus(); input.value = '/repo/one';
+    input.dispatchEvent(new win.Event('input')); await settle();
+    assert.equal(calls[0].path, '/api/issues?query=%2Frepo%2Fone');
+    assert.equal(d.activeElement, input);
+    assert.equal(d.querySelectorAll('.issue-row').length, 1);
+    d.querySelector('.issue-row').click();
+    assert.ok(d.getElementById('issue-999'));
+    assert.ok(d.querySelector('#issue-999 a[href="#post-100"]'));
+  } finally { dom.window.close(); }
+});
+
+test('search ignores stale responses and clearing restores recent issues', async () => {
+  const pending = new Map();
+  const { dom, d, win } = await setup({ hash: '#issues', reply: url => new Promise(resolve => pending.set(url, resolve)) });
+  try {
+    const input = d.querySelector('[type="search"]');
+    input.value = 'first'; input.dispatchEvent(new win.Event('input'));
+    input.value = 'second'; input.dispatchEvent(new win.Event('input'));
+    pending.get('/api/issues?query=second')(ok([issue(2)])); await settle();
+    pending.get('/api/issues?query=first')(ok([issue(3)])); await settle();
+    assert.match(d.querySelector('.issue-row').textContent, /^#2 /);
+    input.value = ''; input.dispatchEvent(new win.Event('input'));
+    assert.match(d.querySelector('.issue-row').textContent, /^#1 /);
+  } finally { dom.window.close(); }
+});
+
+test('search failure is not presented as no matching issues', async () => {
+  const { dom, d, win } = await setup({ hash: '#issues', reply: () => ({ ok: false, status: 503, json: async () => ({ message: 'Unavailable' }) }) });
+  try {
+    const input = d.querySelector('[type="search"]'); input.value = 'blocked'; input.dispatchEvent(new win.Event('input')); await settle();
+    assert.match(d.querySelector('#issue-results').textContent, /Search failed/);
+    assert.doesNotMatch(d.querySelector('#issue-results').textContent, /No matching/);
+  } finally { dom.window.close(); }
+});
+
+test('every resolution remains visible after repeated reopen and resolve cycles', async () => {
+  const data = issue(); data.status = 'resolved'; data.needs_human = false;
+  data.resolutions = [
+    { id: 10, body: 'First verification', agent: 'human', created_at: at },
+    { id: 20, body: 'Second verification', agent: 'human', created_at: at }
+  ];
+  data.resolution = data.resolutions[1];
+  const { dom, d } = await setup({ issues: [data], hash: '#issue-1' });
+  try {
+    assert.equal(d.querySelectorAll('[data-resolution]').length, 2);
+    assert.match(d.querySelector('[data-resolution="10"]').textContent, /First verification.*Previous resolution by human/);
+    assert.match(d.querySelector('[data-resolution="20"]').textContent, /Second verification.*Resolved by human/);
   } finally { dom.window.close(); }
 });

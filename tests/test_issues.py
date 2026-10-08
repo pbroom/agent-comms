@@ -180,3 +180,31 @@ def test_resolution_history_survives_reopen_and_resolve(env):
     )
     assert out["status"] == "open"
     assert len(out["resolutions"]) == 2
+
+
+def test_issue_links_share_thread_cap_across_distinct_issues_and_posts(env):
+    thread = env.thread()
+    env.settings.max_agent_posts_per_thread_without_human = 3
+    env.post('codex', thread, 'first')
+    create(env, thread_id=thread)
+    other = create(env)
+    issues.link_issue(env.board, env.p['codex'], env.sid['codex'], other['id'], thread)
+    assert env.board._agent_posts_since_human(thread) == 3
+    # Repeating an existing join is idempotent, but neither new issues nor posts bypass the cap.
+    issues.link_issue(env.board, env.p['codex'], env.sid['codex'], other['id'], thread)
+    with pytest.raises(LimitExceeded):
+        create(env, thread_id=thread)
+    with pytest.raises(LimitExceeded):
+        env.post('codex', thread, 'bypass')
+    env.clock.advance(1)
+    env.post('human', thread, 'continue')
+    create(env, thread_id=thread)
+    assert env.board._agent_posts_since_human(thread) == 1
+
+
+def test_issue_search_includes_linked_project_and_thread_title(env):
+    thread = env.thread('Distinctive linked workstream')
+    issue = create(env, thread_id=thread)
+    assert [i['id'] for i in issues.list_issues(env.board, env.p['codex'], query='distinctive LINKED')] == [issue['id']]
+    assert [i['id'] for i in issues.list_issues(env.board, env.p['codex'], query='/WORK/repo')] == [issue['id']]
+    assert not issues.list_issues(env.board, env.p['codex'], query='no match')
