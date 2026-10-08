@@ -62,7 +62,7 @@ BASE_ENV = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "LC_AL
             "__CF_USER_TEXT_ENCODING")
 
 
-def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[int] | None = None) -> str:
+def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[int] | None = None, run_id: str | None = None) -> str:
     """The fixed launch prompt. Deliberately takes no post: post text can never reach an agent this way."""
     for v in (thread_id, rule_id):
         if isinstance(v, bool) or not isinstance(v, int):
@@ -77,6 +77,10 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[i
                    "Reading a post or exiting is not completion. Check required access before work; "
                    "report capability failures separately from missing authorization. "
                    "Existing authorization covers routine work within its scope; host approval gates still apply.")
+    if run_id is not None:
+        if not isinstance(run_id, str) or not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in run_id):
+            raise TypeError("invalid dispatcher run ID")
+        prompt += " Register your session with dispatch_run_id=" + run_id + "."
     return prompt
 
 
@@ -120,7 +124,7 @@ def codex_unapproved_tools(template: list[str]) -> list[str]:
         prefix, suffix = f"mcp_servers.{CODEX_SERVER}.tools.", ".approval_mode"
         if key.startswith(prefix) and key.endswith(suffix):
             approved.add(key[len(prefix):-len(suffix)])
-    return [t for t in BOARD_TOOLS if t not in approved]
+    return [t for t in BOARD_TOOLS + REQUEST_TOOLS if t not in approved]
 
 
 def codex_approval_reminder(template: list[str] | None) -> str | None:
@@ -522,13 +526,14 @@ class Dispatcher:
         for r in self.board.active_dispatch_rules(self.human):
             rules.setdefault(r["thread_id"], []).append(r)
         for r in rows:
-            if r["type"] not in ("request", "handoff") and not r["needs_response"]:
-                continue  # informational updates never launch an agent
+            actionable = {v["recipient"] for v in requests.for_post(self.board, r)}
+            if not actionable:
+                continue  # informational agent updates never launch an agent
             for rule in rules.get(r["thread_id"], []):
                 if r["created_at"] < rule["created_at_ts"]:
                     continue  # posts written before the human approved the workstream never trigger it
                 for agent in json.loads(r["to_agents"]):
-                    if agent not in rule["agents"] or agent == r["agent"]:
+                    if agent not in actionable or agent not in rule["agents"] or agent == r["agent"]:
                         continue
                     if r["sealed"]:
                         continue  # the recipient cannot read it (Board.VISIBLE); unsealing gives it a new seq
@@ -650,7 +655,7 @@ class Dispatcher:
         return bool(row and row["state"] == "queued" and row["assigned_agent"] == agent
                     and row["assigned_session"] is None)
 
-    def _request_failure(self, post_id: int | None, agent: str, reason: str) -> None:
+    def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None) -> None:
         if post_id is None:
             return
         with db.write_tx(self.board.conn) as c:
@@ -662,7 +667,9 @@ class Dispatcher:
                 return
             # Never overwrite work explicitly routed to another existing environment.
             if row["assigned_session"] is not None:
-                return
+                session = c.execute("SELECT dispatch_run_id FROM sessions WHERE id=?", (row["assigned_session"],)).fetchone()
+                if run_id is None or session is None or session["dispatch_run_id"] != run_id:
+                    return
             now, version = self.board.now(), row["version"] + 1
             c.execute("""INSERT INTO request_progress
                 (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
@@ -671,8 +678,8 @@ class Dispatcher:
                 (post_id,agent,agent,reason,version,now))
             c.execute("""INSERT INTO request_events
                 (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
-                VALUES (?,?,NULL,NULL,'blocked',?,NULL,?,'[]',?,?,'dispatcher')""",
-                (post_id,agent,agent,reason,version,now))
+                VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
+                (post_id,agent,agent,row["assigned_session"],reason,version,now))
             seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
             c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
 
@@ -710,12 +717,13 @@ class Dispatcher:
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
                   "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
+        self._record(record)  # registration may happen immediately after the child is spawned
         try:
             if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
                 raise FileNotFoundError(f"run directory {cwd!r} does not exist")
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.log_dir, 0o700)
-            prompt = build_prompt(thread_id, rule["id"], rule["purpose"], record["request_ids"])
+            prompt = build_prompt(thread_id, rule["id"], rule["purpose"], record["request_ids"], run_id)
             template = self._runner(agent)
             if template is None:
                 raise LookupError(f"no runner configured for {agent}")
@@ -749,7 +757,7 @@ class Dispatcher:
         self._record(rec)
         for post_id in rec.get("request_ids", []):
             self._request_failure(post_id, run.agent, "Runner ended without explicit request completion: "
-                                  + status + " (exit " + str(code) + ")")
+                                  + status + " (exit " + str(code) + ")", run.run_id)
         log.info("%s run %s ended: %s (exit %s)", run.agent, run.run_id, status, code)
 
     def _reap(self, now: float) -> None:

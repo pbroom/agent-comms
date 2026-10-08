@@ -281,8 +281,9 @@ def test_a_dispatcher_tick_after_unstick_launches_the_stuck_agent(tmp_path, monk
     assert out["dispatcher_running"] is True and out["live_agents"] == [] and out["no_runner"] == []
     d.tick()
     [launch] = env.spawner.calls
-    assert launch["argv"] == ["codex-cli-fake", "exec",
-                              build_prompt(tid, out["rule_id"], unstick.PURPOSE.format(thread=tid), [out["post_id"]])]
+    assert launch["argv"][:2] == ["codex-cli-fake", "exec"]
+    assert launch["argv"][-1].startswith(
+                              build_prompt(tid, out["rule_id"], unstick.PURPOSE.format(thread=tid), [out["post_id"]]))
     assert not any(m in " ".join(launch["argv"]) for m in MARKERS)
     [run] = dispatch.list_runs(env.board, env.p["human"])
     assert (run["agent"], run["thread_id"], run["rule_id"]) == ("codex", tid, out["rule_id"])

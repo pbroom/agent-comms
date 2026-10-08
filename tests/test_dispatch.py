@@ -155,7 +155,7 @@ def test_launches_allowed_agent_for_new_addressed_post(denv):
     call = denv.spawner.calls[0]
     assert call["cwd"] == denv.workdir
     assert call["argv"] == ["codex-cli-fake", "exec", "--cd", denv.workdir,
-                            build_prompt(denv.tid, rule["id"], rule["purpose"], [post["id"]])]
+                            build_prompt(denv.tid, rule["id"], rule["purpose"], [post["id"]], f"s{post['seq']}-codex")]
     [r] = runs(denv)
     assert (r["agent"], r["thread_id"], r["rule_id"], r["post_seq"], r["pid"], r["status"]) == \
         ("codex", denv.tid, rule["id"], post["seq"], 1000, "running")
@@ -1010,16 +1010,16 @@ def test_codex_board_tool_lists_match_the_mcp_server():
 
 
 def test_codex_unapproved_tools_parsing():
-    full = ["codex", "exec"] + [a for t in dispatch.BOARD_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
+    full = ["codex", "exec"] + [a for t in dispatch.BOARD_TOOLS + dispatch.REQUEST_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
     assert dispatch.codex_unapproved_tools(full + ["{prompt}"]) == []
-    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == [dispatch.BOARD_TOOLS[-1]]
+    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == [dispatch.REQUEST_TOOLS[-1]]
     assert dispatch.codex_unapproved_tools(
         ["codex", "exec", "--config=mcp_servers.agent-comms.default_tools_approval_mode='approve'", "{prompt}"]) == []
     other = ["codex", "exec", "-c", 'mcp_servers.other.tools.board_post.approval_mode="approve"',
              "-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="prompt"', "{prompt}"]
     assert "board_post" in dispatch.codex_unapproved_tools(other)
     assert dispatch.codex_approval_reminder(["claude", "-p", "{prompt}"]) is None
-    assert dispatch.BOARD_TOOLS[-1] in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
+    assert dispatch.REQUEST_TOOLS[-1] in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
 
 
 def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, capsys, tmp_path):
@@ -1099,3 +1099,21 @@ def test_explicit_completion_before_dispatch_prevents_launch(denv):
     denv.clock.advance(180)
     denv.d.tick()
     assert not denv.spawner.calls
+
+
+@pytest.mark.parametrize('bind', [True, False])
+def test_exit_blocks_only_session_bound_to_that_run(denv, bind):
+    from agent_comms import requests
+    allow(denv, agents=['codex'])
+    post = human_post(denv, ['codex'])
+    denv.d.tick()
+    record = runs(denv)[0]
+    session = denv.board.register_session(denv.p['codex'], PROJECT,
+        dispatch_run_id=record['run_id'] if bind else None)['session_id']
+    requests.progress(denv.board, denv.p['codex'], session, post['id'], 'codex', 'started')
+    denv.spawner.children[0].code = 1
+    denv.d.tick()
+    row = denv.board.get_post(denv.p['human'], post['id'])['requests'][0]
+    assert row['state'] == ('blocked' if bind else 'started')
+    assert row['assigned_session'] == session
+    assert 'dispatch_run_id=' + record['run_id'] in denv.spawner.calls[0]['argv'][-1]
