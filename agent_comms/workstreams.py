@@ -458,7 +458,7 @@ def _reconcile(board, p, sid, post_id, expected_version, fence):
                 raise Conflict('automatic reconciliation is paused')
             agents = {s['agent'] for s in targets}
             if not any(rule['thread_id']==managed['thread_id'] and agents.issubset(set(rule['agents']))
-                       for rule in board.active_dispatch_rules(p)):
+                       for rule in _continuation_rules(board, p)):
                 raise Forbidden('automatic reconciliation lacks current dispatch approval')
         if type(expected_version) is not int or row['version'] != expected_version:
             raise Conflict('continuation changed; reread before routing')
@@ -524,6 +524,14 @@ def _reconcile(board, p, sid, post_id, expected_version, fence):
         return out(get_for_post(board,post_id))
 
 
+def _continuation_rules(board, p):
+    """Active dispatch approvals that can authorize continuation reconciliation. One-click rules (Unstick, Approve &
+    launch; human_actions binds each to its post) authorize only the launch for their own post, never this."""
+    from . import human_actions
+    one_click = human_actions.one_click_rule_ids(board)
+    return [rule for rule in board.active_dispatch_rules(p) if rule['id'] not in one_click]
+
+
 # Automatic reconciliation of a continuation that stays blocked for the same reason backs off (per process): the
 # dispatcher ticks every few seconds, and each pass inspects Git. A new reason, a takeover or a cleared blocker resets it.
 TICK_BACKOFF_MIN, TICK_BACKOFF_MAX = 5, 300
@@ -538,7 +546,7 @@ def tick(board, p, fence=None):
     """Reconcile only continuations covered by current explicit dispatch approval."""
     if board.is_paused():
         return
-    rules = board.active_dispatch_rules(p)
+    rules = _continuation_rules(board, p)
     now = board.now()
     due = board.conn.execute('SELECT * FROM continuations WHERE deadline<=? AND completion IS NULL',(now,)).fetchall()
     _tick_backoff = _backoff(board)
@@ -606,6 +614,9 @@ def _delivery_rule(board, managed, run):
     if not rules:
         raise Forbidden('continuation dispatch approval was removed')
     rule = rules[0]
+    from . import human_actions
+    if rule['id'] in human_actions.one_click_rule_ids(board):
+        raise Forbidden('a one-click launch approval covers only its own post')
     target = board._dispatch_target(rule)
     # The last launch can have spent the remaining budget; revocation and expiry
     # still prevent binding. No new budget is consumed by registration.

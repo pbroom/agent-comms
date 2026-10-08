@@ -198,6 +198,30 @@ def test_a_healthy_lease_owner_is_neither_blocked_nor_resequenced(stack, monkeyp
     assert managed["deadline"] == lease and current(stack, post)["assigned_session"] == env.sid["codex"]
 
 
+def test_one_click_launch_rules_never_approve_continuation_reconciliation(stack):
+    """An Unstick / Approve & launch rule is bound to its own post (human_actions): it may launch only for that post,
+    so it must not count as the dispatch approval that automatic continuation reconciliation requires."""
+    from agent_comms import human_actions, workstreams
+    env = stack["env"]
+    post = create(stack)
+    _, one_click = human_actions.post_as_human(
+        env.board, env.p["human"], thread_id=stack["thread"], body="Unstick: please continue", type="request",
+        to=["codex", "claude"], needs_response=True, launch=["codex", "claude"], purpose="Unstick this thread")
+    assert one_click["agents"] == ["codex", "claude"] and one_click["active"]
+    env.clock.advance(121)
+    probe(stack, "codex")
+    probe(stack, "claude")
+    workstreams.tick(env.board, env.p["human"])
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]     # not taken over
+    with pytest.raises(Forbidden, match="lacks current dispatch approval"):
+        workstreams.reconcile(env.board, env.p["human"], None, post["id"], current(stack, post)["version"])
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]
+    _tick_rule(stack)                                                        # an ordinary approval does cover it
+    workstreams._backoff(env.board).clear()
+    workstreams.tick(env.board, env.p["human"])
+    assert current(stack, post)["assigned_session"] == env.sid["claude"]
+
+
 def test_git_runs_outside_the_write_transaction_and_blocked_ticks_back_off(stack, monkeypatch):
     from agent_comms import workstreams
     env = stack["env"]
