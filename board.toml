@@ -77,6 +77,10 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
   "-c", 'mcp_servers.agent-comms.tools.board_create_issue.approval_mode="approve"',
   "-c", 'mcp_servers.agent-comms.tools.board_link_issue.approval_mode="approve"',
   "-c", 'mcp_servers.agent-comms.tools.board_comment_issue.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_request_progress.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_request_history.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_register_capabilities.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_route_request.approval_mode="approve"',
   "{prompt}",
 ]
 "claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]

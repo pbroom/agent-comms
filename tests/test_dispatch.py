@@ -105,7 +105,8 @@ class Recorder:
 
 
 @pytest.fixture
-def denv(tmp_path):
+def denv(tmp_path, monkeypatch):
+    monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
     env = make_env(tmp_path)
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -154,7 +155,7 @@ def test_launches_allowed_agent_for_new_addressed_post(denv):
     call = denv.spawner.calls[0]
     assert call["cwd"] == denv.workdir
     assert call["argv"] == ["codex-cli-fake", "exec", "--cd", denv.workdir,
-                            build_prompt(denv.tid, rule["id"], rule["purpose"])]
+                            build_prompt(denv.tid, rule["id"], rule["purpose"], [post["id"]])]
     [r] = runs(denv)
     assert (r["agent"], r["thread_id"], r["rule_id"], r["post_seq"], r["pid"], r["status"]) == \
         ("codex", denv.tid, rule["id"], post["seq"], 1000, "running")
@@ -176,7 +177,8 @@ def test_trigger_selection_rules(denv):
     assert denv.spawner.agents() == ["codex-cli-fake"]
 
 
-def test_posts_below_the_mark_or_before_the_rule_never_trigger(tmp_path):
+def test_posts_below_the_mark_or_before_the_rule_never_trigger(tmp_path, monkeypatch):
+    monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
     env = make_env(tmp_path)
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -204,7 +206,7 @@ def test_posts_below_the_mark_or_before_the_rule_never_trigger(tmp_path):
 def test_sealed_post_does_not_trigger_until_the_recipient_can_read_it(denv):
     rule = allow(denv, agents=["codex"], max_launches=1)
     task = denv.accepted_task(denv.tid)
-    sealed = denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"],
+    sealed = denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"], needs_response=True,
                        refs=[{"kind": "commit", "path": PROJECT, "rev": "abc123"}])
     denv.clock.advance(5 * 60)
     denv.d.tick()
@@ -214,13 +216,13 @@ def test_sealed_post_does_not_trigger_until_the_recipient_can_read_it(denv):
     denv.board.unseal(denv.p["human"], sealed["id"])                  # new seq: now it is new and readable
     denv.d.tick()
     assert len(denv.spawner.calls) == 1
-    assert denv.spawner.calls[0]["argv"][-1] == build_prompt(denv.tid, rule["id"], rule["purpose"])
+    assert denv.spawner.calls[0]["argv"][-1].startswith(build_prompt(denv.tid, rule["id"], rule["purpose"]))
     assert SECRET not in json.dumps(denv.spawner.calls, default=str) + json.dumps(runs(denv))
 
 
 def test_sealed_post_from_before_the_approval_never_triggers_even_when_unsealed(denv):
     task = denv.accepted_task(denv.tid)
-    sealed = denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"],
+    sealed = denv.post("claude", denv.tid, SECRET, "finding", task_id=task, sealed=True, to=["codex"], needs_response=True,
                        refs=[{"kind": "commit", "path": PROJECT, "rev": "abc123"}])
     denv.clock.advance(1)
     allow(denv, agents=["codex"])
@@ -230,14 +232,14 @@ def test_sealed_post_from_before_the_approval_never_triggers_even_when_unsealed(
     assert denv.spawner.calls == []
 
 
-def test_already_read_post_is_not_launched_for(denv):
+def test_read_ack_is_not_request_completion(denv):
     allow(denv, agents=["codex"])
     post = human_post(denv, ["codex"])
     s = denv.board.register_session(denv.p["codex"], PROJECT)["session_id"]
     denv.board.ack(denv.p["codex"], s, post["seq"])
     denv.clock.advance(5 * 60)
     denv.d.tick()
-    assert denv.spawner.calls == []
+    assert len(denv.spawner.calls) == 1
 
 
 # ---------------------------------------------------------------- liveness and concurrency
@@ -468,7 +470,7 @@ def test_prompt_is_fixed_and_carries_no_post_text(denv):
                 "for: Implement and review the parser rewrite. Do only work that fits that purpose; stop and post "
                 f"a status if anything is out of scope. When you finish, post a status on thread {denv.tid} and "
                 "release any task leases you hold.")
-    assert call["argv"][-1] == expected
+    assert call["argv"][-1].startswith(expected)
     blob = json.dumps(call, default=str) + json.dumps(runs(denv))
     for needle in ("IGNORE", "rm -rf", "evil.example", "SUMMARY", "TASKTITLE", "THREADTITLE"):
         assert needle not in blob
@@ -638,13 +640,13 @@ def test_spawn_failure_does_not_crash_and_refunds(denv):
     assert rule["id"] == by_agent["claude"]["rule_id"]
 
 
-def test_missing_run_directory_is_a_spawn_failure(denv):
+def test_missing_run_directory_is_a_preflight_failure(denv):
     denv.config.worktrees = {}
     allow(denv, agents=["codex"])     # /work/repo does not exist on this machine
     human_post(denv, ["codex"])
     denv.d.tick()
     assert denv.spawner.calls == []
-    assert runs(denv)[0]["status"] == "spawn_failed"
+    assert runs(denv)[0]["status"] == "preflight_failed"
 
 
 def test_exceptions_inside_a_pass_do_not_stop_the_loop(denv, monkeypatch):
@@ -891,7 +893,8 @@ def test_no_runner_for_name_or_runtime_means_no_launch(denv):
     denv.clock.advance(5 * 60)
     denv.d.tick()
     assert denv.spawner.calls == []
-    assert runs(denv) == [] and denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 10
+    assert len(runs(denv)) == 2 and all(r["status"] == "preflight_failed" for r in runs(denv))
+    assert denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 10
 
 
 def test_env_passthrough_falls_back_to_runtime():
@@ -981,11 +984,12 @@ def test_codex_board_tool_lists_match_the_mcp_server():
     import tomllib
 
     served = re.findall(r"^    (?:async )?def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
-    assert set(served) == set(dispatch.BOARD_TOOLS) | {"board_resolve_attention"}
+    assert set(served) == set(dispatch.BOARD_TOOLS) | {"board_resolve_attention", "board_request_progress", "board_request_history",
+                                                       "board_register_capabilities", "board_route_request"}
     assert "board_resolve_attention" not in dispatch.BOARD_TOOLS
     runner = DispatchConfig.load(ROOT / "board.toml", local=False).runners["codex-cli"]
     overrides = [runner[i + 1] for i, x in enumerate(runner) if x == "-c"]
-    assert overrides == [dispatch.codex_approval_override(t) for t in dispatch.BOARD_TOOLS]
+    assert overrides == [dispatch.codex_approval_override(t) for t in dispatch.BOARD_TOOLS + dispatch.REQUEST_TOOLS]
     assert overrides[0] == 'mcp_servers.agent-comms.tools.board_register.approval_mode="approve"'
     assert dispatch.codex_unapproved_tools(runner) == [] and dispatch.codex_approval_reminder(runner) is None
     assert runner[:6] == ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write"]
@@ -1040,3 +1044,58 @@ def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, 
     (home / "board.toml").write_text(shipped)
     assert "does not approve" not in allow_cli("codex")
     assert dispatch.uses_codex(["/opt/homebrew/bin/codex", "exec"]) and not dispatch.uses_codex(["claude"])
+
+
+def test_informational_status_never_launches(denv):
+    allow(denv)
+    denv.post('claude', denv.tid, 'Finished. FYI only.', 'status', to=['codex'])
+    denv.d.tick()
+    assert denv.spawner.calls == []
+
+
+def test_distinct_requests_survive_and_revisions_do_not_duplicate(denv):
+    allow(denv, agents=['codex'])
+    first = human_post(denv, ['codex'])
+    second = human_post(denv, ['codex'])
+    denv.d.tick()
+    assert runs(denv)[0]['request_ids'] == [first['id']]
+    denv.spawner.children[0].code = 0
+    denv.d.tick()
+    denv.clock.advance(180)
+    denv.d.tick()
+    assert len(denv.spawner.calls) == 2
+    assert {tuple(r['request_ids']) for r in runs(denv)} == {(first['id'],), (second['id'],)}
+    denv.d._save(**{Dispatcher.MARK_KEY: 0})
+    denv.d.tick()
+    assert len(denv.spawner.calls) == 2
+    assert denv.board.get_post(denv.p['human'], first['id'])['requests'][0]['state'] == 'blocked'
+
+
+@pytest.mark.parametrize('failure', ['executable', 'approvals'])
+def test_preflight_failure_blocks_once_without_spending_budget(denv, monkeypatch, failure):
+    allow(denv, agents=['codex'], max_launches=3)
+    if failure == 'executable':
+        monkeypatch.setattr(dispatch.shutil, 'which', lambda *a, **kw: None)
+    else:
+        denv.config.runners['codex'] = ['codex', 'exec', '{prompt}']
+    post = human_post(denv, ['codex'])
+    denv.d.tick()
+    denv.d.tick()
+    assert not denv.spawner.calls
+    assert len(runs(denv)) == 1
+    assert runs(denv)[0]['status'] == 'preflight_failed'
+    assert denv.board.list_dispatch_rules(denv.p['human'])[0]['launches_left'] == 3
+    request = denv.board.get_post(denv.p['human'], post['id'])['requests'][0]
+    assert request['state'] == 'blocked'
+    event = denv.board.conn.execute('SELECT actor,event_source FROM request_events WHERE post_id=?', (post['id'],)).fetchone()
+    assert event['actor'] is None and event['event_source'] == 'dispatcher'
+
+
+def test_explicit_completion_before_dispatch_prevents_launch(denv):
+    from agent_comms import requests
+    allow(denv, agents=['codex'])
+    post = human_post(denv, ['codex'])
+    requests.progress(denv.board, denv.p['codex'], denv.sid['codex'], post['id'], 'codex', 'finished', 'Done')
+    denv.clock.advance(180)
+    denv.d.tick()
+    assert not denv.spawner.calls
