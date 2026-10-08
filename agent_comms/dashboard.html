@@ -50,8 +50,18 @@ main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 aut
 .thread-list select { font: inherit; font-size: 12px; padding: 2px 4px; color: var(--ink); background: var(--bg);
   border: 1px solid var(--line); border-radius: 5px; }
 .thread-list .when .dot { display: block; margin: 6px 0 0 auto; }
-.thread-list .when .unstick-row { display: block; margin: 6px 0 0 auto; font-size: 11px; padding: 1px 7px;
-  border-color: var(--warn); color: var(--warn); }
+.thread-list .when .unstick-row { display: block; margin: 6px 0 0 auto; font-size: 11px; padding: 1px 7px; }
+/* Unstick buttons (list row and thread header): amber, a hover fill, and while sending a light tracing the outline. */
+.unstick-btn { border-color: var(--warn); color: var(--warn); transition: background-color .12s, box-shadow .12s; }
+.unstick-btn:hover:not(:disabled) { background: var(--warn-bg); box-shadow: 0 0 0 1px var(--warn); }
+.unstick-btn:active:not(:disabled) { transform: translateY(1px); }
+@property --trace { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
+.unstick-btn.sending, .unstick-btn.sending:disabled { cursor: progress; opacity: 1; border-color: transparent;
+  background: linear-gradient(var(--panel), var(--panel)) padding-box,
+    conic-gradient(from var(--trace), transparent 0deg 200deg, var(--warn) 300deg, #fff3 330deg, transparent 360deg) border-box;
+  animation: unstick-trace 1.4s linear infinite; }
+@keyframes unstick-trace { to { --trace: 360deg; } }
+@media (prefers-reduced-motion: reduce) { .unstick-btn.sending { animation: none; border-color: var(--warn); background: var(--panel); } }
 /* Thread status dots (after Claude's session indicators): blue = new posts, amber = stalled,
    grey pulsing = being worked on, grey ring = completed. */
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
@@ -174,7 +184,13 @@ let unstickBusy = false, unstickNote = null;   // { threadId, text, failed }
 // The last successful Unstick per thread, for this page load only: who it went to (`agents`), the live sessions
 // the server named (`sessionIds`), the request's post id and when it was sent (`at`, whole seconds, epoch ms).
 // Sessions of those agents that started at or after `at` (a dispatcher launch registers a new one) received it too.
-const lastUnstick = {};   // thread id -> { threadId, agents, sessionIds, postId, at }
+// Threads whose Unstick is in flight or waiting for the agents to restart: thread id -> { at, until }. The button
+// shows "Sending…" until a target agent runs or posts after the request (or a launched session registers), then
+// leaves; it gives up after UNSTICK_WAIT_MS or at once when nothing can restart (see unstickPending).
+const unsticking = {};
+const UNSTICK_WAIT_MS = 10 * 60000;
+const lastUnstick = {};
+let lastUnstickReply = null;   // thread id -> { threadId, agents, sessionIds, postId, at }
 
 setFocusFromHash();
 
@@ -909,13 +925,36 @@ function statusDot(st) {
   return n;
 }
 
-// The same Unstick as the thread header, under the amber dot in the list. It opens the thread first so the
-// result note (shown in the thread pane) is in view.
-function unstickRowButton(t, st, human) {
-  if (!human || !st || st.kind !== "stalled" || !st.agents || !st.agents.length) return null;
-  return el("button", { class: "unstick-row", "data-unstick": t.id, disabled: unstickBusy,
-    title: unstickTitle(st.agents),
-    onclick: e => { e.stopPropagation(); selectThread(t.id); unstickThread(t); } }, "Unstick");
+// Has the thread restarted since its Unstick? A target agent is running on it (dispatcher), posted after the
+// request, or a session of a target agent registered after the click. Clears the "Sending…" state when so.
+function unstickRestarted(t) {
+  const u = lastUnstick[t.id];
+  if (!u) return false;
+  if ((state.active_runs || []).some(r => r.thread_id === t.id && u.agents.includes(r.agent))) return true;
+  if (u.postId && postsOf(t).some(p => p.id > u.postId && u.agents.includes(p.agent))) return true;
+  return state.sessions.some(s => u.agents.includes(s.agent) && !u.sessionIds.includes(s.id) && Date.parse(s.started_at) >= u.at);
+}
+function unstickSending(t) {
+  const w = unsticking[t.id];
+  if (!w) return false;
+  if (Date.now() > w.until || (!unstickBusy && unstickRestarted(t))) { delete unsticking[t.id]; return false; }
+  return true;
+}
+
+// One Unstick button for the list row (under the amber dot) and the thread header. The row's opens the thread
+// first so the result note is in view. While sending it reads "Sending…" with a tracing outline.
+function unstickButton(t, st, human, where) {
+  if (!human) return null;
+  const sending = unstickSending(t);
+  if (!sending && (!st || st.kind !== "stalled" || !st.agents || !st.agents.length)) return null;
+  const attrs = where === "row" ? { class: "unstick-btn unstick-row" + (sending ? " sending" : ""), "data-unstick": t.id }
+    : { class: "unstick-btn" + (sending ? " sending" : ""), id: "unstick" };
+  const n = el("button", { ...attrs, disabled: sending || unstickBusy, "aria-busy": sending ? "true" : null,
+    title: sending ? "Sent; waiting for the agents to pick it up" : unstickTitle(st.agents),
+    onclick: e => { e.stopPropagation(); if (where === "row") selectThread(t.id); unstickThread(t); } },
+    sending ? "Sending…" : "Unstick");
+  if (sending) n.style.animationDelay = `-${(Date.now() % 1400) / 1000}s`;   // keep the trace in phase across re-renders
+  return n;
 }
 
 function unstickTitle(agents) {
@@ -960,7 +999,7 @@ function renderThreadList(threads, current, human, statuses, hidden) {
           full ? chip("at cap", "bad") : null,
           t.status !== "open" ? chip(t.status) : null)),
       el("td", { class: "when muted small" }, el("span", { title: lastActivity(t) || "" }, ago(lastActivity(t))),
-        statusDot(statuses.get(t.id)), unstickRowButton(t, statuses.get(t.id), human)));
+        statusDot(statuses.get(t.id)), unstickButton(t, statuses.get(t.id), human, "row")));
   });
   const table = el("table", { role: "listbox", "aria-label": "Threads" }, rows);
   table.addEventListener("keydown", e => {
@@ -1004,19 +1043,25 @@ function unstickMessage(r) {
 // The click is the approval: it sends at once. The busy flag (and the server's one-per-2-minutes rule per thread)
 // keeps a double click from posting twice.
 async function unstickThread(t) {
-  if (unstickBusy) return;
-  unstickBusy = true; render();
+  if (unstickBusy || unsticking[t.id]) return;
+  unstickBusy = true; unsticking[t.id] = { until: Date.now() + UNSTICK_WAIT_MS }; render();
   const at = Math.floor(Date.now() / 1000) * 1000;   // session start times are whole seconds
   try {
-    const r = await api("POST", `/api/threads/${t.id}/unstick`);
+    const r = lastUnstickReply = await api("POST", `/api/threads/${t.id}/unstick`);
     unstickNote = { threadId: t.id, text: unstickMessage(r), failed: false }; lastError = "";
     lastUnstick[t.id] = { threadId: t.id, at, postId: Number.isInteger(r.post_id) ? r.post_id : null,
       agents: Array.isArray(r.agents) ? r.agents.filter(a => typeof a === "string") : [],
       sessionIds: Array.isArray(r.sessions) ? r.sessions.filter(Number.isInteger) : [] };
   } catch (e) {
     lastError = e.message; unstickNote = { threadId: t.id, text: `Unstick failed: ${e.message}`, failed: true };
+    delete unsticking[t.id];
     unstickBusy = false; return render();
   }
+  // Nothing will restart (no live agent, and the dispatcher can't launch anyone now): stop "Sending…" at once;
+  // the note says why.
+  const live = r => (r.live_agents || []).length;
+  const canLaunch = r => r.dispatcher_running && !r.paused && r.agents.some(a => !(r.live_agents || []).includes(a) && !(r.no_runner || []).includes(a));
+  if (!live(lastUnstickReply) && !canLaunch(lastUnstickReply)) delete unsticking[t.id];
   unstickBusy = false;
   refresh();
 }
@@ -1039,8 +1084,7 @@ function renderThread(t, human, st) {
       el("h2", {}, `#${t.id} ${t.title}`), chip(t.status, t.status === "open" ? "ok" : ""),
       el("span", { class: "muted small" }, t.project),
       human ? el("button", { onclick: () => act("POST", `/api/threads/${t.id}/${t.status === "open" ? "close" : "reopen"}`) }, t.status === "open" ? "Close" : "Reopen") : null,
-      human && st && st.kind === "stalled" && st.agents && st.agents.length ? el("button", { id: "unstick", disabled: unstickBusy,
-        title: unstickTitle(st.agents), onclick: () => unstickThread(t) }, "Unstick") : null),
+      unstickButton(t, st, human, "header")),
     human && unstickNote && unstickNote.threadId === t.id ? el("div", { class: "unstick-note small" + (unstickNote.failed ? " failed" : ""),
       id: "unstick-result", role: "status" }, el("span", {}, unstickNote.text),
       el("button", { onclick: () => { unstickNote = null; render(); } }, "Dismiss"),
