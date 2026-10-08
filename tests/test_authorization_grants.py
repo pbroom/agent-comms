@@ -197,7 +197,7 @@ def test_v1_migration_preserves_manual_acceptance_and_history(env):
         conn.execute(f"DROP TABLE {table}")
     conn.execute('PRAGMA user_version=1')
     migrated = Board(env.settings, clock=env.clock)
-    assert migrated.conn.execute('PRAGMA user_version').fetchone()[0] == db.SCHEMA_VERSION == 5
+    assert migrated.conn.execute('PRAGMA user_version').fetchone()[0] == db.SCHEMA_VERSION == 6
     for task_id in (tid, created):
         assert migrated.get_task(env.p['codex'], task_id)['authorization']['source'] == 'human'
     assert migrated.get_task(env.p['codex'], proposed)['authorization']['source'] == 'none'

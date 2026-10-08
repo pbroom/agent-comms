@@ -11,9 +11,9 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import StrictInt, BaseModel, ConfigDict
 
-from . import board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
+from . import attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -162,6 +162,12 @@ class DispatchRuleIn(Body):
 
 class LoginLinkIn(Body):
     next: str = "/"
+
+
+class AttentionResolutionIn(Body):
+    session_id: int | None = None
+    reason: str
+    evidence_post_ids: list[StrictInt]
 
 
 class ResolveIn(Body):
@@ -439,6 +445,11 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/posts/{post_id}/finalize")
     def finalize(post_id: int, p: Principal = P):
         return board.finalize(p, post_id)
+
+    @app.post("/api/posts/{post_id}/attention/resolve")
+    def close_attention(post_id: int, body: AttentionResolutionIn, request: Request, p: Principal = P):
+        return attention.close_attention(board, p, sid(p, request, body.session_id), post_id,
+                                         body.reason, body.evidence_post_ids)
 
     @app.post("/api/posts/{post_id}/resolve")
     def resolve_post(post_id: int, body: ResolveIn, p: Principal = P):

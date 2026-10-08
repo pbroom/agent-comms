@@ -253,3 +253,21 @@ test('a #post-N deep link to a needs-you post shows the callout and lands on its
     assert.ok(document.getElementById('post-20').classList.contains('highlight'), 'the post stays highlighted below');
   } finally { dom.window.close(); }
 });
+
+test('selective closeout retains original request and evidence without hiding other attention', async () => {
+  const closed = post(10, 1, { type: 'question', needs_response: true,
+    attention_resolution: { resolved_by: 'codex', session_id: 44, reason: 'Verified alternative browser ' + INJECTION,
+      evidence_post_ids: [12], resolved_at: MINUTES_AGO(1) } });
+  const pending = post(11, 1, { type: 'proposal', needs_response: true });
+  const { dom, document } = await setup({ threads: [thread(1, [closed, pending, post(12, 1)])], needsYou: [pending] });
+  try {
+    await pick(document, 1);
+    assert.deepEqual(items(document), [11]);
+    const source = document.getElementById('post-10');
+    assert.match(source.textContent, /Attention resolved by codex/);
+    assert.match(source.textContent, /post 10/);
+    assert.doesNotMatch(source.querySelector('.meta').textContent, /needs response/);
+    assert.equal(source.querySelector('.attention-resolution a').getAttribute('href'), '#post-12');
+    assert.equal(source.querySelector('img'), null);
+  } finally { dom.window.close(); }
+});

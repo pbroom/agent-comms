@@ -976,12 +976,13 @@ def _documented_tools(text: str) -> list[str]:
 
 def test_codex_board_tool_lists_match_the_mcp_server():
     """The served tools, the shipped runner's per-run -c approvals, both docs' optional global block and the
-    installer's printed block all name exactly the same thirteen board tools."""
+    installer's printed block retain the thirteen preapproved tools; selective closeout is opt-in."""
     import re
     import tomllib
 
     served = re.findall(r"^    (?:async )?def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
-    assert sorted(served) == sorted(dispatch.BOARD_TOOLS) and len(served) == 13
+    assert set(served) == set(dispatch.BOARD_TOOLS) | {"board_resolve_attention"}
+    assert "board_resolve_attention" not in dispatch.BOARD_TOOLS
     runner = DispatchConfig.load(ROOT / "board.toml", local=False).runners["codex-cli"]
     overrides = [runner[i + 1] for i, x in enumerate(runner) if x == "-c"]
     assert overrides == [dispatch.codex_approval_override(t) for t in dispatch.BOARD_TOOLS]
