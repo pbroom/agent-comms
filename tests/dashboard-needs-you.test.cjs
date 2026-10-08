@@ -26,9 +26,11 @@ const QUESTION = () => ({ question: 'Ship the parser fix now? ' + INJECTION, con
     { id: 'ship', label: 'Ship it now', description: 'Merges today; costs a re-review.', outcome: 'approved' }],
   recommended_option_id: 'ship' });
 
+const AGENTS = [{ name: 'human', is_human: 1 }, { name: 'claude-code', is_human: 0 }, { name: 'codex', is_human: 0 }];
+
 // window.confirm/prompt/alert throw (and are recorded): the human's embedded browser blocks them.
 // `threads`, `needsYou` and `issues` may be functions, re-read on every /api/state.
-async function setup({ threads, needsYou = [], issues = [], human = true, launchable = [], reply = () => ok({}),
+async function setup({ threads, needsYou = [], issues = [], human = true, launchable = [], reply = () => ok({}), agents = AGENTS,
   url = 'http://127.0.0.1:8787/', storage = {} }) {
   const calls = [], prompts = [];
   const dom = new JSDOM(html, { url, runScripts: 'dangerously', pretendToBeVisual: true, beforeParse(win) {
@@ -45,7 +47,7 @@ async function setup({ threads, needsYou = [], issues = [], human = true, launch
         issues: typeof issues === 'function' ? issues() : issues, needs_you_issues: [],
         sessions: [], limits: { body_max_bytes: 4096 }, authorization_grants: [], task_categories: [], active_runs: [],
         launchable_agents: launchable,
-        agents: [{ name: 'human', is_human: 1 }, { name: 'claude-code', is_human: 0 }, { name: 'codex', is_human: 0 }] });
+        agents });
       calls.push({ u, method: opts.method, headers: opts.headers, body: opts.body ? JSON.parse(opts.body) : undefined });
       return reply(u, opts);
     };
@@ -156,7 +158,7 @@ test('each card + primary button calls the resolve endpoint once, with no confir
       assert.equal(sent.length, 1, action);
       assert.equal(sent[0].method, 'POST');
       assert.equal(sent[0].headers['X-Board-Request'], '1');
-      assert.deepEqual(sent[0].body, { action });
+      assert.deepEqual(sent[0].body, action.startsWith('approve') ? { action, delivery_agent: 'codex' } : { action }, 'approvals name the agent the select shows');
       assert.equal(document.querySelector('#needs-you-result span').textContent, message);
       assert.deepEqual(items(document), [], 'the item leaves the card on refresh');
       assert.match(document.querySelector('#needs-you h2').textContent, /nothing left here/);
@@ -260,7 +262,8 @@ test('a structured post: Recommended, Alternative, Write your own reply; Choose 
     await settle();
     const sent = calls.filter(c => c.u === '/api/posts/30/resolve');
     assert.equal(sent.length, 1);
-    assert.deepEqual(sent[0].body, { action: 'choose', option_id: 'ship', note: 'only the parser' });
+    // An approved option queues work: it names the agent the select shows (here the author).
+    assert.deepEqual(sent[0].body, { action: 'choose', option_id: 'ship', note: 'only the parser', delivery_agent: 'claude-code' });
     assert.equal(document.querySelector('#needs-you-result span').textContent,
       'Chose the recommended option “Ship it now” for #30; told claude-code (post #96).');
     assert.deepEqual(prompts, []);
@@ -449,6 +452,29 @@ test('assign approved work sends explicit selected implementer, never parses not
   } finally { dom.window.close(); }
 });
 
+test('an inactive author: the assignee the select shows is the one sent; with no active agent, approving is disabled', async () => {
+  const p = post(11, 1, { agent: 'old-bot', type: 'request', needs_response: true });
+  const inactive = [...AGENTS.map(a => a.name === 'claude-code' ? a : { ...a, active: 0 }), { name: 'old-bot', is_human: 0, active: 0 }];
+  const { dom, document, calls } = await setup({ threads: [thread(1, [p])], needsYou: [p], agents: inactive });
+  try {
+    card(document, 11, 'approve').click();
+    const select = document.querySelector('#needs-you [data-post="11"] select');
+    assert.equal(select.value, 'claude-code', 'the first active agent is preselected');
+    assert.equal(select.querySelector('option[selected]').value, 'claude-code');
+    primary(document, 11).click(); await settle();
+    assert.deepEqual(calls.find(c => c.u.endsWith('/11/resolve')).body, { action: 'approve', delivery_agent: 'claude-code' });
+  } finally { dom.window.close(); }
+  const none = AGENTS.map(a => ({ ...a, active: 0 }));
+  const empty = await setup({ threads: [thread(1, [p])], needsYou: [p], agents: none });
+  try {
+    card(empty.document, 11, 'approve').click();
+    assert.equal(primary(empty.document, 11).disabled, true, 'nobody could take the work');
+    assert.match(empty.document.querySelector('#needs-you [data-post="11"] .hint').textContent, /No active agent/);
+    card(empty.document, 11, 'not_now').click();
+    assert.equal(primary(empty.document, 11).disabled, false, 'answers that assign nothing still work');
+  } finally { empty.dom.window.close(); }
+});
+
 // Regression: "when I submit one answer in a group of multiple answers, the whole group closes". The page sends one
 // request for exactly the item answered; the others stay, with their own controls and the human's unsent drafts.
 test('answering one of several items in a thread sends only that item and keeps the others with their drafts', async () => {
@@ -467,7 +493,7 @@ test('answering one of several items in a thread sends only that item and keeps 
     card(document, 11, 'option:ship').click();
     primary(document, 11).click();
     await settle();
-    assert.deepEqual(calls.map(c => [c.u, c.body]), [['/api/posts/11/resolve', { action: 'choose', option_id: 'ship' }]]);
+    assert.deepEqual(calls.map(c => [c.u, c.body]), [['/api/posts/11/resolve', { action: 'choose', option_id: 'ship', delivery_agent: 'codex' }]]);
     assert.deepEqual(items(document), [13, 12, 10], 'only #11 left the card');
     assert.equal(document.querySelector('#needs-you h2').textContent, 'Needs you (3)');
     assert.equal(document.querySelector('#ny-reply-10').value, 'my unsent reply', 'another item\'s draft survives');

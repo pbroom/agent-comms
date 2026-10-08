@@ -1738,10 +1738,17 @@ function renderNeedsYouItem(item) {
     placeholder: "Add a note to your choice (optional)", oninput: e => { nyNotes[item.id] = e.target.value; sync(); } }, nyNotes[item.id] || "");
   const noteBox = el("div", { class: "custom ny-note-box" }, el("label", { class: "field-label", for: note.id }, "Note (optional)"), note);
 
-  const assignee = el("select", { id: `ny-assign-${item.id}`, disabled: busy,
+  // Who takes approved work: always the agent the select shows, sent as delivery_agent. The choice made here, else
+  // the post's author when active, else the first active agent; with none, approving is disabled (the server would
+  // otherwise post the approval to nobody).
+  const assignable = (state.agents || []).filter(a => !a.is_human && a.active !== false && a.active !== 0).map(a => a.name);
+  const assigned = () => assignable.includes(nyAssignees[item.id]) ? nyAssignees[item.id]
+    : assignable.includes(item.agent) ? item.agent : assignable[0] || "";
+  const assigns = c => !!c && !!(c.deliver || ["approve", "approve_launch"].includes(c.action));
+  const assignee = el("select", { id: `ny-assign-${item.id}`, disabled: busy || !assignable.length,
     onchange: e => { nyAssignees[item.id] = e.target.value; } },
-    (state.agents || []).filter(a => !a.is_human && a.active !== false && a.active !== 0).map(a =>
-      el("option", { value: a.name, selected: (nyAssignees[item.id] || item.agent) === a.name }, a.name)));
+    assignable.length ? assignable.map(name => el("option", { value: name, selected: assigned() === name }, name))
+      : el("option", { value: "" }, "No active agent"));
   const assignBox = el("div", { class: "custom ny-assign" },
     el("label", { class: "field-label", for: assignee.id }, "Assign approved work to"), assignee);
 
@@ -1751,6 +1758,7 @@ function renderNeedsYouItem(item) {
     if (c.value === "custom" && !text) return "Write your reply, or choose an option.";
     if (c.value === "custom" && n > limit) return `Your reply is too long (${n} / ${limit} bytes).`;
     if (c.action === "choose" && nn > noteLimit) return `Your note is too long (${nn} / ${noteLimit} bytes).`;
+    if (assigns(c) && !assigned()) return "No active agent can take the approved work. Write your own reply instead.";
     return "";
   };
   const sync = () => {
@@ -1761,7 +1769,7 @@ function renderNeedsYouItem(item) {
     hint.classList.toggle("err", !!(c && p));
     custom.hidden = !c || c.value !== "custom";
     noteBox.hidden = !c || c.action !== "choose";
-    assignBox.hidden = !c || !(c.deliver || ["approve", "approve_launch"].includes(c.action));
+    assignBox.hidden = !assigns(c);
     count.textContent = `${n} / ${limit} bytes` + (n > limit ? " — too long" : "");
     count.classList.toggle("err", n > limit);
   };
@@ -1771,8 +1779,8 @@ function renderNeedsYouItem(item) {
     if (c.value === "custom") resolveItem(item, "reply", (nyDrafts[item.id] || "").trim());
     else if (c.action === "choose") {
       const text = (nyNotes[item.id] || "").trim();
-      resolveItem(item, "choose", null, { option_id: c.option, ...(text ? {note: text} : {}), ...(c.deliver && nyAssignees[item.id] ? {delivery_agent: nyAssignees[item.id]} : {}) });
-    } else resolveItem(item, c.action, null, nyAssignees[item.id] && ["approve", "approve_launch"].includes(c.action) ? {delivery_agent: nyAssignees[item.id]} : {});
+      resolveItem(item, "choose", null, { option_id: c.option, ...(text ? {note: text} : {}), ...(assigns(c) ? {delivery_agent: assigned()} : {}) });
+    } else resolveItem(item, c.action, null, assigns(c) ? {delivery_agent: assigned()} : {});
   });
 
   const cards = el("fieldset", { class: "radio-cards" }, el("legend", {}, q ? "Choose an answer" : "Your answer"),
