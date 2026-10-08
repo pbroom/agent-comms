@@ -354,7 +354,8 @@ button.needs-chip:hover:not(:disabled) { background: var(--warning-bg); box-shad
 .ny-explain { margin: 4px 0 6px; padding: 8px 10px; border-radius: var(--radius); background: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 .ny-explain strong { font-weight: 600; }
 .ask-compact .ask-context { margin-bottom: 2px; }
-.ask-compact .q { display: block; font-weight: 600; overflow-wrap: anywhere; }
+.ask-compact .q { display: block; font-weight: 600; overflow-wrap: anywhere; color: var(--foreground); text-decoration: none; }
+.ask-compact .q:hover { color: var(--primary); text-decoration: underline; }
 .ask-compact .ask-options { margin-top: 3px; color: var(--muted-foreground); overflow-wrap: anywhere; }
 .ask-compact .ask-options b { color: var(--foreground); font-weight: 500; }
 /* Status banner at the top of an issue (and of anything answered): waiting on you, or answered, or resolved. */
@@ -1220,10 +1221,13 @@ function threadStatus(t, human) {
   const stalled = [], agents = [];
   const involve = a => { if (a && !isHumanName(a) && !agents.includes(a) && !runs.some(r => r.agent === a)) agents.push(a); };
   let needsMe = false;
+  const pending = [];
   const shared = allIssues().filter(i => i.status !== "resolved" && i.links.some(l => l.thread_id === t.id));
   if (shared.length) {
     const needsDecision = shared.some(i => i.needs_human && i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
-    stalled.push(needsDecision ? "Shared issue awaiting human decision" : "Shared issue unresolved");
+    // An issue that needs nothing from the human here (answered, or under discussion) is not shown as stalled.
+    if (needsDecision) stalled.push("Shared issue awaiting human decision");
+    else pending.push("Shared issue unresolved (nothing needed from you here)");
     if (human && needsDecision) needsMe = true;
   }
   const waitingIds = (state.needs_you || []).filter(p => p.thread_id === t.id).map(p => p.id).sort((a, b) => a - b);
@@ -1240,7 +1244,6 @@ function threadStatus(t, human) {
   if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
   // Request completion is explicit; reading or unrelated replies never close it.
-  const pending = [];
   const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
   for (const p of posts) {
     if (p.sealed) continue;
