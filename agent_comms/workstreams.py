@@ -458,7 +458,7 @@ def _reconcile(board, p, sid, post_id, expected_version, fence):
                 raise Conflict('automatic reconciliation is paused')
             agents = {s['agent'] for s in targets}
             if not any(rule['thread_id']==managed['thread_id'] and agents.issubset(set(rule['agents']))
-                       for rule in board.active_dispatch_rules(p)):
+                       for rule in _continuation_rules(board, p)):
                 raise Forbidden('automatic reconciliation lacks current dispatch approval')
         if type(expected_version) is not int or row['version'] != expected_version:
             raise Conflict('continuation changed; reread before routing')
@@ -524,6 +524,14 @@ def _reconcile(board, p, sid, post_id, expected_version, fence):
         return out(get_for_post(board,post_id))
 
 
+def _continuation_rules(board, p):
+    """Active dispatch approvals that can authorize continuation reconciliation. One-click rules (Unstick, Approve &
+    launch; human_actions binds each to its post) authorize only the launch for their own post, never this."""
+    from . import human_actions
+    one_click = human_actions.one_click_rule_ids(board)
+    return [rule for rule in board.active_dispatch_rules(p) if rule['id'] not in one_click]
+
+
 # Automatic reconciliation of a continuation that stays blocked for the same reason backs off (per process): the
 # dispatcher ticks every few seconds, and each pass inspects Git. A new reason, a takeover or a cleared blocker resets it.
 TICK_BACKOFF_MIN, TICK_BACKOFF_MAX = 5, 300
@@ -538,7 +546,7 @@ def tick(board, p, fence=None):
     """Reconcile only continuations covered by current explicit dispatch approval."""
     if board.is_paused():
         return
-    rules = board.active_dispatch_rules(p)
+    rules = _continuation_rules(board, p)
     now = board.now()
     due = board.conn.execute('SELECT * FROM continuations WHERE deadline<=? AND completion IS NULL',(now,)).fetchall()
     _tick_backoff = _backoff(board)
@@ -606,6 +614,9 @@ def _delivery_rule(board, managed, run):
     if not rules:
         raise Forbidden('continuation dispatch approval was removed')
     rule = rules[0]
+    from . import human_actions
+    if rule['id'] in human_actions.one_click_rule_ids(board):
+        raise Forbidden('a one-click launch approval covers only its own post')
     target = board._dispatch_target(rule)
     # The last launch can have spent the remaining budget; revocation and expiry
     # still prevent binding. No new budget is consumed by registration.
@@ -677,6 +688,47 @@ def release_ended_deliveries(board, p):
         return released
 
 
+def _delivery_run_ids(board, managed):
+    """The continuation's reserved run plus every recorded dispatcher run for its post."""
+    post_id = managed['post_id']
+    run_ids = [managed['dispatch_run_id']] if managed['dispatch_run_id'] else []
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+        try:
+            run = json.loads(value)
+        except ValueError:
+            continue
+        if isinstance(run, dict) and post_id in run.get('request_ids', []) and run.get('run_id') not in run_ids:
+            run_ids.append(run.get('run_id'))
+    return run_ids
+
+
+def _awaiting_delivery(managed, row):
+    """Nobody has picked the continuation up: its request is blocked, or still queued for the fallback session (or
+    for no session). Started (for example picked up by hand) or finished work is never reset."""
+    return row['state'] == 'blocked' or (
+        row['state'] == 'queued' and row['assigned_session'] in (None, managed['fallback_session']))
+
+
+def delivery_reset(board, managed):
+    """Human-only dashboard metadata for reset_delivery: {'reserved', 'resettable'}. `resettable` when a fallback
+    delivery is stuck (its run is still reserved, or ended without registering and was not reset yet, so the
+    dispatcher will not try again) and nothing for this post is active: when reset_delivery would act. Ids and
+    states only; reset_delivery repeats every check under the write lock."""
+    reserved = managed['dispatch_run_id'] is not None
+    row = board.conn.execute('SELECT state,assigned_session FROM request_progress WHERE post_id=? AND recipient=?',
+                             (managed['post_id'], managed['recipient'])).fetchone()
+    thread = board.conn.execute('SELECT status FROM threads WHERE id=?', (managed['thread_id'],)).fetchone()
+    if (managed['epoch'] < 1 or row is None or not _awaiting_delivery(managed, row)
+            or thread is None or thread['status'] != 'open'):
+        return {'reserved': reserved, 'resettable': False}
+    run_ids = [r for r in _delivery_run_ids(board, managed) if isinstance(r, str)]
+    if not run_ids or any(not _reservation_ended(board, r) for r in run_ids):
+        return {'reserved': reserved, 'resettable': False}
+    stuck = reserved or any(run is not None and not run.get('reset_by_human')
+                            for run in (_run_record(board, r) for r in run_ids))
+    return {'reserved': reserved, 'resettable': stuck}
+
+
 def reset_delivery(board, p, session_id, post_id, expected_version):
     """Human only: retry a failed fallback delivery. Refused while its run is still active. Clears the reservation,
     marks the failed run as reset (so the dispatcher may make one new delivery attempt under its existing approval
@@ -694,18 +746,13 @@ def reset_delivery(board, p, session_id, post_id, expected_version):
             raise Conflict('continuation changed; reread before resetting its delivery')
         if row['state'] == 'finished':
             raise Conflict('continuation is already finished')
+        if not _awaiting_delivery(managed, row):
+            raise Conflict('the continuation was picked up; only a blocked or still-queued delivery can be reset')
         if board._thread_row(managed['thread_id'])['status'] != 'open':
             raise Conflict('continuation thread must be open')
         if managed['epoch'] < 1:
             raise Conflict('no fallback delivery has been assigned yet')
-        run_ids = [managed['dispatch_run_id']] if managed['dispatch_run_id'] else []
-        for (value,) in c.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
-            try:
-                run = json.loads(value)
-            except ValueError:
-                continue
-            if isinstance(run, dict) and post_id in run.get('request_ids', []) and run.get('run_id') not in run_ids:
-                run_ids.append(run.get('run_id'))
+        run_ids = _delivery_run_ids(board, managed)
         for run_id in run_ids:
             if isinstance(run_id, str) and not _reservation_ended(board, run_id):
                 raise Conflict('the delivery run is still active or registered a session; stop it or let it finish first')

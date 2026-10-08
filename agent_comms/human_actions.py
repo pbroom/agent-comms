@@ -72,6 +72,62 @@ def one_click_rule_ids(board: Board) -> set[int]:
     return out
 
 
+def prune_post_rules(board: Board, p: Principal) -> int:
+    """Delete post -> rule bindings that can no longer matter. Call inside a write transaction. A binding goes when
+    its rule is dead for good: revoked, expired, or spent with every launch accounted for by a run that started and
+    has ended (a launch whose run may still fail to spawn is refunded, which would revive the rule). It stays while
+    an ordinary rule on the post's thread that is active, or exhausted (a refund can revive it), was created at or
+    before the post: without the binding that rule could launch for the post, which a dead one-click rule must not allow (its post launches nothing). Live rules keep
+    their bindings, so the dispatcher's "only that rule for that post" lookup is unchanged. Returns how many went."""
+    entries = []
+    for key, value in board.conn.execute("SELECT key, value FROM board_state WHERE key LIKE ?", (POST_RULE_PREFIX + "%",)):
+        try:
+            entries.append((key, int(key[len(POST_RULE_PREFIX):]), json.loads(value)))
+        except (TypeError, ValueError):
+            continue
+    if not entries:
+        return 0
+    started: dict[int, int] = {}   # rule id -> launches that started a process and ended
+    active_runs: set[int] = set()
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
+        try:
+            run = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(run, dict) or not isinstance(run.get("rule_id"), int):
+            continue
+        if run.get("status") in dispatch.ACTIVE:
+            active_runs.add(run["rule_id"])
+        elif run.get("pid") is not None:
+            started[run["rule_id"]] = started.get(run["rule_id"], 0) + 1
+    # Ordinary rules that could launch for a post that has no binding, now or later: active, or exhausted (a launch
+    # still in flight may fail to spawn and be refunded, making the rule active again). Not revoked or expired, which
+    # is final. Live one-click rules launch only for their own post, and their bindings are never pruned.
+    board._require_human(p, "prune one-click launch bindings")
+    one_click = one_click_rule_ids(board)
+    live = [r for r in (board._dispatch_rule_out(x) for x in board._dispatch_rows(active_only=True))
+            if r["state"] in ("active", "exhausted") and r["id"] not in one_click]
+    pruned = 0
+    for key, post_id, rule_id in entries:
+        if not isinstance(rule_id, int) or isinstance(rule_id, bool):
+            continue
+        rows = board._dispatch_rows(rule_id)
+        if not rows:
+            continue   # unknown (e.g. the human identity is inactive): keep
+        target = board._dispatch_target(rows[0])
+        state = board._dispatch_state(rows[0], target)
+        dead = state in ("revoked", "expired") or (
+            state == "exhausted" and rule_id not in active_runs and started.get(rule_id, 0) >= target["max_launches"])
+        if not dead:
+            continue
+        post = board.conn.execute("SELECT thread_id, created_at FROM posts WHERE id = ?", (post_id,)).fetchone()
+        if post is not None and any(r["thread_id"] == post["thread_id"] and r["created_at_ts"] <= post["created_at"]
+                                    for r in live):
+            continue
+        pruned += board.conn.execute("DELETE FROM board_state WHERE key = ?", (key,)).rowcount
+    return pruned
+
+
 def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type: str, to: list[str],
                   needs_response: bool, launch: list[str] | None = None,
                   purpose: str | None = None, answer_to: list[int] | None = None, answer_recipient: str | None = None,
@@ -101,6 +157,7 @@ def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type
                 board.conn.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
                                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                                    (POST_RULE_PREFIX + str(post["id"]), json.dumps(rule["id"]), p.name, board.now()))
+                prune_post_rules(board, p)   # bindings only grow here, so this keeps them bounded
             if post_hook is not None:
                 post_hook(post)
     except Exception:

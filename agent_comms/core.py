@@ -1337,6 +1337,8 @@ class Board:
         managed = workstreams.get_for_post(self, r['id'])
         if managed is not None:
             d['continuation'] = workstreams.out(managed)
+            if p.is_human:   # for the dashboard's "Reset stuck delivery" (a human-only route)
+                d['continuation']['delivery_reset'] = workstreams.delivery_reset(self, managed)
         d["addressed_to_me"] = p.name in to
         return d
 

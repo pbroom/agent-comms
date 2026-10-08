@@ -300,9 +300,11 @@ details summary { cursor: pointer; color: var(--muted-foreground); font-size: 12
 .convo a.chip:hover { text-decoration: underline; }
 .convo button { padding: 0 7px; border-radius: 999px; }
 td > .convo, .post > .convo { display: flex; margin-top: 3px; }
-.unstick-note { margin-top: 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--muted); display: flex;
+.unstick-note, .delivery-reset-note { margin-top: 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--muted); display: flex;
   gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.unstick-note.failed { color: var(--destructive); background: var(--destructive-bg); }
+.unstick-note.failed, .delivery-reset-note.failed { color: var(--destructive); background: var(--destructive-bg); }
+/* Reset stuck delivery (human only): under a continuation post whose fallback delivery ended without registering. */
+.delivery-reset { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
 .unstick-note > .convo-list { flex-basis: 100%; margin-top: 0; }
 a.unstick-chip { text-decoration: none; }
 .convo-list { display: flex; gap: 6px 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
@@ -523,6 +525,8 @@ let resolveBusy = null, resolveNote = null;     // resolveNote: { threadId, text
 const nyExpanded = new Set(), nyDrafts = {}, nyAssignees = {};
 const nyChoice = {}, nyNotes = {};   // post id -> the option card picked / the optional note with a chosen option
 let scrollToNeedsYou = null;   // after the chip or a sidebar item: the post id (or true) to bring into view
+// Reset stuck delivery (human only, click twice): the continuation post being reset and the last result per page load.
+let deliveryResetBusy = null, deliveryResetNote = null;   // deliveryResetNote: { postId, text, failed }
 
 setFocusFromHash();
 
@@ -879,11 +883,51 @@ function renderPost(p, human) {
       r.assigned_session ? el("span", { class: "muted" }, ` session ${r.assigned_session}`) : null,
       r.reason ? el("div", {}, r.reason) : null,
       (r.evidence_post_ids || []).map(id => el("a", { href: `#post-${id}` }, ` Evidence #${id}`)))),
+    human ? renderDeliveryReset(p) : null,
     p.attention_resolution ? el("div", { class: "attention-resolution" },
       el("p", { class: "small muted" }, `Attention resolved by ${p.attention_resolution.resolved_by} · ${ago(p.attention_resolution.resolved_at)}`),
       el("div", { class: "body" }, p.attention_resolution.reason),
       el("div", { class: "small" }, "Evidence: ", (p.attention_resolution.evidence_post_ids || []).map((id, index) =>
         el("span", {}, index ? ", " : "", el("a", { href: `#post-${id}` }, `post #${id}`))))) : null);
+}
+
+// A dependent-stack continuation whose fallback delivery is stuck: its run is still reserved, or it ended without
+// registering a session, and nothing for the post is active (the server decides: continuation.delivery_reset, sent
+// only to the human). Resetting releases the reservation and lets the dispatcher make one new attempt, so it takes a
+// second click. The server rechecks everything (and answers 409 while a run is active); its answer shows inline.
+function renderDeliveryReset(p) {
+  const c = p.continuation;
+  const row = c && (p.requests || []).find(r => r.recipient === c.recipient);
+  const note = deliveryResetNote && deliveryResetNote.postId === p.id ? deliveryResetNote : null;
+  const offered = !!(row && c.delivery_reset && c.delivery_reset.resettable);
+  if (!offered && !note) return null;
+  const busy = deliveryResetBusy === p.id;
+  return el("div", { "data-delivery-reset": p.id },
+    offered ? el("div", { class: "small delivery-reset" },
+      el("span", { class: "muted" }, c.delivery_reset.reserved
+        ? "The fallback delivery is still reserved, but its run ended without registering a session."
+        : "The fallback delivery ended without registering a session; the dispatcher will not retry it."),
+      confirmButton("reset-delivery-" + p.id, busy ? "Resetting…" : "Reset stuck delivery", "Confirm reset?",
+        "Resetting releases the stuck delivery's reservation and lets the dispatcher make one new attempt.",
+        () => resetDelivery(p.id, row.version),
+        { class: "reset-delivery", disabled: deliveryResetBusy !== null, "aria-busy": busy ? "true" : null })) : null,
+    note ? el("div", { class: "delivery-reset-note small" + (note.failed ? " failed" : ""), role: "status" },
+      el("span", {}, note.text),
+      el("button", { onclick: () => { deliveryResetNote = null; render(); } }, "Dismiss")) : null);
+}
+
+async function resetDelivery(postId, version) {
+  if (deliveryResetBusy !== null || !state || !state.me.is_human) return;
+  deliveryResetBusy = postId; deliveryResetNote = null; render();
+  try {
+    const out = await api("POST", `/api/posts/${postId}/continuation/reset-delivery`, { expected_version: version });
+    deliveryResetNote = { postId, failed: false, text: "Delivery reset" + (out && out.deadline ? ` (acknowledge by ${new Date(out.deadline).toLocaleTimeString()})` : "") +
+      ". The fallback's request is queued again; the dispatcher may make one new attempt once its checks pass." };
+  } catch (e) {
+    deliveryResetNote = { postId, failed: true, text: "Reset failed: " + e.message };
+  }
+  deliveryResetBusy = null;
+  await refresh();
 }
 
 function renderTasks(tasks, human) {
