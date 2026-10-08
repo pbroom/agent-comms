@@ -211,6 +211,71 @@ def test_dispatcher_launches_a_one_click_post_only_under_its_own_rule(uenv):
     assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, plain)["id"] == newer["id"]
 
 
+def _one_click(e, tid=None):
+    from agent_comms import human_actions
+    post, rule = human_actions.post_as_human(e.board, e.p["human"], thread_id=tid or e.tid, body="Unstick", type="request",
+                                             to=["codex"], needs_response=True, launch=["codex"], purpose="Unstick")
+    return post["id"], rule["id"]
+
+
+def _run(e, run_id, rule_id, status, pid=123):
+    import json
+    from agent_comms import db
+    with db.write_tx(e.board.conn) as c:
+        c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'dispatcher', ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                  ("dispatch.run." + run_id, json.dumps({"run_id": run_id, "rule_id": rule_id, "agent": "codex",
+                                                         "status": status, "pid": pid}), e.board.now()))
+
+
+def test_bindings_of_dead_one_click_rules_are_pruned_when_a_new_binding_is_made(uenv):
+    from agent_comms import human_actions
+    e, human = uenv, uenv.p["human"]
+    other = e.thread("other")
+    revoked, ended, running, unrecorded, live = (_one_click(e, other) for _ in range(5))
+    e.board.revoke_dispatch_rule(human, revoked[1])
+    for post_id, rule_id in (ended, running, unrecorded):
+        assert e.board.take_dispatch_launch(human, rule_id, "codex") == 0     # spent
+    _run(e, "r-ended", ended[1], "exited")
+    _run(e, "r-refunded", ended[1], "spawn_failed", pid=None)               # a refunded attempt is not a launch
+    _run(e, "r-running", running[1], "running")
+    newest = _one_click(e, other)
+    bound = {p: human_actions.post_rule_id(e.board, p) for p, _ in (revoked, ended, running, unrecorded, live, newest)}
+    assert bound == {revoked[0]: None, ended[0]: None,                      # dead for good: pruned
+                     running[0]: running[1],      # its run may still fail and refund the launch
+                     unrecorded[0]: unrecorded[1],  # spent, but the launch is not accounted for yet
+                     live[0]: live[1], newest[0]: newest[1]}
+    assert revoked[1] not in human_actions.one_click_rule_ids(e.board)
+    assert {running[1], unrecorded[1], live[1], newest[1]} <= human_actions.one_click_rule_ids(e.board)
+    _run(e, "r-running", running[1], "exited")
+    e.clock.advance(human_actions.RULE_HOURS * 3600 + 1)                     # every earlier rule expires
+    latest = _one_click(e, other)
+    assert [p for p in bound if human_actions.post_rule_id(e.board, p) is not None] == []
+    assert human_actions.post_rule_id(e.board, latest[0]) == latest[1]
+    assert human_actions.one_click_rule_ids(e.board) == {latest[1]}
+
+
+def test_a_dead_binding_stays_while_an_older_approval_could_still_launch_its_post(uenv):
+    """Pruning must not reopen a post to another rule: one whose rule was revoked launches nothing, so its binding
+    stays while an approval created at or before the post is still active on its thread."""
+    from agent_comms import human_actions
+    from agent_comms.dispatch import Dispatcher
+    e, human = uenv, uenv.p["human"]
+    older = e.board.create_dispatch_rule(human, thread_id=e.tid, agents=["codex"], purpose="older", max_launches=3)
+    e.clock.advance(1)
+    post_id, rule_id = _one_click(e)
+    e.board.revoke_dispatch_rule(human, rule_id)
+    _one_click(e, e.thread("elsewhere"))
+    assert human_actions.post_rule_id(e.board, post_id) == rule_id
+    item = {"thread_id": e.tid, "agent": "codex", "post_id": post_id,
+            "post_created_at": e.board.conn.execute("SELECT created_at FROM posts WHERE id=?", (post_id,)).fetchone()[0]}
+    rs = e.board.active_dispatch_rules(human)
+    assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, item) is None   # never borrows `older`
+    e.board.revoke_dispatch_rule(human, older["id"])
+    _one_click(e, e.thread("elsewhere again"))
+    assert human_actions.post_rule_id(e.board, post_id) is None
+
+
 def test_unstick_after_an_unspent_unstick_and_an_approve_launch_quotes_its_own_purpose(tmp_path, monkeypatch):
     """Review repro: Unstick #1 approves U1 (unspent, the agent was live); Approve & launch for #5 approves A;
     Unstick #2 must not count U1 as covering, and its post must launch with the Unstick purpose, not A's."""
