@@ -133,6 +133,8 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         if state == 'started':
             from . import browser_readiness
             browser_readiness.assert_request_ready(board,post_id,recipient,session_id)
+            from . import runner_preflight
+            runner_preflight.assert_ready(board, session_id, post_id)
         managed = workstreams.get_for_post(board, post_id)
         if recover_blocked:
             _recover_blocked(board,p,session_id,post,row,state,evidence,expected_version,managed)
