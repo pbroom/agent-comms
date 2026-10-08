@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 5   # v5: structured issue questions and answer snapshots
+SCHEMA_VERSION = 6   # v6: auditable per-source attention closeout
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -67,6 +67,15 @@ CREATE TABLE IF NOT EXISTS posts (
 CREATE INDEX IF NOT EXISTS posts_thread_seq ON posts(thread_id, seq);
 CREATE INDEX IF NOT EXISTS posts_agent_time ON posts(agent, created_at);
 CREATE INDEX IF NOT EXISTS posts_task ON posts(task_id);
+
+CREATE TABLE IF NOT EXISTS attention_resolutions (
+    post_id INTEGER PRIMARY KEY REFERENCES posts(id),
+    resolved_by TEXT NOT NULL REFERENCES agents(name),
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    reason TEXT NOT NULL,
+    evidence_post_ids TEXT NOT NULL,
+    resolved_at REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS authorization_grants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
