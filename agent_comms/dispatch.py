@@ -553,18 +553,26 @@ class Dispatcher:
                 if now - pickup.waiting_since(self.board, post, row) < pickup.PICKUP_WAIT_SECONDS:
                     continue
                 reason = 'Pickup overdue: no explicit acknowledgement from the assigned agent within 40 minutes'
+                state = 'blocked'
+                if row['assigned_session'] is None and not self._attempted(post['id'], row['assigned_agent']):
+                    # A missed delivery is still deliverable when its existing
+                    # approval and liveness gates permit. Keep the overdue marker
+                    # without permanently consuming its sole delivery opportunity.
+                    state = 'queued'
+                    if row['reason'] == reason:
+                        continue
                 version = row['version'] + 1
                 # The write transaction serializes the deadline against explicit
                 # acknowledgement; all state was read after acquiring its lock.
                 c.execute("""INSERT INTO request_progress
                     (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
-                    VALUES (?,?,'blocked',?,?,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
-                    state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
-                    (post['id'],row['recipient'],row['assigned_agent'],row['assigned_session'],reason,version,now))
+                    VALUES (?,?,?,?,?,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
+                    state=excluded.state,reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
+                    (post['id'],row['recipient'],state,row['assigned_agent'],row['assigned_session'],reason,version,now))
                 c.execute("""INSERT INTO request_events
                     (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,
-                     version,created_at,event_source) VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
-                    (post['id'],row['recipient'],row['assigned_agent'],row['assigned_session'],reason,version,now))
+                     version,created_at,event_source) VALUES (?,?,NULL,NULL,?,?,?,?,'[]',?,?,'dispatcher')""",
+                    (post['id'],row['recipient'],state,row['assigned_agent'],row['assigned_session'],reason,version,now))
                 seq = c.execute('SELECT COALESCE(MAX(seq),0)+1 FROM posts').fetchone()[0]
                 c.execute('UPDATE posts SET seq=?,revised_at=? WHERE id=?', (seq,now,post['id']))
 

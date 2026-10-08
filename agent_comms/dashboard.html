@@ -1200,7 +1200,6 @@ function threadStatus(t, human) {
     const needsDecision = shared.some(i => i.needs_human && i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
     // An issue that needs nothing from the human here (answered, or under discussion) is not shown as stalled.
     if (needsDecision) stalled.push("Shared issue awaiting human decision");
-    else pending.push("Shared issue unresolved (nothing needed from you here)");
     if (human && needsDecision) needsMe = true;
   }
   const waitingIds = (state.needs_you || []).filter(p => p.thread_id === t.id).map(p => p.id).sort((a, b) => a - b);
@@ -1254,10 +1253,15 @@ function threadStatus(t, human) {
     const who = [...working.map(k => `${k.owner_agent} working on task ${k.id}`), ...pending];
     return { kind: "active", label: who.join("; ") };
   }
-  // Nothing open, unread, pending or in progress: the thread has settled. It counts as completed (hidden by
-  // default) until a new post arrives.
-  if (t.tasks.length && t.tasks.every(k => ["done", "declined"].includes(k.status))) return { kind: "done", label: "All tasks done" };
-  return { kind: "done", label: "Settled: nothing waiting on anyone" };
+  // An open discussion or unresolved shared issue is not proof of processing or completion.
+  if (shared.length) return null;
+  if (projected) return projected.complete ? { kind: "done", label: "All recorded work finished" } : null;
+  const recorded = posts.flatMap(p => p.requests || []);
+  if ((recorded.length || t.tasks.length) && recorded.every(r => r.state === "finished")
+      && t.tasks.every(k => ["done", "declined"].includes(k.status))) {
+    return { kind: "done", label: "All recorded work finished" };
+  }
+  return null;
 }
 
 function statusDot(st) {

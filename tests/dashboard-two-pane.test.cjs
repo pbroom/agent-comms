@@ -132,7 +132,7 @@ test('status dots: stalled, being worked on or waiting to be picked up, complete
   const box = document.getElementById('show-completed');
   box.checked = true; box.dispatchEvent(new dom.window.Event('change'));
   await settle();
-  assert.deepEqual(dot(6), ['done', 'All tasks done']);
+  assert.deepEqual(dot(6), ['done', 'All recorded work finished']);
   assert.deepEqual(dot(7), ['done', 'Closed']);
   dom.window.close();
 });
@@ -161,7 +161,7 @@ test('status dots: opening or reloading preserves agent pickup until explicit co
   } finally { reload.dom.window.close(); }
 });
 
-test('status dots: every open thread has one; unclaimed tasks are pending, then stalled', async () => {
+test('status dots: unclaimed tasks await pickup then stall; quiet discussion is unclassified', async () => {
   const fresh = thread(1, [post(10, 1, 1)]); fresh.tasks = [{ ...task(1, 'accepted'), updated_at: MINUTES_AGO(5) }];
   const old = thread(2, [post(20, 2, 2)]); old.tasks = [{ ...task(2, 'proposed'), updated_at: MINUTES_AGO(90) }];
   const quiet = thread(3, [post(30, 3, 3)]);
@@ -169,8 +169,8 @@ test('status dots: every open thread has one; unclaimed tasks are pending, then 
     storage: { 'agent-comms-seen': JSON.stringify({ 1: 10, 2: 20, 3: 30 }), 'agent-comms-thread': '3' } });
   assert.deepEqual(dot(1), ['unread', 'task 1 accepted, awaiting agent pickup for 5m']);
   assert.deepEqual(dot(2), ['stalled', 'task 2 proposed, awaiting agent pickup for 2h']);
-  assert.deepEqual(dot(3), ['done', 'Settled: nothing waiting on anyone']);
-  for (const row of document.querySelectorAll('.thread-list tr')) assert.ok(row.querySelector('.dot'), 'no row without a dot');
+  assert.equal(dot(3), null, 'quiet discussion is not evidence of completion or processing');
+  assert.ok(document.querySelector('tr[data-thread="3"]'), 'unclassified discussion stays visible');
   dom.window.close();
 });
 

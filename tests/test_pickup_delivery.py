@@ -47,12 +47,23 @@ def test_unrelated_heartbeat_cannot_hide_pickup_forever(denv):
     env.board.heartbeat(env.p['codex'], sid)
     env.d.tick()
     row = progress(env, post)
-    assert row['state'] == 'blocked'
+    assert row['state'] == 'queued'
     assert 'Pickup overdue' in row['reason']
     assert not env.spawner.calls
     event = env.board.conn.execute('SELECT * FROM request_events WHERE post_id=? ORDER BY version DESC',
                                    (post['id'],)).fetchone()
     assert event['actor'] is None and event['event_source'] == 'dispatcher'
+
+
+    version = row['version']
+    for _ in range(3):
+        env.d.tick()
+    assert progress(env, post)['version'] == version
+    env.clock.advance(121)
+    env.d.tick()
+    assert len(env.spawner.calls) == 1
+    env.d.tick()
+    assert len(env.spawner.calls) == 1
 
 
 def test_assigned_session_is_never_commandeered_or_forgotten(denv):
@@ -80,8 +91,9 @@ def test_reason_only_update_does_not_reset_pickup_deadline(denv):
                       'queued', reason='Still awaiting pickup')
     env.clock.advance(100)
     env.d.tick()
-    assert progress(env, post)['state'] == 'blocked'
-    assert not env.spawner.calls
+    assert progress(env, post)['state'] == 'queued'
+    assert 'Pickup overdue' in progress(env, post)['reason']
+    assert len(env.spawner.calls) == 1
 
 
 @pytest.mark.parametrize('first', ['acknowledgement', 'deadline'])
@@ -89,10 +101,12 @@ def test_deadline_and_exact_acknowledgement_are_serialized(denv, first):
     env = denv
     allow(env, agents=['codex'])
     post = human_post(env, ['codex'])
+    requests.progress(env.board, env.p['codex'], env.sid['codex'], post['id'], 'codex',
+                      'queued', reason='Assigned pending pickup')
     env.clock.advance(2400)
     def acknowledge():
         return requests.progress(env.board, env.p['codex'], env.sid['codex'], post['id'],
-                                 'codex', 'started', expected_version=0)
+                                 'codex', 'started', expected_version=1)
     if first == 'acknowledgement':
         acknowledge()
         env.d.tick()
@@ -171,6 +185,8 @@ def test_simultaneous_deadline_and_acknowledgement_have_one_winner(denv):
     env = denv
     allow(env, agents=['codex'])
     post = human_post(env, ['codex'])
+    requests.progress(env.board, env.p['codex'], env.sid['codex'], post['id'], 'codex',
+                      'queued', reason='Assigned pending pickup')
     env.clock.advance(2400)
     barrier = threading.Barrier(2)
     results, failures = [], []
@@ -178,7 +194,7 @@ def test_simultaneous_deadline_and_acknowledgement_have_one_winner(denv):
         barrier.wait()
         try:
             results.append(requests.progress(env.board, env.p['codex'], env.sid['codex'],
-                post['id'], 'codex', 'started', expected_version=0))
+                post['id'], 'codex', 'started', expected_version=1))
         except Exception as exc:
             failures.append(exc)
     def expire():
@@ -194,13 +210,13 @@ def test_simultaneous_deadline_and_acknowledgement_have_one_winner(denv):
         worker.join(timeout=5)
         assert not worker.is_alive()
     row = progress(env, post)
-    assert row['version'] == 1
+    assert row['version'] == 2
     assert row['state'] in ('started', 'blocked')
     assert len(results) == (1 if row['state'] == 'started' else 0)
     assert len(failures) == (0 if results else 1)
     assert all(isinstance(error, Conflict) for error in failures)
     assert env.board.conn.execute('SELECT COUNT(*) FROM request_events WHERE post_id=?',
-                                  (post['id'],)).fetchone()[0] == 1
+                                  (post['id'],)).fetchone()[0] == 2
 
 
 
@@ -231,4 +247,25 @@ def test_pickup_deadline_ignores_malformed_historical_run_record(denv):
                            ('dispatch.run.broken', '{broken', env.clock()))
     env.clock.advance(2400)
     env.d._expire_generic_pickups()
-    assert progress(env, post)['state'] == 'blocked'
+    assert progress(env, post)['state'] == 'queued'
+    assert 'Pickup overdue' in progress(env, post)['reason']
+
+
+
+def test_restart_recovers_overdue_never_attempted_request_once(denv):
+    env = denv
+    allow(env, agents=['codex'])
+    post = human_post(env, ['codex'])
+    env.d._scan()
+    env.d._save(**{env.d.PENDING_KEY: {}})
+    env.d.release_loop()
+    env.clock.advance(2401)
+    worker = new_dispatcher(env)
+    worker.tick()
+    assert len(env.spawner.calls) == 1
+    row = progress(env, post)
+    assert row['state'] == 'queued'
+    assert 'Pickup overdue' in row['reason']
+    for _ in range(3):
+        worker.tick()
+    assert len(env.spawner.calls) == 1

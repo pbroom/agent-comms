@@ -168,7 +168,8 @@ test('linked unresolved issues keep read threads visible without duplicating dec
   const { dom, d, win } = await setup({ issues: [data], hash: '' });
   try {
     assert.ok(d.querySelector('tr[data-thread="10"]'));
-    assert.match(d.querySelector('tr[data-thread="10"]').textContent + d.querySelector('tr[data-thread="10"]').innerHTML, /Shared issue unresolved/);
+    assert.equal(d.querySelector('tr[data-thread="10"] .dot'), null, 'a shared discussion alone is neither processing nor complete');
+    assert.ok(d.querySelector('#thread-issues a[href="#issue-1"]'), 'the unresolved issue remains reachable');
     assert.equal(d.querySelector('#needs-you'), null);
     d.getElementById('tab-issues').click(); await settle();
     d.getElementById('tab-threads').click(); await settle();
