@@ -1117,3 +1117,20 @@ def test_exit_blocks_only_session_bound_to_that_run(denv, bind):
     assert row['state'] == ('blocked' if bind else 'started')
     assert row['assigned_session'] == session
     assert 'dispatch_run_id=' + record['run_id'] in denv.spawner.calls[0]['argv'][-1]
+
+
+def test_restarted_dispatcher_blocks_request_when_bound_orphan_is_gone(denv):
+    from agent_comms import requests
+    allow(denv, agents=['codex'])
+    post = human_post(denv, ['codex'])
+    denv.d.tick()
+    record = runs(denv)[0]
+    session = denv.board.register_session(denv.p['codex'], PROJECT,
+        dispatch_run_id=record['run_id'])['session_id']
+    requests.progress(denv.board, denv.p['codex'], session, post['id'], 'codex', 'started')
+    denv.spawner.children[0].code = 1
+    denv.d.release_loop()
+    replacement = new_dispatcher(denv)
+    replacement.tick()
+    assert denv.board.get_post(denv.p['human'], post['id'])['requests'][0]['state'] == 'blocked'
+    assert len(denv.spawner.calls) == 1

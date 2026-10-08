@@ -500,6 +500,7 @@ class Dispatcher:
             self.stopping = True
             return  # superseded: leave the mark, pending triggers and orphans to the owner
         foreign = self._reap_orphans(now)
+        self._reconcile_ended_requests()
         if self.board.is_paused():
             return  # no launches while paused; running children are left alone; triggers wait
         pending = self._scan()
@@ -778,6 +779,17 @@ class Dispatcher:
                     run.child.kill()
             except Exception:
                 log.exception("could not check %s run %s", run.agent, run.run_id)
+
+    def _reconcile_ended_requests(self) -> None:
+        # A prior loop may have died between recording a process exit and updating its request.
+        for (value,) in self.board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+            record = json.loads(value)
+            if record.get("status") in ACTIVE:
+                continue
+            for post_id in record.get("request_ids", []):
+                self._request_failure(post_id, record["agent"],
+                    "Runner ended without explicit request completion: " + record.get("status", "unknown"),
+                    record["run_id"])
 
     def _reap_orphans(self, now: float) -> list[dict]:
         """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when
