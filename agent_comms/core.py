@@ -1189,6 +1189,9 @@ class Board:
             d["attention_resolution"] = resolution
         from .requests import for_post
         d["requests"] = for_post(self, r)
+        if p.is_human:
+            from .approval_owners import delivery
+            d["approval_delivery"] = delivery(self, r)
         from . import workstreams
         managed = workstreams.get_for_post(self, r['id'])
         if managed is not None:
