@@ -92,7 +92,7 @@ test('decision requires explicit thread scope and does not resolve implementatio
     assert.equal(calls.length, 0); assert.match(d.querySelector('[role="alert"]').textContent, /Select the threads/);
     fill(win, d, 'outcome', 'approved'); d.querySelector('fieldset input[value="10"]').click();
     submit(win, d.querySelector('[name="decision"]')); await settle();
-    assert.deepEqual(calls[0].body, { body: 'Approved only for detector work', outcome: 'approved', thread_ids: [10] });
+    assert.deepEqual(calls[0].body, { body: 'Approved only for detector work', outcome: 'approved', thread_ids: [10], expected_question_version: 0 });
     assert.match(d.querySelector('#issue-1').textContent, /Human answered · unresolved/);
     assert.equal(calls.some(c => c.path.endsWith('/resolve')), false);
     assert.ok(button(d, 'Mark resolved'));
@@ -181,5 +181,82 @@ test('a deep link fetches an older resolved issue outside both snapshots', async
     assert.ok(d.getElementById('issue-7'));
     assert.deepEqual(calls[0], { path: '/api/issues/7', method: 'GET', body: undefined });
     assert.match(d.getElementById('issue-7').textContent, /Resolved/);
+  } finally { dom.window.close(); }
+});
+
+const structured = () => ({ ...issue(), question_version: 3, decision_question: {
+  question: 'May we update the detector?', context: 'The detector is blocking both reviews.',
+  options: [{ id: 'wait', label: 'Keep the current detector', description: 'The reviews will wait.', outcome: 'declined' },
+    { id: 'fix', label: 'Update the detector', description: 'Allow the proposed detector fix.', outcome: 'approved' }],
+  recommended_option_id: 'fix'
+} });
+test('structured question leads with recommendation, native radios and explicit scoped submission', async () => {
+  const data = structured();
+  const { dom, d, win, calls } = await setup({ issues: [data], hash: '#issue-1' });
+  try {
+    assert.equal(d.querySelector('#issue-1 h2').textContent, data.decision_question.question);
+    const radios = [...d.querySelectorAll('[name="issue-answer"]')];
+    assert.deepEqual(radios.map(r => r.value), ['option:fix', 'option:wait', 'custom']);
+    assert.equal(radios.some(r => r.checked), false);
+    assert.match(radios[0].closest('label').textContent, /Recommended/);
+    assert.match(radios[0].closest('label').textContent, /Records approval/);
+    radios[0].focus(); radios[0].click();
+    assert.equal(d.activeElement, radios[0]); assert.equal(calls.length, 0);
+    assert.equal(d.querySelector('[name="decision"]').required, false);
+    assert.equal(d.querySelectorAll('[type="checkbox"]:checked').length, 0);
+    d.querySelector('input[value="10"]').click();
+    submit(win, button(d, 'Submit answer')); await settle();
+    assert.deepEqual(calls[0].body, { selected_option_id: 'fix', thread_ids: [10], expected_question_version: 3 });
+  } finally { dom.window.close(); }
+});
+test('custom option retains independent answer and outcome through failed submission', async () => {
+  const { dom, d, win, calls } = await setup({ issues: [structured()], hash: '#issue-1',
+    reply: () => ({ ok: false, status: 409, json: async () => ({ message: 'Question changed; review it again.' }) }) });
+  try {
+    d.querySelector('[value="custom"]').click();
+    assert.equal(d.querySelector('[name="decision"]').required, true);
+    fill(win, d, 'decision', 'Proceed only after another review'); fill(win, d, 'outcome', 'answered');
+    d.querySelector('input[value="20"]').click(); submit(win, button(d, 'Submit answer')); await settle();
+    assert.deepEqual(calls[0].body, { body: 'Proceed only after another review', outcome: 'answered', thread_ids: [20], expected_question_version: 3 });
+    assert.equal(d.querySelector('[name="decision"]').value, 'Proceed only after another review');
+    assert.equal(d.querySelector('[value="custom"]').checked, true);
+    assert.match(d.querySelector('[role="alert"]').textContent, /Question changed/);
+  } finally { dom.window.close(); }
+});
+test('new question version clears stale option selection and preserves custom draft', async () => {
+  const data = structured();
+  const { dom, d, win, calls } = await setup({ issues: [data], hash: '#issue-1', reply: () => {
+    data.question_version++; data.decision_question.question = 'May we update only the tests?';
+    return { ok: false, status: 409, json: async () => ({ message: 'Question changed' }) };
+  } });
+  try {
+    d.querySelector('[value="custom"]').click(); fill(win, d, 'decision', 'My draft');
+    d.querySelector('[value="option:fix"]').click(); d.querySelector('input[value="10"]').click();
+    submit(win, button(d, 'Submit answer')); await settle();
+    assert.equal(d.querySelectorAll('[name="issue-answer"]:checked').length, 0);
+    assert.equal(d.querySelector('[name="decision"]').value, 'My draft');
+    assert.equal(d.querySelector('#issue-1 h2').textContent, 'May we update only the tests?');
+    submit(win, button(d, 'Submit answer')); await settle();
+    assert.equal(calls.length, 1);
+  } finally { dom.window.close(); }
+});
+test('legacy issues offer an honest free-text fallback without fabricated presets', async () => {
+  const { dom, d } = await setup({ hash: '#issue-1' });
+  try {
+    assert.match(d.querySelector('#issue-1 h2').textContent, /^How would you like to handle/);
+    assert.equal(d.querySelector('[name="issue-answer"]'), null);
+    assert.match(d.querySelector('.issue-answer').textContent, /No suggested options were provided/);
+    assert.equal(d.querySelector('[name="decision"]').required, true);
+  } finally { dom.window.close(); }
+});
+
+test('Needs you question opens its decision directly', async () => {
+  const { dom, d } = await setup({ issues: [structured()] });
+  try {
+    const link = d.querySelector('.pane-side [data-issue="1"] a');
+    assert.equal(link.textContent, 'May we update the detector?');
+    link.click();
+    assert.equal(d.querySelector('#issue-1 h2').textContent, link.textContent);
+    assert.ok(button(d, 'Submit answer'));
   } finally { dom.window.close(); }
 });

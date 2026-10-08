@@ -180,3 +180,85 @@ def test_resolution_history_survives_reopen_and_resolve(env):
     )
     assert out["status"] == "open"
     assert len(out["resolutions"]) == 2
+
+
+def question():
+    return {
+        "question": "Which approach should we take?",
+        "context": "The first approach preserves current behavior.",
+        "options": [
+            {"id": "keep", "label": "Keep current behavior", "description": "No migration", "outcome": "approved"},
+            {"id": "change", "label": "Change the behavior"},
+        ],
+        "recommended_option_id": "keep",
+    }
+
+
+def test_preset_answer_uses_stored_choice_and_persists_snapshot(env):
+    out = create(env, decision_question=question())
+    iid, tid = out["id"], out["links"][0]["thread_id"]
+    out = issues.decide_issue(env.board, env.p["human"], env.sid["human"], iid,
+                             "Forged broader permission", [tid], "declined",
+                             selected_option_id="keep", expected_question_version=1)
+    decision = out["decisions"][0]
+    assert decision["body"] == "Keep current behavior — No migration"
+    assert decision["outcome"] == "approved"
+    assert decision["selected_option_id"] == "keep"
+    assert decision["question_version"] == 1
+    assert decision["decision_question"] == out["decision_question"]
+    assert out["status"] == "open" and not out["needs_human"]
+    assert not env.board.list_grants(env.p["human"])
+    issues.comment_issue(env.board, env.p["codex"], env.sid["codex"], iid, "Another decision", "request")
+    reloaded = issues.get_issue(env.board, env.p["human"], iid)
+    assert reloaded["decision_question"] is None
+    assert reloaded["question_version"] == 2
+    assert reloaded["decisions"][0] == decision
+
+
+def test_requests_version_question_and_comments_cannot_replace_it(env):
+    from agent_comms.core import Conflict
+    out = create(env, decision_question=question())
+    iid, tid = out["id"], out["links"][0]["thread_id"]
+    issues.comment_issue(env.board, env.p["codex"], env.sid["codex"], iid, "Evidence")
+    assert issues.get_issue(env.board, env.p["human"], iid)["question_version"] == 1
+    with pytest.raises(Invalid):
+        issues.comment_issue(env.board, env.p["codex"], env.sid["codex"], iid, "Replace", decision_question=question())
+    for version, option, error in [(None, "keep", Invalid), (0, "keep", Conflict), (1, "bogus", Invalid)]:
+        with pytest.raises(error):
+            issues.decide_issue(env.board, env.p["human"], env.sid["human"], iid, None, [tid],
+                                selected_option_id=option, expected_question_version=version)
+    issues.comment_issue(env.board, env.p["codex"], env.sid["codex"], iid, "New question", "request", question())
+    with pytest.raises(Conflict):
+        issues.decide_issue(env.board, env.p["human"], env.sid["human"], iid, "Custom", [tid], expected_question_version=1)
+    assert not issues.get_issue(env.board, env.p["human"], iid)["decisions"]
+    out = issues.decide_issue(env.board, env.p["human"], env.sid["human"], iid, "My own choice", [tid], expected_question_version=2)
+    assert out["decisions"][0]["body"] == "My own choice"
+    assert out["decisions"][0]["selected_option_id"] is None
+
+
+@pytest.mark.parametrize("change", [
+    {"options": []}, {"recommended_option_id": "missing"}, {"question": " "},
+    {"options": [{"id": "same", "label": "a"}, {"id": "same", "label": "b"}]},
+    {"options": [{"id": "keep", "label": "a", "outcome": "resolved"}, {"id": "b", "label": "b"}]},
+    {"context": 123},
+])
+def test_malformed_questions_rejected_without_creating_issue(env, change):
+    with pytest.raises(Invalid):
+        create(env, decision_question=question() | change)
+    assert not issues.list_issues(env.board, env.p["human"])
+
+
+def test_v4_migration_adds_questions_without_altering_history(env):
+    issue = create(env)
+    tid = issue["links"][0]["thread_id"]
+    issue = issues.decide_issue(env.board, env.p["human"], env.sid["human"], issue["id"], "Legacy answer", [tid])
+    c = env.board.conn
+    for table, column in [("issues", "decision_question"), ("issues", "question_version"), ("issue_comments", "decision")]:
+        c.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    c.execute("PRAGMA user_version=4")
+    db.init_schema(c)
+    out = issues.get_issue(env.board, env.p["human"], issue["id"])
+    assert out["decision_question"] is None and out["question_version"] == 0
+    assert out["comments"] == issue["comments"]
+    assert out["decisions"][0]["body"] == "Legacy answer"
+    assert out["decisions"][0]["thread_ids"] == [tid]

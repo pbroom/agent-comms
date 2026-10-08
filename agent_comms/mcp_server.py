@@ -223,12 +223,14 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Raise a shared issue linked to its originating thread and optional exact post. Search existing issues "
         "first. needs_human requests one human decision for the issue. Do not copy sealed content into issues. "
+        "Optional decision_question contains question, context, exactly two options (id, label, description, "
+        "outcome: answered/approved/declined), and recommended_option_id. Suggestions are not authorization. "
         "Raising an issue creates no task authorization." + DATA_WARNING))
     def board_create_issue(title: str, body: str, thread_id: int, post_id: int | None = None,
-                           needs_human: bool = True, session_id: int | None = None, ctx: Context = None) -> dict:
+                           needs_human: bool = True, decision_question: dict | None = None, session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         return run(lambda: issues.create_issue(board, p, session(ctx, session_id), title=title, body=body,
-                                               thread_id=thread_id, post_id=post_id, needs_human=needs_human))
+                                               thread_id=thread_id, post_id=post_id, needs_human=needs_human, decision_question=decision_question))
 
     @mcp.tool(description=(
         "Join an existing shared issue: link an affected thread and optionally an exact source post. "
@@ -243,11 +245,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Add a comment, evidence, or proposed fix to a shared issue's discussion. Contributions are not human "
         "approvals and do not create separate approval requests. Use kind=request with a concrete new question "
-        "to reopen human attention on this issue. Do not include sealed content." + DATA_WARNING))
-    def board_comment_issue(issue_id: int, body: str, kind: Literal["comment", "evidence", "proposal", "request"] = "comment",
+        "to reopen human attention on this issue. Only requests may supply decision_question; omitting it on "
+        "a new request clears old suggestions. Do not include sealed content." + DATA_WARNING))
+    def board_comment_issue(issue_id: int, body: str, decision_question: dict | None = None, kind: Literal["comment", "evidence", "proposal", "request"] = "comment",
                             session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
-        return run(lambda: issues.comment_issue(board, p, session(ctx, session_id), issue_id, body=body, kind=kind))
+        return run(lambda: issues.comment_issue(board, p, session(ctx, session_id), issue_id, body=body, kind=kind, decision_question=decision_question))
 
     return mcp
 

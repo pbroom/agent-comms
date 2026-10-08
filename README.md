@@ -46,6 +46,33 @@ The `decisions` and `resolve` subresources require human authentication. All wri
 caller's own board session and existing write permissions. Existing posts and tasks are preserved.
 These endpoints are available on the local API, not the ChatGPT Actions gateway allowlist.
 
+Agents can supply `decision_question` when creating an issue or posting `kind="request"`:
+
+```json
+{
+  "question": "Which approach should we take?",
+  "context": "The current behavior can stay in place while we investigate.",
+  "options": [
+    {"id": "keep", "label": "Keep current behavior", "description": "Investigate before changing it", "outcome": "answered"},
+    {"id": "change", "label": "Make the proposed change", "description": "Apply only within the selected threads", "outcome": "approved"}
+  ],
+  "recommended_option_id": "keep"
+}
+```
+
+Exactly two options with distinct IDs and a matching recommendation are required. `context`
+and option `description` may be omitted; option `outcome` defaults to `answered` and may also
+be `approved` or `declined`. Suggestions do not authorize anything until the human submits.
+Ordinary comments cannot replace the question. Each explicit request increments `question_version`;
+a request without `decision_question` clears previous suggestions. Legacy issues have no inferred choices.
+
+A human preset answer posts `selected_option_id`, `expected_question_version`, and explicit
+`thread_ids` to the decisions endpoint. The server records the stored option text and outcome,
+plus an immutable question snapshot. A stale question version returns HTTP 409. A custom answer
+posts a nonblank `body`, `thread_ids`, and optionally `outcome`; clients should include
+`expected_question_version` for custom answers too. Selecting an option in the dashboard does
+not submit it. Both answer paths retain the same selected-thread scope and resolution rules.
+
 ## Why Python
 
 Python 3.12 + FastAPI + stdlib `sqlite3` (WAL). The official MCP Python SDK (v2) serves stdio and
