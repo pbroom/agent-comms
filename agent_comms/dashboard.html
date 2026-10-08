@@ -214,6 +214,8 @@ async function api(method, path, data, bearer) {
   return body;
 }
 
+// Only pausing the board and signing browsers out still ask first (window.confirm). Every other action happens on
+// click: the human asked for that, and embedded browsers that block confirm() would otherwise make them dead buttons.
 async function act(method, path, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
   try { await api(method, path); lastError = ""; } catch (e) { lastError = e.message; }
@@ -436,9 +438,9 @@ function renderPost(p, human) {
     p.needs_response ? chip("needs response", "warn") : null,
     p.type === "decision" ? (p.decision_status === "final" ? chip("FINAL", "ok") : chip("proposal - not binding", "warn")) : null,
     el("span", { class: "muted", title: p.created_at }, ago(p.created_at)),
-    human && p.sealed ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/unseal`, `Unseal post #${p.id}? Every agent will be able to read it.`) }, "Unseal") : null,
+    human && p.sealed ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/unseal`) }, "Unseal") : null,
     human && p.type === "decision" && p.decision_status !== "final" && !p.sealed
-      ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/finalize`, `Finalize decision #${p.id}? Agents will treat it as binding.`) }, "Finalize") : null,
+      ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/finalize`) }, "Finalize") : null,
   );
   const refs = p.refs.length ? el("div", { class: "refs" },
     p.refs.map(r => el("div", {}, `${r.kind}: ${r.path}${r.rev ? " @ " + r.rev : ""}`))) : null;
@@ -472,7 +474,7 @@ function renderTasks(tasks, human) {
               : "Work paused.") : null),
       el("td", {}, human && t.status === "proposed"
           ? el("button", { onclick: () => transition(t.id, "accepted") }, "Accept") : null,
-        human && t.owner_agent ? el("button", { onclick: () => act("POST", `/api/tasks/${t.id}/release`, `Force-release task ${t.id}?`) }, "Release") : null),
+        human && t.owner_agent ? el("button", { onclick: () => act("POST", `/api/tasks/${t.id}/release`) }, "Release") : null),
     )));
 }
 
@@ -507,7 +509,6 @@ async function saveGrant(event) {
 
 async function revokeGrant(grant) {
   if (grantBusy || !state.me.is_human) return;
-  if (!confirm(`Revoke ${grant.category} approval for ${grant.agents.join(", ")} in ${grant.project}?`)) return;
   grantBusy = true; grantError = ""; render();
   try { await api("POST", `/api/admin/grants/${grant.id}/revoke`); }
   catch (error) { grantError = error.message; }
@@ -588,7 +589,7 @@ function settingRow(item) {
     el("td", {}, sourceChip(item.source)),
     el("td", {}, item.source === "board.local.toml"
       ? el("button", { disabled: cfgBusy, title: "Remove the board.local.toml override",
-          onclick: () => cfgAct("PUT", "/api/settings", { [item.key]: null }, `Remove the board.local.toml value for ${item.key}?`) }, "Reset")
+          onclick: () => cfgAct("PUT", "/api/settings", { [item.key]: null }) }, "Reset")
       : null));
 }
 
@@ -629,9 +630,7 @@ function renderBoardSection() {
       el("input", { type: "checkbox", id: "require-human-accept", checked: accept.value, disabled: cfgBusy || !f.writable,
         onchange: e => {
           const on = e.target.checked;
-          cfgAct("PUT", "/api/settings", { "tasks.require_human_accept": on },
-            on ? "Require your acceptance (or a matching category approval) before agents can claim proposed tasks?"
-               : "Let agents accept and claim proposed tasks without you?");
+          cfgAct("PUT", "/api/settings", { "tasks.require_human_accept": on });
         } }),
       el("label", { for: "require-human-accept" }, el("div", {}, accept.label), el("code", { class: "muted" }, accept.key)),
       sourceChip(accept.source)) : null,
@@ -675,7 +674,7 @@ function renderNotifications() {
     n.rules.length ? n.rules.map(r => el("div", { class: "post small" },
       el("div", {}, el("strong", {}, `Rule ${r.id}: `), r.events.join(", ")),
       el("div", { class: "muted" }, notifyScope(r)),
-      el("button", { class: "danger", disabled: cfgBusy, onclick: () => cfgAct("POST", `/api/admin/notifications/${r.id}/remove`, undefined, `Remove notification rule ${r.id}?`) }, "Remove")))
+      el("button", { class: "danger", disabled: cfgBusy, onclick: () => cfgAct("POST", `/api/admin/notifications/${r.id}/remove`) }, "Remove")))
       : el("p", { class: "small muted" }, "Notifications are off: no rules."),
     el("details", {}, el("summary", {}, "Add a rule"), form),
     el("div", { class: "actions" }, el("button", { disabled: cfgBusy || !n.deliverable, onclick: () => cfgAct("POST", "/api/admin/notifications/test") }, "Send test notification")));
@@ -715,7 +714,7 @@ function renderDispatch() {
     el("h2", {}, "Dispatcher"),
     el("div", { class: "actions" }, st.running ? chip("running", "ok") : chip("stopped"), el("span", {}, status),
       st.running ? el("button", { class: "danger", disabled: cfgBusy,
-        onclick: () => cfgAct("POST", "/api/admin/dispatch/stop", undefined, "Stop the dispatcher? It terminates the agents it started.") }, "Stop dispatcher") : null),
+        onclick: () => cfgAct("POST", "/api/admin/dispatch/stop") }, "Stop dispatcher") : null),
     x.config_error ? el("div", { class: "err" }, "[dispatch] does not validate: " + x.config_error) : null,
     el("h3", {}, "Settings"), settingsTable("dispatch", "Save dispatcher settings"),
     el("div", { id: "settings-runners" },
@@ -738,7 +737,7 @@ function renderDispatch() {
       el("div", {}, `${r.launches_left}/${r.max_launches} launches left · `, r.expires_at ? "expires " + new Date(r.expires_at).toLocaleString() : "no expiry"),
       el("div", { class: "body" }, r.purpose || ""),
       r.state !== "revoked" ? el("button", { class: "danger", disabled: cfgBusy,
-        onclick: () => cfgAct("POST", `/api/admin/dispatch/rules/${r.id}/revoke`, undefined, `Revoke dispatch rule ${r.id}? Agents already running keep running.`) }, "Revoke") : null))
+        onclick: () => cfgAct("POST", `/api/admin/dispatch/rules/${r.id}/revoke`) }, "Revoke") : null))
       : el("p", { class: "small muted" }, "No workstream approvals."),
     el("details", {}, el("summary", {}, "Approve a workstream"), form),
     el("h3", {}, "Recent launches"),
