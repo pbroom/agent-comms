@@ -1295,11 +1295,16 @@ function renderNeedsYouItem(item) {
 function renderNeedsYou(t, human) {
   if (!human || !t) return null;
   const items = needsYouOf(t.id);
+  const issues = waitingIssues().filter(i => i.status !== "resolved" &&
+    i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
+  const count = items.length + issues.length;
   const note = resolveNote && resolveNote.threadId === t.id ? resolveNote : null;
-  if (!items.length && !note) return null;
+  if (!count && !note) return null;
   return el("aside", { class: "card needs-you", id: "needs-you", "aria-label": "Needs you" },
     el("h2", {}, el("span", { class: "dot stalled", "aria-hidden": "true" }),
-      items.length ? `Needs you (${items.length})` : "Needs you: nothing left here"),
+      count ? `Needs you (${count})` : "Needs you: nothing left here"),
+    issueError && issues.length ? el("p", { class: "banner", role: "alert" }, issueError) : null,
+    issues.map(renderNeedsYouIssue),
     items.map(renderNeedsYouItem),
     note ? el("div", { class: "ny-result small" + (note.failed ? " failed" : ""), id: "needs-you-result", role: "status" },
       el("span", {}, note.text), el("button", { onclick: () => { resolveNote = null; render(); } }, "Dismiss")) : null);
@@ -1394,7 +1399,7 @@ function renderIssueAnswer(i, draft, threads, submit) {
     custom.querySelector("textarea").required = id === "custom";
   };
   const option = (id, label, description, outcome, recommended) => el("label", { class: "answer-option" },
-    el("input", { type: "radio", name: "issue-answer", value: id, checked: draft.choice === id,
+    el("input", { type: "radio", name: `issue-answer-${i.id}`, value: id, checked: draft.choice === id,
       onchange: () => choose(id) }),
     el("span", {}, el("strong", {}, label), recommended ? el("span", { class: "chip accent" }, "Recommended") : null,
       description ? el("div", { class: "small" }, description) : null,
@@ -1421,8 +1426,22 @@ function renderIssueAnswer(i, draft, threads, submit) {
     el("p", { class: "small muted" }, "Options are suggestions until you submit. Your answer applies only to the selected threads and does not mark implementation resolved."),
     el("button", { type: "submit", disabled: issueBusy }, "Submit answer"));
 }
+function issueDraft(i) {
+  return issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: [], resolution: "" };
+}
+function renderNeedsYouIssue(i) {
+  const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
+  const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);
+  return el("section", { class: "ny-item", "data-issue": i.id },
+    el("h3", {}, issueQuestion(i)),
+    el("p", { class: "issue-discussion" }, issueContext(i)),
+    renderIssueAnswer(i, issueDraft(i), threads, submit),
+    el("div", { class: "small issue-links" },
+      el("a", { href: `#issue-${i.id}`, onclick: e => { e.preventDefault(); openIssue(i.id); } }, "Full discussion and history"),
+      i.links.filter(l => l.post_id).flatMap(l => [" · ", el("a", { href: `#post-${l.post_id}` }, `post #${l.post_id}`)])));
+}
 function renderIssueDetail(i, human) {
-  const draft = issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: [], resolution: "" };
+  const draft = issueDraft(i);
   const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
   const resolutions = i.resolutions?.length ? i.resolutions : i.resolution ? [i.resolution] : [];
   const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);

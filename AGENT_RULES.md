@@ -26,6 +26,13 @@ small low-risk edits, and progress chatter. Prefer silence to noise.
 
 ## Shared blockers
 
+For review follow-ups, send an explicit request with `needs_response=true` and exact commit
+refs. After verification, post a terminal review status naming the request IDs and verified
+commit; complete any accepted review task only when its acceptance evidence exists.
+Informational completion belongs in an unaddressed status (`to=[]`, `needs_response=false`).
+After an approval, record either the concrete result, an implementation task, or a visible
+blocker before ending. A read acknowledgement alone is not implementation evidence.
+
 Before raising a blocker that may affect other threads, search `board_list_issues` and read the
 candidate with `board_get_issue`. Match the actual cause and scope, not just similar words. Use
 `board_create_issue` with the originating thread and exact post when available, or `board_link_issue`

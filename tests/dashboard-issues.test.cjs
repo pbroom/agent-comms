@@ -201,7 +201,7 @@ test('structured question leads with recommendation, native radios and explicit 
   const { dom, d, win, calls } = await setup({ issues: [data], hash: '#issue-1' });
   try {
     assert.equal(d.querySelector('#issue-1 h2').textContent, data.decision_question.question);
-    const radios = [...d.querySelectorAll('[name="issue-answer"]')];
+    const radios = [...d.querySelectorAll('[name^="issue-answer-"]')];
     assert.deepEqual(radios.map(r => r.value), ['option:fix', 'option:wait', 'custom']);
     assert.equal(radios.some(r => r.checked), false);
     assert.match(radios[0].closest('label').textContent, /Recommended/);
@@ -239,7 +239,7 @@ test('new question version clears stale option selection and preserves custom dr
     d.querySelector('[value="custom"]').click(); fill(win, d, 'decision', 'My draft');
     d.querySelector('[value="option:fix"]').click(); d.querySelector('input[value="10"]').click();
     submit(win, button(d, 'Submit answer')); await settle();
-    assert.equal(d.querySelectorAll('[name="issue-answer"]:checked').length, 0);
+    assert.equal(d.querySelectorAll('[name^="issue-answer-"]:checked').length, 0);
     assert.equal(d.querySelector('[name="decision"]').value, 'My draft');
     assert.equal(d.querySelector('#issue-1 h2').textContent, 'May we update only the tests?');
     submit(win, button(d, 'Submit answer')); await settle();
@@ -250,7 +250,7 @@ test('legacy issues offer an honest free-text fallback without fabricated preset
   const { dom, d } = await setup({ hash: '#issue-1' });
   try {
     assert.match(d.querySelector('#issue-1 h2').textContent, /^How would you like to handle/);
-    assert.equal(d.querySelector('[name="issue-answer"]'), null);
+    assert.equal(d.querySelector('[name^="issue-answer-"]'), null);
     assert.match(d.querySelector('.issue-answer').textContent, /No suggested options were provided/);
     assert.equal(d.querySelector('[name="decision"]').required, true);
   } finally { dom.window.close(); }
@@ -337,5 +337,68 @@ test('every resolution remains visible after repeated reopen and resolve cycles'
     assert.equal(d.querySelectorAll('[data-resolution]').length, 2);
     assert.match(d.querySelector('[data-resolution="10"]').textContent, /First verification.*Previous resolution by human/);
     assert.match(d.querySelector('[data-resolution="20"]').textContent, /Second verification.*Resolved by human/);
+  } finally { dom.window.close(); }
+});
+
+test('thread Needs you renders linked questions with scoped explicit submission and source history', async () => {
+  const data = structured(); data.links.forEach(l => { l.needs_human = true; });
+  const { dom, d, win, calls } = await setup({ issues: [data] });
+  try {
+    const aside = d.querySelector('aside#needs-you');
+    assert.equal(aside.querySelector('h3').textContent, data.decision_question.question);
+    assert.match(aside.textContent, /The detector is blocking both reviews/);
+    assert.equal(aside.querySelectorAll('[data-issue="1"]').length, 1);
+    assert.deepEqual([...aside.querySelectorAll('[name^="issue-answer-"]')].map(r => r.value), ['option:fix', 'option:wait', 'custom']);
+    assert.ok(aside.querySelector('a[href="#post-100"]'));
+    assert.ok(aside.querySelector('a[href="#post-200"]'));
+    aside.querySelector('[value="option:fix"]').click();
+    assert.equal(calls.length, 0);
+    assert.equal(aside.querySelectorAll('[type="checkbox"]:checked').length, 0);
+    aside.querySelector('[type="checkbox"][value="20"]').click();
+    submit(win, aside.querySelector('button[type="submit"]')); await settle();
+    assert.deepEqual(calls[0].body, { selected_option_id: 'fix', thread_ids: [20], expected_question_version: 3 });
+    assert.equal(calls[0].path, '/api/issues/1/decisions');
+  } finally { dom.window.close(); }
+});
+
+test('thread answer errors remain visible with custom text and scope retained', async () => {
+  const { dom, d, win, calls } = await setup({ issues: [structured()],
+    reply: () => ({ ok: false, status: 409, json: async () => ({ message: 'Question changed; review again.' }) }) });
+  try {
+    const aside = () => d.querySelector('#needs-you');
+    submit(win, aside().querySelector('button[type="submit"]')); await settle();
+    assert.match(aside().querySelector('[role="alert"]').textContent, /Choose an option/);
+    aside().querySelector('[value="custom"]').click();
+    fill(win, aside(), 'decision', 'Only after review');
+    aside().querySelector('[type="checkbox"][value="10"]').click();
+    submit(win, aside().querySelector('button[type="submit"]')); await settle();
+    assert.match(aside().querySelector('[role="alert"]').textContent, /Question changed/);
+    assert.equal(aside().querySelector('[name="decision"]').value, 'Only after review');
+    assert.equal(aside().querySelector('[value="custom"]').checked, true);
+    assert.equal(aside().querySelector('[type="checkbox"][value="10"]').checked, true);
+    assert.equal(calls.length, 1);
+  } finally { dom.window.close(); }
+});
+
+test('thread questions respect pending thread scope and older pending snapshots', async () => {
+  const data = structured(); data.links[0].needs_human = false; data.links[1].needs_human = true;
+  const answered = await setup({ issues: [data] });
+  try { assert.equal(answered.d.querySelector('#needs-you'), null); }
+  finally { answered.dom.window.close(); }
+  data.links[0].needs_human = true;
+  const older = await setup({ issues: [], pendingIssues: [data] });
+  try { assert.equal(older.d.querySelectorAll('#needs-you [data-issue="1"]').length, 1); }
+  finally { older.dom.window.close(); }
+});
+
+test('multiple thread questions keep radio choices independent', async () => {
+  const first = structured(), second = { ...structured(), id: 2 };
+  const { dom, d } = await setup({ issues: [first, second] });
+  try {
+    const a = d.querySelector('#needs-you [data-issue="1"] [value="option:fix"]');
+    const b = d.querySelector('#needs-you [data-issue="2"] [value="option:wait"]');
+    a.click(); b.click();
+    assert.equal(a.checked, true); assert.equal(b.checked, true);
+    assert.match(d.querySelector('#needs-you h2').textContent, /Needs you \(2\)/);
   } finally { dom.window.close(); }
 });
