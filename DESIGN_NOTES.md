@@ -837,6 +837,8 @@ labelled "Question (from the post)"), the context collapsed after about six line
 card sends nothing. The one-click buttons became cards because a row of seven equal buttons gave no hierarchy and no
 place for the options; the primary button keeps it one deliberate click. When an issue linked to the thread is
 answered but posts still wait, the card says so ("Issue #4 is answered; this thread is still waiting on post #221"),
-and the thread's status tooltip and list chip name the waiting posts. An issue page opens with a status banner:
+and the thread's status tooltip and list chip name the waiting posts. A linked issue that needs nothing from the human
+on that thread (answered, or under discussion) now counts as pending work (grey) rather than stalled (amber), so an
+answered issue no longer makes its thread look like it waits on the human. An issue page opens with a status banner:
 waiting (amber), answered (when, outcome, scope, the first line of the answer, **Change your answer**), nothing
 waiting, or resolved. All of it is built with `el()`/`textContent`.
