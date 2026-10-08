@@ -516,6 +516,86 @@ def reserve_delivery(board, p, post_id, run_record, fence):
         board.conn.execute('UPDATE continuations SET dispatch_run_id=? WHERE post_id=?',(run_id,post_id))
 
 
+def _run_record(board, run_id):
+    record = board.conn.execute('SELECT value FROM board_state WHERE key=?', ('dispatch.run.'+run_id,)).fetchone()
+    try:
+        run = json.loads(record['value']) if record else None
+    except (TypeError, ValueError):
+        run = None
+    return run if isinstance(run, dict) else None
+
+
+def _reservation_ended(board, run_id):
+    """A delivery reservation whose run is over (or has no record) and never registered a session: nothing can
+    bind it any more, so it only locks every other session out of the continuation."""
+    from .dispatch import ACTIVE
+    run = _run_record(board, run_id)
+    if run is not None and run.get('status') in ACTIVE:
+        return False
+    return board.conn.execute('SELECT 1 FROM sessions WHERE dispatch_run_id=?', (run_id,)).fetchone() is None
+
+
+def release_ended_deliveries(board, p):
+    """Dispatcher tick: clear delivery reservations whose worker exited (or failed to start) before registering, so
+    the assigned fallback session is no longer refused as 'reserved for another dispatcher delivery'. It does not
+    relaunch: the failed run still counts as this delivery's attempt (see reset_delivery)."""
+    board._require_human(p, 'run the dispatcher')
+    with db.write_tx(board.conn) as c:
+        released = 0
+        for managed in c.execute('SELECT post_id,dispatch_run_id FROM continuations WHERE dispatch_run_id IS NOT NULL').fetchall():
+            if _reservation_ended(board, managed['dispatch_run_id']):
+                released += c.execute('UPDATE continuations SET dispatch_run_id=NULL WHERE post_id=? AND dispatch_run_id=?',
+                                      (managed['post_id'], managed['dispatch_run_id'])).rowcount
+        return released
+
+
+def reset_delivery(board, p, session_id, post_id, expected_version):
+    """Human only: retry a failed fallback delivery. Refused while its run is still active. Clears the reservation,
+    marks the failed run as reset (so the dispatcher may make one new delivery attempt under its existing approval
+    and budget), and puts a blocked assignment back in the fallback's queue with a fresh acknowledgement deadline.
+    Ownership, authorization, capability and browser checks all run again before any launch."""
+    board._require_human(p, 'reset a continuation delivery')
+    with db.write_tx(board.conn) as c:
+        board._session(p, session_id)
+        managed = get_for_post(board, post_id)
+        if managed is None:
+            raise Invalid('post has no managed continuation')
+        row = dict(c.execute('SELECT * FROM request_progress WHERE post_id=? AND recipient=?',
+                             (post_id, managed['recipient'])).fetchone())
+        if type(expected_version) is not int or row['version'] != expected_version:
+            raise Conflict('continuation changed; reread before resetting its delivery')
+        if row['state'] == 'finished':
+            raise Conflict('continuation is already finished')
+        if board._thread_row(managed['thread_id'])['status'] != 'open':
+            raise Conflict('continuation thread must be open')
+        if managed['epoch'] < 1:
+            raise Conflict('no fallback delivery has been assigned yet')
+        run_ids = [managed['dispatch_run_id']] if managed['dispatch_run_id'] else []
+        for (value,) in c.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+            try:
+                run = json.loads(value)
+            except ValueError:
+                continue
+            if isinstance(run, dict) and post_id in run.get('request_ids', []) and run.get('run_id') not in run_ids:
+                run_ids.append(run.get('run_id'))
+        for run_id in run_ids:
+            if isinstance(run_id, str) and not _reservation_ended(board, run_id):
+                raise Conflict('the delivery run is still active or registered a session; stop it or let it finish first')
+        for run_id in run_ids:
+            run = _run_record(board, run_id) if isinstance(run_id, str) else None
+            if run is not None and not run.get('reset_by_human'):
+                run['reset_by_human'] = True
+                c.execute('UPDATE board_state SET value=?,updated_at=? WHERE key=?',
+                          (json.dumps(run), board.now(), 'dispatch.run.' + run_id))
+        c.execute("UPDATE continuations SET dispatch_run_id=NULL,blocker='',deadline=? WHERE post_id=?",
+                  (board.now() + managed['ack_seconds'], post_id))
+        if row['state'] == 'blocked':
+            fallback = c.execute('SELECT agent FROM sessions WHERE id=?', (managed['fallback_session'],)).fetchone()
+            requests._save(board, p, session_id, row, 'queued', 'Human reset the failed fallback delivery', [],
+                           fallback['agent'], managed['fallback_session'])
+    return out(get_for_post(board, post_id))
+
+
 def bind_delivery(board, p, sid, run_id):
     """Called in register_session's transaction; only the reserved child can bind."""
     managed = board.conn.execute('SELECT * FROM continuations WHERE dispatch_run_id=?',(run_id,)).fetchone()

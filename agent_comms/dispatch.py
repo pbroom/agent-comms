@@ -507,6 +507,10 @@ class Dispatcher:
             return  # superseded: leave the mark, pending triggers and orphans to the owner
         foreign = self._reap_orphans(now)
         self._reconcile_ended_requests()
+        try:   # a worker that exited before registering must not keep its continuation reserved forever
+            workstreams.release_ended_deliveries(self.board, self.human)
+        except Exception:
+            log.exception("could not release ended continuation deliveries")
         if self.board.is_paused():
             return  # no launches while paused; running children are left alone; triggers wait
         # Ownership reconciliation has its own per-request deadline. Generic agent
@@ -774,7 +778,9 @@ class Dispatcher:
                 record = json.loads(value)
             except ValueError:
                 continue
-            if isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", []):
+            # A run the human reset (workstreams.reset_delivery) no longer counts: the human allowed one new attempt.
+            if (isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", [])
+                    and not record.get("reset_by_human")):
                 return True
         return False
 

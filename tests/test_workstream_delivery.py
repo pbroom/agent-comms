@@ -181,6 +181,47 @@ def test_delivery_failure_is_explicit_and_does_not_duplicate_restack(delivery_en
     assert env.board.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 2
 
 
+@pytest.mark.parametrize('failure', ['spawn', 'unacknowledged_exit'])
+def test_failed_delivery_releases_its_reservation_and_the_human_can_retry(delivery_env, failure):
+    from fastapi.testclient import TestClient
+    from agent_comms.api import create_app
+    stack, worker, rule, post = delivery_env
+    env = stack['env']
+    if failure == 'spawn':
+        env.spawner.fail_for.add('claude-fake')
+    worker.tick()
+    if failure == 'unacknowledged_exit':
+        env.spawner.children[0].code = 0
+    worker.tick()
+    # The worker never registered: its reservation no longer locks the continuation.
+    assert workstreams.get_for_post(env.board, post['id'])['dispatch_run_id'] is None
+    assert current(stack, post)['state'] == 'blocked'
+    version = current(stack, post)['version']
+    client = TestClient(create_app(env.board))
+    url = f"/api/posts/{post['id']}/continuation/reset-delivery"
+    agent = client.post(url, json={'expected_version': version},
+                        headers={'Authorization': f"Bearer {env.tokens['claude']}"})
+    assert agent.status_code == 403
+    human = {'Authorization': f"Bearer {env.tokens['human']}"}
+    assert client.post(url, json={'expected_version': version + 1}, headers=human).status_code == 409
+    r = client.post(url, json={'expected_version': version}, headers=human)
+    assert r.status_code == 200, r.text
+    row = current(stack, post)
+    assert (row['state'], row['assigned_session']) == ('queued', env.sid['claude'])
+    env.spawner.fail_for.clear()
+    env.clock.advance(1)
+    probe(stack, 'codex')
+    probe(stack, 'claude')
+    worker.tick()
+    assert len(env.spawner.calls) == 2                       # exactly one new attempt
+    for _ in range(3):
+        worker.tick()
+    assert len(env.spawner.calls) == 2
+    # While that new run is live, a reset is refused.
+    again = client.post(url, json={'expected_version': current(stack, post)['version']}, headers=human)
+    assert again.status_code == 409 and 'still active' in again.json()['message']
+
+
 def test_configured_environment_must_match_verified_fallback(delivery_env):
     stack, worker, rule, post = delivery_env
     worker.config.worktrees[str(stack['repo'])] = str(stack['repo'])

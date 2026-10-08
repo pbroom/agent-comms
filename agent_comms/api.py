@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import StrictInt, BaseModel, ConfigDict
 
-from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
+from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin, workstreams
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -221,6 +221,10 @@ class ResolveIn(Body):
     text: str | None = None
     option_id: str | None = None   # choose: one of the post's decision_question option ids
     note: str | None = None        # choose: the human's optional note (<= 1 KB)
+
+
+class DeliveryResetIn(Body):
+    expected_version: StrictInt
 
 
 class AckIn(Body):
@@ -513,6 +517,11 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         # post's author; approve_launch first approves a one-shot dispatcher rule for it (see resolve.py).
         return resolve.resolve(board, p, post_id, body.action, body.text, dispatch_config()[0],
                                option_id=body.option_id, note=body.note, delivery_agent=body.delivery_agent)
+
+    @app.post("/api/posts/{post_id}/continuation/reset-delivery")
+    def reset_continuation_delivery(post_id: int, body: DeliveryResetIn, p: Principal = H):
+        # Human only: retry a fallback delivery whose worker failed or exited before registering (workstreams.py).
+        return workstreams.reset_delivery(board, p, board.human_session(p), post_id, body.expected_version)
 
     @app.post("/api/posts/{post_id}/unseal")
     def unseal(post_id: int, p: Principal = P):

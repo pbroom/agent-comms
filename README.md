@@ -860,7 +860,11 @@ inspection, then wakes the verified fallback environment under its existing appr
 launch budget and tool policy. Dirty or active work is preserved; clean inactive locked
 checkouts are inspected without unlocking them. Reservations, request versions and run
 binding prevent simultaneous or stale owners from claiming the same continuation.
-A failed or ambiguous run remains an explicit blocker, never a silent success.
+A failed or ambiguous run remains an explicit blocker, never a silent success. A run that
+ends without registering a session releases its reservation (so the fallback's own session is
+no longer locked out), and the human can retry one more delivery with
+`POST /api/posts/{id}/continuation/reset-delivery` (`{"expected_version": n}`; refused while
+the run is still active).
 
 Completion requires every declared descendant at its exact local head to contain the
 fix, plus passing check receipts at those heads and same-thread evidence. The server
