@@ -529,7 +529,7 @@ function renderPost(p, human) {
     p.task_id ? chip("task " + p.task_id) : null,
     p.sealed ? chip("🔒 sealed", "seal") : null,
     p.was_sealed && !p.sealed ? chip("unsealed by " + p.unsealed_by, "seal") : null,
-    p.attention_resolution ? chip("attention resolved") : p.needs_response ? chip("needs response", "warn") : null,
+    p.attention_resolution ? chip("attention resolved") : p.needs_response && !(p.requests?.length && p.requests.every(r => r.state === "finished")) ? chip("needs response", "warn") : null,
     p.type === "decision" ? (p.decision_status === "final" ? chip("FINAL", "ok") : chip("proposal - not binding", "warn")) : null,
     el("span", { class: "muted", title: p.created_at }, ago(p.created_at)),
     ...allIssues().filter(i => i.links.some(l => l.post_id === p.id)).map(i =>
@@ -544,6 +544,11 @@ function renderPost(p, human) {
   const lit = highlight && highlight.kind === "post" && highlight.id === p.id;
   return el("div", { class: "post" + (p.sealed ? " sealed" : "") + (lit ? " highlight" : ""), id: "post-" + p.id },
     meta, el("div", { class: "body" }, p.body), refs,
+    (p.requests || []).map(r => el("div", { class: "small request-progress", "data-request-recipient": r.recipient },
+      chip(`${r.assigned_agent || r.recipient}: ${r.state}`, r.state === "blocked" ? "warn" : r.state === "finished" ? "ok" : ""),
+      r.assigned_session ? el("span", { class: "muted" }, ` session ${r.assigned_session}`) : null,
+      r.reason ? el("div", {}, r.reason) : null,
+      (r.evidence_post_ids || []).map(id => el("a", { href: `#post-${id}` }, ` Evidence #${id}`)))),
     p.attention_resolution ? el("div", { class: "attention-resolution" },
       el("p", { class: "small muted" }, `Attention resolved by ${p.attention_resolution.resolved_by} · ${ago(p.attention_resolution.resolved_at)}`),
       el("div", { class: "body" }, p.attention_resolution.reason),
@@ -969,27 +974,23 @@ function threadStatus(t, human) {
   for (const k of [...blocked, ...expired]) involve(k.owner_agent);
   if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
-  // Work handed to agents that nobody has picked up: an ask with no later post from its recipient (and no run
-  // in progress for it), or a proposed/accepted task nobody holds. Pending while fresh, stalled after STALL_MINUTES.
+  // Request completion is explicit; reading or unrelated replies never close it.
   const pending = [];
   const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
   for (const p of posts) {
-    if (!p.needs_response || !p.to.length || p.sealed || p.attention_resolution) continue;
-    for (const agent of p.to) {
-      if (agent === "human" || runs.some(r => r.agent === agent)) continue;
-      if (posts.some(q => q.id > p.id && q.agent === agent)) continue;
-      if (stale(p.created_at)) { stalled.push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`); involve(agent); }
-      else pending.push(`#${p.id} waiting on ${agent} for ${since(p.created_at)}`);
-    }
-  }
-  // Preserve implicit asks, but agent status/finding posts require needs_response.
-  // Addressing a completion update alone does not create a reply obligation.
-  const last = posts[posts.length - 1];
-  if (last && !last.sealed && !last.needs_response && (!["status", "finding"].includes(last.type) || isHumanName(last.agent))) {
-    for (const agent of last.to) {
-      if (agent === "human" || agent === last.agent || runs.some(r => r.agent === agent)) continue;
-      if (stale(last.created_at)) { stalled.push(`#${last.id} to ${agent}, no reply for ${since(last.created_at)}`); involve(agent); }
-      else pending.push(`#${last.id} to ${agent}, no reply for ${since(last.created_at)}`);
+    if (p.sealed) continue;
+    const actionable = p.needs_response || ["request", "handoff", "question"].includes(p.type) || isHumanName(p.agent);
+    const requests = p.requests || (actionable ? (p.to || []).filter(a => a !== p.agent && !isHumanName(a))
+      .map(recipient => ({ recipient, assigned_agent: recipient, state: "queued" })) : []);
+    for (const r of requests) {
+      if (r.state === "finished") continue;
+      const agent = r.assigned_agent || r.recipient;
+      if (isHumanName(agent)) continue;
+      const at = r.updated_at || p.created_at;
+      const label = `#${p.id} ${r.state} · ${agent}${r.reason ? ": " + r.reason : ""}`;
+      if (r.state === "blocked" || (!runs.some(run => run.agent === agent) && stale(at))) {
+        stalled.push(label); involve(agent);
+      } else pending.push(label);
     }
   }
   for (const k of t.tasks) {

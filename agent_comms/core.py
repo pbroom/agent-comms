@@ -719,7 +719,8 @@ class Board:
     # ------------------------------------------------------------ sessions
 
     def register_session(self, p: Principal, project: str, worktree: str | None = None,
-                         resume_session_id: int | None = None, client: tuple[str, str] | None = None) -> dict:
+                         resume_session_id: int | None = None, client: tuple[str, str] | None = None,
+                         dispatch_run_id: str | None = None) -> dict:
         """`client` = (kind, conversation uuid) of the client conversation this session runs in. Only server-side
         capture passes it (the stdio MCP server, from its inherited environment); no tool or HTTP parameter maps
         to it. An invalid value is dropped. Resuming with a client moves the session to that conversation."""
@@ -730,12 +731,29 @@ class Board:
         client = conversations.normalize_client(client)
         now = self.now()
         with db.write_tx(self.conn) as c:
+            if dispatch_run_id is not None:
+                if not isinstance(dispatch_run_id, str) or not dispatch_run_id or len(dispatch_run_id) > 200:
+                    raise Invalid("invalid dispatch_run_id")
+                record = c.execute("SELECT value FROM board_state WHERE key=?", ("dispatch.run." + dispatch_run_id,)).fetchone()
+                try:
+                    run = json.loads(record[0]) if record else {}
+                except (ValueError, TypeError):
+                    run = {}
+                thread = c.execute("SELECT project FROM threads WHERE id=?", (run.get("thread_id"),)).fetchone()
+                if run.get("agent") != p.name or run.get("status") not in ("starting", "running") or not thread or thread["project"] != project:
+                    raise Forbidden("dispatch run does not match this active agent and project")
+                existing = c.execute("SELECT id FROM sessions WHERE dispatch_run_id=?", (dispatch_run_id,)).fetchone()
+                if existing and existing["id"] != resume_session_id:
+                    raise Conflict("dispatch run already has a registered session")
             if resume_session_id is not None:
                 row = c.execute("SELECT * FROM sessions WHERE id = ?", (resume_session_id,)).fetchone()
                 if row is None or row["agent"] != p.name:
                     raise Forbidden("that session does not belong to you")
-                c.execute("UPDATE sessions SET project=?, worktree=?, last_seen=? WHERE id=?",
-                          (project, worktree, now, resume_session_id))
+                if row["dispatch_run_id"] and (row["project"] != project or row["worktree"] != worktree
+                                                or dispatch_run_id not in (None, row["dispatch_run_id"])):
+                    raise Conflict("a dispatch-bound session cannot change environment or run")
+                c.execute("UPDATE sessions SET project=?, worktree=?, last_seen=?, dispatch_run_id=COALESCE(?,dispatch_run_id) WHERE id=?",
+                          (project, worktree, now, dispatch_run_id, resume_session_id))
                 if client:
                     c.execute("UPDATE sessions SET client_kind=?, client_session_id=? WHERE id=?",
                               (*client, resume_session_id))
@@ -743,8 +761,8 @@ class Board:
             else:
                 sid = c.execute(
                     """INSERT INTO sessions(agent, runtime, project, worktree, started_at, last_seen, client_kind,
-                       client_session_id) VALUES (?,?,?,?,?,?,?,?)""",
-                    (p.name, p.runtime, project, worktree, now, now, *(client or (None, None))),
+                       client_session_id, dispatch_run_id) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (p.name, p.runtime, project, worktree, now, now, *(client or (None, None)), dispatch_run_id),
                 ).lastrowid
                 # A new session starts where the agent as a whole has read up to, instead of replaying history.
                 c.execute(
@@ -1077,6 +1095,8 @@ class Board:
         resolution = resolution_out(self, r["id"])
         if resolution is not None:
             d["attention_resolution"] = resolution
+        from .requests import for_post
+        d["requests"] = for_post(self, r)
         d["addressed_to_me"] = p.name in to
         return d
 

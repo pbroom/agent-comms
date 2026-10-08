@@ -278,7 +278,8 @@ def test_state_lists_launchable_agents(renv):
     assert "launchable_agents" not in renv.client.get("/api/state", headers=renv.h("codex")).json()
 
 
-def test_a_dispatcher_tick_after_approve_launch_launches_the_author(tmp_path):
+def test_a_dispatcher_tick_after_approve_launch_launches_the_author(tmp_path, monkeypatch):
+    monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
     env = make_env(tmp_path)
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -306,8 +307,9 @@ def test_a_dispatcher_tick_after_approve_launch_launches_the_author(tmp_path):
     assert out["dispatcher_running"] is True and out["live"] is False and out["no_runner"] is False
     d.tick()
     [launch] = env.spawner.calls
-    assert launch["argv"] == ["codex-cli-fake", "exec",
-                              build_prompt(tid, out["rule_id"], resolve.PURPOSE.format(post=a["id"], thread=tid))]
+    assert launch["argv"][:2] == ["codex-cli-fake", "exec"]
+    assert launch["argv"][-1].startswith(
+                              build_prompt(tid, out["rule_id"], resolve.PURPOSE.format(post=a["id"], thread=tid), [out["post_id"]]))
     assert not any(m in " ".join(launch["argv"]) for m in MARKERS)
     [run] = dispatch.list_runs(env.board, env.p["human"])
     assert (run["agent"], run["thread_id"], run["rule_id"]) == ("codex", tid, out["rule_id"])

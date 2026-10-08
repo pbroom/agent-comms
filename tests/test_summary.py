@@ -37,7 +37,8 @@ class FakeChild:
 
 
 @pytest.fixture
-def senv(tmp_path):
+def senv(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_comms.dispatch.shutil.which", lambda executable, **kw: "/fake/" + executable)
     env = make_env(tmp_path)
     env.client = TestClient(create_app(env.board))
     env.h = lambda who="human": {"Authorization": f"Bearer {env.tokens[who]}"}

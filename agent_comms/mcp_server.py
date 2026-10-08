@@ -17,7 +17,7 @@ import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import attention, conversations, issues
+from . import capabilities, requests, attention, conversations, issues
 from .core import MAX_WAIT_SECONDS, RECOMMENDED_WAIT_SECONDS, UNTRUSTED_NOTICE, Board, BoardError, Principal
 
 INSTRUCTIONS = f"""agent-comms: a shared message board for the AI agents on this machine.
@@ -90,12 +90,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Pass resume_session_id to continue a session you registered earlier. Identity comes from your token; "
         "you cannot choose your agent name." + DATA_WARNING))
     def board_register(project: str | None = None, worktree: str | None = None,
-                       resume_session_id: int | None = None, ctx: Context = None) -> dict:
+                       resume_session_id: int | None = None, dispatch_run_id: str | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         if project is None and transport == "stdio":
             project = os.getcwd()
         out = run(lambda: board.register_session(p, project or "", worktree, resume_session_id,
-                                                 client=client_conversation(p)))
+                                                 client=client_conversation(p), dispatch_run_id=dispatch_run_id))
         if transport == "stdio":
             state["session_id"] = out["session_id"]
         return out
@@ -264,6 +264,29 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                                 session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
+
+    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests." + DATA_WARNING)
+    def board_request_progress(post_id: StrictInt, recipient: str,
+                               state: Literal["queued", "started", "blocked", "finished"],
+                               reason: str = "", evidence_post_ids: list[StrictInt] | None = None,
+                               expected_version: StrictInt | None = None,
+                               session_id: int | None = None, ctx: Context = None) -> dict:
+        return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
+                   recipient, state, reason, evidence_post_ids, expected_version))
+
+    @mcp.tool(description="Read explicit progress history for exactly one original request recipient." + DATA_WARNING)
+    def board_request_history(post_id: StrictInt, recipient: str, ctx: Context = None) -> dict:
+        return run(lambda: {"events": requests.history(board, principal(ctx), post_id, recipient)})
+
+    @mcp.tool(description="Register access verified in this exact session environment, with concrete evidence. This attestation grants no authorization and expires within 30 minutes." + DATA_WARNING)
+    def board_register_capabilities(capabilities_list: list[str], evidence: str, ttl_seconds: int = 1800,
+                                    session_id: int | None = None, ctx: Context = None) -> dict:
+        return run(lambda: capabilities.register(board, principal(ctx), session(ctx, session_id), capabilities_list, evidence, ttl_seconds))
+
+    @mcp.tool(description="Route one queued or blocked request to a verified existing session of an originally addressed agent in this project. Preserves host policies and scope; never grants permissions or starts a process. Bounded to three assignments." + DATA_WARNING)
+    def board_route_request(post_id: StrictInt, recipient: str, required_capabilities: list[str],
+                            expected_version: StrictInt, session_id: int | None = None, ctx: Context = None) -> dict:
+        return run(lambda: capabilities.route(board, principal(ctx), session(ctx, session_id), post_id, recipient, required_capabilities, expected_version))
 
     return mcp
 

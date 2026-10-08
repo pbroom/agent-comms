@@ -41,28 +41,15 @@ def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
     statuses, times), never bodies, titles or summaries. No age threshold: the human chose to ask."""
     c, now = board.conn, board.now()
     reasons: list[dict] = []
-    # (a) Unsealed needs-response posts addressed to an agent that has not posted in the thread since.
+    # Completion belongs to each original request/recipient, never a later arbitrary reply.
+    from . import requests
     asks: dict[str, list[int]] = {}
-    for r in c.execute(
-            """SELECT p.id, j.value AS agent FROM posts p, json_each(p.to_agents) j
-               JOIN agents a ON a.name = j.value AND a.active = 1 AND a.is_human = 0
-               WHERE p.thread_id = :t AND p.needs_response = 1 AND p.sealed = 0 AND j.value != p.agent
-                 AND NOT EXISTS (SELECT 1 FROM posts q WHERE q.thread_id = p.thread_id AND q.agent = j.value
-                                 AND q.id > p.id)
-               ORDER BY p.id""", {"t": thread_id}):
-        asks.setdefault(r["agent"], []).append(r["id"])
-    # (a') Preserve implicit asks, but agent status/finding posts require needs_response.
-    last = c.execute("SELECT id FROM posts WHERE thread_id = ? AND sealed = 0 ORDER BY id DESC LIMIT 1",
-                     (thread_id,)).fetchone()
-    if last is not None:
-        for r in c.execute(
-                """SELECT p.id, j.value AS agent FROM posts p, json_each(p.to_agents) j
-                   JOIN agents a ON a.name = j.value AND a.active = 1 AND a.is_human = 0
-                   WHERE p.id = ? AND j.value != p.agent
-                     AND (p.needs_response = 1 OR p.type NOT IN ('status', 'finding')
-                          OR EXISTS (SELECT 1 FROM agents author WHERE author.name = p.agent AND author.is_human = 1))""", (last["id"],)):
-            if r["id"] not in asks.get(r["agent"], []):
-                asks.setdefault(r["agent"], []).append(r["id"])
+    active = {r["name"] for r in c.execute("SELECT name FROM agents WHERE active=1 AND is_human=0")}
+    for post in c.execute("SELECT * FROM posts WHERE thread_id=? AND sealed=0 ORDER BY id", (thread_id,)):
+        for request in requests.for_post(board, post):
+            agent = request["assigned_agent"] or request["recipient"]
+            if request["state"] != "finished" and agent in active:
+                asks.setdefault(agent, []).append(post["id"])
     for agent, ids in asks.items():
         reasons.append({"kind": "unanswered", "agent": agent, "post_ids": ids})
     # (b) Tasks whose owner is blocked or let the lease expire.

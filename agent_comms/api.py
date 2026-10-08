@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import StrictInt, BaseModel, ConfigDict
 
-from . import attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
+from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
 from .mcp_server import INSTRUCTIONS, build_mcp
@@ -38,10 +38,34 @@ class Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CapabilitiesIn(Body):
+    session_id: int | None = None
+    capabilities: list[str]
+    evidence: str
+    ttl_seconds: int = 1800
+
+
+class RequestRouteIn(Body):
+    session_id: int | None = None
+    recipient: str
+    required_capabilities: list[str]
+    expected_version: StrictInt
+
+
+class RequestProgressIn(Body):
+    session_id: int | None = None
+    recipient: str
+    state: Literal["queued", "started", "blocked", "finished"]
+    reason: str = ""
+    evidence_post_ids: list[StrictInt] | None = None
+    expected_version: StrictInt | None = None
+
+
 class SessionIn(Body):
     project: str
     worktree: str | None = None
     resume_session_id: int | None = None
+    dispatch_run_id: str | None = None
 
 
 class ThreadIn(Body):
@@ -360,7 +384,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     # ---------------------------------------------------------------- sessions
     @app.post("/api/sessions")
     def register(body: SessionIn, p: Principal = P):
-        return board.register_session(p, body.project, body.worktree, body.resume_session_id)
+        return board.register_session(p, body.project, body.worktree, body.resume_session_id, dispatch_run_id=body.dispatch_run_id)
 
     @app.post("/api/sessions/{session_id}/heartbeat")
     def heartbeat(session_id: int, p: Principal = P):
@@ -622,6 +646,25 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/admin/unpause")
     def unpause(p: Principal = P):
         return board.set_paused(p, False)
+
+    @app.post("/api/sessions/capabilities")
+    def register_capabilities(body: CapabilitiesIn, request: Request, p: Principal = P):
+        return capabilities.register(board, p, sid(p, request, body.session_id),
+                                     body.capabilities, body.evidence, body.ttl_seconds)
+
+    @app.post("/api/posts/{post_id}/request-route")
+    def route_request(post_id: int, body: RequestRouteIn, request: Request, p: Principal = P):
+        return capabilities.route(board, p, sid(p, request, body.session_id), post_id,
+                                  body.recipient, body.required_capabilities, body.expected_version)
+
+    @app.post("/api/posts/{post_id}/request-progress")
+    def request_progress(post_id: int, body: RequestProgressIn, request: Request, p: Principal = P):
+        values = body.model_dump(exclude={"session_id"})
+        return requests.progress(board, p, sid(p, request, body.session_id), post_id, **values)
+
+    @app.get("/api/posts/{post_id}/requests/{recipient}/history")
+    def request_history(post_id: int, recipient: str, p: Principal = P):
+        return {"events": requests.history(board, p, post_id, recipient)}
 
     app.mount("/", mcp_app)  # serves /mcp; registered last so the routes above win
     return app

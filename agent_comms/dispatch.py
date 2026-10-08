@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import time
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db
+from . import db, requests
 from .config import NAME_RE, RUNTIME_RE, Settings, home
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -61,12 +62,26 @@ BASE_ENV = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "LC_AL
             "__CF_USER_TEXT_ENCODING")
 
 
-def build_prompt(thread_id: int, rule_id: int, purpose: str) -> str:
+def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[int] | None = None, run_id: str | None = None) -> str:
     """The fixed launch prompt. Deliberately takes no post: post text can never reach an agent this way."""
     for v in (thread_id, rule_id):
         if isinstance(v, bool) or not isinstance(v, int):
             raise TypeError("thread_id and rule_id must be integers")
-    return PROMPT_TEMPLATE.format(thread=thread_id, rule=rule_id, purpose=clean(purpose, PURPOSE_MAX))
+    prompt = PROMPT_TEMPLATE.format(thread=thread_id, rule=rule_id, purpose=clean(purpose, PURPOSE_MAX))
+    if request_ids:
+        if any(type(v) is not int or v <= 0 for v in request_ids):
+            raise TypeError("request IDs must be positive integers")
+        prompt += (" Original request post IDs: " + ", ".join(map(str, request_ids)) +
+                   ". Acknowledge and update each request explicitly with board_request_progress. "
+                   "If a lifecycle tool needs unavailable approval, post a blocker; never bypass the gate. "
+                   "Reading a post or exiting is not completion. Check required access before work; "
+                   "report capability failures separately from missing authorization. "
+                   "Existing authorization covers routine work within its scope; host approval gates still apply.")
+    if run_id is not None:
+        if not isinstance(run_id, str) or not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in run_id):
+            raise TypeError("invalid dispatcher run ID")
+        prompt += " Register your session with dispatch_run_id=" + run_id + "."
+    return prompt
 
 
 # Codex 0.157 run non-interactively (`codex exec`) refuses MCP tool calls that need approval ("approval policy is
@@ -76,6 +91,7 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str) -> str:
 BOARD_TOOLS = ("board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
                "board_release_task", "board_set_summary", "board_list_threads",
                "board_list_issues", "board_get_issue", "board_create_issue", "board_link_issue", "board_comment_issue")
+REQUEST_TOOLS = ("board_request_progress", "board_request_history", "board_register_capabilities", "board_route_request")
 CODEX_SERVER = "agent-comms"
 
 
@@ -108,7 +124,7 @@ def codex_unapproved_tools(template: list[str]) -> list[str]:
         prefix, suffix = f"mcp_servers.{CODEX_SERVER}.tools.", ".approval_mode"
         if key.startswith(prefix) and key.endswith(suffix):
             approved.add(key[len(prefix):-len(suffix)])
-    return [t for t in BOARD_TOOLS if t not in approved]
+    return [t for t in BOARD_TOOLS + REQUEST_TOOLS if t not in approved]
 
 
 def codex_approval_reminder(template: list[str] | None) -> str | None:
@@ -484,6 +500,7 @@ class Dispatcher:
             self.stopping = True
             return  # superseded: leave the mark, pending triggers and orphans to the owner
         foreign = self._reap_orphans(now)
+        self._reconcile_ended_requests()
         if self.board.is_paused():
             return  # no launches while paused; running children are left alone; triggers wait
         pending = self._scan()
@@ -501,7 +518,7 @@ class Dispatcher:
             # First run: start at the newest post instead of replaying history.
             mark = c.execute("SELECT COALESCE(MAX(seq), 0) FROM posts").fetchone()[0]
             self._save(**{self.MARK_KEY: mark})
-        rows = c.execute("""SELECT id, seq, thread_id, agent, to_agents, sealed, created_at FROM posts
+        rows = c.execute("""SELECT id, seq, thread_id, agent, to_agents, sealed, created_at, type, needs_response FROM posts
                             WHERE seq > ? ORDER BY seq LIMIT 1000""", (mark,)).fetchall()
         if not rows:
             return pending
@@ -510,18 +527,23 @@ class Dispatcher:
         for r in self.board.active_dispatch_rules(self.human):
             rules.setdefault(r["thread_id"], []).append(r)
         for r in rows:
+            actionable = {v["recipient"] for v in requests.for_post(self.board, r)}
+            if not actionable:
+                continue  # informational agent updates never launch an agent
             for rule in rules.get(r["thread_id"], []):
                 if r["created_at"] < rule["created_at_ts"]:
                     continue  # posts written before the human approved the workstream never trigger it
                 for agent in json.loads(r["to_agents"]):
-                    if agent not in rule["agents"] or agent == r["agent"]:
+                    if agent not in actionable or agent not in rule["agents"] or agent == r["agent"]:
                         continue
                     if r["sealed"]:
                         continue  # the recipient cannot read it (Board.VISIBLE); unsealing gives it a new seq
-                    key = f"{agent}:{r['thread_id']}"
+                    if self._attempted(r["id"], agent):
+                        continue
+                    key = f"{agent}:{r['thread_id']}:{r['id']}"
                     if key not in pending or pending[key]["seq"] < r["seq"]:
                         pending[key] = {"agent": agent, "thread_id": r["thread_id"], "seq": r["seq"],
-                                        "post_created_at": r["created_at"]}
+                                        "post_created_at": r["created_at"], "post_id": r["id"]}
         self._save(**{self.MARK_KEY: rows[-1]["seq"], self.PENDING_KEY: pending})
         return pending
 
@@ -562,11 +584,11 @@ class Dispatcher:
             drop = None
             if rule is None:
                 drop = "no active approval (revoked, expired or out of launches)"
-            elif self._runner(agent) is None:
-                drop = "no runner configured for this agent or its runtime in [dispatch.runners]"
             elif thread is None or thread["status"] != "open":
                 drop = "thread is closed"
-            elif self._handled(agent, thread_id, item["seq"]):
+            elif item.get("post_id") and not self._request_due(item["post_id"], agent):
+                drop = "request finished, blocked, started or assigned to an existing session"
+            elif not item.get("post_id") and self._handled(agent, thread_id, item["seq"]):
                 drop = "the agent already read past the post"
             if drop:
                 log.info("not launching %s for thread %s: %s", agent, thread_id, drop)
@@ -580,6 +602,17 @@ class Dispatcher:
             busy = set(self.running) | {r["agent"] for r in foreign}
             if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
                     or self._live(agent, now)):
+                continue
+            error = self._preflight(agent, rule)
+            if error:
+                self._record({"run_id": self._run_id(item["seq"], agent), "agent": agent,
+                              "thread_id": thread_id, "rule_id": rule["id"], "post_seq": item["seq"],
+                              "request_ids": [item["post_id"]] if item.get("post_id") else [],
+                              "status": "preflight_failed", "error": error, "started_at": now,
+                              "ended_at": now, "pid": None})
+                self._request_failure(item.get("post_id"), agent, "Preflight failed: " + error)
+                del pending[key]
+                changed = True
                 continue
             res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence())
             if not res["ok"]:
@@ -608,6 +641,62 @@ class Dispatcher:
         if changed:
             self._save(**{self.PENDING_KEY: pending})
 
+    def _attempted(self, post_id: int, agent: str) -> bool:
+        for (value,) in self.board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
+            record = json.loads(value)
+            if record.get("agent") == agent and post_id in record.get("request_ids", []):
+                return True
+        return False
+
+    def _request_due(self, post_id: int, agent: str) -> bool:
+        post = self.board.conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+        if post is None or post["sealed"]:
+            return False
+        row = next((r for r in requests.for_post(self.board, post) if r["recipient"] == agent), None)
+        return bool(row and row["state"] == "queued" and row["assigned_agent"] == agent
+                    and row["assigned_session"] is None)
+
+    def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None) -> None:
+        if post_id is None:
+            return
+        with db.write_tx(self.board.conn) as c:
+            post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+            if post is None:
+                return
+            row = next((r for r in requests.for_post(self.board, post) if r["recipient"] == agent), None)
+            if not row or row["state"] in ("finished", "blocked") or row["assigned_agent"] != agent:
+                return
+            # Never overwrite work explicitly routed to another existing environment.
+            if row["assigned_session"] is not None:
+                session = c.execute("SELECT dispatch_run_id FROM sessions WHERE id=?", (row["assigned_session"],)).fetchone()
+                if run_id is None or session is None or session["dispatch_run_id"] != run_id:
+                    return
+            now, version = self.board.now(), row["version"] + 1
+            c.execute("""INSERT INTO request_progress
+                (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
+                VALUES (?,?,'blocked',?,NULL,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
+                state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
+                (post_id,agent,agent,reason,version,now))
+            c.execute("""INSERT INTO request_events
+                (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
+                VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
+                (post_id,agent,agent,row["assigned_session"],reason,version,now))
+            seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
+            c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
+
+    def _preflight(self, agent: str, rule: dict) -> str | None:
+        project = rule["project"]
+        cwd = self.config.worktrees.get(project, project)
+        if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+            return "required run directory does not exist"
+        template = self._runner(agent)
+        if template is None:
+            return "no runner configured"
+        if shutil.which(template[0], path=child_env(agent, self.config,
+                                                  runtime=self._runtime(agent)).get("PATH")) is None:
+            return "required runner executable is unavailable"
+        return codex_approval_reminder(template)
+
     def _own_ids(self) -> set[str]:
         return {r.run_id for r in self.running.values()}
 
@@ -627,14 +716,15 @@ class Dispatcher:
         cwd = self.config.worktrees.get(project, project)
         log_path = self.log_dir / f"{run_id}.log"
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
-                  "post_seq": item["seq"], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
+                  "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
+        self._record(record)  # registration may happen immediately after the child is spawned
         try:
             if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
                 raise FileNotFoundError(f"run directory {cwd!r} does not exist")
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.log_dir, 0o700)
-            prompt = build_prompt(thread_id, rule["id"], rule["purpose"])
+            prompt = build_prompt(thread_id, rule["id"], rule["purpose"], record["request_ids"], run_id)
             template = self._runner(agent)
             if template is None:
                 raise LookupError(f"no runner configured for {agent}")
@@ -645,6 +735,7 @@ class Dispatcher:
             self.board.refund_dispatch_launch(self.human, rule["id"])
             record |= {"status": "spawn_failed", "ended_at": now, "error": f"{type(e).__name__}: {e}"[:300]}
             self._record(record)
+            self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"])
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
         self.running[agent] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path))
@@ -665,6 +756,9 @@ class Dispatcher:
         rec = self._get(self.RUN_PREFIX + run.run_id) or {}
         rec |= {"status": status, "exit_code": code, "ended_at": self.board.now()}
         self._record(rec)
+        for post_id in rec.get("request_ids", []):
+            self._request_failure(post_id, run.agent, "Runner ended without explicit request completion: "
+                                  + status + " (exit " + str(code) + ")", run.run_id)
         log.info("%s run %s ended: %s (exit %s)", run.agent, run.run_id, status, code)
 
     def _reap(self, now: float) -> None:
@@ -685,6 +779,17 @@ class Dispatcher:
                     run.child.kill()
             except Exception:
                 log.exception("could not check %s run %s", run.agent, run.run_id)
+
+    def _reconcile_ended_requests(self) -> None:
+        # A prior loop may have died between recording a process exit and updating its request.
+        for (value,) in self.board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+            record = json.loads(value)
+            if record.get("status") in ACTIVE:
+                continue
+            for post_id in record.get("request_ids", []):
+                self._request_failure(post_id, record["agent"],
+                    "Runner ended without explicit request completion: " + record.get("status", "unknown"),
+                    record["run_id"])
 
     def _reap_orphans(self, now: float) -> list[dict]:
         """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when

@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 6   # v6: auditable per-source attention closeout
+SCHEMA_VERSION = 7   # v7: explicit request lifecycle and dispatch session binding
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -170,6 +170,27 @@ CREATE TABLE IF NOT EXISTS issue_comments (
 CREATE INDEX IF NOT EXISTS issue_comments_issue ON issue_comments(issue_id,id);
 CREATE INDEX IF NOT EXISTS issue_comments_agent ON issue_comments(agent,created_at);
 
+CREATE TABLE IF NOT EXISTS session_capabilities (
+ session_id INTEGER PRIMARY KEY REFERENCES sessions(id), capabilities TEXT NOT NULL,
+ evidence TEXT NOT NULL, verified_at REAL NOT NULL, expires_at REAL NOT NULL,
+ attested_agent TEXT NOT NULL, project TEXT NOT NULL, worktree TEXT
+);
+CREATE TABLE IF NOT EXISTS request_progress (
+ post_id INTEGER NOT NULL REFERENCES posts(id), recipient TEXT NOT NULL REFERENCES agents(name),
+ state TEXT NOT NULL CHECK(state IN ('queued','started','blocked','finished')),
+ assigned_agent TEXT NOT NULL REFERENCES agents(name), assigned_session INTEGER REFERENCES sessions(id),
+ reason TEXT NOT NULL DEFAULT '', evidence_post_ids TEXT NOT NULL DEFAULT '[]',
+ version INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL, PRIMARY KEY(post_id,recipient)
+);
+CREATE TABLE IF NOT EXISTS request_events (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL REFERENCES posts(id),
+ recipient TEXT NOT NULL, actor TEXT REFERENCES agents(name), session_id INTEGER REFERENCES sessions(id),
+ event_source TEXT NOT NULL DEFAULT 'agent',
+ state TEXT NOT NULL, assigned_agent TEXT NOT NULL, assigned_session INTEGER REFERENCES sessions(id),
+ reason TEXT NOT NULL, evidence_post_ids TEXT NOT NULL, version INTEGER NOT NULL, created_at REAL NOT NULL,
+ UNIQUE(post_id,recipient,version)
+);
+
 CREATE TABLE IF NOT EXISTS board_state (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
@@ -223,7 +244,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN authorization_grant_id INTEGER REFERENCES authorization_grants(id)")
         # v3: additive; existing sessions simply have no conversation link.
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-        for column in ("client_kind", "client_session_id"):
+        for column in ("client_kind", "client_session_id", "dispatch_run_id"):
             if column not in session_columns:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")

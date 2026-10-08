@@ -111,9 +111,9 @@ const task = (id, status, lease_state = 'none', owner_agent = 'codex') => ({ id,
 test('status dots: stalled, being worked on or waiting to be picked up, completed (hidden)', async () => {
   const blocked = thread(1, [post(10, 1, 1)]); blocked.tasks = [task(1, 'blocked')];
   const working = thread(2, [post(20, 2, 2)]); working.tasks = [task(2, 'working', 'active')];
-  const asked = thread(3, [post(30, 3, 3, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
-  const fresh = thread(4, [post(40, 4, 4, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(5) })]);
-  const running = thread(5, [post(50, 5, 5, { to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
+  const asked = thread(3, [post(30, 3, 3, { agent: 'claude', to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
+  const fresh = thread(4, [post(40, 4, 4, { agent: 'claude', to: ['codex'], needs_response: true, created_at: MINUTES_AGO(5) })]);
+  const running = thread(5, [post(50, 5, 5, { agent: 'claude', to: ['codex'], needs_response: true, created_at: MINUTES_AGO(120) })]);
   const finished = thread(6, [post(60, 6, 6)]); finished.tasks = [task(3, 'done')];
   const closed = thread(7, [post(70, 7, 7)], 'closed');
   const all = [blocked, working, asked, fresh, running, finished, closed];
@@ -121,10 +121,10 @@ test('status dots: stalled, being worked on or waiting to be picked up, complete
     runs: [{ thread_id: 5, agent: 'codex', run_id: 's50-codex' }], storage: { 'agent-comms-thread': '4' } });
   assert.deepEqual(dot(1), ['stalled', '1 blocked task']);
   assert.deepEqual(dot(2), ['active', 'codex working on task 2']);
-  assert.match(dot(3)[1], /^#30 waiting on codex for 2h$/);
+  assert.match(dot(3)[1], /^#30 queued · codex$/);
   assert.equal(dot(3)[0], 'stalled');
-  assert.deepEqual(dot(4), ['active', '#40 waiting on codex for 5m'], 'a fresh ask is pending, not stalled yet');
-  assert.deepEqual(dot(5), ['active', 'codex running (dispatcher)']);
+  assert.deepEqual(dot(4), ['active', '#40 queued · codex'], 'a fresh ask is pending, not stalled yet');
+  assert.deepEqual(dot(5), ['active', 'codex running (dispatcher); #50 queued · codex']);
   assert.ok(!document.querySelector('tr[data-thread="6"]'), 'completed threads are hidden by default');
   assert.match(document.querySelector('.thread-list').textContent, /Show completed/);
   assert.ok(!document.querySelector('header input[type=checkbox]'), 'the toggle moved out of the header');
@@ -207,9 +207,9 @@ test('status dots: the last word went to an agent that never replied (request); 
   const seen = JSON.stringify({ 1: 11, 2: 21, 3: 31, 4: 41 });
   const { dom, dot } = await dots({ threads: () => [quietFor(1, 35), quietFor(2, 45), quietFor(3, 300), answered],
     storage: { 'agent-comms-seen': seen, 'agent-comms-thread': '4' } });
-  assert.deepEqual(dot(1), ['active', '#11 to claude-code, no reply for 35m'], 'inside the window plus grace');
-  assert.deepEqual(dot(2), ['stalled', '#21 to claude-code, no reply for 45m']);
-  assert.deepEqual(dot(3), ['stalled', '#31 to claude-code, no reply for 5h']);
-  assert.deepEqual(dot(4), ['done', 'Settled: nothing waiting on anyone'], 'a reply clears it');
+  assert.deepEqual(dot(1), ['active', '#11 queued · claude-code'], 'inside the window plus grace');
+  assert.deepEqual(dot(2), ['stalled', '#21 queued · claude-code']);
+  assert.deepEqual(dot(3), ['stalled', '#31 queued · claude-code']);
+  assert.deepEqual(dot(4), ['stalled', '#40 queued · claude-code'], 'an unrelated reply cannot complete the request');
   dom.window.close();
 });
