@@ -1011,7 +1011,8 @@ function settingRow(item) {
     el("td", {}, sourceChip(item.source)),
     el("td", {}, item.source === "board.local.toml"
       ? el("button", { disabled: cfgBusy, title: "Remove the board.local.toml override",
-          onclick: () => cfgAct("PUT", "/api/settings", { [item.key]: null }) }, "Reset")
+          // Drop the unsaved draft too, or the next Save would write the override straight back.
+          onclick: () => { delete cfgDraft[item.key]; cfgAct("PUT", "/api/settings", { [item.key]: null }); } }, "Reset")
       : null));
 }
 
