@@ -93,6 +93,17 @@ def _source_needs_human(board, post_id):
     )
 
 
+def _covers(board, issue_question, post_id):
+    """Whether an issue whose stored question is `issue_question` (JSON text or None) covers the linked post
+    (db.ISSUE_COVERS). Decided once, when the link is made: refining the issue's question later does not move a post
+    in or out of the issue. A thread link (no post) covers no post; it is stored as 1, which nothing reads."""
+    if post_id is None:
+        return True
+    return bool(board.conn.execute(
+        f"SELECT {db.ISSUE_COVERS} FROM posts p, (SELECT ? AS decision_question) i WHERE p.id=?",
+        (issue_question, post_id)).fetchone()[0])
+
+
 def _write(board, p, session_id, issue_id=None, thread_id=None):
     board._check_agent_write(p)
     board._session(p, session_id)
@@ -151,13 +162,15 @@ def get_issue(board, p, issue_id):
     out["links"] = [
         dict(r)
         for r in board.conn.execute(
-            """SELECT l.thread_id,l.post_id,l.needs_human,t.project,t.title
+            """SELECT l.thread_id,l.post_id,l.needs_human,l.covers_post,t.project,t.title
         FROM issue_links l JOIN threads t ON t.id=l.thread_id WHERE l.issue_id=? ORDER BY l.id""",
             (issue_id,),
         )
     ]
     for link in out["links"]:
         link["needs_human"] = bool(link["needs_human"])
+        # Whether this issue's answer answers the linked post (None for a thread link).
+        link["covers_post"] = bool(link["covers_post"]) if link["post_id"] is not None else None
     out["comments"], out["decisions"], out["resolutions"] = [], [], []
     out["resolution"] = None
     for r in board.conn.execute("SELECT * FROM issue_comments WHERE issue_id=? ORDER BY id", (issue_id,)):
@@ -225,14 +238,18 @@ def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, 
     with db.write_tx(board.conn) as c:
         _write(board, p, session_id, thread_id=thread_id)
         _link_target(board, p, thread_id, post_id)
-        pending = int(needs_human or _source_needs_human(board, post_id))
+        stored = json.dumps(question) if question else None
+        covers = _covers(board, stored, post_id)
+        # A source's own attention makes the link wait on the human only when this issue's question covers it; a
+        # post asking its own question is its own Needs you item, answered on its own.
+        pending = int(needs_human or (covers and _source_needs_human(board, post_id)))
         issue_id = c.execute(
             "INSERT INTO issues(title,body,needs_human,created_by,created_at,updated_at,decision_question,question_version) VALUES(?,?,?,?,?,?,?,1)",
-            (title, body, pending, p.name, board.now(), board.now(), json.dumps(question) if question else None),
+            (title, body, pending, p.name, board.now(), board.now(), stored),
         ).lastrowid
         c.execute(
-            "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at) VALUES(?,?,?,?,?,?)",
-            (issue_id, thread_id, post_id, pending, p.name, board.now()),
+            "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at,covers_post) VALUES(?,?,?,?,?,?,?)",
+            (issue_id, thread_id, post_id, pending, p.name, board.now(), int(covers)),
         )
         _event(board, p, session_id, issue_id, "created", body)
     board._notify("issue.created", {"issue_id": issue_id})
@@ -241,7 +258,7 @@ def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, 
 
 def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
     with db.write_tx(board.conn) as c:
-        _row(board, issue_id)
+        row = _row(board, issue_id)
         board._check_agent_write(p)
         board._session(p, session_id)
         _link_target(board, p, thread_id, post_id)
@@ -251,10 +268,11 @@ def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
         ).fetchone()
         if not exists:
             _write(board, p, session_id, issue_id, thread_id)
-            pending = int(post_id is None or _source_needs_human(board, post_id))
+            covers = _covers(board, row["decision_question"], post_id)
+            pending = int(post_id is None or (covers and _source_needs_human(board, post_id)))
             c.execute(
-                "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at) VALUES(?,?,?,?,?,?)",
-                (issue_id, thread_id, post_id, pending, p.name, board.now()),
+                "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at,covers_post) VALUES(?,?,?,?,?,?,?)",
+                (issue_id, thread_id, post_id, pending, p.name, board.now(), int(covers)),
             )
             if pending:
                 c.execute("UPDATE issues SET status='open',needs_human=1 WHERE id=?", (issue_id,))
@@ -342,8 +360,10 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         event_id = _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
         for tid in sorted(set(thread_ids)):
             selected = [link for link in frozen_links if link['thread_id']==tid]
+            # Answer only the source posts this issue's question covers (issue_links.covers_post). A linked post
+            # asking its own, different question keeps its own Needs you item; the issue's answer is not its answer.
             source_ids = sorted({link['post_id'] for link in selected
-                                 if link['post_id'] is not None and not link['source_is_human']})
+                                 if link['post_id'] is not None and not link['source_is_human'] and link['covers_post']})
             intended = {link['source_agent'] or link['agent'] for link in selected}
             recipients = [agent for agent in sorted(intended) if c.execute(
                 'SELECT 1 FROM agents WHERE name=? AND is_human=0',(agent,)).fetchone()]

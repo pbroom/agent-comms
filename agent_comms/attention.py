@@ -35,8 +35,8 @@ def close_attention(board: Board, p: Principal, session_id: int, post_id: int,
         if not c.execute(f"SELECT 1 FROM posts p WHERE p.id=? AND {board.NEEDS_YOU_SOURCE}",
                          (post_id,)).fetchone():
             raise Conflict("post has no outstanding source attention")
-        # Linked attention is governed by shared-issue decisions/resolution, not this endpoint.
-        if c.execute("SELECT 1 FROM issue_links WHERE post_id=?", (post_id,)).fetchone():
+        # Attention an open shared issue covers is governed by its decisions/resolution, not this endpoint.
+        if c.execute(f"SELECT 1 FROM posts p WHERE p.id=? AND {board.ISSUE_GOVERNS}", (post_id,)).fetchone():
             raise Conflict("source belongs to a shared issue; use its decision/resolution flow")
         for evidence_id in evidence_post_ids:
             evidence = board.get_post(p, evidence_id)
