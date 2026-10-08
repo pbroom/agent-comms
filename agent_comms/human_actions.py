@@ -46,21 +46,29 @@ def release_cooldown(board: Board, key: str) -> None:
         c.execute("DELETE FROM board_state WHERE key = ?", (key,))
 
 
-def uncovered_agents(board: Board, p: Principal, thread_id: int, agents: list[str], purpose: str) -> list[str]:
-    """The agents no active rule already covers for this launch. A rule covers an agent only when it is on this
-    thread, names that agent, has the same purpose (the dispatcher quotes it in the launch prompt, so another
-    rule's purpose would launch the agent for something else) and still has a launch left for it. A rule's budget
-    is shared by its agents, so each covered agent spends one of its launches here."""
-    purpose = " ".join(purpose.split())          # stored purposes are whitespace-normalized
-    rules = [r for r in board.active_dispatch_rules(p) if r["thread_id"] == thread_id and r["purpose"] == purpose]
-    left = {r["id"]: r["launches_left"] or 0 for r in rules}
-    out = []
-    for agent in agents:
-        rule = next((r for r in rules if agent in r["agents"] and left[r["id"]] > 0), None)
-        if rule is None:
-            out.append(agent)
-        else:
-            left[rule["id"]] -= 1
+POST_RULE_PREFIX = "launch.post_rule."   # board_state: the one-shot rule a one-click post approved, by post id
+
+
+def post_rule_id(board: Board, post_id: int) -> int | None:
+    """The one-shot rule approved together with this human post (post_as_human with launch), or None."""
+    row = board.conn.execute("SELECT value FROM board_state WHERE key = ?", (POST_RULE_PREFIX + str(post_id),)).fetchone()
+    try:
+        value = json.loads(row["value"]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def one_click_rule_ids(board: Board) -> set[int]:
+    """Rules approved by a one-click action for one post: no other post may launch under them."""
+    out = set()
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key LIKE ?", (POST_RULE_PREFIX + "%",)):
+        try:
+            v = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, int) and not isinstance(v, bool):
+            out.add(v)
     return out
 
 
@@ -69,19 +77,19 @@ def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type
                   purpose: str | None = None, answer_to: list[int] | None = None, answer_recipient: str | None = None,
                   post_check: Callable[[], None] | None = None,
                   post_hook: Callable[[dict], None] | None = None) -> tuple[dict, dict | None]:
-    """Post fixed text as the human, in the human's own board session. With `launch`, first approve a one-shot
-    dispatcher rule (one launch each, RULE_HOURS) for those agents that no active rule already covers
-    (`uncovered_agents`: same thread, agent, purpose, and a launch left for each). The rule comes first because the dispatcher only triggers on posts created at or after a rule; if the
-    post then fails, the rule is revoked. Returns (post, rule or None)."""
+    """Post fixed text as the human, in the human's own board session. With `launch`, first approve a fresh one-shot
+    dispatcher rule (one launch each, RULE_HOURS) for exactly those agents, and record it against the post
+    (POST_RULE_PREFIX): the dispatcher launches for this post only under this rule, so its purpose is the one quoted
+    in the launch prompt. An existing rule is never counted as covering the launch (it may carry another purpose,
+    or be picked for another post). The rule comes first because the dispatcher only triggers on posts created at or
+    after a rule; if the post then fails, the rule is revoked. Returns (post, rule or None)."""
     board._require_human(p, "post as the human")
     rule = None
     try:
         if launch:
-            uncovered = uncovered_agents(board, p, thread_id, launch, purpose or "")
-            if uncovered:
-                rule = board.create_dispatch_rule(p, thread_id=thread_id, agents=uncovered, purpose=purpose or "",
-                                                  max_launches=len(uncovered),
-                                                  expires_at=board.now() + RULE_HOURS * 3600)
+            agents = list(dict.fromkeys(launch))
+            rule = board.create_dispatch_rule(p, thread_id=thread_id, agents=agents, purpose=purpose or "",
+                                              max_launches=len(agents), expires_at=board.now() + RULE_HOURS * 3600)
         human_sid = board.human_session(p)
         with db.write_tx(board.conn):
             if post_check is not None:
@@ -89,6 +97,10 @@ def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type
             post = board.create_post(p, human_sid, body=body, type=type, thread_id=thread_id, to=to,
                                      needs_response=needs_response, answer_to=answer_to,
                                      _answer_recipient=answer_recipient, _in_transaction=True)
+            if rule is not None:
+                board.conn.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
+                                      ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                                   (POST_RULE_PREFIX + str(post["id"]), json.dumps(rule["id"]), p.name, board.now()))
             if post_hook is not None:
                 post_hook(post)
     except Exception:

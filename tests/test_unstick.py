@@ -1,5 +1,7 @@
 """POST /api/threads/{id}/unstick: the human asks the agents a stalled thread is waiting on to fix it."""
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -179,62 +181,84 @@ def test_body_for_one_agent_lists_ids(uenv):
                            f"#{ids[4]} and 2 more have had no reply from codex). Find the root cause")
 
 
-def test_no_duplicate_rule_when_an_active_rule_covers_the_agents(uenv):
+def test_every_unstick_approves_its_own_rule_recorded_against_its_post(uenv):
+    from agent_comms import human_actions
     e = uenv
-    existing = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"],
-                                            purpose=unstick.PURPOSE.format(thread=e.tid), max_launches=3)
-    ask(e, "claude", ["codex"])
-    out = call(e).json()
-    assert out["rule_id"] is None and out["agents"] == ["codex"]
-    assert [r["id"] for r in rules(e)] == [existing["id"]]
-    # Only the uncovered agent gets a new rule.
-    e.clock.advance(unstick.UNSTICK_COOLDOWN_SECONDS + 1)
-    ask(e, "claude", ["grok"])
-    out = call(e).json()
-    assert out["agents"] == ["codex", "grok"]
-    new = next(r for r in rules(e) if r["id"] == out["rule_id"])
-    assert new["agents"] == ["grok"] and new["max_launches"] == 1
-    # An exhausted rule no longer counts as covering.
-    e.board.revoke_dispatch_rule(e.p["human"], existing["id"])
-    e.clock.advance(unstick.UNSTICK_COOLDOWN_SECONDS + 1)
-    out = call(e).json()
-    assert next(r for r in rules(e) if r["id"] == out["rule_id"])["agents"] == ["codex"]
-
-
-def test_coverage_is_per_agent_purpose_and_launches_left(uenv):
-    e = uenv
-    # A rule with another purpose does not cover: the dispatcher would quote that purpose in the launch prompt.
-    other = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex", "grok"],
-                                         purpose="parser work", max_launches=5)
+    same = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex", "grok"],
+                                        purpose=unstick.PURPOSE.format(thread=e.tid), max_launches=5)
     ask(e, "claude", ["codex"])
     out = call(e).json()
     new = next(r for r in rules(e) if r["id"] == out["rule_id"])
-    assert new["agents"] == ["codex"] and new["purpose"] == unstick.PURPOSE.format(thread=e.tid)
-    e.board.revoke_dispatch_rule(e.p["human"], other["id"])
-    e.board.revoke_dispatch_rule(e.p["human"], new["id"])
-    # A same-purpose rule shared by two agents with one launch left covers only one of them.
-    shared = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex", "grok"],
-                                          purpose=unstick.PURPOSE.format(thread=e.tid), max_launches=1)
-    ask(e, "claude", ["grok"])
-    e.clock.advance(unstick.UNSTICK_COOLDOWN_SECONDS + 1)
-    out = call(e).json()
-    assert out["agents"] == ["codex", "grok"]
-    new = next(r for r in rules(e) if r["id"] == out["rule_id"])
-    assert new["agents"] == ["grok"] and new["max_launches"] == 1 and shared["id"] != new["id"]
+    assert new["id"] != same["id"] and new["agents"] == ["codex"] and new["max_launches"] == 1
+    assert human_actions.post_rule_id(e.board, out["post_id"]) == new["id"]
 
 
-def test_dispatcher_uses_the_newest_rule_so_the_one_click_purpose_is_quoted(uenv):
+def test_dispatcher_launches_a_one_click_post_only_under_its_own_rule(uenv):
     from agent_comms.dispatch import Dispatcher
     e = uenv
-    old = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="parser work",
-                                       max_launches=5)
+    ask(e, "claude", ["codex"])
+    out = call(e).json()
     e.clock.advance(1)
-    new = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="one click",
-                                       max_launches=1)
+    newer = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="other",
+                                         max_launches=1)
     rs = e.board.active_dispatch_rules(e.p["human"])
-    item = {"thread_id": e.tid, "agent": "codex", "post_created_at": e.board.now()}
-    assert Dispatcher._rule_for(None, rs, item)["id"] == new["id"]
-    assert Dispatcher._rule_for(None, rs, item | {"post_created_at": e.board.now() - 1})["id"] == old["id"]
+    item = {"thread_id": e.tid, "agent": "codex", "post_created_at": e.board.now(), "post_id": out["post_id"]}
+    assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, item)["id"] == out["rule_id"]
+    e.board.revoke_dispatch_rule(e.p["human"], out["rule_id"])
+    rs = e.board.active_dispatch_rules(e.p["human"])
+    assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, item) is None   # never borrows another rule
+    plain = {"thread_id": e.tid, "agent": "codex", "post_created_at": e.board.now()}
+    assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, plain)["id"] == newer["id"]
+
+
+def test_unstick_after_an_unspent_unstick_and_an_approve_launch_quotes_its_own_purpose(tmp_path, monkeypatch):
+    """Review repro: Unstick #1 approves U1 (unspent, the agent was live); Approve & launch for #5 approves A;
+    Unstick #2 must not count U1 as covering, and its post must launch with the Unstick purpose, not A's."""
+    from agent_comms import resolve
+    monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
+    env = make_env(tmp_path)
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    env.config = DispatchConfig.from_dict({"runners": {"claude": ["claude-fake", "-p", "{prompt}"]},
+                                           "worktrees": {PROJECT: str(workdir)}, "live_minutes": 2})
+    env.board.s.dispatch = {"runners": {"claude": ["claude-fake", "-p", "{prompt}"]}}
+    env.spawner, env.log_dir = FakeSpawner(), tmp_path / "logs"
+    env.procs = FakeProcs(env.spawner)
+    d = new_dispatcher(env)
+    d.tick()
+    client = TestClient(create_app(env.board))
+    h = {"Authorization": f"Bearer {env.tokens['human']}"}
+    tid = env.thread("t", as_="codex")
+    env.post("codex", tid, "please", "request", to=["claude"], needs_response=True)
+    env.clock.advance(1)
+    env.board.heartbeat(env.p["claude"], env.sid["claude"])          # claude is live: U1 stays unspent
+    u1 = client.post(f"/api/threads/{tid}/unstick", headers=h).json()
+    d.tick()
+    assert env.spawner.calls == []
+    env.clock.advance(1)
+    q = env.post("claude", tid, "may I?", "question", needs_response=True)
+    env.clock.advance(1)
+    a = resolve.resolve(env.board, env.p["human"], q["id"], "approve_launch", None, env.config)
+    env.clock.advance(unstick.UNSTICK_COOLDOWN_SECONDS + 1)          # claude is no longer live
+    later = env.post("codex", tid, "still waiting", "request", to=["claude"], needs_response=True)
+    env.clock.advance(1)
+    u2 = client.post(f"/api/threads/{tid}/unstick", headers=h).json()
+    assert u2["rule_id"] not in (None, u1["rule_id"], a["rule_id"])
+    for _ in range(8):                                               # one run per agent at a time: drain them
+        d.tick()
+        for child in env.spawner.children:
+            child.code = 0
+        env.clock.advance(3 * 60)
+    runs = {r["request_ids"][0]: r for r in dispatch.list_runs(env.board, env.p["human"], 20)}
+    expected = {a["post_id"]: (a["rule_id"], resolve.PURPOSE.format(post=q["id"], thread=tid)),
+                u1["post_id"]: (u1["rule_id"], unstick.PURPOSE.format(thread=tid)),
+                u2["post_id"]: (u2["rule_id"], unstick.PURPOSE.format(thread=tid))}
+    assert set(runs) == set(expected)        # no post launches under another post's one-click rule (e.g. #later)
+    assert later["id"] not in runs
+    prompts = {c["argv"][-1].rsplit("dispatch_run_id=", 1)[1].rstrip("."): c["argv"][-1] for c in env.spawner.calls}
+    for post_id, (rule_id, purpose) in expected.items():
+        assert runs[post_id]["rule_id"] == rule_id                   # each post launches under its own rule
+        assert f"dispatch rule {rule_id}) for: {purpose}" in prompts[runs[post_id]["run_id"]]
 
 
 def test_rate_limit_per_thread(uenv):

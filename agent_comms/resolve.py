@@ -17,8 +17,8 @@ Guardrails (DESIGN_NOTES "Needs you actions"):
   more of the human's post. Nothing else (question, context,
   descriptions, body) is copied.
 - Approve & launch approves a one-shot dispatcher rule (one launch, RULE_HOURS) for the author on this thread,
-  before posting, unless an active rule on this thread for that agent with this same purpose has a launch left. The dispatcher's
-  launch prompt stays its fixed template, with this fixed purpose.
+  before posting (always a fresh rule, recorded against the post, so the dispatcher launches for this post only under
+  it). The dispatcher's launch prompt stays its fixed template, with this fixed purpose.
 - Only an item still in Needs you can be resolved (409 otherwise), and one resolve per post per
   RESOLVE_COOLDOWN_SECONDS, checked together in one write transaction, so a double click cannot post twice.
 """

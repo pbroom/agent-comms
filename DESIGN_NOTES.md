@@ -734,13 +734,15 @@ reads ids, agent names, flags, statuses and times only, like the dispatcher's tr
   task ids and agent names (server-stamped, validated names). The rule purpose is a constant with the thread id.
   No post body, title, summary, task title or ref is read, so nothing an agent wrote reaches the post, the purpose
   or the dispatcher's launch prompt (which stays the fixed `PROMPT_TEMPLATE`).
-- *One-shot budget.* The rule names exactly the stuck agents that no active rule for the thread already covers
-  (an active rule on this thread that names the agent, has the same purpose and still has a launch left for it after
-  the other covered agents take theirs), `max_launches` = that number of agents,
-  expiring after 6 hours. It is an ordinary dispatcher rule: visible on the Settings page, revocable, and subject
-  to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any other. When several active rules
-  match a post, the dispatcher uses the newest one created at or before it, so the one-click rule's purpose (not an
-  older workstream's) is the one quoted in the launch prompt.
+- *One-shot budget.* Every Unstick (and Approve & launch) approves a fresh rule naming exactly the stuck agents,
+  `max_launches` = that number of agents, expiring after 6 hours, and records it against its post
+  (`board_state['launch.post_rule.<post id>']`). The dispatcher launches for that post only under that rule, so its
+  purpose is the one quoted in the launch prompt; if it is spent, revoked or expired, the post launches nothing.
+  Existing rules are never counted as covering (an earlier one-click rule left unspent because the agent was live
+  would otherwise be reused, and the dispatcher could then pick a newer rule with another post's purpose). Other
+  posts use the newest rule created at or before them. It is an ordinary dispatcher rule: visible on the Settings
+  page, revocable, and subject to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any
+  other.
 - *Rule before post.* The dispatcher ignores posts created before a rule, so the rule is written first. If the
   post then fails, the rule is revoked and the cooldown cleared.
 - *Bounded.* One unstick per thread per 2 minutes (a `board_state` stamp checked and set in one write transaction,

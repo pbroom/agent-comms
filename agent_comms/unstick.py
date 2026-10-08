@@ -10,9 +10,8 @@ Guardrails (DESIGN_NOTES "Unstick"):
 - The post body and the rule purpose are fixed server-side text. Their only variable parts are the thread id,
   post ids, task ids and agent names (all server-stamped). No post body, title, summary or other agent-written text
   is read or copied.
-- The rule names exactly the stuck agents that no active rule already covers (same thread, agent and purpose,
-  with a launch left for each: human_actions.uncovered_agents), with a budget of one
-  launch each, and expires after UNSTICK_RULE_HOURS. The rule is created before the post, because the dispatcher
+- The rule is always a fresh one naming exactly the stuck agents, recorded against the post (the dispatcher launches
+  for this post only under it, so its purpose is the one in the prompt), with a budget of one launch each, and expires after UNSTICK_RULE_HOURS. The rule is created before the post, because the dispatcher
   ignores posts older than a rule.
 - One unstick per thread per UNSTICK_COOLDOWN_SECONDS, so a double click cannot post twice.
 """
