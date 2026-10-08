@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     acceptance        TEXT NOT NULL DEFAULT '',
     category          TEXT,
     continuation_scope TEXT,
+    proposed_by_post  INTEGER,                   -- the proposal post that created this task (propose_task)
     authorization_source TEXT NOT NULL DEFAULT 'none',
     authorization_grant_id INTEGER REFERENCES authorization_grants(id),
     status            TEXT NOT NULL DEFAULT 'proposed'
@@ -287,6 +288,16 @@ def init_schema(conn: sqlite3.Connection) -> None:
             for name, definition in additions.items():
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        if "proposed_by_post" not in {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}:
+            # Which proposal created its task (propose_task), so Needs you leaves only those to the task flow. Older
+            # rows are matched to the earliest proposal by the task's creator, from the creating session, posted
+            # within seconds of the task (propose_task writes both in one transaction).
+            conn.execute("ALTER TABLE tasks ADD COLUMN proposed_by_post INTEGER")
+            conn.execute("""UPDATE tasks SET proposed_by_post = (
+                SELECT MIN(p.id) FROM posts p WHERE p.task_id = tasks.id AND p.type = 'proposal'
+                  AND p.agent = tasks.created_by AND ABS(p.created_at - tasks.created_at) < 5
+                  AND p.session_id IN (SELECT session_id FROM task_events e WHERE e.task_id = tasks.id
+                                       AND e.event = 'create'))""")
         link_columns = {row[1] for row in conn.execute("PRAGMA table_info(issue_links)")}
         if "needs_human" not in link_columns:
             conn.execute("ALTER TABLE issue_links ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0")

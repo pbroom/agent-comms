@@ -161,10 +161,14 @@ def test_source_attention_uses_exact_existing_rules(env):
     issue = create(env, thread_id=thread, post_id=post["id"], needs_human=False)
     assert not issue["needs_human"]
     thread = env.thread()
-    task = env.accepted_task(thread)
-    post = env.post("codex", thread, type="proposal", task_id=task)
+    post = env.post("codex", thread, type="proposal", propose_task={"title": "t"})   # left to the task flow
     issue = create(env, thread_id=thread, post_id=post["id"], needs_human=False)
     assert not issue["needs_human"]
+    thread = env.thread()
+    task = env.accepted_task(thread)
+    post = env.post("codex", thread, type="proposal", task_id=task)   # about an existing task: asks the human
+    issue = create(env, thread_id=thread, post_id=post["id"], needs_human=False)
+    assert issue["needs_human"]
 
 
 def test_resolution_history_survives_reopen_and_resolve(env):

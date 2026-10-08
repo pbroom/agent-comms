@@ -289,3 +289,27 @@ def test_only_latest_decision_can_match_a_retry(env):
     for body in ('First instruction','Second instruction','First instruction'):
         issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],body,[tid])
     assert env.board.conn.execute("SELECT COUNT(*) FROM issue_comments WHERE kind='decision'").fetchone()[0]==3
+
+
+def test_proposal_about_an_existing_task_needs_the_human_but_propose_task_does_not(env):
+    tid = env.thread()
+    created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
+    task_id = env.accepted_task(tid, title='Existing task')
+    about = env.post('codex', tid, 'Change the approach on the existing task?', 'proposal', task_id=task_id)
+    to_agents = env.post('codex', tid, 'Between us', 'proposal', task_id=task_id, to=['claude'])
+    # The second proposal on the propose_task task is not the one that created it.
+    again = env.post('codex', tid, 'And on the new one too?', 'proposal', task_id=created['task_id'])
+    assert pending(env) == {about['id'], again['id']}
+    assert created['id'] not in pending(env) and to_agents['id'] not in pending(env)
+
+
+def test_migration_records_which_proposal_created_its_task(env):
+    tid = env.thread()
+    created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
+    env.clock.advance(60)
+    about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'])
+    c = env.board.conn
+    c.execute('ALTER TABLE tasks DROP COLUMN proposed_by_post')
+    db.init_schema(c)
+    assert c.execute('SELECT proposed_by_post FROM tasks WHERE id=?', (created['task_id'],)).fetchone()[0] == created['id']
+    assert pending(env) == {about['id']}

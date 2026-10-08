@@ -1143,6 +1143,8 @@ class Board:
                  task_id, json.dumps(refs), int(bool(sealed)), int(bool(sealed)), int(bool(final)),
                  now if final else None, now, json.dumps(question) if question else None),
             ).lastrowid
+            if propose_task is not None:
+                c.execute("UPDATE tasks SET proposed_by_post = ? WHERE id = ?", (post_id, task_id))
             if continuation is not None:
                 workstreams.create(self, p, session_id, post_id, continuation)
             for source_id in answer_to or []:
@@ -1775,11 +1777,13 @@ class Board:
     # Human-only; the human sees every post, so no visibility predicate is needed.
     # Waiting on the human: needs-response posts addressed to nobody or to the human; open (unfinalized) decisions;
     # and agents' proposals addressed to nobody or to the human, which need the human's yes or no (a proposal
-    # that only proposes a task is left to the task flow, and one addressed to agents is between agents).
+    # that created its task via propose_task is left to the task flow, and one addressed to agents is between
+    # agents). A proposal that merely refers to an existing task (task_id) still needs the human's answer.
     NEEDS_YOU_SOURCE = """((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                         JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1)))
                      OR (p.type = 'decision' AND p.final = 0)
-                     OR (p.type = 'proposal' AND p.task_id IS NULL
+                     OR (p.type = 'proposal'
+                         AND NOT EXISTS (SELECT 1 FROM tasks pt WHERE pt.id = p.task_id AND pt.proposed_by_post = p.id)
                          AND EXISTS (SELECT 1 FROM agents pa WHERE pa.name = p.agent AND pa.is_human = 0)
                          AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                               JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))))
