@@ -70,6 +70,9 @@ def test_missing_env_and_codex_identities_store_nothing(env, monkeypatch):
     # A Codex CLI started from a Claude Code terminal inherits the variable; it is not Codex's conversation.
     reg = mcp_register(env, monkeypatch, agent="codex", env_value=CLAUDE_ID)
     assert client_row(env, reg["session_id"]) == (None, None)
+    # Nor is it the conversation of any other non-Claude Code runtime started from that terminal.
+    reg = mcp_register(env, monkeypatch, agent="grok", env_value=CLAUDE_ID)
+    assert client_row(env, reg["session_id"]) == (None, None)
 
 
 def test_resume_updates_the_conversation_and_keeps_it_without_one(env, monkeypatch):

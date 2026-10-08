@@ -16,6 +16,12 @@ Capture never trusts tool parameters or request bodies (DESIGN_NOTES "Conversati
   `<parent uuid>/subagents/*.jsonl`), so the transcript that recorded the board_register tool_result for a board
   session names the conversation by its file name (a subagent's: its parent's directory name). Only that UUID
   leaves this module.
+  An env-captured session is always stored as `claude-code`, never `claude-code-subagent`: Claude Code starts one
+  stdio MCP server per conversation and its subagents call tools through that same process, so the environment
+  (fixed when the process started) is identical for the parent and every subagent and offers no signal to tell
+  them apart. The stored UUID is still right for a subagent (its parent conversation, which is what a subagent
+  link opens); only the "subagent" label is missing. Telling them apart would need per-call metadata from Claude
+  Code, which it does not send, and is not inferred from tool arguments an agent controls.
 - Codex sets no such variable. Codex writes every MCP tool call and its result to its rollout file
   `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread uuid>.jsonl`, so `CodexResolver` finds the file that
   recorded the board_register result for a board session and takes the thread UUID from the file NAME. Rollout

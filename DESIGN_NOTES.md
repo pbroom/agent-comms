@@ -653,6 +653,12 @@ the new stdio code, so every Claude session from before it had no link. `ClaudeR
   Claude". Encoding the flag in `client_kind` keeps the schema at v3 and the allow-list a single check
   (`KINDS`); older code that does not know the kind shows no link rather than a wrong one. Several matches (a
   resumed or forked conversation): the most recently written file.
+- *Env-captured subagents are not labelled.* A subagent that registers through the env path is stored as
+  `claude-code`: Claude Code runs one stdio MCP server per conversation and its subagents call tools through that
+  same process, so CLAUDE_CODE_SESSION_ID (and every other inherited variable) is the same for parent and
+  subagent. The stored UUID is the parent's, which is the right link target; only the "subagent" label is missing.
+  Per-call metadata from Claude Code would be needed to tell them apart; tool arguments an agent controls are not
+  used for it. (Checked 2026-10-08.)
 - *Where and how much.* On human dashboard loads only, for sessions whose runtime starts with `claude-code`, that
   have no id and were seen in the last 7 days (a backfill, so longer than Codex's day). Directories: the slugs of
   the session's worktree, project, and the project's ancestors at least two levels deep (`/Users/me`, for a Claude
