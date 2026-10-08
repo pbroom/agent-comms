@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 7   # v7: explicit request lifecycle and dispatch session binding
+SCHEMA_VERSION = 8   # v8: optional structured decision_question on posts that need the human
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -221,6 +221,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         for table, additions in {
             "issues": {"decision_question": "TEXT", "question_version": "INTEGER NOT NULL DEFAULT 0"},
             "issue_comments": {"decision": "TEXT"},
+            # v8: a post that asks the human to choose carries the same structured question as an issue.
+            "posts": {"decision_question": "TEXT"},
         }.items():
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, definition in additions.items():

@@ -616,3 +616,68 @@ test('a decision from the thread card reports its result there', async () => {
     assert.match(d.getElementById('needs-you-result').textContent, /Issue #1: Approved for #10, #20/);
   } finally { dom.window.close(); }
 });
+
+// ------------------------------------------------------------------ answered vs waiting: the status banner
+test('an answered issue says so at the top, with the answer, and Change your answer reopens the decision', async () => {
+  const data = structured(); data.needs_human = false; data.links.forEach(l => { l.needs_human = false; });
+  data.decisions = [{ id: 7, outcome: 'approved', body: 'Approved\nonly for the detector ' + poison, agent: 'human', thread_ids: [10],
+    created_at: ago(37) }];
+  const { dom, d, win, calls } = await setup({ issues: [data], hash: '#issue-1' });
+  try {
+    noDialogs(win);
+    const banner = d.querySelector('#issue-1 [data-banner]');
+    assert.equal(d.querySelector('#issue-1').firstElementChild, banner, 'at the top');
+    assert.equal(banner.dataset.banner, 'answered');
+    assert.equal(banner.querySelector('.sb-title').textContent, 'You answered 37m ago — Approved · applies to #10');
+    assert.equal(banner.querySelector('.sb-first').textContent, 'Approved');
+    assert.match(banner.textContent, /Nothing is waiting on you here/);
+    assert.equal(d.querySelector('#issue-1 .decision-card'), null, 'no amber decision card when nothing is asked');
+    assert.equal(send(d), null, 'the decision panel stays folded');
+    assert.ok(![...d.querySelectorAll('#issue-1 summary')].some(s => /Answer again/.test(s.textContent)));
+    const toggle = banner.querySelector('[data-change-answer]');
+    assert.equal(toggle.textContent, 'Change your answer');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    toggle.click();
+    assert.ok(d.getElementById('issue-1-change'));
+    assert.ok(send(d), 'the decision panel opens');
+    assert.deepEqual([...d.querySelectorAll('#issue-1-change [name^="issue-answer-"]')].map(r => r.value), ['option:fix', 'option:wait', 'custom']);
+    assert.deepEqual([...d.querySelectorAll('#issue-1-change .radio-card .badge')].map(b => b.textContent), ['Recommended', 'Alternative']);
+    assert.equal(d.querySelector('#issue-1 [data-change-answer]').textContent, 'Keep my answer');
+    assert.equal(calls.length, 0);
+    assert.equal(d.querySelector('img'), null); assert.equal(win.pwned, undefined);
+  } finally { dom.window.close(); }
+});
+
+test('an issue awaiting the human says so at the top and names the threads it blocks', async () => {
+  const data = structured(); data.links[0].needs_human = true; data.links[1].needs_human = false;
+  const { dom, d } = await setup({ issues: [data], hash: '#issue-1' });
+  try {
+    const banner = d.querySelector('#issue-1 [data-banner]');
+    assert.equal(banner.dataset.banner, 'waiting');
+    assert.equal(banner.querySelector('.sb-title').textContent, 'Waiting on your decision');
+    assert.equal(banner.querySelector('.sb-sub').textContent, 'Issue #1 · blocks thread #10');
+    assert.equal(d.querySelector('#issue-1 .decision-card .card-description').textContent, 'Issue #1 · blocks thread #10');
+    assert.equal(d.querySelector('#issue-1 [data-change-answer]'), null);
+    // The thread card uses the same component, with the same context line.
+    d.getElementById('tab-threads').click(); await settle();
+    assert.equal(d.querySelector('#needs-you [data-issue="1"] .ask-context .where').textContent, 'Issue #1 · blocks thread #10');
+    assert.equal(d.querySelector('#needs-you [data-issue="1"] .ask-label').textContent, 'Question');
+  } finally { dom.window.close(); }
+});
+
+test('an open issue with no request does not look like it needs the human', async () => {
+  const data = issue(); data.needs_human = false; data.links.forEach(l => { l.needs_human = false; });
+  const { dom, d } = await setup({ issues: [data], hash: '#issue-1' });
+  try {
+    const banner = d.querySelector('#issue-1 [data-banner]');
+    assert.equal(banner.dataset.banner, 'idle');
+    assert.equal(banner.querySelector('.sb-title').textContent, 'Nothing is waiting on you');
+    assert.equal(banner.querySelector('[data-change-answer]').textContent, 'Answer anyway');
+    assert.equal(d.querySelector('#issue-1 .decision-card'), null);
+    assert.equal(d.querySelector('.issue-row[data-issue="1"] .dot').className, 'dot answered');
+    assert.doesNotMatch(d.getElementById('tab-issues').textContent, /awaiting/);
+    d.getElementById('tab-threads').click(); await settle();
+    assert.equal(d.querySelector('#needs-you'), null);
+    assert.match(d.querySelector('.pane-side').textContent, /Needs you \(0\)/);
+  } finally { dom.window.close(); }
+});

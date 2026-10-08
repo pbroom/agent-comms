@@ -937,7 +937,7 @@ class Board:
                     thread_id: int | None = None, new_thread_title: str | None = None,
                     to: list[str] | None = None, needs_response: bool = False, task_id: int | None = None,
                     refs: list[dict] | None = None, sealed: bool = False, final: bool = False,
-                    propose_task: dict | None = None) -> dict:
+                    propose_task: dict | None = None, decision_question: dict | None = None) -> dict:
         self._check_agent_write(p)
         s = self._session(p, session_id)
         if type not in POST_TYPES:
@@ -964,6 +964,7 @@ class Board:
             raise Invalid("use either task_id or propose_task, not both")
         if (thread_id is None) == (not new_thread_title):
             raise Invalid("give exactly one of thread_id or new_thread_title")
+        question = self._post_question(decision_question, type, to, needs_response)
 
         now = self.now()
         with db.write_tx(self.conn) as c:
@@ -1003,11 +1004,11 @@ class Board:
             seq = c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM posts").fetchone()[0]
             post_id = c.execute(
                 """INSERT INTO posts(seq, thread_id, session_id, agent, type, body, to_agents, needs_response,
-                     task_id, refs, sealed, was_sealed, final, finalized_at, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     task_id, refs, sealed, was_sealed, final, finalized_at, created_at, decision_question)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (seq, thread_id, session_id, p.name, type, body, json.dumps(to), int(bool(needs_response)),
                  task_id, json.dumps(refs), int(bool(sealed)), int(bool(sealed)), int(bool(final)),
-                 now if final else None, now),
+                 now if final else None, now, json.dumps(question) if question else None),
             ).lastrowid
             unsealed: list[int] = []
             if sealed and type == "finding" and task_id is not None:
@@ -1020,6 +1021,25 @@ class Board:
         out = self.get_post(p, post_id)
         out["auto_unsealed_post_ids"] = unsealed
         return out
+
+    QUESTION_POST_TYPES = ("question", "proposal", "decision", "request")
+
+    def _post_question(self, value: dict | None, type: str, to: list[str], needs_response: bool) -> dict | None:
+        """A structured question for the human on a post: the same schema and rules as a shared issue's
+        (issues._question: question, context, exactly two options, recommended_option_id). Only on a post that asks
+        the human: a question/proposal/decision/request that needs a response (a decision always waits on the
+        human), addressed to nobody or to the human. Its text is agent-written board data, like any body."""
+        if value is None:
+            return None
+        if type not in self.QUESTION_POST_TYPES:
+            raise Invalid(f"decision_question is only allowed on {' | '.join(self.QUESTION_POST_TYPES)} posts")
+        if type != "decision" and not needs_response:
+            raise Invalid("decision_question asks the human: set needs_response=true")
+        humans = {r[0] for r in self.conn.execute("SELECT name FROM agents WHERE is_human = 1")}
+        if any(name not in humans for name in to):
+            raise Invalid("decision_question asks the human: address the post to nobody (to=[]) or to the human")
+        from .issues import _question
+        return _question(self, value)
 
     def _auto_unseal(self, c: sqlite3.Connection, task_id: int) -> list[int]:
         """Unseal sealed posts on a task once every agent named in their `to` posted a sealed finding on it."""
@@ -1082,7 +1102,8 @@ class Board:
         d = {"id": r["id"], "seq": r["seq"], "thread_id": r["thread_id"], "agent": r["agent"],
              "session_id": r["session_id"], "type": r["type"], "body": r["body"], "to": to,
              "needs_response": bool(r["needs_response"]), "task_id": r["task_id"], "refs": json.loads(r["refs"]),
-             "sealed": bool(r["sealed"]), "created_at": iso(r["created_at"])}
+             "sealed": bool(r["sealed"]), "created_at": iso(r["created_at"]),
+             "decision_question": json.loads(r["decision_question"]) if r["decision_question"] else None}
         if r["was_sealed"]:
             d["was_sealed"] = True
             d["unsealed_by"] = r["unsealed_by"]

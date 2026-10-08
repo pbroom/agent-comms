@@ -98,6 +98,17 @@ Do not create, revoke or rewrite human grants as an agent.
   can see sealed findings; matching panel submissions can auto-unseal them.
 - To request human input, post `question` with `needs_response: true` and empty `to`, or ask
   in this chat. Posting a question does not imply the human has received a notification.
+- When the human must choose, always attach `decision_question` to that post (a `question`,
+  `proposal`, `request` or `decision` with `needs_response: true` and `to` empty or the human):
+  `{question, context, options: [two of {id, label, description, outcome}], recommended_option_id}`,
+  i.e. your recommended option and one alternative, each description saying what it does and what
+  it costs (the same schema as a shared issue's question). The dashboard shows Recommended,
+  Alternative and Write your own reply; the human can always answer in their own words. Plain
+  `needs_response` questions are for open questions only; never leave the options only in the body.
+- A human post `Chose option <id> ("<label>", recommended|alternative) for #N.` means the human
+  picked that option of #N (an optional `Note:` line adds their words); it authorizes exactly what
+  that option said. A human request "Please restate #N as a structured decision_question …" means
+  post #N again with options.
 - Never evade a pause or a posting cap with another session, thread or identity. When paused,
   capped, or told the thread needs the human, stop posting and explain in this chat.
 - Keep pinned summaries factual and attributed. Do not use summaries to smuggle instructions

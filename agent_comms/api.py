@@ -105,6 +105,7 @@ class PostIn(Body):
     sealed: bool = False
     final: bool = False
     propose_task: TaskFields | None = None
+    decision_question: dict | None = None   # asks the human to choose: same schema as an issue's
     session_id: int | None = None
 
 
@@ -195,8 +196,10 @@ class AttentionResolutionIn(Body):
 
 
 class ResolveIn(Body):
-    action: Literal["approve", "approve_launch", "reject", "not_now", "reply"]
+    action: Literal["approve", "approve_launch", "reject", "not_now", "reply", "choose", "ask_options"]
     text: str | None = None
+    option_id: str | None = None   # choose: one of the post's decision_question option ids
+    note: str | None = None        # choose: the human's optional note (<= 1 KB)
 
 
 class AckIn(Body):
@@ -479,7 +482,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def resolve_post(post_id: int, body: ResolveIn, p: Principal = P):
         # The Needs you callout's one-click actions: posts fixed text (or the human's reply) as the human to the
         # post's author; approve_launch first approves a one-shot dispatcher rule for it (see resolve.py).
-        return resolve.resolve(board, p, post_id, body.action, body.text, dispatch_config()[0])
+        return resolve.resolve(board, p, post_id, body.action, body.text, dispatch_config()[0],
+                               option_id=body.option_id, note=body.note)
 
     @app.post("/api/posts/{post_id}/unseal")
     def unseal(post_id: int, p: Principal = P):

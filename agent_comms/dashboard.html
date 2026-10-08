@@ -328,6 +328,48 @@ button.needs-chip { border: 0; padding: 1px 7px; font-size: 12px; box-shadow: no
 button.needs-chip:hover:not(:disabled) { background: var(--warning-bg); box-shadow: 0 0 0 1px var(--warning); }
 .ny-side { cursor: pointer; }
 .ny-side:hover { background: var(--background); }
+/* The one decision component (thread card, sidebar, Issues tab): what it blocks, the question, its context, then
+   option cards in a fixed order (Recommended, Alternative, ..., Write your own reply) and one primary button. */
+.ask-context { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted-foreground); }
+.ask-context .where { color: var(--foreground); font-weight: 600; }
+.ask-context .sp { flex: 1; }
+.ask-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted-foreground); margin-top: 8px; }
+.ask .ask-label + h3 { margin-top: 2px; }
+.ny-item > h3 { overflow-wrap: anywhere; }
+.ask-form { display: grid; gap: 10px; margin-top: 10px; }
+.ask-form fieldset { min-width: 0; border: 0; margin: 0; padding: 0; }
+.ask-form .field-label, .ask-form legend { font-size: 12px; font-weight: 600; color: var(--muted-foreground); padding: 0; margin: 0 0 6px; }
+.ask-form fieldset > legend { float: left; width: 100%; }
+.ask-form fieldset > legend + * { clear: both; }
+.ask-form .custom { display: grid; gap: 6px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: var(--radius); }
+.ask-form .custom[hidden] { display: none; }
+.ask-form .custom textarea { width: 100%; min-height: 72px; }
+.ask-form .custom .row { display: flex; gap: 8px; align-items: center; }
+.ask-form .footer, .decision .footer { display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.ask-form .footer .hint { margin-right: auto; font-size: 12px; color: var(--muted-foreground); }
+.ask-form .footer .hint.err { color: var(--destructive); }
+.ask-form .ny-ask { margin: 0; font-size: 12px; color: var(--muted-foreground); display: flex; gap: 4px; flex-wrap: wrap; align-items: baseline; }
+.radio-card .badge { font-size: 11px; }
+.radio-card:has(input:disabled) { cursor: not-allowed; opacity: .7; }
+.ny-explain { margin: 4px 0 6px; padding: 8px 10px; border-radius: var(--radius); background: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.ny-explain strong { font-weight: 600; }
+.ask-compact .ask-context { margin-bottom: 2px; }
+.ask-compact .q { display: block; font-weight: 600; overflow-wrap: anywhere; color: var(--foreground); text-decoration: none; }
+.ask-compact .q:hover { color: var(--primary); text-decoration: underline; }
+.ask-compact .ask-options { margin-top: 3px; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.ask-compact .ask-options b { color: var(--foreground); font-weight: 500; }
+/* Status banner at the top of an issue (and of anything answered): waiting on you, or answered, or resolved. */
+.status-banner { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; }
+.status-banner > .dot { grid-row: 1; }
+.status-banner .sb-title { font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+.status-banner .sb-sub { grid-column: 2 / -1; font-size: 13px; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.status-banner .sb-first { grid-column: 2 / -1; font-size: 13px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.status-banner.waiting { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); box-shadow: inset 3px 0 0 var(--warning), var(--shadow-xs); background: color-mix(in srgb, var(--warning-bg) 55%, var(--card)); }
+.status-banner.waiting .sb-title { color: var(--warning); }
+.status-banner.answered { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); box-shadow: inset 3px 0 0 var(--success), var(--shadow-xs); }
+.status-banner.answered .sb-title { color: var(--success); }
+.status-banner.answered > .dot { background: var(--success); }
+@media (max-width: 480px) { .status-banner { grid-template-columns: auto minmax(0, 1fr); } .status-banner > button { grid-column: 2; justify-self: start; } }
 
 /* ---- Shared issues ---- */
 .issue-head .overline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--muted-foreground); }
@@ -467,7 +509,8 @@ let lastUnstickReply = null;   // thread id -> { threadId, agents, sessionIds, p
 // Needs you callout (human only): the post being resolved (one at a time), the last result per page load, which
 // bodies are expanded, and Reply drafts (kept across the 3-second re-render). A click acts at once (no confirm).
 let resolveBusy = null, resolveNote = null;     // resolveNote: { threadId, text, failed }
-const nyExpanded = new Set(), nyReplying = new Set(), nyDrafts = {};
+const nyExpanded = new Set(), nyDrafts = {};
+const nyChoice = {}, nyNotes = {};   // post id -> the option card picked / the optional note with a chosen option
 let scrollToNeedsYou = null;   // after the chip or a sidebar item: the post id (or true) to bring into view
 
 setFocusFromHash();
@@ -1178,15 +1221,21 @@ function threadStatus(t, human) {
   const stalled = [], agents = [];
   const involve = a => { if (a && !isHumanName(a) && !agents.includes(a) && !runs.some(r => r.agent === a)) agents.push(a); };
   let needsMe = false;
+  const pending = [];
   const shared = allIssues().filter(i => i.status !== "resolved" && i.links.some(l => l.thread_id === t.id));
   if (shared.length) {
     const needsDecision = shared.some(i => i.needs_human && i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
-    stalled.push(needsDecision ? "Shared issue awaiting human decision" : "Shared issue unresolved");
+    // An issue that needs nothing from the human here (answered, or under discussion) is not shown as stalled.
+    if (needsDecision) stalled.push("Shared issue awaiting human decision");
+    else pending.push("Shared issue unresolved (nothing needed from you here)");
     if (human && needsDecision) needsMe = true;
   }
-  const waiting = (state.needs_you || []).filter(p => p.thread_id === t.id).length;
+  const waitingIds = (state.needs_you || []).filter(p => p.thread_id === t.id).map(p => p.id).sort((a, b) => a - b);
+  const waiting = waitingIds.length;
   if (human && waiting) needsMe = true;
-  if (human && waiting) stalled.push(waiting === 1 ? "Waiting on you" : `${waiting} posts waiting on you`);
+  // Name the items, so it is clear what blocks the thread (and not, say, an answered issue linked to it).
+  if (human && waiting) stalled.push(waiting === 1 ? `Waiting on you: post #${waitingIds[0]}`
+    : `${waiting} posts waiting on you: ${waitingIds.map(id => "#" + id).join(", ")}`);
   const blocked = t.tasks.filter(k => k.status === "blocked");
   if (blocked.length) stalled.push(plural(blocked.length, "blocked task"));
   const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status));
@@ -1195,7 +1244,6 @@ function threadStatus(t, human) {
   if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
   // Request completion is explicit; reading or unrelated replies never close it.
-  const pending = [];
   const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
   for (const p of posts) {
     if (p.sealed) continue;
@@ -1292,8 +1340,11 @@ function unstickSessionsLine(u) {
 }
 
 function renderThreadList(threads, current, human, statuses, hidden) {
-  const waiting = {};
-  for (const p of state.needs_you || []) waiting[p.thread_id] = (waiting[p.thread_id] || 0) + 1;
+  const waiting = {}, waitingPosts = {};
+  for (const p of state.needs_you || []) {
+    waiting[p.thread_id] = (waiting[p.thread_id] || 0) + 1;
+    (waitingPosts[p.thread_id] ||= []).push(p.id);
+  }
   const rows = threads.map(t => {
     const posts = postsOf(t), on = current && current.id === t.id;
     const base = (t.project || "").split("/").filter(Boolean).pop() || t.project;
@@ -1309,7 +1360,7 @@ function renderThreadList(threads, current, human, statuses, hidden) {
           el("span", {}, `· ${posts.length}${posts.length >= 60 ? "+" : ""} post${posts.length === 1 ? "" : "s"}`),
           open ? el("span", {}, `· ${open} task${open === 1 ? "" : "s"}`) : null,
           human && waiting[t.id] ? el("button", { class: "chip warn needs-chip", "data-needs": t.id,
-            title: "Open this thread at what needs you",
+            title: `Open this thread at what needs you: ${waitingPosts[t.id].map(id => "post #" + id).join(", ")}`,
             onclick: e => { e.stopPropagation(); openNeedsYou(t.id); } }, `${waiting[t.id]} need${waiting[t.id] === 1 ? "s" : ""} you`) : null,
           full ? chip("at cap", "bad") : null,
           t.status !== "open" ? chip(t.status) : null)),
@@ -1392,16 +1443,47 @@ function needsYouOf(threadId) {
   return (state.needs_you || []).filter(p => p.thread_id === threadId && !p.attention_resolution).sort((a, b) => b.id - a.id);
 }
 
-function callToAction(p) {
-  const who = isHumanName(p.agent) ? "You" : p.agent;
-  switch (p.type) {
-    case "decision": return `${who} ${who === "You" ? "propose" : "proposes"} a decision — finalize it or reply`;
-    case "question": return `${who} ${who === "You" ? "asked" : "asks you"} a question — reply`;
-    case "proposal": return `${who} ${who === "You" ? "made" : "makes"} a proposal — approve or reply`;
-    case "handoff": return `${who} ${who === "You" ? "handed" : "hands"} work to you — approve or reply`;
-    default: return `${who} ${who === "You" ? "are" : "is"} waiting on you (${p.type}) — approve or reply`;
-  }
+// ---- The one decision component. Every item waiting on the human (a post in state.needs_you, or a shared issue
+// awaiting a decision) is shown the same way in the thread's Needs you card, the sidebar (compact) and the Issues
+// tab: a context line saying exactly what it blocks, the question as the heading, its context, then option cards in
+// a fixed order (Recommended, Alternative, ..., Write your own reply) and one primary button naming the effect.
+// A structured question (`decision_question`) supplies the question and the two options; a plain post has none, so
+// its first line stands in as the question and the cards are the fixed one-click answers. Board text only ever
+// becomes text (el() / textContent).
+const Q_MAX = 140;
+function firstLine(text) {
+  const line = String(text || "").split("\n").map(s => s.trim()).find(Boolean) || "";
+  return line.length > Q_MAX ? line.slice(0, Q_MAX - 1).trimEnd() + "…" : line;
 }
+function postQuestion(p) { return (p.decision_question && p.decision_question.question) || firstLine(p.body) || `Post #${p.id}`; }
+// The context under the heading: the question's context, then the post itself.
+function postContext(p) {
+  const q = p.decision_question;
+  return q ? [q.context, p.body].map(s => (s || "").trim()).filter(Boolean).join("\n\n") : p.body || "";
+}
+function blockingLine(p) { return `Blocking thread #${p.thread_id} · post #${p.id} by ${isHumanName(p.agent) ? "you" : p.agent}`; }
+function threadList(ids) { return `${ids.length === 1 ? "thread" : "threads"} ${ids.map(id => "#" + id).join(", ")}`; }
+// The threads an issue blocks: those awaiting a decision (all linked threads when none is flagged).
+function issueBlocks(i) {
+  const threads = issueThreads(i), flagged = threads.filter(l => l.needs_human);
+  return (flagged.length ? flagged : threads).map(l => l.thread_id);
+}
+function issueLine(i) {
+  return `Issue #${i.id} · ${i.needs_human && i.status !== "resolved" ? "blocks" : "linked to"} ${threadList(issueBlocks(i))}`;
+}
+// Recommended first, then the alternative: the fixed order everywhere.
+function rankedOptions(q) {
+  if (!q || !Array.isArray(q.options)) return [];
+  return [...q.options].sort((a, b) => Number(b.id === q.recommended_option_id) - Number(a.id === q.recommended_option_id))
+    .map(o => ({ ...o, rank: o.id === q.recommended_option_id ? "Recommended" : "Alternative" }));
+}
+// One line for the sidebar: the options at a glance.
+function optionsSummary(q, plain) {
+  const ranked = rankedOptions(q);
+  if (!ranked.length) return el("div", { class: "small ask-options" }, plain);
+  return el("div", { class: "small ask-options" }, ranked.flatMap((o, n) => [n ? " · " : "", `${o.rank}: `, el("b", {}, o.label)]));
+}
+function isAgent(name) { return (state.agents || []).some(a => a.name === name && !a.is_human); }
 
 // A body is collapsed to about six lines; "Show more" opens it. Decided from the text (no layout needed).
 const NY_LINES = 6;
@@ -1436,6 +1518,11 @@ function resolveMessage(action, item, r) {
   if (action === "reject") return `Rejected decision ${n}${to ? "; told " + to : ""}${mine}.`;
   if (action === "not_now") return `Parked ${n}${to ? "; told " + to + " not now" : ""}${mine}.`;
   if (action === "reply") return `Replied to ${n}${to ? " (to " + to + ")" : ""}${mine}.`;
+  if (action === "choose") {
+    const o = rankedOptions(item.decision_question).find(x => x.id === r.option_id);
+    return `Chose ${o ? `the ${o.rank.toLowerCase()} option “${o.label}”` : "an option"} for ${n}${to ? "; told " + to : ""}${mine}.`;
+  }
+  if (action === "ask_options") return `Asked ${to || item.agent} to restate ${n} with a recommended option and an alternative${mine}.`;
   if (action === "approve") return `Approved ${n}${to ? "; told " + to + " to go ahead" : ""}${mine}.`;
   const a = typeof r.agent === "string" ? r.agent : item.agent;
   if (r.live) return `Approved ${n}${mine}. ${a} is active in a session and will see it there (no launch needed).`;
@@ -1446,15 +1533,15 @@ function resolveMessage(action, item, r) {
 }
 
 // One click, one request: no window.confirm (the human's embedded browser blocks it). The busy flag disables the
-// item's buttons while in flight; the server refuses an item that no longer needs you, and a second resolve within 10 s.
-async function resolveItem(item, action, text) {
+// item's controls while in flight; the server refuses an item that no longer needs you, and a second resolve within 10 s.
+async function resolveItem(item, action, text, extra = {}) {
   if (resolveBusy) return;
   resolveBusy = item.id; render();
   try {
     const r = action === "finalize" ? await api("POST", `/api/posts/${item.id}/finalize`)
-      : await api("POST", `/api/posts/${item.id}/resolve`, action === "reply" ? { action, text } : { action });
+      : await api("POST", `/api/posts/${item.id}/resolve`, action === "reply" ? { action, text } : { action, ...extra });
     resolveNote = { threadId: item.thread_id, text: resolveMessage(action, item, r || {}), failed: false };
-    if (action === "reply") { delete nyDrafts[item.id]; nyReplying.delete(item.id); }
+    delete nyDrafts[item.id]; delete nyChoice[item.id]; delete nyNotes[item.id];
     lastError = "";
   } catch (e) {
     resolveNote = { threadId: item.thread_id, text: `Couldn't resolve #${item.id}: ${e.message}`, failed: true };
@@ -1463,57 +1550,142 @@ async function resolveItem(item, action, text) {
   await refresh();
 }
 
-function renderReply(item) {
-  const limit = bodyLimit(), draft = nyDrafts[item.id] || "";
-  const count = el("span", { class: "small muted ny-count" });
-  const send = el("button", { class: "primary ny-send", disabled: true }, "Send");
-  const sync = () => {
-    const v = nyDrafts[item.id] || "", n = bytes(v.trim());
-    count.textContent = `${n} / ${limit} bytes` + (n > limit ? " — too long" : "");
-    count.classList.toggle("err", n > limit);
-    send.disabled = !!resolveBusy || !v.trim() || n > limit;
-  };
-  const area = el("textarea", { class: "ny-textarea", "aria-label": `Reply to #${item.id}`, rows: 3,
-    placeholder: `Reply to ${item.agent} (sent as you, addressed to ${item.agent})`, disabled: !!resolveBusy,
-    oninput: e => { nyDrafts[item.id] = e.target.value; sync(); },
-    onkeydown: e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !send.disabled) { e.preventDefault(); send.click(); } } }, draft);
-  send.addEventListener("click", () => {
-    const v = (nyDrafts[item.id] || "").trim();
-    if (v && bytes(v) <= limit) resolveItem(item, "reply", v);
-  });
-  sync();
-  return el("div", { class: "ny-reply" }, area,
-    el("div", { class: "row" }, send,
-      el("button", { class: "linkish", onclick: () => { nyReplying.delete(item.id); render(); } }, "Cancel"), count));
+// The option cards for a post, in the fixed order. A structured question: Recommended, Alternative (each posts
+// "Chose option …"). A plain post: Approve as proposed, Approve & launch <agent>, Not now. Decisions add Finalize and
+// Reject. Write your own reply is always last. `button` is the primary button's label once the card is picked.
+function postChoices(item) {
+  const who = isHumanName(item.agent) ? "the thread" : item.agent, n = `#${item.id}`;
+  const decision = item.type === "decision", q = item.decision_question;
+  const launchable = (state.launchable_agents || []).includes(item.agent) && !isHumanName(item.agent);
+  const finalize = decision && !item.sealed ? [{ value: "finalize", action: "finalize", title: "Finalize the decision",
+    desc: "Makes this decision final and binding.", button: "Finalize decision" }] : [];
+  const reject = decision ? [{ value: "reject", action: "reject", title: "Reject the decision",
+    effect: `Posts “Not approved: decision ${n} is rejected.” to ${who}`, button: "Reject decision", danger: true }] : [];
+  const own = { value: "custom", action: "reply", title: "Write your own reply",
+    desc: "Answer in your own words, or propose something else.", button: "Send reply" };
+  if (q) return [
+    ...rankedOptions(q).map(o => ({ value: "option:" + o.id, action: "choose", option: o.id, rank: o.rank, title: o.label,
+      desc: o.description, effect: `Tells ${who} you chose this option`, button: `Choose ${o.rank}` })),
+    ...finalize, ...reject, own];
+  return [
+    ...finalize,
+    { value: "approve", action: "approve", title: "Approve as proposed", effect: `Posts “Approved: go ahead with ${n}.” to ${who}`,
+      button: "Approve" },
+    ...(launchable ? [{ value: "approve_launch", action: "approve_launch", title: `Approve & launch ${item.agent}`,
+      effect: `Approves, and lets the dispatcher launch ${item.agent} once on this thread now (uses tokens)`,
+      button: `Approve & launch ${item.agent}` }] : []),
+    ...reject,
+    { value: "not_now", action: "not_now", title: "Not now", effect: `Posts “Not now: parking ${n}.” to ${who}`, button: "Not now" },
+    own];
+}
+
+// A card in a radio group (real radio inputs). `name` keeps groups independent.
+function choiceCard(name, c, checked, disabled, onPick) {
+  return el("label", { class: "radio-card" + (c.danger ? " danger" : ""), "data-choice": c.value },
+    el("input", { type: "radio", name, value: c.value, checked, disabled, "data-action": c.action, onchange: onPick }),
+    el("span", { class: "rc-body" },
+      el("span", { class: "rc-title" }, c.title,
+        c.rank ? el("span", { class: "badge " + (c.rank === "Recommended" ? "badge-warning" : "badge-outline") }, c.rank) : null),
+      c.desc ? el("span", { class: "rc-desc" }, c.desc) : null,
+      c.effect ? el("span", { class: "rc-effect" }, c.effect) : null));
+}
+
+// The question block shared by posts and issues: the label, the question as the heading, the context (collapsed
+// after about six lines, "Show more" opens it).
+function askHead(key, label, question, context, cls = "") {
+  const open = nyExpanded.has(key), long = longBody(context || "");
+  return [el("div", { class: "ask-label" }, label), el("h3", {}, question),
+    context ? el("div", { class: "ny-body " + cls + (long && !open ? " clamped" : "") }, context) : null,
+    long ? el("button", { class: "linkish small", "data-action": "more", "aria-expanded": open ? "true" : "false",
+      onclick: () => { open ? nyExpanded.delete(key) : nyExpanded.add(key); render(); } }, open ? "Show less" : "Show more") : null];
 }
 
 function renderNeedsYouItem(item) {
-  const busy = !!resolveBusy, open = nyExpanded.has(item.id), long = longBody(item.body || "");
-  const launchable = (state.launchable_agents || []).includes(item.agent) && !isHumanName(item.agent);
-  const btn = (action, label, attrs = {}) => el("button", { "data-action": action, disabled: busy,
-    "aria-busy": resolveBusy === item.id ? "true" : null, ...attrs, onclick: () => resolveItem(item, action) }, label);
-  const decision = item.type === "decision";
-  const actions = el("div", { class: "ny-actions" },
-    decision && !item.sealed ? btn("finalize", "Finalize", { class: "primary", title: "Make this decision final and binding" }) : null,
-    decision ? btn("reject", "Reject", { class: "danger", title: `Post “Not approved: decision #${item.id} is rejected.” to ${item.agent}` }) : null,
-    btn("approve", "Approve", { class: decision ? "" : "primary", title: `Post “Approved: go ahead with #${item.id}.” to ${item.agent}` }),
-    launchable ? btn("approve_launch", `Approve & launch ${item.agent}`, { class: "unstick-btn",
-      title: `Approve, and let the dispatcher launch ${item.agent} once on this thread now (uses tokens)` }) : null,
-    btn("not_now", "Not now", { title: `Post “Not now: parking #${item.id}.” to ${item.agent}` }),
-    el("button", { "data-action": "reply-open", disabled: busy, "aria-expanded": nyReplying.has(item.id) ? "true" : "false",
-      onclick: () => { nyReplying.add(item.id); render(); const a = document.querySelector(`#needs-you [data-post="${item.id}"] textarea`); if (a) a.focus(); } }, "Reply…"),
-    el("button", { class: "linkish", "data-action": "jump", onclick: () => jumpToPost(item.id) }, `Jump to post #${item.id}`));
+  const busy = !!resolveBusy, q = item.decision_question, limit = bodyLimit(), noteLimit = 1024;
+  const choices = postChoices(item), name = `ny-answer-${item.id}`;
+  if (!choices.some(c => c.value === nyChoice[item.id])) delete nyChoice[item.id];
+  const picked = () => choices.find(c => c.value === nyChoice[item.id]);
+
+  const send = el("button", { type: "button", class: "btn btn-warning btn-md ny-primary", "data-primary": item.id,
+    "aria-busy": resolveBusy === item.id ? "true" : "false" });
+  const hint = el("span", { class: "hint", id: `ny-hint-${item.id}` });
+  send.setAttribute("aria-describedby", hint.id);
+  const count = el("span", { class: "small muted ny-count" });
+  const area = el("textarea", { class: "ny-textarea", "aria-label": `Reply to #${item.id}`, rows: 3, disabled: busy,
+    placeholder: `Your reply to ${item.agent} (sent as you, addressed to ${item.agent})`,
+    oninput: e => { nyDrafts[item.id] = e.target.value; sync(); },
+    onkeydown: e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !send.disabled) { e.preventDefault(); send.click(); } } },
+    nyDrafts[item.id] || "");
+  const custom = el("div", { class: "custom ny-reply" }, el("label", { class: "field-label", for: `ny-reply-${item.id}` }, "Your reply"), area,
+    el("div", { class: "row" }, count));
+  area.id = `ny-reply-${item.id}`;
+  const note = el("textarea", { class: "ny-note", name: "note", rows: 2, id: `ny-note-${item.id}`, disabled: busy,
+    placeholder: "Add a note to your choice (optional)", oninput: e => { nyNotes[item.id] = e.target.value; sync(); } }, nyNotes[item.id] || "");
+  const noteBox = el("div", { class: "custom ny-note-box" }, el("label", { class: "field-label", for: note.id }, "Note (optional)"), note);
+
+  const problem = () => {
+    const c = picked(), text = (nyDrafts[item.id] || "").trim(), n = bytes(text), nn = bytes((nyNotes[item.id] || "").trim());
+    if (!c) return "Choose an option or write your own reply.";
+    if (c.value === "custom" && !text) return "Write your reply, or choose an option.";
+    if (c.value === "custom" && n > limit) return `Your reply is too long (${n} / ${limit} bytes).`;
+    if (c.action === "choose" && nn > noteLimit) return `Your note is too long (${nn} / ${noteLimit} bytes).`;
+    return "";
+  };
+  const sync = () => {
+    const c = picked(), p = problem(), n = bytes((nyDrafts[item.id] || "").trim());
+    send.textContent = resolveBusy === item.id ? "Sending…" : c ? c.button : "Choose an option";
+    send.disabled = busy || !!p;
+    hint.textContent = c ? p : "";
+    hint.classList.toggle("err", !!(c && p));
+    custom.hidden = !c || c.value !== "custom";
+    noteBox.hidden = !c || c.action !== "choose";
+    count.textContent = `${n} / ${limit} bytes` + (n > limit ? " — too long" : "");
+    count.classList.toggle("err", n > limit);
+  };
+  send.addEventListener("click", () => {
+    const c = picked();
+    if (!c || problem() || resolveBusy) return;
+    if (c.value === "custom") resolveItem(item, "reply", (nyDrafts[item.id] || "").trim());
+    else if (c.action === "choose") {
+      const text = (nyNotes[item.id] || "").trim();
+      resolveItem(item, "choose", null, text ? { option_id: c.option, note: text } : { option_id: c.option });
+    } else resolveItem(item, c.action);
+  });
+
+  const cards = el("fieldset", { class: "radio-cards" }, el("legend", {}, q ? "Choose an answer" : "Your answer"),
+    choices.map(c => choiceCard(name, c, nyChoice[item.id] === c.value, busy, () => {
+      nyChoice[item.id] = c.value; sync();
+      if (c.value === "custom") area.focus();
+    })));
+  const ask = !q && isAgent(item.agent) ? el("p", { class: "ny-ask" },
+    el("span", {}, `This post has no structured options (a recommended option and an alternative).`),
+    el("button", { type: "button", class: "linkish", "data-action": "ask_options", disabled: busy,
+      title: `Posts a request to ${item.agent} to restate #${item.id} as a structured question`,
+      onclick: () => resolveItem(item, "ask_options") }, `Ask ${item.agent} for options`)) : null;
   const refs = item.refs && item.refs.length ? el("div", { class: "refs" },
     item.refs.map(r => el("div", {}, `${r.kind}: ${r.path}${r.rev ? " @ " + r.rev : ""}`))) : null;
-  return el("div", { class: "ny-item", "data-post": item.id },
-    el("div", { class: "ny-cta" }, callToAction(item)),
-    el("div", { class: "meta" }, el("strong", {}, "#" + item.id), chip(item.type, decision ? "accent" : ""),
-      el("span", {}, item.agent), item.sealed ? chip("🔒 sealed", "seal") : null,
-      el("span", { class: "muted", title: item.created_at }, ago(item.created_at))),
-    el("div", { class: "ny-body" + (long && !open ? " clamped" : "") }, item.body),
-    long ? el("button", { class: "linkish small", "data-action": "more", "aria-expanded": open ? "true" : "false",
-      onclick: () => { open ? nyExpanded.delete(item.id) : nyExpanded.add(item.id); render(); } }, open ? "Show less" : "Show more") : null,
-    refs, actions, nyReplying.has(item.id) ? renderReply(item) : null);
+  sync();
+  return el("div", { class: "ny-item ask", "data-post": item.id },
+    el("div", { class: "ask-context" }, el("span", { class: "where" }, blockingLine(item)),
+      chip(item.type, item.type === "decision" ? "accent" : ""), item.sealed ? chip("🔒 sealed", "seal") : null,
+      el("span", { title: item.created_at }, ago(item.created_at)), el("span", { class: "sp" }),
+      el("button", { class: "linkish small", "data-action": "jump", onclick: () => jumpToPost(item.id) }, `Jump to post #${item.id}`)),
+    askHead("post-" + item.id, q ? "Question" : "Question (from the post)", postQuestion(item), postContext(item)),
+    refs,
+    el("div", { class: "ask-form" }, cards, custom, noteBox, ask, el("div", { class: "footer" }, hint, send)));
+}
+
+// Answered issues linked to this thread that no longer wait on the human here, while posts still do: say so, so an
+// answered issue is not mistaken for what blocks the thread (or the thread for answered).
+function answeredButWaiting(t, items, waiting) {
+  if (!items.length) return null;
+  const answered = allIssues().filter(i => i.status !== "resolved" && !waiting.includes(i) && (i.decisions || []).length
+    && i.links.some(l => l.thread_id === t.id));
+  if (!answered.length) return null;
+  const ids = answered.map(i => `#${i.id}`).join(", "), posts = items.map(p => `#${p.id}`).join(", ");
+  return el("p", { class: "ny-explain", "data-explain": t.id },
+    el("strong", {}, `${answered.length === 1 ? "Issue" : "Issues"} ${ids} ${answered.length === 1 ? "is" : "are"} answered`),
+    `; this thread is still waiting on ${items.length === 1 ? "post" : "posts"} ${posts}.`);
 }
 
 function renderNeedsYou(t, human) {
@@ -1527,6 +1699,7 @@ function renderNeedsYou(t, human) {
   return el("aside", { class: "card needs-you", id: "needs-you", "aria-label": "Needs you" },
     el("h2", {}, el("span", { class: "dot stalled", "aria-hidden": "true" }),
       count ? `Needs you (${count})` : "Needs you: nothing left here"),
+    answeredButWaiting(t, items, issues),
     issues.map(i => renderNeedsYouIssue(i, t.id)),
     items.map(renderNeedsYouItem),
     note ? el("div", { class: "ny-result small" + (note.failed ? " failed" : ""), id: "needs-you-result", role: "status" },
@@ -1727,17 +1900,17 @@ function renderDecisionPanel(i, where, onSuccess) {
     count.textContent = `${n} of ${plural(threads.length, "thread")}`;
   };
 
-  const choiceCard = (id, title, description, effect, recommended) => el("label", { class: "radio-card" },
+  const card = (id, title, description, effect, rank) => el("label", { class: "radio-card", "data-choice": id },
     el("input", { type: "radio", name: `issue-answer-${i.id}`, value: id, checked: draft.choice === id,
       onchange: () => { draft.choice = id; sync(); if (id === "custom" && area) area.focus(); } }),
     el("span", { class: "rc-body" },
-      el("span", { class: "rc-title" }, title, recommended ? el("span", { class: "badge badge-warning" }, "Recommended") : null),
+      el("span", { class: "rc-title" }, title,
+        rank ? el("span", { class: "badge " + (rank === "Recommended" ? "badge-warning" : "badge-outline") }, rank) : null),
       description ? el("span", { class: "rc-desc" }, description) : null,
       effect ? el("span", { class: "rc-effect" }, effect) : null));
   const choices = q ? el("fieldset", { class: "radio-cards" }, el("legend", { class: "field-label" }, "Choose an answer"),
-    [...q.options].sort((a, b) => Number(b.id === q.recommended_option_id) - Number(a.id === q.recommended_option_id))
-      .map(o => choiceCard("option:" + o.id, o.label, o.description, OUTCOME_EFFECT[o.outcome], o.id === q.recommended_option_id)),
-    choiceCard("custom", "Write your own answer", "Reply in your own words or propose another option.", null, false))
+    rankedOptions(q).map(o => card("option:" + o.id, o.label, o.description, OUTCOME_EFFECT[o.outcome], o.rank)),
+    card("custom", "Write your own reply", "Reply in your own words or propose another option.", null, null))
     : el("p", { class: "note" }, "No suggested options were provided for this issue. Reply in your own words.");
 
   const area = el("textarea", { name: "decision", id: `decision-${uid}`, rows: 3, required: draft.choice === "custom",
@@ -1784,11 +1957,10 @@ function renderDecisionPanel(i, where, onSuccess) {
 }
 
 function renderNeedsYouIssue(i, threadId) {
-  return el("section", { class: "ny-item", "data-issue": i.id },
-    el("div", { class: "meta" }, chip(`Shared issue #${i.id}`, "warn"),
-      el("span", { class: "muted" }, plural(issueThreads(i).length, "linked thread"))),
-    el("h3", {}, issueQuestion(i)),
-    el("p", { class: "issue-discussion" }, issueContext(i)),
+  return el("section", { class: "ny-item ask", "data-issue": i.id },
+    el("div", { class: "ask-context" }, el("span", { class: "where" }, issueLine(i)), chip("shared issue", "warn"),
+      el("span", { title: i.updated_at || "" }, ago(i.updated_at))),
+    askHead("issue-" + i.id, i.decision_question ? "Question" : "Question (from the issue)", issueQuestion(i), issueContext(i), "issue-discussion"),
     renderDecisionPanel(i, "ny", text => { resolveNote = { threadId, text: `Issue #${i.id}: ${text}`, failed: false }; }),
     el("div", { class: "small issue-links" },
       el("a", { href: `#issue-${i.id}`, "data-open-issue": i.id, onclick: e => { e.preventDefault(); openIssue(i.id); } }, "Full discussion and history"),
@@ -1859,6 +2031,32 @@ function renderComposer(i) {
   return form;
 }
 
+// The status banner at the top of an issue: is it waiting on the human, or answered (when, how, for which threads,
+// and the first line of the answer), or resolved? "Change your answer" opens the decision panel again.
+function issueBanner(i, human) {
+  const banner = (cls, dot, title, ...rest) => el("div", { class: `card status-banner ${cls}`, "data-banner": cls },
+    el("span", { class: "dot " + dot, "aria-hidden": "true" }), el("div", { class: "sb-title" }, title), ...rest);
+  if (i.status === "resolved") {
+    const r = i.resolution || (i.resolutions || []).at(-1);
+    return banner("done", "done", `Resolved${r ? " " + ago(r.created_at) : ""}`, null,
+      el("div", { class: "sb-sub" }, "Nothing is waiting on you. The implementation was verified."));
+  }
+  if (i.needs_human) return banner("waiting", "stalled", human ? "Waiting on your decision" : "Waiting on the human's decision", null,
+    el("div", { class: "sb-sub" }, issueLine(i)));
+  const d = (i.decisions || []).at(-1);
+  const toggle = human ? el("button", { type: "button", class: "btn-ghost", "data-change-answer": i.id,
+    "aria-expanded": answerOpen.has(i.id) ? "true" : "false", "aria-controls": `issue-${i.id}-change`,
+    onclick: () => { answerOpen.has(i.id) ? answerOpen.delete(i.id) : answerOpen.add(i.id); render(); } },
+    answerOpen.has(i.id) ? "Keep my answer" : d ? "Change your answer" : "Answer anyway") : null;
+  const note = human && !answerOpen.has(i.id) ? issueNote(`decide-${i.id}`) : null;
+  if (!d) return banner("idle", "answered", "Nothing is waiting on you", toggle,
+    el("div", { class: "sb-sub" }, `Under discussion; no decision requested · ${issueLine(i)}`), note);
+  const who = human && isHumanName(d.agent) ? "You" : d.agent || "The human";
+  return banner("answered", "answered", `${who} answered ${ago(d.created_at)} — ${OUTCOME_LABEL[d.outcome] || "Answered"} · applies to ${(d.thread_ids || []).map(id => "#" + id).join(", ")}`,
+    toggle, firstLine(d.body) ? el("div", { class: "sb-first" }, firstLine(d.body)) : null,
+    el("div", { class: "sb-sub" }, "Nothing is waiting on you here. Waiting for the implementation to be verified and resolved."), note);
+}
+
 function renderIssueDetail(i, human) {
   const draft = issueDraft(i), st = issueState(i), threads = issueThreads(i);
   const context = issueContext(i);
@@ -1866,7 +2064,9 @@ function renderIssueDetail(i, human) {
   const projects = [...new Set(threads.map(l => l.project))];
   const activity = issueActivity(i);
   const resolveKey = `resolve-${i.id}`;
+  const changing = answerOpen.has(i.id);
   return el("div", { class: "issue-detail", id: `issue-${i.id}` },
+    issueBanner(i, human),
     el("section", { class: "card issue-head" },
       el("div", { class: "overline" }, el("span", {}, `Issue #${i.id}`), issueStatus(i),
         el("span", { class: "title" }, i.title)),
@@ -1874,18 +2074,18 @@ function renderIssueDetail(i, human) {
       el("p", { class: "issue-discussion" }, context),
       context !== i.body && !hasCreated ? el("div", { class: "original" }, el("div", { class: "label" }, "Original report"),
         el("div", { class: "issue-discussion" }, i.body)) : null),
-    // Awaiting you: the decision panel, open and amber. Answered: the same panel, folded away as a secondary action.
+    // Awaiting you: the decision panel, open and amber. Answered: the same panel, opened from the banner's
+    // "Change your answer" (a new answer is recorded alongside the earlier ones).
     human && i.status !== "resolved" ? (i.needs_human
       ? el("section", { class: "card decision-card", "aria-label": "Your decision" },
           el("div", { class: "card-header" },
-            el("div", { class: "card-title" }, el("span", { class: "dot stalled", "aria-hidden": "true" }), "Your decision")),
+            el("div", { class: "card-title" }, el("span", { class: "dot stalled", "aria-hidden": "true" }), "Your decision"),
+            el("p", { class: "card-description" }, issueLine(i))),
           renderDecisionPanel(i, "iv"))
-      : el("section", { class: "card resolve-card", "aria-label": "Answer again" },
-          el("details", { class: "resolve-box", open: answerOpen.has(i.id), ontoggle: e => { e.target.open ? answerOpen.add(i.id) : answerOpen.delete(i.id); } },
-            el("summary", {}, "Answer again"),
-            el("p", { class: "card-description", style: "margin-bottom:10px" }, "No thread is waiting on you. A new answer is recorded alongside the earlier ones."),
-            renderDecisionPanel(i, "iv")),
-          answerOpen.has(i.id) ? null : issueNote(`decide-${i.id}`))) : null,
+      : changing ? el("section", { class: "card resolve-card", id: `issue-${i.id}-change`, "aria-label": "Change your answer" },
+          el("div", { class: "card-header" }, el("div", { class: "card-title" }, (i.decisions || []).length ? "Change your answer" : "Answer anyway"),
+            el("p", { class: "card-description" }, "No thread is waiting on you. A new answer is recorded alongside the earlier ones.")),
+          renderDecisionPanel(i, "iv")) : null) : null,
     el("section", { class: "card", id: `issue-${i.id}-threads` },
       el("div", { class: "card-header" }, el("h3", { class: "card-title" }, "Affected threads"),
         el("p", { class: "card-description" }, `${plural(threads.length, "thread")} in ${plural(projects.length, "project")}`)),
@@ -2181,17 +2381,23 @@ function render() {
       : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   }
   if (human) right.append(renderGrants());
-  if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length + waitingIssues().length})`),
-    el("div", { class: "small muted" }, "Shared issues awaiting a decision, plus unlinked posts needing a response."),
-    waitingIssues().map(i => el("div", { class: "post", "data-issue": i.id },
-      el("a", { href: `#issue-${i.id}`, onclick: e => { e.preventDefault(); openIssue(i.id); } }, el("strong", {}, issueQuestion(i))),
-      el("div", { class: "small muted" }, `${plural(new Set(i.links.map(l => l.thread_id)).size, "linked thread")} · Awaiting decision`))),
-    state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post ny-side", "data-post": p.id, role: "button", tabindex: "0",
-        title: `Open thread ${p.thread_id} at #${p.id}`,
+  // Sidebar Needs you: the same component, compact. What it blocks, the question, the options at a glance; a click
+  // opens the full card (the thread's Needs you card, or the issue).
+  const waitingNow = waitingIssues().filter(i => i.status !== "resolved");
+  if (human) right.append(el("section", { class: "card", id: "needs-you-side" }, el("h2", {}, `Needs you (${state.needs_you.length + waitingNow.length})`),
+    el("div", { class: "small muted" }, "Everything waiting on your answer: shared issues, then posts."),
+    waitingNow.map(i => el("div", { class: "post ny-side ask-compact", "data-issue": i.id },
+      el("div", { class: "ask-context" }, el("span", {}, issueLine(i))),
+      el("a", { class: "q", href: `#issue-${i.id}`, onclick: e => { e.preventDefault(); openIssue(i.id); } }, issueQuestion(i)),
+      optionsSummary(i.decision_question, "No suggested options · answer in your own words"))),
+    state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post ny-side ask-compact", "data-post": p.id, role: "button", tabindex: "0",
+        title: `Open thread #${p.thread_id} at post #${p.id}`,
         onclick: e => { e.preventDefault(); listTab = "threads"; openNeedsYou(p.thread_id, p.id); },
         onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); listTab = "threads"; openNeedsYou(p.thread_id, p.id); } } },
-      el("div", { class: "meta" }, el("a", { href: `#post-${p.id}` }, el("strong", {}, `#${p.id}`)), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
-      el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : waitingIssues().length ? null : el("div", { class: "muted small" }, "Nothing waiting.")));
+      el("div", { class: "ask-context" }, el("span", {}, blockingLine(p)), chip(p.type)),
+      el("a", { class: "q", href: `#post-${p.id}` }, postQuestion(p)),
+      optionsSummary(p.decision_question, p.type === "decision" ? "No structured options · finalize, reject or reply"
+        : "No structured options · approve, not now or reply"))) : waitingNow.length ? null : el("div", { class: "muted small" }, "Nothing waiting.")));
   // Sessions, in the server's order (last seen first); never re-sorted here. A session that received an Unstick
   // this page load carries a chip naming the request, next to its conversation link.
   const received = new Map();   // session id -> [unstick]

@@ -32,7 +32,8 @@ and after each unit of work. Requests that advance the human's authorized goal m
 asking again when covered by that goal or a matching human standing grant. Verify project, category,
 agent membership, active state and purpose; category labels alone do not prove semantic fit. Claim a
 task before editing its files. Stop when owner_may_work is false and refresh permission on each pull. Post 'status' when blocked, 'finding'
-with refs at a commit for reviews. Set needs_response=true to ask the human when unsure."""
+with refs at a commit for reviews. Set needs_response=true to ask the human when unsure; when the human must
+choose, attach a decision_question (a recommended option and one alternative, each with what it does and costs)."""
 
 DATA_WARNING = " SECURITY: " + UNTRUSTED_NOTICE
 
@@ -138,18 +139,27 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "human finalizes it. propose_task={title, acceptance, intends_files, depends_on, category} on a 'proposal' post "
         "creates a task in state 'proposed'. category is review|implementation|tests|documentation; immutable once created. "
         "Human standing grants returned by register/read can authorize matching task categories within their purpose. "
-        "Choose a category honestly; a label does not authorize work outside the human goal." + DATA_WARNING))
+        "Choose a category honestly; a label does not authorize work outside the human goal. "
+        "When you ask the human to CHOOSE, attach decision_question={question, context, options: exactly two "
+        "[{id, label, description, outcome: answered|approved|declined}], recommended_option_id}: your recommended "
+        "option and one alternative, each description saying what it does and what it costs. Allowed on "
+        "question/proposal/decision/request posts with needs_response=true (a decision always waits) and `to` "
+        "empty or the human. The dashboard shows Recommended, Alternative and Write your own reply; the human "
+        "can always answer in their own words. Plain needs_response questions are for open questions only. "
+        "A human reply 'Chose option <id> (\"<label>\", recommended|alternative) for #N.' means the human picked "
+        "that option of post #N (an optional 'Note:' line follows); it covers only what that option said." + DATA_WARNING))
     def board_post(body: str, type: Literal["question", "proposal", "status", "finding", "handoff", "request",
                                             "decision"],
                    thread_id: int | None = None, new_thread_title: str | None = None, to: list[str] | None = None,
                    needs_response: bool = False, task_id: int | None = None, refs: list[dict] | None = None,
-                   sealed: bool = False, propose_task: dict | None = None, session_id: int | None = None,
-                   ctx: Context = None) -> dict:
+                   sealed: bool = False, propose_task: dict | None = None, decision_question: dict | None = None,
+                   session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         sid = session(ctx, session_id)
         return run(lambda: board.create_post(
             p, sid, body=body, type=type, thread_id=thread_id, new_thread_title=new_thread_title, to=to,
-            needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task))
+            needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task,
+            decision_question=decision_question))
 
     @mcp.tool(description=(
         "Claim a task lease before editing its files (atomic: only one session wins). Calling it again on a task "
