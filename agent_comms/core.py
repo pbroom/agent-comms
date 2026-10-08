@@ -1077,6 +1077,8 @@ class Board:
         resolution = resolution_out(self, r["id"])
         if resolution is not None:
             d["attention_resolution"] = resolution
+        from .requests import for_post
+        d["requests"] = for_post(self, r)
         d["addressed_to_me"] = p.name in to
         return d
 
