@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { JSDOM } = require('jsdom');
 const html = fs.readFileSync(path.join(__dirname, '../agent_comms/dashboard.html'), 'utf8');
-const settle = () => new Promise(resolve => setTimeout(resolve, 60));
+const settle = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
 const INJECTION = '<img src=x onerror=alert(1)>';
 
 function setting(key, type, value, source, min, max) {
@@ -246,10 +246,12 @@ test('signed-in browsers: listed as text, revoke one, sign out all', async () =>
   assert.match(section.textContent, /30 days after its last use/);
   // Both take a second click (the first arms the button; see dashboard-confirms.test.cjs).
   section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
-  section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
+  await settle(520);   // the confirming click comes at least 500 ms after arming
+  document.querySelector('#settings-browsers tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
   await settle();
   assert.ok(calls.some(c => c.url === '/api/web-sessions/bbbbbbbbbbbbbbbb/revoke' && c.method === 'POST'));
   document.querySelector('#sign-out-all').click();
+  await settle(520);   // the confirming click comes at least 500 ms after arming
   document.querySelector('#sign-out-all').click();
   await settle();
   assert.ok(calls.some(c => c.url === '/api/web-sessions/revoke-all' && c.method === 'POST'));

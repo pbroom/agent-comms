@@ -492,6 +492,7 @@ const threadPosts = {};    // thread id -> older posts fetched to show a deep-li
 const SELECTED_KEY = "agent-comms-thread";
 let selected = Number(load(SELECTED_KEY)) || null;
 const opened = new Set();  // threads shown on the right since this page loaded: kept listed even once settled
+let autoSelected = false;   // the selected thread was defaulted (first in the list), not chosen by the human
 // New posts: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor). It
 // only brings a settled or completed thread back with a blue dot until it is opened; it never acknowledges agent
 // work (pickup and completion come from the server's request records).
@@ -536,6 +537,7 @@ function setFocusFromHash() {
   focusVersion++;
   focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
   if (focus) focus.viaLink = true;   // a link to a post that needs you lands on its callout block
+  if (focus) autoSelected = false;   // following a link is choosing
   if (focus && focus.kind === "thread") selected = focus.id;
   if (focus) listTab = "threads";
 }
@@ -578,6 +580,7 @@ async function act(method, path) {
 // re-render never replaces it). The armed key lives here, so a re-render keeps the armed state (and render() keeps
 // focus on it); arming and disarming update the button in place, so a click elsewhere is never lost to a re-render.
 const CONFIRM_MS = 4000;
+const CONFIRM_GAP_MS = 500;   // minimum time between arming and confirming
 let armed = null;   // { key, timer }
 function announce(text) {
   let n = document.getElementById("confirm-live");
@@ -597,13 +600,21 @@ function confirmButton(key, label, confirmLabel, hint, action, attrs = {}) {
     "data-confirm": key, "data-label": label, "aria-describedby": on ? "confirm-live" : null }, on ? confirmLabel : label);
   n.addEventListener("click", e => {
     e.stopPropagation();
-    if (armed && armed.key === key) { disarm(); action(); return; }
+    if (armed && armed.key === key) {
+      // A double-click (or a held key) must not arm and confirm in one go: the confirming activation has to come at
+      // least CONFIRM_GAP_MS after arming. (Not e.detail: with a slow OS double-click setting every click counts.)
+      if (Date.now() - armed.at < CONFIRM_GAP_MS) return;
+      disarm(); action(); return;
+    }
     disarm();
-    armed = { key, timer: setTimeout(() => { if (armed && armed.key === key) disarm(); }, CONFIRM_MS) };
+    armed = { key, at: Date.now(), timer: setTimeout(() => { if (armed && armed.key === key) disarm(); }, CONFIRM_MS) };
     announce(`${hint} Activate “${confirmLabel}” again within ${CONFIRM_MS / 1000} seconds to confirm, or press Escape to cancel.`);
     for (const b of confirmButtons(key)) { b.textContent = confirmLabel; b.classList.add("btn-confirm"); b.setAttribute("aria-describedby", "confirm-live"); }
   });
-  n.addEventListener("keydown", e => { if (e.key === "Escape" && armed && armed.key === key) { e.preventDefault(); disarm(); } });
+  n.addEventListener("keydown", e => {
+    if (e.key === "Escape" && armed && armed.key === key) { e.preventDefault(); disarm(); }
+    else if ((e.key === "Enter" || e.key === " ") && e.repeat) e.preventDefault();   // a held key never confirms
+  });
   // A blur caused by render() swapping the DOM is not the human leaving the button.
   n.addEventListener("blur", () => { if (!rendering && armed && armed.key === key) disarm(); });
   return n;
@@ -1228,8 +1239,10 @@ function sortedThreads(statuses) {
 }
 
 function selectThread(id) {
+  const wasAuto = autoSelected;
+  autoSelected = false;
   focusVersion++;
-  if (id === selected && !highlight) return;
+  if (id === selected && !highlight) { if (wasAuto) render(); return; }   // clicking the defaulted thread opens it
   selected = id; store(SELECTED_KEY, String(id));
   highlight = focus = null; scrollToThread = true;
   try { history.replaceState(null, "", "#thread-" + id); } catch (e) {}
@@ -1617,7 +1630,7 @@ function bodyLimit() { return (state.limits && state.limits.body_max_bytes) || 4
 // A thread that is not in the snapshot (closed, with "Show completed" off) goes through applyFocus, which fetches
 // it and turns "Show completed" on; otherwise the pane would fall back to some other thread.
 function openNeedsYou(threadId, postId) {
-  focusVersion++;
+  focusVersion++; autoSelected = false;
   selected = threadId; store(SELECTED_KEY, String(threadId));
   highlight = focus = null; scrollToNeedsYou = postId || true;
   try { history.replaceState(null, "", "#thread-" + threadId); } catch (e) {}
@@ -1954,7 +1967,7 @@ function openIssue(id) {
 }
 // From an issue to one of its threads: the Threads tab with that thread selected.
 function openThread(id) {
-  focusVersion++;
+  focusVersion++; autoSelected = false;
   view = "board"; listTab = "threads"; selected = id; store(SELECTED_KEY, String(id));
   highlight = null; scrollToThread = true;
   focus = state && state.threads.some(t => t.id === id) ? null : { kind: "thread", id };   // fetch a closed one
@@ -2602,9 +2615,11 @@ function draw(app) {
     const current = threads.find(t => t.id === selected) || threads[0] || null;
     // The default (first) thread becomes the selection once, so a post elsewhere that re-sorts the list does not
     // swap the pane. Not while a deep link is still fetching its thread.
-    if (current && current.id !== selected && !focus) selected = current.id;
+    if (current && current.id !== selected && !focus) { selected = current.id; autoSelected = true; }
     if (current) {
-      opened.add(current.id); markSeen(current);
+      // Only a thread the human chose (click, keys, link, or the selection they left last time) counts as read; a
+      // thread shown merely because it sorts first keeps its "New posts" dot until it is actually opened.
+      opened.add(current.id); if (!autoSelected) markSeen(current);
       if ((statuses.get(current.id) || {}).newPosts) statuses.set(current.id, listStatus(current, human));
     }
     list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
