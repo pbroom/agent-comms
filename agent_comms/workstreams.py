@@ -232,6 +232,9 @@ def after_save(board, p, sid, row, state):
         board._event(board.conn,task['id'],'transition',task['status'],'done',p,sid,'Continuation descendants and check receipts accepted')
 
 
+UNKNOWN_ACTIVITY = 'Owner activity is unknown; fresh explicit idle evidence is required'
+
+
 def _inactive(board, session, managed):
     now = board.now()
     path = os.path.realpath(session['worktree'] or session['project'])
@@ -275,7 +278,7 @@ def _inactive(board, session, managed):
     minimum = max(last_start or 0,last_work or 0)
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
     if not ended and not idle:
-        return 'Owner activity is unknown; fresh explicit idle evidence is required'
+        return UNKNOWN_ACTIVITY
     if not path or not os.path.isdir(path):
         return 'Owner worktree cannot be inspected'
     try:
@@ -333,9 +336,16 @@ def _descendant_checkouts(board, managed):
                     if os.path.realpath(s['worktree'] or s['project'])==path]
         if not sessions:
             return label+'checkout ownership is unknown; registered idle or ended owner evidence is required'
-        reasons = [_inactive(board,s,managed) for s in sessions]
-        if all(reasons):
-            return label+reasons[0]
+        # Every session at the checkout must be shown inactive: one idle or ended session says nothing about
+        # another. The only ones skipped are long ended: unknown activity, yet not seen for a whole lease TTL
+        # (so it holds no lease; _inactive has already ruled out a live lease, live peer or active run).
+        stale_before = board.now() - board.s.lease_ttl_minutes * 60
+        for s in sessions:
+            reason = _inactive(board,s,managed)
+            if reason == UNKNOWN_ACTIVITY and s['last_seen'] < stale_before:
+                continue
+            if reason:
+                return label+reason
     return None
 
 
