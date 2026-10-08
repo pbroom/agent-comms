@@ -81,6 +81,15 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
     row = next((r for r in post["requests"] if r["recipient"] == recipient), None)
     if row is None:
         raise NotFound("request recipient not found")
+    if not p.is_human and p.name not in (post["agent"], row["assigned_agent"]):
+        raise Forbidden("only the author or assigned recipient may route a request")
+    if (not p.is_human and p.name == row["assigned_agent"]
+            and row["assigned_session"] not in (None, session_id)):
+        raise Conflict("request is owned by another session")
+    if row["version"] != expected_version:
+        raise Conflict("request changed; reread before routing")
+    if not p.is_human and thread["status"] != "open":
+        raise Conflict("thread is closed")
     if row["state"] not in ("queued", "blocked"):
         raise Conflict("only queued or blocked requests may be routed")
     # Preserve any existing suitable assignment: repeat routing must not duplicate work.
@@ -88,6 +97,12 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
     candidates.sort(key=lambda s: (s["id"] != row["assigned_session"], s["agent"] != recipient))
     source = board.conn.execute("SELECT to_agents FROM posts WHERE id=?", (post_id,)).fetchone()
     allowed = set(json.loads(source["to_agents"])) | {recipient}
+    if post["task_id"] is not None:
+        task = board.conn.execute("SELECT * FROM tasks WHERE id=?", (post["task_id"],)).fetchone()
+        allowed = {agent for agent in allowed
+                   if task is not None and board._task_authorization_active(task, agent)}
+        if not allowed:
+            raise Forbidden("no original recipient has active authorization for the linked task")
     for candidate in candidates:
         if candidate["agent"] in allowed and eligible(board, candidate["id"], thread["project"], required):
             return requests.assign(board, p, session_id, post_id, recipient, candidate["id"],

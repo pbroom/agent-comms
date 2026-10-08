@@ -164,3 +164,35 @@ def test_capability_does_not_override_task_authorization(env):
     with pytest.raises(Forbidden, match="authoriz"):
         capabilities.route(env.board, env.p["codex"], env.sid["codex"], post["id"], "claude",
                            ["browser:desktop"], 0)
+
+
+def test_route_skips_capable_but_unauthorized_preferred_recipient(env):
+    env.board.create_grant(env.p["human"], project=PROJECT, category="review", agents=["claude"],
+                           purpose="Review this project")
+    post = env.post("grok", env.thread(), type="proposal", to=["codex", "claude"], needs_response=True,
+                    propose_task={"title": "Review", "category": "review"})
+    env.board.claim_task(env.p["claude"], env.sid["claude"], post["task_id"])
+    env.board.release_task(env.p["claude"], env.sid["claude"], post["task_id"])
+    probe(env, "codex")
+    probe(env, "claude")
+    queued = route(env, post, as_="grok")
+    assert queued["assigned_agent"] == "claude"
+    assert queued["assigned_session"] == env.sid["claude"]
+
+
+def test_unrelated_caller_denied_before_candidate_selection(env):
+    post = request(env)
+    with pytest.raises(Forbidden, match="author or assigned"):
+        route(env, post, as_="grok")
+    assert env.board.conn.execute("SELECT COUNT(*) FROM request_events").fetchone()[0] == 0
+
+
+def test_author_cannot_block_started_execution_with_failed_route(env):
+    from agent_comms import requests
+    from agent_comms.core import Conflict
+    post = env.post("claude", env.thread(), type="request", to=["codex"])
+    started = requests.progress(env.board, env.p["codex"], env.sid["codex"], post["id"], "codex", "started")
+    with pytest.raises(Conflict):
+        route(env, post, started["version"], as_="claude")
+    current = env.board.get_post(env.p["claude"], post["id"])["requests"][0]
+    assert current["state"] == "started"
