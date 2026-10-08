@@ -88,3 +88,104 @@ test('new-post marks never hide agent pickup, and my own posts are not new', asy
     assert.match(dotOf(d, 1)[1], /awaiting agent pickup/, 'pickup keeps its own label');
   } finally { dom.window.close(); }
 });
+
+// ---------------------------------------------------------------- 3. the poll retries a failed first load
+test('a failed first /api/state is retried by the 3-second refresh', async () => {
+  let failures = 1;
+  const board = { threads: [thread(1, [post(10, 1)])] };
+  const { dom, d } = await setup({ board, routes: {
+    '/api/state': () => failures-- > 0 ? fail(500, 'board busy') : ok({ me: { name: 'human', is_human: true }, paused: false,
+      sessions: [], needs_you: [], limits: {}, authorization_grants: [], agents: [], task_categories: [], active_runs: [],
+      threads: board.threads }) } });
+  try {
+    assert.equal(d.querySelector('.thread-list'), null, 'the first load failed');
+    await settle(3300);
+    assert.ok(d.querySelector(rowSel(1)), 'the next poll loaded the board');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 5. the default thread stays put
+test('the default thread stays selected when another thread gets a newer post', async () => {
+  const a = thread(1, [post(10, 1, { created_at: ago(5) })]), b = thread(2, [post(20, 2, { created_at: ago(50) })]);
+  const board = { threads: [a, b] };
+  const { dom, win, d } = await setup({ board });
+  try {
+    assert.deepEqual(shown(d), ['thread-1'], 'the most recent thread is shown by default');
+    b.posts = [...b.posts, post(21, 2, { created_at: ago(1) })];
+    await win.refresh();
+    assert.equal(d.querySelector(rowSel(2)), d.querySelector('.thread-list [data-thread]'), 'thread 2 now sorts first');
+    assert.deepEqual(shown(d), ['thread-1'], 'the pane did not jump');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 6. a slow deep link loses to a newer click
+test('a slow deep-link fetch does not override a click made meanwhile', async () => {
+  const open1 = thread(1, [post(10, 1)]), open2 = thread(2, [post(20, 2)]);
+  const old = thread(9, [post(90, 9)], { status: 'closed' });
+  const board = { threads: [open1, open2, old] };
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { dom, win, d } = await setup({ board, url: 'http://127.0.0.1:8787/#post-90', routes: {
+    '/api/posts/90': async () => { await gate; return ok(post(90, 9)); },
+    '/api/threads/9/posts': () => ok({ posts: [post(90, 9)] }) } });
+  try {
+    d.querySelector(rowSel(2)).click();
+    assert.deepEqual(shown(d), ['thread-2']);
+    release(); await settle(100);
+    assert.deepEqual(shown(d), ['thread-2'], 'the click wins');
+    assert.equal(d.getElementById('show-completed').checked, false, 'and "Show completed" is left alone');
+    assert.equal(win.location.hash, '#thread-2');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 7. Needs you item in a closed thread
+test('a Needs you item in a closed thread opens that thread (via the deep-link path)', async () => {
+  const open1 = thread(1, [post(10, 1)]);
+  const waiting = post(90, 9, { type: 'question', needs_response: true, to: ['human'] });
+  const closed = thread(9, [waiting], { status: 'closed' });
+  const board = { threads: [open1, closed], needs_you: [waiting] };
+  const { dom, d } = await setup({ board, routes: {
+    '/api/posts/90': () => ok(waiting), '/api/threads/9/posts': () => ok({ posts: [waiting] }) } });
+  try {
+    d.querySelector('#needs-you-side [data-post="90"]').click();
+    await settle(150);
+    assert.deepEqual(shown(d), ['thread-9'], 'the closed thread is shown, not the first open one');
+    assert.equal(d.getElementById('show-completed').checked, true, '"Show completed" is turned on');
+    assert.ok(d.querySelector('#needs-you [data-post="90"]'), 'with its Needs you item');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 8. issue search moves the pane with the list
+const issue = (id, title, extra = {}) => ({ id, title, body: 'Body ' + id, status: 'open', needs_human: false, created_by: 'codex',
+  created_at: ago(id), updated_at: ago(id), comments: [], decisions: [], resolution: null,
+  links: [{ thread_id: 1, post_id: 10, project: '/repo/app-1', title: 'Thread 1' }], ...extra });
+test('searching issues shows the newly selected first match in the pane', async () => {
+  const one = issue(1, 'Flaky login'), two = issue(2, 'Disk full');
+  const board = { threads: [thread(1, [post(10, 1)])], issues: [one, two] };
+  const { dom, win, d } = await setup({ board, url: 'http://127.0.0.1:8787/#issues',
+    routes: { '/api/issues?query=': u => ok([one, two].filter(i => i.title.toLowerCase().includes(new URL(u, 'http://x').searchParams.get('query').toLowerCase()))) } });
+  try {
+    assert.ok(d.getElementById('issue-1'), 'the newest issue is shown first');
+    const input = d.querySelector('[type="search"]'); input.focus(); input.value = 'disk';
+    input.dispatchEvent(new win.Event('input')); await settle();
+    assert.equal(d.querySelector('.issue-row[data-issue="2"]') && d.querySelectorAll('.issue-row').length, 1);
+    assert.ok(d.getElementById('issue-2'), 'the pane follows the selection');
+    assert.equal(d.getElementById('issue-1'), null);
+    assert.equal(d.activeElement, input, 'the search box keeps focus');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 9. tab focus survives the refresh
+test('arrowing between the list tabs keeps focus on the new tab after the refresh', async () => {
+  const board = { threads: [thread(1, [post(10, 1)])], issues: [issue(1, 'Flaky login')] };
+  const { dom, win, d } = await setup({ board });
+  try {
+    d.getElementById('tab-threads').focus();
+    d.getElementById('tab-threads').dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    assert.equal(d.getElementById('tab-issues').getAttribute('aria-selected'), 'true');
+    assert.equal(d.activeElement && d.activeElement.id, 'tab-issues', 'focus is on the Issues tab after the refresh');
+    await win.refresh();
+    assert.equal(d.activeElement && d.activeElement.id, 'tab-issues', 'and stays there across a poll');
+  } finally { dom.window.close(); }
+});

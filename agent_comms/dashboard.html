@@ -482,6 +482,8 @@ let notifyDraft = { events: [...NOTIFY_DEFAULT], project: "", thread: "", idle: 
 let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
 // Deep links: #post-<id>, #thread-<id>, #settings. `focus` is what still needs scrolling to; the highlight stays.
 let focus = null, focusTried = false, focusBusy = false, highlight = null;
+// Bumped by every navigation (a click, a link): deep-link work started before it is dropped (see applyFocus).
+let focusVersion = 0;
 const threadPosts = {};    // thread id -> older posts fetched to show a deep-linked post outside the snapshot
 // Two-pane board: the thread shown on the right. Remembered per browser (a convenience only).
 const SELECTED_KEY = "agent-comms-thread";
@@ -528,6 +530,7 @@ function parseFocus(hash) {
   return m ? { kind: m[1], id: Number(m[2]) } : null;
 }
 function setFocusFromHash() {
+  focusVersion++;
   focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
   if (focus) focus.viaLink = true;   // a link to a post that needs you lands on its callout block
   if (focus && focus.kind === "thread") selected = focus.id;
@@ -700,6 +703,7 @@ async function loadSettings() {
 }
 
 function setView(next) {
+  focusVersion++;
   view = next;
   if (next !== "board") highlight = focus = null;
   const back = listTab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : location.pathname;
@@ -725,6 +729,8 @@ async function applyFocus() {
     focus = null; render(); return;
   }
   focusTried = true; focusBusy = true;
+  // A click (or a newer link) while this fetches wins: the stale result must not change the selection.
+  const version = focusVersion;
   try {
     let tid = focus.id;
     if (focus.kind === "post") {
@@ -733,10 +739,13 @@ async function applyFocus() {
       const older = await api("GET", `/api/threads/${tid}/posts?since_seq=${Math.max(0, post.seq - 1)}&limit=500`);
       threadPosts[tid] = older.posts || [];
     }
-    selected = tid;
-    if (!state.threads.some(t => t.id === tid)) showClosed = true;
+    if (version === focusVersion) {
+      selected = tid;
+      if (!state.threads.some(t => t.id === tid)) showClosed = true;
+    }
   } catch (e) {}
   focusBusy = false;
+  if (version !== focusVersion) { if (focus) render(); return; }   // let the newer focus work run
   await refresh();
 }
 
@@ -1215,6 +1224,7 @@ function sortedThreads(statuses) {
 }
 
 function selectThread(id) {
+  focusVersion++;
   if (id === selected && !highlight) return;
   selected = id; store(SELECTED_KEY, String(id));
   highlight = focus = null; scrollToThread = true;
@@ -1562,14 +1572,22 @@ function bytes(text) {
 function bodyLimit() { return (state.limits && state.limits.body_max_bytes) || 4096; }
 
 // Opens the thread and brings its callout (and the given item) into view. Used by the list chip and the sidebar.
+// A thread that is not in the snapshot (closed, with "Show completed" off) goes through applyFocus, which fetches
+// it and turns "Show completed" on; otherwise the pane would fall back to some other thread.
 function openNeedsYou(threadId, postId) {
+  focusVersion++;
   selected = threadId; store(SELECTED_KEY, String(threadId));
   highlight = focus = null; scrollToNeedsYou = postId || true;
   try { history.replaceState(null, "", "#thread-" + threadId); } catch (e) {}
+  if (!state.threads.some(t => t.id === threadId)) {
+    scrollToNeedsYou = null; focusTried = false;
+    focus = postId ? { kind: "post", id: postId, viaLink: true } : { kind: "thread", id: threadId };
+  }
   render();
 }
 
 function jumpToPost(id) {
+  focusVersion++;
   highlight = { kind: "post", id }; focus = { kind: "post", id }; focusTried = false;
   render();
 }
@@ -1877,6 +1895,7 @@ function currentIssue() {
 }
 
 function openIssue(id) {
+  focusVersion++;
   view = "board"; listTab = "issues"; selectedIssue = id; issueError = ""; highlight = focus = null; scrollToIssue = true;
   const found = issueSearchResults.find(i => i.id === id);
   if (found) selectedIssueDetail = found;
@@ -1885,6 +1904,7 @@ function openIssue(id) {
 }
 // From an issue to one of its threads: the Threads tab with that thread selected.
 function openThread(id) {
+  focusVersion++;
   view = "board"; listTab = "threads"; selected = id; store(SELECTED_KEY, String(id));
   highlight = null; scrollToThread = true;
   focus = state && state.threads.some(t => t.id === id) ? null : { kind: "thread", id };   // fetch a closed one
@@ -1894,6 +1914,7 @@ function openThread(id) {
 }
 // "Link issue" on a post: the Issues tab, with a banner for linking that exact post.
 function beginIssue(p) {
+  focusVersion++;
   issueSource = { thread_id: p.thread_id, post_id: p.id };
   issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
   issueSearch = ""; selectedIssue = null; issueError = ""; issueCreateOpen = false; delete issueNotes.link; delete issueNotes.create;
@@ -2248,7 +2269,16 @@ async function searchIssues(value) {
   const version = ++issueSearchVersion;
   issueSearchResults = []; issueSearchError = "";
   issueSearchLoading = Boolean(value.trim());
-  const update = () => { const box = document.getElementById("issue-results"); if (box) renderIssueResults(box); };
+  // Only the list and the pane are redrawn (a full render would take focus from the search box). With no issue
+  // picked, the first match is the current one: the pane must follow the list's selection.
+  const update = () => {
+    const box = document.getElementById("issue-results");
+    if (!box) return;
+    const current = currentIssue();
+    renderIssueResults(box, current);
+    const pane = document.getElementById("thread-pane");
+    if (pane && state && view === "board" && listTab === "issues" && !issueSearchLoading) pane.replaceChildren(...renderIssuePane(current, state.me.is_human));
+  };
   update();
   if (!issueSearchLoading) return;
   try {
@@ -2280,6 +2310,7 @@ function renderListTabs(threadCount) {
       : el("span", { class: "count" }, String(allIssues().length)))));
 }
 function setTab(tab) {
+  focusVersion++;
   if (listTab === tab && view === "board") return;
   listTab = tab; view = "board"; store(TAB_KEY, tab); highlight = focus = null;
   const hash = tab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : "";
@@ -2472,6 +2503,9 @@ function draw(app) {
     pane.append(...renderIssuePane(current, human));
   } else {
     const current = threads.find(t => t.id === selected) || threads[0] || null;
+    // The default (first) thread becomes the selection once, so a post elsewhere that re-sorts the list does not
+    // swap the pane. Not while a deep link is still fetching its thread.
+    if (current && current.id !== selected && !focus) selected = current.id;
     if (current) {
       opened.add(current.id); markSeen(current);
       if ((statuses.get(current.id) || {}).newPosts) statuses.set(current.id, listStatus(current, human));
@@ -2549,7 +2583,8 @@ function editing() {
   const a = document.activeElement;
   return !!a && ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName) && a.type !== "checkbox";
 }
-setInterval(() => { if (signedIn && state && !armed && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
+// Signed in is enough: a first /api/state that failed is retried here (gating on `state` stopped that for good).
+setInterval(() => { if (signedIn && !armed && document.visibilityState === "visible" && !document.querySelector("details[open]") && !editing() && !cfgBusy) refresh(); }, 3000);
 </script>
 </body>
 </html>
