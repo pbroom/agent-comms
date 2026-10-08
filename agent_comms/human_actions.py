@@ -48,7 +48,9 @@ def release_cooldown(board: Board, key: str) -> None:
 
 def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type: str, to: list[str],
                   needs_response: bool, launch: list[str] | None = None,
-                  purpose: str | None = None, answer_to: list[int] | None = None, answer_recipient: str | None = None) -> tuple[dict, dict | None]:
+                  purpose: str | None = None, answer_to: list[int] | None = None, answer_recipient: str | None = None,
+                  post_check: Callable[[], None] | None = None,
+                  post_hook: Callable[[dict], None] | None = None) -> tuple[dict, dict | None]:
     """Post fixed text as the human, in the human's own board session. With `launch`, first approve a one-shot
     dispatcher rule (one launch each, RULE_HOURS) for those agents that no active rule on this thread already
     covers. The rule comes first because the dispatcher only triggers on posts created at or after a rule; if the
@@ -63,8 +65,15 @@ def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type
                 rule = board.create_dispatch_rule(p, thread_id=thread_id, agents=uncovered, purpose=purpose or "",
                                                   max_launches=len(uncovered),
                                                   expires_at=board.now() + RULE_HOURS * 3600)
-        post = board.create_post(p, board.human_session(p), body=body, type=type, thread_id=thread_id, to=to,
-                                 needs_response=needs_response,answer_to=answer_to,_answer_recipient=answer_recipient)
+        human_sid = board.human_session(p)
+        with db.write_tx(board.conn):
+            if post_check is not None:
+                post_check()
+            post = board.create_post(p, human_sid, body=body, type=type, thread_id=thread_id, to=to,
+                                     needs_response=needs_response, answer_to=answer_to,
+                                     _answer_recipient=answer_recipient, _in_transaction=True)
+            if post_hook is not None:
+                post_hook(post)
     except Exception:
         if rule is not None:
             board.revoke_dispatch_rule(p, rule["id"])

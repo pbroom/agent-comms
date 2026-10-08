@@ -186,6 +186,9 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             owner = session_id
         _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner)
         workstreams.after_save(board,p,session_id,row,state)
+        if state == 'started' and not p.is_human:
+            from . import recovery
+            recovery.after_pickup(board, p, session_id, post, row)
         if state == 'finished':
             from . import decision_actions
             decision_actions.reconcile_successor(board,p,session_id,post,recipient)
@@ -251,4 +254,6 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         if attempts >= 3:
             raise Conflict('routing attempt limit reached; human review required')
         _save(board,p,session_id,row,'queued',reason.strip(),[],target['agent'],target_session_id)
+        from . import recovery
+        recovery.after_route(board, p, post, row)
     return next(r for r in board.get_post(p,post_id)['requests'] if r['recipient']==recipient)

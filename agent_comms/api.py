@@ -53,6 +53,12 @@ class RequestRouteIn(Body):
     expected_version: StrictInt
 
 
+class RequestOwnershipIn(Body):
+    session_id: StrictInt | None = None
+    recipient: str
+    expected_version: StrictInt
+
+
 class RequestRepostIn(Body):
     session_id: StrictInt | None = None
     recipient: str
@@ -693,6 +699,12 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def request_progress(post_id: int, body: RequestProgressIn, request: Request, p: Principal = P):
         values = body.model_dump(exclude={"session_id"})
         return requests.progress(board, p, sid(p, request, body.session_id), post_id, **values)
+
+    @app.post("/api/posts/{post_id}/requests/recover-owner")
+    def recover_request_owner(post_id: int, body: RequestOwnershipIn, request: Request, p: Principal = P):
+        from . import recovery
+        return recovery.transfer_ended_owner(board, p, sid(p, request, body.session_id),
+                                              post_id, body.recipient, body.expected_version)
 
     @app.get("/api/posts/{post_id}/requests/{recipient}/history")
     def request_history(post_id: int, recipient: str, p: Principal = P):

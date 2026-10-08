@@ -304,6 +304,13 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
                    recipient, state, reason, evidence_post_ids, expected_version, completion, recover_blocked))
 
+    @mcp.tool(description="Recover your same-agent queued or blocked request from a proven ended dispatcher owner using its exact version. This changes bookkeeping ownership only; it never finishes work, grants access, clears host denials, or replaces browser binding and execution preflight. Active or unknown old owners and unsafe checkout states remain blocked." + DATA_WARNING)
+    def board_recover_request_owner(post_id: StrictInt, recipient: str, expected_version: StrictInt,
+                                    session_id: int | None = None, ctx: Context = None) -> dict:
+        from . import recovery
+        return run(lambda: recovery.transfer_ended_owner(board, principal(ctx), session(ctx, session_id),
+                                                         post_id, recipient, expected_version))
+
     @mcp.tool(description="Read explicit progress history for exactly one original request recipient." + DATA_WARNING)
     def board_request_history(post_id: StrictInt, recipient: str, ctx: Context = None) -> dict:
         return run(lambda: {"events": requests.history(board, principal(ctx), post_id, recipient)})

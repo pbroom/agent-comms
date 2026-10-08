@@ -15,11 +15,7 @@ def setup(e, count=1):
 
 
 def pickup(e, source):
-    # Exercise the intended internal hook in the same transaction as progress.
-    with db.write_tx(e.board.conn):
-        previous = e.board.get_post(e.p['codex'], source['id'])['requests'][0]
-        requests.progress(e.board,e.p['codex'],e.sid['codex'],source['id'],'codex','started',_in_transaction=True)
-        recovery.after_pickup(e.board,e.p['codex'],e.sid['codex'],source,previous)
+    requests.progress(e.board,e.p['codex'],e.sid['codex'],source['id'],'codex','started')
 
 
 def row(e,p):
@@ -192,3 +188,45 @@ def test_active_successor_exception_still_fences_old_owner_and_peers(env,tmp_pat
     else: pathlib.Path(project,'.git','MERGE_HEAD').write_text('pending')
     with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
     assert row(env,post)['assigned_session']==old
+
+
+def test_http_recover_owner_is_authenticated_versioned_and_not_completion(env, tmp_path):
+    from fastapi.testclient import TestClient
+    from agent_comms.api import create_app
+    from test_issues_api import headers
+    post, old, new, _ = authorized_successor(env, tmp_path)
+    client = TestClient(create_app(env.board))
+    url = f"/api/posts/{post['id']}/requests/recover-owner"
+    body = {'recipient': 'codex', 'session_id': new, 'expected_version': 1}
+    assert client.post(url, json=body).status_code == 401
+    assert client.post(url, headers=headers(env, 'claude'), json=body).status_code == 403
+    assert client.post(url, headers=headers(env), json={**body, 'expected_version': 0}).status_code == 409
+    response = client.post(url, headers=headers(env), json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()['assigned_session'] == new
+    assert response.json()['state'] == 'queued'
+    assert client.post(url, headers=headers(env), json=body).status_code == 409
+
+
+def test_unstick_records_exact_links_and_pickup_retires_only_recovery(env):
+    from agent_comms.dispatch import DispatchConfig
+    tid = env.thread()
+    source = env.post('human', tid, 'unfinished work', 'request', to=['codex'])
+    result = unstick.unstick(env.board, env.p['human'], tid, DispatchConfig())
+    obligation = env.board.get_post(env.p['human'], result['post_id'])
+    pickup(env, source)
+    assert row(env, source)['state'] == 'started'
+    assert row(env, obligation)['state'] == 'finished'
+
+
+def test_unstick_link_failure_rolls_back_post_and_rule(env, monkeypatch):
+    from agent_comms.dispatch import DispatchConfig
+    tid = env.thread()
+    env.post('human', tid, 'unfinished work', 'request', to=['codex'])
+    before = env.board.conn.execute('SELECT count(*) FROM posts').fetchone()[0]
+    def fail(*args): raise RuntimeError('link unavailable')
+    monkeypatch.setattr(recovery, 'record', fail)
+    with pytest.raises(RuntimeError):
+        unstick.unstick(env.board, env.p['human'], tid, DispatchConfig())
+    assert env.board.conn.execute('SELECT count(*) FROM posts').fetchone()[0] == before
+    assert not env.board.active_dispatch_rules(env.p['human'])
