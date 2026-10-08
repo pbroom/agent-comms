@@ -633,7 +633,10 @@ def test_configuration_error_text_is_generic_for_agents_and_redacted_for_the_hum
 
 @pytest.mark.parametrize('text,leak', [('--api-key=sk-SECRET-1', 'SECRET'), ('run --token hunter2', 'hunter2'),
                                        ('Authorization: Bearer abc.def', 'abc.def'), ('password=hunter2', 'hunter2'),
-                                       ('ghp_1234567890abcdef', '1234567890')])
+                                       ('ghp_1234567890abcdef', '1234567890'), ('token = "hunter2"', 'hunter2'),
+                                       ("{'KEY': 'hunter2'}", 'hunter2'), ('["codex", "--api-key","x"]', '"x"'),
+                                       ("['codex', '--token', 'hunter2']", 'hunter2'), ('api_key: "a b c"', 'a b c'),
+                                       ('"password": "p\\"q"', 'q')])
 def test_redact_secrets(text, leak):
     assert leak not in core.redact_secrets(text)
     assert core.redact_secrets('unknown setting [dispatch] unknown_future_option') == \

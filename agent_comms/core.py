@@ -76,13 +76,27 @@ def _runtime_source_changed() -> bool:
         return True  # unavailable source cannot prove compatibility
 
 
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)((?:api[_-]?key|access[_-]?key|token|secret|passw(?:or)?d|auth(?:orization)?|bearer|credential|"
-    r"private[_-]?key|session[_-]?key|cookie)s?[\"']?\s*[=:]\s*)(?!\[redacted\])([^\s,;'\"\])]+)")
-_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+\S+")
-_SECRET_FLAG = re.compile(r"(?i)(--?[a-z0-9_-]*(?:key|token|secret|passw(?:or)?d|auth|credential)[a-z0-9_-]*(?:\s+|=))([^\s'\"]+)")
+_SECRET_WORD = (r"(?:api[_-]?key|access[_-]?key|private[_-]?key|session[_-]?key|key|token|secret|passw(?:or)?d|pwd|"
+                r"auth(?:orization)?|bearer|credential|cookie)s?")
+# A value: double- or single-quoted (kept quoted, contents replaced) or bare.
+_VALUE = r"""(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;'"]+)"""
+# name = value / name: value, the name possibly quoted (`token = "x"`, `'KEY': 'x'`, `"api_key": "x"`).
+_SECRET_ASSIGNMENT = re.compile(r"(?i)((?<![\w-])[\"']?[\w.-]*" + _SECRET_WORD + r"[\w.-]*[\"']?\s*[=:]\s*)(" + _VALUE + ")")
+# --flag value, --flag=value, and an argv pair written as list items (`"--api-key", "x"`).
+_SECRET_FLAG = re.compile(r"(?i)((?<![\w-])[\"']?--?[\w-]*" + _SECRET_WORD + r"[\w-]*[\"']?(?:\s*,\s*|\s+|=))(" + _VALUE + ")")
+_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+(?!\[redacted\])\S+")
 _SECRET_VALUE = re.compile(r"\b(?:sk|pk|rk|ghp|gho|ghs|xox[abp]|glpat|AKIA)[-_A-Za-z0-9]{6,}|"
                            r"\b[A-Za-z0-9+/_-]{32,}={0,2}")
+
+
+def _redact_value(m: re.Match) -> str:
+    value = m.group(2)
+    if value == "[redacted]" or value.startswith(("[redacted]", '"[redacted]"', "'[redacted]'")):
+        return m.group(0)
+    quote = value[0] if value[:1] in "\"'" and len(value) > 1 and value[-1] == value[0] else ""
+    return m.group(1) + quote + "[redacted]" + quote
+
+
 CONFIG_ERROR_FOR_AGENTS = "board configuration has an error; the human has details"
 
 
@@ -90,8 +104,8 @@ def redact_secrets(text: str) -> str:
     """Configuration error text with values that look like credentials replaced (`--api-key=...`, `token: ...`,
     `sk-...`, long opaque strings). Applied before the text is stored or shown, even to the human."""
     text = _BEARER.sub(r"\1 [redacted]", text)
-    text = _SECRET_FLAG.sub(lambda m: m.group(1) + "[redacted]", text)
-    text = _SECRET_ASSIGNMENT.sub(lambda m: m.group(1) + "[redacted]", text)
+    text = _SECRET_FLAG.sub(_redact_value, text)
+    text = _SECRET_ASSIGNMENT.sub(_redact_value, text)
     return _SECRET_VALUE.sub("[redacted]", text)
 
 
