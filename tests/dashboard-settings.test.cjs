@@ -131,6 +131,21 @@ test('a numeric edit sends a PUT with only the changed key', async () => {
   dom.window.close();
 });
 
+test('Reset drops the unsaved draft, so the next Save does not write the override back', async () => {
+  const { dom, win, document, calls } = await setup();
+  input(win, document.querySelector('input[data-key="limits.body_max_bytes"]'), '9000');
+  const row = document.querySelector('input[data-key="limits.body_max_bytes"]').closest('tr');
+  [...row.querySelectorAll('button')].find(b => b.textContent === 'Reset').click();
+  await settle();
+  const puts = () => calls.filter(c => c.method === 'PUT').map(c => JSON.parse(c.body));
+  assert.deepEqual(puts(), [{ 'limits.body_max_bytes': null }]);
+  assert.notEqual(document.querySelector('input[data-key="limits.body_max_bytes"]').value, '9000', 'the draft is gone');
+  document.querySelector('button[data-save="limits"]').click();
+  await settle();
+  assert.deepEqual(puts(), [{ 'limits.body_max_bytes': null }], 'Save sends nothing for the reset key');
+  dom.window.close();
+});
+
 test('a fractional value for a whole-number setting is not sent', async () => {
   const { dom, win, document, calls } = await setup();
   input(win, document.querySelector('input[data-key="dispatch.max_concurrent"]'), '1.5');
@@ -229,9 +244,12 @@ test('signed-in browsers: listed as text, revoke one, sign out all', async () =>
   assert.match(section.textContent, /this browser/);
   assert.match(section.textContent, /<img src=x onerror/);
   assert.match(section.textContent, /30 days after its last use/);
+  // Both take a second click (the first arms the button; see dashboard-confirms.test.cjs).
+  section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
   section.querySelector('tr[data-session="bbbbbbbbbbbbbbbb"] button').click();
   await settle();
   assert.ok(calls.some(c => c.url === '/api/web-sessions/bbbbbbbbbbbbbbbb/revoke' && c.method === 'POST'));
+  document.querySelector('#sign-out-all').click();
   document.querySelector('#sign-out-all').click();
   await settle();
   assert.ok(calls.some(c => c.url === '/api/web-sessions/revoke-all' && c.method === 'POST'));

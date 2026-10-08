@@ -40,7 +40,7 @@ async function setup({ threads, runs = [], issues = [], storage = {} }) {
   return { dom, document: dom.window.document, win: dom.window, calls };
 }
 function dot(document, id = 1) {
-  const node = document.querySelector(`tr[data-thread="${id}"] .dot`);
+  const node = document.querySelector(`li[data-thread="${id}"] .dot`);
   assert.ok(node, `thread ${id} has a status dot`);
   return node;
 }
@@ -58,7 +58,7 @@ test('a fresh queued request is blue on first visit and stays blue after human o
   try {
     assert.match(assertKind(page.document, 'unread'), /waiting|pickup|pick.?up|queued/i);
     assert.match(dot(page.document).title, /codex/i);
-    page.document.querySelector('tr[data-thread="1"]').click();
+    page.document.querySelector('li[data-thread="1"]').click();
     assertKind(page.document, 'unread');
     await page.win.refresh();
     assertKind(page.document, 'unread');
@@ -103,7 +103,7 @@ test('one finished recipient cannot hide another recipient still waiting for pic
   const page = await setup({ threads: [target] });
   try {
     assert.match(assertKind(page.document, 'unread'), /claude/i);
-    assert.equal(page.document.querySelector('tr[data-thread="1"] .dot.done'), null);
+    assert.equal(page.document.querySelector('li[data-thread="1"] .dot.done'), null);
   } finally { page.dom.window.close(); }
 });
 
@@ -118,9 +118,11 @@ test('all recipients explicitly finished settle the thread despite unseen eviden
   const target = thread(1, [post(10, [request('codex', 'finished'), request('claude', 'finished')], { agent: 'human' }),
     post(11, [], { type: 'status', agent: 'codex', to: ['claude'], needs_response: false, body: 'Verified the fix' })]);
   const other = thread(2, [post(20, [request('claude')], { thread_id: 2, agent: 'human' })]);
-  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{}', 'agent-comms-thread': '2' } });
+  // Seen in this browser already: an unseen post would bring the thread back with a "New posts" dot (a browser
+  // convenience, tested in dashboard-review-fixes), which is not what this test is about.
+  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{"1":11,"2":20}', 'agent-comms-thread': '2' } });
   try {
-    assert.equal(page.document.querySelector('tr[data-thread="1"]'), null, 'completed work is hidden by default');
+    assert.equal(page.document.querySelector('li[data-thread="1"]'), null, 'completed work is hidden by default');
     page.document.getElementById('show-completed').click();
     await settle();
     assert.match(assertKind(page.document, 'done'), /done|closed|settled|finished/i);
@@ -131,13 +133,13 @@ test('all recipients explicitly finished settle the thread despite unseen eviden
 test('an addressed FYI without response intent never creates blue pickup', async () => {
   const target = thread(1, [post(10, [], { type: 'status', agent: 'codex', to: ['claude'], needs_response: false })]);
   const other = thread(2, [post(20, [request('claude')], { thread_id: 2, agent: 'human' })]);
-  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{}', 'agent-comms-thread': '2' } });
+  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{"1":10,"2":20}', 'agent-comms-thread': '2' } });
   try {
     page.document.getElementById('show-completed').click();
     await settle();
-    assert.equal(page.document.querySelector('tr[data-thread="1"] .dot.unread'), null);
-    assert.equal(page.document.querySelector('tr[data-thread="1"] .dot'), null, 'FYI is neither pickup, processing nor completion');
-    assert.ok(page.document.querySelector('tr[data-thread="1"]'), 'unclassified discussion remains visible');
+    assert.equal(page.document.querySelector('li[data-thread="1"] .dot.unread'), null);
+    assert.equal(page.document.querySelector('li[data-thread="1"] .dot'), null, 'FYI is neither pickup, processing nor completion');
+    assert.ok(page.document.querySelector('li[data-thread="1"]'), 'unclassified discussion remains visible');
   } finally { page.dom.window.close(); }
 });
 
@@ -167,8 +169,8 @@ for (const content of ['empty', 'FYI', 'finished-task']) {
       lease_state: 'none', intends_files: [], events: [] }];
     const page = await setup({ threads: [target], runs: [{ thread_id: 1, agent: 'codex', run_id: 'unbound' }] });
     try {
-      assert.ok(page.document.querySelector('tr[data-thread="1"]'), 'uncertain work is not hidden as complete');
-      assert.equal(page.document.querySelector('tr[data-thread="1"] .dot'), null, 'no processing or completion is inferred');
+      assert.ok(page.document.querySelector('li[data-thread="1"]'), 'uncertain work is not hidden as complete');
+      assert.equal(page.document.querySelector('li[data-thread="1"] .dot'), null, 'no processing or completion is inferred');
     } finally { page.dom.window.close(); }
   });
 }
@@ -182,8 +184,8 @@ for (const complete of [false, true]) {
       links: [{ thread_id: 1, post_id: null, project: '/repo/app', title: target.title, needs_human: false }] };
     const page = await setup({ threads: [target], issues: [issue] });
     try {
-      assert.ok(page.document.querySelector('tr[data-thread="1"]'), 'the unresolved thread remains visible');
-      assert.equal(page.document.querySelector('tr[data-thread="1"] .dot'), null, 'shared discussion supplies neither started nor completion evidence');
+      assert.ok(page.document.querySelector('li[data-thread="1"]'), 'the unresolved thread remains visible');
+      assert.equal(page.document.querySelector('li[data-thread="1"] .dot'), null, 'shared discussion supplies neither started nor completion evidence');
       assert.ok(page.document.querySelector('#thread-issues a[href="#issue-7"]'), 'discussion evidence remains accessible');
     } finally { page.dom.window.close(); }
   });
