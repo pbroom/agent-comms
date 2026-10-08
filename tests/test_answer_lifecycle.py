@@ -329,7 +329,17 @@ def test_migration_records_which_proposal_created_its_task(env):
     env.clock.advance(60)
     about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'])
     c = env.board.conn
+    done = env.accepted_task(tid, title='Finished long ago')
+    old_done = env.post('claude', tid, 'Old proposal on a finished task', 'proposal', task_id=done)
+    env.board.transition_task(env.p['human'], env.sid['human'], done, 'done')
+    c = env.board.conn
     c.execute('ALTER TABLE tasks DROP COLUMN proposed_by_post')
     db.init_schema(c)
     assert c.execute('SELECT proposed_by_post FROM tasks WHERE id=?', (created['task_id'],)).fetchone()[0] == created['id']
-    assert pending(env) == {about['id']}
+    # The upgrade changes nothing visible: proposals the old rule hid stay out of Needs you.
+    assert pending(env) == set()
+    assert {about['id'], old_done['id']} <= {r[0] for r in c.execute('SELECT source_post_id FROM legacy_attention_answers')}
+    db.init_schema(c)                                    # idempotent
+    # A proposal about an existing task posted after the upgrade does need the human.
+    fresh = env.post('codex', tid, 'And now this?', 'proposal', task_id=created['task_id'])
+    assert pending(env) == {fresh['id']}

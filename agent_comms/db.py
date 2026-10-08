@@ -298,6 +298,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
                   AND p.agent = tasks.created_by AND ABS(p.created_at - tasks.created_at) < 5
                   AND p.session_id IN (SELECT session_id FROM task_events e WHERE e.task_id = tasks.id
                                        AND e.event = 'create'))""")
+            # The upgrade changes nothing visible: every proposal with a task_id that existed before it was hidden
+            # from Needs you by the old rule, so it is recorded as a legacy attention boundary (attention only,
+            # never completion proof) instead of resurfacing years of unanswered history. Only proposals posted
+            # from now on use the new rule.
+            conn.execute("""INSERT OR IGNORE INTO legacy_attention_answers(source_post_id, recorded_at)
+                SELECT p.id, CAST(strftime('%s','now') AS REAL) FROM posts p
+                WHERE p.type = 'proposal' AND p.task_id IS NOT NULL""")
         link_columns = {row[1] for row in conn.execute("PRAGMA table_info(issue_links)")}
         if "needs_human" not in link_columns:
             conn.execute("ALTER TABLE issue_links ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0")
