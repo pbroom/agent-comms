@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from agent_comms import browser_readiness as br, requests
+from agent_comms import browser_readiness as br, db, requests
 from agent_comms.core import Board, Conflict, Forbidden, Invalid
 from conftest import PROJECT
 
@@ -73,7 +73,8 @@ def test_owner_liveness_and_evidence_expiry_are_independent(env):
                                          ('client_session_id', 'other-conversation')])
 def test_context_change_invalidates_probe(env, column, value):
     probe(env)
-    env.board.conn.execute(f'UPDATE sessions SET {column}=? WHERE id=?', (value, env.sid['codex']))
+    with db.write_tx(env.board.conn):
+        env.board.conn.execute(f'UPDATE sessions SET {column}=? WHERE id=?', (value, env.sid['codex']))
     assert br.readiness(env.board, env.sid['codex'], URL) == 'context_changed'
 
 

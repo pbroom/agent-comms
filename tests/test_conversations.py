@@ -125,6 +125,7 @@ def test_http_session_body_cannot_set_a_client(env):
 
 def test_v2_database_migrates_and_keeps_sessions(env):
     conn = env.board.conn
+    conn.execute('DROP TRIGGER managed_browser_session_identity')
     for column in ("client_kind", "client_session_id"):
         conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
     for table in ("issue_comments", "issue_links", "issues"):
