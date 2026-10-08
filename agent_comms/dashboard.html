@@ -601,9 +601,9 @@ function confirmButton(key, label, confirmLabel, hint, action, attrs = {}) {
   n.addEventListener("click", e => {
     e.stopPropagation();
     if (armed && armed.key === key) {
-      // A double-click (or a held key) must not arm and confirm in one go: the confirming activation has to be
-      // its own, deliberate one, at least CONFIRM_GAP_MS after arming.
-      if (e.detail > 1 || Date.now() - armed.at < CONFIRM_GAP_MS) return;
+      // A double-click (or a held key) must not arm and confirm in one go: the confirming activation has to come at
+      // least CONFIRM_GAP_MS after arming. (Not e.detail: with a slow OS double-click setting every click counts.)
+      if (Date.now() - armed.at < CONFIRM_GAP_MS) return;
       disarm(); action(); return;
     }
     disarm();
@@ -1239,9 +1239,10 @@ function sortedThreads(statuses) {
 }
 
 function selectThread(id) {
+  const wasAuto = autoSelected;
   autoSelected = false;
   focusVersion++;
-  if (id === selected && !highlight) return;
+  if (id === selected && !highlight) { if (wasAuto) render(); return; }   // clicking the defaulted thread opens it
   selected = id; store(SELECTED_KEY, String(id));
   highlight = focus = null; scrollToThread = true;
   try { history.replaceState(null, "", "#thread-" + id); } catch (e) {}
@@ -1629,7 +1630,7 @@ function bodyLimit() { return (state.limits && state.limits.body_max_bytes) || 4
 // A thread that is not in the snapshot (closed, with "Show completed" off) goes through applyFocus, which fetches
 // it and turns "Show completed" on; otherwise the pane would fall back to some other thread.
 function openNeedsYou(threadId, postId) {
-  focusVersion++;
+  focusVersion++; autoSelected = false;
   selected = threadId; store(SELECTED_KEY, String(threadId));
   highlight = focus = null; scrollToNeedsYou = postId || true;
   try { history.replaceState(null, "", "#thread-" + threadId); } catch (e) {}
@@ -1966,7 +1967,7 @@ function openIssue(id) {
 }
 // From an issue to one of its threads: the Threads tab with that thread selected.
 function openThread(id) {
-  focusVersion++;
+  focusVersion++; autoSelected = false;
   view = "board"; listTab = "threads"; selected = id; store(SELECTED_KEY, String(id));
   highlight = null; scrollToThread = true;
   focus = state && state.threads.some(t => t.id === id) ? null : { kind: "thread", id };   // fetch a closed one

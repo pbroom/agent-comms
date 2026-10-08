@@ -309,11 +309,14 @@ test('thread and issue lists are lists of rows whose title link selects; buttons
 
 test('a thread shown only because it sorts first keeps its "New posts" dot until it is opened', async () => {
   // Review of #44: the defaulted first thread (often the unread one, in priority order) was marked seen on load.
-  const done = thread(1, [post(10, 1), post(11, 1, { type: 'finding', to: ['human'] })], { pickup: complete });
-  const other = thread(2, [post(20, 2)], { pickup: { ...complete, complete: false } });
+  // Thread 1 has the newest post, so it sorts first and is the one shown by default (the stored selection is gone).
+  const done = thread(1, [post(10, 1, { created_at: ago(30) }), post(11, 1, { type: 'finding', to: ['human'], created_at: ago(1) })],
+    { pickup: complete });
+  const other = thread(2, [post(20, 2, { created_at: ago(60) })], { pickup: { ...complete, complete: false } });
   const { dom, win, d } = await setup({ board: { threads: [done, other] },
     storage: { 'agent-comms-seen': JSON.stringify({ 1: 10, 2: 20 }), 'agent-comms-thread': '999' } });
   try {
+    assert.deepEqual(shown(d), ['thread-1'], 'thread 1 is the defaulted thread on the right');
     assert.deepEqual(dotOf(d, 1), ['unread', 'New posts'], 'still new after load: nobody opened it');
     await win.refresh();
     assert.deepEqual(dotOf(d, 1), ['unread', 'New posts'], 'and after a refresh');
