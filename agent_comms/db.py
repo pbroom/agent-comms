@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 4   # v4: shared issues and scoped decisions
+SCHEMA_VERSION = 5   # v5: structured issue questions and answer snapshots
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -188,6 +188,14 @@ def init_schema(conn: sqlite3.Connection) -> None:
     with write_tx(conn):
         if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             raise RuntimeError("database schema is newer than this server")
+        for table, additions in {
+            "issues": {"decision_question": "TEXT", "question_version": "INTEGER NOT NULL DEFAULT 0"},
+            "issue_comments": {"decision": "TEXT"},
+        }.items():
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in additions.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
         link_columns = {row[1] for row in conn.execute("PRAGMA table_info(issue_links)")}
         if "needs_human" not in link_columns:
             conn.execute("ALTER TABLE issue_links ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0")

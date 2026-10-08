@@ -14,6 +14,7 @@ characters ("sealed post" for a sealed post), or the cleaned title for a shared 
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -67,7 +68,7 @@ def _awaiting_issues(board: Board, limit: int, *, previews: bool = False) -> tup
     rows = board.conn.execute(f"""SELECT i.id, i.created_by, i.updated_at,
                 (SELECT l.thread_id FROM issue_links l WHERE l.issue_id=i.id ORDER BY l.thread_id LIMIT 1) thread_id,
                 (SELECT l.post_id FROM issue_links l WHERE l.issue_id=i.id AND l.post_id IS NOT NULL
-                 ORDER BY l.post_id LIMIT 1) post_id {', i.title' if previews else ''}
+                 ORDER BY l.post_id LIMIT 1) post_id {', i.title, i.decision_question' if previews else ''}
             FROM issues i WHERE {where} ORDER BY i.updated_at DESC, i.id DESC LIMIT ?""", (limit,))
     items = []
     for r in rows:
@@ -75,7 +76,9 @@ def _awaiting_issues(board: Board, limit: int, *, previews: bool = False) -> tup
                 "agent": r["created_by"], "type": "issue", "_time": r["updated_at"]}
         if previews:
             item.update(needs_response=True, task_id=None, task_status=None, decision_status=None,
-                        sealed=False, preview=preview(r["title"], False))
+                        sealed=False, preview=preview(
+                            (json.loads(r["decision_question"]) or {}).get("question")
+                            if r["decision_question"] else r["title"], False))
         items.append(item)
     return count, items
 

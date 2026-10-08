@@ -47,3 +47,18 @@ def test_issue_without_post_and_existing_posts_share_limit(env):
     assert '\n' not in d['items'][0]['preview'] and '\u202e' not in d['items'][0]['preview']
     s = summary.human_summary(b, p['human'], DispatchConfig())
     assert s['needs_you']['count'] == 12 and len(s['needs_you']['items']) == 5
+
+
+def test_question_preview_is_sanitized_and_summary_keeps_text_private(env):
+    from test_issues import question
+    q = question()
+    q['question'] = 'May we\nproceed\u202e?' + 'x' * 100
+    issue = issues.create_issue(env.board, env.p['codex'], env.sid['codex'], title='Old title',
+                               body='Context', thread_id=env.thread(), decision_question=q)
+    listing = summary.needs_you_list(env.board, env.p['human'])
+    text = listing['items'][0]['preview']
+    assert text.startswith('May we') and 'Old title' not in text
+    assert '\n' not in text and '\u202e' not in text and len(text) <= 80
+    assert 'May we' not in json.dumps(summary.human_summary(env.board, env.p['human'], DispatchConfig()))
+    issues.comment_issue(env.board, env.p['codex'], env.sid['codex'], issue['id'], 'Legacy request', 'request')
+    assert summary.needs_you_list(env.board, env.p['human'])['items'][0]['preview'] == 'Old title'

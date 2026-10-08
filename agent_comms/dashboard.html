@@ -170,9 +170,17 @@ button.needs-chip:hover { box-shadow: 0 0 0 1px var(--warn); }
 .issue-form { display: grid; gap: 10px; margin-top: 12px; }
 .issue-form label { display: grid; gap: 4px; font-size: 12px; }
 .issue-form textarea { min-height: 90px; width: 100%; }
-.issue-form input:not([type=checkbox]), .issue-form select, .issue-search { width: 100%; }
+.issue-form input:not([type=checkbox]):not([type=radio]), .issue-form select, .issue-search { width: 100%; }
 .issue-form .scope-option { display: flex; align-items: center; gap: 6px; }
 .issue-links { padding-left: 20px; overflow-wrap: anywhere; }
+.issue-answer { margin: 20px 0 28px; }
+.issue-form .answer-option { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 12px; cursor: pointer; font-size: 14px; overflow-wrap: anywhere; }
+.answer-option input { flex: none; margin-top: 4px; }
+.answer-option:has(input:checked) { border-color: var(--accent); }
+.answer-option:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.issue-form fieldset { min-width: 0; }
+.issue-form .scope-option { flex-wrap: wrap; overflow-wrap: anywhere; }
+.issue-form [hidden] { display: none; }
 .issue-discussion { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 750px) { .issues-layout { grid-template-columns: 1fr; } }
 </style>
@@ -1354,6 +1362,56 @@ function issueField(label, key, draft, multiline = false) {
     oninput: e => { draft[key] = e.target.value; }
   }, multiline ? draft[key] : null));
 }
+function issueQuestion(i) { return i.decision_question?.question || `How would you like to handle ${i.title}?`; }
+function issueContext(i) {
+  if (i.decision_question) return i.decision_question.context || i.body;
+  return [...(i.comments || [])].reverse().find(c => c.kind === "request")?.body || i.body;
+}
+function renderIssueAnswer(i, draft, threads, submit) {
+  const q = i.decision_question;
+  const version = i.question_version || 0;
+  if (draft.questionVersion !== version) {
+    draft.choice = q ? "" : "custom"; draft.questionVersion = version;
+  }
+  const custom = el("div", { hidden: draft.choice !== "custom" },
+    el("label", {}, "Your answer and exact scope of any approval", el("textarea", { name: "decision",
+      required: draft.choice === "custom", oninput: e => { draft.decision = e.target.value; } }, draft.decision)),
+    el("label", {}, "Record this answer as", el("select", { name: "outcome", onchange: e => { draft.outcome = e.target.value; } },
+      ["answered", "approved", "declined"].map(k => el("option", { value: k, selected: draft.outcome === k },
+        { answered: "Answer only", approved: "Approval for the selected scope", declined: "Decline for the selected scope" }[k])))));
+  const choose = id => {
+    draft.choice = id;
+    custom.hidden = id !== "custom";
+    custom.querySelector("textarea").required = id === "custom";
+  };
+  const option = (id, label, description, outcome, recommended) => el("label", { class: "answer-option" },
+    el("input", { type: "radio", name: "issue-answer", value: id, checked: draft.choice === id,
+      onchange: () => choose(id) }),
+    el("span", {}, el("strong", {}, label), recommended ? el("span", { class: "chip accent" }, "Recommended") : null,
+      description ? el("div", { class: "small" }, description) : null,
+      outcome ? el("div", { class: "small muted" }, { answered: "Records an answer", approved: "Records approval for the selected threads", declined: "Records a decline for the selected threads" }[outcome]) : null));
+  return el("form", { class: "issue-form issue-answer", onsubmit: e => { e.preventDefault();
+    if (!draft.choice) { issueError = "Choose an option or write your own answer."; render(); return; }
+    if (!draft.scopes.length) { issueError = "Select the threads this decision applies to."; render(); return; }
+    const payload = { thread_ids: draft.scopes, expected_question_version: version };
+    if (draft.choice === "custom") { payload.body = draft.decision; payload.outcome = draft.outcome; }
+    else payload.selected_option_id = draft.choice.slice(7);
+    submit("decisions", payload, () => { draft.choice = q ? "" : "custom"; draft.decision = ""; draft.scopes = []; });
+  } },
+    q ? el("fieldset", {}, el("legend", {}, "Choose your answer"),
+      [...q.options].sort((a, b) => Number(b.id === q.recommended_option_id) - Number(a.id === q.recommended_option_id))
+        .map(o => option("option:" + o.id, o.label, o.description, o.outcome, o.id === q.recommended_option_id)),
+      option("custom", "Write your own answer", "Reply in your own words or propose another option.")) :
+      el("p", { class: "small muted" }, "No suggested options were provided for this issue. Reply in your own words."),
+    custom,
+    el("fieldset", {}, el("legend", {}, "Applies only to these threads"), threads.map(l =>
+      el("label", { class: "scope-option" }, el("input", { type: "checkbox", value: l.thread_id,
+        checked: draft.scopes.includes(l.thread_id), onchange: e => {
+          draft.scopes = e.target.checked ? [...draft.scopes, l.thread_id] : draft.scopes.filter(id => id !== l.thread_id);
+        } }), `#${l.thread_id} ${l.title || ""}`, el("span", { class: "muted" }, l.project)))),
+    el("p", { class: "small muted" }, "Options are suggestions until you submit. Your answer applies only to the selected threads and does not mark implementation resolved."),
+    el("button", { type: "submit", disabled: issueBusy }, "Submit answer"));
+}
 function renderIssueDetail(i, human) {
   const draft = issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: [], resolution: "" };
   const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
@@ -1361,7 +1419,11 @@ function renderIssueDetail(i, human) {
   const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);
   return el("section", { class: "card", id: `issue-${i.id}` },
     el("div", { class: "meta" }, el("span", { class: "muted small" }, `Issue #${i.id}`), " ", issueStatus(i)),
-    el("h2", {}, i.title), el("p", { class: "issue-discussion" }, i.body),
+    el("h2", {}, issueQuestion(i)),
+    el("p", { class: "issue-discussion" }, issueContext(i)),
+    human && i.status !== "resolved" ? renderIssueAnswer(i, draft, threads, submit) : null,
+    el("h3", {}, "Issue context"), el("p", { class: "small muted" }, i.title),
+    issueContext(i) !== i.body ? el("p", { class: "issue-discussion" }, i.body) : null,
     issueSource && human ? el("div", { class: "card" },
       el("p", {}, `Link post #${issueSource.post_id} from thread #${issueSource.thread_id} to this issue?`),
       el("p", { class: "small muted" }, "Compare the cause and required fix before linking. Similar wording alone may describe a different blocker."),
@@ -1389,21 +1451,6 @@ function renderIssueDetail(i, human) {
       el("div", { class: "issue-discussion" }, d.body),
       el("div", { class: "small" }, "Applies to: ", d.thread_ids.map((id, n) => el("span", {}, n ? ", " : "",
         el("a", { href: `#thread-${id}` }, `thread #${id}`)))))),
-    human && i.status !== "resolved" ? el("details", {}, el("summary", {}, "Record a human decision"),
-      el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
-        if (!draft.scopes.length) { issueError = "Select the threads this decision applies to."; render(); return; }
-        submit("decisions", { body: draft.decision, outcome: draft.outcome, thread_ids: draft.scopes }, () => {
-          draft.decision = ""; draft.scopes = []; }); } },
-        el("label", {}, "Outcome", el("select", { name: "outcome", onchange: e => { draft.outcome = e.target.value; } },
-          ["answered", "approved", "declined"].map(k => el("option", { value: k, selected: draft.outcome === k }, k)))),
-        issueField("Answer and exact scope of any approval", "decision", draft, true),
-        el("fieldset", {}, el("legend", {}, "Applies only to these threads"), threads.map(l =>
-          el("label", { class: "scope-option" }, el("input", { type: "checkbox", value: l.thread_id,
-            checked: draft.scopes.includes(l.thread_id), onchange: e => {
-              draft.scopes = e.target.checked ? [...draft.scopes, l.thread_id] : draft.scopes.filter(id => id !== l.thread_id);
-            } }), `#${l.thread_id} ${l.title || ""}`, el("span", { class: "muted" }, l.project)))),
-        el("p", { class: "small muted" }, "Recording an answer does not mark implementation resolved or authorize work outside this scope."),
-        el("button", { type: "submit", disabled: issueBusy }, "Record decision"))) : null,
     el("h3", {}, "Resolution"),
     resolutions.length ? resolutions.map((r, index) => el("div", { class: "post issue-discussion", "data-resolution": r.id || index }, r.body,
       el("p", { class: "small muted" }, `${i.status === "resolved" && index === resolutions.length - 1 ? "Resolved" : "Previous resolution"} by ${r.agent} · ${ago(r.created_at)}`))) :
@@ -1584,7 +1631,7 @@ function render() {
   if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length + waitingIssues().length})`),
     el("div", { class: "small muted" }, "Shared issues awaiting a decision, plus unlinked posts needing a response."),
     waitingIssues().map(i => el("div", { class: "post", "data-issue": i.id },
-      el("a", { href: `#issue-${i.id}` }, `Issue #${i.id}: ${i.title}`),
+      el("a", { href: `#issue-${i.id}`, onclick: e => { e.preventDefault(); openIssue(i.id); } }, el("strong", {}, issueQuestion(i))),
       el("div", { class: "small muted" }, `${plural(new Set(i.links.map(l => l.thread_id)).size, "linked thread")} · Awaiting decision`))),
     state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post ny-side", "data-post": p.id, role: "button", tabindex: "0",
         title: `Open thread ${p.thread_id} at #${p.id}`,

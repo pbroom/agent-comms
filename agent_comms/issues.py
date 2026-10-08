@@ -28,6 +28,41 @@ def _body(board, value, field="body", limit=None):
     return value
 
 
+def _question(board, value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"question", "context", "options", "recommended_option_id"}:
+        raise Invalid("decision_question must contain question, context, options and recommended_option_id")
+    options = value.get("options")
+    if not isinstance(options, list) or len(options) != 2:
+        raise Invalid("decision_question requires exactly two options")
+    normalized = []
+    for option in options:
+        if not isinstance(option, dict) or set(option) - {"id", "label", "description", "outcome"}:
+            raise Invalid("invalid decision option")
+        outcome = option.get("outcome", "answered")
+        if outcome not in ("answered", "approved", "declined"):
+            raise Invalid("invalid option outcome")
+        description = option.get("description", "")
+        if not isinstance(description, str):
+            raise Invalid("option description must be text")
+        normalized.append({"id": _body(board, option.get("id"), "option id", 100),
+                           "label": _body(board, option.get("label"), "option label", 200),
+                           "description": description.strip(), "outcome": outcome})
+    ids = [o["id"] for o in normalized]
+    if len(set(ids)) != 2 or value.get("recommended_option_id") not in ids:
+        raise Invalid("options need unique ids and a recommended_option_id matching an option")
+    context = value.get("context", "")
+    if not isinstance(context, str):
+        raise Invalid("question context must be text")
+    result = {"question": _body(board, value.get("question"), "question", 500),
+              "context": context.strip(), "options": normalized,
+              "recommended_option_id": value["recommended_option_id"]}
+    if len(json.dumps(result).encode()) > board.s.body_max_bytes:
+        raise Invalid("decision_question exceeds size limit")
+    return result
+
+
 def _link_target(board, p, thread_id, post_id):
     thread = board._thread_row(thread_id)
     if thread["status"] == "closed" and not p.is_human:
@@ -82,10 +117,10 @@ def _write(board, p, session_id, issue_id=None, thread_id=None):
             raise LimitExceeded("issue discussion cap reached; ask the human in your own chat")
 
 
-def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None):
+def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None, decision=None):
     board.conn.execute(
-        """INSERT INTO issue_comments(issue_id,session_id,agent,kind,body,outcome,scope,created_at)
-        VALUES(?,?,?,?,?,?,?,?)""",
+        """INSERT INTO issue_comments(issue_id,session_id,agent,kind,body,outcome,scope,created_at,decision)
+        VALUES(?,?,?,?,?,?,?,?,?)""",
         (
             issue_id,
             session_id,
@@ -95,6 +130,7 @@ def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None)
             outcome,
             json.dumps(scope) if scope else None,
             board.now(),
+            json.dumps(decision) if decision else None,
         ),
     )
     board.conn.execute("UPDATE issues SET updated_at=? WHERE id=?", (board.now(), issue_id))
@@ -103,6 +139,7 @@ def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None)
 def get_issue(board, p, issue_id):
     out = dict(_row(board, issue_id))
     out["needs_human"] = bool(out["needs_human"])
+    out["decision_question"] = json.loads(out["decision_question"]) if out["decision_question"] else None
     for key in ("created_at", "updated_at"):
         out[key] = iso(out[key])
     out["links"] = [
@@ -133,6 +170,8 @@ def get_issue(board, p, issue_id):
                 projects=sorted({s["project"] for s in scope}),
                 scope=scope,
             )
+            if r["decision"]:
+                event.update(json.loads(r["decision"]))
             out["decisions"].append(event)
         elif r["kind"] == "resolution":
             out["resolutions"].append(event)
@@ -170,8 +209,9 @@ def list_issues(board, p, project=None, status=None, query=None, thread_id=None,
     ]
 
 
-def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, needs_human=True):
+def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, needs_human=True, decision_question=None):
     title, body = _body(board, title, "title", 200), _body(board, body)
+    question = _question(board, decision_question)
     if not isinstance(needs_human, bool):
         raise Invalid("needs_human must be boolean")
     with db.write_tx(board.conn) as c:
@@ -179,8 +219,8 @@ def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, 
         _link_target(board, p, thread_id, post_id)
         pending = int(needs_human or _source_needs_human(board, post_id))
         issue_id = c.execute(
-            "INSERT INTO issues(title,body,needs_human,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (title, body, pending, p.name, board.now(), board.now()),
+            "INSERT INTO issues(title,body,needs_human,created_by,created_at,updated_at,decision_question,question_version) VALUES(?,?,?,?,?,?,?,1)",
+            (title, body, pending, p.name, board.now(), board.now(), json.dumps(question) if question else None),
         ).lastrowid
         c.execute(
             "INSERT INTO issue_links(issue_id,thread_id,post_id,needs_human,agent,created_at) VALUES(?,?,?,?,?,?)",
@@ -221,30 +261,51 @@ def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
     return get_issue(board, p, issue_id)
 
 
-def comment_issue(board, p, session_id, issue_id, body, kind="comment"):
+def comment_issue(board, p, session_id, issue_id, body, kind="comment", decision_question=None):
     if kind not in ("comment", "evidence", "proposal", "request"):
         raise Invalid("kind must be comment, evidence, proposal, or request")
     body = _body(board, body)
+    if decision_question is not None and kind != "request":
+        raise Invalid("only request comments can set decision_question")
+    question = _question(board, decision_question)
     with db.write_tx(board.conn) as c:
         _row(board, issue_id)
         _write(board, p, session_id, issue_id)
         _event(board, p, session_id, issue_id, kind, body)
         if kind == "request":
+            c.execute("UPDATE issues SET decision_question=?,question_version=question_version+1 WHERE id=?",
+                      (json.dumps(question) if question else None, issue_id))
             c.execute("UPDATE issue_links SET needs_human=1 WHERE issue_id=?", (issue_id,))
             c.execute("UPDATE issues SET status='open',needs_human=1 WHERE id=?", (issue_id,))
     return get_issue(board, p, issue_id)
 
 
-def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answered"):
+def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answered", selected_option_id=None, expected_question_version=None):
     board._require_human(p, "decide a shared issue")
-    body = _body(board, body)
+    if selected_option_id is None:
+        body = _body(board, body)
     if outcome not in ("answered", "approved", "declined"):
         raise Invalid("outcome must be answered, approved, or declined")
     if not isinstance(thread_ids, list) or not thread_ids or any(type(t) is not int for t in thread_ids):
         raise Invalid("thread_ids must explicitly select linked threads")
     with db.write_tx(board.conn) as c:
-        _row(board, issue_id)
+        row = _row(board, issue_id)
         _write(board, p, session_id, issue_id)
+        if expected_question_version is not None and (
+            type(expected_question_version) is not int or expected_question_version != row["question_version"]
+        ):
+            raise Conflict("question changed; reload the issue before answering")
+        question = json.loads(row["decision_question"]) if row["decision_question"] else None
+        if selected_option_id is not None:
+            if expected_question_version is None:
+                raise Invalid("preset answers require expected_question_version")
+            option = next((o for o in question["options"] if o["id"] == selected_option_id), None) if question else None
+            if option is None:
+                raise Invalid("selected_option_id must match a current question option")
+            body = option["label"] + (" — " + option["description"] if option["description"] else "")
+            outcome = option["outcome"]
+        decision = {"decision_question": question, "question_version": row["question_version"],
+                    "selected_option_id": selected_option_id}
         linked = {
             r["thread_id"]: r["project"]
             for r in c.execute(
@@ -255,7 +316,7 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         if not set(thread_ids) <= linked.keys():
             raise Invalid("decision scope must contain only linked threads")
         scope = [{"thread_id": t, "project": linked[t]} for t in sorted(set(thread_ids))]
-        _event(board, p, session_id, issue_id, "decision", body, outcome, scope)
+        _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
         c.execute(
             "UPDATE issue_links SET needs_human=0 WHERE issue_id=? AND thread_id IN (SELECT value FROM json_each(?))",
             (issue_id, json.dumps(thread_ids)),

@@ -82,7 +82,9 @@ def test_mcp_issue_discovery_and_collaboration(env, monkeypatch):
                 assert not result.is_error, result
                 return json.loads(result.content[0].text)
 
-            created = await call("board_create_issue", {"title": "Permission", "body": "Same blocker", "thread_id": first})
+            from test_issues import question
+            created = await call("board_create_issue", {"title": "Permission", "body": "Same blocker", "thread_id": first, "decision_question": question()})
+            assert created["decision_question"]["question"] == question()["question"]
             issue_id = created["id"]
             await call("board_link_issue", {"issue_id": issue_id, "thread_id": second})
             await call("board_comment_issue", {"issue_id": issue_id, "body": "Fix suggestion", "kind": "proposal"})
@@ -94,3 +96,28 @@ def test_mcp_issue_discovery_and_collaboration(env, monkeypatch):
             assert detail["decisions"] == []
 
     asyncio.run(go())
+
+
+def test_http_question_answer_roundtrip_and_stale_selection(env):
+    from test_issues import question
+    client = TestClient(create_app(env.board))
+    tid = env.thread()
+    created = client.post('/api/issues', headers=headers(env), json={
+        'title': 'Choice', 'body': 'Details', 'thread_id': tid, 'decision_question': question()})
+    assert created.status_code == 200, created.text
+    path = f'/api/issues/{created.json()["id"]}'
+    payload = {'thread_ids': [tid], 'selected_option_id': 'keep', 'expected_question_version': 1}
+    assert client.post(path + '/decisions', headers=headers(env), json=payload).status_code == 403
+    answered = client.post(path + '/decisions', headers=headers(env, 'human'), json=payload)
+    assert answered.status_code == 200, answered.text
+    saved = client.get(path, headers=headers(env)).json()
+    assert saved['decisions'] == answered.json()['decisions']
+    assert saved['decisions'][0]['outcome'] == 'approved'
+    reopened = client.post(path + '/comments', headers=headers(env), json={
+        'body': 'New request', 'kind': 'request', 'decision_question': question()})
+    assert reopened.json()['question_version'] == 2
+    assert client.post(path + '/decisions', headers=headers(env, 'human'), json=payload).status_code == 409
+    custom = client.post(path + '/decisions', headers=headers(env, 'human'), json={
+        'thread_ids': [tid], 'body': 'My alternative', 'expected_question_version': 2})
+    assert custom.status_code == 200
+    assert custom.json()['decisions'][-1]['body'] == 'My alternative'

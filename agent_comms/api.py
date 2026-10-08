@@ -85,6 +85,7 @@ class PostIn(Body):
 
 
 class IssueIn(Body):
+    decision_question: dict | None = None
     title: str
     body: str
     thread_id: int
@@ -100,13 +101,16 @@ class IssueLinkIn(Body):
 
 
 class IssueCommentIn(Body):
+    decision_question: dict | None = None
     body: str
     kind: Literal["comment", "evidence", "proposal", "request"] = "comment"
     session_id: int | None = None
 
 
 class IssueDecisionIn(Body):
-    body: str
+    selected_option_id: str | None = None
+    expected_question_version: int | None = None
+    body: str | None = None
     thread_ids: list[int]
     outcome: Literal["answered", "approved", "declined"] = "answered"
     session_id: int | None = None
