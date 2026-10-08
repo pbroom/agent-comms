@@ -529,7 +529,7 @@ function renderPost(p, human) {
     p.task_id ? chip("task " + p.task_id) : null,
     p.sealed ? chip("🔒 sealed", "seal") : null,
     p.was_sealed && !p.sealed ? chip("unsealed by " + p.unsealed_by, "seal") : null,
-    p.attention_resolution ? chip("attention resolved") : p.needs_response ? chip("needs response", "warn") : null,
+    p.attention_resolution ? chip("attention resolved") : p.needs_response && !(p.requests?.length && p.requests.every(r => r.state === "finished")) ? chip("needs response", "warn") : null,
     p.type === "decision" ? (p.decision_status === "final" ? chip("FINAL", "ok") : chip("proposal - not binding", "warn")) : null,
     el("span", { class: "muted", title: p.created_at }, ago(p.created_at)),
     ...allIssues().filter(i => i.links.some(l => l.post_id === p.id)).map(i =>
