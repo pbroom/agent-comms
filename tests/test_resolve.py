@@ -242,11 +242,20 @@ def test_approve_launch_rolls_back_the_rule_when_the_post_fails(renv, monkeypatc
 
 def test_approve_launch_reuses_an_active_rule_with_launches_left(renv):
     e = renv
-    existing = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="parser work",
-                                            max_launches=2)
     a = ask(e)
+    # A rule with another purpose does not cover the author (its purpose would be quoted in the launch prompt).
+    unrelated = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="parser work",
+                                             max_launches=2)
     out = call(e, a["id"], "approve_launch").json()
-    assert out["rule_id"] is None and [r["id"] for r in rules(e)] == [existing["id"]]
+    assert out["rule_id"] is not None and out["rule_id"] != unrelated["id"]
+    e.board.revoke_dispatch_rule(e.p["human"], unrelated["id"])
+    e.board.revoke_dispatch_rule(e.p["human"], out["rule_id"])
+    a = ask(e)
+    existing = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"],
+                                            purpose=resolve.PURPOSE.format(post=a["id"], thread=e.tid), max_launches=2)
+    before = [r["id"] for r in rules(e)]
+    out = call(e, a["id"], "approve_launch").json()
+    assert out["rule_id"] is None and [r["id"] for r in rules(e)] == before
     # An exhausted rule no longer counts: a fresh one-shot rule is approved.
     e.board.take_dispatch_launch(e.p["human"], existing["id"], "codex")
     e.board.take_dispatch_launch(e.p["human"], existing["id"], "codex")

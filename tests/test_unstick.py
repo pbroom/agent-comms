@@ -181,8 +181,8 @@ def test_body_for_one_agent_lists_ids(uenv):
 
 def test_no_duplicate_rule_when_an_active_rule_covers_the_agents(uenv):
     e = uenv
-    existing = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="parser work",
-                                            max_launches=3)
+    existing = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"],
+                                            purpose=unstick.PURPOSE.format(thread=e.tid), max_launches=3)
     ask(e, "claude", ["codex"])
     out = call(e).json()
     assert out["rule_id"] is None and out["agents"] == ["codex"]
@@ -199,6 +199,42 @@ def test_no_duplicate_rule_when_an_active_rule_covers_the_agents(uenv):
     e.clock.advance(unstick.UNSTICK_COOLDOWN_SECONDS + 1)
     out = call(e).json()
     assert next(r for r in rules(e) if r["id"] == out["rule_id"])["agents"] == ["codex"]
+
+
+def test_coverage_is_per_agent_purpose_and_launches_left(uenv):
+    e = uenv
+    # A rule with another purpose does not cover: the dispatcher would quote that purpose in the launch prompt.
+    other = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex", "grok"],
+                                         purpose="parser work", max_launches=5)
+    ask(e, "claude", ["codex"])
+    out = call(e).json()
+    new = next(r for r in rules(e) if r["id"] == out["rule_id"])
+    assert new["agents"] == ["codex"] and new["purpose"] == unstick.PURPOSE.format(thread=e.tid)
+    e.board.revoke_dispatch_rule(e.p["human"], other["id"])
+    e.board.revoke_dispatch_rule(e.p["human"], new["id"])
+    # A same-purpose rule shared by two agents with one launch left covers only one of them.
+    shared = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex", "grok"],
+                                          purpose=unstick.PURPOSE.format(thread=e.tid), max_launches=1)
+    ask(e, "claude", ["grok"])
+    e.clock.advance(unstick.UNSTICK_COOLDOWN_SECONDS + 1)
+    out = call(e).json()
+    assert out["agents"] == ["codex", "grok"]
+    new = next(r for r in rules(e) if r["id"] == out["rule_id"])
+    assert new["agents"] == ["grok"] and new["max_launches"] == 1 and shared["id"] != new["id"]
+
+
+def test_dispatcher_uses_the_newest_rule_so_the_one_click_purpose_is_quoted(uenv):
+    from agent_comms.dispatch import Dispatcher
+    e = uenv
+    old = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="parser work",
+                                       max_launches=5)
+    e.clock.advance(1)
+    new = e.board.create_dispatch_rule(e.p["human"], thread_id=e.tid, agents=["codex"], purpose="one click",
+                                       max_launches=1)
+    rs = e.board.active_dispatch_rules(e.p["human"])
+    item = {"thread_id": e.tid, "agent": "codex", "post_created_at": e.board.now()}
+    assert Dispatcher._rule_for(None, rs, item)["id"] == new["id"]
+    assert Dispatcher._rule_for(None, rs, item | {"post_created_at": e.board.now() - 1})["id"] == old["id"]
 
 
 def test_rate_limit_per_thread(uenv):

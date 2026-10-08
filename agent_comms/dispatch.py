@@ -679,8 +679,11 @@ class Dispatcher:
         return acked is not None and acked >= seq
 
     def _rule_for(self, rules: list[dict], item: dict) -> dict | None:
-        return next((r for r in rules if r["thread_id"] == item["thread_id"] and item["agent"] in r["agents"]
-                     and r["created_at_ts"] <= item["post_created_at"]), None)
+        # The newest approval at or before the post: a one-click action (Unstick, Approve & launch) creates its own
+        # rule just before its post, and that rule's purpose, not an older workstream's, belongs in the prompt.
+        return max((r for r in rules if r["thread_id"] == item["thread_id"] and item["agent"] in r["agents"]
+                    and r["created_at_ts"] <= item["post_created_at"]),
+                   key=lambda r: (r["created_at_ts"], r["id"]), default=None)
 
     def _launch_due(self, pending: dict[str, dict], now: float, foreign: list[dict] | None = None) -> None:
         if not pending:

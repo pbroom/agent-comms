@@ -722,9 +722,12 @@ reads ids, agent names, flags, statuses and times only, like the dispatcher's tr
   No post body, title, summary, task title or ref is read, so nothing an agent wrote reaches the post, the purpose
   or the dispatcher's launch prompt (which stays the fixed `PROMPT_TEMPLATE`).
 - *One-shot budget.* The rule names exactly the stuck agents that no active rule for the thread already covers
-  (an active rule with launches left already triggers on the new post), `max_launches` = that number of agents,
+  (an active rule on this thread that names the agent, has the same purpose and still has a launch left for it after
+  the other covered agents take theirs), `max_launches` = that number of agents,
   expiring after 6 hours. It is an ordinary dispatcher rule: visible on the Settings page, revocable, and subject
-  to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any other.
+  to pause, live-session, one-run-per-agent, `max_concurrent` and timeout like any other. When several active rules
+  match a post, the dispatcher uses the newest one created at or before it, so the one-click rule's purpose (not an
+  older workstream's) is the one quoted in the launch prompt.
 - *Rule before post.* The dispatcher ignores posts created before a rule, so the rule is written first. If the
   post then fails, the rule is revoked and the cooldown cleared.
 - *Bounded.* One unstick per thread per 2 minutes (a `board_state` stamp checked and set in one write transaction,

@@ -350,7 +350,8 @@ answered, a task it marked blocked, or a task lease it let expire), the thread h
 dialog (the click is your approval, and some embedded browsers block confirmation dialogs anyway). The board:
 
 1. works out which agents the thread is waiting on, from the database (the server decides, not the page);
-2. approves a one-shot dispatcher rule for the agents that no active rule for this thread already covers:
+2. approves a one-shot dispatcher rule for the agents that no active rule for this thread already covers
+   (same agent, same purpose, a launch left for each):
    one launch each, expiring in 6 hours, purpose "Unstick thread N: diagnose why it stalled, resolve it,
    and propose a prevention; stay within the thread's existing request";
 3. posts a `request` as you to those agents, with fixed text naming only post ids, task ids and agent

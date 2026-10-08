@@ -46,21 +46,38 @@ def release_cooldown(board: Board, key: str) -> None:
         c.execute("DELETE FROM board_state WHERE key = ?", (key,))
 
 
+def uncovered_agents(board: Board, p: Principal, thread_id: int, agents: list[str], purpose: str) -> list[str]:
+    """The agents no active rule already covers for this launch. A rule covers an agent only when it is on this
+    thread, names that agent, has the same purpose (the dispatcher quotes it in the launch prompt, so another
+    rule's purpose would launch the agent for something else) and still has a launch left for it. A rule's budget
+    is shared by its agents, so each covered agent spends one of its launches here."""
+    purpose = " ".join(purpose.split())          # stored purposes are whitespace-normalized
+    rules = [r for r in board.active_dispatch_rules(p) if r["thread_id"] == thread_id and r["purpose"] == purpose]
+    left = {r["id"]: r["launches_left"] or 0 for r in rules}
+    out = []
+    for agent in agents:
+        rule = next((r for r in rules if agent in r["agents"] and left[r["id"]] > 0), None)
+        if rule is None:
+            out.append(agent)
+        else:
+            left[rule["id"]] -= 1
+    return out
+
+
 def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type: str, to: list[str],
                   needs_response: bool, launch: list[str] | None = None,
                   purpose: str | None = None, answer_to: list[int] | None = None, answer_recipient: str | None = None,
                   post_check: Callable[[], None] | None = None,
                   post_hook: Callable[[dict], None] | None = None) -> tuple[dict, dict | None]:
     """Post fixed text as the human, in the human's own board session. With `launch`, first approve a one-shot
-    dispatcher rule (one launch each, RULE_HOURS) for those agents that no active rule on this thread already
-    covers. The rule comes first because the dispatcher only triggers on posts created at or after a rule; if the
+    dispatcher rule (one launch each, RULE_HOURS) for those agents that no active rule already covers
+    (`uncovered_agents`: same thread, agent, purpose, and a launch left for each). The rule comes first because the dispatcher only triggers on posts created at or after a rule; if the
     post then fails, the rule is revoked. Returns (post, rule or None)."""
     board._require_human(p, "post as the human")
     rule = None
     try:
         if launch:
-            covered = {a for r in board.active_dispatch_rules(p) if r["thread_id"] == thread_id for a in r["agents"]}
-            uncovered = [a for a in launch if a not in covered]
+            uncovered = uncovered_agents(board, p, thread_id, launch, purpose or "")
             if uncovered:
                 rule = board.create_dispatch_rule(p, thread_id=thread_id, agents=uncovered, purpose=purpose or "",
                                                   max_launches=len(uncovered),
