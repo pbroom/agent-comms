@@ -118,7 +118,9 @@ test('all recipients explicitly finished settle the thread despite unseen eviden
   const target = thread(1, [post(10, [request('codex', 'finished'), request('claude', 'finished')], { agent: 'human' }),
     post(11, [], { type: 'status', agent: 'codex', to: ['claude'], needs_response: false, body: 'Verified the fix' })]);
   const other = thread(2, [post(20, [request('claude')], { thread_id: 2, agent: 'human' })]);
-  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{}', 'agent-comms-thread': '2' } });
+  // Seen in this browser already: an unseen post would bring the thread back with a "New posts" dot (a browser
+  // convenience, tested in dashboard-review-fixes), which is not what this test is about.
+  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{"1":11,"2":20}', 'agent-comms-thread': '2' } });
   try {
     assert.equal(page.document.querySelector('tr[data-thread="1"]'), null, 'completed work is hidden by default');
     page.document.getElementById('show-completed').click();
@@ -131,7 +133,7 @@ test('all recipients explicitly finished settle the thread despite unseen eviden
 test('an addressed FYI without response intent never creates blue pickup', async () => {
   const target = thread(1, [post(10, [], { type: 'status', agent: 'codex', to: ['claude'], needs_response: false })]);
   const other = thread(2, [post(20, [request('claude')], { thread_id: 2, agent: 'human' })]);
-  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{}', 'agent-comms-thread': '2' } });
+  const page = await setup({ threads: [target, other], storage: { 'agent-comms-seen': '{"1":10,"2":20}', 'agent-comms-thread': '2' } });
   try {
     page.document.getElementById('show-completed').click();
     await settle();

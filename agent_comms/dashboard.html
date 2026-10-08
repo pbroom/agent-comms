@@ -487,6 +487,11 @@ const threadPosts = {};    // thread id -> older posts fetched to show a deep-li
 const SELECTED_KEY = "agent-comms-thread";
 let selected = Number(load(SELECTED_KEY)) || null;
 const opened = new Set();  // threads shown on the right since this page loaded: kept listed even once settled
+// New posts: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor). It
+// only brings a settled or completed thread back with a blue dot until it is opened; it never acknowledges agent
+// work (pickup and completion come from the server's request records).
+const SEEN_KEY = "agent-comms-seen";
+let seen = null;
 // Thread list order, remembered per browser: "priority", "activity" (last updated) or "created".
 const SORT_KEY = "agent-comms-sort";
 const SORTS = { priority: "Priority", activity: "Recent activity", created: "Newest first" };
@@ -1215,6 +1220,37 @@ function selectThread(id) {
   highlight = focus = null; scrollToThread = true;
   try { history.replaceState(null, "", "#thread-" + id); } catch (e) {}
   render();
+}
+
+function loadSeen() {
+  if (seen) return;
+  try { seen = JSON.parse(load(SEEN_KEY) || "null"); } catch (e) { seen = null; }
+  if (!seen || typeof seen !== "object" || Array.isArray(seen)) {
+    // First visit in this browser: everything already here counts as seen, so nothing lights up at once.
+    seen = {};
+    for (const t of state.threads) seen[t.id] = newestId(t);
+    store(SEEN_KEY, JSON.stringify(seen));
+  }
+}
+function newestId(t, filter = () => true) {
+  return postsOf(t).filter(filter).reduce((m, p) => Math.max(m, p.id), 0);
+}
+function markSeen(t) {
+  const id = newestId(t);
+  if (!seen || (Number(seen[t.id]) || 0) >= id) return;
+  seen[t.id] = id;
+  store(SEEN_KEY, JSON.stringify(seen));
+}
+// A post by someone else that this browser has not shown yet, in an open thread.
+function hasNewPosts(t) {
+  return !!seen && t.status === "open" && newestId(t, p => p.agent !== state.me.name) > (Number(seen[t.id]) || 0);
+}
+// The work status, unless the thread has settled (completed, or nothing to flag) and has new posts: then a blue
+// "New posts" dot, which brings a completed thread back into the list until it is opened.
+function listStatus(t, human) {
+  const st = threadStatus(t, human);
+  if ((!st || st.kind === "done") && hasNewPosts(t)) return { kind: "unread", label: "New posts", newPosts: true };
+  return st;
 }
 
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
@@ -2420,7 +2456,8 @@ function draw(app) {
     const holder = state.threads.find(t => postsOf(t).some(p => p.id === highlight.id));
     if (holder) selected = holder.id;
   }
-  const statuses = new Map(state.threads.map(t => [t.id, threadStatus(t, human)]));
+  loadSeen();
+  const statuses = new Map(state.threads.map(t => [t.id, listStatus(t, human)]));
   const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
   const all = sortedThreads(statuses);
   // Completed threads are hidden unless "Show completed" is on (or a link points at one).
@@ -2435,7 +2472,10 @@ function draw(app) {
     pane.append(...renderIssuePane(current, human));
   } else {
     const current = threads.find(t => t.id === selected) || threads[0] || null;
-    if (current) opened.add(current.id);
+    if (current) {
+      opened.add(current.id); markSeen(current);
+      if ((statuses.get(current.id) || {}).newPosts) statuses.set(current.id, listStatus(current, human));
+    }
     list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
     if (current) {
       const linked = allIssues().filter(i => i.links.some(l => l.thread_id === current.id));
