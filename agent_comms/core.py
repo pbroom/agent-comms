@@ -1520,9 +1520,16 @@ class Board:
     # The dashboard's "Needs you" (also counted by the menu bar summary, agent_comms/summary.py): a needs-response
     # post addressed to the human or to no one, or a decision awaiting finalize, with no later human post in its
     # thread. Human-only; the human sees every post, so no visibility predicate is needed.
+    # Waiting on the human: needs-response posts addressed to nobody or to the human; open (unfinalized) decisions;
+    # and agents' proposals addressed to nobody or to the human, which need the human's yes or no (a proposal
+    # that only proposes a task is left to the task flow, and one addressed to agents is between agents).
     NEEDS_YOU = """((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                         JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1)))
-                     OR (p.type = 'decision' AND p.final = 0))
+                     OR (p.type = 'decision' AND p.final = 0)
+                     OR (p.type = 'proposal' AND p.task_id IS NULL
+                         AND EXISTS (SELECT 1 FROM agents pa WHERE pa.name = p.agent AND pa.is_human = 0)
+                         AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
+                              JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))))
                    AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
                                    WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)"""
 

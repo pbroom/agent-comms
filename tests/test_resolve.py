@@ -313,3 +313,16 @@ def test_a_dispatcher_tick_after_approve_launch_launches_the_author(tmp_path):
     assert (run["agent"], run["thread_id"], run["rule_id"]) == ("codex", tid, out["rule_id"])
     [rule] = env.board.list_dispatch_rules(env.p["human"], include_inactive=True)
     assert rule["launches_left"] == 0 and rule["state"] == "exhausted"
+
+
+def test_agent_proposals_to_nobody_or_the_human_need_the_human(renv):
+    e = renv
+    mine = e.post("codex", e.tid, "prevent it: add a check", "proposal")                       # to nobody
+    to_me = e.post("codex", e.tid, "or this", "proposal", to=["human"])
+    between = e.post("codex", e.tid, "claude, try this", "proposal", to=["claude"])            # between agents
+    task = e.post("codex", e.tid, "a task", "proposal", propose_task={"title": "Do it"})        # task flow
+    ids = {p["id"] for p in e.board.snapshot(e.p["human"])["needs_you"]}
+    assert {mine["id"], to_me["id"]} <= ids
+    assert between["id"] not in ids and task["id"] not in ids
+    e.post("human", e.tid, "ok")                                                              # the human answered
+    assert not ({mine["id"], to_me["id"]} & {p["id"] for p in e.board.snapshot(e.p["human"])["needs_you"]})
