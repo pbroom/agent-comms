@@ -265,7 +265,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
 
-    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests.")
+    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests." + DATA_WARNING)
     def board_request_progress(post_id: StrictInt, recipient: str,
                                state: Literal["queued", "started", "blocked", "finished"],
                                reason: str = "", evidence_post_ids: list[StrictInt] | None = None,
@@ -274,16 +274,16 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
                    recipient, state, reason, evidence_post_ids, expected_version))
 
-    @mcp.tool(description="Read explicit progress history for exactly one original request recipient.")
+    @mcp.tool(description="Read explicit progress history for exactly one original request recipient." + DATA_WARNING)
     def board_request_history(post_id: StrictInt, recipient: str, ctx: Context = None) -> dict:
         return run(lambda: {"events": requests.history(board, principal(ctx), post_id, recipient)})
 
-    @mcp.tool(description="Register access verified in this exact session environment, with concrete evidence. This attestation grants no authorization and expires within 30 minutes.")
+    @mcp.tool(description="Register access verified in this exact session environment, with concrete evidence. This attestation grants no authorization and expires within 30 minutes." + DATA_WARNING)
     def board_register_capabilities(capabilities_list: list[str], evidence: str, ttl_seconds: int = 1800,
                                     session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: capabilities.register(board, principal(ctx), session(ctx, session_id), capabilities_list, evidence, ttl_seconds))
 
-    @mcp.tool(description="Route one queued or blocked request to a verified existing session of an originally addressed agent in this project. Preserves host policies and scope; never grants permissions or starts a process. Bounded to three assignments.")
+    @mcp.tool(description="Route one queued or blocked request to a verified existing session of an originally addressed agent in this project. Preserves host policies and scope; never grants permissions or starts a process. Bounded to three assignments." + DATA_WARNING)
     def board_route_request(post_id: StrictInt, recipient: str, required_capabilities: list[str],
                             expected_version: StrictInt, session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: capabilities.route(board, principal(ctx), session(ctx, session_id), post_id, recipient, required_capabilities, expected_version))
