@@ -702,16 +702,23 @@ def _delivery_run_ids(board, managed):
     return run_ids
 
 
+def _awaiting_delivery(managed, row):
+    """Nobody has picked the continuation up: its request is blocked, or still queued for the fallback session (or
+    for no session). Started (for example picked up by hand) or finished work is never reset."""
+    return row['state'] == 'blocked' or (
+        row['state'] == 'queued' and row['assigned_session'] in (None, managed['fallback_session']))
+
+
 def delivery_reset(board, managed):
     """Human-only dashboard metadata for reset_delivery: {'reserved', 'resettable'}. `resettable` when a fallback
     delivery is stuck (its run is still reserved, or ended without registering and was not reset yet, so the
     dispatcher will not try again) and nothing for this post is active: when reset_delivery would act. Ids and
     states only; reset_delivery repeats every check under the write lock."""
     reserved = managed['dispatch_run_id'] is not None
-    row = board.conn.execute('SELECT state FROM request_progress WHERE post_id=? AND recipient=?',
+    row = board.conn.execute('SELECT state,assigned_session FROM request_progress WHERE post_id=? AND recipient=?',
                              (managed['post_id'], managed['recipient'])).fetchone()
     thread = board.conn.execute('SELECT status FROM threads WHERE id=?', (managed['thread_id'],)).fetchone()
-    if (managed['epoch'] < 1 or row is None or row['state'] == 'finished'
+    if (managed['epoch'] < 1 or row is None or not _awaiting_delivery(managed, row)
             or thread is None or thread['status'] != 'open'):
         return {'reserved': reserved, 'resettable': False}
     run_ids = [r for r in _delivery_run_ids(board, managed) if isinstance(r, str)]
@@ -739,6 +746,8 @@ def reset_delivery(board, p, session_id, post_id, expected_version):
             raise Conflict('continuation changed; reread before resetting its delivery')
         if row['state'] == 'finished':
             raise Conflict('continuation is already finished')
+        if not _awaiting_delivery(managed, row):
+            raise Conflict('the continuation was picked up; only a blocked or still-queued delivery can be reset')
         if board._thread_row(managed['thread_id'])['status'] != 'open':
             raise Conflict('continuation thread must be open')
         if managed['epoch'] < 1:

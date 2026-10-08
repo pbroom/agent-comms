@@ -324,3 +324,30 @@ def test_human_sees_when_a_stuck_delivery_can_be_reset(delivery_env):
     workstreams.reset_delivery(env.board, env.p['human'], env.sid['human'], post['id'],
                                current(stack, post)['version'])
     assert reset_state() == {'reserved': False, 'resettable': False}
+
+
+def test_a_delivery_picked_up_by_hand_is_not_offered_or_reset(delivery_env):
+    from fastapi.testclient import TestClient
+    from agent_comms.api import create_app
+    stack, worker, rule, post = delivery_env
+    env = stack['env']
+    env.spawner.fail_for.add('claude-fake')
+    worker.tick()                                                         # the delivery failed to start
+    worker.tick()                                                         # and its reservation was released
+
+    def reset_state():
+        return env.board.get_post(env.p['human'], post['id'])['continuation']['delivery_reset']
+    assert current(stack, post)['state'] == 'blocked' and reset_state()['resettable']
+    probe(stack, 'claude', activity='active')                            # the fallback picks it up by hand
+    requests.progress(env.board, env.p['claude'], env.sid['claude'], post['id'], 'codex', 'started',
+                      expected_version=current(stack, post)['version'])
+    row = current(stack, post)
+    assert (row['state'], row['assigned_session']) == ('started', env.sid['claude'])
+    assert reset_state() == {'reserved': False, 'resettable': False}
+    managed = workstreams.get_for_post(env.board, post['id'])
+    r = TestClient(create_app(env.board)).post(f"/api/posts/{post['id']}/continuation/reset-delivery",
+        json={'expected_version': row['version']}, headers={'Authorization': f"Bearer {env.tokens['human']}"})
+    assert r.status_code == 409 and 'picked up' in r.json()['message']
+    after = workstreams.get_for_post(env.board, post['id'])
+    assert (after['deadline'], after['blocker']) == (managed['deadline'], managed['blocker'])
+    assert current(stack, post) == row
