@@ -124,6 +124,8 @@ td > .convo, .post > .convo { display: flex; margin-top: 3px; }
 .unstick-note { margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: var(--chip); display: flex;
   gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .unstick-note.failed { color: var(--bad); background: var(--bad-bg); }
+.unstick-note > .convo-list { flex-basis: 100%; margin-top: 0; }
+a.unstick-chip { text-decoration: none; }
 .convo-list { display: flex; gap: 6px 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
 </style>
 </head>
@@ -167,7 +169,12 @@ let sortMode = SORTS[load(SORT_KEY)] ? load(SORT_KEY) : "activity";
 // Work handed to an agent is "pending" (grey pulse) for STALL_MINUTES plus a short grace, then "stalled" (amber).
 const STALL_MINUTES = 30, GRACE_MINUTES = 10;
 // Unstick (thread header, human only): the result of the last click, shown under the header until dismissed.
+// A click sends at once (no window.confirm: embedded browsers block it, and the human asked for one click).
 let unstickBusy = false, unstickNote = null;   // { threadId, text, failed }
+// The last successful Unstick per thread, for this page load only: who it went to (`agents`), the live sessions
+// the server named (`sessionIds`), the request's post id and when it was sent (`at`, whole seconds, epoch ms).
+// Sessions of those agents that started at or after `at` (a dispatcher launch registers a new one) received it too.
+const lastUnstick = {};   // thread id -> { threadId, agents, sessionIds, postId, at }
 
 setFocusFromHash();
 
@@ -378,13 +385,17 @@ function conversationLinks(c, who) {
     if (!m) continue;
     const cmd = kind.command(m[1]);
     const cwd = typeof c.cwd === "string" ? c.cwd : "";
-    const label = `${who ? who + ": " : ""}open this conversation in the ${kind.app} app`;
+    // A Claude Code subagent has no conversation of its own: the link opens the parent conversation that ran it.
+    const parent = c.subagent === true;
+    const label = `${who ? who + ": " : ""}` + (parent ? `open the parent conversation (this session is one of its subagents) in the ${kind.app} app`
+      : `open this conversation in the ${kind.app} app`);
     const copy = el("button", { class: "copy-resume", "data-command": cmd,
       title: `Copy “${cmd}”` + (cwd ? ` and run it in ${cwd}` : ""), "aria-label": `Copy resume command${who ? " for " + who : ""}` },
       "Copy resume");
     copy.addEventListener("click", e => { e.stopPropagation(); copyText(cmd, copy); });
     return el("span", { class: "convo" },
-      el("a", { class: "chip accent", href: c.url, rel: "noopener noreferrer", title: label, "aria-label": label }, "Open in " + kind.app),
+      el("a", { class: "chip accent", href: c.url, rel: "noopener noreferrer", title: label, "aria-label": label },
+        (parent ? "Open parent conversation in " : "Open in ") + kind.app),
       copy);
   }
   return null;
@@ -904,8 +915,29 @@ function statusDot(st) {
 function unstickRowButton(t, st, human) {
   if (!human || !st || st.kind !== "stalled" || !st.agents || !st.agents.length) return null;
   return el("button", { class: "unstick-row", "data-unstick": t.id, disabled: unstickBusy,
-    title: `Ask ${names(st.agents)} to find and fix why this thread is stuck`,
-    onclick: e => { e.stopPropagation(); selectThread(t.id); unstickThread(t, st.agents); } }, "Unstick");
+    title: unstickTitle(st.agents),
+    onclick: e => { e.stopPropagation(); selectThread(t.id); unstickThread(t); } }, "Unstick");
+}
+
+function unstickTitle(agents) {
+  return `Ask ${names(agents)} to find and fix why this thread is stuck. Sends at once: posts a request as you and ` +
+    `launches ${agents.length === 1 ? "it" : "each"} once if not already running (uses tokens).`;
+}
+
+// The sessions that received a thread's last Unstick: the live ones the server named, plus sessions of the same
+// agents that started at or after the click (a dispatcher launch). In the server's order (last seen first).
+function unstickReceivers(u) {
+  if (!u || !state) return [];
+  return state.sessions.filter(s => u.agents.includes(s.agent)
+    && (u.sessionIds.includes(s.id) || Date.parse(s.started_at) >= u.at));
+}
+
+function unstickSessionsLine(u) {
+  const got = unstickReceivers(u);
+  return el("div", { class: "convo-list", id: "unstick-sessions" },
+    el("span", { class: "muted" }, got.length ? "Received in:" : "No session has picked it up yet."),
+    got.map(s => el("span", { class: "convo", "data-session": s.id }, el("span", {}, `s${s.id} ${s.agent}`),
+      conversationLinks(s.conversation, s.agent))));
 }
 
 function renderThreadList(threads, current, human, statuses, hidden) {
@@ -970,15 +1002,18 @@ function unstickMessage(r) {
   return out.join(" ");
 }
 
-async function unstickThread(t, agents) {
+// The click is the approval: it sends at once. The busy flag (and the server's one-per-2-minutes rule per thread)
+// keeps a double click from posting twice.
+async function unstickThread(t) {
   if (unstickBusy) return;
-  const one = agents.length === 1, who = names(agents);
-  if (!confirm(`Ask ${who} to find and fix why this thread is stuck? This posts a request as you and, if ${who} ` +
-    `${one ? "isn't" : "aren't"} already running, launches ${one ? "it" : "each"} once (uses ${one ? "its" : "their"} tokens).`)) return;
   unstickBusy = true; render();
+  const at = Math.floor(Date.now() / 1000) * 1000;   // session start times are whole seconds
   try {
     const r = await api("POST", `/api/threads/${t.id}/unstick`);
     unstickNote = { threadId: t.id, text: unstickMessage(r), failed: false }; lastError = "";
+    lastUnstick[t.id] = { threadId: t.id, at, postId: Number.isInteger(r.post_id) ? r.post_id : null,
+      agents: Array.isArray(r.agents) ? r.agents.filter(a => typeof a === "string") : [],
+      sessionIds: Array.isArray(r.sessions) ? r.sessions.filter(Number.isInteger) : [] };
   } catch (e) {
     lastError = e.message; unstickNote = { threadId: t.id, text: `Unstick failed: ${e.message}`, failed: true };
     unstickBusy = false; return render();
@@ -1006,10 +1041,11 @@ function renderThread(t, human, st) {
       el("span", { class: "muted small" }, t.project),
       human ? el("button", { onclick: () => act("POST", `/api/threads/${t.id}/${t.status === "open" ? "close" : "reopen"}`) }, t.status === "open" ? "Close" : "Reopen") : null,
       human && st && st.kind === "stalled" && st.agents && st.agents.length ? el("button", { id: "unstick", disabled: unstickBusy,
-        title: `Ask ${names(st.agents)} to find and fix why this thread is stuck`, onclick: () => unstickThread(t, st.agents) }, "Unstick") : null),
+        title: unstickTitle(st.agents), onclick: () => unstickThread(t) }, "Unstick") : null),
     human && unstickNote && unstickNote.threadId === t.id ? el("div", { class: "unstick-note small" + (unstickNote.failed ? " failed" : ""),
       id: "unstick-result", role: "status" }, el("span", {}, unstickNote.text),
-      el("button", { onclick: () => { unstickNote = null; render(); } }, "Dismiss")) : null,
+      el("button", { onclick: () => { unstickNote = null; render(); } }, "Dismiss"),
+      !unstickNote.failed && lastUnstick[t.id] ? unstickSessionsLine(lastUnstick[t.id]) : null) : null,
     working.length ? el("div", { class: "convo-list small", id: "working-conversations" }, el("span", { class: "muted" }, "Working:"), working) : null,
     el("div", { class: "small muted", style: "margin-top:6px" }, `agent posts since your last post: ${t.agent_posts_since_human} / ${t.thread_cap}`),
     el("div", { class: "meter" + (pct >= 100 ? " full" : "") }, el("div", { style: `width:${pct}%` })),
@@ -1118,9 +1154,17 @@ function render() {
     state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post" },
       el("div", { class: "meta" }, el("a", { href: `#post-${p.id}` }, el("strong", {}, `#${p.id}`)), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
       el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : el("div", { class: "muted small" }, "Nothing waiting.")));
-  right.append(el("section", { class: "card" }, el("h2", {}, "Sessions"),
-    state.sessions.map(s => el("div", { class: "post small" },
-      el("div", {}, el("strong", {}, `s${s.id} ${s.agent}`), " ", el("span", { class: "muted" }, s.runtime)),
+  // Sessions, in the server's order (last seen first); never re-sorted here. A session that received an Unstick
+  // this page load carries a chip naming the request, next to its conversation link.
+  const received = new Map();   // session id -> [unstick]
+  if (human) for (const u of Object.values(lastUnstick)) for (const s of unstickReceivers(u))
+    received.set(s.id, [...(received.get(s.id) || []), u]);
+  right.append(el("section", { class: "card", id: "sessions" }, el("h2", {}, "Sessions"),
+    state.sessions.map(s => el("div", { class: "post small", "data-session": s.id },
+      el("div", {}, el("strong", {}, `s${s.id} ${s.agent}`), " ", el("span", { class: "muted" }, s.runtime),
+        (received.get(s.id) || []).flatMap(u => [" ", el("a", { class: "chip warn unstick-chip",
+          href: u.postId ? `#post-${u.postId}` : `#thread-${u.threadId}`,
+          title: `Received the Unstick request for thread #${u.threadId}` }, u.postId ? `Unstick #${u.postId}` : "Unstick")])),
       el("div", { class: "muted refs" }, s.project + (s.worktree ? "  (wt " + s.worktree + ")" : "")),
       el("div", { class: "muted" }, "seen " + ago(s.last_seen)),
       human ? conversationLinks(s.conversation, s.agent) : null))));

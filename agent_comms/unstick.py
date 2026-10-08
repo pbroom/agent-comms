@@ -29,6 +29,7 @@ UNSTICK_RULE_HOURS = 6
 STATE_PREFIX = "unstick.thread."
 MAX_IDS_PER_AGENT = 5    # post ids listed per agent in the body; the rest are counted
 MAX_REASONS = 20         # reasons listed in the body (keeps it far below the body size limit)
+MAX_SESSIONS = 20        # live session ids returned to the page
 
 PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and propose a prevention; "
            "stay within the thread's existing request.")
@@ -161,9 +162,16 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         live += [a for a in sorted({r.get("agent") for r in dispatch._active_records(board)} & set(agents))
                  if a not in live]
     runtimes = {r["name"]: r["runtime"] for r in board.conn.execute("SELECT name, runtime FROM agents")}
+    # Where the request will be seen now: the target agents' sessions inside the dispatcher's live window (the
+    # dispatcher's own notion of live), most recently seen first. Sessions a launch registers later are found by
+    # the page from their start time.
+    marks = ",".join("?" * len(agents))
+    sessions = [r["id"] for r in board.conn.execute(
+        f"""SELECT id FROM sessions WHERE agent IN ({marks}) AND last_seen >= ?
+            ORDER BY last_seen DESC, id DESC LIMIT {MAX_SESSIONS}""", (*agents, now - window))]
     return {"post_id": post["id"], "thread_id": thread_id, "agents": agents,
             "rule_id": rule["id"] if rule else None,
             "dispatcher_running": bool(status.get("running")), "paused": board.is_paused(),
-            "live_agents": live,
+            "live_agents": live, "sessions": sessions,
             "no_runner": [a for a in agents if config.runner_for(a, runtimes.get(a)) is None],
             "reasons": reasons}

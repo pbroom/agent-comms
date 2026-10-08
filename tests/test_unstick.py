@@ -219,14 +219,35 @@ def test_response_fields(uenv):
     e = uenv
     e.board.s.dispatch = {"runners": {"codex-cli": ["codex", "exec", "{prompt}"]}}
     ask(e, "claude", ["codex", "grok"])
-    e.session("grok")                                        # grok has a live session
+    grok = e.session("grok")                                 # grok has a live session
     out = call(e).json()
     assert set(out) == {"post_id", "thread_id", "agents", "rule_id", "dispatcher_running", "paused", "live_agents",
-                        "no_runner", "reasons"}
+                        "sessions", "no_runner", "reasons"}
     assert out["agents"] == ["codex", "grok"] and out["live_agents"] == ["grok"]
+    assert out["sessions"] == [grok]
     assert out["no_runner"] == ["grok"] and out["dispatcher_running"] is False and out["paused"] is False
     assert out["reasons"] == [{"kind": "unanswered", "agent": a, "post_ids": [out["post_id"] - 1]}
                               for a in ("codex", "grok")]
+
+
+def test_sessions_are_the_target_agents_live_sessions_last_seen_first(uenv):
+    """`sessions`: where the request will be seen now. The dispatcher's live notion (seen within live_minutes),
+    target agents only, most recently seen first."""
+    e = uenv
+    ask(e, "claude", ["codex", "grok"])
+    stale = e.session("codex")
+    e.clock.advance(3 * 60)                                  # past the 2-minute live window
+    older = e.session("codex")
+    e.clock.advance(30)
+    newer = e.session("grok")
+    e.clock.advance(30)
+    e.session("claude")                                      # live, but not a target
+    out = unstick.unstick(e.board, e.p["human"], e.tid, DispatchConfig(live_minutes=2))
+    assert out["sessions"] == [newer, older] and stale not in out["sessions"]
+    assert sorted(out["live_agents"]) == ["codex", "grok"]
+    # The dashboard's Sessions panel shows /api/state's order as is: last seen first.
+    seen = [s["last_seen"] for s in e.client.get("/api/state", headers=e.h()).json()["sessions"]]
+    assert seen == sorted(seen, reverse=True)
 
 
 # ---------------------------------------------------------------- end to end with the dispatcher

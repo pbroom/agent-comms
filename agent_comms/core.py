@@ -239,6 +239,7 @@ class Board:
         self.settings_generation = 0
         self.settings_error: str | None = None   # why the last reload was refused (the last good settings stay)
         self._codex: conversations.CodexResolver | None = None   # Codex thread lookup (resolve_conversations)
+        self._claude: conversations.ClaudeResolver | None = None   # Claude transcript fallback (likewise)
         db.init_schema(self.conn)
         self.sync_agents(force=True)
 
@@ -1584,12 +1585,44 @@ class Board:
             self._codex = conversations.CodexResolver(home, self.now)
         return self._codex
 
+    def _claude_resolver(self, cfg: conversations.ConversationConfig) -> conversations.ClaudeResolver:
+        home = cfg.claude_dir()
+        if self._claude is None or self._claude.home != home:
+            self._claude = conversations.ClaudeResolver(home, self.now)
+        return self._claude
+
     def resolve_conversations(self) -> int:
-        """Link recent, still unlinked Codex sessions to their Codex threads (CodexResolver: bounded and at most
-        once a minute per session). Runs when the human loads the dashboard; never fails the caller."""
+        """Link still unlinked sessions to their client conversations: Codex sessions seen in the last day to their
+        Codex threads (CodexResolver), and Claude Code sessions seen in the last week that registered without the
+        environment capture to their Claude Code conversations (ClaudeResolver). Both are bounded and look a
+        session up at most once a minute. Runs when the human loads the dashboard; never fails the caller."""
         cfg = conversations.config_of(self.s)
         if not cfg.enabled:
             return 0
+        return self._resolve_codex(cfg) + self._resolve_claude(cfg)
+
+    def _resolve_claude(self, cfg: conversations.ConversationConfig) -> int:
+        try:
+            rows = self.conn.execute(
+                """SELECT id, agent, runtime, project, worktree, started_at FROM sessions
+                   WHERE client_session_id IS NULL AND runtime LIKE 'claude-code%' AND last_seen >= ?
+                   ORDER BY id DESC LIMIT 50""",
+                (self.now() - conversations.CLAUDE_RECENT_SECONDS,)).fetchall()
+            found = self._claude_resolver(cfg).resolve([dict(r) for r in rows]) if rows else {}
+            linked = 0
+            for sid, client in found.items():
+                client = conversations.normalize_client(client)
+                if client is None or client[0] not in (conversations.CLAUDE, conversations.CLAUDE_SUBAGENT):
+                    continue
+                with db.write_tx(self.conn) as c:
+                    linked += c.execute("""UPDATE sessions SET client_kind = ?, client_session_id = ?
+                                           WHERE id = ? AND client_session_id IS NULL""", (*client, sid)).rowcount
+            return linked
+        except Exception:   # a missing or odd Claude home must never break the dashboard
+            log.exception("claude conversation lookup failed")
+            return 0
+
+    def _resolve_codex(self, cfg: conversations.ConversationConfig) -> int:
         try:
             rows = self.conn.execute(
                 """SELECT id, agent, started_at FROM sessions WHERE client_session_id IS NULL AND runtime LIKE 'codex%'
