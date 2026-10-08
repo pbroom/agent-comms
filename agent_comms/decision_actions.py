@@ -63,6 +63,8 @@ def execute(board, p, session_id, question, action, *, _authorization_decision_i
               else f"Human selected mechanical {action['type']} from decision #{question['id']}")
     if action['type'] == 'close':
         return requests.progress(**common, state='finished', reason=reason, evidence_post_ids=action['evidence_post_ids'])
+    if action['type'] == 'repost':
+        assert_execution_authorized(board, source['id'], row['assigned_agent'])
     if action['type'] == 'route':
         return requests.assign(**common, target_session_id=action['target_session_id'], reason=reason,
                                required_capabilities=action['required_capabilities'])
@@ -145,3 +147,44 @@ def reconcile_successor(board, p, session_id, successor, recipient):
     requests._save(board,p,session_id,row,'finished',f"Completed through successor #{successor['id']}",
                    [receipt['id']],row['assigned_agent'],row['assigned_session'])
     reconcile_successor(board,p,session_id,source,row['recipient'])
+
+
+def assert_execution_authorized(board, post_id, executor):
+    """Recheck every carried scope at pickup; bookkeeping may still report reality."""
+    seen = set()
+    while True:
+        if post_id in seen:
+            raise Conflict('cyclic request lineage')
+        seen.add(post_id)
+        record = board.conn.execute('SELECT value FROM board_state WHERE key=?',
+                                    ('request.successor.' + str(post_id),)).fetchone()
+        if not record:
+            return
+        link = json.loads(record['value'])
+        successor = board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+        source = board.conn.execute('SELECT * FROM posts WHERE id=?', (link['source_post_id'],)).fetchone()
+        if source is None or source['sealed'] or board._thread_row(source['thread_id'])['status'] != 'open':
+            raise Conflict('original request is sealed or its thread is closed')
+        row = board.conn.execute('SELECT * FROM request_progress WHERE post_id=? AND recipient=?',
+                                (source['id'], link['recipient'])).fetchone()
+        if row is None or row['version'] != link['source_version'] or row['state'] != 'blocked':
+            raise Conflict('original routed request changed; reread its current instructions')
+        if source['task_id'] is not None:
+            task = board.conn.execute('SELECT * FROM tasks WHERE id=?', (source['task_id'],)).fetchone()
+            if not task or task['status'] in ('done', 'declined') or not board._task_authorization_active(task, executor):
+                raise Forbidden('original task authorization is no longer active')
+        approval = link.get('authorization_decision_id')
+        if approval is not None:
+            event = board.conn.execute('''SELECT * FROM issue_comments WHERE id=(
+                SELECT MAX(id) FROM issue_comments WHERE kind='decision' AND issue_id=(
+                    SELECT issue_id FROM issue_comments WHERE id=?))''', (approval,)).fetchone()
+            scope = json.loads(event['scope'] or '[]') if event else []
+            decision = json.loads(event['decision'] or '{}') if event else {}
+            ids = decision.get('issue_link_ids', [])
+            if (not event or event['outcome'] != 'approved'
+                    or not {source['thread_id'], successor['thread_id']} <= {s['thread_id'] for s in scope}
+                    or not ids or not board.conn.execute(
+                        'SELECT 1 FROM issue_links WHERE id IN (SELECT value FROM json_each(?)) AND post_id=?',
+                        (json.dumps(ids), source['id'])).fetchone()):
+                raise Forbidden('original routing authorization is no longer active')
+        post_id = source['id']

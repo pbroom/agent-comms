@@ -134,6 +134,8 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
     with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)):
         post,row = _context(board,p,session_id,post_id,recipient)
         if state == 'started':
+            from . import decision_actions
+            decision_actions.assert_execution_authorized(board, post_id, row['assigned_agent'])
             from . import browser_readiness
             browser_readiness.assert_request_ready(board,post_id,recipient,session_id)
             from . import runner_preflight
@@ -229,6 +231,8 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         target=board.conn.execute('SELECT * FROM sessions WHERE id=?',(target_session_id,)).fetchone()
         if target is None or target['agent'] not in post['to']:
             raise Forbidden('route only to an originally addressed agent')
+        from . import decision_actions
+        decision_actions.assert_execution_authorized(board, post_id, target['agent'])
         if post['task_id'] is not None:
             task=board.conn.execute('SELECT * FROM tasks WHERE id=?',(post['task_id'],)).fetchone()
             if task is None or not board._task_authorization_active(task,target['agent']):

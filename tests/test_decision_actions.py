@@ -213,3 +213,63 @@ def test_ended_successor_can_use_verified_blocked_recovery(env):
         [evidence['id']],3,recover_blocked=True)
     assert result['state']=='finished' and result['assigned_session']==old
     assert env.board.get_post(env.p['codex'],req['id'])['requests'][0]['state']=='finished'
+
+
+def test_nested_successors_recheck_original_task_authorization_at_pickup(env):
+    tid,req,proof,a = setup(env,'repost')
+    task = env.accepted_task(tid)
+    # Create the real linked request through the normal API.
+    req = env.post('human',tid,'Authorized task','request',to=['codex'],task_id=task)
+    a['post_id']=req['id']
+    target = env.thread('B'); a['target_thread_id']=target
+    first = choose(env,proposal(env,tid,a))['action_result']['reposted_post_id']
+    third = env.thread('C')
+    second_action = {'type':'repost','post_id':first,'recipient':'codex','expected_version':1,'target_thread_id':third}
+    second = choose(env,proposal(env,target,second_action))['action_result']['reposted_post_id']
+    # Revoke only authorization of A; B and C have no task of their own.
+    env.board.conn.execute("UPDATE tasks SET authorization_source='none' WHERE id=?",(task,))
+    with pytest.raises(Forbidden,match='original task authorization'):
+        requests.progress(env.board,env.p['codex'],env.sid['codex'],second,'codex','started')
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],second,'codex','blocked','Authorization revoked')
+    assert env.board.get_post(env.p['codex'],second)['requests'][0]['state']=='blocked'
+
+
+def test_later_declined_scope_prevents_successor_pickup_but_not_truthful_bookkeeping(env):
+    from agent_comms import decision_actions, issues
+    tid,req,proof,a = setup(env,'repost'); target=env.thread('B')
+    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='route',body='same objective',thread_id=tid,post_id=req['id'])
+    issues.link_issue(env.board,env.p['human'],env.sid['human'],issue['id'],target)
+    issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'approved',[tid,target],'approved')
+    successor=decision_actions.repost(env.board,env.p['codex'],env.sid['codex'],req['id'],'codex',0,target)['reposted_post_id']
+    issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'stop',[tid,target],'declined')
+    with pytest.raises(Forbidden,match='routing authorization'):
+        requests.progress(env.board,env.p['codex'],env.sid['codex'],successor,'codex','started')
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],successor,'codex','blocked','Stopped after authorization changed')
+
+
+def test_closed_source_prevents_new_pickup_but_not_blocker_reporting(env):
+    tid,req,proof,a=setup(env,'repost'); target=env.thread('destination'); a['target_thread_id']=target
+    successor=choose(env,proposal(env,tid,a))['action_result']['reposted_post_id']
+    env.board.set_thread_status(env.p['human'],tid,'closed')
+    with pytest.raises(Conflict,match='thread is closed'):
+        requests.progress(env.board,env.p['codex'],env.sid['codex'],successor,'codex','started')
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],successor,'codex','blocked','Original thread closed')
+
+
+def test_assignment_checks_lineage_for_target_not_previous_assignee(env, monkeypatch):
+    from agent_comms import capabilities, decision_actions
+    tid,req,proof,a = setup(env,'route')
+    target=env.session('claude')
+    capabilities.register(env.board,env.p['claude'],target,['git_write'],'verified repo access')
+    checked=[]
+    def gate(board, post_id, executor):
+        checked.append(executor)
+        if executor=='codex': raise Forbidden('previous assignee lost authorization')
+    monkeypatch.setattr(decision_actions,'assert_execution_authorized',gate)
+    result=requests.assign(env.board,env.p['human'],env.sid['human'],req['id'],'codex',target,0,'Authorized target',['git_write'])
+    assert checked==['claude'] and result['assigned_agent']=='claude'
+    def revoked(board, post_id, executor):
+        raise Forbidden('target authorization revoked')
+    monkeypatch.setattr(decision_actions,'assert_execution_authorized',revoked)
+    with pytest.raises(Forbidden,match='target authorization revoked'):
+        requests.assign(env.board,env.p['human'],env.sid['human'],req['id'],'codex',target,1,'Retry',['git_write'])

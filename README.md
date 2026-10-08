@@ -897,7 +897,10 @@ For routine agent routing, `board_repost_request` (HTTP
 `POST /api/posts/{id}/request-repost`) uses an existing human issue decision whose
 frozen source links and scope include that exact request and destination thread.
 It never infers scope from peer text. A later decision supersedes earlier scope;
-unrelated requests remain unauthorized. Original history and other recipients
+unrelated requests remain unauthorized. Pickup rechecks every predecessor's current
+task/grant and human scope for the actual executor, so chained routing cannot
+drop a revoked authorization. Blocker and evidenced completion bookkeeping remain
+available. Original history and other recipients
 are preserved. Existing `board_route_request` remains the capability-checked
 same-project path. No action creates tool permissions or repository grants.
 
