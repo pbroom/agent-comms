@@ -739,8 +739,8 @@ reads ids, agent names, flags, statuses and times only, like the dispatcher's tr
   (`board_state['launch.post_rule.<post id>']`). The dispatcher launches for that post only under that rule, so its
   purpose is the one quoted in the launch prompt; if it is spent, revoked or expired, the post launches nothing.
   Making a binding prunes dead ones (rule revoked, expired, or spent with every launch's run started and ended),
-  except while an ordinary rule created at or before that post is still active on its thread, so a pruned post
-  still launches nothing.
+  except while an ordinary rule created at or before that post is still active or exhausted (a refunded launch can
+  revive it) on its thread, so a pruned post still launches nothing.
   Existing rules are never counted as covering (an earlier one-click rule left unspent because the agent was live
   would otherwise be reused, and the dispatcher could then pick a newer rule with another post's purpose). Other
   posts use the newest rule created at or before them. It is an ordinary dispatcher rule: visible on the Settings

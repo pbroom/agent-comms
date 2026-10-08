@@ -276,6 +276,30 @@ def test_a_dead_binding_stays_while_an_older_approval_could_still_launch_its_pos
     assert human_actions.post_rule_id(e.board, post_id) is None
 
 
+def test_a_dead_binding_stays_while_an_older_rule_is_spent_only_by_a_launch_in_flight(uenv):
+    """Review repro: older ordinary rule R spent its launch on a run still "starting"; one-click post X's rule is
+    revoked; another one-click action must not prune X's binding, because R's spawn can fail and refund the launch,
+    and X would then launch under R's purpose."""
+    from agent_comms import human_actions
+    from agent_comms.dispatch import Dispatcher
+    e, human = uenv, uenv.p["human"]
+    older = e.board.create_dispatch_rule(human, thread_id=e.tid, agents=["codex"], purpose="older", max_launches=1)
+    assert e.board.take_dispatch_launch(human, older["id"], "codex") == 0
+    _run(e, "r-older", older["id"], "starting", pid=None)
+    e.clock.advance(1)
+    post_id, rule_id = _one_click(e)
+    e.board.revoke_dispatch_rule(human, rule_id)
+    _one_click(e, e.thread("elsewhere"))
+    assert human_actions.post_rule_id(e.board, post_id) == rule_id
+    e.board.refund_dispatch_launch(human, older["id"])                      # the spawn failed
+    _run(e, "r-older", older["id"], "spawn_failed", pid=None)
+    item = {"thread_id": e.tid, "agent": "codex", "post_id": post_id,
+            "post_created_at": e.board.conn.execute("SELECT created_at FROM posts WHERE id=?", (post_id,)).fetchone()[0]}
+    rs = e.board.active_dispatch_rules(human)
+    assert older["id"] in {r["id"] for r in rs}
+    assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, item) is None   # X still launches nothing
+
+
 def test_unstick_after_an_unspent_unstick_and_an_approve_launch_quotes_its_own_purpose(tmp_path, monkeypatch):
     """Review repro: Unstick #1 approves U1 (unspent, the agent was live); Approve & launch for #5 approves A;
     Unstick #2 must not count U1 as covering, and its post must launch with the Unstick purpose, not A's."""
