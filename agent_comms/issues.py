@@ -327,7 +327,8 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         if not set(thread_ids) <= linked.keys():
             raise Invalid("decision scope must contain only linked threads")
         scope = [{"thread_id": t, "project": linked[t]} for t in sorted(set(thread_ids))]
-        frozen_links = c.execute('''SELECT l.*,p.agent AS source_agent,a.is_human AS source_is_human FROM issue_links l
+        frozen_links = c.execute('''SELECT l.*,p.agent AS source_agent,a.is_human AS source_is_human,
+            p.decision_question AS source_question FROM issue_links l
             LEFT JOIN posts p ON p.id=l.post_id LEFT JOIN agents a ON a.name=p.agent WHERE l.issue_id=?
             AND l.thread_id IN (SELECT value FROM json_each(?)) ORDER BY l.id''',(issue_id,json.dumps(thread_ids))).fetchall()
         decision['issue_link_ids'] = [link['id'] for link in frozen_links]
@@ -342,8 +343,11 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         event_id = _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
         for tid in sorted(set(thread_ids)):
             selected = [link for link in frozen_links if link['thread_id']==tid]
+            # Answer only the source posts this issue's question covers (Board.ISSUE_COVERS). A linked post asking its
+            # own, different question keeps its own Needs you item; the issue's answer is not its answer.
             source_ids = sorted({link['post_id'] for link in selected
-                                 if link['post_id'] is not None and not link['source_is_human']})
+                                 if link['post_id'] is not None and not link['source_is_human']
+                                 and link['source_question'] in (None, row['decision_question'])})
             intended = {link['source_agent'] or link['agent'] for link in selected}
             recipients = [agent for agent in sorted(intended) if c.execute(
                 'SELECT 1 FROM agents WHERE name=? AND is_human=0',(agent,)).fetchone()]

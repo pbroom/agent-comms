@@ -799,9 +799,9 @@ Finalize keeps its own route.
 `agent_comms/human_actions.py` holds the cooldown stamp, `post_as_human` (rule before post, rollback) and
 `launch_outlook` (dispatcher running, paused, live agents and sessions, no runner); `unstick.py` now uses them too.
 
-**Side effects to know.** Any human post in a thread clears every earlier Needs you item in that thread (the existing
-rule), so resolving the newest item also clears older ones in the same thread. A resolve resets the thread's
-agent-post budget, like any human post.
+**Side effects to know.** A resolve clears only the post it answers (an exact `answer_links` row since v10; the
+older "any later human post clears every earlier item in the thread" rule is gone, see "Answering one item" below).
+A resolve resets the thread's agent-post budget, like any human post.
 
 ## Structured Needs you (schema v8, 2026-10-08)
 
@@ -842,3 +842,25 @@ on that thread (answered, or under discussion) now counts as pending work (grey)
 answered issue no longer makes its thread look like it waits on the human. An issue page opens with a status banner:
 waiting (amber), answered (when, outcome, scope, the first line of the answer, **Change your answer**), nothing
 waiting, or resolved. All of it is built with `el()`/`textContent`.
+
+## Answering one item clears only that item (2026-10-08)
+
+**Report.** "When I submit one answer in a group of multiple answers, the whole group closes and is marked answered,
+even if there were other unanswered questions."
+
+**Cause.** Post resolves were already exact (v10 `answer_links`), but a shared issue swallowed its linked posts:
+`Board.NEEDS_YOU` hid every post with an `issue_links` row, and `issues.decide_issue` wrote one answer post with
+`answer_to` = every linked source post in each selected thread. An agent that linked several posts, each with its own
+structured `decision_question`, to one issue therefore turned several questions into one Needs you item, and the one
+issue answer marked all of them answered (and let completion reconciliation close the thread). The agent brief's
+`open_questions_for_human` still used the pre-v10 "any later human post" rule, so one reply zeroed the whole thread.
+
+**Rule.** An issue's question covers a linked source post (`Board.ISSUE_COVERS`) only when the post has no structured
+question of its own, or its question is exactly the issue's (same stored JSON). Covered posts are still represented by
+the issue in Needs you and answered by its decision, as before. A linked post asking its own, different question stays
+its own Needs you item (resolve works on it), and an issue decision neither links nor clears it. The decision still
+sets `needs_human=0` only on the links of the selected threads ("Applies to" is unchanged), so other threads' links
+keep waiting. If the issue's question changes later, a post that no longer matches reappears unless it was answered.
+No schema change or backfill: legacy suppression (`legacy_attention_answers`) and attention resolutions apply as before.
+The brief counts with `NEEDS_YOU_SOURCE`. The decision panel names linked posts that stay in Needs you
+("Linked posts #30, #31 each ask their own question …"). Dashboard drafts and choices were already per item.

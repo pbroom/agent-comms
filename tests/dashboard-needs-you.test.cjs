@@ -27,7 +27,7 @@ const QUESTION = () => ({ question: 'Ship the parser fix now? ' + INJECTION, con
   recommended_option_id: 'ship' });
 
 // window.confirm/prompt/alert throw (and are recorded): the human's embedded browser blocks them.
-// `threads` and `needsYou` may be functions, re-read on every /api/state.
+// `threads`, `needsYou` and `issues` may be functions, re-read on every /api/state.
 async function setup({ threads, needsYou = [], issues = [], human = true, launchable = [], reply = () => ok({}),
   url = 'http://127.0.0.1:8787/', storage = {} }) {
   const calls = [], prompts = [];
@@ -42,7 +42,7 @@ async function setup({ threads, needsYou = [], issues = [], human = true, launch
       if (u.startsWith('/api/state')) return ok({ me, paused: false,
         threads: typeof threads === 'function' ? threads() : threads,
         needs_you: typeof needsYou === 'function' ? needsYou() : needsYou,
-        issues, needs_you_issues: [],
+        issues: typeof issues === 'function' ? issues() : issues, needs_you_issues: [],
         sessions: [], limits: { body_max_bytes: 4096 }, authorization_grants: [], task_categories: [], active_runs: [],
         launchable_agents: launchable,
         agents: [{ name: 'human', is_human: 1 }, { name: 'claude-code', is_human: 0 }, { name: 'codex', is_human: 0 }] });
@@ -446,5 +446,82 @@ test('assign approved work sends explicit selected implementer, never parses not
     select.value='claude-code'; select.dispatchEvent(new win.Event('change'));
     primary(document,11).click(); await settle();
     assert.equal(calls.find(c => c.u.endsWith('/11/resolve')).body.delivery_agent,'claude-code');
+  } finally { dom.window.close(); }
+});
+
+// Regression: "when I submit one answer in a group of multiple answers, the whole group closes". The page sends one
+// request for exactly the item answered; the others stay, with their own controls and the human's unsent drafts.
+test('answering one of several items in a thread sends only that item and keeps the others with their drafts', async () => {
+  let open = [post(13, 1, { type: 'proposal', needs_response: true }), post(12, 1, { type: 'decision' }),
+    post(11, 1, { type: 'question', needs_response: true, decision_question: QUESTION() }),
+    post(10, 1, { type: 'question', needs_response: true })];   // newest first, as the server sends them
+  const answered = id => { open = open.filter(p => p.id !== id); return ok({ post_id: 99, resolved_post_id: id, to: ['codex'] }); };
+  const { dom, document, calls } = await setup({ threads: () => [thread(1, [...open].reverse())], needsYou: () => open,
+    reply: (u, opts) => u.endsWith('/resolve') ? answered(Number(u.split('/')[3])) : u.endsWith('/finalize') ? answered(12) : ok({}) });
+  try {
+    await pick(document, 1);
+    assert.deepEqual(items(document), [13, 12, 11, 10]);
+    card(document, 10, 'custom').click();
+    const area = document.querySelector('#ny-reply-10');
+    area.value = 'my unsent reply'; area.dispatchEvent(new document.defaultView.Event('input'));
+    card(document, 11, 'option:ship').click();
+    primary(document, 11).click();
+    await settle();
+    assert.deepEqual(calls.map(c => [c.u, c.body]), [['/api/posts/11/resolve', { action: 'choose', option_id: 'ship' }]]);
+    assert.deepEqual(items(document), [13, 12, 10], 'only #11 left the card');
+    assert.equal(document.querySelector('#needs-you h2').textContent, 'Needs you (3)');
+    assert.equal(document.querySelector('#ny-reply-10').value, 'my unsent reply', 'another item\'s draft survives');
+    assert.equal(card(document, 10, 'custom').checked, true);
+    for (const id of [10, 12, 13]) assert.ok(primary(document, id), `#${id} keeps its own controls`);
+    assert.deepEqual([...document.querySelectorAll('#needs-you-side [data-post]')].map(n => Number(n.dataset.post)), [13, 12, 10]);
+    // Answering the rest clears them, one by one.
+    primary(document, 10).click(); await settle();
+    card(document, 12, 'finalize').click(); primary(document, 12).click(); await settle();
+    card(document, 13, 'not_now').click(); primary(document, 13).click(); await settle();
+    assert.deepEqual(calls.slice(1).map(c => c.u), ['/api/posts/10/resolve', '/api/posts/12/finalize', '/api/posts/13/resolve']);
+    assert.deepEqual(items(document), []);
+    assert.equal(document.querySelector('#needs-you h2').textContent, 'Needs you: nothing left here');
+  } finally { dom.window.close(); }
+});
+
+test('an issue answer leaves linked posts that ask their own question in Needs you, and says so', async () => {
+  const own1 = post(30, 1, { type: 'question', needs_response: true, decision_question: QUESTION() });
+  const own2 = post(31, 1, { type: 'question', needs_response: true, decision_question: { ...QUESTION(), question: 'Other?' } });
+  let open = [own2, own1], flagged = { 1: true, 2: true };
+  const issue = () => ({ id: 5, title: 'Detector', body: 'b', status: 'open', needs_human: flagged[1] || flagged[2],
+    created_by: 'codex', created_at: MINUTES_AGO(9), updated_at: MINUTES_AGO(9), comments: [], decisions: [], resolution: null,
+    question_version: 1, decision_question: { ...QUESTION(), question: 'Issue question?' },
+    links: [{ thread_id: 1, post_id: 30, needs_human: flagged[1], project: '/repo/app', title: 'T1' },
+      { thread_id: 1, post_id: 31, needs_human: flagged[1], project: '/repo/app', title: 'T1' },
+      { thread_id: 1, post_id: 32, needs_human: flagged[1], project: '/repo/app', title: 'T1' },
+      { thread_id: 2, post_id: 40, needs_human: flagged[2], project: '/repo/app', title: 'T2' }] });
+  const { dom, document, calls } = await setup({ threads: [thread(1, [own1, own2, post(32, 1)]), thread(2, [post(40, 2)])],
+    needsYou: () => open, issues: () => [issue()],
+    reply: (u, opts) => {
+      const body = JSON.parse(opts.body || '{}');
+      if (u === '/api/issues/5/decisions') { for (const t of body.thread_ids) flagged[t] = false; return ok(issue()); }
+      if (u.endsWith('/resolve')) { open = open.filter(p => p.id !== Number(u.split('/')[3])); return ok({ post_id: 99 }); }
+      return ok({});
+    } });
+  try {
+    await pick(document, 1);
+    const ny = document.getElementById('needs-you');
+    assert.equal(ny.querySelector('h2').textContent, 'Needs you (3)', 'the issue and both posts with their own question');
+    assert.equal(ny.querySelector('[data-separate]').textContent,
+      'Linked posts #30, #31 each ask their own question: this answer does not answer them. They stay in Needs you, to answer separately.');
+    const form = ny.querySelector('[data-decision-form="5"]');
+    form.querySelector('input[value="option:ship"]').click();
+    form.querySelector('.scope input[value="2"]').click();     // this thread only
+    form.querySelector('button[type="submit"]').click();
+    await settle();
+    assert.deepEqual(calls.map(c => [c.u, c.body.thread_ids]), [['/api/issues/5/decisions', [1]]]);
+    assert.deepEqual(items(document).filter(Boolean), [31, 30], 'the posts keep their own items and controls');
+    assert.equal(document.querySelector('#needs-you [data-issue="5"]'), null, 'the issue no longer waits here');
+    assert.ok(document.querySelector('#needs-you-side [data-issue="5"]'), 'it still waits on thread #2');
+    card(document, 30, 'option:wait').click(); primary(document, 30).click(); await settle();
+    assert.deepEqual(items(document).filter(Boolean), [31]);
+    card(document, 31, 'option:ship').click(); primary(document, 31).click(); await settle();
+    assert.deepEqual(items(document).filter(Boolean), []);
+    assert.deepEqual(calls.slice(1).map(c => c.u), ['/api/posts/30/resolve', '/api/posts/31/resolve']);
   } finally { dom.window.close(); }
 });
