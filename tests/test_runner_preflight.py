@@ -135,6 +135,17 @@ def test_registered_session_cannot_start_before_verified_receipts(denv):
         requests.progress(e.board, e.p['claude'], sid, post['id'], 'claude', 'started')
 
 
+def test_registered_session_cannot_skip_the_gate_by_finishing_unstarted_work(denv):
+    e = denv
+    post, run, rec = configure(e)
+    sid = e.board.register_session(e.p['claude'], PROJECT, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    proof = e.board.create_post(e.p['claude'], sid, thread_id=post['thread_id'], type='status', body='Did it all')
+    with pytest.raises(Conflict, match='preflight has not passed'):
+        requests.progress(e.board, e.p['claude'], sid, post['id'], 'claude', 'finished', reason='Done',
+                          evidence_post_ids=[proof['id']])
+
+
 @pytest.mark.parametrize('mismatch', ['conversation', 'directory'])
 def test_wrong_execution_context_cannot_use_verified_receipts(denv, mismatch):
     e = denv

@@ -293,6 +293,18 @@ def test_target_refuses_hosts_a_browser_would_refuse(bad):
         br.target(bad)
 
 
+def test_unstarted_browser_work_cannot_be_finished_without_a_ready_probe(env):
+    post = task(env)
+    proof = env.post('codex', post['thread_id'], 'I checked the page myself')
+    with pytest.raises(Conflict, match='browser preflight blocked'):
+        requests.progress(env.board, env.p['codex'], env.sid['codex'], post['id'], 'codex', 'finished',
+                          reason='Done', evidence_post_ids=[proof['id']])
+    probe(env)
+    out = requests.progress(env.board, env.p['codex'], env.sid['codex'], post['id'], 'codex', 'finished',
+                            reason='Done', evidence_post_ids=[proof['id']])
+    assert out['state'] == 'finished'
+
+
 def test_deny_gate_cannot_be_bypassed_by_respelling_the_host(env):
     deny = 'https://example.com/app'
     br.report_failure(env.board, env.p['codex'], env.sid['codex'], deny, CTX, 'policy_denied', 'denied by host')
