@@ -260,7 +260,7 @@ def test_response_fields(uenv):
     grok = e.session("grok")                                 # grok has a live session
     out = call(e).json()
     assert set(out) == {"post_id", "thread_id", "agents", "rule_id", "dispatcher_running", "paused", "live_agents",
-                        "sessions", "no_runner", "reasons"}
+                        "sessions", "sessions_detail", "no_runner", "reasons"}
     assert out["agents"] == ["codex", "grok"] and out["live_agents"] == ["grok"]
     assert out["sessions"] == [grok]
     assert out["no_runner"] == ["grok"] and out["dispatcher_running"] is False and out["paused"] is False
@@ -286,6 +286,31 @@ def test_sessions_are_the_target_agents_live_sessions_last_seen_first(uenv):
     # The dashboard's Sessions panel shows /api/state's order as is: last seen first.
     seen = [s["last_seen"] for s in e.client.get("/api/state", headers=e.h()).json()["sessions"]]
     assert seen == sorted(seen, reverse=True)
+
+
+def test_sessions_detail_carries_receivers_the_capped_snapshot_hides(uenv):
+    e = uenv
+    ask(e, "claude", ["codex"])
+    receiver = e.session("codex")
+    e.clock.advance(1)
+    for _ in range(31):                                      # newer sessions push the receiver out of the snapshot's 30
+        e.session("claude")
+    state = e.client.get("/api/state", headers=e.h()).json()
+    assert receiver not in [s["id"] for s in state["sessions"]]
+    out = call(e).json()
+    assert out["sessions"] == [receiver]
+    [d] = out["sessions_detail"]
+    shape = state["sessions"][0]
+    assert set(d) == set(shape) and d["id"] == receiver and d["agent"] == "codex" and "client_session_id" not in d
+
+
+def test_approve_launch_returns_the_receivers_sessions_detail(uenv):
+    from agent_comms import resolve
+    e = uenv
+    q = e.post("codex", e.tid, "approve?", "question", needs_response=True)
+    live = e.session("codex")
+    out = resolve.resolve(e.board, e.p["human"], q["id"], "approve_launch", None, DispatchConfig())
+    assert out["sessions"][0] == live and [s["id"] for s in out["sessions_detail"]] == out["sessions"]
 
 
 # ---------------------------------------------------------------- end to end with the dispatcher

@@ -142,7 +142,10 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         human_actions.release_cooldown(board, key)
         raise
     # Where the request will be seen now (`sessions`): the target agents' sessions inside the dispatcher's live
-    # window, most recently seen first. Sessions a launch registers later are found by the page from their start time.
+    # window, most recently seen first, and `sessions_detail`: those sessions in the snapshot's session shape (the
+    # snapshot lists only the 30 most recently seen). Sessions a launch registers later are found by the page from
+    # their start time.
+    outlook = human_actions.launch_outlook(board, config, agents)
     return {"post_id": post["id"], "thread_id": thread_id, "agents": agents,
-            "rule_id": rule["id"] if rule else None,
-            **human_actions.launch_outlook(board, config, agents), "reasons": reasons}
+            "rule_id": rule["id"] if rule else None, **outlook,
+            "sessions_detail": board.session_details(p, outlook["sessions"]), "reasons": reasons}

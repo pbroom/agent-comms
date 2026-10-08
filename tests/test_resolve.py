@@ -214,7 +214,7 @@ def test_approve_launch_rule_before_post(renv, monkeypatch):
     [rule] = rules(e)
     assert seen == [[rule["id"]]]
     assert set(out) == {"action", "post_id", "resolved_post_id", "thread_id", "to", "agent", "rule_id",
-                        "dispatcher_running", "paused", "live", "no_runner"}
+                        "dispatcher_running", "paused", "live", "no_runner", "sessions", "sessions_detail"}
     assert (out["rule_id"], out["agent"], out["live"], out["no_runner"], out["dispatcher_running"], out["paused"]) == \
         (rule["id"], "codex", False, True, False, False)
     assert rule["agents"] == ["codex"] and rule["max_launches"] == rule["launches_left"] == 1

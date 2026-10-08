@@ -192,7 +192,10 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
         o = human_actions.launch_outlook(board, config, to_author)
         out |= {"agent": to_author[0], "rule_id": rule["id"] if rule else None,
                 "dispatcher_running": o["dispatcher_running"], "paused": o["paused"],
-                "live": bool(o["live_agents"]), "no_runner": bool(o["no_runner"])}
+                "live": bool(o["live_agents"]), "no_runner": bool(o["no_runner"]),
+                # The receiver's live sessions now, as ids and in the snapshot's session shape (which the
+                # snapshot's capped `sessions` list may not include).
+                "sessions": o["sessions"], "sessions_detail": board.session_details(p, o["sessions"])}
     return out
 
 

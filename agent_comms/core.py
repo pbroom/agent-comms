@@ -1816,6 +1816,26 @@ class Board:
                    WHERE il.post_id = p.id AND il.covers_post = 1 AND i.status != 'resolved')"""
     NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT " + ISSUE_GOVERNS
 
+    def _session_out(self, r: sqlite3.Row, p: Principal, links: bool) -> dict:
+        """One session as the dashboard shows it (snapshot `sessions`; Unstick / Approve & launch `sessions_detail`)."""
+        d = {k: r[k] for k in r.keys() if k not in ("client_kind", "client_session_id")}
+        d |= {"started_at": iso(r["started_at"]), "last_seen": iso(r["last_seen"])}
+        if p.is_human:
+            d["conversation"] = self._conversation(r) if links else None
+        return d
+
+    def session_details(self, p: Principal, session_ids: list[int]) -> list[dict]:
+        """These sessions in the snapshot's session shape, in the given order (human only). For the one-click
+        actions' receivers, which the snapshot's capped `sessions` list may not include."""
+        self._require_human(p, "view session details")
+        ids = [i for i in session_ids if isinstance(i, int) and not isinstance(i, bool)]
+        if not ids:
+            return []
+        links = conversations.config_of(self.s).enabled
+        rows = {r["id"]: r for r in self.conn.execute(
+            f"SELECT * FROM sessions WHERE id IN ({','.join('?' * len(ids))})", ids)}
+        return [self._session_out(rows[i], p, links) for i in ids if i in rows]
+
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""
         threads = self.list_threads(p, status=None if closed_threads else "open")
@@ -1833,13 +1853,8 @@ class Board:
         links = p.is_human and conversations.config_of(self.s).enabled
         if links:
             self.resolve_conversations()
-        sessions = []
-        for r in self.conn.execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 30"):
-            d = {k: r[k] for k in r.keys() if k not in ("client_kind", "client_session_id")}
-            d |= {"started_at": iso(r["started_at"]), "last_seen": iso(r["last_seen"])}
-            if p.is_human:
-                d["conversation"] = self._conversation(r) if links else None
-            sessions.append(d)
+        sessions = [self._session_out(r, p, links)
+                    for r in self.conn.execute("SELECT * FROM sessions ORDER BY last_seen DESC LIMIT 30")]
         if p.is_human:
             # Task rows link to the owner's conversation while it holds or works the task.
             owners: dict[int, dict | None] = {}

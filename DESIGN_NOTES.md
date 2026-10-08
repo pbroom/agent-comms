@@ -752,7 +752,10 @@ existing rules cover everyone), `dispatcher_running` (`dispatch.loop_status`), `
 seen within `[dispatch] live_minutes`, or a dispatched run in progress: the dispatcher will not launch them, and they
 see the request through their normal read, hook or channel path), `no_runner` (no `[dispatch.runners]` entry, so it
 can never be launched), `sessions` (the target agents' session ids inside the same live window, last seen first:
-where the request will be seen now) and `reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
+where the request will be seen now), `sessions_detail` (those same sessions as full rows in `/api/state`'s
+session shape, including the human's `conversation` link, because `/api/state` lists only the 30 most recently seen
+sessions and a receiver can fall outside them; Approve & launch returns `sessions` and `sessions_detail` too) and
+`reasons`. A launched agent's run shows in `active_runs`, so the dot turns grey and
 pulsing; a blocked task keeps the dot amber until the agent resolves it, but the button is not offered for an agent
 that is running for that thread.
 
