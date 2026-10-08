@@ -1559,15 +1559,15 @@ function postChoices(item) {
     desc: "Answer in your own words, or propose something else.", button: "Send reply" };
   if (q) return [
     ...rankedOptions(q).map(o => ({ value: "option:" + o.id, action: "choose", option: o.id, rank: o.rank, title: o.label,
-      desc: o.description, deliver: o.outcome === "approved" && !o.action, effect: mechanicalEffect(o.action) || (o.outcome === "approved" ? `Queues this approved work for ${who}; allows one launch if inactive` : `Tells ${who} you chose this option`), button: o.action ? `Choose and ${o.action.type}` : `Choose ${o.rank}` })),
+      desc: o.description, deliver: o.outcome === "approved" && !o.action, effect: mechanicalEffect(o.action) || (o.outcome === "approved" ? "Queues this approved work for the selected agent; allows one launch if inactive" : `Tells ${who} you chose this option`), button: o.action ? `Choose and ${o.action.type}` : `Choose ${o.rank}` })),
     ...finalize, ...reject, own];
   return [
     ...finalize,
-    { value: "approve", action: "approve", title: "Approve as proposed", effect: `Queues approved work ${n} for ${who}; allows one launch if inactive`,
+    { value: "approve", action: "approve", title: "Approve as proposed", effect: `Queues approved work ${n} for the selected agent; allows one launch if inactive`,
       button: "Approve" },
-    ...(launchable ? [{ value: "approve_launch", action: "approve_launch", title: `Approve & launch ${item.agent}`,
-      effect: `Approves, and lets the dispatcher launch ${item.agent} once on this thread now (uses tokens)`,
-      button: `Approve & launch ${item.agent}` }] : []),
+    ...(launchable ? [{ value: "approve_launch", action: "approve_launch", title: "Approve and allow one launch",
+      effect: "Approves, and lets the dispatcher launch the selected agent once on this thread now (uses tokens)",
+      button: "Approve and allow launch" }] : []),
     ...reject,
     { value: "not_now", action: "not_now", title: "Not now", effect: `Posts “Not now: parking ${n}.” to ${who}`, button: "Not now" },
     own];

@@ -108,9 +108,9 @@ test('cards per plain item: decisions get Finalize and Reject; Approve & launch 
   const q = post(14, 1, { type: 'question', agent: 'claude-code', needs_response: true });
   const { dom, document } = await setup({ threads: [thread(1, [d, sealedD, q])], needsYou: [q, sealedD, d], launchable: ['codex'] });
   try {
-    assert.deepEqual(cards(document, 12), ['Finalize the decision', 'Approve as proposed', 'Approve & launch codex',
+    assert.deepEqual(cards(document, 12), ['Finalize the decision', 'Approve as proposed', 'Approve and allow one launch',
       'Reject the decision', 'Not now', 'Write your own reply']);
-    assert.deepEqual(cards(document, 13), ['Approve as proposed', 'Approve & launch codex', 'Reject the decision', 'Not now',
+    assert.deepEqual(cards(document, 13), ['Approve as proposed', 'Approve and allow one launch', 'Reject the decision', 'Not now',
       'Write your own reply'], 'a sealed decision cannot be finalized until unsealed');
     assert.deepEqual(cards(document, 14), ['Approve as proposed', 'Not now', 'Write your own reply'], 'claude-code is not launchable');
     // Nothing is picked: one primary button, disabled, that says what to do.
@@ -131,10 +131,10 @@ test('each card + primary button calls the resolve endpoint once, with no confir
       'Parked #14; told codex not now (post #91).'],
     ['reject', 'Reject decision', { type: 'decision' }, { action: 'reject', post_id: 92, resolved_post_id: 14, to: ['codex'] },
       'Rejected decision #14; told codex (post #92).'],
-    ['approve_launch', 'Approve & launch codex', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 93,
+    ['approve_launch', 'Approve and allow launch', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 93,
       resolved_post_id: 14, to: ['codex'], agent: 'codex', rule_id: 5, dispatcher_running: true, paused: false, live: false, no_runner: false },
       'Approved #14 and launched codex (dispatcher running; it starts within seconds) (post #93).'],
-    ['approve_launch', 'Approve & launch codex', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 94,
+    ['approve_launch', 'Approve and allow launch', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 94,
       resolved_post_id: 14, to: ['codex'], agent: 'codex', rule_id: 6, dispatcher_running: false, paused: false, live: false, no_runner: false },
       "Approved #14 (post #94). The dispatcher isn't running — start it with `board dispatch run` to launch codex."],
   ];
