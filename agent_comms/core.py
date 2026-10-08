@@ -1715,7 +1715,14 @@ class Board:
                    AND NOT EXISTS (SELECT 1 FROM legacy_attention_answers la WHERE la.source_post_id=p.id)
                    AND NOT EXISTS (SELECT 1 FROM attention_resolutions ar WHERE ar.post_id = p.id)"""
 
-    NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT EXISTS (SELECT 1 FROM issue_links il WHERE il.post_id = p.id)"
+    # A linked post is represented by its issue (hidden here, answered by the issue's decision) only while the issue
+    # is unresolved and its question covers the post (issue_links.covers_post, set from db.ISSUE_COVERS when linked).
+    # A linked post asking its own, different question stays its own item. A covered post the issue never answered
+    # comes back once the issue is resolved, rather than staying hidden and unanswered for good.
+    ISSUE_COVERS = db.ISSUE_COVERS
+    ISSUE_GOVERNS = """EXISTS (SELECT 1 FROM issue_links il JOIN issues i ON i.id = il.issue_id
+                   WHERE il.post_id = p.id AND il.covers_post = 1 AND i.status != 'resolved')"""
+    NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT " + ISSUE_GOVERNS
 
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""
@@ -1895,9 +1902,7 @@ class Board:
                   AND p.needs_response = 1
                   AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                        JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))
-                  AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
-                                  WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)
-                   AND NOT EXISTS (SELECT 1 FROM attention_resolutions ar WHERE ar.post_id = p.id)""",
+                  AND {self.NEEDS_YOU_SOURCE}""",
             {"threads": json.dumps(threads), **self._vis(p)}).fetchone()[0]
         grants = [g for g in self.list_grants(p) if g["active"] and g["project"] in projects]
         out = {"agent": p.name, "projects": projects, "paused": self.is_paused(),
