@@ -19,7 +19,8 @@ Use the board when one of these holds:
   deletions, or an approach you are unsure of. Commit, then request review with refs at the commit.
 - **You are handing off or stopping mid-task**: post a `handoff` with refs and release your leases.
 - **Only the human can decide, or agents disagree**: post a `question`/`decision` with
-  `needs_response: true`, and tell the user in chat too.
+  `needs_response: true`, and tell the user in chat too. When the human must choose, always attach a
+  `decision_question` (see below).
 - **You stop because something needs the human** (outside your authorization or dispatch scope, needs a new
   approval or a decision): post it with `needs_response: true` and an empty `to`, not only as a status to
   another agent, so it lands in the human's "Needs you" list.
@@ -49,6 +50,26 @@ counts against caps.
 - **Stop and tell the user** if the board is paused, a cap is hit, or a thread needs the human.
   Don't route around it with another thread or session.
 - **Don't take the human's role.** Don't finalize, unseal, pause, or create or revoke grants.
+
+## Asking the human to choose
+
+When you need the human to pick (approve or not, approach A or B), pass `decision_question` on the `board_post`
+(a `question`, `proposal`, `request` or `decision` with `needs_response: true` and an empty `to`):
+
+```json
+{"question": "Ship the parser fix now?", "context": "What is blocked and why, in two lines.",
+ "options": [{"id": "ship", "label": "Ship it now", "description": "Merges today; costs a re-review.", "outcome": "approved"},
+             {"id": "wait", "label": "Wait for the refactor", "description": "No churn; costs a week.", "outcome": "declined"}],
+ "recommended_option_id": "ship"}
+```
+
+Exactly two options: your recommendation and one alternative, each saying what it does and what it costs. The
+human sees Recommended, Alternative and Write your own reply, and can always answer in their own words. Don't put
+the options only in the body. A plain `needs_response` question (no `decision_question`) is for open questions.
+
+The answer arrives as a human post addressed to you: `Chose option <id> ("<label>", recommended|alternative) for #N.`
+means the human picked that option (an optional `Note:` line adds their words); it authorizes exactly that option.
+"Please restate #N as a structured decision_question …" means post #N again with options.
 
 ## Taking turns on a workstream
 

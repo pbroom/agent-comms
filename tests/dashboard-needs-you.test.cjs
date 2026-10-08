@@ -1,5 +1,6 @@
 // Requires jsdom >=23. Run with jsdom available: node --test tests/dashboard-needs-you.test.cjs
-// The Needs you callout: at the top of the selected thread, a call to action and one-click resolve buttons.
+// The Needs you card: at the top of the selected thread, one decision component per item that waits on the human:
+// what it blocks, the question, option cards (Recommended, Alternative, ..., Write your own reply) and one primary button.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -20,11 +21,15 @@ function thread(id, posts, extra = {}) {
   return { id, title: 'Thread ' + id + ' ' + INJECTION, project: '/repo/app', status: 'open', agent_posts_since_human: 0,
     thread_cap: 12, pinned_summary: null, tasks: [], task_counts: {}, posts, created_at: MINUTES_AGO(300), ...extra };
 }
+const QUESTION = () => ({ question: 'Ship the parser fix now? ' + INJECTION, context: 'Trailing commas are dropped. ' + INJECTION,
+  options: [{ id: 'wait', label: 'Wait for the refactor ' + INJECTION, description: 'No churn; costs a week.', outcome: 'declined' },
+    { id: 'ship', label: 'Ship it now', description: 'Merges today; costs a re-review.', outcome: 'approved' }],
+  recommended_option_id: 'ship' });
 
 // window.confirm/prompt/alert throw (and are recorded): the human's embedded browser blocks them.
 // `threads` and `needsYou` may be functions, re-read on every /api/state.
-async function setup({ threads, needsYou = [], human = true, launchable = [], reply = () => ok({}), url = 'http://127.0.0.1:8787/',
-  storage = {} }) {
+async function setup({ threads, needsYou = [], issues = [], human = true, launchable = [], reply = () => ok({}),
+  url = 'http://127.0.0.1:8787/', storage = {} }) {
   const calls = [], prompts = [];
   const dom = new JSDOM(html, { url, runScripts: 'dangerously', pretendToBeVisual: true, beforeParse(win) {
     for (const [k, v] of Object.entries({ 'agent-comms-seen': '{}', ...storage })) win.localStorage.setItem(k, v);
@@ -37,6 +42,7 @@ async function setup({ threads, needsYou = [], human = true, launchable = [], re
       if (u.startsWith('/api/state')) return ok({ me, paused: false,
         threads: typeof threads === 'function' ? threads() : threads,
         needs_you: typeof needsYou === 'function' ? needsYou() : needsYou,
+        issues, needs_you_issues: [],
         sessions: [], limits: { body_max_bytes: 4096 }, authorization_grants: [], task_categories: [], active_runs: [],
         launchable_agents: launchable,
         agents: [{ name: 'human', is_human: 1 }, { name: 'claude-code', is_human: 0 }, { name: 'codex', is_human: 0 }] });
@@ -48,12 +54,17 @@ async function setup({ threads, needsYou = [], human = true, launchable = [], re
   return { dom, win: dom.window, document: dom.window.document, calls, prompts };
 }
 const items = d => [...d.querySelectorAll('#needs-you .ny-item')].map(n => Number(n.dataset.post));
-const ctas = d => [...d.querySelectorAll('#needs-you .ny-cta')].map(n => n.textContent);
-const actions = (d, id) => [...d.querySelectorAll(`#needs-you [data-post="${id}"] .ny-actions button`)].map(b => b.textContent);
+const contexts = d => [...d.querySelectorAll('#needs-you .ny-item .ask-context .where')].map(n => n.textContent);
+// The option cards of an item, in order: their titles (without the badge) and badges.
+const cards = (d, id) => [...d.querySelectorAll(`#needs-you [data-post="${id}"] .radio-card .rc-title`)].map(n => n.firstChild.textContent);
+const badges = (d, id) => [...d.querySelectorAll(`#needs-you [data-post="${id}"] .radio-card`)]
+  .map(n => (n.querySelector('.badge') || {}).textContent || '');
+const card = (d, id, value) => d.querySelector(`#needs-you [data-post="${id}"] input[type="radio"][value="${value}"]`);
+const primary = (d, id) => d.querySelector(`#needs-you [data-post="${id}"] .ny-primary`);
 const button = (d, id, action) => d.querySelector(`#needs-you [data-post="${id}"] button[data-action="${action}"]`);
 const pick = async (d, id) => { d.querySelector(`tr[data-thread="${id}"]`).click(); await settle(10); };
 
-test('the callout sits at the top of the thread, only for items that need you, newest first', async () => {
+test('the card sits at the top of the thread, only for items that need you, newest first, saying what each blocks', async () => {
   const q = post(10, 1, { type: 'question', agent: 'claude-code', needs_response: true });
   const d = post(12, 1, { type: 'decision', decision_status: 'proposal (NOT binding until the human finalizes it)' });
   const r = post(14, 1, { type: 'request', needs_response: true });
@@ -66,11 +77,16 @@ test('the callout sits at the top of the thread, only for items that need you, n
     assert.equal(pane.firstElementChild.id, 'needs-you', 'above the thread header and posts');
     assert.equal(pane.children[1].id, 'thread-1');
     assert.deepEqual(items(document), [14, 12, 10], 'newest first, this thread only');
-    assert.deepEqual(ctas(document), ['codex is waiting on you (request) — approve or reply',
-      'codex proposes a decision — finalize it or reply', 'claude-code asks you a question — reply']);
+    assert.deepEqual(contexts(document), ['Blocking thread #1 · post #14 by codex', 'Blocking thread #1 · post #12 by codex',
+      'Blocking thread #1 · post #10 by claude-code']);
+    // A plain post has no structured question: its first line stands in, labelled as such.
+    const first = document.querySelector('#needs-you [data-post="14"]');
+    assert.equal(first.querySelector('.ask-label').textContent, 'Question (from the post)');
+    assert.equal(first.querySelector('h3').textContent, 'post 14 ' + INJECTION);
     assert.equal(document.querySelector('#needs-you h2').textContent, 'Needs you (3)');
+    assert.match(document.querySelector('tr[data-thread="1"] .dot').getAttribute('aria-label'), /3 posts waiting on you: #10, #12, #14/);
     await pick(document, 3);
-    assert.equal(document.getElementById('needs-you'), null, 'no callout where nothing needs you');
+    assert.equal(document.getElementById('needs-you'), null, 'no card where nothing needs you');
     assert.equal(win.pwned, undefined);
     assert.equal(document.querySelector('img'), null, 'post text and titles are never parsed as HTML');
     assert.ok(document.querySelector('#needs-you, #thread-3 .body').textContent.includes('<img'), 'shown as text');
@@ -85,41 +101,53 @@ test('hidden for an agent viewing the board', async () => {
   dom.window.close();
 });
 
-test('buttons per item: decisions get Finalize and Reject; Approve & launch only for a launchable author', async () => {
+test('cards per plain item: decisions get Finalize and Reject; Approve & launch only for a launchable author', async () => {
   const d = post(12, 1, { type: 'decision' }), sealedD = post(13, 1, { type: 'decision', sealed: true });
   const q = post(14, 1, { type: 'question', agent: 'claude-code', needs_response: true });
   const { dom, document } = await setup({ threads: [thread(1, [d, sealedD, q])], needsYou: [q, sealedD, d], launchable: ['codex'] });
   try {
-    assert.deepEqual(actions(document, 12), ['Finalize', 'Reject', 'Approve', 'Approve & launch codex', 'Not now', 'Reply…', 'Jump to post #12']);
-    assert.deepEqual(actions(document, 13), ['Reject', 'Approve', 'Approve & launch codex', 'Not now', 'Reply…', 'Jump to post #13'],
-      'a sealed decision cannot be finalized until unsealed');
-    assert.deepEqual(actions(document, 14), ['Approve', 'Not now', 'Reply…', 'Jump to post #14'], 'claude-code is not launchable');
+    assert.deepEqual(cards(document, 12), ['Finalize the decision', 'Approve as proposed', 'Approve & launch codex',
+      'Reject the decision', 'Not now', 'Write your own reply']);
+    assert.deepEqual(cards(document, 13), ['Approve as proposed', 'Approve & launch codex', 'Reject the decision', 'Not now',
+      'Write your own reply'], 'a sealed decision cannot be finalized until unsealed');
+    assert.deepEqual(cards(document, 14), ['Approve as proposed', 'Not now', 'Write your own reply'], 'claude-code is not launchable');
+    // Nothing is picked: one primary button, disabled, that says what to do.
+    assert.equal(primary(document, 14).textContent, 'Choose an option');
+    assert.equal(primary(document, 14).disabled, true);
+    assert.equal(document.querySelectorAll('#needs-you [data-post="14"] .ny-primary').length, 1);
+    // Plain posts offer to ask the author for options.
+    assert.equal(button(document, 14, 'ask_options').textContent, 'Ask claude-code for options');
+    assert.match(document.querySelector('#needs-you [data-post="14"] .ny-ask').textContent, /no structured options/);
   } finally { dom.window.close(); }
 });
 
-test('each button calls the resolve endpoint once, with no confirm, and the result line says what happened', async () => {
+test('each card + primary button calls the resolve endpoint once, with no confirm, and the result line says what happened', async () => {
   const cases = [
-    ['approve', { type: 'request', needs_response: true }, { action: 'approve', post_id: 90, resolved_post_id: 14, to: ['codex'] },
+    ['approve', 'Approve', { type: 'request', needs_response: true }, { action: 'approve', post_id: 90, resolved_post_id: 14, to: ['codex'] },
       'Approved #14; told codex to go ahead (post #90).'],
-    ['not_now', { type: 'request', needs_response: true }, { action: 'not_now', post_id: 91, resolved_post_id: 14, to: ['codex'] },
+    ['not_now', 'Not now', { type: 'request', needs_response: true }, { action: 'not_now', post_id: 91, resolved_post_id: 14, to: ['codex'] },
       'Parked #14; told codex not now (post #91).'],
-    ['reject', { type: 'decision' }, { action: 'reject', post_id: 92, resolved_post_id: 14, to: ['codex'] },
+    ['reject', 'Reject decision', { type: 'decision' }, { action: 'reject', post_id: 92, resolved_post_id: 14, to: ['codex'] },
       'Rejected decision #14; told codex (post #92).'],
-    ['approve_launch', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 93, resolved_post_id: 14,
-      to: ['codex'], agent: 'codex', rule_id: 5, dispatcher_running: true, paused: false, live: false, no_runner: false },
+    ['approve_launch', 'Approve & launch codex', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 93,
+      resolved_post_id: 14, to: ['codex'], agent: 'codex', rule_id: 5, dispatcher_running: true, paused: false, live: false, no_runner: false },
       'Approved #14 and launched codex (dispatcher running; it starts within seconds) (post #93).'],
-    ['approve_launch', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 94, resolved_post_id: 14,
-      to: ['codex'], agent: 'codex', rule_id: 6, dispatcher_running: false, paused: false, live: false, no_runner: false },
+    ['approve_launch', 'Approve & launch codex', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 94,
+      resolved_post_id: 14, to: ['codex'], agent: 'codex', rule_id: 6, dispatcher_running: false, paused: false, live: false, no_runner: false },
       "Approved #14 (post #94). The dispatcher isn't running — start it with `board dispatch run` to launch codex."],
   ];
-  for (const [action, extra, answer, message] of cases) {
+  for (const [action, label, extra, answer, message] of cases) {
     const item = post(14, 1, extra);
     let waiting = [item];
     const reply = u => { if (u === '/api/posts/14/resolve') { waiting = []; return ok(answer); } return fail(404, 'nf'); };
     const { dom, document, calls, prompts } = await setup({ threads: [thread(1, [item])], needsYou: () => waiting, reply,
       launchable: ['codex'] });
     try {
-      button(document, 14, action).click();
+      card(document, 14, action).click();
+      assert.equal(calls.length, 0, 'picking a card sends nothing');
+      assert.equal(primary(document, 14).textContent, label, 'the button names its effect');
+      assert.equal(primary(document, 14).disabled, false);
+      primary(document, 14).click();
       await settle();
       assert.deepEqual(prompts, [], 'no window.confirm/prompt/alert');
       const sent = calls.filter(c => c.u === '/api/posts/14/resolve');
@@ -128,10 +156,10 @@ test('each button calls the resolve endpoint once, with no confirm, and the resu
       assert.equal(sent[0].headers['X-Board-Request'], '1');
       assert.deepEqual(sent[0].body, { action });
       assert.equal(document.querySelector('#needs-you-result span').textContent, message);
-      assert.deepEqual(items(document), [], 'the item leaves the callout on refresh');
+      assert.deepEqual(items(document), [], 'the item leaves the card on refresh');
       assert.match(document.querySelector('#needs-you h2').textContent, /nothing left here/);
       document.querySelector('#needs-you-result button').click();
-      assert.equal(document.getElementById('needs-you'), null, 'dismissed: the callout goes away');
+      assert.equal(document.getElementById('needs-you'), null, 'dismissed: the card goes away');
     } finally { dom.window.close(); }
   }
 });
@@ -144,44 +172,52 @@ test('Finalize uses the existing endpoint; errors show inline, not in an alert; 
     return fail(409, 'post #12 no longer needs you (it was already handled)'); };
   const { dom, document, calls, prompts } = await setup({ threads: [thread(1, [d])], needsYou: [d], reply });
   try {
-    button(document, 12, 'finalize').click();
+    card(document, 12, 'finalize').click();
+    assert.equal(primary(document, 12).textContent, 'Finalize decision');
+    primary(document, 12).click();
     await settle(10);
-    assert.ok(button(document, 12, 'finalize').disabled && button(document, 12, 'approve').disabled, 'busy while in flight');
-    button(document, 12, 'finalize').click();
+    assert.ok(primary(document, 12).disabled && card(document, 12, 'approve').disabled, 'busy while in flight');
+    assert.equal(primary(document, 12).textContent, 'Sending…');
+    primary(document, 12).click();
     release();
     await settle();
     assert.equal(calls.filter(c => c.u === '/api/posts/12/finalize').length, 1);
     assert.equal(document.querySelector('#needs-you-result span').textContent, 'Finalized decision #12.');
-    button(document, 12, 'approve').click();
+    card(document, 12, 'approve').click();
+    primary(document, 12).click();
     await settle();
     const res = document.getElementById('needs-you-result');
     assert.ok(res.classList.contains('failed'));
     assert.equal(res.querySelector('span').textContent, "Couldn't resolve #12: post #12 no longer needs you (it was already handled)");
+    assert.equal(card(document, 12, 'approve').checked, true, 'the choice survives a failure');
     assert.deepEqual(prompts, []);
   } finally { dom.window.close(); }
 });
 
-test('Reply… opens a textarea; Send posts the human text; the byte limit is enforced', async () => {
+test('Write your own reply reveals a textarea; Send reply posts the human text; the byte limit is enforced', async () => {
   const q = post(14, 1, { type: 'question', needs_response: true });
   let waiting = [q];
   const reply = u => { if (u === '/api/posts/14/resolve') { waiting = []; return ok({ action: 'reply', post_id: 95, resolved_post_id: 14, to: ['codex'] }); }
     return fail(404, 'nf'); };
   const { dom, document, win, calls, prompts } = await setup({ threads: [thread(1, [q])], needsYou: () => waiting, reply });
   try {
-    assert.equal(document.querySelector('#needs-you textarea'), null);
-    button(document, 14, 'reply-open').click();
-    const area = document.querySelector('#needs-you [data-post="14"] textarea');
-    assert.ok(area, 'the textarea opens inline');
-    const send = () => document.querySelector('#needs-you .ny-send');
-    assert.ok(send().disabled, 'nothing to send yet');
+    const box = () => document.querySelector('#needs-you [data-post="14"] .ny-reply');
+    assert.equal(box().hidden, true, 'hidden until Write your own reply is picked');
+    card(document, 14, 'custom').click();
+    assert.equal(box().hidden, false);
+    const area = document.querySelector('#needs-you [data-post="14"] textarea.ny-textarea');
+    assert.equal(primary(document, 14).textContent, 'Send reply');
+    assert.ok(primary(document, 14).disabled, 'nothing to send yet');
     area.value = 'x'.repeat(4097); area.dispatchEvent(new win.Event('input'));
-    assert.ok(send().disabled, 'over 4 KB');
+    assert.ok(primary(document, 14).disabled, 'over 4 KB');
     assert.match(document.querySelector('#needs-you .ny-count').textContent, /4097 \/ 4096 bytes — too long/);
+    assert.match(document.querySelector('#needs-you [data-post="14"] .hint').textContent, /too long/);
     area.value = '  Use option B, not ' + INJECTION + '  '; area.dispatchEvent(new win.Event('input'));
-    assert.ok(!send().disabled);
+    assert.ok(!primary(document, 14).disabled);
     await win.refresh(); await settle(10);
-    assert.equal(document.querySelector('#needs-you textarea').value, '  Use option B, not ' + INJECTION + '  ', 'the draft survives a refresh');
-    send().click();
+    assert.equal(document.querySelector('#needs-you textarea.ny-textarea').value, '  Use option B, not ' + INJECTION + '  ', 'the draft survives a refresh');
+    assert.equal(card(document, 14, 'custom').checked, true, 'so does the choice');
+    primary(document, 14).click();
     await settle();
     const [sent] = calls.filter(c => c.u === '/api/posts/14/resolve');
     assert.deepEqual(sent.body, { action: 'reply', text: 'Use option B, not ' + INJECTION });
@@ -189,6 +225,115 @@ test('Reply… opens a textarea; Send posts the human text; the byte limit is en
     assert.equal(document.querySelector('#needs-you textarea'), null);
     assert.equal(win.pwned, undefined);
     assert.deepEqual(prompts, []);
+  } finally { dom.window.close(); }
+});
+
+test('a structured post: Recommended, Alternative, Write your own reply; Choose sends the option and an optional note', async () => {
+  const s = post(30, 1, { type: 'proposal', agent: 'claude-code', needs_response: true, decision_question: QUESTION() });
+  let waiting = [s];
+  const reply = u => { if (u === '/api/posts/30/resolve') { waiting = []; return ok({ action: 'choose', post_id: 96,
+    resolved_post_id: 30, to: ['claude-code'], option_id: 'ship' }); } return fail(404, 'nf'); };
+  const { dom, document, win, calls, prompts } = await setup({ threads: [thread(1, [s])], needsYou: () => waiting, reply,
+    launchable: ['claude-code'] });
+  try {
+    const item = document.querySelector('#needs-you [data-post="30"]');
+    assert.equal(item.querySelector('.ask-context .where').textContent, 'Blocking thread #1 · post #30 by claude-code');
+    assert.equal(item.querySelector('.ask-label').textContent, 'Question');
+    assert.equal(item.querySelector('h3').textContent, QUESTION().question);
+    assert.match(item.querySelector('.ny-body').textContent, /^Trailing commas are dropped/);
+    assert.deepEqual(cards(document, 30), ['Ship it now', 'Wait for the refactor ' + INJECTION, 'Write your own reply']);
+    assert.deepEqual(badges(document, 30), ['Recommended', 'Alternative', '']);
+    assert.match(item.querySelector('.radio-card').textContent, /Merges today; costs a re-review/);
+    assert.equal(button(document, 30, 'ask_options'), null, 'structured: nothing to ask for');
+    assert.equal(card(document, 30, 'approve'), null, 'no fixed one-click answers in place of the options');
+    card(document, 30, 'option:wait').click();
+    assert.equal(primary(document, 30).textContent, 'Choose Alternative');
+    card(document, 30, 'option:ship').click();
+    assert.equal(primary(document, 30).textContent, 'Choose Recommended');
+    const note = item.querySelector('textarea.ny-note');
+    assert.equal(note.closest('.ny-note-box').hidden, false, 'a note can go with a chosen option');
+    note.value = 'only the parser'; note.dispatchEvent(new win.Event('input'));
+    assert.equal(calls.length, 0);
+    primary(document, 30).click();
+    await settle();
+    const sent = calls.filter(c => c.u === '/api/posts/30/resolve');
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].body, { action: 'choose', option_id: 'ship', note: 'only the parser' });
+    assert.equal(document.querySelector('#needs-you-result span').textContent,
+      'Chose the recommended option “Ship it now” for #30; told claude-code (post #96).');
+    assert.deepEqual(prompts, []);
+    assert.equal(win.pwned, undefined); assert.equal(document.querySelector('img'), null);
+  } finally { dom.window.close(); }
+});
+
+test('a plain post can ask its author for options, in one click', async () => {
+  const p = post(40, 1, { type: 'proposal', agent: 'claude-code', needs_response: true,
+    body: 'Two ways forward.\n(A, recommended) do x\n(B) do y' });
+  let waiting = [p];
+  const reply = u => { if (u === '/api/posts/40/resolve') { waiting = []; return ok({ action: 'ask_options', post_id: 97,
+    resolved_post_id: 40, to: ['claude-code'] }); } return fail(404, 'nf'); };
+  const { dom, document, calls, prompts } = await setup({ threads: [thread(1, [p])], needsYou: () => waiting, reply });
+  try {
+    assert.equal(document.querySelector('#needs-you [data-post="40"] h3').textContent, 'Two ways forward.');
+    button(document, 40, 'ask_options').click();
+    await settle();
+    const sent = calls.filter(c => c.u === '/api/posts/40/resolve');
+    assert.deepEqual(sent.map(c => c.body), [{ action: 'ask_options' }]);
+    assert.equal(document.querySelector('#needs-you-result span').textContent,
+      'Asked claude-code to restate #40 with a recommended option and an alternative (post #97).');
+    assert.deepEqual(prompts, []);
+  } finally { dom.window.close(); }
+});
+
+test('an answered linked issue is not shown as the blocker; the card names the post that is', async () => {
+  // The thread-7 situation: issue #4 is answered for this thread, but post #221 (a plain proposal) still waits.
+  const p = post(221, 7, { type: 'proposal', agent: 'claude-code', needs_response: true, body: 'Pick one: (A, recommended) x (B) y' });
+  const answered = { id: 4, title: 'Shared blocker', body: 'b', status: 'open', needs_human: false, created_by: 'codex',
+    created_at: MINUTES_AGO(90), updated_at: MINUTES_AGO(37), comments: [], resolution: null,
+    decisions: [{ id: 9, outcome: 'approved', body: 'Approved', agent: 'human', thread_ids: [7], created_at: MINUTES_AGO(37) }],
+    links: [{ thread_id: 7, post_id: null, needs_human: false, project: '/repo/app', title: 'Thread 7' }] };
+  const { dom, document } = await setup({ threads: [thread(7, [p])], needsYou: [p], issues: [answered] });
+  try {
+    const card7 = document.getElementById('needs-you');
+    assert.equal(card7.querySelector('[data-issue="4"]'), null, 'the answered issue is not offered for a decision');
+    assert.equal(card7.querySelector('.ny-explain').textContent, 'Issue #4 is answered; this thread is still waiting on post #221.');
+    assert.deepEqual(contexts(document), ['Blocking thread #7 · post #221 by claude-code']);
+    assert.match(document.querySelector('#thread-issues').textContent, /Human answered · unresolved/);
+    assert.match(document.querySelector('tr[data-thread="7"] .dot').getAttribute('aria-label'), /Waiting on you: post #221/);
+    assert.match(document.querySelector('tr[data-thread="7"] .needs-chip').title, /post #221/);
+  } finally { dom.window.close(); }
+});
+
+test('the sidebar lists every item compactly: what it blocks, the question, the options at a glance', async () => {
+  const s = post(30, 1, { type: 'question', needs_response: true, decision_question: QUESTION() });
+  const p = post(31, 2, { type: 'request', needs_response: true, body: '\n\n  Can I delete the cache? ' + INJECTION + '\nmore' });
+  const issue = { id: 5, title: 'Detector', body: 'b', status: 'open', needs_human: true, created_by: 'codex', created_at: MINUTES_AGO(9),
+    updated_at: MINUTES_AGO(9), comments: [], decisions: [], resolution: null, question_version: 1, decision_question: QUESTION(),
+    links: [{ thread_id: 1, post_id: null, needs_human: true, project: '/repo/app', title: 'T1' },
+      { thread_id: 2, post_id: null, needs_human: true, project: '/repo/app', title: 'T2' }] };
+  const { dom, document, win } = await setup({ threads: [thread(1, [s]), thread(2, [p])], needsYou: [p, s], issues: [issue] });
+  try {
+    const side = document.getElementById('needs-you-side');
+    assert.equal(side.querySelector('h2').textContent, 'Needs you (3)');
+    const rows = [...side.querySelectorAll('.ask-compact')];
+    assert.deepEqual(rows.map(r => r.dataset.issue ? 'issue-' + r.dataset.issue : 'post-' + r.dataset.post), ['issue-5', 'post-31', 'post-30']);
+    assert.equal(rows[0].querySelector('.ask-context').textContent, 'Issue #5 · blocks threads #1, #2');
+    assert.equal(rows[0].querySelector('a').textContent, QUESTION().question);
+    assert.equal(rows[0].querySelector('.ask-options').textContent, 'Recommended: Ship it now · Alternative: Wait for the refactor ' + INJECTION);
+    assert.match(rows[1].querySelector('.ask-context').textContent, /^Blocking thread #2 · post #31 by codex/);
+    assert.equal(rows[1].querySelector('a').textContent, 'Can I delete the cache? ' + INJECTION);
+    assert.equal(rows[1].querySelector('.ask-options').textContent, 'No structured options · approve, not now or reply');
+    assert.match(rows[2].querySelector('.ask-options').textContent, /^Recommended: Ship it now/);
+    assert.equal(win.pwned, undefined); assert.equal(document.querySelector('img'), null);
+  } finally { dom.window.close(); }
+});
+
+test('a long first line is trimmed to about 140 characters for the heading', async () => {
+  const p = post(50, 1, { type: 'question', needs_response: true, body: 'word '.repeat(60) });
+  const { dom, document } = await setup({ threads: [thread(1, [p])], needsYou: [p] });
+  try {
+    const h = document.querySelector('#needs-you [data-post="50"] h3').textContent;
+    assert.ok(h.length <= 140 && h.endsWith('…'), h);
   } finally { dom.window.close(); }
 });
 
