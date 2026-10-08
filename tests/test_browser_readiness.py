@@ -211,3 +211,54 @@ def test_delayed_or_replayed_probe_cannot_restore_readiness(env, invalidation):
         br.begin_probe(env.board, env.p['codex'], sid, URL, CTX)
     with pytest.raises(Conflict, match='attempt'):
         br.report_probe(env.board, env.p['codex'], sid, URL, CTX, EVIDENCE, attempt)
+
+
+def probe_url(env, url):
+    attempt = br.begin_probe(env.board, env.p['codex'], env.sid['codex'], url, CTX)
+    return br.report_probe(env.board, env.p['codex'], env.sid['codex'], url, CTX,
+                           {**EVIDENCE, 'rendered_url': url}, attempt['attempt_id'])
+
+
+@pytest.mark.parametrize('failure', ['disconnected', 'browser_missing', 'host_permission'])
+def test_connection_failure_invalidates_other_urls_and_inflight_probes(env, failure):
+    other = 'http://localhost:5185/settings'
+    pending_url = 'http://localhost:5185/profile'
+    probe(env)
+    probe_url(env, other)
+    attempt = br.begin_probe(env.board, env.p['codex'], env.sid['codex'], pending_url, CTX)
+    assert br.has_ready_probe(env.board, env.sid['codex'])
+    fail(env, failure)
+    assert br.readiness(env.board, env.sid['codex'], other) != 'ready'
+    assert not br.has_ready_probe(env.board, env.sid['codex'])
+    with pytest.raises(Conflict):
+        br.report_probe(env.board, env.p['codex'], env.sid['codex'], pending_url, CTX,
+                        {**EVIDENCE, 'rendered_url': pending_url}, attempt['attempt_id'])
+
+
+def test_reconnect_budget_shared_between_targets_and_success_does_not_restore_others(env):
+    other = 'http://localhost:5185/settings'
+    probe(env)
+    probe_url(env, other)
+    fail(env)
+    for expected, url in enumerate((URL, other), 1):
+        attempt = br.claim_reconnect(env.board, env.p['codex'], env.sid['codex'], url, CTX)
+        assert attempt['attempt'] == expected
+    for url in (URL, other):
+        with pytest.raises(Conflict, match='limit'):
+            br.claim_reconnect(env.board, env.p['codex'], env.sid['codex'], url, CTX)
+    probe_url(env, other)
+    assert br.readiness(env.board, env.sid['codex'], other) == 'ready'
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'disconnected'
+    fail(env)
+    assert br.claim_reconnect(env.board, env.p['codex'], env.sid['codex'], URL, CTX)['attempt'] == 1
+
+
+def test_reconnect_invalidates_other_target_inflight_attempt(env):
+    other = 'http://localhost:5185/settings'
+    probe(env)
+    fail(env)
+    attempt = br.begin_probe(env.board, env.p['codex'], env.sid['codex'], other, CTX)
+    br.claim_reconnect(env.board, env.p['codex'], env.sid['codex'], URL, CTX)
+    with pytest.raises(Conflict, match='attempt'):
+        br.report_probe(env.board, env.p['codex'], env.sid['codex'], other, CTX,
+                        {**EVIDENCE, 'rendered_url': other}, attempt['attempt_id'])

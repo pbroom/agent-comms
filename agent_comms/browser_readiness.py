@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from . import db, requests
 from .core import Conflict, Forbidden, Invalid
@@ -59,7 +59,9 @@ def target(value):
         origin = f'{u.scheme}://{host}:{port}'
     except ValueError:
         raise Invalid('invalid browser target URL') from None
-    return value, origin
+    default_port = 443 if u.scheme == 'https' else 80
+    netloc = host if port == default_port else f'{host}:{port}'
+    return urlunsplit((u.scheme,netloc,u.path or '/',u.query,u.fragment)), origin
 
 
 def _text(value, name, limit=4096):
@@ -121,7 +123,7 @@ def _context(value, session):
         raise Invalid('context kind must be desktop or headless')
     if session['dispatch_run_id'] and value['kind'] == 'desktop':
         raise Invalid('dispatched process cannot attest another desktop context')
-    return {k: _text(v, k, 200) for k, v in value.items()}
+    return {k: _text(value[k], k, 200) for k in sorted(value)}
 
 
 def begin_probe(board, p, session_id, target_url, context):
@@ -163,7 +165,7 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
             raise Invalid('probe requires HTTP status, rendered URL/identity and harmless interaction/result')
         if type(evidence['http_status']) is not int or not 200 <= evidence['http_status'] < 300:
             raise Invalid('probe must report a successful HTTP response')
-        if evidence['rendered_url'] != url:
+        if target(evidence['rendered_url'])[0] != url:
             raise Invalid('rendered target must match the requested URL exactly')
         for k in ('rendered_identity', 'interaction', 'interaction_result'):
             _text(evidence[k], k, 1000)
@@ -173,6 +175,7 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
             execution_key=excluded.execution_key,context=excluded.context,status=excluded.status,evidence=excluded.evidence,
             verified_at=excluded.verified_at,expires_at=excluded.expires_at,reconnects=0,permission_epoch=excluded.permission_epoch''',
             (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),'ready',json.dumps(evidence),now,expires,gate['epoch']))
+        board.conn.execute('UPDATE browser_probes SET reconnects=0 WHERE session_id=? AND context=?',(session_id,json.dumps(ctx)))
         board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,url))
         _event(board,p,session_id,s['project'],origin,'probe',json.dumps(evidence))
     return {'status': 'ready', 'session_id': session_id, 'target_url': url,
@@ -198,15 +201,20 @@ def report_failure(board, p, session_id, target_url, context, failure, evidence)
             execution_key=excluded.execution_key,context=excluded.context,status=excluded.status,evidence=excluded.evidence,expires_at=0,permission_epoch=excluded.permission_epoch''',
             (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),failure,detail,board.now(),0,gate['epoch']))
         board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,url))
+        if failure in ('disconnected','browser_missing','host_permission'):
+            board.conn.execute('UPDATE browser_probes SET status=?,evidence=?,expires_at=0 WHERE session_id=?',
+                               (failure,detail,session_id))
+            board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=?',(session_id,))
         _event(board,p,session_id,s['project'],origin,failure,detail)
         # Invalidate running work for this context; a denial affects every context at this origin.
-        affected = board.conn.execute('''SELECT b.post_id,b.recipient FROM browser_requirements b
+        affected = board.conn.execute('''SELECT b.post_id,b.recipient,b.origin FROM browser_requirements b
             JOIN posts p ON p.id=b.post_id JOIN threads t ON t.id=p.thread_id
-            WHERE t.project=? AND b.origin=?''', (s['project'],origin)).fetchall()
+            WHERE t.project=? AND (b.origin=? OR ?)''',
+            (s['project'],origin,failure in ('disconnected','browser_missing','host_permission'))).fetchall()
         for req in affected:
             raw = board.conn.execute('SELECT * FROM posts WHERE id=?',(req['post_id'],)).fetchone()
             row = next(r for r in requests.for_post(board,raw) if r['recipient']==req['recipient'])
-            if row['state'] != 'finished' and (failure in ('policy_denied','host_permission') or row['assigned_session']==session_id):
+            if row['state'] != 'finished' and ((failure in ('policy_denied','host_permission') and req['origin']==origin) or row['assigned_session']==session_id):
                 requests._save(board,p,session_id,row,'blocked',f'Browser {failure}: {detail}',[],row['assigned_agent'],row['assigned_session'])
     return {'status': 'blocked', 'failure': failure, 'human_action_required': failure in ('policy_denied','host_permission')}
 
@@ -290,12 +298,15 @@ def claim_reconnect(board, p, session_id, target_url, context):
         if status not in ('disconnected','stale_probe'):
             raise Conflict(f'reconnect not allowed for {status}')
         probe = board.conn.execute('SELECT * FROM browser_probes WHERE session_id=? AND target_url=?',(session_id,url)).fetchone()
-        if json.loads(probe['context']) != ctx or probe['reconnects'] >= MAX_RECONNECTS:
+        used = board.conn.execute('SELECT MAX(reconnects) FROM browser_probes WHERE session_id=? AND context=?',
+                                  (session_id,json.dumps(ctx))).fetchone()[0]
+        if json.loads(probe['context']) != ctx or used >= MAX_RECONNECTS:
             raise Conflict('same-context reconnect limit reached or context changed')
-        board.conn.execute('UPDATE browser_probes SET reconnects=reconnects+1,status=\'disconnected\',expires_at=0 WHERE session_id=? AND target_url=?',
-                           (session_id,url))
+        board.conn.execute('UPDATE browser_probes SET reconnects=?,status=\'disconnected\',expires_at=0 WHERE session_id=? AND context=?',
+                           (used+1,session_id,json.dumps(ctx)))
+        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=?',(session_id,))
         _event(board,p,session_id,s['project'],origin,'reconnect_reserved',json.dumps(ctx))
-    return {'attempt': probe['reconnects']+1, 'limit': MAX_RECONNECTS, 'fresh_probe_required': True}
+    return {'attempt': used+1, 'limit': MAX_RECONNECTS, 'fresh_probe_required': True}
 
 
 def status(board, p, session_id, target_url):
@@ -303,3 +314,9 @@ def status(board, p, session_id, target_url):
     s = board._session(p,session_id)
     return {'readiness': readiness(board,session_id,url), 'gate': _gate(board,s['project'],origin),
             'target_url': url, 'session_id': session_id, 'execution_key': _key(s)}
+
+
+def has_ready_probe(board, session_id):
+    """Generic browser capability names require actual context evidence too."""
+    return any(readiness(board,session_id,row['target_url']) == 'ready' for row in
+               board.conn.execute('SELECT target_url FROM browser_probes WHERE session_id=?',(session_id,)))
