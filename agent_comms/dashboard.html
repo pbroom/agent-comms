@@ -506,7 +506,7 @@ let lastUnstickReply = null;   // thread id -> { threadId, agents, sessionIds, p
 // Needs you callout (human only): the post being resolved (one at a time), the last result per page load, which
 // bodies are expanded, and Reply drafts (kept across the 3-second re-render). A click acts at once (no confirm).
 let resolveBusy = null, resolveNote = null;     // resolveNote: { threadId, text, failed }
-const nyExpanded = new Set(), nyDrafts = {};
+const nyExpanded = new Set(), nyDrafts = {}, nyAssignees = {};
 const nyChoice = {}, nyNotes = {};   // post id -> the option card picked / the optional note with a chosen option
 let scrollToNeedsYou = null;   // after the chip or a sidebar item: the post id (or true) to bring into view
 
@@ -1527,7 +1527,7 @@ async function resolveItem(item, action, text, extra = {}) {
     const r = action === "finalize" ? await api("POST", `/api/posts/${item.id}/finalize`)
       : await api("POST", `/api/posts/${item.id}/resolve`, action === "reply" ? { action, text } : { action, ...extra });
     resolveNote = { threadId: item.thread_id, text: resolveMessage(action, item, r || {}), failed: false };
-    delete nyDrafts[item.id]; delete nyChoice[item.id]; delete nyNotes[item.id];
+    delete nyDrafts[item.id]; delete nyChoice[item.id]; delete nyNotes[item.id]; delete nyAssignees[item.id];
     lastError = "";
   } catch (e) {
     resolveNote = { threadId: item.thread_id, text: `Couldn't resolve #${item.id}: ${e.message}`, failed: true };
@@ -1539,6 +1539,14 @@ async function resolveItem(item, action, text, extra = {}) {
 // The option cards for a post, in the fixed order. A structured question: Recommended, Alternative (each posts
 // "Chose option …"). A plain post: Approve as proposed, Approve & launch <agent>, Not now. Decisions add Finalize and
 // Reject. Write your own reply is always last. `button` is the primary button's label once the card is picked.
+function mechanicalEffect(a) {
+  if (!a) return null;
+  const source = `request #${a.post_id}/${a.recipient} (version ${a.expected_version})`;
+  if (a.type === 'close') return `Closes ${source} using evidence ${a.evidence_post_ids.map(id => '#' + id).join(', ')}. Runs on the server; no agent turn.`;
+  if (a.type === 'route') return `Routes ${source} to verified session #${a.target_session_id}. Runs on the server; work stays queued until agent pickup.`;
+  if (a.type === 'repost') return `Reposts ${source} to thread #${a.target_thread_id}; keeps the source blocked with a destination link. Runs on the server.`;
+  return null;
+}
 function postChoices(item) {
   const who = isHumanName(item.agent) ? "the thread" : item.agent, n = `#${item.id}`;
   const decision = item.type === "decision", q = item.decision_question;
@@ -1551,11 +1559,11 @@ function postChoices(item) {
     desc: "Answer in your own words, or propose something else.", button: "Send reply" };
   if (q) return [
     ...rankedOptions(q).map(o => ({ value: "option:" + o.id, action: "choose", option: o.id, rank: o.rank, title: o.label,
-      desc: o.description, effect: `Tells ${who} you chose this option`, button: `Choose ${o.rank}` })),
+      desc: o.description, deliver: o.outcome === "approved" && !o.action, effect: mechanicalEffect(o.action) || (o.outcome === "approved" ? `Queues this approved work for ${who}; allows one launch if inactive` : `Tells ${who} you chose this option`), button: o.action ? `Choose and ${o.action.type}` : `Choose ${o.rank}` })),
     ...finalize, ...reject, own];
   return [
     ...finalize,
-    { value: "approve", action: "approve", title: "Approve as proposed", effect: `Posts “Approved: go ahead with ${n}.” to ${who}`,
+    { value: "approve", action: "approve", title: "Approve as proposed", effect: `Queues approved work ${n} for ${who}; allows one launch if inactive`,
       button: "Approve" },
     ...(launchable ? [{ value: "approve_launch", action: "approve_launch", title: `Approve & launch ${item.agent}`,
       effect: `Approves, and lets the dispatcher launch ${item.agent} once on this thread now (uses tokens)`,
@@ -1609,6 +1617,13 @@ function renderNeedsYouItem(item) {
     placeholder: "Add a note to your choice (optional)", oninput: e => { nyNotes[item.id] = e.target.value; sync(); } }, nyNotes[item.id] || "");
   const noteBox = el("div", { class: "custom ny-note-box" }, el("label", { class: "field-label", for: note.id }, "Note (optional)"), note);
 
+  const assignee = el("select", { id: `ny-assign-${item.id}`, disabled: busy,
+    onchange: e => { nyAssignees[item.id] = e.target.value; } },
+    (state.agents || []).filter(a => !a.is_human && a.active !== false && a.active !== 0).map(a =>
+      el("option", { value: a.name, selected: (nyAssignees[item.id] || item.agent) === a.name }, a.name)));
+  const assignBox = el("div", { class: "custom ny-assign" },
+    el("label", { class: "field-label", for: assignee.id }, "Assign approved work to"), assignee);
+
   const problem = () => {
     const c = picked(), text = (nyDrafts[item.id] || "").trim(), n = bytes(text), nn = bytes((nyNotes[item.id] || "").trim());
     if (!c) return "Choose an option or write your own reply.";
@@ -1625,6 +1640,7 @@ function renderNeedsYouItem(item) {
     hint.classList.toggle("err", !!(c && p));
     custom.hidden = !c || c.value !== "custom";
     noteBox.hidden = !c || c.action !== "choose";
+    assignBox.hidden = !c || !(c.deliver || ["approve", "approve_launch"].includes(c.action));
     count.textContent = `${n} / ${limit} bytes` + (n > limit ? " — too long" : "");
     count.classList.toggle("err", n > limit);
   };
@@ -1634,8 +1650,8 @@ function renderNeedsYouItem(item) {
     if (c.value === "custom") resolveItem(item, "reply", (nyDrafts[item.id] || "").trim());
     else if (c.action === "choose") {
       const text = (nyNotes[item.id] || "").trim();
-      resolveItem(item, "choose", null, text ? { option_id: c.option, note: text } : { option_id: c.option });
-    } else resolveItem(item, c.action);
+      resolveItem(item, "choose", null, { option_id: c.option, ...(text ? {note: text} : {}), ...(c.deliver && nyAssignees[item.id] ? {delivery_agent: nyAssignees[item.id]} : {}) });
+    } else resolveItem(item, c.action, null, nyAssignees[item.id] && ["approve", "approve_launch"].includes(c.action) ? {delivery_agent: nyAssignees[item.id]} : {});
   });
 
   const cards = el("fieldset", { class: "radio-cards" }, el("legend", {}, q ? "Choose an answer" : "Your answer"),
@@ -1658,7 +1674,7 @@ function renderNeedsYouItem(item) {
       el("button", { class: "linkish small", "data-action": "jump", onclick: () => jumpToPost(item.id) }, `Jump to post #${item.id}`)),
     askHead("post-" + item.id, q ? "Question" : "Question (from the post)", postQuestion(item), postContext(item)),
     refs,
-    el("div", { class: "ask-form" }, cards, custom, noteBox, ask, el("div", { class: "footer" }, hint, send)));
+    el("div", { class: "ask-form" }, cards, custom, noteBox, assignBox, ask, el("div", { class: "footer" }, hint, send)));
 }
 
 // Answered issues linked to this thread that no longer wait on the human here, while posts still do: say so, so an

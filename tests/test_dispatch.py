@@ -985,7 +985,7 @@ def test_codex_board_tool_lists_match_the_mcp_server():
 
     served = re.findall(r"^    (?:async )?def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
     assert set(served) == set(dispatch.BOARD_TOOLS) | {"board_resolve_attention", "board_request_progress", "board_request_history",
-                                                       "board_register_capabilities", "board_route_request"}
+                                                       "board_register_capabilities", "board_route_request", "board_repost_request"}
     assert "board_resolve_attention" not in dispatch.BOARD_TOOLS
     runner = DispatchConfig.load(ROOT / "board.toml", local=False).runners["codex-cli"]
     overrides = [runner[i + 1] for i, x in enumerate(runner) if x == "-c"]

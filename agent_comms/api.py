@@ -53,6 +53,13 @@ class RequestRouteIn(Body):
     expected_version: StrictInt
 
 
+class RequestRepostIn(Body):
+    session_id: StrictInt | None = None
+    recipient: str
+    expected_version: StrictInt
+    target_thread_id: StrictInt
+
+
 class RequestProgressIn(Body):
     session_id: int | None = None
     recipient: str
@@ -202,6 +209,7 @@ class AttentionResolutionIn(Body):
 
 
 class ResolveIn(Body):
+    delivery_agent: str | None = None
     action: Literal["approve", "approve_launch", "reject", "not_now", "reply", "choose", "ask_options"]
     text: str | None = None
     option_id: str | None = None   # choose: one of the post's decision_question option ids
@@ -489,7 +497,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         # The Needs you callout's one-click actions: posts fixed text (or the human's reply) as the human to the
         # post's author; approve_launch first approves a one-shot dispatcher rule for it (see resolve.py).
         return resolve.resolve(board, p, post_id, body.action, body.text, dispatch_config()[0],
-                               option_id=body.option_id, note=body.note)
+                               option_id=body.option_id, note=body.note, delivery_agent=body.delivery_agent)
 
     @app.post("/api/posts/{post_id}/unseal")
     def unseal(post_id: int, p: Principal = P):
@@ -666,6 +674,12 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def route_request(post_id: int, body: RequestRouteIn, request: Request, p: Principal = P):
         return capabilities.route(board, p, sid(p, request, body.session_id), post_id,
                                   body.recipient, body.required_capabilities, body.expected_version)
+
+    @app.post("/api/posts/{post_id}/request-repost")
+    def repost_request(post_id: int, body: RequestRepostIn, request: Request, p: Principal = P):
+        from . import decision_actions
+        return decision_actions.repost(board, p, sid(p, request, body.session_id), post_id,
+                                       body.recipient, body.expected_version, body.target_thread_id)
 
     @app.post("/api/posts/{post_id}/request-progress")
     def request_progress(post_id: int, body: RequestProgressIn, request: Request, p: Principal = P):

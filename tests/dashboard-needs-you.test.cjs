@@ -418,3 +418,33 @@ test('selective closeout retains original request and evidence without hiding ot
     assert.equal(source.querySelector('img'), null);
   } finally { dom.window.close(); }
 });
+
+test('mechanical close exposes exact target, version and evidence before execution', async () => {
+  const q = QUESTION();
+  q.options[1].action = { type: 'close', post_id: 3, recipient: 'codex', expected_version: 2, evidence_post_ids: [4] };
+  const p = post(11, 1, { type: 'question', needs_response: true, decision_question: q });
+  const { dom, document, calls } = await setup({ threads: [thread(1, [p])], needsYou: [p] });
+  try {
+    await pick(document, 1);
+    const node = document.querySelector('#needs-you [data-post="11"]');
+    assert.match(node.textContent, /Closes request #3\/codex \(version 2\) using evidence #4/);
+    card(document,11,'option:ship').click();
+    assert.equal(primary(document,11).textContent, 'Choose and close');
+    assert.equal(node.querySelector('.ny-assign').hidden, true);
+    primary(document,11).click(); await settle();
+    assert.deepEqual(calls.find(c => c.u.endsWith('/11/resolve')).body, {action:'choose',option_id:'ship'});
+  } finally { dom.window.close(); }
+});
+
+test('assign approved work sends explicit selected implementer, never parses notes', async () => {
+  const p = post(11,1,{type:'question',needs_response:true,decision_question:QUESTION()});
+  const { dom, win, document, calls } = await setup({threads:[thread(1,[p])],needsYou:[p]});
+  try {
+    await pick(document,1);
+    card(document,11,'option:ship').click();
+    const select = document.querySelector('#needs-you [data-post="11"] select');
+    select.value='claude-code'; select.dispatchEvent(new win.Event('change'));
+    primary(document,11).click(); await settle();
+    assert.equal(calls.find(c => c.u.endsWith('/11/resolve')).body.delivery_agent,'claude-code');
+  } finally { dom.window.close(); }
+});

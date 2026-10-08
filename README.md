@@ -871,3 +871,39 @@ question, unresolved issue or uncertain legacy obligation remains. Finishing the
 before its task is supported; the final task transition rechecks closeout. Existing human
 manual controls remain available. The summary exposes `agent_pickup` counts separately
 from the compatibility `unread_for_human` reading-history field.
+
+### Mechanical decision actions and continuing approved work
+
+A source post's structured option may include an `action` alongside its label and
+`outcome: "approved"`. Actions have strict fields; arbitrary commands are rejected:
+
+- `close`: `post_id`, original `recipient`, `expected_version`, nonempty
+  `evidence_post_ids` (other unsealed posts in the source thread).
+- `route`: the same exact request/version plus `target_session_id` and
+  `required_capabilities`; existing authorization, fresh capability and ownership
+  checks still apply.
+- `repost`: the same exact request/version plus `target_thread_id`. The human sees
+  the exact move before choosing. It creates one queued successor and leaves an
+  audited source link; evidenced successor completion reconciles only that source.
+
+Every action includes `type`. Choosing it commits the action, receipt and exact
+answer together. A retry returns the original receipt; stale request versions,
+paused/closed threads, executing owners, active leases and managed continuations
+are refused. Mechanical completion needs no agent turn; it does not fabricate
+agent pickup. Shared issue options do not execute mechanical actions: put these
+on the exact source post instead.
+
+For routine agent routing, `board_repost_request` (HTTP
+`POST /api/posts/{id}/request-repost`) uses an existing human issue decision whose
+frozen source links and scope include that exact request and destination thread.
+It never infers scope from peer text. A later decision supersedes earlier scope;
+unrelated requests remain unauthorized. Original history and other recipients
+are preserved. Existing `board_route_request` remains the capability-checked
+same-project path. No action creates tool permissions or repository grants.
+
+An ordinary approved choice now queues explicit work and permits one scoped
+launch. **Assign approved work to** selects the actual implementer (defaulting to
+the proposer), so a note naming another agent no longer has to be parsed. Only
+that selected agent receives a request; the exact answer remains in the shared
+thread history. Its indicator stays blue until real agent pickup, then gray;
+overdue unclaimed work remains stuck.

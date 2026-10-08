@@ -24,8 +24,9 @@ Guardrails (DESIGN_NOTES "Needs you actions"):
 from __future__ import annotations
 
 from typing import Any
+import json
 
-from . import dispatch, human_actions
+from . import dispatch, human_actions, db, decision_actions, requests
 from .core import Board, Conflict, Invalid, Principal
 
 ACTIONS = ("approve", "approve_launch", "reject", "not_now", "reply", "choose", "ask_options")
@@ -53,7 +54,7 @@ def _needs_you(c, post_id: int) -> bool:
 
 
 def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | None,
-            config: dispatch.DispatchConfig, option_id: str | None = None, note: str | None = None) -> dict[str, Any]:
+            config: dispatch.DispatchConfig, option_id: str | None = None, note: str | None = None, delivery_agent: str | None = None) -> dict[str, Any]:
     board._require_human(p, "resolve a post that needs you")
     if action not in ACTIONS:
         raise Invalid(f"action must be one of {ACTIONS}")
@@ -107,6 +108,15 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
         c.execute("DELETE FROM board_state WHERE key LIKE ? AND updated_at < ?",
                   (STATE_PREFIX + "%", board.now() - RESOLVE_COOLDOWN_SECONDS))
 
+    if delivery_agent is not None:
+        if not (action in ('approve', 'approve_launch') or (action == 'choose' and option['outcome'] == 'approved' and not option.get('action'))):
+            raise Invalid('assign to is only for an approved agent action')
+        if not board.conn.execute('SELECT 1 FROM agents WHERE name=? AND active=1 AND is_human=0', (delivery_agent,)).fetchone():
+            raise Invalid('assign to requires an active agent')
+        to_author = [delivery_agent]
+    if option and option.get('action'):
+        return _mechanical(board, p, item, option, question, note)
+
     key = STATE_PREFIX + str(post_id)
     human_actions.reserve_cooldown(
         board, p, key, RESOLVE_COOLDOWN_SECONDS,
@@ -123,11 +133,13 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
     else:
         body = {"approve": APPROVE, "approve_launch": APPROVE, "reject": REJECT, "not_now": NOT_NOW}[action]
         body, type_ = body.format(post=post_id), "status"
-    launch = to_author if action == "approve_launch" else None
+    deliver = action in ('approve', 'approve_launch') or (action == 'choose' and option['outcome'] == 'approved')
+    needs_response = needs_response or bool(deliver and to_author)
+    launch = to_author if deliver else None
     try:
         post, rule = human_actions.post_as_human(
             board, p, thread_id=item["thread_id"], body=body, type=type_, to=to_author, needs_response=needs_response,
-            launch=launch, purpose=PURPOSE.format(post=post_id, thread=item["thread_id"]),answer_to=[post_id])
+            launch=launch, purpose=PURPOSE.format(post=post_id, thread=item["thread_id"]),answer_to=[post_id], answer_recipient=delivery_agent)
     except Exception:
         human_actions.release_cooldown(board, key)
         raise
@@ -141,3 +153,43 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
                 "dispatcher_running": o["dispatcher_running"], "paused": o["paused"],
                 "live": bool(o["live_agents"]), "no_runner": bool(o["no_runner"])}
     return out
+
+
+def _mechanical(board, p, item, option, question, note):
+    """Commit the mechanical result and its answer together; retries return the receipt."""
+    session_id = board.human_session(p)
+    key = 'decision.action.' + str(item['id'])
+    with db.write_tx(board.conn) as c:
+        prior = c.execute('SELECT value FROM board_state WHERE key=?', (key,)).fetchone()
+        if prior:
+            result = json.loads(prior['value'])
+            if result['option_id'] != option['id']:
+                raise Conflict('this decision action was already executed with a different option')
+            return result
+        if not _needs_you(c, item['id']):
+            raise Conflict('this decision no longer needs you')
+        result = decision_actions.execute(board, p, session_id, item, option['action'])
+        action = option['action']
+        target = f"request #{action['post_id']}/{action['recipient']}"
+        if action['type'] == 'close':
+            detail = f"Closed {target} using evidence " + ', '.join('#' + str(i) for i in action['evidence_post_ids']) + '.'
+        elif action['type'] == 'route':
+            detail = f"Routed {target} to session #{action['target_session_id']}; waiting for agent pickup."
+        else:
+            detail = f"Reposted {target} as #{result['reposted_post_id']} on thread #{result['target_thread_id']}; completion will reconcile the original."
+        receipt = board.create_post(p, session_id, thread_id=item['thread_id'], type='status',
+            body=f"Server executed the choice on #{item['id']}. {detail}", _in_transaction=True)
+        rank = 'recommended' if option['id'] == question['recommended_option_id'] else 'alternative'
+        body = CHOSE.format(id=_one_line(option['id']), label=_one_line(option['label']), rank=rank, post=item['id'])
+        answer = board.create_post(p, session_id, thread_id=item['thread_id'], type='status',
+            body=body + (f'\nNote: {note}' if note else ''), answer_to=[item['id']], _in_transaction=True)
+        for row in answer['requests']:
+            requests.progress(board, p, session_id, answer['id'], row['recipient'], 'finished',
+                reason='Mechanical action executed by the server; no agent turn required',
+                evidence_post_ids=[receipt['id']], expected_version=row['version'], _in_transaction=True)
+        out = {'action': 'choose', 'option_id': option['id'], 'post_id': answer['id'],
+               'resolved_post_id': item['id'], 'thread_id': item['thread_id'], 'to': [],
+               'action_result': result, 'receipt_post_id': receipt['id']}
+        c.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
+                  (key, json.dumps(out), p.name, board.now()))
+        return out

@@ -38,7 +38,7 @@ def _question(board, value):
         raise Invalid("decision_question requires exactly two options")
     normalized = []
     for option in options:
-        if not isinstance(option, dict) or set(option) - {"id", "label", "description", "outcome"}:
+        if not isinstance(option, dict) or set(option) - {"id", "label", "description", "outcome", "action"}:
             raise Invalid("invalid decision option")
         outcome = option.get("outcome", "answered")
         if outcome not in ("answered", "approved", "declined"):
@@ -49,6 +49,11 @@ def _question(board, value):
         normalized.append({"id": _body(board, option.get("id"), "option id", 100),
                            "label": _body(board, option.get("label"), "option label", 200),
                            "description": description.strip(), "outcome": outcome})
+        if "action" in option:
+            from .decision_actions import validate
+            if outcome != "approved":
+                raise Invalid('mechanical option actions require approved outcome')
+            normalized[-1]['action'] = validate(option['action'])
     ids = [o["id"] for o in normalized]
     if len(set(ids)) != 2 or value.get("recommended_option_id") not in ids:
         raise Invalid("options need unique ids and a recommended_option_id matching an option")
@@ -213,6 +218,8 @@ def list_issues(board, p, project=None, status=None, query=None, thread_id=None,
 def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, needs_human=True, decision_question=None):
     title, body = _body(board, title, "title", 200), _body(board, body)
     question = _question(board, decision_question)
+    if question and any('action' in o for o in question['options']):
+        raise Invalid('mechanical actions belong on a source post decision_question')
     if not isinstance(needs_human, bool):
         raise Invalid("needs_human must be boolean")
     with db.write_tx(board.conn) as c:
@@ -269,6 +276,8 @@ def comment_issue(board, p, session_id, issue_id, body, kind="comment", decision
     if decision_question is not None and kind != "request":
         raise Invalid("only request comments can set decision_question")
     question = _question(board, decision_question)
+    if question and any('action' in o for o in question['options']):
+        raise Invalid('mechanical actions belong on a source post decision_question')
     with db.write_tx(board.conn) as c:
         _row(board, issue_id)
         _write(board, p, session_id, issue_id)

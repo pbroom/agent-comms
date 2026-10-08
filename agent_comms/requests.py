@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
 from . import db
 from .core import Conflict, Forbidden, Invalid, iso
@@ -27,7 +28,7 @@ def for_post(board, post):
     result = []
     for recipient in dict.fromkeys(json.loads(post['to_agents'])):
         identity = board.conn.execute('SELECT is_human FROM agents WHERE name=?', (recipient,)).fetchone()
-        if recipient == post['agent'] or not identity or identity['is_human']:
+        if (recipient == post['agent'] and recipient not in rows) or not identity or identity['is_human']:
             continue
         row = rows.get(recipient, dict(post_id=post['id'], recipient=recipient, state='queued',
             assigned_agent=recipient, assigned_session=None, reason='', evidence_post_ids='[]',
@@ -112,7 +113,7 @@ def _recover_blocked(board, p, session_id, post, row, state, evidence, expected_
 
 
 def progress(board, p, session_id, post_id, recipient, state, reason='', evidence_post_ids=None, expected_version=None,
-             completion=None, recover_blocked=False):
+             completion=None, recover_blocked=False, _in_transaction=False):
     from . import workstreams
     if expected_version is not None and (type(expected_version) is not int or expected_version < 0):
         raise Invalid('expected_version must be a nonnegative integer')
@@ -128,7 +129,9 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         raise Invalid('evidence must contain at most 20 distinct post IDs')
     if state in ('blocked','finished') and not reason:
         raise Invalid('blocked and finished require an explicit reason')
-    with db.write_tx(board.conn):
+    if _in_transaction and not board.conn.in_transaction:
+        raise Invalid('internal request mutation requires an active transaction')
+    with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)):
         post,row = _context(board,p,session_id,post_id,recipient)
         if state == 'started':
             from . import browser_readiness
@@ -139,6 +142,11 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             reason = 'Terminal recovery from ended session '+str(row['assigned_session'])+': '+reason
             if len(reason.encode()) > board.s.body_max_bytes:
                 raise Invalid('recovery reason exceeds the body limit')
+        successor = board.conn.execute('SELECT 1 FROM board_state WHERE key=?', ('request.successor.' + str(post_id),)).fetchone()
+        if successor and not recover_blocked and not p.is_human and row['assigned_session'] not in (None, session_id):
+            raise Conflict('routed successor is owned by another session')
+        if successor and state == 'finished' and not evidence:
+            raise Invalid('routed successor completion requires evidence post IDs')
         if managed is not None and state == 'finished' and not evidence:
             raise Invalid('managed completion requires same-thread evidence post IDs')
         if not p.is_human and p.name not in (post['agent'],row['assigned_agent']):
@@ -175,6 +183,8 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner)
         workstreams.after_save(board,p,session_id,row,state)
         if state == 'finished':
+            from . import decision_actions
+            decision_actions.reconcile_successor(board,p,session_id,post,recipient)
             from . import issues
             issues.reconcile_completed(board,p,session_id,post['thread_id'])
     return next(r for r in board.get_post(p,post_id)['requests'] if r['recipient']==recipient)
@@ -193,7 +203,7 @@ def history(board,p,post_id,recipient):
     return result
 
 
-def assign(board,p,session_id,post_id,recipient,target_session_id,expected_version,reason,required_capabilities):
+def assign(board,p,session_id,post_id,recipient,target_session_id,expected_version,reason,required_capabilities, _in_transaction=False):
     from . import capabilities
     from . import workstreams
     if workstreams.get_for_post(board, post_id) is not None:
@@ -202,7 +212,9 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         raise Invalid('expected_version is required for reassignment')
     if not isinstance(reason,str) or not reason.strip() or len(reason.encode())>board.s.body_max_bytes:
         raise Invalid('a bounded reassignment reason is required')
-    with db.write_tx(board.conn):
+    if _in_transaction and not board.conn.in_transaction:
+        raise Invalid('internal request mutation requires an active transaction')
+    with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)):
         post,row = _context(board,p,session_id,post_id,recipient)
         if not p.is_human and p.name not in (post['agent'],row['assigned_agent']):
             raise Forbidden('only the author or assigned recipient may route a request')

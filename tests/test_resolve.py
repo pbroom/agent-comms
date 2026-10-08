@@ -97,10 +97,10 @@ def test_fixed_text_actions(renv, action, expected):
                    "to": ["codex"]}
     post = renv.board.get_post(renv.p["human"], out["post_id"])
     assert (post["agent"], post["type"], post["to"], post["needs_response"], post["thread_id"]) == \
-        ("human", "status", ["codex"], False, renv.tid)
+        ("human", "status", ["codex"], action == "approve", renv.tid)
     assert post["body"] == expected.format(id=a["id"])
     assert needs_you(renv) == []                              # the human post after it takes it out
-    assert rules(renv) == []
+    assert len(rules(renv)) == (1 if action == "approve" else 0)
     for text in (post["body"], r.text):
         assert not any(m in text for m in MARKERS), text
 
@@ -166,7 +166,7 @@ def test_404_and_409(renv):
     for action in ("approve", "not_now", "reply", "approve_launch"):
         r = call(renv, a["id"], action, "again" if action == "reply" else None)
         assert r.status_code == 409, action
-    assert len(human_posts(renv)) == 1 and rules(renv) == []
+    assert len(human_posts(renv)) == 1 and len(rules(renv)) == 1
     d = ask(renv, frm="claude", type="decision")
     renv.board.finalize(renv.p["human"], d["id"])            # finalize keeps its own route and also resolves it
     assert call(renv, d["id"], "reject").status_code == 409
@@ -225,7 +225,7 @@ def test_approve_launch_rule_before_post(renv, monkeypatch):
     assert f'"expires_at": {e.clock() + 6 * 3600}' in target
     post = e.board.get_post(e.p["human"], out["post_id"])
     assert (post["body"], post["to"], post["needs_response"]) == (f"Approved: go ahead with #{a['id']}.",
-                                                                  ["codex"], False)
+                                                                  ["codex"], True)
     for text in (post["body"], rule["purpose"], r.text):
         assert not any(m in text for m in MARKERS), text
 
