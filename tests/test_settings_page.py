@@ -467,3 +467,98 @@ def test_settings_routes_are_not_reachable_through_the_chatgpt_gateway():
         for method, path in (("GET", "/api/settings"), ("PUT", "/api/settings"), ("GET", "/api/admin/dispatch"),
                              ("POST", "/api/admin/notifications")):
             assert not gateway.allowed(mode, method, path)
+
+
+def test_configuration_rejected_reload_is_visible_and_refresh_preserves_bytes(senv):
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n[dispatch]\nunknown_future_option = true\n')
+    before = senv.local.read_bytes()
+    status = senv.client.get('/api/configuration', headers=senv.h('codex')).json()
+    assert status['state'] == 'stale'
+    assert status['error']
+    assert status['effective_limits']['daily_post_cap_per_agent'] == 200
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).json()
+    assert result['applied'] is False and result['state'] == 'stale'
+    assert senv.local.read_bytes() == before
+    registered = senv.board.register_session(senv.p['codex'], PROJECT)
+    assert registered['configuration']['state'] == 'stale'
+    assert senv.board.snapshot(senv.p['codex'])['configuration']['state'] == 'stale'
+    assert senv.board.snapshot(senv.p['human'])['configuration']['state'] == 'stale'
+    updates = senv.board.read_updates(senv.p['codex'], registered['session_id'])
+    assert updates['configuration']['state'] == 'stale'
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).json()
+    assert result['applied'] is True and result['state'] == 'current'
+    assert result['effective_limits']['daily_post_cap_per_agent'] == 1000
+
+
+def test_refresh_retries_unchanged_signature_but_never_reload_source(senv, monkeypatch):
+    from agent_comms import core
+    original = senv.board._settings_files_sig()
+    monkeypatch.setattr(senv.board, '_settings_files_sig', lambda: original)
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+    assert senv.board.reload_settings() is False
+    assert senv.board.refresh_configuration()['effective_limits']['daily_post_cap_per_agent'] == 1000
+    monkeypatch.setattr(core, '_runtime_source_fingerprint', lambda: 'new-install')
+    generation = senv.board.settings_generation
+    result = senv.board.refresh_configuration()
+    assert result['applied'] is False and result['runtime_source_changed'] is True
+    assert result['refresh_supported'] is False
+    assert 'Reconnect' in result['recovery']
+    assert senv.board.settings_generation == generation
+
+
+def test_configuration_restart_only_and_authenticated_routes(senv):
+    senv.local.write_text('[server]\nport = 9898\n')
+    result = senv.client.post('/api/configuration/refresh', headers=senv.h('codex')).json()
+    assert result['state'] == 'restart_required'
+    assert result['restart_required'] == ['port']
+    assert senv.board.s.port == 8787
+    for method, path in [('GET', '/api/configuration'), ('POST', '/api/configuration/refresh')]:
+        assert senv.client.request(method, path).status_code == 401
+    assert senv.client.get('/api/whoami', headers=senv.h('codex')).json()['configuration']['state'] == 'restart_required'
+
+
+def test_configuration_mcp_refresh_uses_authenticated_runtime(senv, monkeypatch):
+    import asyncio
+    from mcp import Client
+    from agent_comms.mcp_server import build_mcp
+    monkeypatch.setenv('AGENT_COMMS_TOKEN', senv.tokens['codex'])
+    async def run():
+        async with Client(build_mcp(senv.board, 'stdio')) as client:
+            for name in ['board_configuration_status', 'board_refresh_configuration']:
+                result = await client.call_tool(name, {})
+                assert not result.is_error
+                status = json.loads(result.content[0].text)
+                assert status['state'] == 'current'
+                assert status['effective_limits']['daily_post_cap_per_agent'] == 200
+    asyncio.run(run())
+
+
+def test_configuration_refresh_retries_rejected_unchanged_file(senv, monkeypatch):
+    from agent_comms import core
+    validator = core.check_reloadable
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+    def incompatible(settings):
+        raise ValueError('unsupported runtime configuration')
+    monkeypatch.setattr(core, 'check_reloadable', incompatible)
+    assert senv.board.reload_settings() is False
+    assert senv.board.configuration_status()['state'] == 'stale'
+    monkeypatch.setattr(core, 'check_reloadable', validator)
+    assert senv.board.reload_settings() is False
+    result = senv.board.refresh_configuration()
+    assert result['applied'] and result['error'] is None
+    assert result['effective_limits']['daily_post_cap_per_agent'] == 1000
+
+
+def test_configuration_changed_during_validation_is_not_applied(senv, monkeypatch):
+    from agent_comms import core
+    validator = core.check_reloadable
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+    def changing(settings):
+        validator(settings)
+        senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 300\n')
+        touch_later(senv.local)
+    monkeypatch.setattr(core, 'check_reloadable', changing)
+    assert senv.board.reload_settings() is False
+    assert senv.board.s.daily_post_cap_per_agent == 200
+    assert 'changed while being read' in senv.board.settings_error
