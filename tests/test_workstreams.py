@@ -231,6 +231,25 @@ def test_git_runs_outside_the_write_transaction_and_blocked_ticks_back_off(stack
     assert current(stack, post)["assigned_session"] == env.sid["codex"]
 
 
+def test_takeover_rechecks_git_live_when_the_checkout_changed_after_inspection(stack, monkeypatch):
+    from agent_comms import workstreams
+    env = stack["env"]
+    post = create(stack)
+    env.clock.advance(121)
+    probe(stack, "codex")
+    probe(stack, "claude")
+    real = workstreams._inspect
+
+    def inspect_then_dirty(board, post_id):
+        real(board, post_id)                                  # recorded: the owner checkout is clean
+        (stack["owner_path"] / "unfinished").write_text("written after the inspection\n")
+    monkeypatch.setattr(workstreams, "_inspect", inspect_then_dirty)
+    route(stack, post)
+    assert current(stack, post)["assigned_session"] == env.sid["codex"]      # no takeover on stale results
+    assert "unfinished changes" in workstreams.get_for_post(env.board, post["id"])["blocker"]
+    assert (stack["owner_path"] / "unfinished").exists()
+
+
 def test_simultaneous_takeover_has_one_winner_and_fences_old_owner(stack):
     post = create(stack)
     env = stack["env"]

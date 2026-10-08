@@ -393,6 +393,7 @@ def reconcile(board, p, sid, post_id, expected_version, fence=None):
             pass
         finally:
             _git_memo.mode = None
+        memo.clear()   # each replay uses only the results of the inspection pass just before it
         _git_memo.mode = ('record', memo)
         try:
             _inspect(board, post_id)
@@ -412,6 +413,16 @@ def _inspect(board, post_id):
     if source is not None:
         _inactive(board, source, managed)
     _descendant_checkouts(board, managed)
+
+
+def _recheck_live(board, source, managed):
+    """The owner and descendant Git checks again, live (not replayed), inside the caller's transaction. Only on the
+    takeover path, which is rare; blocker outcomes rely on the recorded results and are re-inspected next pass."""
+    mode, _git_memo.mode = getattr(_git_memo, 'mode', None), None
+    try:
+        return _inactive(board, source, managed) or _descendant_checkouts(board, managed)
+    finally:
+        _git_memo.mode = mode
 
 
 def _healthy_owner(board, row, task):
@@ -492,6 +503,10 @@ def _reconcile(board, p, sid, post_id, expected_version, fence):
             reason = 'Fallback lacks active continuation authorization'
         if not reason and not capabilities.eligible(board,fallback['id'],thread['project'],json.loads(managed['required_capabilities'])):
             reason = 'Fallback needs fresh successful capability probes in the exact project'
+        if not reason:
+            # A takeover moves work off a checkout: the Git results recorded before the lock may be stale, so the
+            # owner and descendant checks run once more, live, under the lock right before deciding.
+            reason = _recheck_live(board, source, managed)
         if reason:
             if managed['blocker'] != reason:
                 board.conn.execute('UPDATE continuations SET blocker=? WHERE post_id=?',(reason,post_id))
