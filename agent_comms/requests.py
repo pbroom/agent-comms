@@ -83,6 +83,8 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             raise Forbidden('only the assigned recipient may acknowledge execution')
         if not p.is_human and p.name == row['assigned_agent'] and row['assigned_session'] not in (None,session_id) and not (p.name == post['agent'] and state == 'finished'):
             raise Conflict('request is owned by another session')
+        if row['state'] == 'started' and state == 'blocked' and (p.name != row['assigned_agent'] or session_id != row['assigned_session']):
+            raise Conflict('only the executing session may release a started request as blocked')
         for pid in evidence:
             item = board.get_post(p,pid)
             if pid == post_id or item['thread_id'] != post['thread_id'] or item['sealed']:

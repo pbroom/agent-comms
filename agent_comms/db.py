@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 6   # v6: auditable per-source attention closeout
+SCHEMA_VERSION = 7   # v7: explicit request lifecycle and dispatch session binding
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -244,7 +244,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN authorization_grant_id INTEGER REFERENCES authorization_grants(id)")
         # v3: additive; existing sessions simply have no conversation link.
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-        for column in ("client_kind", "client_session_id"):
+        for column in ("client_kind", "client_session_id", "dispatch_run_id"):
             if column not in session_columns:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")

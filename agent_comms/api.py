@@ -65,6 +65,7 @@ class SessionIn(Body):
     project: str
     worktree: str | None = None
     resume_session_id: int | None = None
+    dispatch_run_id: str | None = None
 
 
 class ThreadIn(Body):
@@ -383,7 +384,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     # ---------------------------------------------------------------- sessions
     @app.post("/api/sessions")
     def register(body: SessionIn, p: Principal = P):
-        return board.register_session(p, body.project, body.worktree, body.resume_session_id)
+        return board.register_session(p, body.project, body.worktree, body.resume_session_id, dispatch_run_id=body.dispatch_run_id)
 
     @app.post("/api/sessions/{session_id}/heartbeat")
     def heartbeat(session_id: int, p: Principal = P):

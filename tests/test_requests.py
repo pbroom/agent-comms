@@ -63,3 +63,30 @@ def test_evidence_boundaries_and_stale_version(env):
     with pytest.raises(Conflict): update(env,post,'blocked',reason='missing access',expected_version=0)
     wrong=env.post('codex',env.thread())
     with pytest.raises(Invalid): update(env,post,'finished',reason='done',evidence_post_ids=[wrong['id']])
+
+
+def test_author_and_human_cannot_release_executing_session(env):
+    post=env.post('claude',env.thread(),type='request',to=['codex'])
+    update(env,post,'started')
+    for actor in ('claude','human'):
+        with pytest.raises(Conflict):
+            update(env,post,'blocked',as_=actor,reason='reroute')
+    assert update(env,post,'blocked',reason='I stopped execution')['state']=='blocked'
+
+
+def test_dispatch_binding_requires_exact_active_identity_project_and_one_session(env):
+    import json
+    from conftest import PROJECT
+    tid=env.thread()
+    def record(status='running'):
+        env.board.conn.execute('INSERT OR REPLACE INTO board_state(key,value,updated_at) VALUES (?,?,?)',
+            ('dispatch.run.run-1',json.dumps(dict(agent='codex',thread_id=tid,status=status)),env.clock()))
+    record()
+    sid=env.board.register_session(env.p['codex'],PROJECT,dispatch_run_id='run-1')['session_id']
+    assert env.board.conn.execute('SELECT dispatch_run_id FROM sessions WHERE id=?',(sid,)).fetchone()[0]=='run-1'
+    with pytest.raises(Conflict): env.board.register_session(env.p['codex'],PROJECT,dispatch_run_id='run-1')
+    with pytest.raises(Forbidden): env.board.register_session(env.p['claude'],PROJECT,dispatch_run_id='run-1')
+    with pytest.raises(Forbidden): env.board.register_session(env.p['codex'],'/other',dispatch_run_id='run-1')
+    with pytest.raises(Conflict): env.board.register_session(env.p['codex'],'/other',resume_session_id=sid)
+    record('finished')
+    with pytest.raises(Forbidden): env.board.register_session(env.p['codex'],PROJECT,resume_session_id=sid,dispatch_run_id='run-1')

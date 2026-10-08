@@ -90,12 +90,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Pass resume_session_id to continue a session you registered earlier. Identity comes from your token; "
         "you cannot choose your agent name." + DATA_WARNING))
     def board_register(project: str | None = None, worktree: str | None = None,
-                       resume_session_id: int | None = None, ctx: Context = None) -> dict:
+                       resume_session_id: int | None = None, dispatch_run_id: str | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         if project is None and transport == "stdio":
             project = os.getcwd()
         out = run(lambda: board.register_session(p, project or "", worktree, resume_session_id,
-                                                 client=client_conversation(p)))
+                                                 client=client_conversation(p), dispatch_run_id=dispatch_run_id))
         if transport == "stdio":
             state["session_id"] = out["session_id"]
         return out
