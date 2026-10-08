@@ -51,6 +51,14 @@ def _runtime_source_fingerprint() -> str:
 
 _LOADED_SOURCE_FINGERPRINT = _runtime_source_fingerprint()
 
+
+def _runtime_source_changed() -> bool:
+    try:
+        return _runtime_source_fingerprint() != _LOADED_SOURCE_FINGERPRINT
+    except OSError:
+        return True  # unavailable source cannot prove compatibility
+
+
 # Settings a running Board applies when board.toml or board.local.toml changes (Board.reload_settings); the
 # [dispatch] table is reloaded too, and the dispatcher applies its scalars. Everything else (host, port, paths)
 # needs a restart.
@@ -312,6 +320,8 @@ class Board:
         if self.s.config_path is None:
             return False
         with self._settings_lock:
+            if _runtime_source_changed():
+                return False
             sig = self._settings_files_sig()
             if not force and sig == self._settings_sig:
                 return False
@@ -324,6 +334,8 @@ class Board:
             except Exception as e:  # malformed TOML, unknown key, wrong type: keep running on the last good values
                 self.settings_error = f"{type(e).__name__}: {e}"[:500]
                 log.warning("settings not reloaded; keeping the last good settings: %s", self.settings_error)
+                return False
+            if _runtime_source_changed():
                 return False
             self.settings_error = None
             for k in RELOADABLE_INT + RELOADABLE_BOOL + RELOADABLE_WEB:
@@ -342,10 +354,7 @@ class Board:
 
     def configuration_status(self) -> dict:
         """Safe process-local status: effective limits only, never dispatch commands or credentials."""
-        try:
-            source_changed = _runtime_source_fingerprint() != _LOADED_SOURCE_FINGERPRINT
-        except OSError:
-            source_changed = True  # source unavailable: a refresh cannot prove runtime compatibility
+        source_changed = _runtime_source_changed()
         with self._settings_lock:
             stale = self.settings_error is not None
             restart = list(self.settings_restart_required)
