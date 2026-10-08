@@ -318,6 +318,7 @@ def test_upgrade_rekeys_gates_and_requirements_stored_under_other_spellings(env)
     post = env.post('human', env.thread(), type='request', to=['codex'])
     c = env.board.conn
     with db.write_tx(c):
+        c.execute('ALTER TABLE browser_permission_gates DROP COLUMN created_by')   # an older database
         c.execute("INSERT INTO browser_permission_gates VALUES (?,?,1,3,'old deny')", (PROJECT, 'http://localhost.:5185'))
         c.execute('INSERT INTO browser_requirements VALUES (?,?,?,?)',
                   (post['id'], 'codex', 'http://LOCALHOST.:5185/about', 'http://localhost.:5185'))
@@ -327,3 +328,44 @@ def test_upgrade_rekeys_gates_and_requirements_stored_under_other_spellings(env)
     assert br.requirement(env.board, post['id'], 'codex')['origin'] == 'http://localhost:5185'
     assert br.readiness(env.board, env.sid['codex'], URL) == 'policy_denied'
     assert 'human permission change' in br.request_blocker(env.board, post['id'], 'codex')
+
+
+def test_denial_gates_are_capped_per_agent_and_project(env, monkeypatch):
+    from agent_comms.core import LimitExceeded
+    monkeypatch.setattr(br, 'MAX_GATES_PER_AGENT_PROJECT', 3)
+    for i in range(3):
+        br.report_failure(env.board, env.p['codex'], env.sid['codex'], f'https://h{i}.example/', CTX,
+                          'policy_denied', 'denied')
+    with pytest.raises(LimitExceeded, match='permission gates'):
+        br.report_failure(env.board, env.p['codex'], env.sid['codex'], 'https://h9.example/', CTX,
+                          'policy_denied', 'denied')
+    # An existing gate can still be re-denied, and another agent has its own quota.
+    br.report_failure(env.board, env.p['codex'], env.sid['codex'], 'https://h0.example/', CTX, 'host_permission', 'again')
+    br.report_failure(env.board, env.p['claude'], env.sid['claude'], 'https://h9.example/', CTX, 'policy_denied', 'denied')
+    assert env.board.conn.execute('SELECT COUNT(*) FROM browser_permission_gates').fetchone()[0] == 4
+
+
+def test_probe_attempts_are_keyed_on_origin_and_path(env):
+    for i in range(20):
+        br.begin_probe(env.board, env.p['codex'], env.sid['codex'], f'{URL}?v={i}#f{i}', CTX)
+    assert env.board.conn.execute('SELECT COUNT(*) FROM browser_probe_attempts').fetchone()[0] == 1
+    attempt = br.begin_probe(env.board, env.p['codex'], env.sid['codex'], URL + '?v=1', CTX)
+    with pytest.raises(Conflict, match='attempt'):   # the earlier attempt for this path was superseded
+        br.report_probe(env.board, env.p['codex'], env.sid['codex'], URL + '?v=2', CTX,
+                        {**EVIDENCE, 'rendered_url': URL + '?v=2'}, 'stale-id')
+    out = br.report_probe(env.board, env.p['codex'], env.sid['codex'], URL + '?v=1', CTX,
+                          {**EVIDENCE, 'rendered_url': URL + '?v=1'}, attempt['attempt_id'])
+    assert out['status'] == 'ready'
+
+
+def test_events_probes_and_attempts_are_pruned_after_retention(env):
+    probe(env)
+    fail(env, 'unreachable')
+    br.begin_probe(env.board, env.p['codex'], env.sid['codex'], 'http://localhost:5185/other', CTX)
+    c = env.board.conn
+    assert c.execute('SELECT COUNT(*) FROM browser_events').fetchone()[0] >= 2
+    env.clock.advance(br.EVENT_RETENTION_SECONDS + 1)
+    br.begin_probe(env.board, env.p['codex'], env.sid['codex'], URL, CTX)   # any new attempt prunes
+    assert c.execute('SELECT COUNT(*) FROM browser_events').fetchone()[0] == 0
+    assert c.execute('SELECT COUNT(*) FROM browser_probes').fetchone()[0] == 0
+    assert [r[0] for r in c.execute('SELECT target_url FROM browser_probe_attempts')] == [URL]

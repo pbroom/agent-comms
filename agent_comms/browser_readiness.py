@@ -11,11 +11,17 @@ import ipaddress
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from . import db, requests
-from .core import Conflict, Forbidden, Invalid
+from .core import Conflict, Forbidden, Invalid, LimitExceeded
 
 PROBE_TTL = 300
 LIVE_SECONDS = 90
 MAX_RECONNECTS = 2
+# Bounds on what agents can make the board store. Denial gates an agent records per project (a human-recorded
+# change lifts a gate but never frees the agent's quota until the gate is gone); probe results and events
+# are kept for a retention window. Attempts are keyed by origin + path, so query strings cannot multiply them.
+MAX_GATES_PER_AGENT_PROJECT = 50
+EVENT_RETENTION_SECONDS = 30 * 86400
+PROBE_RETENTION_SECONDS = 7 * 86400
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS browser_requirements (
  post_id INTEGER NOT NULL REFERENCES posts(id), recipient TEXT NOT NULL,
@@ -30,7 +36,7 @@ CREATE TABLE IF NOT EXISTS browser_probes (
 );
 CREATE TABLE IF NOT EXISTS browser_permission_gates (
  project TEXT NOT NULL, origin TEXT NOT NULL, denied INTEGER NOT NULL,
- epoch INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(project,origin)
+ epoch INTEGER NOT NULL, reason TEXT NOT NULL, created_by TEXT, PRIMARY KEY(project,origin)
 );
 CREATE TABLE IF NOT EXISTS browser_probe_attempts (
  session_id INTEGER NOT NULL REFERENCES sessions(id), target_url TEXT NOT NULL,
@@ -43,6 +49,7 @@ CREATE TABLE IF NOT EXISTS browser_events (
  session_id INTEGER NOT NULL REFERENCES sessions(id), actor TEXT NOT NULL,
  action TEXT NOT NULL, evidence TEXT NOT NULL, created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS browser_events_time ON browser_events(created_at);
 """
 
 
@@ -133,7 +140,10 @@ def target(value):
 def canonicalize_stored(conn):
     """Upgrade: re-key permission gates and browser requirements stored before hosts were canonicalized, so a deny
     recorded under one spelling (`EXAMPLE.com.`) still applies to the host. Merged gates keep the strictest state
-    (denied if either was) and the newest epoch. Runs inside init_schema's write transaction; idempotent."""
+    (denied if either was) and the newest epoch. Also adds the gates' created_by column (older gates have no
+    recorded creator and count against no agent's quota). Runs inside init_schema's write transaction; idempotent."""
+    if 'created_by' not in {r[1] for r in conn.execute('PRAGMA table_info(browser_permission_gates)')}:
+        conn.execute('ALTER TABLE browser_permission_gates ADD COLUMN created_by TEXT')
     for row in conn.execute('SELECT * FROM browser_permission_gates').fetchall():
         try:
             origin = target(row['origin'])[1]
@@ -141,10 +151,10 @@ def canonicalize_stored(conn):
             continue
         if origin == row['origin']:
             continue
-        conn.execute('''INSERT INTO browser_permission_gates VALUES (?,?,?,?,?)
-            ON CONFLICT(project,origin) DO UPDATE SET denied=MAX(denied,excluded.denied),
+        conn.execute('''INSERT INTO browser_permission_gates(project,origin,denied,epoch,reason,created_by)
+            VALUES (?,?,?,?,?,?) ON CONFLICT(project,origin) DO UPDATE SET denied=MAX(denied,excluded.denied),
             epoch=MAX(epoch,excluded.epoch)+1, reason=CASE WHEN excluded.denied THEN excluded.reason ELSE reason END''',
-            (row['project'], origin, row['denied'], row['epoch'], row['reason']))
+            (row['project'], origin, row['denied'], row['epoch'], row['reason'], row['created_by']))
         conn.execute('DELETE FROM browser_permission_gates WHERE project=? AND origin=?', (row['project'], row['origin']))
     for row in conn.execute('SELECT post_id, recipient, origin FROM browser_requirements').fetchall():
         try:
@@ -171,6 +181,22 @@ def _gate(board, project, origin):
     row = board.conn.execute('SELECT * FROM browser_permission_gates WHERE project=? AND origin=?',
                              (project, origin)).fetchone()
     return dict(row) if row else {'denied': False, 'epoch': 0}
+
+
+def attempt_key(url):
+    """The canonical origin + path a probe attempt is keyed on (query and fragment dropped)."""
+    u = urlsplit(url)
+    return urlunsplit((u.scheme, u.netloc, u.path or '/', '', ''))
+
+
+def prune(board):
+    """Retention, inside the caller's write transaction: events and finished probe results past their window,
+    and attempts that can no longer be reported (older than PROBE_TTL)."""
+    now = board.now()
+    board.conn.execute('DELETE FROM browser_events WHERE created_at < ?', (now - EVENT_RETENTION_SECONDS,))
+    board.conn.execute('DELETE FROM browser_probes WHERE verified_at < ? AND expires_at < ?',
+                       (now - PROBE_RETENTION_SECONDS, now))
+    board.conn.execute('DELETE FROM browser_probe_attempts WHERE started_at < ?', (now - PROBE_TTL,))
 
 
 def _event(board, p, sid, project, origin, action, evidence):
@@ -230,8 +256,9 @@ def begin_probe(board, p, session_id, target_url, context):
             raise Conflict('browser permission denied; do not probe or reconnect')
         attempt = secrets.token_hex(16)
         now = board.now()
+        prune(board)
         board.conn.execute('INSERT OR REPLACE INTO browser_probe_attempts VALUES (?,?,?,?,?,?,?,?,?)',
-            (session_id,url,attempt,json.dumps(ctx),_key(s),s['project'],s['worktree'],gate['epoch'],now))
+            (session_id,attempt_key(url),attempt,json.dumps(ctx),_key(s),s['project'],s['worktree'],gate['epoch'],now))
     return {'attempt_id': attempt, 'expires_at': now+PROBE_TTL, 'permission_granted_by_board': False}
 
 
@@ -245,7 +272,7 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
         if gate['denied']:
             raise Conflict('browser permission denied; supported human permission change must be recorded first')
         attempt = board.conn.execute('SELECT * FROM browser_probe_attempts WHERE session_id=? AND target_url=?',
-                                     (session_id,url)).fetchone()
+                                     (session_id,attempt_key(url))).fetchone()
         now = board.now()
         if (not attempt or attempt['attempt_id'] != attempt_id
                 or attempt['permission_epoch'] != gate['epoch']
@@ -268,7 +295,7 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
             verified_at=excluded.verified_at,expires_at=excluded.expires_at,reconnects=0,permission_epoch=excluded.permission_epoch''',
             (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),'ready',json.dumps(evidence),now,expires,gate['epoch']))
         board.conn.execute('UPDATE browser_probes SET reconnects=0 WHERE session_id=? AND context=?',(session_id,json.dumps(ctx)))
-        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,url))
+        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,attempt_key(url)))
         _event(board,p,session_id,s['project'],origin,'probe',json.dumps(evidence))
     return {'status': 'ready', 'session_id': session_id, 'target_url': url,
             'expires_at': expires, 'authority': 'self_reported_probe_not_authorization'}
@@ -285,14 +312,22 @@ def report_failure(board, p, session_id, target_url, context, failure, evidence)
         ctx = _context(context,s)
         gate = _gate(board,s['project'],origin)
         if failure in ('policy_denied', 'host_permission'):
-            board.conn.execute('''INSERT INTO browser_permission_gates VALUES (?,?,1,1,?)
+            exists = board.conn.execute('SELECT 1 FROM browser_permission_gates WHERE project=? AND origin=?',
+                                        (s['project'], origin)).fetchone()
+            if not exists and not p.is_human and board.conn.execute(
+                    'SELECT COUNT(*) FROM browser_permission_gates WHERE project=? AND created_by=?',
+                    (s['project'], p.name)).fetchone()[0] >= MAX_GATES_PER_AGENT_PROJECT:
+                raise LimitExceeded(f'this agent already recorded {MAX_GATES_PER_AGENT_PROJECT} browser permission '
+                                    'gates in this project; ask the human to review them')
+            board.conn.execute('''INSERT INTO browser_permission_gates(project,origin,denied,epoch,reason,created_by)
+                VALUES (?,?,1,1,?,?)
                 ON CONFLICT(project,origin) DO UPDATE SET denied=1,epoch=epoch+1,reason=excluded.reason''',
-                (s['project'],origin,detail))
+                (s['project'],origin,detail,p.name))
         board.conn.execute('''INSERT INTO browser_probes VALUES (?,?,?,?,?,?,?,?,?,?,0,?)
             ON CONFLICT(session_id,target_url) DO UPDATE SET project=excluded.project,worktree=excluded.worktree,
             execution_key=excluded.execution_key,context=excluded.context,status=excluded.status,evidence=excluded.evidence,expires_at=0,permission_epoch=excluded.permission_epoch''',
             (session_id,url,s['project'],s['worktree'],_key(s),json.dumps(ctx),failure,detail,board.now(),0,gate['epoch']))
-        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,url))
+        board.conn.execute('DELETE FROM browser_probe_attempts WHERE session_id=? AND target_url=?',(session_id,attempt_key(url)))
         if failure in ('disconnected','browser_missing','host_permission'):
             board.conn.execute('UPDATE browser_probes SET status=?,evidence=?,expires_at=0 WHERE session_id=?',
                                (failure,detail,session_id))
