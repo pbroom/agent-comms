@@ -111,6 +111,7 @@ class PostIn(Body):
     propose_task: TaskFields | None = None
     decision_question: dict | None = None   # asks the human to choose: same schema as an issue's
     continuation: dict | None = None
+    answer_to: list[StrictInt] | None = None
     session_id: int | None = None
 
 

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db, requests, workstreams
+from . import db, requests, workstreams, pickup
 from .config import NAME_RE, RUNTIME_RE, Settings, home
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -506,8 +506,75 @@ class Dispatcher:
         # Ownership reconciliation has its own per-request deadline. Generic agent
         # heartbeats must not indefinitely suppress a managed continuation.
         workstreams.tick(self.board, self.human, fence=self._fence())
+        self._expire_generic_pickups()
         pending = self._scan()
         self._launch_due(pending, now, foreign)
+
+    def _generic_pickups(self, rules):
+        """Durable queued requests covered by an existing dispatch approval.
+
+        Includes virtual request rows on addressed human posts. Assignment does
+        not authorize a launch: callers must still check the exact session.
+        """
+        if not rules:
+            return []
+        result = []
+        for post in self.board.conn.execute("""SELECT p.* FROM posts p JOIN threads t ON t.id=p.thread_id
+                WHERE p.sealed=0 AND t.status='open'
+                  AND NOT EXISTS(SELECT 1 FROM continuations w WHERE w.post_id=p.id)
+                ORDER BY p.seq"""):
+            for row in requests.for_post(self.board, post):
+                if row['state'] == 'queued' and any(
+                        rule['thread_id'] == post['thread_id'] and row['assigned_agent'] in rule['agents']
+                        and post['created_at'] >= rule['created_at_ts'] for rule in rules):
+                    result.append((post, row))
+        return result
+
+    def _expire_generic_pickups(self):
+        """A heartbeat or read cursor cannot indefinitely hide missing pickup.
+
+        This records a blocker only; it never transfers an existing assignment.
+        A reserved live child remains subject to the dispatcher's process timeout.
+        """
+        with db.write_tx(self.board.conn) as c:
+            key, value = self._fence()
+            owner = c.execute('SELECT value FROM board_state WHERE key=?', (key,)).fetchone()
+            if self.board.is_paused() or owner is None or owner['value'] != value:
+                return
+            rules = self.board.active_dispatch_rules(self.human)
+            active_runs = _active_records(self.board)
+            for post, row in self._generic_pickups(rules):
+                if any(run.get('status') in ACTIVE and run.get('agent') == row['assigned_agent']
+                       and post['id'] in run.get('request_ids', [])
+                       and row['recipient'] in run.get('request_recipients', [row['recipient']])
+                       for run in active_runs):
+                    continue
+                now = self.board.now()
+                if now - pickup.waiting_since(self.board, post, row) < pickup.PICKUP_WAIT_SECONDS:
+                    continue
+                reason = 'Pickup overdue: no explicit acknowledgement from the assigned agent within 40 minutes'
+                state = 'blocked'
+                if row['assigned_session'] is None and not self._attempted(post['id'], row['assigned_agent']):
+                    # A missed delivery is still deliverable when its existing
+                    # approval and liveness gates permit. Keep the overdue marker
+                    # without permanently consuming its sole delivery opportunity.
+                    state = 'queued'
+                    if row['reason'] == reason:
+                        continue
+                version = row['version'] + 1
+                # The write transaction serializes the deadline against explicit
+                # acknowledgement; all state was read after acquiring its lock.
+                c.execute("""INSERT INTO request_progress
+                    (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
+                    VALUES (?,?,?,?,?,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
+                    state=excluded.state,reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
+                    (post['id'],row['recipient'],state,row['assigned_agent'],row['assigned_session'],reason,version,now))
+                c.execute("""INSERT INTO request_events
+                    (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,
+                     version,created_at,event_source) VALUES (?,?,NULL,NULL,?,?,?,?,'[]',?,?,'dispatcher')""",
+                    (post['id'],row['recipient'],state,row['assigned_agent'],row['assigned_session'],reason,version,now))
+                seq = c.execute('SELECT COALESCE(MAX(seq),0)+1 FROM posts').fetchone()[0]
+                c.execute('UPDATE posts SET seq=?,revised_at=? WHERE id=?', (seq,now,post['id']))
 
     def _scan(self) -> dict[str, dict]:
         """New posts (seq above our mark) on approved threads, addressed to an allowed agent by someone else, that
@@ -540,6 +607,14 @@ class Dispatcher:
                 key = f"{agent}:{r['thread_id']}:{r['id']}"
                 pending[key] = {'agent':agent,'thread_id':r['thread_id'],'seq':r['seq'],
                                 'post_created_at':r['created_at'],'post_id':r['id'],'managed':True}
+        # Recover unassigned generic requests after lost pending state, including
+        # addressed human answers. Preserve the once-per-post/agent attempt fence.
+        for post, row in self._generic_pickups([rule for group in rules.values() for rule in group]):
+            agent = row['assigned_agent']
+            if row['assigned_session'] is None and not self._attempted(post['id'], agent):
+                key = f"{agent}:{post['thread_id']}:{post['id']}"
+                pending[key] = {'agent':agent,'thread_id':post['thread_id'],'seq':post['seq'],
+                    'post_created_at':post['created_at'],'post_id':post['id'],'recipient':row['recipient']}
         if not rows:
             self._save(**{self.PENDING_KEY:pending})
             return pending
@@ -686,8 +761,11 @@ class Dispatcher:
 
     def _attempted(self, post_id: int, agent: str) -> bool:
         for (value,) in self.board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
-            record = json.loads(value)
-            if record.get("agent") == agent and post_id in record.get("request_ids", []):
+            try:
+                record = json.loads(value)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", []):
                 return True
         return False
 
@@ -697,7 +775,8 @@ class Dispatcher:
             return False
         if workstreams.get_for_post(self.board, post_id) is not None:
             return workstreams.delivery(self.board, post_id, agent) is not None
-        row = next((r for r in requests.for_post(self.board, post) if r["recipient"] == agent), None)
+        row = next((r for r in requests.for_post(self.board, post) if r["assigned_agent"] == agent and r["state"] == "queued"
+                        and r["assigned_session"] is None), None)
         return bool(row and row["state"] == "queued" and row["assigned_agent"] == agent
                     and row["assigned_session"] is None)
 
@@ -709,33 +788,36 @@ class Dispatcher:
             if post is None:
                 return
             managed = workstreams.get_for_post(self.board, post_id)
-            row = next((r for r in requests.for_post(self.board, post)
-                        if (r['assigned_agent'] if managed is not None else r['recipient']) == agent), None)
-            if not row or row["state"] in ("finished", "blocked") or row["assigned_agent"] != agent:
-                return
-            # Never overwrite work explicitly routed to another existing environment.
-            if row["assigned_session"] is not None:
-                session = c.execute("SELECT dispatch_run_id FROM sessions WHERE id=?", (row["assigned_session"],)).fetchone()
-                if managed is not None:
-                    if run_id is not None and managed['dispatch_run_id'] != run_id:
-                        return
-                    if run_id is None and managed['dispatch_run_id'] is not None:
-                        return
-                elif run_id is None or session is None or session["dispatch_run_id"] != run_id:
-                    return
-            recipient = row['recipient']
-            now, version = self.board.now(), row["version"] + 1
-            c.execute("""INSERT INTO request_progress
-                (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
-                VALUES (?,?,'blocked',?,NULL,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
-                state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
-                (post_id,recipient,agent,reason,version,now))
-            c.execute("""INSERT INTO request_events
-                (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
-                VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
-                (post_id,recipient,agent,row["assigned_session"],reason,version,now))
-            seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
-            c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
+            record = self._get(self.RUN_PREFIX + run_id) if run_id else None
+            recipients = record.get('request_recipients') if isinstance(record, dict) else None
+            for row in requests.for_post(self.board, post):
+                if recipients is not None and row['recipient'] not in recipients:
+                    continue
+                if row["state"] in ("finished", "blocked") or row["assigned_agent"] != agent:
+                    continue
+                # Never overwrite work explicitly routed to another existing environment.
+                if row["assigned_session"] is not None:
+                    session = c.execute("SELECT dispatch_run_id FROM sessions WHERE id=?", (row["assigned_session"],)).fetchone()
+                    if managed is not None:
+                        if run_id is not None and managed['dispatch_run_id'] != run_id:
+                            continue
+                        if run_id is None and managed['dispatch_run_id'] is not None:
+                            continue
+                    elif run_id is None or session is None or session["dispatch_run_id"] != run_id:
+                        continue
+                recipient = row['recipient']
+                now, version = self.board.now(), row["version"] + 1
+                c.execute("""INSERT INTO request_progress
+                    (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
+                    VALUES (?,?,'blocked',?,NULL,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
+                    state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
+                    (post_id,recipient,agent,reason,version,now))
+                c.execute("""INSERT INTO request_events
+                    (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
+                    VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
+                    (post_id,recipient,agent,row["assigned_session"],reason,version,now))
+                seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
+                c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
@@ -785,6 +867,11 @@ class Dispatcher:
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
                   "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
+        if item.get('post_id'):
+            post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (item['post_id'],)).fetchone()
+            record['request_recipients'] = [row['recipient'] for row in requests.for_post(self.board, post)
+                if row['assigned_agent'] == agent and row['state'] == 'queued'
+                and (item.get('managed') or row['assigned_session'] is None)]
         if item.get('managed'):
             delivery = item['delivery']
             record |= {'continuation_version': delivery['version'], 'continuation_epoch': delivery['epoch']}

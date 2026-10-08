@@ -2,8 +2,8 @@
 
 The dashboard's Needs you card offers, per item: Approve, Approve & launch <agent>, Reject (decisions only),
 Not now, and Reply; for a post with a structured `decision_question`, Choose (one of its two options); for one
-without, Ask for options. Each posts as the human in the item's thread, addressed to the item's author; a human
-post after the item takes it out of Board.NEEDS_YOU. Finalizing a decision keeps its own route.
+without, Ask for options. Each posts as the human in the item's thread, addressed to the item's author, with
+an exact answer link that clears only that source's human attention. Finalizing a decision keeps its own route.
 
 Guardrails (DESIGN_NOTES "Needs you actions"):
 - The human's click is the approval. Agents cannot call this route; core and the route both check.
@@ -127,7 +127,7 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
     try:
         post, rule = human_actions.post_as_human(
             board, p, thread_id=item["thread_id"], body=body, type=type_, to=to_author, needs_response=needs_response,
-            launch=launch, purpose=PURPOSE.format(post=post_id, thread=item["thread_id"]))
+            launch=launch, purpose=PURPOSE.format(post=post_id, thread=item["thread_id"]),answer_to=[post_id])
     except Exception:
         human_actions.release_cooldown(board, key)
         raise

@@ -484,14 +484,11 @@ const threadPosts = {};    // thread id -> older posts fetched to show a deep-li
 const SELECTED_KEY = "agent-comms-thread";
 let selected = Number(load(SELECTED_KEY)) || null;
 const opened = new Set();  // threads shown on the right since this page loaded: kept listed even once settled
-// Unread dots: the newest post id this browser has shown per thread (a per-browser convenience, not a cursor).
-const SEEN_KEY = "agent-comms-seen";
-let seen = null;
 // Thread list order, remembered per browser: "priority", "activity" (last updated) or "created".
 const SORT_KEY = "agent-comms-sort";
 const SORTS = { priority: "Priority", activity: "Recent activity", created: "Newest first" };
 let sortMode = SORTS[load(SORT_KEY)] ? load(SORT_KEY) : "activity";
-// Work handed to an agent is "pending" (grey pulse) for STALL_MINUTES plus a short grace, then "stalled" (amber).
+// Unacknowledged agent work stays blue until the pickup deadline, then becomes amber.
 const STALL_MINUTES = 30, GRACE_MINUTES = 10;
 // Unstick (thread header, human only): the result of the last click, shown under the header until dismissed.
 // A click sends at once (no window.confirm: embedded browsers block it, and the human asked for one click).
@@ -1151,7 +1148,7 @@ const time = iso => Date.parse(iso || 0) || 0;
 // Priority buckets: 0 stalled on you, 1 stalled on someone else, 2 new posts, 3 being worked on, 4 the rest.
 function priority(t, st) {
   if (st && st.kind === "stalled") return st.needsMe ? 0 : 1;
-  if (isUnread(t)) return 2;
+  if (st && st.kind === "unread") return 2;
   if (st && st.kind === "active") return 3;
   return 4;
 }
@@ -1178,30 +1175,6 @@ function selectThread(id) {
   render();
 }
 
-function loadSeen() {
-  if (seen) return;
-  try { seen = JSON.parse(load(SEEN_KEY) || "null"); } catch (e) { seen = null; }
-  if (!seen || typeof seen !== "object") {
-    // First visit in this browser: everything already here counts as seen, so nothing lights up at once.
-    seen = {};
-    for (const t of state.threads) seen[t.id] = newestId(t);
-    store(SEEN_KEY, JSON.stringify(seen));
-  }
-}
-function newestId(t, filter = () => true) {
-  return postsOf(t).filter(filter).reduce((m, p) => Math.max(m, p.id), 0);
-}
-function markSeen(t) {
-  const id = newestId(t);
-  if (!seen || (seen[t.id] || 0) >= id) return;
-  seen[t.id] = id;
-  store(SEEN_KEY, JSON.stringify(seen));
-}
-
-function isUnread(t) {
-  return !!seen && newestId(t, p => p.agent !== state.me.name) > (seen[t.id] || 0);
-}
-
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
 function since(iso) { return ago(iso).replace(/ ago$/, ""); }
 
@@ -1210,7 +1183,7 @@ function isHumanName(name) {
     (state.agents || []).some(a => a.name === name && a.is_human);
 }
 
-// One status per thread, most urgent first: closed > stalled > being worked on > new posts > all tasks done.
+// One status per thread: closed > stuck > waiting for agent pickup > processing > complete.
 // Returns { kind: done|stalled|active|unread, label } or null (nothing to flag). A stalled status also lists the
 // agents it waits on that are not running for this thread now (`agents`: who Unstick would ask).
 function threadStatus(t, human) {
@@ -1221,13 +1194,12 @@ function threadStatus(t, human) {
   const stalled = [], agents = [];
   const involve = a => { if (a && !isHumanName(a) && !agents.includes(a) && !runs.some(r => r.agent === a)) agents.push(a); };
   let needsMe = false;
-  const pending = [];
+  const pending = [], pickup = [];
   const shared = allIssues().filter(i => i.status !== "resolved" && i.links.some(l => l.thread_id === t.id));
   if (shared.length) {
     const needsDecision = shared.some(i => i.needs_human && i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
     // An issue that needs nothing from the human here (answered, or under discussion) is not shown as stalled.
     if (needsDecision) stalled.push("Shared issue awaiting human decision");
-    else pending.push("Shared issue unresolved (nothing needed from you here)");
     if (human && needsDecision) needsMe = true;
   }
   const waitingIds = (state.needs_you || []).filter(p => p.thread_id === t.id).map(p => p.id).sort((a, b) => a - b);
@@ -1245,37 +1217,51 @@ function threadStatus(t, human) {
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
   // Request completion is explicit; reading or unrelated replies never close it.
   const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
-  for (const p of posts) {
-    if (p.sealed) continue;
+  const projected = t.pickup;
+  const obligations = projected ? [
+    ...projected.waiting.map(r => ({...r, pickupState: "waiting"})),
+    ...projected.processing.map(r => ({...r, pickupState: "processing"})),
+    ...projected.blocked.map(r => ({...r, pickupState: "blocked"}))
+  ] : posts.filter(p => !p.sealed).flatMap(p => {
     const actionable = p.needs_response || ["request", "handoff", "question"].includes(p.type) || isHumanName(p.agent);
-    const requests = p.requests || (actionable ? (p.to || []).filter(a => a !== p.agent && !isHumanName(a))
-      .map(recipient => ({ recipient, assigned_agent: recipient, state: "queued" })) : []);
-    for (const r of requests) {
-      if (r.state === "finished") continue;
-      const agent = r.assigned_agent || r.recipient;
-      if (isHumanName(agent)) continue;
-      const at = r.updated_at || p.created_at;
-      const label = `#${p.id} ${r.state} · ${agent}${r.reason ? ": " + r.reason : ""}`;
-      if (r.state === "blocked" || (!runs.some(run => run.agent === agent) && stale(at))) {
-        stalled.push(label); involve(agent);
-      } else pending.push(label);
-    }
+    const rows = p.requests || (actionable ? (p.to || []).filter(a => a !== p.agent && !isHumanName(a))
+      .map(recipient => ({recipient, assigned_agent: recipient, state: "queued"})) : []);
+    return rows.filter(r => r.state !== "finished").map(r => ({...r, post_id: p.id,
+      pickupState: r.state === "started" ? "processing" : r.state === "blocked" ? "blocked" : "waiting",
+      overdue: stale(r.updated_at || p.created_at)}));
+  });
+  for (const r of obligations) {
+    const agent = r.assigned_agent || r.recipient;
+    if (isHumanName(agent)) continue;
+    const label = `#${r.post_id} · ${agent}${r.assigned_session ? " s" + r.assigned_session : ""}`;
+    if (r.pickupState === "blocked") {
+      stalled.push(`${label}: blocked${r.reason ? ": " + r.reason : ""}`); involve(agent);
+    } else if (r.pickupState === "waiting") {
+      const overdue = r.overdue || (r.deadline_at && now >= Date.parse(r.deadline_at));
+      if (overdue) { stalled.push(`${label}: agent pickup overdue`); involve(agent); }
+      else pickup.push(`${label}: awaiting agent pickup`);
+    } else pending.push(`${label}: in progress${r.reason ? ": " + r.reason : ""}`);
   }
   for (const k of t.tasks) {
     if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active") continue;
     const at = k.updated_at || k.created_at;
-    (at && stale(at) ? stalled : pending).push(`task ${k.id} ${k.status}, not picked up${at ? " for " + since(at) : ""}`);
+    (at && stale(at) ? stalled : pickup).push(`task ${k.id} ${k.status}, awaiting agent pickup${at ? " for " + since(at) : ""}`);
   }
   if (stalled.length) return { kind: "stalled", label: stalled.join("; "), needsMe, agents };
-  if (runs.length || working.length || pending.length) {
-    const who = [...runs.map(r => `${r.agent} running (dispatcher)`), ...working.map(k => `${k.owner_agent} working on task ${k.id}`), ...pending];
+  if (pickup.length) return { kind: "unread", label: pickup.join("; ") };
+  if (working.length || pending.length) {
+    const who = [...working.map(k => `${k.owner_agent} working on task ${k.id}`), ...pending];
     return { kind: "active", label: who.join("; ") };
   }
-  if (isUnread(t)) return { kind: "unread", label: "New posts" };
-  // Nothing open, unread, pending or in progress: the thread has settled. It counts as completed (hidden by
-  // default) until a new post arrives.
-  if (t.tasks.length && t.tasks.every(k => ["done", "declined"].includes(k.status))) return { kind: "done", label: "All tasks done" };
-  return { kind: "done", label: "Settled: nothing waiting on anyone" };
+  // An open discussion or unresolved shared issue is not proof of processing or completion.
+  if (shared.length) return null;
+  if (projected) return projected.complete ? { kind: "done", label: "All recorded work finished" } : null;
+  const recorded = posts.flatMap(p => p.requests || []);
+  if ((recorded.length || t.tasks.length) && recorded.every(r => r.state === "finished")
+      && t.tasks.every(k => ["done", "declined"].includes(k.status))) {
+    return { kind: "done", label: "All recorded work finished" };
+  }
+  return null;
 }
 
 function statusDot(st) {
@@ -2348,7 +2334,6 @@ function render() {
     const holder = state.threads.find(t => postsOf(t).some(p => p.id === highlight.id));
     if (holder) selected = holder.id;
   }
-  loadSeen();
   const statuses = new Map(state.threads.map(t => [t.id, threadStatus(t, human)]));
   const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
   const all = sortedThreads(statuses);
@@ -2364,7 +2349,7 @@ function render() {
     pane.append(...renderIssuePane(current, human));
   } else {
     const current = threads.find(t => t.id === selected) || threads[0] || null;
-    if (current) { opened.add(current.id); markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
+    if (current) opened.add(current.id);
     list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
     if (current) {
       const linked = allIssues().filter(i => i.links.some(l => l.thread_id === current.id));

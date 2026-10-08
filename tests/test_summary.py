@@ -83,7 +83,7 @@ def populate(env, tmp_path):
     d.tick()
     env.clock.advance(5 * 60)                  # codex's session is no longer live (2 min), so it can be launched
     s.create_post(human, sid["human"], body="codex, your turn " + INJECTION, type="request", thread_id=t1,
-                  to=["codex"])                # a human post: clears t1's earlier needs-you items
+                  to=["codex"])                # unrelated human work does not answer earlier sources
     s.create_post(claude, sid["claude"], body="after human " + INJECTION, type="question", thread_id=t1,
                   needs_response=True)         # needs you again in t1
     env.clock.advance(5 * 60)                  # codex quiet again (claude posted, codex did not)
@@ -110,13 +110,14 @@ def test_summary_counts_and_items(senv, tmp_path):
     d = r.json()
     t1, t2 = w["t1"], w["t2"]
     assert d["summary_version"] == 1 and d["paused"] is False
-    # Needs you: t2's request to the human, and t1's question after the human's post (newest first)
+    # Only exact answers clear sources; unrelated human work leaves all four questions outstanding.
     snap = senv.board.snapshot(senv.p["human"])
-    assert d["needs_you"]["count"] == len(snap["needs_you"]) == 2
+    assert d["needs_you"]["count"] == len(snap["needs_you"]) == 4
     assert d["needs_you"]["items"] == [{"post_id": x["id"], "thread_id": x["thread_id"], "agent": x["agent"],
                                         "type": x["type"]} for x in snap["needs_you"]]
     assert [(i["thread_id"], i["agent"], i["type"]) for i in d["needs_you"]["items"]] == \
-        [(t1, "claude", "question"), (t2, "codex", "request")]
+        [(t1, "claude", "question"), (t1, "codex", "decision"),
+         (t2, "codex", "request"), (t1, "claude", "question")]
     assert d["threads"] == {"open": 2}
     assert d["tasks"]["open"] == 2
     assert d["tasks"]["by_status"] == {"proposed": 1, "accepted": 1, "working": 0, "blocked": 0}

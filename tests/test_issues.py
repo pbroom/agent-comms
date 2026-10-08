@@ -157,7 +157,7 @@ def test_source_attention_uses_exact_existing_rules(env):
     assert issue["needs_human"]
     thread = env.thread()
     post = env.post("codex", thread, needs_response=True)
-    env.post("human", thread, "Answered")
+    env.post("human", thread, "Answered", answer_to=[post['id']])
     issue = create(env, thread_id=thread, post_id=post["id"], needs_human=False)
     assert not issue["needs_human"]
     thread = env.thread()

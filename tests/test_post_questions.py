@@ -120,7 +120,7 @@ def test_migration_adds_the_column_and_keeps_posts(qenv):
     c.execute("ALTER TABLE posts DROP COLUMN decision_question")
     c.execute("PRAGMA user_version=7")
     db.init_schema(c)
-    assert c.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 9
+    assert c.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     old = qenv.board.get_post(qenv.p["human"], p["id"])
     assert (old["body"], old["decision_question"]) == ("old post", None)
     assert ask(qenv)["decision_question"]["recommended_option_id"] == "ship"

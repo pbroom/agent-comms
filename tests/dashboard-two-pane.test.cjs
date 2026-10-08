@@ -22,8 +22,7 @@ function thread(id, posts, status = 'open') {
 const THREADS = [thread(3, [post(30, 3, 10)]), thread(2, [post(20, 2, 40), post(21, 2, 45)]), thread(1, [post(10, 1, 5)])];
 
 async function setup({ url = 'http://127.0.0.1:8787/', storage = {}, needsYou = [] } = {}) {
-  // Every post unread, so no thread has settled (settled threads are hidden); these tests are about layout.
-  storage = { 'agent-comms-seen': '{}', ...storage };
+  // Layout fixtures are quiet FYIs. Show completed explicitly rather than inventing pickup obligations.
   const dom = new JSDOM(html, { url, runScripts: 'dangerously', beforeParse(win) {
     for (const [k, v] of Object.entries(storage)) win.localStorage.setItem(k, v);
     win.fetch = async u => {
@@ -33,6 +32,8 @@ async function setup({ url = 'http://127.0.0.1:8787/', storage = {}, needsYou = 
       return { ok: false, status: 404, statusText: '404', json: async () => ({ message: 'not found' }) };
     };
   } });
+  await settle();
+  dom.window.document.getElementById('show-completed').click();
   await settle();
   return { dom, win: dom.window, document: dom.window.document };
 }
@@ -121,56 +122,55 @@ test('status dots: stalled, being worked on or waiting to be picked up, complete
     runs: [{ thread_id: 5, agent: 'codex', run_id: 's50-codex' }], storage: { 'agent-comms-thread': '4' } });
   assert.deepEqual(dot(1), ['stalled', '1 blocked task']);
   assert.deepEqual(dot(2), ['active', 'codex working on task 2']);
-  assert.match(dot(3)[1], /^#30 queued · codex$/);
+  assert.match(dot(3)[1], /^#30 · codex: agent pickup overdue$/);
   assert.equal(dot(3)[0], 'stalled');
-  assert.deepEqual(dot(4), ['active', '#40 queued · codex'], 'a fresh ask is pending, not stalled yet');
-  assert.deepEqual(dot(5), ['active', 'codex running (dispatcher); #50 queued · codex']);
+  assert.deepEqual(dot(4), ['unread', '#40 · codex: awaiting agent pickup'], 'a fresh ask is pending, not stalled yet');
+  assert.deepEqual(dot(5), ['stalled', '#50 · codex: agent pickup overdue']);
   assert.ok(!document.querySelector('tr[data-thread="6"]'), 'completed threads are hidden by default');
   assert.match(document.querySelector('.thread-list').textContent, /Show completed/);
   assert.ok(!document.querySelector('header input[type=checkbox]'), 'the toggle moved out of the header');
   const box = document.getElementById('show-completed');
   box.checked = true; box.dispatchEvent(new dom.window.Event('change'));
   await settle();
-  assert.deepEqual(dot(6), ['done', 'All tasks done']);
+  assert.deepEqual(dot(6), ['done', 'All recorded work finished']);
   assert.deepEqual(dot(7), ['done', 'Closed']);
   dom.window.close();
 });
 
-test('status dots: blue for posts this browser has not shown, cleared by opening the thread', async () => {
-  // First visit: nothing lights up.
-  const first = await dots({ threads: () => THREADS });
-  assert.equal(first.dot(1), null); assert.equal(first.dot(3), null);
-  const seen = first.win.localStorage.getItem('agent-comms-seen');
-  first.dom.window.close();
-  // Thread 1 gets a new agent post and thread 3 a new human post (one's own posts are never unread).
-  const later = [thread(3, [post(30, 3, 10), post(31, 3, 50, { agent: 'human' })]), thread(2, [post(20, 2, 40), post(21, 2, 45)]),
-                 thread(1, [post(10, 1, 5), post(11, 1, 55)])];
-  const { dom, document, dot } = await dots({ threads: () => later, storage: { 'agent-comms-seen': seen, 'agent-comms-thread': '2' } });
-  assert.deepEqual(dot(1), ['unread', 'New posts']);
-  assert.equal(dot(3), null);
-  document.querySelector('tr[data-thread="1"]').click();
-  assert.deepEqual(dot(1), ['done', 'Settled: nothing waiting on anyone'], 'opening the thread marks it seen');
-  assert.ok(document.querySelector('tr[data-thread="1"]'), 'the thread being read stays listed');
-  document.querySelector('tr[data-thread="2"]').click();
-  assert.ok(document.querySelector('tr[data-thread="1"]'), 'threads opened on this page stay listed while you browse');
-  const seenNow = dom.window.localStorage.getItem('agent-comms-seen');
-  dom.window.close();
-  const reload = await dots({ threads: () => later, storage: { 'agent-comms-seen': seenNow, 'agent-comms-thread': '2' } });
-  assert.equal(reload.document.querySelector('tr[data-thread="1"]'), null, 'after a reload a settled thread is hidden');
-  assert.ok(reload.document.querySelector('tr[data-thread="2"]'), 'the selected thread is always listed');
-  reload.dom.window.close();
+test('status dots: opening or reloading preserves agent pickup until explicit completion', async () => {
+  const request = { recipient: 'claude', assigned_agent: 'claude', state: 'queued', updated_at: MINUTES_AGO(1) };
+  const pending = thread(1, [post(11, 1, 55, { type: 'request', to: ['claude'], requests: [request] })]);
+  const quiet = thread(2, [post(21, 2, 45)]);
+  const all = [pending, quiet];
+  const page = await dots({ threads: () => all, storage: { 'agent-comms-thread': '2' } });
+  try {
+    assert.deepEqual(page.dot(1), ['unread', '#11 · claude: awaiting agent pickup']);
+    page.document.querySelector('tr[data-thread="1"]').click();
+    assert.equal(page.dot(1)[0], 'unread', 'human reading does not acknowledge agent work');
+    page.document.querySelector('tr[data-thread="2"]').click();
+    assert.equal(page.dot(1)[0], 'unread', 'navigating away preserves pickup');
+  } finally { page.dom.window.close(); }
+  const reload = await dots({ threads: () => all,
+    storage: { 'agent-comms-seen': JSON.stringify({ 1: 9999 }), 'agent-comms-thread': '2' } });
+  try {
+    assert.equal(reload.dot(1)[0], 'unread', 'legacy browser read marks cannot settle a request');
+    request.state = 'finished';
+    await reload.win.refresh();
+    assert.equal(reload.document.querySelector('tr[data-thread="1"]'), null, 'explicit completion hides settled work');
+    assert.ok(reload.document.querySelector('tr[data-thread="2"]'), 'the selected thread stays listed');
+  } finally { reload.dom.window.close(); }
 });
 
-test('status dots: every open thread has one; unclaimed tasks are pending, then stalled', async () => {
+test('status dots: unclaimed tasks await pickup then stall; quiet discussion is unclassified', async () => {
   const fresh = thread(1, [post(10, 1, 1)]); fresh.tasks = [{ ...task(1, 'accepted'), updated_at: MINUTES_AGO(5) }];
   const old = thread(2, [post(20, 2, 2)]); old.tasks = [{ ...task(2, 'proposed'), updated_at: MINUTES_AGO(90) }];
   const quiet = thread(3, [post(30, 3, 3)]);
   const { dom, document, dot } = await dots({ threads: () => [fresh, old, quiet],
     storage: { 'agent-comms-seen': JSON.stringify({ 1: 10, 2: 20, 3: 30 }), 'agent-comms-thread': '3' } });
-  assert.deepEqual(dot(1), ['active', 'task 1 accepted, not picked up for 5m']);
-  assert.deepEqual(dot(2), ['stalled', 'task 2 proposed, not picked up for 2h']);
-  assert.deepEqual(dot(3), ['done', 'Settled: nothing waiting on anyone']);
-  for (const row of document.querySelectorAll('.thread-list tr')) assert.ok(row.querySelector('.dot'), 'no row without a dot');
+  assert.deepEqual(dot(1), ['unread', 'task 1 accepted, awaiting agent pickup for 5m']);
+  assert.deepEqual(dot(2), ['stalled', 'task 2 proposed, awaiting agent pickup for 2h']);
+  assert.equal(dot(3), null, 'quiet discussion is not evidence of completion or processing');
+  assert.ok(document.querySelector('tr[data-thread="3"]'), 'unclassified discussion stays visible');
   dom.window.close();
 });
 
@@ -179,7 +179,8 @@ test('sorting: recent activity (default), newest first, priority; the choice is 
     { created_at: `2027-01-15T0${created}:00:00+00:00` }, extra);
   const onMe = mk(1, 1, 10);                                                   // waiting on the human
   const onAgent = mk(2, 2, 20); onAgent.tasks = [task(1, 'blocked')];          // stalled on someone else
-  const fresh = mk(3, 3, 30);                                                   // unread
+  const fresh = mk(3, 3, 30);                                                   // agent pickup outstanding
+  Object.assign(fresh.posts[0], { type: 'request', to: ['claude'], needs_response: true });
   const busy = mk(4, 4, 40); busy.tasks = [task(2, 'working', 'active')];       // being worked on
   const quiet = mk(5, 0, 50);                                                   // nothing to flag; oldest thread
   const all = [onMe, onAgent, fresh, busy, quiet];
@@ -207,9 +208,9 @@ test('status dots: the last word went to an agent that never replied (request); 
   const seen = JSON.stringify({ 1: 11, 2: 21, 3: 31, 4: 41 });
   const { dom, dot } = await dots({ threads: () => [quietFor(1, 35), quietFor(2, 45), quietFor(3, 300), answered],
     storage: { 'agent-comms-seen': seen, 'agent-comms-thread': '4' } });
-  assert.deepEqual(dot(1), ['active', '#11 queued · claude-code'], 'inside the window plus grace');
-  assert.deepEqual(dot(2), ['stalled', '#21 queued · claude-code']);
-  assert.deepEqual(dot(3), ['stalled', '#31 queued · claude-code']);
-  assert.deepEqual(dot(4), ['stalled', '#40 queued · claude-code'], 'an unrelated reply cannot complete the request');
+  assert.deepEqual(dot(1), ['unread', '#11 · claude-code: awaiting agent pickup'], 'inside the window plus grace');
+  assert.deepEqual(dot(2), ['stalled', '#21 · claude-code: agent pickup overdue']);
+  assert.deepEqual(dot(3), ['stalled', '#31 · claude-code: agent pickup overdue']);
+  assert.deepEqual(dot(4), ['stalled', '#40 · claude-code: agent pickup overdue'], 'an unrelated reply cannot complete the request');
   dom.window.close();
 });

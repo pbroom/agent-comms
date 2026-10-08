@@ -85,6 +85,8 @@ test('the card sits at the top of the thread, only for items that need you, newe
     assert.equal(first.querySelector('h3').textContent, 'post 14 ' + INJECTION);
     assert.equal(document.querySelector('#needs-you h2').textContent, 'Needs you (3)');
     assert.match(document.querySelector('tr[data-thread="1"] .dot').getAttribute('aria-label'), /3 posts waiting on you: #10, #12, #14/);
+    document.getElementById('show-completed').click();
+    await settle();
     await pick(document, 3);
     assert.equal(document.getElementById('needs-you'), null, 'no card where nothing needs you');
     assert.equal(win.pwned, undefined);
@@ -95,7 +97,7 @@ test('the card sits at the top of the thread, only for items that need you, newe
 
 test('hidden for an agent viewing the board', async () => {
   const r = post(14, 1, { type: 'request', needs_response: true, agent: 'claude-code' });
-  const { dom, document } = await setup({ threads: [thread(1, [r])], needsYou: [r], human: false });
+  const { dom, document } = await setup({ threads: [thread(1, [r])], needsYou: [r], human: false, url: 'http://127.0.0.1:8787/#thread-1' });
   assert.ok(document.getElementById('thread-1'));
   assert.equal(document.getElementById('needs-you'), null);
   dom.window.close();

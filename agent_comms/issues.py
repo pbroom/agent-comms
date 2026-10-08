@@ -118,7 +118,7 @@ def _write(board, p, session_id, issue_id=None, thread_id=None):
 
 
 def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None, decision=None):
-    board.conn.execute(
+    event = board.conn.execute(
         """INSERT INTO issue_comments(issue_id,session_id,agent,kind,body,outcome,scope,created_at,decision)
         VALUES(?,?,?,?,?,?,?,?,?)""",
         (
@@ -134,6 +134,7 @@ def _event(board, p, session_id, issue_id, kind, body, outcome=None, scope=None,
         ),
     )
     board.conn.execute("UPDATE issues SET updated_at=? WHERE id=?", (board.now(), issue_id))
+    return event.lastrowid
 
 
 def get_issue(board, p, issue_id):
@@ -288,6 +289,7 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         raise Invalid("outcome must be answered, approved, or declined")
     if not isinstance(thread_ids, list) or not thread_ids or any(type(t) is not int for t in thread_ids):
         raise Invalid("thread_ids must explicitly select linked threads")
+    answer_posts = []
     with db.write_tx(board.conn) as c:
         row = _row(board, issue_id)
         _write(board, p, session_id, issue_id)
@@ -316,7 +318,33 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         if not set(thread_ids) <= linked.keys():
             raise Invalid("decision scope must contain only linked threads")
         scope = [{"thread_id": t, "project": linked[t]} for t in sorted(set(thread_ids))]
-        _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
+        frozen_links = c.execute('''SELECT l.*,p.agent AS source_agent,a.is_human AS source_is_human FROM issue_links l
+            LEFT JOIN posts p ON p.id=l.post_id LEFT JOIN agents a ON a.name=p.agent WHERE l.issue_id=?
+            AND l.thread_id IN (SELECT value FROM json_each(?)) ORDER BY l.id''',(issue_id,json.dumps(thread_ids))).fetchall()
+        decision['issue_link_ids'] = [link['id'] for link in frozen_links]
+        latest = c.execute("SELECT * FROM issue_comments WHERE issue_id=? AND kind='decision' ORDER BY id DESC LIMIT 1",
+                           (issue_id,)).fetchone()
+        if (latest is not None and latest['body']==body and latest['outcome']==outcome
+                and json.loads(latest['scope'] or 'null')==scope
+                and json.loads(latest['decision'] or 'null')==decision):
+            return get_issue(board,p,issue_id)
+        if any(board._thread_row(tid)['status'] != 'open' for tid in thread_ids):
+            raise Conflict('reopen every selected thread before delivering an issue answer')
+        event_id = _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
+        for tid in sorted(set(thread_ids)):
+            selected = [link for link in frozen_links if link['thread_id']==tid]
+            source_ids = sorted({link['post_id'] for link in selected
+                                 if link['post_id'] is not None and not link['source_is_human']})
+            intended = {link['source_agent'] or link['agent'] for link in selected}
+            recipients = [agent for agent in sorted(intended) if c.execute(
+                'SELECT 1 FROM agents WHERE name=? AND is_human=0',(agent,)).fetchone()]
+            answer = board.create_post(p,session_id,thread_id=tid,type='status',
+                body=f'Human answer for issue #{issue_id} ({outcome}):\n{body}',to=recipients,
+                answer_to=source_ids or None,_in_transaction=True)
+            answer_posts.append(answer)
+            for link in selected:
+                c.execute('''INSERT INTO issue_answer_links(decision_comment_id,issue_link_id,answer_post_id,question_version)
+                    VALUES (?,?,?,?)''',(event_id,link['id'],answer['id'],row['question_version']))
         c.execute(
             "UPDATE issue_links SET needs_human=0 WHERE issue_id=? AND thread_id IN (SELECT value FROM json_each(?))",
             (issue_id, json.dumps(thread_ids)),
@@ -325,6 +353,9 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
             "UPDATE issues SET needs_human=EXISTS(SELECT 1 FROM issue_links WHERE issue_id=? AND needs_human=1) WHERE id=?",
             (issue_id, issue_id),
         )
+    for answer in answer_posts:
+        board._notify('post.created',{'post_id':answer['id'],'thread_id':answer['thread_id'],
+            'agent':p.name,'to':answer['to'],'needs_response':False,'sealed':False})
     return get_issue(board, p, issue_id)
 
 
@@ -338,3 +369,87 @@ def resolve_issue(board, p, session_id, issue_id, body):
         c.execute("UPDATE issue_links SET needs_human=0 WHERE issue_id=?", (issue_id,))
         c.execute("UPDATE issues SET status='resolved',needs_human=0 WHERE id=?", (issue_id,))
     return get_issue(board, p, issue_id)
+
+
+def _completed_answer_work(board, thread_id):
+    """Conservative completion proof; silence and legacy attention are never evidence."""
+    from . import requests
+    c = board.conn
+    linked = c.execute('''SELECT 1 FROM posts p WHERE p.thread_id=? AND (
+        EXISTS (SELECT 1 FROM answer_links a WHERE a.answer_post_id=p.id) OR
+        EXISTS (SELECT 1 FROM issue_answer_links a WHERE a.answer_post_id=p.id)) LIMIT 1''',(thread_id,)).fetchone()
+    if not linked:
+        return False
+    if c.execute("SELECT 1 FROM tasks WHERE thread_id=? AND status NOT IN ('done','declined') LIMIT 1",(thread_id,)).fetchone():
+        return False
+    if c.execute(f'SELECT 1 FROM posts p WHERE p.thread_id=? AND {board.NEEDS_YOU_SOURCE} LIMIT 1',(thread_id,)).fetchone():
+        return False
+    if c.execute('''SELECT 1 FROM legacy_attention_answers l JOIN posts p ON p.id=l.source_post_id
+        WHERE p.thread_id=? AND NOT EXISTS (SELECT 1 FROM answer_links a WHERE a.source_post_id=p.id) LIMIT 1''',
+        (thread_id,)).fetchone():
+        return False
+    obligations = 0
+    for post in c.execute('SELECT p.*,a.is_human FROM posts p JOIN agents a ON a.name=p.agent WHERE p.thread_id=?',(thread_id,)):
+        rows = requests.for_post(board,post)
+        if not rows and c.execute('''SELECT 1 WHERE EXISTS(SELECT 1 FROM answer_links WHERE answer_post_id=?)
+            OR EXISTS(SELECT 1 FROM issue_answer_links WHERE answer_post_id=?)''',(post['id'],post['id'])).fetchone():
+            return False  # no recorded intended agent: completion cannot be inferred
+        if (not rows and not post['is_human'] and post['type'] in ('question','proposal','decision')
+                and not c.execute('SELECT 1 FROM answer_links WHERE source_post_id=?',(post['id'],)).fetchone()
+                and not c.execute('SELECT 1 FROM attention_resolutions WHERE post_id=?',(post['id'],)).fetchone()):
+            return False
+        for row in rows:
+            obligations += 1
+            if row['state'] != 'finished' or not row['evidence_post_ids']:
+                return False
+            for evidence_id in row['evidence_post_ids']:
+                evidence = c.execute('SELECT thread_id,sealed FROM posts WHERE id=?',(evidence_id,)).fetchone()
+                if evidence is None or evidence['thread_id'] != thread_id or evidence['sealed']:
+                    return False
+    return obligations > 0
+
+
+def reconcile_completed(board, p, session_id, thread_id):
+    """Called inside explicit request completion; close only fully evidenced answer work.
+
+    This internal helper has no transport or permissions surface. The caller holds
+    the write transaction after validating the actual request's completing actor.
+    """
+    if not board.conn.in_transaction:
+        raise Invalid('completion reconciliation requires an active transaction')
+    session = board._session(p,session_id)
+    thread = board._thread_row(thread_id)
+    result = {'closed_thread_ids':[],'resolved_issue_ids':[]}
+    if session['project'] != thread['project'] or thread['status'] != 'open':
+        return result
+    if not _completed_answer_work(board,thread_id):
+        return result
+    c = board.conn
+    close_candidates = {thread_id}
+    for issue in c.execute('''SELECT DISTINCT i.* FROM issues i JOIN issue_links l ON l.issue_id=i.id
+        WHERE l.thread_id=? AND i.status='open' ''',(thread_id,)).fetchall():
+        if issue['needs_human']:
+            continue
+        links = c.execute('SELECT * FROM issue_links WHERE issue_id=?',(issue['id'],)).fetchall()
+        if not links or any(link['needs_human'] for link in links):
+            continue
+        if any(board._thread_row(link['thread_id'])['project'] != session['project'] for link in links):
+            continue
+        if any(not c.execute('''SELECT 1 FROM issue_answer_links WHERE issue_link_id=? AND question_version=?''',
+                              (link['id'],issue['question_version'])).fetchone() for link in links):
+            continue
+        if not all(_completed_answer_work(board,tid) for tid in {link['thread_id'] for link in links}):
+            continue
+        _event(board,p,session_id,issue['id'],'resolution',
+               'All exact linked answer requests have explicit completion evidence; required tasks are terminal.')
+        c.execute("UPDATE issues SET status='resolved',needs_human=0 WHERE id=?",(issue['id'],))
+        result['resolved_issue_ids'].append(issue['id'])
+        close_candidates.update(link['thread_id'] for link in links)
+    for tid in sorted(close_candidates):
+        if c.execute('''SELECT 1 FROM issue_links l JOIN issues i ON i.id=l.issue_id
+            WHERE l.thread_id=? AND i.status!='resolved' LIMIT 1''',(tid,)).fetchone():
+            continue
+        if board._thread_row(tid)['status']=='open' and _completed_answer_work(board,tid):
+            c.execute("UPDATE threads SET status='closed' WHERE id=?",(tid,))
+            result['closed_thread_ids'].append(tid)
+    return result

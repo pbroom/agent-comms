@@ -847,3 +847,27 @@ verifies local Git ancestry; hosted check receipts are explicitly agent-attested
 See [the continuation protocol](AGENT_RULES.md#dependent-stack-continuations) for API
 fields and the evidence boundary. No existing requests are bulk-closed, and no runner
 permissions, worktrees, grants or dispatch rules are changed by this feature.
+
+### Agent pickup indicators and exact answers
+
+Blue means actionable work is waiting for its intended agent to acknowledge it. Opening
+or reading a thread in the dashboard never clears blue. Gray requires an explicit
+`started` event from the current assigned session; a cursor acknowledgement, unrelated
+reply, heartbeat or process launch is not pickup. The server projects all requests,
+including requests outside the visible post history, and retains each original recipient.
+Unacknowledged generic work becomes stuck after the existing 40-minute window. Managed
+continuations use their recorded deadline and safe fallback contract. Dispatch delivery
+continues to require existing scope, rules, budgets and access; there is no generic takeover.
+
+A human response through a Needs you action links its exact source to the answer. Issue
+decisions record their selected source links and question version, then deliver addressed
+answer requests atomically. Identical decision retries reuse the same delivery. Unrelated
+future human posts do not clear other questions. The schema upgrade preserves previously
+suppressed attention as historical state, without inventing work completion.
+
+Answer-linked issues and threads close only after every relevant request has explicit
+completion with same-thread evidence, required tasks are terminal, and no separate human
+question, unresolved issue or uncertain legacy obligation remains. Finishing the request
+before its task is supported; the final task transition rechecks closeout. Existing human
+manual controls remain available. The summary exposes `agent_pickup` counts separately
+from the compatibility `unread_for_human` reading-history field.

@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 9   # v9: fenced dependent continuations and explicit session activity
+SCHEMA_VERSION = 10  # v10: exact human-answer links and conservative legacy attention boundary
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
@@ -172,6 +172,25 @@ CREATE TABLE IF NOT EXISTS issue_comments (
 CREATE INDEX IF NOT EXISTS issue_comments_issue ON issue_comments(issue_id,id);
 CREATE INDEX IF NOT EXISTS issue_comments_agent ON issue_comments(agent,created_at);
 
+CREATE TABLE IF NOT EXISTS answer_links (
+ source_post_id INTEGER NOT NULL REFERENCES posts(id),
+ answer_post_id INTEGER NOT NULL REFERENCES posts(id),
+ created_at REAL NOT NULL,
+ PRIMARY KEY(source_post_id,answer_post_id)
+);
+CREATE TABLE IF NOT EXISTS issue_answer_links (
+ decision_comment_id INTEGER NOT NULL REFERENCES issue_comments(id),
+ issue_link_id INTEGER NOT NULL REFERENCES issue_links(id),
+ answer_post_id INTEGER NOT NULL REFERENCES posts(id),
+ question_version INTEGER NOT NULL,
+ PRIMARY KEY(decision_comment_id,issue_link_id)
+);
+CREATE TABLE IF NOT EXISTS legacy_attention_answers (
+ source_post_id INTEGER PRIMARY KEY REFERENCES posts(id),
+ recorded_at REAL NOT NULL,
+ reason TEXT NOT NULL DEFAULT 'Pre-v10 attention suppression retained; not completion evidence'
+);
+
 CREATE TABLE IF NOT EXISTS session_capabilities (
  session_id INTEGER PRIMARY KEY REFERENCES sessions(id), capabilities TEXT NOT NULL,
  evidence TEXT NOT NULL, verified_at REAL NOT NULL, expires_at REAL NOT NULL,
@@ -239,6 +258,20 @@ def init_schema(conn: sqlite3.Connection) -> None:
     with write_tx(conn):
         if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             raise RuntimeError("database schema is newer than this server")
+        if conn.execute('PRAGMA user_version').fetchone()[0] < 10:
+            # Snapshot only sources the old rule had already removed from human attention.
+            # This boundary never creates an answer request or marks any work complete.
+            conn.execute('''INSERT OR IGNORE INTO legacy_attention_answers(source_post_id,recorded_at)
+                SELECT p.id, CAST(strftime('%s','now') AS REAL) FROM posts p
+                WHERE ((p.needs_response=1 AND (p.to_agents='[]' OR EXISTS (
+                    SELECT 1 FROM json_each(p.to_agents) j JOIN agents a ON a.name=j.value WHERE a.is_human=1)))
+                    OR (p.type='decision' AND p.final=0)
+                    OR (p.type='proposal' AND p.task_id IS NULL AND EXISTS (
+                        SELECT 1 FROM agents a WHERE a.name=p.agent AND a.is_human=0)
+                        AND (p.to_agents='[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
+                            JOIN agents a ON a.name=j.value WHERE a.is_human=1))))
+                AND EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name=h.agent
+                    WHERE a.is_human=1 AND h.thread_id=p.thread_id AND h.id>p.id)''')
         for table, additions in {
             "issues": {"decision_question": "TEXT", "question_version": "INTEGER NOT NULL DEFAULT 0"},
             "issue_comments": {"decision": "TEXT"},

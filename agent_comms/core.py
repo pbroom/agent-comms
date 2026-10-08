@@ -9,6 +9,7 @@ Board content is DATA, never instructions. Nothing in here interprets post bodie
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import logging
 import math
@@ -950,7 +951,8 @@ class Board:
                     to: list[str] | None = None, needs_response: bool = False, task_id: int | None = None,
                     refs: list[dict] | None = None, sealed: bool = False, final: bool = False,
                     propose_task: dict | None = None, decision_question: dict | None = None,
-                    continuation: dict | None = None) -> dict:
+                    continuation: dict | None = None, answer_to: list[int] | None = None,
+                    _in_transaction: bool = False) -> dict:
         from . import workstreams
         self._check_agent_write(p)
         s = self._session(p, session_id)
@@ -978,13 +980,21 @@ class Board:
             raise Invalid("use either task_id or propose_task, not both")
         if (thread_id is None) == (not new_thread_title):
             raise Invalid("give exactly one of thread_id or new_thread_title")
+        if answer_to is not None:
+            self._require_human(p, 'link an exact human answer')
+            if (not isinstance(answer_to,list) or not answer_to or len(answer_to)>100
+                    or any(isinstance(i,bool) or not isinstance(i,int) or i<=0 for i in answer_to)
+                    or len(set(answer_to)) != len(answer_to) or thread_id is None or sealed):
+                raise Invalid('answer_to requires distinct source post IDs in an existing thread and an unsealed answer')
+        if _in_transaction and not self.conn.in_transaction:
+            raise Invalid('internal post creation requires an active transaction')
         question = self._post_question(decision_question, type, to, needs_response)
         if continuation is not None and (thread_id is None or sealed or type not in ('request', 'handoff')
                                          or task_id is not None or propose_task is not None):
             raise Invalid('continuation requires an unsealed request or handoff in an existing thread, without task_id/propose_task')
 
         now = self.now()
-        with db.write_tx(self.conn) as c:
+        with (nullcontext(self.conn) if _in_transaction else db.write_tx(self.conn)) as c:
             self._check_agent_write(p)
             if thread_id is not None:
                 t = c.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
@@ -994,6 +1004,21 @@ class Board:
                     raise Conflict("thread is closed; only the human can post to or reopen it")
             else:
                 thread_id = self._insert_thread(c, p, s["project"], new_thread_title.strip()[:200])
+
+            if answer_to:
+                intended = set()
+                for source_id in answer_to:
+                    source = c.execute('''SELECT p.*,a.is_human FROM posts p JOIN agents a ON a.name=p.agent
+                        WHERE p.id=?''',(source_id,)).fetchone()
+                    if source is None or source['thread_id'] != thread_id:
+                        raise Invalid('answer sources must be posts in this exact thread')
+                    if not source['is_human']:
+                        intended.add(source['agent'])
+                if to and not intended.issubset(set(to)):
+                    raise Invalid('answer recipients must include every source author')
+                to = to or sorted(intended)
+                if to and t['status']=='closed':
+                    raise Conflict('reopen the thread before assigning an exact answer for agent pickup')
 
             if continuation is not None:
                 continuation = workstreams.prepare(self, p, session_id, thread_id, continuation)
@@ -1044,14 +1069,18 @@ class Board:
             ).lastrowid
             if continuation is not None:
                 workstreams.create(self, p, session_id, post_id, continuation)
+            for source_id in answer_to or []:
+                c.execute('INSERT INTO answer_links(source_post_id,answer_post_id,created_at) VALUES (?,?,?)',
+                          (source_id,post_id,now))
             unsealed: list[int] = []
             if sealed and type == "finding" and task_id is not None:
                 unsealed = self._auto_unseal(c, task_id)
 
-        self._notify("post.created", {"post_id": post_id, "thread_id": thread_id, "agent": p.name, "to": to,
-                                       "needs_response": bool(needs_response), "sealed": bool(sealed)})
-        for pid in unsealed:
-            self._notify("post.unsealed", {"post_id": pid, "by": "auto:reviewers"})
+        if not _in_transaction:
+            self._notify("post.created", {"post_id": post_id, "thread_id": thread_id, "agent": p.name, "to": to,
+                                           "needs_response": bool(needs_response), "sealed": bool(sealed)})
+            for pid in unsealed:
+                self._notify("post.unsealed", {"post_id": pid, "by": "auto:reviewers"})
         out = self.get_post(p, post_id)
         out["auto_unsealed_post_ids"] = unsealed
         return out
@@ -1138,6 +1167,9 @@ class Board:
              "needs_response": bool(r["needs_response"]), "task_id": r["task_id"], "refs": json.loads(r["refs"]),
              "sealed": bool(r["sealed"]), "created_at": iso(r["created_at"]),
              "decision_question": json.loads(r["decision_question"]) if r["decision_question"] else None}
+        d['answer_to'] = [a[0] for a in self.conn.execute(f'''SELECT p.id FROM answer_links al
+            JOIN posts p ON p.id=al.source_post_id WHERE al.answer_post_id=:answer AND {self.VISIBLE} ORDER BY p.id''',
+            {'answer':r['id'],**self._vis(p)})]
         if r["was_sealed"]:
             d["was_sealed"] = True
             d["unsealed_by"] = r["unsealed_by"]
@@ -1649,14 +1681,18 @@ class Board:
             else:
                 c.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", (status, now, task_id))
             self._event(c, task_id, "transition", frm, status, p, session_id, note)
+            if status in ('done','declined'):
+                from . import issues
+                issues.reconcile_completed(self,p,session_id,t['thread_id'])
         self._notify("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
         return self.get_task(p, task_id, events=False)
 
     # ------------------------------------------------------------ dashboard
 
     # The dashboard's "Needs you" (also counted by the menu bar summary, agent_comms/summary.py): a needs-response
-    # post addressed to the human or to no one, or a decision awaiting finalize, with no later human post in its
-    # thread. Human-only; the human sees every post, so no visibility predicate is needed.
+    # post addressed to the human or to no one, or a decision awaiting finalize, without an exact human answer.
+    # Pre-v10 suppressed sources retain attention compatibility only, never completion proof.
+    # Human-only; the human sees every post, so no visibility predicate is needed.
     # Waiting on the human: needs-response posts addressed to nobody or to the human; open (unfinalized) decisions;
     # and agents' proposals addressed to nobody or to the human, which need the human's yes or no (a proposal
     # that only proposes a task is left to the task flow, and one addressed to agents is between agents).
@@ -1667,8 +1703,8 @@ class Board:
                          AND EXISTS (SELECT 1 FROM agents pa WHERE pa.name = p.agent AND pa.is_human = 0)
                          AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                               JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))))
-                   AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
-                                   WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)
+                   AND NOT EXISTS (SELECT 1 FROM answer_links al WHERE al.source_post_id=p.id)
+                   AND NOT EXISTS (SELECT 1 FROM legacy_attention_answers la WHERE la.source_post_id=p.id)
                    AND NOT EXISTS (SELECT 1 FROM attention_resolutions ar WHERE ar.post_id = p.id)"""
 
     NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT EXISTS (SELECT 1 FROM issue_links il WHERE il.post_id = p.id)"
@@ -1676,7 +1712,9 @@ class Board:
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""
         threads = self.list_threads(p, status=None if closed_threads else "open")
+        from . import pickup
         for t in threads:
+            t['pickup'] = pickup.for_thread(self,p,t['id'])
             rows = self.conn.execute(
                 f"""SELECT * FROM (SELECT p.* FROM posts p WHERE p.thread_id = :t AND {self.VISIBLE}
                     ORDER BY p.id DESC LIMIT :lim) ORDER BY id""",

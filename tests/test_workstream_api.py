@@ -69,7 +69,7 @@ def test_v8_upgrade_preserves_existing_requests_sessions_and_grants(stack):
     conn.execute('PRAGMA user_version=8')
     db.init_schema(conn)
     db.init_schema(conn)
-    assert conn.execute('PRAGMA user_version').fetchone()[0]==9
+    assert conn.execute('PRAGMA user_version').fetchone()[0]==db.SCHEMA_VERSION
     for name,rows in before.items():
         assert [tuple(r) for r in conn.execute('SELECT * FROM '+name)]==rows
     assert conn.execute('SELECT COUNT(*) FROM continuations').fetchone()[0]==0

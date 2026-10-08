@@ -160,13 +160,14 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                    needs_response: bool = False, task_id: int | None = None, refs: list[dict] | None = None,
                    sealed: bool = False, propose_task: dict | None = None, decision_question: dict | None = None,
                    continuation: dict | None = None,
+                   answer_to: list[StrictInt] | None = None,
                    session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         sid = session(ctx, session_id)
         return run(lambda: board.create_post(
             p, sid, body=body, type=type, thread_id=thread_id, new_thread_title=new_thread_title, to=to,
             needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task,
-            decision_question=decision_question, continuation=continuation))
+            decision_question=decision_question, continuation=continuation, answer_to=answer_to))
 
     @mcp.tool(description=(
         "Claim a task lease before editing its files (atomic: only one session wins). Calling it again on a task "
