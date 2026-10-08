@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import secrets
-from urllib.parse import urlsplit, urlunsplit
+import ipaddress
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from . import db, requests
 from .core import Conflict, Forbidden, Invalid
@@ -45,6 +46,73 @@ CREATE TABLE IF NOT EXISTS browser_events (
 """
 
 
+def _ipv4_number(part):
+    """One WHATWG IPv4 part (decimal, 0x hex or 0-prefixed octal), or None when it is not a number."""
+    if part.startswith(('0x', '0X')):
+        digits, base = part[2:], 16
+    elif len(part) > 1 and part.startswith('0'):
+        digits, base = part[1:], 8
+    else:
+        digits, base = part, 10
+    if digits == '':
+        return 0
+    try:
+        allowed = {8: '01234567', 10: '0123456789', 16: '0123456789abcdefABCDEF'}[base]
+        return int(digits, base) if all(c in allowed for c in digits) else None
+    except ValueError:
+        return None
+
+
+def _ipv6_text(addr):
+    """WHATWG IPv6 serialization: lowercase hex pieces, the first longest run of two or more zero pieces as `::`,
+    and no embedded dotted IPv4 (Python keeps `::ffff:127.0.0.1`; a browser shows `::ffff:7f00:1`)."""
+    pieces = [(int(addr) >> (16 * (7 - i))) & 0xffff for i in range(8)]
+    best, start = (0, -1), None
+    for i, v in enumerate(pieces + [1]):
+        if v == 0 and start is None:
+            start = i
+        elif v != 0 and start is not None:
+            if i - start > best[0]:
+                best = (i - start, start)
+            start = None
+    text = [format(v, 'x') for v in pieces]
+    if best[0] < 2:
+        return ':'.join(text)
+    return ':'.join(text[:best[1]]) + '::' + ':'.join(text[best[1] + best[0]:])
+
+
+def canonical_host(raw):
+    """The host as a browser resolves it, so a deny gate cannot be sidestepped by spelling the same host differently:
+    percent-decoded, IDNA-encoded (Unicode, full-width and mixed-case labels become one ASCII form), lowercased,
+    without a trailing dot, and IP literals in their one canonical form (WHATWG: `127.1`, `0x7f.0.0.1`,
+    `2130706433` and `0177.0.0.1` are all 127.0.0.1; IPv6 is compressed and bracketed). Raises ValueError."""
+    host = unquote(raw)
+    if ':' in host:                                     # urlsplit strips the brackets of an IPv6 literal
+        if '%' in host:
+            raise ValueError('zone ids are not allowed')
+        return '[' + _ipv6_text(ipaddress.IPv6Address(host)) + ']'
+    if any(c in host for c in '\x00/\\?#@[]<>^|%') or any(ord(c) < 0x21 for c in host):
+        raise ValueError('forbidden host character')
+    try:
+        host = host.encode('idna').decode('ascii').lower()
+    except UnicodeError:
+        raise ValueError('invalid international host name') from None
+    if host.endswith('.'):
+        host = host[:-1]
+    labels = host.split('.')
+    if not host or '' in labels:
+        raise ValueError('empty host label')
+    if _ipv4_number(labels[-1]) is not None:              # "ends in a number": an IPv4 address, or invalid
+        if len(labels) > 4:
+            raise ValueError('invalid IPv4 address')
+        nums = [_ipv4_number(x) for x in labels]
+        if any(n is None for n in nums) or any(n > 255 for n in nums[:-1]) or nums[-1] >= 256 ** (5 - len(nums)):
+            raise ValueError('invalid IPv4 address')
+        value = nums[-1] + sum(n * 256 ** (3 - i) for i, n in enumerate(nums[:-1]))
+        return str(ipaddress.IPv4Address(value))
+    return host
+
+
 def target(value):
     if not isinstance(value, str) or not value or len(value) > 2048 or any(c.isspace() for c in value):
         raise Invalid('target_url must be an absolute HTTP(S) URL without whitespace')
@@ -53,15 +121,39 @@ def target(value):
         if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password:
             raise ValueError()
         port = u.port or (443 if u.scheme == 'https' else 80)
-        host = u.hostname.lower()
-        if ':' in host:
-            host = '[' + host + ']'
+        host = canonical_host(u.hostname)
         origin = f'{u.scheme}://{host}:{port}'
     except ValueError:
         raise Invalid('invalid browser target URL') from None
     default_port = 443 if u.scheme == 'https' else 80
     netloc = host if port == default_port else f'{host}:{port}'
     return urlunsplit((u.scheme,netloc,u.path or '/',u.query,u.fragment)), origin
+
+
+def canonicalize_stored(conn):
+    """Upgrade: re-key permission gates and browser requirements stored before hosts were canonicalized, so a deny
+    recorded under one spelling (`EXAMPLE.com.`) still applies to the host. Merged gates keep the strictest state
+    (denied if either was) and the newest epoch. Runs inside init_schema's write transaction; idempotent."""
+    for row in conn.execute('SELECT * FROM browser_permission_gates').fetchall():
+        try:
+            origin = target(row['origin'])[1]
+        except Invalid:
+            continue
+        if origin == row['origin']:
+            continue
+        conn.execute('''INSERT INTO browser_permission_gates VALUES (?,?,?,?,?)
+            ON CONFLICT(project,origin) DO UPDATE SET denied=MAX(denied,excluded.denied),
+            epoch=MAX(epoch,excluded.epoch)+1, reason=CASE WHEN excluded.denied THEN excluded.reason ELSE reason END''',
+            (row['project'], origin, row['denied'], row['epoch'], row['reason']))
+        conn.execute('DELETE FROM browser_permission_gates WHERE project=? AND origin=?', (row['project'], row['origin']))
+    for row in conn.execute('SELECT post_id, recipient, origin FROM browser_requirements').fetchall():
+        try:
+            origin = target(row['origin'])[1]
+        except Invalid:
+            continue
+        if origin != row['origin']:
+            conn.execute('UPDATE browser_requirements SET origin=? WHERE post_id=? AND recipient=?',
+                         (origin, row['post_id'], row['recipient']))
 
 
 def _text(value, name, limit=4096):

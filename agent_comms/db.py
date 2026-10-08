@@ -329,6 +329,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         # Legacy virtual requests intentionally remain queued. Neither a later reply nor
         # a terminal linked task proves this particular request was completed. Reconcile
         # verified historical work through requests.progress with exact evidence instead.
+        browser_readiness.canonicalize_stored(conn)
         _install_managed_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
