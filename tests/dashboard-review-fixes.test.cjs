@@ -189,3 +189,49 @@ test('arrowing between the list tabs keeps focus on the new tab after the refres
     assert.equal(d.activeElement && d.activeElement.id, 'tab-issues', 'and stays there across a poll');
   } finally { dom.window.close(); }
 });
+
+// ---------------------------------------------------------------- 10. "Sending…" ends when the thread closes
+const task = (id, status, extra = {}) => ({ id, title: 'T' + id, status, lease_state: 'none', owner_agent: 'codex', owner_session: 1,
+  intends_files: [], events: [], depends_on: [], updated_at: ago(90), ...extra });
+const UNSTICK_REPLY = { post_id: 50, agents: ['codex'], live_agents: [], no_runner: [], dispatcher_running: true, paused: false, sessions: [] };
+test('"Sending…" clears at once when the thread is closed after Unstick', async () => {
+  const stuck = thread(1, [post(10, 1)], { tasks: [task(1, 'blocked')] });
+  const board = { threads: [stuck] };
+  const { dom, win, d } = await setup({ board, routes: { '/api/threads/1/unstick': () => ok(UNSTICK_REPLY) } });
+  try {
+    d.getElementById('show-completed').click(); await settle();
+    d.querySelector(`${rowSel(1)} [data-unstick="1"]`).click(); await settle();
+    assert.equal(d.querySelector(`${rowSel(1)} [data-unstick="1"]`).textContent, 'Sending…', 'waiting for codex to restart');
+    stuck.status = 'closed';
+    await win.refresh();
+    assert.equal(d.querySelector(`${rowSel(1)} [data-unstick="1"]`), null, 'closed: no "Sending…" for up to 10 minutes');
+    stuck.status = 'open';
+    await win.refresh();
+    assert.equal(d.querySelector(`${rowSel(1)} [data-unstick="1"]`).textContent, 'Unstick', 'reopened: a fresh Unstick, not a stale wait');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 11. the post cap is "on you" for the human only
+test('with an agent token, a thread at the post cap is not sorted into "stalled on you"', async () => {
+  const capped = thread(1, [post(10, 1, { created_at: ago(60) })], { agent_posts_since_human: 12 });
+  const blocked = thread(2, [post(20, 2, { created_at: ago(5) })], { tasks: [task(1, 'blocked')] });
+  const me = { name: 'claude', is_human: false };
+  const { dom, d } = await setup({ board: { threads: [capped, blocked] }, me, storage: { 'agent-comms-sort': 'priority' } });
+  try {
+    const order = [...d.querySelectorAll('.thread-list [data-thread]')].map(n => Number(n.dataset.thread));
+    assert.deepEqual(order, [2, 1], 'both are stalled on someone else (the human), so recent activity decides');
+  } finally { dom.window.close(); }
+});
+
+// ---------------------------------------------------------------- 12. tasks waiting on prerequisites are not stalled
+test('a task waiting on an unfinished prerequisite is neither awaiting pickup nor stalled', async () => {
+  const t = thread(1, [post(10, 1)], { tasks: [task(1, 'working', { lease_state: 'active' }), task(2, 'proposed', { depends_on: [1] })] });
+  const board = { threads: [t] };
+  const { dom, win, d } = await setup({ board });
+  try {
+    assert.deepEqual(dotOf(d, 1), ['active', 'codex working on task 1']);
+    t.tasks[0] = task(1, 'done');
+    await win.refresh();
+    assert.deepEqual(dotOf(d, 1), ['stalled', 'task 2 proposed, awaiting agent pickup for 2h'], 'once its prerequisite is done it can stall');
+  } finally { dom.window.close(); }
+});

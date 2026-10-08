@@ -1302,7 +1302,8 @@ function threadStatus(t, human) {
   const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status));
   if (expired.length) stalled.push("A task lease expired");
   for (const k of [...blocked, ...expired]) involve(k.owner_agent);
-  if (t.agent_posts_since_human >= t.thread_cap) needsMe = true;
+  // Only a human post lifts the cap: it is "on you" for the human only (an agent's view sorts it as someone else's).
+  if (human && t.agent_posts_since_human >= t.thread_cap) needsMe = true;
   if (t.agent_posts_since_human >= t.thread_cap) stalled.push("At the post cap: agents need a human post to continue");
   // Request completion is explicit; reading or unrelated replies never close it.
   const stale = iso => now - Date.parse(iso) >= (STALL_MINUTES + GRACE_MINUTES) * 60000;
@@ -1331,8 +1332,13 @@ function threadStatus(t, human) {
       else pickup.push(`${label}: awaiting agent pickup`);
     } else pending.push(`${label}: in progress${r.reason ? ": " + r.reason : ""}`);
   }
+  // A task waiting on unfinished prerequisites (depends_on) cannot be claimed yet (the server refuses the claim), so
+  // it is neither awaiting pickup nor stalled. A prerequisite counts as finished only when it is "done" (the server's
+  // rule); one this snapshot does not show is treated as unfinished.
+  const taskStatus = new Map(state.threads.flatMap(x => x.tasks.map(k => [k.id, k.status])));
+  const waitsOnPrerequisites = k => Array.isArray(k.depends_on) && k.depends_on.some(id => taskStatus.get(id) !== "done");
   for (const k of t.tasks) {
-    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active") continue;
+    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active" || waitsOnPrerequisites(k)) continue;
     const at = k.updated_at || k.created_at;
     (at && stale(at) ? stalled : pickup).push(`task ${k.id} ${k.status}, awaiting agent pickup${at ? " for " + since(at) : ""}`);
   }
@@ -1373,7 +1379,8 @@ function unstickRestarted(t) {
 function unstickSending(t) {
   const w = unsticking[t.id];
   if (!w) return false;
-  if (Date.now() > w.until || (!unstickBusy && unstickRestarted(t))) { delete unsticking[t.id]; return false; }
+  // A thread closed meanwhile will not restart: stop waiting at once (not after UNSTICK_WAIT_MS).
+  if (Date.now() > w.until || t.status !== "open" || (!unstickBusy && unstickRestarted(t))) { delete unsticking[t.id]; return false; }
   return true;
 }
 
@@ -2489,7 +2496,13 @@ function draw(app) {
     if (holder) selected = holder.id;
   }
   loadSeen();
-  const statuses = new Map(state.threads.map(t => [t.id, listStatus(t, human)]));
+  // "Sending…" ends for a thread that is no longer open: closed in this snapshot, or gone from a snapshot of open
+  // threads (every open thread is in it), so reopening it later does not bring a stale "Sending…" back.
+  for (const id of Object.keys(unsticking)) {
+    const t = state.threads.find(x => x.id === Number(id));
+    if (t ? t.status !== "open" : !showClosed && !unstickBusy) delete unsticking[id];
+  }
+  const statuses =new Map(state.threads.map(t => [t.id, listStatus(t, human)]));
   const pinned = highlight && highlight.kind === "thread" ? highlight.id : null;
   const all = sortedThreads(statuses);
   // Completed threads are hidden unless "Show completed" is on (or a link points at one).
