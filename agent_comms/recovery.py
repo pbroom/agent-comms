@@ -12,10 +12,12 @@ from .core import Conflict, Forbidden, Invalid
 PREFIX = 'request.recovery.'
 
 
-def record(board, p, recovery_post_id, recipient, sources):
+def record(board, p, recovery_post_id, recipient, sources, *, requires_diagnostics=False):
     """Link a new recovery acknowledgement to exact unfinished request versions."""
     from . import workstreams
     board._require_human(p, 'record recovery obligations')
+    if type(requires_diagnostics) is not bool:
+        raise Invalid('requires_diagnostics must be a boolean')
     if not board.conn.in_transaction:
         raise Invalid('recovery links require the creating human action transaction')
     post = board.get_post(p, recovery_post_id)
@@ -45,7 +47,7 @@ def record(board, p, recovery_post_id, recipient, sources):
             raise Conflict('recovery obligations cannot target other recovery obligations')
         seen.add(key)
         links.append(dict(item, picked_up=False))
-    value = {'post_id': recovery_post_id, 'recipient': recipient, 'version': row['version'], 'sources': links}
+    value = {'post_id': recovery_post_id, 'recipient': recipient, 'version': row['version'], 'sources': links, 'requires_diagnostics': requires_diagnostics}
     board.conn.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
                        (PREFIX + str(recovery_post_id) + '.' + recipient, json.dumps(value), p.name, board.now()))
 
@@ -110,13 +112,14 @@ def after_pickup(board, p, session_id, source, previous):
                 ready = False
                 break
             decision_actions.assert_execution_authorized(board, original['id'], work['assigned_agent'])
-        if ready:
+        diagnostics = _diagnostic_evidence(board, p, session_id, recovery, current['evidence_post_ids']) if link.get('requires_diagnostics') else []
+        if ready and (not link.get('requires_diagnostics') or diagnostics):
             receipt = board.create_post(p, session_id, thread_id=source['thread_id'], type='status',
                 body=f"Recovery acknowledgement #{recovery['id']}/{row['recipient']} retired after verified pickup of its explicitly linked requests. Their original work remains unfinished until separately evidenced completion.",
                 refs=[{'kind': 'artifact', 'path': f"board:post/{s['post_id']}"} for s in link['sources']], _in_transaction=True)
             requests._save(board, p, session_id, row, 'finished', 'Obsolete recovery acknowledgement; verified original request pickup',
-                           [receipt['id']], row['assigned_agent'], row['assigned_session'])
-            link['retired'] = {'receipt_post_id': receipt['id'], 'session_id': session_id}
+                           [receipt['id'], *diagnostics], row['assigned_agent'], row['assigned_session'])
+            link['retired'] = {'receipt_post_id': receipt['id'], 'session_id': session_id, 'diagnostic_post_ids': diagnostics}
         board.conn.execute('UPDATE board_state SET value=?,updated_by=?,updated_at=? WHERE key=?',
                            (json.dumps(link), p.name, board.now(), record['key']))
 
@@ -215,8 +218,13 @@ def _ownership_blocker(board, old, session_id, post):
         if (os.path.realpath(peer['worktree'] or peer['project']) == path
                 and (peer['state'] != 'idle' or peer['recorded_at'] is None or not board.now()-90 <= peer['recorded_at'] <= board.now())):
             return 'Another live session in the owner worktree has active or unknown activity'
-    for record in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
+    for record in board.conn.execute("SELECT key,value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
         run = json.loads(record['value'])
+        current_run = (current['dispatch_run_id'] and record['key'] == 'dispatch.run.' + current['dispatch_run_id']
+                       and run.get('agent') == current['agent'] and run.get('thread_id') == post['thread_id']
+                       and isinstance(run.get('cwd'), str) and os.path.realpath(run['cwd']) == path)
+        if current_run:
+            continue
         if run.get('status') in ACTIVE and (run.get('agent') == old['agent'] or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path)):
             return 'Owner dispatcher run is active or unresolved'
     try:
@@ -229,3 +237,20 @@ def _ownership_blocker(board, old, session_id, post):
     except Conflict as exc:
         return str(exc)
     return None
+
+
+def _diagnostic_evidence(board, p, session_id, recovery, evidence_ids):
+    """Structured exact refs attest the recovery deliverables, never text matches."""
+    found = {}
+    created_at = board.conn.execute('SELECT created_at FROM posts WHERE id=?', (recovery['id'],)).fetchone()[0]
+    for evidence_id in evidence_ids:
+        raw = board.conn.execute('SELECT * FROM posts WHERE id=?', (evidence_id,)).fetchone()
+        if (not raw or raw['sealed'] or raw['id'] <= recovery['id'] or raw['created_at'] < created_at
+                or raw['thread_id'] != recovery['thread_id'] or raw['agent'] != p.name
+                or raw['session_id'] != session_id or raw['type'] not in ('finding', 'proposal')):
+            continue
+        evidence = board.get_post(p, evidence_id)
+        if any(ref.get('kind') == 'artifact' and ref.get('path') == f"board:post/{recovery['id']}"
+               for ref in evidence['refs']):
+            found[evidence['type']] = evidence_id
+    return [found['finding'], found['proposal']] if set(found) == {'finding', 'proposal'} else []

@@ -215,6 +215,11 @@ def test_unstick_records_exact_links_and_pickup_retires_only_recovery(env):
     result = unstick.unstick(env.board, env.p['human'], tid, DispatchConfig())
     obligation = env.board.get_post(env.p['human'], result['post_id'])
     pickup(env, source)
+    assert row(env, obligation)['state'] == 'queued'
+    refs = [{'kind':'artifact','path':f"board:post/{obligation['id']}"}]
+    finding = env.post('codex',tid,'verified cause','finding',refs=refs+[{'kind':'commit','path':'repo','rev':'a'*40}])
+    proposal = env.post('codex',tid,'prevention','proposal',refs=refs)
+    diagnostic_pickup(env, source, [finding['id'],proposal['id']])
     assert row(env, source)['state'] == 'started'
     assert row(env, obligation)['state'] == 'finished'
 
@@ -224,9 +229,77 @@ def test_unstick_link_failure_rolls_back_post_and_rule(env, monkeypatch):
     tid = env.thread()
     env.post('human', tid, 'unfinished work', 'request', to=['codex'])
     before = env.board.conn.execute('SELECT count(*) FROM posts').fetchone()[0]
-    def fail(*args): raise RuntimeError('link unavailable')
+    def fail(*args, **kwargs): raise RuntimeError('link unavailable')
     monkeypatch.setattr(recovery, 'record', fail)
     with pytest.raises(RuntimeError):
         unstick.unstick(env.board, env.p['human'], tid, DispatchConfig())
     assert env.board.conn.execute('SELECT count(*) FROM posts').fetchone()[0] == before
     assert not env.board.active_dispatch_rules(env.p['human'])
+def diagnostic_setup(e):
+    tid=e.thread(); source=e.post('human',tid,'work','request',to=['codex'])
+    obligation=e.post('human',tid,'root cause finding and prevention proposal','request',to=['codex'])
+    with db.write_tx(e.board.conn):
+        recovery.record(e.board,e.p['human'],obligation['id'],'codex',
+            [{'post_id':source['id'],'recipient':'codex','version':0}],requires_diagnostics=True)
+    return tid,source,obligation
+
+
+def diagnostic_pickup(e,source,evidence):
+    requests.progress(e.board,e.p['codex'],e.sid['codex'],source['id'],'codex','started', evidence_post_ids=evidence)
+
+
+def test_true_unstick_requires_diagnostic_deliverables(env):
+    tid,source,obligation=diagnostic_setup(env)
+    pickup(env,source)
+    assert row(env,obligation)['state']=='queued'
+    refs=[{'kind':'artifact','path':f"board:post/{obligation['id']}"}]
+    finding=env.post('codex',tid,'root cause','finding',refs=refs+[{'kind':'commit','path':'repo','rev':'a'*40}])
+    proposal=env.post('codex',tid,'prevention','proposal',refs=refs)
+    diagnostic_pickup(env,source,[finding['id'],proposal['id']])
+    assert row(env,obligation)['state']=='finished'
+    assert row(env,source)['state']=='started'
+    assert set([finding['id'],proposal['id']]) <= set(row(env,obligation)['evidence_post_ids'])
+
+
+@pytest.mark.parametrize('gate',['missing_proposal','wrong_ref','wrong_session','wrong_author','old_post'])
+def test_unstick_rejects_inexact_diagnostic_evidence(env,gate):
+    tid,source,obligation=diagnostic_setup(env)
+    refs=[{'kind':'artifact','path':f"board:post/{obligation['id']}"}]
+    if gate=='wrong_ref': refs=[{'kind':'artifact','path':f"board:post/{source['id']}"}]
+    kwargs={}
+    if gate=='wrong_session': kwargs['session_id']=env.session('codex')
+    author='claude' if gate=='wrong_author' else 'codex'
+    finding=env.post(author,tid,'root cause','finding',refs=refs+[{'kind':'commit','path':'repo','rev':'a'*40}],**kwargs)
+    proposal=env.post('codex',tid,'prevention','proposal',refs=refs)
+    evidence=[finding['id'],proposal['id']]
+    if gate=='missing_proposal': evidence=[finding['id']]
+    if gate=='old_post':
+        env.board.conn.execute('UPDATE posts SET created_at=? WHERE id=?',(env.clock()-1,finding['id']))
+    diagnostic_pickup(env,source,evidence)
+    assert row(env,obligation)['state']=='queued'
+
+
+def test_exact_live_successor_dispatch_does_not_block_its_own_transfer(env,tmp_path):
+    import json
+    post,old,new,project=authorized_successor(env,tmp_path)
+    env.board.conn.execute('UPDATE sessions SET dispatch_run_id=? WHERE id=?',('current',new))
+    run={'agent':'codex','thread_id':post['thread_id'],'cwd':project,'status':'running'}
+    env.board.conn.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
+        ('dispatch.run.current',json.dumps(run),'codex',env.clock()))
+    assert recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)['assigned_session']==new
+
+
+@pytest.mark.parametrize('field',['id','thread_id','cwd','agent'])
+def test_nonmatching_live_dispatch_is_still_fenced(env,tmp_path,field):
+    import json
+    post,old,new,project=authorized_successor(env,tmp_path)
+    env.board.conn.execute('UPDATE sessions SET dispatch_run_id=? WHERE id=?',('current',new))
+    run={'agent':'codex','thread_id':post['thread_id'],'cwd':project,'status':'running'}
+    key='dispatch.run.current'
+    if field=='id': key='dispatch.run.unknown'
+    elif field=='thread_id': run[field]=post['thread_id']+1
+    elif field=='cwd': run[field]='/elsewhere'
+    else: run[field]='claude'
+    env.board.conn.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
+        (key,json.dumps(run),'codex',env.clock()))
+    with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
