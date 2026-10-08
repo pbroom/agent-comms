@@ -184,6 +184,24 @@ def test_choose_with_a_note_and_its_limits(qenv):
     assert reply["body"] == f'Chose option ship ("Ship it now", recommended) for #{p["id"]}.\nNote: only for the parser'
 
 
+def test_choose_checks_the_whole_reply_against_the_board_body_limit(tmp_path):
+    env = make_env(tmp_path, body_max_bytes=256)
+    env.client = TestClient(create_app(env.board))
+    env.h = lambda who="human": {"Authorization": f"Bearer {env.tokens[who]}"}
+    env.tid = env.thread("questions", as_="claude")
+    dq = {"question": "Ship?", "context": "",
+          "options": [{"id": "ship", "label": "Ship it now", "outcome": "approved"}, {"id": "wait", "label": "Wait"}],
+          "recommended_option_id": "ship"}
+    p = env.post("codex", env.tid, "please decide", "question", needs_response=True, decision_question=dq)
+    r = resolve(env, p["id"], {"action": "choose", "option_id": "ship", "note": "n" * 300})   # under 1 KB, over 256
+    assert r.status_code == 400, r.text
+    assert "over this board's post limit of 256 bytes" in r.json()["message"] and "shorten the note" in r.json()["message"]
+    assert p["id"] in needs_you(env)
+    # The refusal reserved nothing: a shorter note works at once (no cooldown).
+    r = resolve(env, p["id"], {"action": "choose", "option_id": "ship", "note": "n" * 100})
+    assert r.status_code == 200, r.text
+
+
 def test_choose_refusals(qenv):
     plain = qenv.post("codex", qenv.tid, "unstructured?", "question", needs_response=True)
     r = resolve(qenv, plain["id"], {"action": "choose", "option_id": "ship"})

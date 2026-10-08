@@ -59,6 +59,19 @@ def _one_line(text: str) -> str:
     return " ".join(text.split()).replace('"', "'")
 
 
+def _chose_body(board: Board, post_id: int, option: dict, question: dict, note: str | None) -> str:
+    """The Choose reply, checked whole against this board's post size limit (a long label plus a note can exceed a
+    small body_max_bytes even when the note alone is within NOTE_MAX_BYTES)."""
+    rank = "recommended" if option["id"] == question["recommended_option_id"] else "alternative"
+    body = CHOSE.format(id=_option_id(option["id"]), label=_one_line(option["label"]), rank=rank, post=post_id)
+    body += f"\nNote: {note}" if note else ""
+    size, limit = len(body.encode()), board.s.body_max_bytes
+    if size > limit:
+        raise Invalid(f"this answer would be {size} bytes, over this board's post limit of {limit} bytes"
+                      + ("; shorten the note" if note else "; use Reply instead"))
+    return body
+
+
 def _needs_you(c, post_id: int) -> bool:
     return c.execute(f"SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}", (post_id,)).fetchone() is not None
 
@@ -109,6 +122,7 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
             raise Invalid(f"post #{post_id} already has structured options; choose one or reply")
         if not to_author:
             raise Invalid(f"post #{post_id} was not written by an active agent, so there is no one to ask")
+
     def still_needs_you(c) -> None:
         if not _needs_you(c, post_id):
             raise Conflict(f"post #{post_id} no longer needs you (it was already handled)")
@@ -146,22 +160,20 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
     if option and option.get('action'):
         return _mechanical(board, p, item, option, question, note)
 
-    key = STATE_PREFIX + str(post_id)
-    human_actions.reserve_cooldown(
-        board, p, key, RESOLVE_COOLDOWN_SECONDS,
-        lambda wait: f"post #{post_id} was just resolved; try again in {wait} s", check=still_needs_you)
     needs_response = False
     if action == "reply":
         body, type_ = text, ("question" if text.endswith("?") else "status")
     elif action == "choose":
-        rank = "recommended" if option["id"] == question["recommended_option_id"] else "alternative"
-        body = CHOSE.format(id=_option_id(option["id"]), label=_one_line(option["label"]), rank=rank, post=post_id)
-        body, type_ = body + (f"\nNote: {note}" if note else ""), "status"
+        body, type_ = _chose_body(board, item["id"], option, question, note), "status"
     elif action == "ask_options":
         body, type_, needs_response = ASK_OPTIONS.format(post=post_id), "request", True
     else:
         body = {"approve": APPROVE, "approve_launch": APPROVE, "reject": REJECT, "not_now": NOT_NOW}[action]
         body, type_ = body.format(post=post_id), "status"
+    key = STATE_PREFIX + str(post_id)
+    human_actions.reserve_cooldown(
+        board, p, key, RESOLVE_COOLDOWN_SECONDS,
+        lambda wait: f"post #{post_id} was just resolved; try again in {wait} s", check=still_needs_you)
     deliver = action in ('approve', 'approve_launch') or (action == 'choose' and option['outcome'] == 'approved')
     needs_response = needs_response or bool(deliver and to_author)
     launch = to_author if deliver else None
@@ -187,6 +199,7 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
 def _mechanical(board, p, item, option, question, note):
     """Commit the mechanical result and its answer together; retries return the receipt."""
     session_id = board.human_session(p)
+    body = _chose_body(board, item['id'], option, question, note)   # validated before anything is executed
     key = 'decision.action.' + str(item['id'])
     with db.write_tx(board.conn) as c:
         prior = c.execute('SELECT value FROM board_state WHERE key=?', (key,)).fetchone()
@@ -208,10 +221,8 @@ def _mechanical(board, p, item, option, question, note):
             detail = f"Reposted {target} as #{result['reposted_post_id']} on thread #{result['target_thread_id']}; completion will reconcile the original."
         receipt = board.create_post(p, session_id, thread_id=item['thread_id'], type='status',
             body=f"Server executed the choice on #{item['id']}. {detail}", _in_transaction=True)
-        rank = 'recommended' if option['id'] == question['recommended_option_id'] else 'alternative'
-        body = CHOSE.format(id=_option_id(option['id']), label=_one_line(option['label']), rank=rank, post=item['id'])
         answer = board.create_post(p, session_id, thread_id=item['thread_id'], type='status',
-            body=body + (f'\nNote: {note}' if note else ''), answer_to=[item['id']], _in_transaction=True)
+            body=body, answer_to=[item['id']], _in_transaction=True)
         for row in answer['requests']:
             requests.progress(board, p, session_id, answer['id'], row['recipient'], 'finished',
                 reason='Mechanical action executed by the server; no agent turn required',
