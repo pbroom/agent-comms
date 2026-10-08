@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db, requests
+from . import db, requests, workstreams
 from .config import NAME_RE, RUNTIME_RE, Settings, home
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -503,6 +503,9 @@ class Dispatcher:
         self._reconcile_ended_requests()
         if self.board.is_paused():
             return  # no launches while paused; running children are left alone; triggers wait
+        # Ownership reconciliation has its own per-request deadline. Generic agent
+        # heartbeats must not indefinitely suppress a managed continuation.
+        workstreams.tick(self.board, self.human, fence=self._fence())
         pending = self._scan()
         self._launch_due(pending, now, foreign)
 
@@ -520,13 +523,39 @@ class Dispatcher:
             self._save(**{self.MARK_KEY: mark})
         rows = c.execute("""SELECT id, seq, thread_id, agent, to_agents, sealed, created_at, type, needs_response FROM posts
                             WHERE seq > ? ORDER BY seq LIMIT 1000""", (mark,)).fetchall()
-        if not rows:
-            return pending
         # Rules are read after the posts, so a rule approved meanwhile is seen (and its created_at filter applies).
         rules: dict[int, list[dict]] = {}
         for r in self.board.active_dispatch_rules(self.human):
             rules.setdefault(r["thread_id"], []).append(r)
+        # Recover a crash after pending-trigger removal but before durable launch
+        # reservation. A reserved/attempted run is never reconstructed or repeated.
+        for r in c.execute('''SELECT p.*,q.assigned_agent FROM continuations w
+                JOIN posts p ON p.id=w.post_id
+                JOIN request_progress q ON q.post_id=w.post_id AND q.recipient=w.recipient
+                WHERE w.epoch=1 AND w.dispatch_run_id IS NULL AND q.state='queued' AND p.sealed=0'''):
+            agent = r['assigned_agent']
+            if (not self._attempted(r['id'], agent)
+                    and any(agent in rule['agents'] and r['created_at'] >= rule['created_at_ts']
+                            for rule in rules.get(r['thread_id'], []))):
+                key = f"{agent}:{r['thread_id']}:{r['id']}"
+                pending[key] = {'agent':agent,'thread_id':r['thread_id'],'seq':r['seq'],
+                                'post_created_at':r['created_at'],'post_id':r['id'],'managed':True}
+        if not rows:
+            self._save(**{self.PENDING_KEY:pending})
+            return pending
         for r in rows:
+            managed = workstreams.get_for_post(self.board, r['id'])
+            if managed is not None:
+                assignment = requests.for_post(self.board, r)[0]
+                agent = assignment['assigned_agent']
+                if (managed['epoch'] >= 1 and assignment['state'] == 'queued' and not r['sealed']
+                        and not self._attempted(r['id'], agent)
+                        and any(agent in rule['agents'] and r['created_at'] >= rule['created_at_ts']
+                                for rule in rules.get(r['thread_id'], []))):
+                    key = f"{agent}:{r['thread_id']}:{r['id']}"
+                    pending[key] = {'agent': agent, 'thread_id': r['thread_id'], 'seq': r['seq'],
+                                    'post_created_at': r['created_at'], 'post_id': r['id'], 'managed': True}
+                continue
             actionable = {v["recipient"] for v in requests.for_post(self.board, r)}
             if not actionable:
                 continue  # informational agent updates never launch an agent
@@ -586,7 +615,9 @@ class Dispatcher:
                 drop = "no active approval (revoked, expired or out of launches)"
             elif thread is None or thread["status"] != "open":
                 drop = "thread is closed"
-            elif item.get("post_id") and not self._request_due(item["post_id"], agent):
+            elif item.get('managed') and self._attempted(item['post_id'], agent):
+                drop = "managed delivery already attempted"
+            elif item.get("post_id") and not item.get('managed') and not self._request_due(item["post_id"], agent):
                 drop = "request finished, blocked, started or assigned to an existing session"
             elif not item.get("post_id") and self._handled(agent, thread_id, item["seq"]):
                 drop = "the agent already read past the post"
@@ -595,15 +626,25 @@ class Dispatcher:
                 del pending[key]
                 changed = True
                 continue
+            delivery = workstreams.delivery(self.board, item['post_id'], agent) if item.get('managed') else None
+            if item.get('managed') and delivery is None:
+                continue  # preserve the trigger until fresh safe ownership evidence is available
             # Wait (keep pending) while the agent is busy or live; it may handle the post itself. Runs left by an
             # earlier dispatcher count too, so a restart cannot exceed one-per-agent or max_concurrent.
             if foreign is None:
                 foreign = check_orphans(self.board, self.probe, self._own_ids())
             busy = set(self.running) | {r["agent"] for r in foreign}
             if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
-                    or self._live(agent, now)):
+                    or (not item.get('managed') and self._live(agent, now))):
                 continue
             error = self._preflight(agent, rule)
+            if item.get('post_id'):
+                error = self._browser_blocker(item['post_id'], agent) or error
+            if delivery is not None:
+                configured_cwd = self.config.worktrees.get(rule['project'], rule['project'])
+                if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
+                    error = 'Configured runner directory differs from the verified fallback environment'
+                item['delivery'] = delivery
             if error:
                 self._record({"run_id": self._run_id(item["seq"], agent), "agent": agent,
                               "thread_id": thread_id, "rule_id": rule["id"], "post_seq": item["seq"],
@@ -636,6 +677,8 @@ class Dispatcher:
             try:
                 self._launch(agent, rule, item, now, res["launches_left"])
             except Exception:
+                if item.get('managed') and not self._attempted(item['post_id'], agent):
+                    pending[key] = item  # reservation lost a race; retain the undelivered assignment
                 log.exception("launch of %s for thread %s failed", agent, thread_id)
             rules = self.board.active_dispatch_rules(self.human)
         if changed:
@@ -652,6 +695,8 @@ class Dispatcher:
         post = self.board.conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
         if post is None or post["sealed"]:
             return False
+        if workstreams.get_for_post(self.board, post_id) is not None:
+            return workstreams.delivery(self.board, post_id, agent) is not None
         row = next((r for r in requests.for_post(self.board, post) if r["recipient"] == agent), None)
         return bool(row and row["state"] == "queued" and row["assigned_agent"] == agent
                     and row["assigned_session"] is None)
@@ -663,24 +708,32 @@ class Dispatcher:
             post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
             if post is None:
                 return
-            row = next((r for r in requests.for_post(self.board, post) if r["recipient"] == agent), None)
+            managed = workstreams.get_for_post(self.board, post_id)
+            row = next((r for r in requests.for_post(self.board, post)
+                        if (r['assigned_agent'] if managed is not None else r['recipient']) == agent), None)
             if not row or row["state"] in ("finished", "blocked") or row["assigned_agent"] != agent:
                 return
             # Never overwrite work explicitly routed to another existing environment.
             if row["assigned_session"] is not None:
                 session = c.execute("SELECT dispatch_run_id FROM sessions WHERE id=?", (row["assigned_session"],)).fetchone()
-                if run_id is None or session is None or session["dispatch_run_id"] != run_id:
+                if managed is not None:
+                    if run_id is not None and managed['dispatch_run_id'] != run_id:
+                        return
+                    if run_id is None and managed['dispatch_run_id'] is not None:
+                        return
+                elif run_id is None or session is None or session["dispatch_run_id"] != run_id:
                     return
+            recipient = row['recipient']
             now, version = self.board.now(), row["version"] + 1
             c.execute("""INSERT INTO request_progress
                 (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
                 VALUES (?,?,'blocked',?,NULL,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
                 state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
-                (post_id,agent,agent,reason,version,now))
+                (post_id,recipient,agent,reason,version,now))
             c.execute("""INSERT INTO request_events
                 (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
                 VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
-                (post_id,agent,agent,row["assigned_session"],reason,version,now))
+                (post_id,recipient,agent,row["assigned_session"],reason,version,now))
             seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
             c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
 
@@ -696,6 +749,20 @@ class Dispatcher:
                                                   runtime=self._runtime(agent)).get("PATH")) is None:
             return "required runner executable is unavailable"
         return codex_approval_reminder(template)
+
+    def _browser_blocker(self, post_id: int, agent: str) -> str | None:
+        from . import browser_readiness
+        post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+        if post is None:
+            return 'request is unavailable'
+        for row in requests.for_post(self.board, post):
+            if row['assigned_agent'] == agent:
+                reason = browser_readiness.request_blocker(self.board, post_id, row['recipient'])
+                if reason:
+                    return reason
+                if browser_readiness.requirement(self.board, post_id, row['recipient']):
+                    return 'Browser-bound work needs a verified existing browser session; a generic CLI cannot inherit its probe'
+        return None
 
     def _own_ids(self) -> set[str]:
         return {r.run_id for r in self.running.values()}
@@ -718,13 +785,32 @@ class Dispatcher:
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
                   "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
-        self._record(record)  # registration may happen immediately after the child is spawned
+        if item.get('managed'):
+            delivery = item['delivery']
+            record |= {'continuation_version': delivery['version'], 'continuation_epoch': delivery['epoch']}
+            try:
+                workstreams.reserve_delivery(self.board, self.human, item['post_id'], record, self._fence())
+            except Exception:
+                self.board.refund_dispatch_launch(self.human, rule['id'])
+                raise
+        else:
+            self._record(record)  # registration may happen immediately after the child is spawned
         try:
+            if item.get('post_id'):
+                browser_blocker = self._browser_blocker(item['post_id'], agent)
+                if browser_blocker:
+                    raise Conflict(browser_blocker)
             if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
                 raise FileNotFoundError(f"run directory {cwd!r} does not exist")
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.log_dir, 0o700)
             prompt = build_prompt(thread_id, rule["id"], rule["purpose"], record["request_ids"], run_id)
+            if item.get('managed'):
+                prompt += (' This is an assigned dependent continuation. Read its current request and continuation '
+                           'contract, register fresh successful capability probes in this exact environment, then '
+                           'claim its dependent task before editing. Report progress using the original recipient '
+                           'key from the request and its current version. Finish only with the required descendant '
+                           'ancestry and check evidence. Stop if the assignment or authorization changes.')
             template = self._runner(agent)
             if template is None:
                 raise LookupError(f"no runner configured for {agent}")
@@ -735,7 +821,7 @@ class Dispatcher:
             self.board.refund_dispatch_launch(self.human, rule["id"])
             record |= {"status": "spawn_failed", "ended_at": now, "error": f"{type(e).__name__}: {e}"[:300]}
             self._record(record)
-            self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"])
+            self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"], run_id)
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
         self.running[agent] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path))

@@ -125,6 +125,7 @@ def test_http_session_body_cannot_set_a_client(env):
 
 def test_v2_database_migrates_and_keeps_sessions(env):
     conn = env.board.conn
+    conn.execute('DROP TRIGGER managed_browser_session_identity')
     for column in ("client_kind", "client_session_id"):
         conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
     for table in ("issue_comments", "issue_links", "issues"):
@@ -132,7 +133,7 @@ def test_v2_database_migrates_and_keeps_sessions(env):
     conn.execute("PRAGMA user_version=2")
     before = conn.execute("SELECT id, agent, project FROM sessions ORDER BY id").fetchall()
     migrated = Board(env.settings, clock=env.clock)
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 8
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 9
     cols = {r[1] for r in migrated.conn.execute("PRAGMA table_info(sessions)")}
     assert {"client_kind", "client_session_id"} <= cols
     assert [tuple(r) for r in migrated.conn.execute("SELECT id, agent, project FROM sessions ORDER BY id")] == \

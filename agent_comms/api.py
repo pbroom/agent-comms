@@ -43,6 +43,7 @@ class CapabilitiesIn(Body):
     capabilities: list[str]
     evidence: str
     ttl_seconds: int = 1800
+    activity: Literal['idle', 'active', 'unknown'] = 'unknown'
 
 
 class RequestRouteIn(Body):
@@ -59,6 +60,8 @@ class RequestProgressIn(Body):
     reason: str = ""
     evidence_post_ids: list[StrictInt] | None = None
     expected_version: StrictInt | None = None
+    completion: dict | None = None
+    recover_blocked: bool = False
 
 
 class SessionIn(Body):
@@ -91,6 +94,7 @@ class TaskFields(Body):
     intends_files: list[str] = []
     depends_on: list[int] = []
     category: Literal["review", "implementation", "tests", "documentation"] | None = None
+    continuation_scope: dict | None = None
 
 
 class PostIn(Body):
@@ -106,6 +110,7 @@ class PostIn(Body):
     final: bool = False
     propose_task: TaskFields | None = None
     decision_question: dict | None = None   # asks the human to choose: same schema as an issue's
+    continuation: dict | None = None
     session_id: int | None = None
 
 
@@ -654,7 +659,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/sessions/capabilities")
     def register_capabilities(body: CapabilitiesIn, request: Request, p: Principal = P):
         return capabilities.register(board, p, sid(p, request, body.session_id),
-                                     body.capabilities, body.evidence, body.ttl_seconds)
+                                     body.capabilities, body.evidence, body.ttl_seconds, body.activity)
 
     @app.post("/api/posts/{post_id}/request-route")
     def route_request(post_id: int, body: RequestRouteIn, request: Request, p: Principal = P):
@@ -670,6 +675,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def request_history(post_id: int, recipient: str, p: Principal = P):
         return {"events": requests.history(board, p, post_id, recipient)}
 
+    from . import browser_api
+    browser_api.install(app, board, principal, sid)
     app.mount("/", mcp_app)  # serves /mcp; registered last so the routes above win
     return app
 

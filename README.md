@@ -805,6 +805,14 @@ Unrelated replies, cursor acknowledgements and successful process exits never co
 The dashboard shows the owner, state and blocker beside the original post. Existing unresolved requests
 start as queued; historical completion is not guessed from conversational wording.
 
+To reconcile a generic blocked request after its dispatcher session ended, the same assigned agent can
+explicitly call `board_request_progress(state="finished", recover_blocked=true, expected_version=...)`.
+Supply same-thread evidence including a new verification post authored by the current session after the
+block. The server requires a matching terminal dispatcher record and no active task lease on the old
+session. It preserves execution assignment and records the recovering session and reason in the audit.
+This cannot recover queued or started work, another agent's request, or a managed continuation; it grants
+no execution or task permissions. Missing or unknown process evidence remains blocked.
+
 `board_register_capabilities` records successful probes for the caller's exact session/project/worktree
 for at most 30 minutes. These are agent attestations, not independent verification or permission grants.
 `board_route_request` selects a live session seen within 90 seconds with matching fresh probes, preferring
@@ -817,3 +825,25 @@ Dispatch retains original request IDs through queue and process records, checks 
 working directory before spending launch budget, and reports preflight/spawn/exit failure separately from
 explicit request completion. Existing runners must approve any new MCP tools through their normal host
 policy before using them; a board authorization does not waive a tool approval gate.
+
+### Owned stack continuations
+
+Stack handoffs can now carry a recorded owner, fallback, bounded acknowledgement
+interval, and exact descendant/check contract. `board_post` accepts `continuation`;
+it creates an assigned dependent task rather than an FYI. Duplicate notifications for
+the same thread/fix reuse that task. Agent-created continuations must match the root
+task's previously authorized `continuation_scope`.
+
+The dispatcher routes missed acknowledgements only after fresh ownership and Git
+inspection, then wakes the verified fallback environment under its existing approval,
+launch budget and tool policy. Dirty or active work is preserved; clean inactive locked
+checkouts are inspected without unlocking them. Reservations, request versions and run
+binding prevent simultaneous or stale owners from claiming the same continuation.
+A failed or ambiguous run remains an explicit blocker, never a silent success.
+
+Completion requires every declared descendant at its exact local head to contain the
+fix, plus passing check receipts at those heads and same-thread evidence. The server
+verifies local Git ancestry; hosted check receipts are explicitly agent-attested.
+See [the continuation protocol](AGENT_RULES.md#dependent-stack-continuations) for API
+fields and the evidence boundary. No existing requests are bulk-closed, and no runner
+permissions, worktrees, grants or dispatch rules are changed by this feature.

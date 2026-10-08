@@ -6,9 +6,10 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 8   # v8: optional structured decision_question on posts that need the human
+SCHEMA_VERSION = 9   # v9: fenced dependent continuations and explicit session activity
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
 CREATE TABLE IF NOT EXISTS agents (
     name        TEXT PRIMARY KEY,
     runtime     TEXT NOT NULL,
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title             TEXT NOT NULL,
     acceptance        TEXT NOT NULL DEFAULT '',
     category          TEXT,
+    continuation_scope TEXT,
     authorization_source TEXT NOT NULL DEFAULT 'none',
     authorization_grant_id INTEGER REFERENCES authorization_grants(id),
     status            TEXT NOT NULL DEFAULT 'proposed'
@@ -191,6 +193,24 @@ CREATE TABLE IF NOT EXISTS request_events (
  UNIQUE(post_id,recipient,version)
 );
 
+CREATE TABLE IF NOT EXISTS session_activity (
+ session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+ state TEXT NOT NULL CHECK(state IN ('idle','active','unknown')), recorded_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS continuations (
+ post_id INTEGER PRIMARY KEY REFERENCES posts(id),
+ thread_id INTEGER NOT NULL REFERENCES threads(id),
+ task_id INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
+ root_task_id INTEGER NOT NULL REFERENCES tasks(id),
+ owner_session INTEGER NOT NULL REFERENCES sessions(id),
+ fallback_session INTEGER NOT NULL REFERENCES sessions(id),
+ recipient TEXT NOT NULL, fix_commit TEXT NOT NULL, descendants TEXT NOT NULL,
+ required_checks TEXT NOT NULL, required_capabilities TEXT NOT NULL,
+ ack_seconds INTEGER NOT NULL, deadline REAL NOT NULL, epoch INTEGER NOT NULL DEFAULT 0,
+ blocker TEXT NOT NULL DEFAULT '', completion TEXT, dispatch_run_id TEXT, created_at REAL NOT NULL,
+ UNIQUE(thread_id,fix_commit)
+);
+
 CREATE TABLE IF NOT EXISTS board_state (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
@@ -212,9 +232,10 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
+    from . import browser_readiness
     if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
         raise RuntimeError("database schema is newer than this server")
-    conn.executescript(SCHEMA)
+    conn.executescript(SCHEMA + browser_readiness.SCHEMA)
     with write_tx(conn):
         if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
             raise RuntimeError("database schema is newer than this server")
@@ -223,6 +244,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             "issue_comments": {"decision": "TEXT"},
             # v8: a post that asks the human to choose carries the same structured question as an issue.
             "posts": {"decision_question": "TEXT"},
+            "tasks": {"continuation_scope": "TEXT"},
         }.items():
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, definition in additions.items():
@@ -249,17 +271,77 @@ def init_schema(conn: sqlite3.Connection) -> None:
         for column in ("client_kind", "client_session_id", "dispatch_run_id"):
             if column not in session_columns:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+        _install_managed_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _install_managed_writer_fence(conn: sqlite3.Connection) -> None:
+    """Old live servers may read the new schema, but cannot mutate managed work.
+
+    A permit exists only inside a new writer's uncommitted transaction. SQLite's
+    single-writer lock prevents an old connection from borrowing that permit.
+    This is a compatibility fence, not protection from arbitrary SQL access.
+    """
+    no_permit = "NOT EXISTS (SELECT 1 FROM managed_write_permit WHERE id=1)"
+    for operation in ('UPDATE', 'DELETE'):
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS managed_tasks_{operation.lower()}
+            BEFORE {operation} ON tasks
+            WHEN {no_permit} AND EXISTS (
+                SELECT 1 FROM continuations WHERE task_id=OLD.id OR root_task_id=OLD.id)
+            BEGIN SELECT RAISE(ABORT, 'managed work requires an updated server'); END""")
+    for operation in ('INSERT', 'UPDATE', 'DELETE'):
+        keys = ['NEW.post_id'] if operation == 'INSERT' else ['OLD.post_id']
+        if operation == 'UPDATE':
+            keys.append('NEW.post_id')
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS managed_requests_{operation.lower()}
+            BEFORE {operation} ON request_progress
+            WHEN {no_permit} AND EXISTS (
+                SELECT 1 FROM continuations WHERE post_id IN ({','.join(keys)}))
+            BEGIN SELECT RAISE(ABORT, 'managed work requires an updated server'); END""")
+    for operation in ('INSERT', 'UPDATE', 'DELETE'):
+        versions = ['NEW'] if operation == 'INSERT' else ['OLD']
+        if operation == 'UPDATE':
+            versions.append('NEW')
+        matches = ' OR '.join(f'(post_id={v}.post_id AND recipient={v}.recipient)' for v in versions)
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS managed_browser_requests_{operation.lower()}
+            BEFORE {operation} ON request_progress
+            WHEN {no_permit} AND EXISTS (
+                SELECT 1 FROM browser_requirements WHERE {matches})
+            BEGIN SELECT RAISE(ABORT, 'browser work requires an updated server'); END""")
+    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS managed_browser_session_identity
+        BEFORE UPDATE OF project,worktree,dispatch_run_id,client_session_id ON sessions
+        WHEN {no_permit}
+          AND (NEW.project IS NOT OLD.project OR NEW.worktree IS NOT OLD.worktree
+               OR NEW.dispatch_run_id IS NOT OLD.dispatch_run_id
+               OR NEW.client_session_id IS NOT OLD.client_session_id)
+          AND (EXISTS (SELECT 1 FROM browser_probes WHERE session_id=OLD.id)
+               OR EXISTS (SELECT 1 FROM browser_probe_attempts WHERE session_id=OLD.id)
+               OR EXISTS (SELECT 1 FROM browser_requirements b JOIN request_progress r
+                   ON r.post_id=b.post_id AND r.recipient=b.recipient
+                   WHERE r.assigned_session=OLD.id AND r.state!='finished'))
+        BEGIN SELECT RAISE(ABORT, 'browser work requires an updated server'); END""")
+    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS managed_session_environment
+        BEFORE UPDATE OF project,worktree,dispatch_run_id ON sessions
+        WHEN {no_permit}
+          AND (NEW.project IS NOT OLD.project OR NEW.worktree IS NOT OLD.worktree
+               OR NEW.dispatch_run_id IS NOT OLD.dispatch_run_id)
+          AND EXISTS (SELECT 1 FROM continuations w JOIN request_progress r
+              ON r.post_id=w.post_id AND r.recipient=w.recipient
+              WHERE r.state!='finished' AND
+                  (w.owner_session=OLD.id OR w.fallback_session=OLD.id OR r.assigned_session=OLD.id))
+        BEGIN SELECT RAISE(ABORT, 'managed work requires an updated server'); END""")
 
 
 @contextmanager
 def write_tx(conn: sqlite3.Connection):
-    """BEGIN IMMEDIATE: take the write lock up front so check-then-write is serialized across processes."""
+    """Serialize checks and writes; fence managed mutations by obsolete servers."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("INSERT INTO managed_write_permit(id) VALUES (1)")
         yield conn
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    else:
+        conn.execute("DELETE FROM managed_write_permit WHERE id=1")
         conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise

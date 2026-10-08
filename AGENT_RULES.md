@@ -197,3 +197,42 @@ If no eligible session exists, the request remains blocked. Ask once for the min
 an eligible environment, through a human-facing question. Do not ask for the objective's approval again.
 Only a critical/destructive action outside the existing scope or an actual mandatory gate needs a new
 human decision. Never auto-grant access, impersonate another identity, or bypass a denial.
+
+## Dependent stack continuations
+
+When an approved lower-branch fix must propagate, record its continuation rather than
+sending an informational handoff. Propose the root task with `continuation_scope`
+containing `fix_ref`, exact `descendants` (full `refs/heads/...` names), permitted
+`agents`, `required_checks`, and `required_capabilities`. The existing task acceptance
+or matching grant authorizes that recorded scope; an unrelated old task is not authority.
+
+Use `board_post(type="handoff", thread_id=..., continuation={root_task_id,
+owner_session, fallback_session, fix_commit, descendants, required_checks,
+required_capabilities, ack_seconds})`. This creates one dependent task and one assigned
+request atomically. The same thread/fix cannot produce a second task. Read its returned
+request version and claim only from its assigned session after successful capability
+probes. Keep completion and the lower fix separate: the dependent task remains open
+until every declared descendant contains the fix and required checks pass at that head.
+
+Report `activity="idle"` through `board_register_capabilities` only after stopping edits
+and checking unsaved work. It is a short-lived self-attestation, not inferred from a read
+cursor or heartbeat. Takeover checks inspect the owner and every descendant checkout,
+including tracked/untracked changes, unfinished Git operations, leases and running
+workers. A clean, inspected, inactive checked-out or locked branch does not itself block
+routing. Unknown or unfinished work produces a specific blocker; never delete, unlock,
+reset, or force-push another worktree to clear it.
+
+A missed acknowledgement can route to the recorded capable fallback. An existing
+human-approved dispatcher rule can wake that exact verified environment; it does not
+expand tool permissions or project scope. Delivery reserves the request before launch
+and binds it to the new run/session, fencing the old session. The worker must perform
+its own capability probes before claiming. One fallback delivery is allowed, with
+explicit failure reporting and no blind duplicate launch after an ambiguous crash.
+
+Finish through `board_request_progress` with the current `expected_version`, same-thread
+`evidence_post_ids`, and `completion={descendants:[{ref,head,contains_fix:true,
+checks:{check_name:{head,status:"passed"}}}]}`. The server verifies local heads and fix
+ancestry; check receipts remain attributed agent attestations. Cite actual check evidence,
+and never describe these receipts as independently verified hosted CI. Finishing the
+request closes its dependent task in the same transaction; generic task completion cannot
+skip this gate.

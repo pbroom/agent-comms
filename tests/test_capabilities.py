@@ -8,7 +8,7 @@ from conftest import PROJECT
 
 def probe(env, name="codex", **kw):
     return capabilities.register(env.board, env.p[name], env.sid[name],
-                                 kw.pop("capabilities", ["browser:desktop"]),
+                                 kw.pop("capabilities", ["files:read"]),
                                  kw.pop("evidence", "Opened the project page successfully"), **kw)
 
 
@@ -17,7 +17,7 @@ def test_attestation_stamps_own_environment_and_no_grants(env):
     assert result["agent"] == "codex"
     assert result["project"] == PROJECT
     assert result["authority"] == "self_reported_probe_not_authorization"
-    assert capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["browser:desktop"])
+    assert capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["files:read"])
     assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["git:write"])
     assert env.board.conn.execute("SELECT COUNT(*) FROM authorization_grants").fetchone()[0] == 0
     with pytest.raises(Forbidden):
@@ -26,7 +26,7 @@ def test_attestation_stamps_own_environment_and_no_grants(env):
 
 @pytest.mark.parametrize("changes", [{"ttl_seconds": 1801}, {"ttl_seconds": float("nan")},
     {"ttl_seconds": True}, {"ttl_seconds": 0}, {"evidence": " "},
-    {"capabilities": []}, {"capabilities": [" browser:desktop"]}])
+    {"capabilities": []}, {"capabilities": [" files:read"]}])
 def test_invalid_probes(env, changes):
     with pytest.raises(Invalid):
         probe(env, **changes)
@@ -35,19 +35,19 @@ def test_invalid_probes(env, changes):
 def test_staleness_expiry_inactive_and_environment_binding(env):
     probe(env)
     env.clock.advance(91)
-    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["browser:desktop"])
+    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["files:read"])
     env.board.heartbeat(env.p["codex"], env.sid["codex"])
-    assert capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["browser:desktop"])
+    assert capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["files:read"])
     env.clock.advance(1710)
     env.board.heartbeat(env.p["codex"], env.sid["codex"])
-    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["browser:desktop"])
+    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["files:read"])
     probe(env)
     env.board.register_session(env.p["codex"], PROJECT, "/different-worktree", resume_session_id=env.sid["codex"])
-    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["browser:desktop"])
+    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["files:read"])
     probe(env)
-    assert not capabilities.eligible(env.board, env.sid["codex"], "/other-project", ["browser:desktop"])
+    assert not capabilities.eligible(env.board, env.sid["codex"], "/other-project", ["files:read"])
     env.board.conn.execute("UPDATE agents SET active=0 WHERE name='codex'")
-    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["browser:desktop"])
+    assert not capabilities.eligible(env.board, env.sid["codex"], PROJECT, ["files:read"])
 
 
 def test_pause_prevents_probe_writes(env):
@@ -62,7 +62,7 @@ def request(env, to=None):
 
 def route(env, post, version=0, as_="codex"):
     return capabilities.route(env.board, env.p[as_], env.sid[as_], post["id"], "codex",
-                              ["browser:desktop"], version)
+                              ["files:read"], version)
 
 
 def test_routing_uses_only_original_identities_and_fresh_environment(env):
@@ -163,7 +163,7 @@ def test_capability_does_not_override_task_authorization(env):
     probe(env, "claude")
     with pytest.raises(Forbidden, match="authoriz"):
         capabilities.route(env.board, env.p["codex"], env.sid["codex"], post["id"], "claude",
-                           ["browser:desktop"], 0)
+                           ["files:read"], 0)
 
 
 def test_route_skips_capable_but_unauthorized_preferred_recipient(env):

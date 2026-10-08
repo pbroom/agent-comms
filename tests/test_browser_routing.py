@@ -1,7 +1,7 @@
 """Browser proof must be enforced by actual routing, lifecycle and dispatcher."""
 import pytest
 
-from agent_comms import browser_readiness as br, capabilities, requests
+from agent_comms import browser_readiness as br, capabilities, db, requests
 from agent_comms.core import Conflict
 from conftest import PROJECT
 from test_dispatch import denv, allow, human_post  # noqa: F401 - shared fake dispatcher fixture
@@ -86,8 +86,9 @@ def test_start_rechecks_proof_after_assignment(env, change):
         env.clock.advance(br.PROBE_TTL + 1)
         env.board.heartbeat(env.p['codex'], env.sid['codex'])
     else:
-        env.board.conn.execute('UPDATE sessions SET client_session_id=? WHERE id=?',
-                               ('replacement-conversation', env.sid['codex']))
+        with db.write_tx(env.board.conn):
+            env.board.conn.execute('UPDATE sessions SET client_session_id=? WHERE id=?',
+                                   ('replacement-conversation', env.sid['codex']))
     with pytest.raises(Conflict, match='browser'):
         start(env, post)
 
