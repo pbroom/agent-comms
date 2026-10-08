@@ -47,7 +47,7 @@ def test_scoped_override_preserves_unrelated_runner_and_denies():
     scoped = rp.scoped_template(original)
     assert original[-2] == '--allowedTools=Bash'
     assert '--allowedTools=Bash' not in scoped
-    assert '--disallowedTools=Bash(git push *)' in scoped
+    assert any(x.startswith('--disallowedTools=') and 'Bash(git push *)' in x for x in scoped)
     assert 'dontAsk' in scoped
     assert not any(x.startswith('--setting-sources') for x in scoped)
     assert 'Bash' not in rp.ALLOWED
@@ -124,3 +124,36 @@ def test_preflight_timeout_is_bounded(denv):
     e.d.tick()
     assert len(e.spawner.calls) == 1
     assert e.board.get_post(e.p['human'], post['id'])['requests'][0]['state'] == 'blocked'
+
+
+def test_registered_session_cannot_start_before_verified_receipts(denv):
+    e = denv
+    post, run, rec = configure(e)
+    sid = e.board.register_session(e.p['claude'], PROJECT, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    with pytest.raises(Conflict, match='preflight has not passed'):
+        requests.progress(e.board, e.p['claude'], sid, post['id'], 'claude', 'started')
+
+
+@pytest.mark.parametrize('mismatch', ['conversation', 'directory'])
+def test_wrong_execution_context_cannot_use_verified_receipts(denv, mismatch):
+    e = denv
+    post, run, rec = configure(e)
+    complete_probe(e, run, rec)
+    client = rec['tool_preflight']['session_id'] if mismatch != 'conversation' else 'f7030b88-321d-470e-90f3-33d280a71735'
+    directory = e.workdir if mismatch != 'directory' else str(Path(e.workdir)/'other')
+    sid = e.board.register_session(e.p['claude'], PROJECT, directory,
+        client=('claude-code', client), dispatch_run_id=run.run_id)['session_id']
+    with pytest.raises(Conflict, match='preflight has not passed'):
+        requests.progress(e.board, e.p['claude'], sid, post['id'], 'claude', 'started')
+
+
+def test_revocation_between_verified_probe_and_pickup_is_enforced(denv):
+    e = denv
+    post, run, rec = configure(e)
+    complete_probe(e, run, rec)
+    sid = e.board.register_session(e.p['claude'], PROJECT, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    e.board.revoke_dispatch_rule(e.p['human'], run.rule_id)
+    with pytest.raises(Conflict, match='authorization ended'):
+        requests.progress(e.board, e.p['claude'], sid, post['id'], 'claude', 'started')

@@ -952,6 +952,8 @@ class Dispatcher:
                 or rule["state"] not in ("active", "exhausted") or run.agent not in rule["agents"]
                 or self.board._thread_row(run.thread_id)["status"] != "open"):
             raise Conflict("launch authorization changed during tool preflight")
+        if rec.get("request_ids") and not rec.get("request_versions"):
+            raise Conflict("request ownership was missing before tool preflight")
         for pid in rec.get("request_ids", []):
             post = self.board.conn.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
             current = {r["recipient"]: r for r in requests.for_post(self.board, post)} if post else {}
@@ -1009,8 +1011,8 @@ class Dispatcher:
                     else:
                         self._finish(run, "timeout" if run.timed_out else "exited", code)
                 elif run.terminated_at is None and now - run.started_at >= run_timeout:
-                    log.warning("%s run %s exceeded %s min; terminating", run.agent, run.run_id,
-                                self.config.timeout_minutes)
+                    log.warning("%s run %s exceeded %s seconds; terminating", run.agent, run.run_id,
+                                run_timeout)
                     run.timed_out, run.terminated_at = True, now
                     run.child.terminate()
                 elif (run.terminated_at is not None and not run.killed

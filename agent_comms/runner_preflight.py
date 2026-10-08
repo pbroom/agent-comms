@@ -13,9 +13,12 @@ ALLOWED = (
     "mcp__agent-comms", "Edit(./**)", "Write(./**)",
     "Bash(git status *)", "Bash(git diff *)", "Bash(git log *)", "Bash(git show *)",
     "Bash(git rev-parse *)", "Bash(git add *)", "Bash(git commit *)",
+    "Bash(git fetch origin)", "Bash(git fetch origin main)",
+    "Bash(git worktree add -b codex/*)", "Bash(git switch -c codex/*)",
     "Bash(uv run pytest *)", "Bash(pytest *)", "Bash(gh --version)",
     "Bash(gh pr view *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)", "Bash(gh run view *)",
 )
+DENIED = ("Bash(git *--force*)", "Bash(git *--discard-changes*)", "Bash(git * -f*)")
 PROMPT = (
     "Tool preflight only. Run exactly these three separate Bash commands, without combining or changing them: "
     + "; ".join(COMMANDS) + ". Do not read or edit files, call board tools, or start work. "
@@ -28,12 +31,22 @@ def scoped_template(template: list[str]) -> list[str]:
     replaced = {"--allowedTools", "--allowed-tools", "--permission-mode"}
     forbidden = {"--session-id", "--resume", "-r", "--continue", "-c", "--fork-session",
                  "--output-format", "--max-turns", "--settings", "--permission-prompt-tool", "--setting-sources", "--add-dir", "--no-session-persistence"}
-    out, i = [], 0
+    out, i, denied = [], 0, list(DENIED)
     while i < len(template):
         arg = template[i]
         flag = arg.split("=", 1)[0]
         if flag in forbidden or any(x in arg for x in ("bypass", "dangerously")):
             raise ValueError("scoped Claude runner has incompatible session, settings or bypass flags")
+        if flag in {"--disallowedTools", "--disallowed-tools"}:
+            if "=" in arg:
+                denied.append(arg.split("=", 1)[1])
+                i += 1
+            else:
+                i += 1
+                while i < len(template) and not template[i].startswith("-") and template[i] != "{prompt}":
+                    denied.append(template[i])
+                    i += 1
+            continue
         if flag in replaced:
             i += 1
             if "=" not in arg:
@@ -45,7 +58,8 @@ def scoped_template(template: list[str]) -> list[str]:
             continue
         out.append(arg)
         i += 1
-    return out + ["--permission-mode", "dontAsk", "--allowedTools=" + ",".join(ALLOWED)]
+    return out + ["--permission-mode", "dontAsk", "--allowedTools=" + ",".join(ALLOWED),
+                  "--disallowedTools=" + ",".join(denied)]
 
 
 def verify(path: Path, session_id: str) -> dict:
@@ -101,6 +115,11 @@ def assert_ready(board, session_id: int, post_id: int) -> None:
                              ("dispatch.run." + session["dispatch_run_id"],)).fetchone()
     record = json.loads(row[0]) if row else {}
     proof = record.get("tool_preflight")
+    if proof is not None:
+        rules = board._dispatch_rows(record.get("rule_id"))
+        if (record.get("status") not in ("starting", "running") or not rules
+                or board._dispatch_state(rules[0], board._dispatch_target(rules[0])) not in ("active", "exhausted")):
+            raise Conflict("runner launch authorization ended before request pickup")
     if proof is not None and (proof.get("state") != "verified" or record.get("phase") != "work"
                               or post_id not in record.get("request_ids", [])
                               or session["client_kind"] != "claude-code"

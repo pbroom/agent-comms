@@ -14,10 +14,11 @@ launch-scoped permission profile, **not an operating-system sandbox**.
 
 For an opted-in project the runner uses `dontAsk` and a fixed list in
 `runner_preflight.ALLOWED` in place of broad runner-argv permissions. It permits
-repository edits, Git status/diff/log/show/rev-parse/add/commit, pytest through uv or
+repository edits, Git status/diff/log/show/rev-parse/add/commit, fetch from origin,
+new `codex/*` branches and worktrees, pytest through uv or
 directly, and GitHub CLI version/read-only PR/check/run inspection. It does not
 pre-approve arbitrary Bash, git reset/clean/push, GitHub merge/API/delete, or new
-machine privileges. The native Claude permission engine checks compound commands;
+machine privileges. Force/discard flags are explicitly denied. The native Claude permission engine checks compound commands;
 these patterns are not our own shell parser. Tests and Git hooks execute repository
 code, so only opt in repositories whose implementation work the human approved.
 Inherited user, project, local, and managed ask/deny policies stay in force. The
