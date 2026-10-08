@@ -190,3 +190,23 @@ for (const complete of [false, true]) {
     } finally { page.dom.window.close(); }
   });
 }
+
+
+test('an explicit supersession stays distinct from completion and preserves another recipient', async () => {
+  const old = request('codex', 'finished'); old.disposition = 'superseded';
+  old.reason = 'The optional candidate was replaced by the owner repair'; old.evidence_post_ids = [11];
+  const target = thread(1, [post(10, [old, request('claude')], { agent: 'human' }),
+    post(11, [], { type: 'status', agent: 'codex', to: [], needs_response: false,
+      request_reply: { post_id: 10, recipient: 'codex', state: 'finished', disposition: 'superseded' } })]);
+  const page = await setup({ threads: [target] });
+  try {
+    assert.match(assertKind(page.document, 'unread'), /claude/);
+    const row = page.document.querySelector('#post-10 [data-request-recipient="codex"]');
+    assert.match(row.textContent, /codex: superseded/);
+    assert.equal(row.querySelector('.chip.ok'), null, 'supersession is not a success claim');
+    const link = page.document.querySelector('#post-11 .request-reply a');
+    assert.equal(link.getAttribute('href'), '#post-10');
+    assert.equal(link.textContent, 'Reply to #10');
+    assert.match(page.document.querySelector('#post-11 .request-reply').textContent, /codex.*superseded/);
+  } finally { page.dom.window.close(); }
+});

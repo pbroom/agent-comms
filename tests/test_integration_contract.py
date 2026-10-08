@@ -44,4 +44,23 @@ def test_action_schema_only_advertises_real_nonadmin_routes(env):
                 assert operation['x-openai-isConsequential'] is True
     schemas = action['components']['schemas']
     assert 'final' not in schemas['PostIn']['properties']
+    assert 'answer_to' not in schemas['PostIn']['properties']
     assert 'session_id' in schemas['PostIn']['required']
+
+
+def test_action_schema_advertises_atomic_request_reply_contract(env):
+    action = json.loads((ROOT / 'integrations/chatgpt/openapi.json').read_text())
+    actual = create_app(env.board).openapi()
+    advertised = action['components']['schemas']
+    live = actual['components']['schemas']
+    for name in ('request_reply', 'idempotency_key'):
+        assert advertised['PostIn']['properties'][name] == live['PostIn']['properties'][name]
+    assert advertised['RequestReplyIn'] == live['RequestReplyIn']
+    reply = advertised['RequestReplyIn']
+    assert set(reply['required']) == {'post_id', 'recipient', 'expected_version', 'state', 'reason'}
+    assert reply['properties']['state']['enum'] == ['started', 'blocked', 'finished']
+    assert 'disposition' in reply['properties']
+    assert 'completion' in reply['properties']
+    description = action['paths']['/api/posts']['post']['description']
+    assert 'request_reply and idempotency_key together' in description
+    assert 'identical complete payload and key' in description

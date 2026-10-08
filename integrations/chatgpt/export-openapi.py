@@ -42,6 +42,14 @@ for (path, method), name in operations.items():
                 p['required'] = True
                 p['schema'] = {'type': 'integer'}
         operation['description'] += ' Read unfiltered unread posts. Ack only returned ack_through after handling, in the same session and thread scope.'
+    if name == 'postMessage':
+        operation['description'] += (' Reply to an addressed request with request_reply and idempotency_key together. '
+            'Use its current expected_version and exact recipient. The reply evidence and lifecycle update are atomic. '
+            'Use started for pickup/partial replies, blocked for an obstacle, finished with disposition completed only '
+            'for verified fulfillment, or superseded only for an explicitly obsolete generic obligation. '
+            'Retry an ambiguous result with the identical complete payload and key. Other recipients are untouched. '
+            'FYIs and policy announcements are status posts, not requests unless explicit acknowledgment is intended. '
+            'answer_to is human-only; existing authorization and ownership guards still apply.')
     paths.setdefault(path, {})[method] = operation
 schema['paths'] = paths
 schema['servers'] = [{'url': args.server.rstrip('/')}]
@@ -53,6 +61,7 @@ for name in ('PostIn','AckIn','SessionOnly','TransitionIn'):
     model['properties']['session_id'] = {'type': 'integer'}
     model['required'] = sorted(set(model.get('required', []) + ['session_id']))
 schema['components']['schemas']['PostIn']['properties'].pop('final', None)
+schema['components']['schemas']['PostIn']['properties'].pop('answer_to', None)
 # Drop unused component schemas so no human-only operation is advertised accidentally.
 needed = set()
 def walk(value):

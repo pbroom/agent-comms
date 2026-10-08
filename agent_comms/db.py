@@ -9,7 +9,7 @@ from pathlib import Path
 # Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
 # question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
 ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question IS i.decision_question)"
-SCHEMA_VERSION = 10  # v10: exact human-answer links and conservative legacy attention boundary
+SCHEMA_VERSION = 11  # v11: atomic request replies and explicit terminal dispositions
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
@@ -217,6 +217,15 @@ CREATE TABLE IF NOT EXISTS request_events (
  UNIQUE(post_id,recipient,version)
 );
 
+CREATE TABLE IF NOT EXISTS supersession_close_permit (
+ kind TEXT NOT NULL CHECK(kind IN ('thread','issue')), entity_id INTEGER NOT NULL,
+ PRIMARY KEY(kind,entity_id)
+);
+CREATE TABLE IF NOT EXISTS request_reply_operations (
+ actor TEXT NOT NULL REFERENCES agents(name), session_id INTEGER NOT NULL REFERENCES sessions(id),
+ idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL, reply_post_id INTEGER NOT NULL REFERENCES posts(id),
+ result TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(actor,session_id,idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS session_activity (
  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
  state TEXT NOT NULL CHECK(state IN ('idle','active','unknown')), recorded_at REAL NOT NULL
@@ -280,6 +289,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         for table, additions in {
             "issues": {"decision_question": "TEXT", "question_version": "INTEGER NOT NULL DEFAULT 0"},
             "issue_comments": {"decision": "TEXT"},
+            "request_progress": {"disposition": "TEXT"},
+            "request_events": {"disposition": "TEXT"},
             # v8: a post that asks the human to choose carries the same structured question as an issue.
             "posts": {"decision_question": "TEXT"},
             "tasks": {"continuation_scope": "TEXT"},
@@ -338,6 +349,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         # verified historical work through requests.progress with exact evidence instead.
         browser_readiness.canonicalize_stored(conn)
         _install_managed_writer_fence(conn)
+        _install_supersession_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -411,3 +423,39 @@ def write_tx(conn: sqlite3.Connection):
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         raise
+
+
+def _install_supersession_writer_fence(conn: sqlite3.Connection) -> None:
+    """Fence legacy completion inference without disrupting unrelated writers.
+
+    A different marker from managed_write_permit is essential: live v10 writers
+    already set the latter. SQLite serializes writers; the scoped marker exists
+    only during an explicitly authorized action and is removed before commit.
+    """
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS supersession_thread_close
+        BEFORE UPDATE OF status ON threads
+        WHEN NEW.status='closed' AND OLD.status!='closed'
+          AND NOT EXISTS (SELECT 1 FROM supersession_close_permit WHERE kind='thread' AND entity_id=OLD.id)
+          AND EXISTS (SELECT 1 FROM posts p JOIN request_progress r ON r.post_id=p.id
+                      WHERE p.thread_id=OLD.id AND r.disposition='superseded')
+        BEGIN SELECT RAISE(ABORT, 'superseded work is not completion; refresh this client and use the explicit thread close action'); END""")
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS supersession_issue_resolve
+        BEFORE UPDATE OF status ON issues
+        WHEN NEW.status='resolved' AND OLD.status!='resolved'
+          AND NOT EXISTS (SELECT 1 FROM supersession_close_permit WHERE kind='issue' AND entity_id=OLD.id)
+          AND EXISTS (SELECT 1 FROM issue_links l JOIN posts p ON p.thread_id=l.thread_id
+                      JOIN request_progress r ON r.post_id=p.id
+                      WHERE l.issue_id=OLD.id AND r.disposition='superseded')
+        BEGIN SELECT RAISE(ABORT, 'superseded work is not completion; refresh this client and use an explicit human resolution'); END""")
+
+
+@contextmanager
+def explicit_supersession_close(conn: sqlite3.Connection, kind: str, entity_id: int):
+    """Internal authorized explicit-action scope, never used by automatic completion."""
+    if not conn.in_transaction or kind not in ('thread','issue'):
+        raise ValueError('explicit close permit requires an active transaction and exact entity')
+    conn.execute('INSERT INTO supersession_close_permit(kind,entity_id) VALUES (?,?)', (kind,entity_id))
+    try:
+        yield
+    finally:
+        conn.execute('DELETE FROM supersession_close_permit WHERE kind=? AND entity_id=?', (kind,entity_id))

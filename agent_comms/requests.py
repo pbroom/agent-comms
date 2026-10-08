@@ -32,7 +32,7 @@ def for_post(board, post):
             continue
         row = rows.get(recipient, dict(post_id=post['id'], recipient=recipient, state='queued',
             assigned_agent=recipient, assigned_session=None, reason='', evidence_post_ids='[]',
-            version=0, updated_at=post['created_at']))
+            version=0, updated_at=post['created_at'], disposition=None))
         row['evidence_post_ids'] = json.loads(row['evidence_post_ids'])
         row['updated_at'] = iso(row['updated_at'])
         result.append(row)
@@ -54,19 +54,19 @@ def _context(board, p, session_id, post_id, recipient):
     return post, row
 
 
-def _save(board, p, session_id, row, state, reason, evidence, assigned_agent, assigned_session):
+def _save(board, p, session_id, row, state, reason, evidence, assigned_agent, assigned_session, disposition=None):
     now = board.now()
     version = row['version'] + 1
     board.conn.execute('''INSERT INTO request_progress
-        (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
+        (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at,disposition)
+        VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
         state=excluded.state,assigned_agent=excluded.assigned_agent,assigned_session=excluded.assigned_session,
-        reason=excluded.reason,evidence_post_ids=excluded.evidence_post_ids,version=excluded.version,updated_at=excluded.updated_at''',
-        (row['post_id'],row['recipient'],state,assigned_agent,assigned_session,reason,json.dumps(evidence),version,now))
+        reason=excluded.reason,evidence_post_ids=excluded.evidence_post_ids,version=excluded.version,updated_at=excluded.updated_at,disposition=excluded.disposition''',
+        (row['post_id'],row['recipient'],state,assigned_agent,assigned_session,reason,json.dumps(evidence),version,now,disposition))
     board.conn.execute('''INSERT INTO request_events
-        (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-        (row['post_id'],row['recipient'],p.name,session_id,state,assigned_agent,assigned_session,reason,json.dumps(evidence),version,now))
+        (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,disposition)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (row['post_id'],row['recipient'],p.name,session_id,state,assigned_agent,assigned_session,reason,json.dumps(evidence),version,now,disposition))
     seq = board.conn.execute('SELECT COALESCE(MAX(seq),0)+1 FROM posts').fetchone()[0]
     board.conn.execute('UPDATE posts SET seq=?,revised_at=? WHERE id=?',(seq,now,row['post_id']))
 
@@ -113,8 +113,10 @@ def _recover_blocked(board, p, session_id, post, row, state, evidence, expected_
 
 
 def progress(board, p, session_id, post_id, recipient, state, reason='', evidence_post_ids=None, expected_version=None,
-             completion=None, recover_blocked=False, _in_transaction=False):
+             completion=None, recover_blocked=False, _in_transaction=False, terminal_disposition=None):
     from . import workstreams
+    if terminal_disposition not in (None, 'completed', 'superseded') or (terminal_disposition is not None and state != 'finished'):
+        raise Invalid('terminal disposition requires finished and completed or superseded')
     if expected_version is not None and (type(expected_version) is not int or expected_version < 0):
         raise Invalid('expected_version must be a nonnegative integer')
     if type(recover_blocked) is not bool:
@@ -133,6 +135,9 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         raise Invalid('internal request mutation requires an active transaction')
     with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)):
         post,row = _context(board,p,session_id,post_id,recipient)
+        if terminal_disposition == 'superseded':
+            from . import request_replies
+            request_replies.guard_superseded(board, post_id)
         # The assigned agent finishing work it never started (queued or blocked -> finished) executed it all the
         # same, so it passes the same browser and tool-preflight gates as a start; otherwise self-posted evidence
         # could skip them. A finish after a start was gated at the start (its probe may have expired since).
@@ -171,7 +176,7 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             item = board.get_post(p,pid)
             if pid == post_id or item['thread_id'] != post['thread_id'] or item['sealed']:
                 raise Invalid('evidence must be another unsealed post in the same thread')
-        if row['state']==state and row['reason']==reason and row['evidence_post_ids']==evidence:
+        if row['state']==state and row['reason']==reason and row['evidence_post_ids']==evidence and row.get('disposition') == terminal_disposition:
             if managed is not None:
                 if p.name != row['assigned_agent'] or session_id != row['assigned_session']:
                     raise Forbidden('only the assigned continuation session may report progress')
@@ -190,12 +195,12 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         owner = row['assigned_session']
         if p.name == row['assigned_agent'] and not recover_blocked:
             owner = session_id
-        _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner)
+        _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner,terminal_disposition)
         workstreams.after_save(board,p,session_id,row,state)
         if state == 'started' and not p.is_human:
             from . import recovery
             recovery.after_pickup(board, p, session_id, post, row)
-        if state == 'finished':
+        if state == 'finished' and terminal_disposition != 'superseded':
             from . import decision_actions
             decision_actions.reconcile_successor(board,p,session_id,post,recipient)
             from . import issues

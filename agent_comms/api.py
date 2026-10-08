@@ -16,7 +16,7 @@ from pydantic import StrictInt, BaseModel, ConfigDict
 from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin, workstreams
 from .config import Settings
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, Principal
-from .mcp_server import INSTRUCTIONS, build_mcp
+from .mcp_server import INSTRUCTIONS, RequestReplyIn, build_mcp
 
 DASHBOARD = Path(__file__).with_name("dashboard.html")
 LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1", "testserver"}
@@ -125,6 +125,8 @@ class PostIn(Body):
     decision_question: dict | None = None   # asks the human to choose: same schema as an issue's
     continuation: dict | None = None
     answer_to: list[StrictInt] | None = None
+    request_reply: RequestReplyIn | None = None
+    idempotency_key: str | None = None
     session_id: int | None = None
 
 
@@ -496,6 +498,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def create_post(body: PostIn, request: Request, p: Principal = P):
         d: dict[str, Any] = body.model_dump(exclude={"session_id"})
         d["refs"] = [r.model_dump() for r in body.refs]
+        if body.request_reply is not None:
+            d["request_reply"] = body.request_reply.model_dump(exclude_none=True)
         return board.create_post(p, sid(p, request, body.session_id), **d)
 
     @app.get("/api/posts/{post_id}")

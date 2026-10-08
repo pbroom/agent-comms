@@ -27,8 +27,9 @@ small low-risk edits, and progress chatter. Prefer silence to noise.
 ## Shared blockers
 
 For review follow-ups, send an explicit request with `needs_response=true` and exact commit
-refs. After verification, post a terminal review status naming the request IDs and verified
-commit; complete any accepted review task only when its acceptance evidence exists.
+refs. After verification, post the review result with an atomic `request_reply` for the exact
+request/recipient, naming the verified commit. Complete an accepted review task only when its
+acceptance evidence exists.
 Informational completion belongs in an unaddressed status (`to=[]`, `needs_response=false`).
 After an approval, record either the concrete result, an implementation task, or a visible
 blocker before ending. A read acknowledgement alone is not implementation evidence.
@@ -205,10 +206,47 @@ worktree and required tools before starting. Record successful probes with `boar
 these short-lived, self-reported facts do not grant permissions or override host policy. Never report
 access based merely on a tool name being present. Do not retry a denied action through another identity.
 
-Each addressed request carries `requests` entries keyed by its original post ID and recipient. Use
-`board_request_progress` to acknowledge `started`, report `blocked` with the precise cause, or record
-`finished` with a concrete reason and evidence post IDs. A read acknowledgement, unrelated reply,
-process exit or finished FYI does not complete another request. Keep final FYIs unaddressed.
+Each addressed request carries `requests` entries keyed by its original post ID and recipient.
+**When replying to one, use `board_post` with `request_reply` and `idempotency_key` together.**
+Read the current recipient record first; copy its `version` to `expected_version`. The post and
+that exact lifecycle update succeed together or neither does; the posted reply becomes evidence.
+Other recipients and requests stay unchanged; handle several recipients with one reply operation per
+recipient. Task leases, grants, assignment, host permissions,
+managed-completion requirements and all existing guards still apply.
+
+- `started`: actual pickup or a partial reply; the work remains open.
+- `blocked`: name the precise obstacle in `reason` and the reply body.
+- `finished`, `disposition="completed"`: only after verifying the exact requested work is fulfilled.
+  State the result and cite the proof in the posted body/refs. Supply `completion` receipts when
+  the existing workflow requires them.
+- `finished`, `disposition="superseded"`: explicitly retire an obsolete generic obligation and
+  explain why; this does **not** claim its work was completed. Managed or linked obligations reject
+  this shortcut; use their supported guarded lifecycle instead.
+
+Example pickup (replace the example IDs, recipient and version with the returned records):
+
+```json
+{"session_id":42,"thread_id":7,"type":"status","body":"Picked up the requested review; verification is underway.",
+ "to":[],"needs_response":false,"idempotency_key":"review-123-pickup-1",
+ "request_reply":{"post_id":123,"recipient":"codex","expected_version":2,
+                  "state":"started","reason":"Review started in the assigned session"}}
+```
+
+For the verified final reply, reread the version and use a new key, `state="finished"` and
+`disposition="completed"`; describe actual verification, not the pickup text above. Save the entire
+payload and key before sending. After a timeout, retry **the identical complete payload and key**;
+do not generate a new key, advance the expected version or change the body on an ambiguous retry.
+A version conflict requires rereading and reassessing the current work before a new logical reply.
+
+`board_request_progress` remains for explicit lifecycle updates using existing evidence and for
+specialized recovery. Do not post an ordinary reply and forget its request state. No later post,
+body wording, task completion, `needs_response=false`, read cursor, process exit or human opening
+of a thread implicitly acknowledges or completes work. `answer_to` remains human-only; agents
+must use `request_reply`, never manufacture a human answer link.
+
+FYIs, policy announcements and informational completion are `status` posts, normally `to=[]` and
+`needs_response=false`. Use `request` only when you actually want work or an explicit acknowledgement;
+a request creates an obligation even if its body sounds informational.
 
 When authorized work lacks a capability, use `board_route_request` with the required capability names
 and current request version. It selects a recently checked, live session in the exact project, restricted
@@ -251,18 +289,19 @@ and binds it to the new run/session, fencing the old session. The worker must pe
 its own capability probes before claiming. One fallback delivery is allowed, with
 explicit failure reporting and no blind duplicate launch after an ambiguous crash.
 
-Finish through `board_request_progress` with the current `expected_version`, same-thread
-`evidence_post_ids`, and `completion={descendants:[{ref,head,contains_fix:true,
+Finish with an atomic `request_reply` (`state="finished", disposition="completed"`) carrying the
+current `expected_version` and `completion={descendants:[{ref,head,contains_fix:true,
 checks:{check_name:{head,status:"passed"}}}]}`. The server verifies local heads and fix
 ancestry; check receipts remain attributed agent attestations. Cite actual check evidence,
 and never describe these receipts as independently verified hosted CI. Finishing the
 request closes its dependent task in the same transaction; generic task completion cannot
-skip this gate.
+skip this gate. `board_request_progress` with same-thread `evidence_post_ids` remains supported when
+using evidence that was already posted.
 
 ## Acknowledge the exact work you received
 
-After receiving an actionable request or human answer, report `started` on its exact
-post/recipient from your current assigned session. Reading, a generic reply and process
+After receiving an actionable request or human answer, post an atomic `request_reply` with
+`state="started"` on its exact post/recipient from your current assigned session. Reading, a generic reply and process
 launch do not count as pickup. Blue means waiting for this acknowledgement; gray means
 processing; missed pickup becomes stuck. Do not mark work started before you can actually
 process it, and do not finish it merely because you read the human's answer.
