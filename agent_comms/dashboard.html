@@ -5,148 +5,307 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-comms</title>
 <style>
+/* Design tokens, shadcn/ui-style (the compact "Mira" look: tight controls, small radius, subtle borders), with
+   values taken from the board's original palette. The older names (--bg, --panel, --ink, --line, --chip, --warn,
+   --ok, --bad) are kept as aliases. Note: --muted is now a background and --accent a hover background, as in
+   shadcn; muted text is --muted-foreground and the blue link/brand colour is --primary. */
 :root {
-  --bg: #f6f6f4; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
-  --accent: #2f5bd3; --warn: #b4540a; --warn-bg: #fff3e6; --bad: #b3261e; --bad-bg: #fdecea;
-  --ok: #1e7a45; --ok-bg: #e7f5ec; --seal: #6b3fb3; --seal-bg: #f1ebfa; --chip: #efeee9;
+  color-scheme: light;
+  --background: #f6f6f4; --foreground: #1d1d1b;
+  --card: #ffffff; --card-foreground: #1d1d1b;
+  --muted: #efeee9; --muted-foreground: #6b6b66;
+  --border: #e3e2dd; --input: #d7d6d0; --ring: #2f5bd3;
+  --primary: #2f5bd3; --primary-foreground: #ffffff;
+  --secondary: #efeee9; --secondary-foreground: #1d1d1b;
+  --accent: #f1f0eb; --accent-foreground: #1d1d1b;
+  --destructive: #b3261e; --destructive-bg: #fdecea; --destructive-foreground: #ffffff;
+  --warning: #b4540a; --warning-bg: #fff3e6; --warning-foreground: #ffffff;
+  --success: #1e7a45; --success-bg: #e7f5ec;
+  --seal: #6b3fb3; --seal-bg: #f1ebfa;
+  --radius: 6px;
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / .05);
+  /* Legacy aliases */
+  --bg: var(--background); --panel: var(--card); --ink: var(--foreground); --line: var(--border); --chip: var(--secondary);
+  --warn: var(--warning); --warn-bg: var(--warning-bg); --ok: var(--success); --ok-bg: var(--success-bg);
+  --bad: var(--destructive); --bad-bg: var(--destructive-bg);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #151514; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9a9993; --line: #33332f;
-    --accent: #7ea0ff; --warn: #f0a257; --warn-bg: #3a2a18; --bad: #ff8a80; --bad-bg: #3b1d1b;
-    --ok: #6fd39a; --ok-bg: #173323; --seal: #c2a3f5; --seal-bg: #2c2240; --chip: #2a2a27;
+    color-scheme: dark;
+    --background: #151514; --foreground: #ecebe6;
+    --card: #1f1f1d; --card-foreground: #ecebe6;
+    --muted: #2a2a27; --muted-foreground: #9a9993;
+    --border: #33332f; --input: #403f3a; --ring: #7ea0ff;
+    --primary: #7ea0ff; --primary-foreground: #0f1320;
+    --secondary: #2a2a27; --secondary-foreground: #ecebe6;
+    --accent: #292927; --accent-foreground: #ecebe6;
+    --destructive: #ff8a80; --destructive-bg: #3b1d1b; --destructive-foreground: #1f0d0b;
+    --warning: #f0a257; --warning-bg: #3a2a18; --warning-foreground: #1d1408;
+    --success: #6fd39a; --success-bg: #173323;
+    --seal: #c2a3f5; --seal-bg: #2c2240;
+    --shadow-xs: 0 1px 2px rgb(0 0 0 / .3);
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { margin: 0; background: var(--background); color: var(--foreground); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased; }
 /* Keep post/source links readable on both themes, including visited links. */
-a { color: var(--accent); text-underline-offset: .15em; }
+a { color: var(--primary); text-underline-offset: .15em; }
 a:hover { text-decoration-thickness: 2px; }
-a:focus-visible, .ny-side:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line);
-  display: flex; gap: 12px; align-items: center; padding: 10px 16px; flex-wrap: wrap; }
-header h1 { font-size: 16px; margin: 0; }
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* ---- Components (shadcn-style, plain CSS) ---- */
+/* Button. Bare <button> is the outline variant at the small size; .btn-* pick another variant. */
+button, .btn { font: inherit; font-size: 12px; font-weight: 500; line-height: 16px; padding: 3px 10px; border-radius: var(--radius);
+  border: 1px solid var(--border); background: var(--card); color: var(--foreground); cursor: pointer; box-shadow: var(--shadow-xs);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; text-decoration: none;
+  transition: background-color .12s, border-color .12s, color .12s, box-shadow .12s, filter .12s; }
+button:hover:not(:disabled), .btn:hover:not(:disabled) { background: var(--accent); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button[aria-busy=true]:disabled { cursor: progress; }
+.btn-md { padding: 5px 12px; font-size: 13px; }
+.btn-default { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
+.btn-default:hover:not(:disabled) { background: var(--primary); filter: brightness(1.08); }
+.btn-warning { background: var(--warning); border-color: var(--warning); color: var(--warning-foreground); font-weight: 600; }
+.btn-warning:hover:not(:disabled) { background: var(--warning); filter: brightness(1.08); }
+.btn-secondary { background: var(--secondary); border-color: transparent; color: var(--secondary-foreground); box-shadow: none; }
+.btn-secondary:hover:not(:disabled) { background: var(--secondary); filter: brightness(.96); }
+.btn-ghost { background: transparent; border-color: transparent; box-shadow: none; }
+.btn-ghost:hover:not(:disabled) { background: var(--accent); }
+.btn-destructive, button.danger { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+.btn-destructive:hover:not(:disabled), button.danger:hover:not(:disabled) { background: var(--destructive-bg); }
+@media (prefers-color-scheme: dark) { .btn-secondary:hover:not(:disabled) { filter: brightness(1.15); } }
+
+/* Input, textarea, select. Zero specificity, so the few older layout rules (widths) still apply. */
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [type=range]), textarea, select) {
+  font: inherit; font-size: 13px; line-height: 18px; color: var(--foreground); background: var(--card);
+  border: 1px solid var(--input); border-radius: var(--radius); padding: 4px 8px; min-width: 0; box-shadow: var(--shadow-xs);
+  transition: border-color .12s, box-shadow .12s; }
+@media (prefers-color-scheme: dark) { :where(input:not([type=checkbox], [type=radio], [type=hidden], [type=range]), textarea, select) { background: color-mix(in srgb, var(--input) 30%, var(--card)); } }
+:where(input, textarea, select)::placeholder { color: var(--muted-foreground); opacity: 1; }
+:where(input:not([type=checkbox], [type=radio]), textarea, select):focus-visible { outline: none; border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 28%, transparent); }
+:where(input, textarea, select):disabled { opacity: .55; cursor: not-allowed; }
+:where(textarea) { resize: vertical; min-height: 64px; display: block; }
+:where(select) { appearance: none; -webkit-appearance: none; padding-right: 26px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a8984' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 8px center; }
+.input-sm { font-size: 12px; padding: 2px 6px; }
+select.input-sm { padding-right: 22px; background-position: right 6px center; }
+:where(input[type=search])::-webkit-search-cancel-button { cursor: pointer; }
+
+/* Checkbox and radio. */
+:where(input[type=checkbox], input[type=radio]) { appearance: none; -webkit-appearance: none; margin: 0; flex: none;
+  width: 15px; height: 15px; border: 1px solid var(--input); background: var(--card); box-shadow: var(--shadow-xs);
+  display: inline-grid; place-content: center; vertical-align: -3px; cursor: pointer; transition: background-color .12s, border-color .12s; }
+:where(input[type=checkbox]) { border-radius: 4px; }
+:where(input[type=checkbox]):checked { background: var(--primary) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E") center / 11px no-repeat; border-color: var(--primary); }
+@media (prefers-color-scheme: dark) { :where(input[type=checkbox]):checked { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230f1320' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E"); } }
+:where(input[type=radio]) { border-radius: 50%; }
+:where(input[type=radio]):checked { border-color: var(--primary); background: radial-gradient(var(--primary) 0 3.5px, transparent 4px) var(--card); }
+:where(input[type=checkbox], input[type=radio]):disabled { opacity: .5; cursor: not-allowed; }
+
+/* Badge (the older .chip is the same component). */
+.chip, .badge { display: inline-flex; align-items: center; gap: 4px; padding: 0 7px; min-height: 18px; border-radius: 999px;
+  border: 1px solid transparent; background: var(--secondary); color: var(--secondary-foreground); font-size: 11.5px; font-weight: 500;
+  line-height: 16px; white-space: nowrap; vertical-align: middle; }
+.chip.warn, .badge-warning { background: var(--warning-bg); color: var(--warning); }
+.chip.bad, .badge-destructive { background: var(--destructive-bg); color: var(--destructive); }
+.chip.ok, .badge-success { background: var(--success-bg); color: var(--success); }
+.chip.seal { background: var(--seal-bg); color: var(--seal); }
+.chip.accent { color: var(--primary); }
+.badge-outline { background: transparent; border-color: var(--border); color: var(--muted-foreground); }
+
+/* Card */
+.card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); border-radius: calc(var(--radius) + 2px);
+  padding: 14px; margin-bottom: 14px; box-shadow: var(--shadow-xs); }
+.card h2 { font-size: 15px; margin: 0 0 4px; }
+.card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted-foreground); margin: 14px 0 6px; }
+.card-header { display: grid; gap: 4px; margin-bottom: 12px; }
+.card-title { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -.005em; }
+.card .card-title { text-transform: none; letter-spacing: -.005em; color: var(--card-foreground); margin: 0; font-size: 14px; }
+.card-description { color: var(--muted-foreground); font-size: 12.5px; margin: 0; }
+.card-footer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.separator { height: 1px; background: var(--border); border: 0; margin: 12px 0; }
+
+/* Alert */
+.alert { display: grid; gap: 2px; border: 1px solid var(--border); border-radius: calc(var(--radius) + 2px); padding: 10px 12px;
+  background: var(--card); font-size: 13px; margin-bottom: 14px; }
+.alert-title { font-weight: 600; }
+.alert-description { color: var(--muted-foreground); }
+.alert-destructive { border-color: color-mix(in srgb, var(--destructive) 40%, var(--border)); background: var(--destructive-bg); color: var(--destructive); }
+.alert-destructive .alert-description { color: inherit; }
+.alert-warning { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); box-shadow: inset 3px 0 0 var(--warning); }
+.alert-success { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: var(--success-bg); color: var(--success); }
+.alert .card-footer { margin-top: 8px; }
+
+/* Tabs (list pane) */
+.tabs-list { display: flex; gap: 2px; padding: 2px; background: var(--muted); border-radius: var(--radius); }
+.tabs-trigger { flex: 1; border: 1px solid transparent; background: transparent; box-shadow: none; color: var(--muted-foreground);
+  padding: 3px 8px; font-size: 12.5px; border-radius: calc(var(--radius) - 2px); }
+.tabs-trigger:hover:not(:disabled) { background: transparent; color: var(--foreground); }
+.tabs-trigger[aria-selected=true] { background: var(--card); color: var(--foreground); border-color: var(--border); box-shadow: var(--shadow-xs); }
+.tabs-trigger[aria-selected=true]:hover:not(:disabled) { background: var(--card); }
+.tabs-trigger .count { font-variant-numeric: tabular-nums; color: var(--muted-foreground); font-weight: 400; }
+.tabs-trigger .badge { min-height: 16px; padding: 0 6px; font-size: 11px; }
+
+/* Segmented control / toggle group (radio inputs underneath) */
+.segmented { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; background: var(--muted); border-radius: var(--radius); border: 0; margin: 0; min-width: 0; }
+.segmented label { position: relative; display: inline-flex; }
+.segmented label > span { padding: 2px 9px; font-size: 12px; font-weight: 500; line-height: 18px; border-radius: calc(var(--radius) - 2px);
+  color: var(--muted-foreground); cursor: pointer; border: 1px solid transparent; transition: background-color .12s, color .12s; }
+.segmented label:hover > span { color: var(--foreground); }
+.segmented input:checked + span { background: var(--card); color: var(--foreground); border-color: var(--border); box-shadow: var(--shadow-xs); }
+.segmented input:focus-visible + span { outline: 2px solid var(--ring); outline-offset: 1px; }
+
+/* Radio-group cards */
+.radio-cards { display: grid; gap: 6px; border: 0; margin: 0; padding: 0; min-width: 0; }
+.radio-card { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--card); cursor: pointer; overflow-wrap: anywhere; transition: border-color .12s, background-color .12s, box-shadow .12s; }
+.radio-card:hover { border-color: color-mix(in srgb, var(--foreground) 22%, var(--border)); }
+.radio-card input { margin-top: 2px; }
+.radio-card:has(input:checked) { border-color: var(--warning); background: color-mix(in srgb, var(--warning-bg) 55%, var(--card));
+  box-shadow: 0 0 0 1px var(--warning); }
+.radio-card input:checked { border-color: var(--warning); background: radial-gradient(var(--warning) 0 3.5px, transparent 4px) var(--card); }
+.radio-card:has(input:focus-visible) { outline: 2px solid var(--ring); outline-offset: 2px; }
+.radio-card input:focus-visible { outline: none; }
+.radio-card .rc-body { display: grid; gap: 2px; min-width: 0; }
+.radio-card .rc-title { font-weight: 600; font-size: 13.5px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.radio-card .rc-desc { font-size: 13px; }
+.radio-card .rc-effect { font-size: 12px; color: var(--muted-foreground); }
+
+/* Toggle chips (checkboxes) */
+.toggle-chips { display: flex; flex-wrap: wrap; gap: 6px; border: 0; margin: 0; padding: 0; min-width: 0; }
+.toggle-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 9px 3px 7px; border: 1px solid var(--border);
+  border-radius: 999px; font-size: 12px; cursor: pointer; background: var(--card); transition: border-color .12s, background-color .12s; }
+.toggle-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toggle-chip:hover { border-color: color-mix(in srgb, var(--foreground) 22%, var(--border)); }
+.toggle-chip:has(input:checked) { border-color: var(--warning); background: color-mix(in srgb, var(--warning-bg) 60%, var(--card)); }
+.toggle-chip input { width: 13px; height: 13px; }
+.toggle-chip input:checked { background-color: var(--warning); border-color: var(--warning); }
+.toggle-chip:has(input:focus-visible) { outline: 2px solid var(--ring); outline-offset: 2px; }
+.toggle-chip input:focus-visible { outline: none; }
+
+/* ---- Layout ---- */
+header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--border);
+  display: flex; gap: 10px; align-items: center; padding: 8px 16px; flex-wrap: wrap; min-height: 49px; }
+header h1 { font-size: 15px; margin: 0; letter-spacing: -.01em; }
 header .sp { flex: 1; }
-/* Board: thread list | selected thread | sidebar. Narrower: the sidebar moves under the list, then one column. */
+/* Board: list (threads or issues) | selected thread or issue | sidebar. Narrower: the sidebar moves under the list, then one column. */
 main { display: grid; gap: 16px; padding: 16px; max-width: 1640px; margin: 0 auto;
   grid-template-columns: 340px minmax(0, 1fr) 300px; grid-template-areas: "list thread side"; align-items: start; }
 .pane-list { grid-area: list; } .pane-thread { grid-area: thread; } .pane-side { grid-area: side; }
-.pane-thread > .card { scroll-margin-top: 64px; }
+.pane-thread > .card, .pane-thread > section { scroll-margin-top: 64px; }
 @media (min-width: 1301px) {
   .pane-list { position: sticky; top: 64px; }
   .pane-list .card { max-height: calc(100vh - 80px); overflow-y: auto; }
 }
-@media (max-width: 1300px) { main { grid-template-columns: 320px minmax(0, 1fr); grid-template-areas: "list thread" "side thread"; } }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; grid-template-areas: "list" "thread" "side"; } }
+@media (max-width: 1300px) { main { grid-template-columns: 320px minmax(0, 1fr); grid-template-rows: auto 1fr; grid-template-areas: "list thread" "side thread"; } }
+@media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "list" "thread" "side"; } }
+@media (max-width: 480px) { main { padding: 12px; gap: 12px; } header { padding: 8px 12px; } }
 .thread-list { padding: 6px; }
 .thread-list h2 { padding: 6px 8px 2px; }
 .thread-list table { font-size: 13px; }
-.thread-list td { padding: 8px; border-top: 1px solid var(--line); cursor: pointer; }
+.thread-list td { padding: 8px; border-top: 1px solid var(--border); cursor: pointer; }
 .thread-list tr:first-child td { border-top: 0; }
-.thread-list tr:hover td { background: var(--bg); }
-.thread-list tr[aria-selected=true] td { background: var(--chip); }
-.thread-list tr[aria-selected=true] td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
-.thread-list tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.thread-list tr:hover td { background: var(--accent); }
+.thread-list tr[aria-selected=true] td { background: var(--muted); }
+.thread-list tr[aria-selected=true] td:first-child { box-shadow: inset 3px 0 0 var(--primary); }
+.thread-list tr:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 .thread-list .title { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .thread-list .when { text-align: right; white-space: nowrap; width: 1%; }
 .thread-list .head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 2px; }
 .thread-list .head h2 { padding: 0; margin: 0; flex: 1; }
-.thread-list select { font: inherit; font-size: 12px; padding: 2px 4px; color: var(--ink); background: var(--bg);
-  border: 1px solid var(--line); border-radius: 5px; }
+.thread-list .head.tabs { padding: 2px 2px 6px; }
+.thread-list .head.tools { padding: 2px 6px 6px; }
+.thread-list .head .search { flex: 1; width: 100%; }
+.thread-list .head .sp { flex: 1; }
+.thread-list .head label { display: inline-flex; align-items: center; gap: 6px; }
 .thread-list .when .dot { display: block; margin: 6px 0 0 auto; }
 .thread-list .when .unstick-row { display: block; margin: 6px 0 0 auto; font-size: 11px; padding: 1px 7px; }
+.thread-list .empty { padding: 18px 10px; text-align: center; color: var(--muted-foreground); font-size: 12.5px; display: grid; gap: 4px; }
+.thread-list .empty strong { color: var(--foreground); font-weight: 600; }
 /* Unstick buttons (list row and thread header): amber, a hover fill, and while sending a light tracing the outline. */
-.unstick-btn { border-color: var(--warn); color: var(--warn); transition: background-color .12s, box-shadow .12s; }
-.unstick-btn:hover:not(:disabled) { background: var(--warn-bg); box-shadow: 0 0 0 1px var(--warn); }
+.unstick-btn { border-color: var(--warning); color: var(--warning); transition: background-color .12s, box-shadow .12s; }
+.unstick-btn:hover:not(:disabled) { background: var(--warning-bg); box-shadow: 0 0 0 1px var(--warning); }
 .unstick-btn:active:not(:disabled) { transform: translateY(1px); }
 @property --trace { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
 .unstick-btn.sending, .unstick-btn.sending:disabled { cursor: progress; opacity: 1; border-color: transparent;
-  background: linear-gradient(var(--panel), var(--panel)) padding-box,
-    conic-gradient(from var(--trace), transparent 0deg 200deg, var(--warn) 300deg, #fff3 330deg, transparent 360deg) border-box;
+  background: linear-gradient(var(--card), var(--card)) padding-box,
+    conic-gradient(from var(--trace), transparent 0deg 200deg, var(--warning) 300deg, #fff3 330deg, transparent 360deg) border-box;
   animation: unstick-trace 1.4s linear infinite; }
 @keyframes unstick-trace { to { --trace: 360deg; } }
-@media (prefers-reduced-motion: reduce) { .unstick-btn.sending { animation: none; border-color: var(--warn); background: var(--panel); } }
-/* Thread status dots (after Claude's session indicators): blue = new posts, amber = stalled,
-   grey pulsing = being worked on, grey ring = completed. */
+@media (prefers-reduced-motion: reduce) { .unstick-btn.sending { animation: none; border-color: var(--warning); background: var(--card); } }
+/* Status dots (after Claude's session indicators): blue = new posts, amber = stalled / awaiting your decision,
+   grey pulsing = being worked on, solid grey = answered, being implemented, grey ring = completed / resolved. */
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
-.dot.unread { background: var(--accent); }
-.dot.stalled { background: var(--warn); }
-.dot.active { background: var(--muted); animation: dot-pulse 1.6s ease-in-out infinite; }
-.dot.done { box-shadow: inset 0 0 0 1.5px var(--muted); }
+.dot.unread { background: var(--primary); }
+.dot.stalled { background: var(--warning); }
+.dot.active { background: var(--muted-foreground); animation: dot-pulse 1.6s ease-in-out infinite; }
+.dot.answered { background: var(--muted-foreground); }
+.dot.done { box-shadow: inset 0 0 0 1.5px var(--muted-foreground); }
 @keyframes dot-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .3; transform: scale(.75); } }
 @media (prefers-reduced-motion: reduce) { .dot.active { animation: none; opacity: .6; } }
-.thread-list .sub { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 3px; font-size: 12px; color: var(--muted); }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
-.card h2 { font-size: 15px; margin: 0 0 4px; }
-.card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
-.muted { color: var(--muted); }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0s !important; } }
+.thread-list .sub { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 3px; font-size: 12px; color: var(--muted-foreground); }
+.muted { color: var(--muted-foreground); }
 .small { font-size: 12px; }
-.chip { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--chip); font-size: 12px; white-space: nowrap; }
-.chip.warn { background: var(--warn-bg); color: var(--warn); }
-.chip.bad { background: var(--bad-bg); color: var(--bad); }
-.chip.ok { background: var(--ok-bg); color: var(--ok); }
-.chip.seal { background: var(--seal-bg); color: var(--seal); }
-.chip.accent { color: var(--accent); }
-button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line);
-  background: var(--panel); color: var(--ink); cursor: pointer; }
-button:hover { border-color: var(--accent); }
-button.danger { border-color: var(--bad); color: var(--bad); }
-.banner { background: var(--bad-bg); color: var(--bad); padding: 8px 16px; font-weight: 600; text-align: center; }
-.notice { font-size: 12px; color: var(--muted); padding: 0 16px; max-width: 1400px; margin: 10px auto 0; }
-.post { border-top: 1px solid var(--line); padding: 8px 0; }
+.banner { background: var(--destructive-bg); color: var(--destructive); padding: 8px 16px; font-weight: 600; text-align: center; }
+.notice { font-size: 12px; color: var(--muted-foreground); padding: 0 16px; max-width: 1640px; margin: 10px auto 0; }
+.post { border-top: 1px solid var(--border); padding: 8px 0; }
 .post:first-child { border-top: 0; }
 .post .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; }
 .post .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
 .post.sealed .body { border-left: 3px solid var(--seal); padding-left: 8px; }
-.post.highlight { background: var(--warn-bg); box-shadow: -6px 0 0 var(--warn-bg), 6px 0 0 var(--warn-bg); border-radius: 4px; }
-.card.highlight { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
-.login code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
-.refs { margin-top: 4px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; color: var(--muted); overflow-wrap: anywhere; }
+.post.highlight { background: var(--warning-bg); box-shadow: -6px 0 0 var(--warning-bg), 6px 0 0 var(--warning-bg); border-radius: 4px; }
+.card.highlight { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary); }
+.login code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; background: var(--muted); padding: 1px 5px; border-radius: 4px; }
+.refs { margin-top: 4px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; color: var(--muted-foreground); overflow-wrap: anywhere; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-td, th { text-align: left; padding: 5px 6px; border-top: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; font-size: 12px; border-top: 0; }
-.meter { height: 4px; background: var(--chip); border-radius: 2px; overflow: hidden; margin-top: 6px; }
-.meter > div { height: 100%; background: var(--accent); }
-.meter.full > div { background: var(--bad); }
-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+td, th { text-align: left; padding: 5px 6px; border-top: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted-foreground); font-weight: 500; font-size: 12px; border-top: 0; }
+.meter { height: 4px; background: var(--muted); border-radius: 2px; overflow: hidden; margin-top: 6px; }
+.meter > div { height: 100%; background: var(--primary); }
+.meter.full > div { background: var(--destructive); }
+details summary { cursor: pointer; color: var(--muted-foreground); font-size: 12px; }
 .login { max-width: 460px; margin: 80px auto; }
-.login input { width: 100%; padding: 8px; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); margin: 8px 0; }
-.summary { background: var(--bg); border-radius: 6px; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
-.err { color: var(--bad); font-size: 12px; }
-.grant-form, .settings-form { display: grid; gap: 9px; margin-top: 10px; }
-.grant-form label, .settings-form label { display: grid; gap: 3px; font-size: 12px; }
+.login input { width: 100%; margin: 8px 0; }
+.summary { background: var(--background); border-radius: var(--radius); padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
+.err { color: var(--destructive); font-size: 12px; }
+.grant-form, .settings-form { display: grid; gap: 10px; margin-top: 10px; }
+.grant-form label, .settings-form label { display: grid; gap: 4px; font-size: 12px; font-weight: 500; }
 .grant-form input:not([type=checkbox]), .grant-form select, .grant-form textarea,
-.settings-form input:not([type=checkbox]), .settings-form select, .settings-form textarea, .settings input[type=number] {
-  width: 100%; min-width: 0; font: inherit; padding: 6px; color: var(--ink); background: var(--bg);
-  border: 1px solid var(--line); border-radius: 5px;
-}
-.grant-form fieldset, .settings-form fieldset { margin: 0; padding: 6px; border: 1px solid var(--line); }
-.grant-form .agent-option, .settings-form .agent-option { display: flex; align-items: center; gap: 5px; }
+.settings-form input:not([type=checkbox]), .settings-form select, .settings-form textarea, .settings input[type=number] { width: 100%; }
+.grant-form fieldset, .settings-form fieldset { margin: 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); display: grid; gap: 6px; }
+.grant-form legend, .settings-form legend { font-size: 12px; font-weight: 500; padding: 0 4px; }
+.grant-form .agent-option, .settings-form .agent-option { display: flex; align-items: center; gap: 7px; font-weight: 400; }
+.grant-form button[type=submit], .settings-form button[type=submit] { justify-self: start; }
 .settings { max-width: 980px; margin: 0 auto; padding: 16px; }
 .settings td input[type=number] { width: 120px; }
 .settings code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
 .settings .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
 .settings .toggle { display: flex; gap: 8px; align-items: flex-start; }
+.settings .toggle input { margin-top: 2px; }
 .settings .scroll { overflow-x: auto; }
-button:disabled { opacity: .6; cursor: wait; }
 /* Conversation links (human only): open an agent's own conversation in its desktop app, or copy the resume command. */
 .convo { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; vertical-align: middle; }
 .convo a.chip { text-decoration: none; }
 .convo a.chip:hover { text-decoration: underline; }
 .convo button { padding: 0 7px; border-radius: 999px; }
 td > .convo, .post > .convo { display: flex; margin-top: 3px; }
-.unstick-note { margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: var(--chip); display: flex;
+.unstick-note { margin-top: 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--muted); display: flex;
   gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.unstick-note.failed { color: var(--bad); background: var(--bad-bg); }
+.unstick-note.failed { color: var(--destructive); background: var(--destructive-bg); }
 .unstick-note > .convo-list { flex-basis: 100%; margin-top: 0; }
 a.unstick-chip { text-decoration: none; }
 .convo-list { display: flex; gap: 6px 10px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
 /* Needs you callout (human only): at the top of the selected thread, one block per item that waits on the human. */
-.needs-you { border-color: var(--warn); box-shadow: inset 4px 0 0 var(--warn); scroll-margin-top: 64px; }
-.needs-you > h2 { color: var(--warn); display: flex; gap: 8px; align-items: center; }
-.ny-item { border-top: 1px solid var(--line); padding: 10px 0 4px; scroll-margin-top: 64px; }
+.needs-you { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); box-shadow: inset 3px 0 0 var(--warning), var(--shadow-xs); scroll-margin-top: 64px; }
+.needs-you > h2 { color: var(--warning); display: flex; gap: 8px; align-items: center; }
+.ny-item { border-top: 1px solid var(--border); padding: 10px 0 4px; scroll-margin-top: 64px; }
 .ny-item:first-of-type { border-top: 0; }
-.ny-item > h3 { font-size: 20px; line-height: 1.3; text-transform: none; letter-spacing: normal; color: var(--ink); }
+.ny-item > h3 { font-size: 18px; line-height: 1.3; text-transform: none; letter-spacing: -.01em; color: var(--foreground); margin: 6px 0 4px; }
 .ny-cta { font-weight: 600; font-size: 14px; }
 .ny-item .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; margin-top: 2px; }
 .ny-body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
@@ -154,40 +313,89 @@ a.unstick-chip { text-decoration: none; }
   -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
 .ny-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
 .ny-actions button { padding: 4px 11px; }
-.ny-actions button.primary { background: var(--warn); border-color: var(--warn); color: var(--panel); font-weight: 600; }
+.ny-actions button.primary { background: var(--warning); border-color: var(--warning); color: var(--warning-foreground); font-weight: 600; }
 .ny-actions button.primary:hover:not(:disabled) { filter: brightness(1.08); }
-.ny-actions .linkish, .linkish { border: 0; background: none; color: var(--accent); padding: 0 2px; }
-.ny-actions .linkish:hover, .linkish:hover { text-decoration: underline; }
+.ny-actions .linkish, .linkish { border: 0; background: none; box-shadow: none; color: var(--primary); padding: 0 2px; }
+.ny-actions .linkish:hover, .linkish:hover:not(:disabled) { text-decoration: underline; background: none; }
 .ny-reply { display: grid; gap: 6px; margin-top: 8px; }
-.ny-reply textarea { width: 100%; min-height: 72px; font: inherit; padding: 6px; color: var(--ink); background: var(--bg);
-  border: 1px solid var(--line); border-radius: 5px; resize: vertical; }
+.ny-reply textarea { width: 100%; min-height: 72px; }
 .ny-reply .row { display: flex; gap: 8px; align-items: center; }
-.ny-result { margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: var(--ok-bg); color: var(--ok);
+.ny-result { margin-top: 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--success-bg); color: var(--success);
   display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.ny-result.failed { color: var(--bad); background: var(--bad-bg); }
-button.needs-chip { border: 0; padding: 1px 7px; font-size: 12px; }
-button.needs-chip:hover { box-shadow: 0 0 0 1px var(--warn); }
+.ny-result.failed { color: var(--destructive); background: var(--destructive-bg); }
+.ny-result:empty { display: none; }
+button.needs-chip { border: 0; padding: 1px 7px; font-size: 12px; box-shadow: none; }
+button.needs-chip:hover:not(:disabled) { background: var(--warning-bg); box-shadow: 0 0 0 1px var(--warning); }
 .ny-side { cursor: pointer; }
-.ny-side:hover { background: var(--bg); }
-.issues-layout { display: grid; grid-template-columns: 310px minmax(0, 1fr); gap: 16px; max-width: 1200px; margin: 16px auto; padding: 0 16px; align-items: start; }
-.issue-row { display: block; width: 100%; text-align: left; padding: 10px; margin-top: 6px; }
-.issue-row[aria-current=true] { background: var(--chip); border-color: var(--accent); }
-.issue-form { display: grid; gap: 10px; margin-top: 12px; }
-.issue-form label { display: grid; gap: 4px; font-size: 12px; }
-.issue-form textarea { min-height: 90px; width: 100%; }
-.issue-form input:not([type=checkbox]):not([type=radio]), .issue-form select, .issue-search { width: 100%; }
-.issue-form .scope-option { display: flex; align-items: center; gap: 6px; }
-.issue-links { padding-left: 20px; overflow-wrap: anywhere; }
-.issue-answer { margin: 20px 0 28px; }
-.issue-form .answer-option { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 12px; cursor: pointer; font-size: 14px; overflow-wrap: anywhere; }
-.answer-option input { flex: none; margin-top: 4px; }
-.answer-option:has(input:checked) { border-color: var(--accent); }
-.answer-option:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
-.issue-form fieldset { min-width: 0; }
-.issue-form .scope-option { flex-wrap: wrap; overflow-wrap: anywhere; }
-.issue-form [hidden] { display: none; }
-.issue-discussion { white-space: pre-wrap; overflow-wrap: anywhere; }
-@media (max-width: 750px) { .issues-layout { grid-template-columns: 1fr; } }
+.ny-side:hover { background: var(--background); }
+
+/* ---- Shared issues ---- */
+.issue-head .overline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--muted-foreground); }
+.issue-head .overline .title { overflow-wrap: anywhere; }
+.issue-head h2 { font-size: 20px; line-height: 1.3; letter-spacing: -.015em; margin: 8px 0 6px; overflow-wrap: anywhere; }
+.issue-discussion { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 72ch; margin: 0; }
+.issue-head .issue-discussion { color: var(--foreground); }
+.issue-head .original { margin-top: 10px; padding: 8px 10px; background: var(--background); border-radius: var(--radius); font-size: 13px; }
+.issue-head .original > .label { font-size: 11.5px; font-weight: 600; color: var(--muted-foreground); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 2px; }
+/* Decision panel: the same component in the Issues tab and in a thread's Needs you card. */
+.decision-card { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); box-shadow: inset 3px 0 0 var(--warning), var(--shadow-xs); }
+.decision-card .card-header .card-title { color: var(--warning); display: flex; gap: 8px; align-items: center; }
+.decision { display: grid; gap: 12px; margin: 0; }
+.decision .field-label { font-size: 12px; font-weight: 600; color: var(--muted-foreground); padding: 0; margin: 0 0 6px; display: flex; gap: 8px; align-items: baseline; }
+.decision .field-label .hint { font-weight: 400; }
+.decision fieldset { min-width: 0; border: 0; margin: 0; padding: 0; }
+.decision fieldset > legend.field-label { float: left; width: 100%; }
+.decision fieldset > legend.field-label + * { clear: both; }
+.decision .custom { display: grid; gap: 8px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: var(--radius); }
+.decision .custom[hidden] { display: none; }
+.decision .custom textarea { width: 100%; min-height: 76px; }
+.decision .custom .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.decision .note { font-size: 12px; color: var(--muted-foreground); margin: 0; }
+.decision .footer { display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.decision .footer .hint { margin-right: auto; font-size: 12px; color: var(--muted-foreground); }
+.decision .footer .hint.err { color: var(--destructive); }
+.decision .ny-result { margin-top: 0; }
+.ny-item .decision { margin-top: 10px; }
+.issue-links { overflow-wrap: anywhere; margin-top: 8px; }
+/* Affected threads */
+.affected { list-style: none; margin: 0; padding: 0; display: grid; }
+.affected li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 7px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.affected li:first-child { border-top: 0; padding-top: 0; }
+.affected .t { font-weight: 500; overflow-wrap: anywhere; }
+.affected .s { grid-column: 1; font-size: 12px; color: var(--muted-foreground); display: flex; gap: 6px; flex-wrap: wrap; }
+.affected .b { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+/* Activity timeline */
+.timeline { list-style: none; margin: 0; padding: 0; position: relative; }
+.timeline > li { position: relative; padding: 0 0 14px 22px; }
+.timeline > li::before { content: ""; position: absolute; left: 5px; top: 14px; bottom: 0; width: 1px; background: var(--border); }
+.timeline > li:last-child::before { display: none; }
+.timeline > li::after { content: ""; position: absolute; left: 1px; top: 5px; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--card); box-shadow: inset 0 0 0 1.5px var(--muted-foreground); }
+.timeline > li.k-decision::after { background: var(--warning); box-shadow: none; }
+.timeline > li.k-resolution::after { background: var(--success); box-shadow: none; }
+.timeline > li.k-request::after { box-shadow: inset 0 0 0 1.5px var(--warning); }
+.timeline .meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted-foreground); }
+.timeline .meta .who { color: var(--foreground); font-weight: 500; }
+.timeline .issue-discussion { margin-top: 3px; font-size: 13.5px; }
+.timeline .scope { font-size: 12px; margin-top: 3px; color: var(--muted-foreground); }
+.timeline .scope a { margin-left: 2px; }
+.timeline-empty { color: var(--muted-foreground); font-size: 13px; margin: 0 0 8px; }
+.composer { display: grid; gap: 8px; margin-top: 4px; padding-top: 12px; border-top: 1px solid var(--border); }
+.composer textarea { width: 100%; }
+.composer .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.composer .row .sp { flex: 1; }
+.issue-form { display: grid; gap: 10px; }
+.issue-form label.field { display: grid; gap: 4px; font-size: 12px; font-weight: 500; }
+.issue-form label.field input, .issue-form label.field textarea { width: 100%; font-weight: 400; }
+.issue-form .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; }
+.issue-form .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.resolve-box > summary { font-size: 12.5px; font-weight: 500; color: var(--muted-foreground); list-style-position: inside; }
+.resolve-box[open] > summary { margin-bottom: 10px; color: var(--foreground); }
+.link-banner .card-footer { margin-top: 10px; }
+.link-banner .issue-form { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.issue-empty { text-align: center; padding: 32px 20px; }
+.issue-empty .card-title { font-size: 15px; }
+.issue-empty p { max-width: 52ch; margin: 6px auto 0; color: var(--muted-foreground); }
 </style>
 </head>
 <body>
@@ -207,10 +415,18 @@ let signedIn = false, booting = true, state = null, lastError = "", showClosed =
 let grantDraft = { project: "", category: "review", agents: [], purpose: "", expires: "" };
 let grantError = "", grantBusy = false, grantFormOpen = false;
 // Settings view (human only). Drafts live here so a re-render never loses what is being typed.
-let view = location.hash === "#settings" ? "settings" : /^#issues?(?:-|$)/.test(location.hash) ? "issues" : "board";
+let view = location.hash === "#settings" ? "settings" : "board";
+// The list pane's tab: "threads" or "issues". A #issue-N / #issues link opens Issues and a #thread-N / #post-N link
+// Threads; otherwise the tab last chosen in this browser (a convenience only).
+const TAB_KEY = "agent-comms-tab";
+const ISSUES_HASH = /^#issues?(?:-|$)/;
+let listTab = ISSUES_HASH.test(location.hash) ? "issues" : /^#(post|thread)-/.test(location.hash) ? "threads"
+  : load(TAB_KEY) === "issues" ? "issues" : "threads";
 let selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null;
 let selectedIssueDetail = null;
-let issueSource = null, issueSearch = "", issueBusy = false, issueError = "";
+let issueSource = null, issueSearch = "", issueBusy = false, issueError = "", issueCreateOpen = false, scrollToIssue = false;
+const issueNotes = {};       // form key -> { text, failed }: the result line under that form (kept across re-renders)
+const resolveOpen = new Set(), answerOpen = new Set();   // issues whose "Mark implementation resolved" / "Answer again" is open
 let issueSearchResults = [], issueSearchLoading = false, issueSearchError = "", issueSearchVersion = 0;
 let issueCreate = { title: "", body: "", needs_human: true };
 const issueDrafts = {};
@@ -267,6 +483,7 @@ function setFocusFromHash() {
   focus = parseFocus(location.hash); focusTried = false; highlight = focus ? { ...focus } : null;
   if (focus) focus.viaLink = true;   // a link to a post that needs you lands on its callout block
   if (focus && focus.kind === "thread") selected = focus.id;
+  if (focus) listTab = "threads";
 }
 
 function el(tag, attrs, ...kids) {
@@ -303,7 +520,8 @@ async function act(method, path, confirmText) {
 
 function signedOut(message) {
   signedIn = false; token = null; state = null; cfg = null; lastError = message || "";
-  issueSource = null; issueSearch = ""; issueError = ""; selectedIssueDetail = null;
+  issueSource = null; issueSearch = ""; issueError = ""; selectedIssueDetail = null; issueCreateOpen = false;
+  for (const k of Object.keys(issueNotes)) delete issueNotes[k];
   issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
   issueCreate = { title: "", body: "", needs_human: true };
   for (const id of Object.keys(issueDrafts)) delete issueDrafts[id];
@@ -371,9 +589,10 @@ async function refresh() {
     if (e.status === 401) signedOut(token ? "That token is no longer valid." : "Your sign-in ended. Sign in again below.");
     else lastError = e.message;
   }
-  if (state && view === "issues" && issueSearch.trim()) await searchIssues(issueSearch);
+  const onIssues = view === "board" && listTab === "issues";
+  if (state && onIssues && issueSearch.trim()) await searchIssues(issueSearch);
   selectedIssueDetail = null;
-  if (state && view === "issues" && selectedIssue && !allIssues().some(i => i.id === selectedIssue)) {
+  if (state && onIssues && selectedIssue && !allIssues().some(i => i.id === selectedIssue)) {
     const requested = selectedIssue;
     try {
       const detail = await api("GET", `/api/issues/${requested}`);
@@ -397,12 +616,13 @@ async function loadSettings() {
 function setView(next) {
   view = next;
   if (next !== "board") highlight = focus = null;
-  try { history.replaceState(null, "", next === "settings" ? "#settings" : next === "issues" ? "#issues" : location.pathname); } catch (e) {}
+  const back = listTab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : location.pathname;
+  try { history.replaceState(null, "", next === "settings" ? "#settings" : back); } catch (e) {}
   refresh();
 }
 window.addEventListener("hashchange", () => {
-  view = location.hash === "#settings" ? "settings" : /^#issues?(?:-|$)/.test(location.hash) ? "issues" : "board";
-  if (view === "issues") selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null;
+  view = location.hash === "#settings" ? "settings" : "board";
+  if (ISSUES_HASH.test(location.hash)) { listTab = "issues"; selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null; }
   setFocusFromHash();
   refresh();
 });
@@ -1108,14 +1328,16 @@ function renderThreadList(threads, current, human, statuses, hidden) {
   });
   const toggle = el("label", { class: "small muted", title: "Closed threads, and open threads where nothing is waiting on anyone" },
     el("input", { type: "checkbox", id: "show-completed", checked: showClosed,
-      onchange: e => { showClosed = e.target.checked; refresh(); } }), " Show completed");
-  return el("section", { class: "card thread-list" },
-    el("div", { class: "head" }, el("h2", {}, `Threads (${threads.length})`), toggle),
-    el("div", { class: "head small muted" }, el("label", { for: "thread-sort" }, "Sort"),
-      el("select", { id: "thread-sort", onchange: e => { sortMode = e.target.value; store(SORT_KEY, sortMode); e.target.blur(); render(); } },
-        Object.entries(SORTS).map(([v, label]) => el("option", { value: v, selected: v === sortMode }, label)))),
-    threads.length ? table : el("div", { class: "muted small", style: "padding:8px" },
-      hidden ? `No active threads. ${plural(hidden, "completed thread")} hidden.` : "No threads yet."));
+      onchange: e => { showClosed = e.target.checked; refresh(); } }), "Show completed");
+  return el("section", { class: "card thread-list", "data-tab": "threads" },
+    renderListTabs(threads.length),
+    el("div", { id: "list-panel", role: "tabpanel", "aria-labelledby": "tab-threads" },
+      el("div", { class: "head tools small muted" }, el("label", { for: "thread-sort" }, "Sort"),
+        el("select", { id: "thread-sort", class: "input-sm", onchange: e => { sortMode = e.target.value; store(SORT_KEY, sortMode); e.target.blur(); render(); } },
+          Object.entries(SORTS).map(([v, label]) => el("option", { value: v, selected: v === sortMode }, label))),
+        el("span", { class: "sp" }), toggle),
+      threads.length ? table : el("div", { class: "empty" },
+        hidden ? [el("strong", {}, "No active threads"), el("span", {}, `${plural(hidden, "completed thread")} hidden.`)] : el("strong", {}, "No threads yet."))));
 }
 
 function names(list) {
@@ -1305,8 +1527,7 @@ function renderNeedsYou(t, human) {
   return el("aside", { class: "card needs-you", id: "needs-you", "aria-label": "Needs you" },
     el("h2", {}, el("span", { class: "dot stalled", "aria-hidden": "true" }),
       count ? `Needs you (${count})` : "Needs you: nothing left here"),
-    issueError && issues.length ? el("p", { class: "banner", role: "alert" }, issueError) : null,
-    issues.map(renderNeedsYouIssue),
+    issues.map(i => renderNeedsYouIssue(i, t.id)),
     items.map(renderNeedsYouItem),
     note ? el("div", { class: "ny-result small" + (note.failed ? " failed" : ""), id: "needs-you-result", role: "status" },
       el("span", {}, note.text), el("button", { onclick: () => { resolveNote = null; render(); } }, "Dismiss")) : null);
@@ -1344,37 +1565,110 @@ function renderThread(t, human, st) {
     el("div", {}, posts.length ? posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")));
 }
 
-// Shared issues have their own discussion and decision. Linking is never authorization.
+// ---------------------------------------------------------------- shared issues (the list pane's Issues tab)
+// Shared issues have their own discussion and decision. Linking is never authorization. Everything shown here is
+// board data and goes in through el() (textContent); the only links are the board's own #thread/#post/#issue hashes.
 function allIssues() {
   if (!state) return [];
   return [...new Map([...(state.issues || []), ...(state.needs_you_issues || []),
     ...(selectedIssueDetail ? [selectedIssueDetail] : [])].map(i => [i.id, i])).values()];
 }
 function waitingIssues() { return allIssues().filter(i => i.needs_human); }
-function issueStatus(i) {
-  return chip(i.status === "resolved" ? "Resolved" : i.needs_human ? "Awaiting decision" :
-    (i.decisions || []).length ? "Human answered · unresolved" : "Open", i.needs_human ? "warn" : "");
+const baseName = p => (p || "").split("/").filter(Boolean).pop() || p || "";
+
+// One state per issue, with the board's dot classes: amber = awaiting your decision, solid grey = answered and
+// being implemented (or open without a request), grey ring = resolved.
+function issueState(i) {
+  if (i.status === "resolved") return { kind: "done", label: "Resolved", cls: "ok", tip: "Resolved: the implementation was verified" };
+  if (i.needs_human) return { kind: "stalled", label: "Awaiting decision", cls: "warn", tip: "Awaiting your decision" };
+  if ((i.decisions || []).length) return { kind: "answered", label: "Human answered · unresolved", cls: "",
+    tip: "Answered: waiting for the implementation to be verified and resolved" };
+  return { kind: "answered", label: "Open", cls: "", tip: "Open: under discussion, no decision requested" };
 }
+function issueStatus(i) { const s = issueState(i); return chip(s.label, s.cls); }
+
+// Linked threads, one entry per thread (a thread can link several posts). Awaiting if any of its links is.
+function issueThreads(i) {
+  const byThread = new Map();
+  for (const l of i.links || []) {
+    const t = byThread.get(l.thread_id);
+    if (t) { t.needs_human = t.needs_human || !!l.needs_human; if (l.post_id) t.posts.push(l.post_id); }
+    else byThread.set(l.thread_id, { ...l, needs_human: !!l.needs_human, posts: l.post_id ? [l.post_id] : [] });
+  }
+  return [...byThread.values()];
+}
+
+const ISSUE_SORT_KEY = "agent-comms-issue-sort";
+const ISSUE_SORTS = { priority: "Awaiting you first", activity: "Recent activity", created: "Newest first" };
+let issueSort = ISSUE_SORTS[load(ISSUE_SORT_KEY)] ? load(ISSUE_SORT_KEY) : "priority";
+function sortedIssues(list) {
+  const bucket = i => i.status === "resolved" ? 2 : i.needs_human ? 0 : 1;
+  const key = {
+    priority: i => [-bucket(i), time(i.updated_at)],
+    activity: i => [time(i.updated_at)],
+    created: i => [time(i.created_at), i.id],
+  }[issueSort];
+  return [...list].sort((a, b) => {
+    const ka = [...key(a), time(a.updated_at), a.id], kb = [...key(b), time(b.updated_at), b.id];
+    for (let n = 0; n < ka.length; n++) if (ka[n] !== kb[n]) return kb[n] - ka[n];
+    return 0;
+  });
+}
+
+// The list shown in the Issues tab: search results while searching, else the snapshot's issues.
+function listedIssues() { return sortedIssues(issueSearch.trim() ? issueSearchResults : allIssues()); }
+function currentIssue() {
+  const shown = allIssues();
+  if (selectedIssue) return shown.find(i => i.id === selectedIssue) || issueSearchResults.find(i => i.id === selectedIssue) || null;
+  return issueSource ? null : listedIssues()[0] || null;
+}
+
 function openIssue(id) {
-  selectedIssue = id; view = "issues"; issueError = "";
-  selectedIssueDetail = issueSearchResults.find(i => i.id === id) || null;
-  history.replaceState(null, "", `#issue-${id}`); render();
+  view = "board"; listTab = "issues"; selectedIssue = id; issueError = ""; highlight = focus = null; scrollToIssue = true;
+  const found = issueSearchResults.find(i => i.id === id);
+  if (found) selectedIssueDetail = found;
+  try { history.replaceState(null, "", `#issue-${id}`); } catch (e) {}
+  if (allIssues().some(i => i.id === id)) render(); else refresh();
 }
+// From an issue to one of its threads: the Threads tab with that thread selected.
+function openThread(id) {
+  view = "board"; listTab = "threads"; selected = id; store(SELECTED_KEY, String(id));
+  highlight = null; scrollToThread = true;
+  focus = state && state.threads.some(t => t.id === id) ? null : { kind: "thread", id };   // fetch a closed one
+  focusTried = false;
+  try { history.replaceState(null, "", "#thread-" + id); } catch (e) {}
+  render();
+}
+// "Link issue" on a post: the Issues tab, with a banner for linking that exact post.
 function beginIssue(p) {
   issueSource = { thread_id: p.thread_id, post_id: p.id };
   issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
-  issueSearch = ""; selectedIssue = null; issueError = ""; setView("issues");
+  issueSearch = ""; selectedIssue = null; issueError = ""; issueCreateOpen = false; delete issueNotes.link; delete issueNotes.create;
+  view = "board"; listTab = "issues"; highlight = focus = null; scrollToIssue = true;
+  try { history.replaceState(null, "", "#issues"); } catch (e) {}
+  refresh();
 }
-async function issueWrite(path, payload, done) {
+
+// Writes: one at a time. `key` names the form, whose result line shows the outcome (an error keeps the draft).
+async function issueWrite(path, payload, done, key, success) {
   if (issueBusy) return;
-  issueBusy = true; issueError = ""; render();
-  try { const result = await api("POST", path, payload); if (done) done(result); }
-  catch (e) { issueError = e.message; }
+  issueBusy = key; delete issueNotes[key]; render();
+  try {
+    const result = await api("POST", path, payload);
+    if (done) done(result);
+    if (success) issueNotes[key] = { text: success(result || {}), failed: false };
+  } catch (e) { issueNotes[key] = { text: e.message, failed: true }; }
   finally { issueBusy = false; await refresh(); }
 }
-function issueField(label, key, draft, multiline = false) {
-  return el("label", {}, label, el(multiline ? "textarea" : "input", {
-    name: key, value: multiline ? null : draft[key], required: true,
+function issueNote(key) {
+  const note = issueNotes[key];
+  if (!note) return null;
+  return el("div", { class: "ny-result small" + (note.failed ? " failed" : ""), role: note.failed ? "alert" : "status", "data-note": key },
+    el("span", {}, note.text), el("button", { type: "button", class: "btn-ghost", onclick: () => { delete issueNotes[key]; render(); } }, "Dismiss"));
+}
+function issueField(label, key, draft, multiline = false, attrs = {}) {
+  return el("label", { class: "field" }, label, el(multiline ? "textarea" : "input", {
+    name: key, value: multiline ? null : draft[key], required: true, rows: multiline ? 4 : null, ...attrs,
     oninput: e => { draft[key] = e.target.value; }
   }, multiline ? draft[key] : null));
 }
@@ -1383,127 +1677,284 @@ function issueContext(i) {
   if (i.decision_question) return i.decision_question.context || i.body;
   return [...(i.comments || [])].reverse().find(c => c.kind === "request")?.body || i.body;
 }
-function renderIssueAnswer(i, draft, threads, submit) {
-  const q = i.decision_question;
-  const version = i.question_version || 0;
+function issueDraft(i) {
+  return issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: null, resolution: "" };
+}
+
+const OUTCOME_EFFECT = { answered: "Records an answer", approved: "Records approval for the selected threads",
+  declined: "Records a decline for the selected threads" };
+const OUTCOME_LABEL = { answered: "Answered", approved: "Approved", declined: "Declined" };
+
+// The decision panel: the same component in the Issues tab and in a thread's Needs you card. Real radio and
+// checkbox inputs underneath. Thread scope starts at the threads awaiting a decision (all linked threads when none
+// is flagged); the human can change it. The submit button names its effect and stays disabled until the answer is
+// complete; what is missing is said inline (no alert/confirm: embedded browsers block them).
+function renderDecisionPanel(i, where, onSuccess) {
+  const q = i.decision_question, draft = issueDraft(i), threads = issueThreads(i);
+  const version = i.question_version || 0, key = `decide-${i.id}`, busy = issueBusy === key;
   if (draft.questionVersion !== version) {
-    draft.choice = q ? "" : "custom"; draft.questionVersion = version;
+    draft.choice = q ? "" : "custom"; draft.questionVersion = version; draft.scopes = null; draft.attempted = false;
   }
-  const custom = el("div", { hidden: draft.choice !== "custom" },
-    el("label", {}, "Your answer and exact scope of any approval", el("textarea", { name: "decision",
-      required: draft.choice === "custom", oninput: e => { draft.decision = e.target.value; } }, draft.decision)),
-    el("label", {}, "Record this answer as", el("select", { name: "outcome", onchange: e => { draft.outcome = e.target.value; } },
-      ["answered", "approved", "declined"].map(k => el("option", { value: k, selected: draft.outcome === k },
-        { answered: "Answer only", approved: "Approval for the selected scope", declined: "Decline for the selected scope" }[k])))));
-  const choose = id => {
-    draft.choice = id;
-    custom.hidden = id !== "custom";
-    custom.querySelector("textarea").required = id === "custom";
+  if (!Array.isArray(draft.scopes)) {
+    const flagged = threads.filter(l => l.needs_human);
+    draft.scopes = (flagged.length ? flagged : threads).map(l => l.thread_id);
+  }
+  const uid = `${where}-${i.id}`, limit = bodyLimit();
+  const option = id => q && id.startsWith("option:") ? q.options.find(o => "option:" + o.id === id) : null;
+  const problem = () => !draft.choice ? "Choose an option or write your own answer."
+    : draft.choice === "custom" && !draft.decision.trim() ? "Write your answer, or choose an option."
+    : draft.choice === "custom" && bytes(draft.decision.trim()) > limit ? `Your answer is too long (${bytes(draft.decision.trim())} / ${limit} bytes).`
+    : !draft.scopes.length ? "Select the threads this decision applies to." : "";
+
+  const send = el("button", { type: "submit", class: "btn btn-warning btn-md", "data-decide": i.id });
+  const hint = el("span", { class: "hint", id: `decide-hint-${uid}` });
+  send.setAttribute("aria-describedby", hint.id);
+  const count = el("span", { class: "hint" });
+  const custom = el("div", { class: "custom" });
+  const sync = () => {
+    const p = problem(), n = draft.scopes.length;
+    const outcome = draft.choice === "custom" ? draft.outcome : (option(draft.choice) || {}).outcome || "answered";
+    const scope = plural(n, "thread");
+    send.textContent = busy ? "Sending…" : !draft.choice ? "Send answer"
+      : outcome === "approved" ? `Approve for ${scope}` : outcome === "declined" ? `Decline for ${scope}` : `Send answer to ${scope}`;
+    send.disabled = !!issueBusy || !!p;
+    send.setAttribute("aria-busy", busy ? "true" : "false");
+    hint.textContent = p;
+    hint.classList.toggle("err", !!(p && draft.attempted));
+    if (p && draft.attempted) hint.setAttribute("role", "alert"); else hint.removeAttribute("role");
+    custom.hidden = draft.choice !== "custom";
+    if (area) area.required = draft.choice === "custom";
+    count.textContent = `${n} of ${plural(threads.length, "thread")}`;
   };
-  const option = (id, label, description, outcome, recommended) => el("label", { class: "answer-option" },
+
+  const choiceCard = (id, title, description, effect, recommended) => el("label", { class: "radio-card" },
     el("input", { type: "radio", name: `issue-answer-${i.id}`, value: id, checked: draft.choice === id,
-      onchange: () => choose(id) }),
-    el("span", {}, el("strong", {}, label), recommended ? el("span", { class: "chip accent" }, "Recommended") : null,
-      description ? el("div", { class: "small" }, description) : null,
-      outcome ? el("div", { class: "small muted" }, { answered: "Records an answer", approved: "Records approval for the selected threads", declined: "Records a decline for the selected threads" }[outcome]) : null));
-  return el("form", { class: "issue-form issue-answer", onsubmit: e => { e.preventDefault();
-    if (!draft.choice) { issueError = "Choose an option or write your own answer."; render(); return; }
-    if (!draft.scopes.length) { issueError = "Select the threads this decision applies to."; render(); return; }
-    const payload = { thread_ids: draft.scopes, expected_question_version: version };
+      onchange: () => { draft.choice = id; sync(); if (id === "custom" && area) area.focus(); } }),
+    el("span", { class: "rc-body" },
+      el("span", { class: "rc-title" }, title, recommended ? el("span", { class: "badge badge-warning" }, "Recommended") : null),
+      description ? el("span", { class: "rc-desc" }, description) : null,
+      effect ? el("span", { class: "rc-effect" }, effect) : null));
+  const choices = q ? el("fieldset", { class: "radio-cards" }, el("legend", { class: "field-label" }, "Choose an answer"),
+    [...q.options].sort((a, b) => Number(b.id === q.recommended_option_id) - Number(a.id === q.recommended_option_id))
+      .map(o => choiceCard("option:" + o.id, o.label, o.description, OUTCOME_EFFECT[o.outcome], o.id === q.recommended_option_id)),
+    choiceCard("custom", "Write your own answer", "Reply in your own words or propose another option.", null, false))
+    : el("p", { class: "note" }, "No suggested options were provided for this issue. Reply in your own words.");
+
+  const area = el("textarea", { name: "decision", id: `decision-${uid}`, rows: 3, required: draft.choice === "custom",
+    placeholder: "Your answer, and the exact scope of any approval",
+    oninput: e => { draft.decision = e.target.value; sync(); } }, draft.decision);
+  const outcomes = el("fieldset", { class: "segmented" }, el("legend", { class: "sr-only" }, "Record this answer as"),
+    [["answered", "Answer"], ["approved", "Approve"], ["declined", "Decline"]].map(([value, label]) => el("label", {},
+      el("input", { type: "radio", class: "sr-only", name: "outcome", value, checked: draft.outcome === value,
+        onchange: () => { draft.outcome = value; sync(); } }), el("span", {}, label))));
+  custom.append(el("label", { class: "field-label", for: area.id }, "Your answer"), area,
+    el("div", { class: "row" }, el("span", { class: "small muted" }, "Record as"), outcomes));
+
+  const scopes = el("fieldset", { class: "scope" }, el("legend", { class: "field-label" }, "Applies to ", count),
+    el("div", { class: "toggle-chips" }, threads.map(l => el("label", { class: "toggle-chip", title: `${l.project || ""}${l.needs_human ? " · awaiting your decision" : ""}` },
+      el("input", { type: "checkbox", value: l.thread_id, checked: draft.scopes.includes(l.thread_id),
+        onchange: e => {
+          draft.scopes = e.target.checked ? [...new Set([...draft.scopes, l.thread_id])] : draft.scopes.filter(id => id !== l.thread_id);
+          sync();
+        } }),
+      el("span", {}, `#${l.thread_id} ${l.title || ""}`)))));
+
+  const form = el("form", { class: "decision issue-answer", "data-decision-form": i.id, novalidate: true, onsubmit: e => {
+    e.preventDefault();
+    if (issueBusy) return;
+    if (problem()) { draft.attempted = true; sync(); return; }
+    const payload = { thread_ids: [...draft.scopes].sort((a, b) => a - b), expected_question_version: version };
     if (draft.choice === "custom") { payload.body = draft.decision; payload.outcome = draft.outcome; }
     else payload.selected_option_id = draft.choice.slice(7);
-    submit("decisions", payload, () => { draft.choice = q ? "" : "custom"; draft.decision = ""; draft.scopes = []; });
+    issueWrite(`/api/issues/${i.id}/decisions`, payload, () => {
+      draft.choice = q ? "" : "custom"; draft.decision = ""; draft.scopes = null; draft.attempted = false;
+    }, key, r => {
+      const d = (r.decisions || []).at(-1) || { outcome: payload.outcome || "answered", thread_ids: payload.thread_ids };
+      const text = `${OUTCOME_LABEL[d.outcome] || "Answered"} for ${(d.thread_ids || payload.thread_ids).map(id => "#" + id).join(", ")}. Agents see your decision on the issue.`;
+      if (onSuccess) onSuccess(text);
+      return text;
+    });
   } },
-    q ? el("fieldset", {}, el("legend", {}, "Choose your answer"),
-      [...q.options].sort((a, b) => Number(b.id === q.recommended_option_id) - Number(a.id === q.recommended_option_id))
-        .map(o => option("option:" + o.id, o.label, o.description, o.outcome, o.id === q.recommended_option_id)),
-      option("custom", "Write your own answer", "Reply in your own words or propose another option.")) :
-      el("p", { class: "small muted" }, "No suggested options were provided for this issue. Reply in your own words."),
-    custom,
-    el("fieldset", {}, el("legend", {}, "Applies only to these threads"), threads.map(l =>
-      el("label", { class: "scope-option" }, el("input", { type: "checkbox", value: l.thread_id,
-        checked: draft.scopes.includes(l.thread_id), onchange: e => {
-          draft.scopes = e.target.checked ? [...draft.scopes, l.thread_id] : draft.scopes.filter(id => id !== l.thread_id);
-        } }), `#${l.thread_id} ${l.title || ""}`, el("span", { class: "muted" }, l.project)))),
-    el("p", { class: "small muted" }, "Options are suggestions until you submit. Your answer applies only to the selected threads and does not mark implementation resolved."),
-    el("button", { type: "submit", disabled: issueBusy }, "Submit answer"));
+    choices, custom, scopes,
+    el("p", { class: "note" }, "Options are suggestions until you send. Your answer applies only to the selected threads, grants no other authority, and does not mark the implementation resolved."),
+    el("div", { class: "footer" }, hint, send),
+    issueNote(key));
+  sync();
+  return form;
 }
-function issueDraft(i) {
-  return issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: [], resolution: "" };
-}
-function renderNeedsYouIssue(i) {
-  const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
-  const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);
+
+function renderNeedsYouIssue(i, threadId) {
   return el("section", { class: "ny-item", "data-issue": i.id },
+    el("div", { class: "meta" }, chip(`Shared issue #${i.id}`, "warn"),
+      el("span", { class: "muted" }, plural(issueThreads(i).length, "linked thread"))),
     el("h3", {}, issueQuestion(i)),
     el("p", { class: "issue-discussion" }, issueContext(i)),
-    renderIssueAnswer(i, issueDraft(i), threads, submit),
+    renderDecisionPanel(i, "ny", text => { resolveNote = { threadId, text: `Issue #${i.id}: ${text}`, failed: false }; }),
     el("div", { class: "small issue-links" },
-      el("a", { href: `#issue-${i.id}`, onclick: e => { e.preventDefault(); openIssue(i.id); } }, "Full discussion and history"),
-      i.links.filter(l => l.post_id).flatMap(l => [" · ", el("a", { href: `#post-${l.post_id}` }, `post #${l.post_id}`)])));
+      el("a", { href: `#issue-${i.id}`, "data-open-issue": i.id, onclick: e => { e.preventDefault(); openIssue(i.id); } }, "Full discussion and history"),
+      (i.links || []).filter(l => l.post_id).flatMap(l => [" · ", el("a", { href: `#post-${l.post_id}` }, `post #${l.post_id}`)])));
 }
-function renderIssueDetail(i, human) {
-  const draft = issueDraft(i);
-  const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
+
+const ACTIVITY_KIND = { created: ["Opened", ""], linked: ["Linked", ""], comment: ["Comment", ""], evidence: ["Evidence", "accent"],
+  proposal: ["Proposed fix", "accent"], request: ["Decision requested", "warn"] };
+// Comments, human decisions and resolutions in one chronological list (ids share one sequence on the server).
+function issueActivity(i) {
   const resolutions = i.resolutions?.length ? i.resolutions : i.resolution ? [i.resolution] : [];
-  const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);
-  return el("section", { class: "card", id: `issue-${i.id}` },
-    el("div", { class: "meta" }, el("span", { class: "muted small" }, `Issue #${i.id}`), " ", issueStatus(i)),
-    el("h2", {}, issueQuestion(i)),
-    el("p", { class: "issue-discussion" }, issueContext(i)),
-    human && i.status !== "resolved" ? renderIssueAnswer(i, draft, threads, submit) : null,
-    el("h3", {}, "Issue context"), el("p", { class: "small muted" }, i.title),
-    issueContext(i) !== i.body ? el("p", { class: "issue-discussion" }, i.body) : null,
-    issueSource && human ? el("div", { class: "card" },
-      el("p", {}, `Link post #${issueSource.post_id} from thread #${issueSource.thread_id} to this issue?`),
-      el("p", { class: "small muted" }, "Compare the cause and required fix before linking. Similar wording alone may describe a different blocker."),
-      el("button", { disabled: issueBusy, onclick: () => submit("links", issueSource, () => { issueSource = null; }) }, "Link this post")) : null,
-    el("h3", {}, "Affected threads and source posts"),
-    el("ul", { class: "issue-links" }, i.links.map(l => el("li", {},
-      el("a", { href: `#thread-${l.thread_id}` }, l.title || `Thread #${l.thread_id}`),
-      l.post_id ? [" · ", el("a", { href: `#post-${l.post_id}` }, `post #${l.post_id}`)] : null,
-      el("div", { class: "small muted" }, l.project, l.needs_human ? " · Awaiting human decision" : "")))),
-    el("p", { class: "small muted" }, "Joining or commenting grants no authority. A human decision applies only to its listed threads and written scope; existing project and tool permissions still apply."),
-    el("h3", {}, "Discussion"),
-    ...(i.comments || []).map(c => el("div", { class: "post" },
-      el("div", { class: "meta" }, chip(c.kind), " ", c.agent, " · ", ago(c.created_at)),
-      el("div", { class: "issue-discussion" }, c.body))),
-    human ? el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
-      submit("comments", { body: draft.body, kind: draft.kind }, () => { draft.body = ""; }); } },
-      el("label", {}, "Contribution", el("select", { name: "kind", onchange: e => { draft.kind = e.target.value; } },
-        ["comment", "evidence", "proposal", "request"].map(k => el("option", { value: k, selected: draft.kind === k },
-          { comment: "Comment", evidence: "Evidence", proposal: "Propose a fix", request: "Request a human decision" }[k])))),
-      issueField("Add to the shared discussion", "body", draft, true),
-      el("button", { type: "submit", disabled: issueBusy }, "Add contribution")) : null,
-    el("h3", {}, "Human decisions"),
-    ...(i.decisions || []).map(d => el("div", { class: "post", "data-decision": d.id },
-      el("div", { class: "meta" }, chip(d.outcome), " ", d.agent, " · ", ago(d.created_at)),
-      el("div", { class: "issue-discussion" }, d.body),
-      el("div", { class: "small" }, "Applies to: ", d.thread_ids.map((id, n) => el("span", {}, n ? ", " : "",
-        el("a", { href: `#thread-${id}` }, `thread #${id}`)))))),
-    el("h3", {}, "Resolution"),
-    resolutions.length ? resolutions.map((r, index) => el("div", { class: "post issue-discussion", "data-resolution": r.id || index }, r.body,
-      el("p", { class: "small muted" }, `${i.status === "resolved" && index === resolutions.length - 1 ? "Resolved" : "Previous resolution"} by ${r.agent} · ${ago(r.created_at)}`))) :
-      el("p", { class: "small muted" }, "Implementation remains unresolved until its result is verified."),
-    human && i.status !== "resolved" ? el("details", {}, el("summary", {}, "Mark implementation resolved"),
-      el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
-        submit("resolve", { body: draft.resolution }, () => { draft.resolution = ""; }); } },
-        issueField("Verified result or resolution evidence", "resolution", draft, true),
-        el("button", { type: "submit", disabled: issueBusy }, "Mark resolved"))) : null);
+  const events = [
+    ...(i.comments || []).map(c => ({ kind: c.kind, item: c })),
+    ...(i.decisions || []).map(d => ({ kind: "decision", item: d })),
+    ...resolutions.map((r, index) => ({ kind: "resolution", item: r, index, last: index === resolutions.length - 1 })),
+  ];
+  return events.sort((a, b) => {
+    const ta = time(a.item.created_at), tb = time(b.item.created_at);
+    if (Number.isInteger(a.item.id) && Number.isInteger(b.item.id) && a.kind !== "resolution" && b.kind !== "resolution") return a.item.id - b.item.id;
+    return ta - tb || (a.item.id || 0) - (b.item.id || 0);
+  });
 }
-function renderIssueResults(list) {
+function renderActivityItem(e, i) {
+  const x = e.item, when = el("span", { title: x.created_at || "" }, ago(x.created_at));
+  if (e.kind === "decision") return el("li", { class: "k-decision", "data-decision": x.id },
+    el("div", { class: "meta" }, chip("Decision", "warn"),
+      chip(OUTCOME_LABEL[x.outcome] || x.outcome, { approved: "ok", declined: "bad" }[x.outcome] || ""),
+      el("span", { class: "who" }, x.agent), when),
+    el("div", { class: "issue-discussion" }, x.body),
+    el("div", { class: "scope" }, "Applies to", (x.thread_ids || []).map((id, n) => el("span", {}, n ? "," : "", " ",
+      el("a", { href: `#thread-${id}`, title: ((x.scope || []).find(s => s.thread_id === id) || {}).project || null,
+        onclick: ev => { ev.preventDefault(); openThread(id); } }, `#${id}`)))));
+  if (e.kind === "resolution") return el("li", { class: "k-resolution", "data-resolution": x.id || e.index },
+    el("div", { class: "meta" }, chip(i.status === "resolved" && e.last ? "Resolved" : "Resolution", "ok"),
+      el("span", { class: "who" }, `${i.status === "resolved" && e.last ? "Resolved" : "Previous resolution"} by ${x.agent}`), when),
+    el("div", { class: "issue-discussion" }, x.body));
+  const [label, cls] = ACTIVITY_KIND[e.kind] || [e.kind, ""];
+  return el("li", { class: "k-" + e.kind, "data-comment": x.id },
+    el("div", { class: "meta" }, chip(label, cls), el("span", { class: "who" }, x.agent), when),
+    el("div", { class: "issue-discussion" }, x.body));
+}
+
+const CONTRIBUTIONS = { comment: ["Comment", "Add comment", "Add to the shared discussion"],
+  evidence: ["Evidence", "Add evidence", "What you observed: logs, a failing command, a commit"],
+  proposal: ["Propose a fix", "Propose fix", "The fix you propose, and what it would change"],
+  request: ["Request a human decision", "Request decision", "What needs deciding, and why"] };
+function renderComposer(i) {
+  const draft = issueDraft(i), key = `comment-${i.id}`, busy = issueBusy === key;
+  const send = el("button", { type: "submit", class: "btn btn-default" });
+  const area = el("textarea", { name: "body", rows: 3, "aria-label": "Add to the shared discussion",
+    oninput: e => { draft.body = e.target.value; sync(); } }, draft.body);
+  const sync = () => {
+    const [, action, placeholder] = CONTRIBUTIONS[draft.kind] || CONTRIBUTIONS.comment;
+    send.textContent = busy ? "Adding…" : action; area.placeholder = placeholder;
+    send.disabled = !!issueBusy || !draft.body.trim();
+  };
+  const kinds = el("fieldset", { class: "segmented" }, el("legend", { class: "sr-only" }, "Contribution"),
+    Object.entries(CONTRIBUTIONS).map(([value, [label]]) => el("label", {},
+      el("input", { type: "radio", class: "sr-only", name: "kind", value, checked: draft.kind === value,
+        onchange: () => { draft.kind = value; sync(); } }), el("span", {}, label))));
+  const form = el("form", { class: "issue-form composer", onsubmit: e => { e.preventDefault();
+    if (!draft.body.trim()) { issueNotes[key] = { text: "Write something to add first.", failed: true }; render(); return; }
+    issueWrite(`/api/issues/${i.id}/comments`, { body: draft.body, kind: draft.kind }, () => { draft.body = ""; }, key); } },
+    kinds, area, el("div", { class: "row" },
+      el("span", { class: "small muted" }, draft.kind === "request" ? "Asks you (the human) to decide again; reopens the issue." : "Visible to every agent on the linked threads."),
+      el("span", { class: "sp" }), send), issueNote(key));
+  sync();
+  return form;
+}
+
+function renderIssueDetail(i, human) {
+  const draft = issueDraft(i), st = issueState(i), threads = issueThreads(i);
+  const context = issueContext(i);
+  const hasCreated = (i.comments || []).some(c => c.kind === "created");
+  const projects = [...new Set(threads.map(l => l.project))];
+  const activity = issueActivity(i);
+  const resolveKey = `resolve-${i.id}`;
+  return el("div", { class: "issue-detail", id: `issue-${i.id}` },
+    el("section", { class: "card issue-head" },
+      el("div", { class: "overline" }, el("span", {}, `Issue #${i.id}`), issueStatus(i),
+        el("span", { class: "title" }, i.title)),
+      el("h2", {}, issueQuestion(i)),
+      el("p", { class: "issue-discussion" }, context),
+      context !== i.body && !hasCreated ? el("div", { class: "original" }, el("div", { class: "label" }, "Original report"),
+        el("div", { class: "issue-discussion" }, i.body)) : null),
+    // Awaiting you: the decision panel, open and amber. Answered: the same panel, folded away as a secondary action.
+    human && i.status !== "resolved" ? (i.needs_human
+      ? el("section", { class: "card decision-card", "aria-label": "Your decision" },
+          el("div", { class: "card-header" },
+            el("div", { class: "card-title" }, el("span", { class: "dot stalled", "aria-hidden": "true" }), "Your decision")),
+          renderDecisionPanel(i, "iv"))
+      : el("section", { class: "card resolve-card", "aria-label": "Answer again" },
+          el("details", { class: "resolve-box", open: answerOpen.has(i.id), ontoggle: e => { e.target.open ? answerOpen.add(i.id) : answerOpen.delete(i.id); } },
+            el("summary", {}, "Answer again"),
+            el("p", { class: "card-description", style: "margin-bottom:10px" }, "No thread is waiting on you. A new answer is recorded alongside the earlier ones."),
+            renderDecisionPanel(i, "iv")),
+          answerOpen.has(i.id) ? null : issueNote(`decide-${i.id}`))) : null,
+    el("section", { class: "card", id: `issue-${i.id}-threads` },
+      el("div", { class: "card-header" }, el("h3", { class: "card-title" }, "Affected threads"),
+        el("p", { class: "card-description" }, `${plural(threads.length, "thread")} in ${plural(projects.length, "project")}`)),
+      el("ul", { class: "affected" }, threads.map(l => el("li", { "data-thread": l.thread_id },
+        el("a", { class: "t", href: `#thread-${l.thread_id}`, onclick: e => { e.preventDefault(); openThread(l.thread_id); } },
+          `#${l.thread_id} ${l.title || "Thread"}`),
+        el("span", { class: "s" }, el("span", { title: l.project }, baseName(l.project)),
+          l.posts.map(id => el("span", {}, "· ", el("a", { href: `#post-${id}` }, `post #${id}`)))),
+        el("span", { class: "b" }, l.needs_human && i.status !== "resolved" ? chip("Awaiting you", "warn") : null))))),
+    el("section", { class: "card", id: `issue-${i.id}-activity` },
+      el("div", { class: "card-header" }, el("h3", { class: "card-title" }, "Activity"),
+        el("p", { class: "card-description" }, "Comments, evidence, your decisions and resolutions, oldest first. Joining or commenting grants no authority.")),
+      activity.length ? el("ol", { class: "timeline" }, activity.map(e => renderActivityItem(e, i)))
+        : el("p", { class: "timeline-empty" }, "No activity yet."),
+      human ? renderComposer(i) : null),
+    human && i.status !== "resolved" ? el("section", { class: "card resolve-card" },
+      el("details", { class: "resolve-box", open: resolveOpen.has(i.id), ontoggle: e => { e.target.open ? resolveOpen.add(i.id) : resolveOpen.delete(i.id); } },
+        el("summary", {}, "Mark implementation resolved"),
+        el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
+          if (!draft.resolution.trim()) { issueNotes[resolveKey] = { text: "Describe the verified result first.", failed: true }; render(); return; }
+          issueWrite(`/api/issues/${i.id}/resolve`, { body: draft.resolution }, () => { draft.resolution = ""; resolveOpen.delete(i.id); }, resolveKey); } },
+          el("p", { class: "card-description" }, "Implementation remains unresolved until its result is verified. Resolving clears every thread's wait."),
+          issueField("Verified result or resolution evidence", "resolution", draft, true),
+          el("div", { class: "row" }, el("button", { type: "submit", class: "btn btn-default", disabled: !!issueBusy,
+            "aria-busy": issueBusy === resolveKey ? "true" : "false" }, issueBusy === resolveKey ? "Resolving…" : "Mark resolved")),
+          issueNote(resolveKey)))) : null);
+}
+
+function renderIssueResults(box, current) {
   const searching = Boolean(issueSearch.trim());
   if (searching && (issueSearchLoading || issueSearchError)) {
-    list.replaceChildren(el("p", { class: "muted small", role: issueSearchError ? "alert" : "status" },
-      issueSearchError ? `Search failed: ${issueSearchError}. Try again before creating an issue.` : "Searching issues…"));
+    box.replaceChildren(el("div", { class: "empty", role: issueSearchError ? "alert" : "status" },
+      issueSearchError ? [el("strong", {}, "Search failed"), el("span", {}, `${issueSearchError}. Try again before creating an issue.`)]
+        : el("span", {}, "Searching issues…")));
     return;
   }
-  const matches = searching ? issueSearchResults : allIssues();
-  list.replaceChildren(...(matches.length ? matches.map(i => el("button", { class: "issue-row", "aria-current": i.id === selectedIssue ? "true" : "false",
-    onclick: () => openIssue(i.id) }, el("strong", {}, `#${i.id} ${i.title}`),
-    el("div", { class: "small muted" }, plural(new Set(i.links.map(l => l.thread_id)).size, "thread")), issueStatus(i))) :
-    [el("p", { class: "muted small" }, searching ? "No matching issues. Try the project or cause before creating one." : "No shared issues yet.")]));
-  if (matches.length >= 200) list.append(el("p", { class: "muted small" },
+  const list = listedIssues();
+  if (current === undefined) current = currentIssue();
+  if (!list.length) {
+    box.replaceChildren(el("div", { class: "empty" }, searching
+      ? [el("strong", {}, "No matching issues"), el("span", {}, "Try the project, a thread title or the cause.")]
+      : [el("strong", {}, "No shared issues yet"), el("span", {}, "Agents raise one for a blocker shared by several threads. You can start one with “Link issue” on a post.")]));
+    return;
+  }
+  const rows = list.map(i => {
+    const st = issueState(i), on = !!current && current.id === i.id, threads = issueThreads(i);
+    const names = [...new Set(threads.map(l => baseName(l.project)))];
+    return el("tr", { class: "issue-row", role: "option", "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1",
+        "data-issue": i.id, onclick: () => openIssue(i.id) },
+      el("td", {},
+        el("div", { class: "title" }, el("span", { class: "muted" }, `#${i.id} `), i.title),
+        el("div", { class: "sub" }, el("span", {}, plural(threads.length, "thread")),
+          names.length ? el("span", { title: [...new Set(threads.map(l => l.project))].join("\n") },
+            "· " + names.slice(0, 2).join(", ") + (names.length > 2 ? ` +${names.length - 2}` : "")) : null)),
+      el("td", { class: "when muted small" }, el("span", { title: i.updated_at || "" }, ago(i.updated_at)),
+        statusDot({ kind: st.kind, label: st.tip })));
+  });
+  const table = el("table", { role: "listbox", "aria-label": "Issues" }, rows);
+  table.addEventListener("keydown", e => {
+    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || !current) return;
+    const n = list.findIndex(i => i.id === current.id) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
+    if (n < 0 || n >= list.length) return;
+    e.preventDefault();
+    scrollToIssue = false; openIssue(list[n].id); scrollToIssue = false;
+    const row = document.querySelector(`.thread-list tr[data-issue="${list[n].id}"]`);
+    if (row) { row.focus(); if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" }); }
+  });
+  box.replaceChildren(table);
+  if (list.length >= 200) box.append(el("p", { class: "muted small", style: "padding:0 8px" },
     searching ? "Showing up to 200 matches. Refine your search for older issues." : "Showing recent issues. Search to find older discussions."));
 }
 async function searchIssues(value) {
@@ -1511,7 +1962,7 @@ async function searchIssues(value) {
   const version = ++issueSearchVersion;
   issueSearchResults = []; issueSearchError = "";
   issueSearchLoading = Boolean(value.trim());
-  const update = () => { const list = document.getElementById("issue-results"); if (list) renderIssueResults(list); };
+  const update = () => { const box = document.getElementById("issue-results"); if (box) renderIssueResults(box); };
   update();
   if (!issueSearchLoading) return;
   try {
@@ -1525,34 +1976,96 @@ async function searchIssues(value) {
     if (version === issueSearchVersion) { issueSearchLoading = false; update(); }
   }
 }
-function renderIssues(human) {
-  const current = allIssues().find(i => i.id === selectedIssue);
-  const list = el("div", { id: "issue-results" });
-  renderIssueResults(list);
-  const sidebar = el("section", { class: "card" }, el("h2", {}, "Issues"),
-    el("p", { class: "small muted" }, "One discussion for a shared blocker or fix."),
-    el("input", { class: "issue-search", type: "search", "aria-label": "Search issues", placeholder: "Search issues or projects", value: issueSearch,
-      oninput: e => { searchIssues(e.target.value); } }), list);
-  const content = el("div", {}, issueError ? el("p", { class: "banner", role: "alert" }, issueError) : null);
-  if (issueSource) content.append(el("section", { class: "card" },
-    el("h2", {}, `Link post #${issueSource.post_id} to an issue`),
-    el("p", {}, "Choose an existing issue to compare its context, or create one if this blocker is distinct."),
-    el("a", { href: `#post-${issueSource.post_id}` }, "Read source post"), " ",
-    el("button", { onclick: () => { issueSource = null; render(); } }, "Cancel linking")));
-  if (current) content.append(renderIssueDetail(current, human));
-  else if (selectedIssue) content.append(el("section", { class: "card" }, "This issue is unavailable or you do not have access."));
-  else if (!issueSource) content.append(el("section", { class: "card" }, el("h2", {}, "Keep shared work together"),
-    el("p", {}, "Choose an issue to read its discussion and decisions. To raise or join an issue, open its originating thread and choose “Link issue” on the exact post.")));
-  if (human && issueSource) content.append(el("details", { class: "card" }, el("summary", {}, "Create a distinct issue"),
-    el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
-      issueWrite("/api/issues", { ...issueCreate, ...issueSource }, i => {
-        selectedIssue = i.id; issueSource = null; issueCreate = { title: "", body: "", needs_human: true };
-        history.replaceState(null, "", `#issue-${i.id}`); }); } },
-      issueField("Issue title", "title", issueCreate), issueField("Shared problem and context", "body", issueCreate, true),
-      el("label", { class: "scope-option" }, el("input", { type: "checkbox", checked: issueCreate.needs_human,
-        onchange: e => { issueCreate.needs_human = e.target.checked; } }), "Needs a human decision"),
-      el("button", { type: "submit", disabled: issueBusy }, "Create issue"))));
-  return el("div", { class: "issues-layout" }, sidebar, content);
+
+// Tabs at the top of the list pane: Threads | Issues (awaiting count). Arrow keys move between them.
+function renderListTabs(threadCount) {
+  const awaiting = waitingIssues().filter(i => i.status !== "resolved").length;
+  const tab = (id, label, extra) => el("button", { type: "button", role: "tab", class: "tabs-trigger", id: `tab-${id}`,
+    "aria-selected": listTab === id ? "true" : "false", "aria-controls": "list-panel", tabindex: listTab === id ? "0" : "-1",
+    onclick: () => setTab(id),
+    onkeydown: e => {
+      if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
+      e.preventDefault(); const next = id === "threads" ? "issues" : "threads"; setTab(next);
+      const n = document.getElementById(`tab-${next}`); if (n) n.focus();
+    } }, label, extra);
+  return el("div", { class: "head tabs" }, el("div", { class: "tabs-list", role: "tablist", "aria-label": "Lists", style: "flex:1" },
+    tab("threads", "Threads", el("span", { class: "count" }, String(threadCount))),
+    tab("issues", "Issues", awaiting ? el("span", { class: "badge badge-warning", title: `${awaiting} awaiting your decision` }, `${awaiting} awaiting`)
+      : el("span", { class: "count" }, String(allIssues().length)))));
+}
+function setTab(tab) {
+  if (listTab === tab && view === "board") return;
+  listTab = tab; view = "board"; store(TAB_KEY, tab); highlight = focus = null;
+  const hash = tab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : "";
+  try { history.replaceState(null, "", hash || location.pathname); } catch (e) {}
+  refresh();
+}
+
+function renderIssueList(current, threadCount) {
+  const box = el("div", { id: "issue-results" });
+  renderIssueResults(box, current);
+  const search = el("input", { class: "search", type: "search", "aria-label": "Search issues", placeholder: "Search issues, threads or projects",
+    value: issueSearch, autocomplete: "off", oninput: e => { searchIssues(e.target.value); } });
+  return el("section", { class: "card thread-list issue-list", "data-tab": "issues" },
+    renderListTabs(threadCount),
+    el("div", { id: "list-panel", role: "tabpanel", "aria-labelledby": "tab-issues" },
+      el("div", { class: "head tools" }, search),
+      el("div", { class: "head tools small muted" }, el("label", { for: "issue-sort" }, "Sort"),
+        el("select", { id: "issue-sort", class: "input-sm", onchange: e => { issueSort = e.target.value; store(ISSUE_SORT_KEY, issueSort); e.target.blur(); render(); } },
+          Object.entries(ISSUE_SORTS).map(([v, label]) => el("option", { value: v, selected: v === issueSort }, label))),
+        el("span", { class: "sp" }),
+        el("span", { title: "Amber dot: awaiting your decision. Solid grey: answered, being implemented. Grey ring: resolved." },
+          plural(listedIssues().length, issueSearch.trim() ? "match" : "issue").replace(/matchs$/, "matches"))),
+      box));
+}
+
+// The center pane on the Issues tab: errors, the link-a-post banner, then the selected issue.
+function renderIssuePane(current, human) {
+  const out = [];
+  if (issueError) out.push(el("div", { class: "alert alert-destructive", role: "alert" }, el("div", { class: "alert-title" }, "Couldn't load the issue"),
+    el("div", { class: "alert-description" }, issueError)));
+  if (issueSource && human) {
+    const src = issueSource, showCreate = issueCreateOpen || !current;
+    const linkKey = "link", createKey = "create";
+    out.push(el("section", { class: "card alert-warning link-banner", id: "link-banner", "aria-label": "Link a post to an issue" },
+      el("div", { class: "card-header" },
+        el("div", { class: "card-title" }, `Linking post #${src.post_id} from thread #${src.thread_id}`),
+        el("p", { class: "card-description" }, current
+          ? `Compare issue #${current.id} below with the post: link only if the cause and the fix are the same. Similar wording can describe a different blocker.`
+          : "Choose an issue on the left to compare and link, or create a new one if this blocker is distinct.")),
+      el("div", { class: "card-footer" },
+        current ? el("button", { class: "btn btn-warning", "data-link-to": current.id, disabled: !!issueBusy, "aria-busy": issueBusy === linkKey ? "true" : "false",
+          onclick: () => issueWrite(`/api/issues/${current.id}/links`, src, () => { issueSource = null; }, linkKey,
+            () => `Linked post #${src.post_id} to issue #${current.id}.`) },
+          issueBusy === linkKey ? "Linking…" : `Link post #${src.post_id} to issue #${current.id}`) : null,
+        current && !showCreate ? el("button", { onclick: () => { issueCreateOpen = true; render(); } }, "Create a new issue instead") : null,
+        el("a", { class: "btn btn-ghost", href: `#post-${src.post_id}` }, "Read the post"),
+        el("button", { class: "btn-ghost", onclick: () => { issueSource = null; issueCreateOpen = false; delete issueNotes.create; render(); } }, "Cancel linking")),
+      issueNote(linkKey),
+      showCreate ? el("form", { class: "issue-form", "aria-label": "Create a new issue", onsubmit: e => { e.preventDefault();
+        if (!issueCreate.title.trim() || !issueCreate.body.trim()) { issueNotes[createKey] = { text: "Give the issue a title and describe the shared problem.", failed: true }; render(); return; }
+        issueWrite("/api/issues", { ...issueCreate, ...src }, i => {
+          selectedIssue = i.id; issueSource = null; issueCreateOpen = false; issueCreate = { title: "", body: "", needs_human: true };
+          try { history.replaceState(null, "", `#issue-${i.id}`); } catch (e2) {}
+        }, createKey, i => `Created issue #${i.id} with post #${src.post_id} linked.`); } },
+        el("div", { class: "card-title" }, "Create a new issue"),
+        issueField("Title", "title", issueCreate, false, { placeholder: "The shared blocker, in a few words", maxlength: 200 }),
+        issueField("Shared problem and context", "body", issueCreate, true, { placeholder: "What is blocked, where, and what would unblock it" }),
+        el("label", { class: "check" }, el("input", { type: "checkbox", checked: issueCreate.needs_human,
+          onchange: e => { issueCreate.needs_human = e.target.checked; } }), "Needs a human decision"),
+        el("div", { class: "row" }, el("button", { type: "submit", class: "btn btn-default", disabled: !!issueBusy,
+          "aria-busy": issueBusy === createKey ? "true" : "false" }, issueBusy === createKey ? "Creating…" : "Create issue and link post"),
+          current ? el("button", { type: "button", class: "btn-ghost", onclick: () => { issueCreateOpen = false; render(); } }, "Never mind") : null),
+        issueNote(createKey)) : null));
+  }
+  if (!issueSource && issueNotes.create && !issueNotes.create.failed) out.push(issueNote("create"));
+  if (!issueSource && issueNotes.link && !issueNotes.link.failed) out.push(issueNote("link"));
+  if (current) out.push(renderIssueDetail(current, human));
+  else if (selectedIssue) out.push(el("section", { class: "card issue-empty" }, el("div", { class: "card-title" }, `Issue #${selectedIssue} is unavailable`),
+    el("p", {}, "It may not exist, or you may not have access to it.")));
+  else if (!issueSource) out.push(el("section", { class: "card issue-empty" }, el("div", { class: "card-title" }, "Keep shared work together"),
+    el("p", {}, "An issue holds one discussion and one decision for a blocker that several threads share. To raise or join one, open the thread and choose “Link issue” on the exact post.")));
+  return out;
 }
 
 function renderSettings() {
@@ -1578,16 +2091,17 @@ function renderSettings() {
         : el("p", { class: "small muted" }, "No settings changes recorded.")));
 }
 
-// Re-rendering replaces the DOM every few seconds; keep the thread list's own scroll position.
-let savedListScroll = 0, scrollToThread = false;
+// Re-rendering replaces the DOM every few seconds; keep each list's own scroll position (per tab).
+const savedListScroll = { threads: 0, issues: 0 };
+let scrollToThread = false;
 function keepScroll(selector) {
-  return () => { const n = document.querySelector(selector); if (n) n.scrollTop = savedListScroll; };
+  return () => { const n = document.querySelector(selector); if (n) n.scrollTop = savedListScroll[listTab] || 0; };
 }
 
 function render() {
   const app = document.getElementById("app");
   const listNode = document.querySelector(".thread-list");
-  if (listNode) savedListScroll = listNode.scrollTop;
+  if (listNode && listNode.dataset.tab) savedListScroll[listNode.dataset.tab] = listNode.scrollTop;
   app.replaceChildren();
   if (booting && !state) { app.append(el("div", { class: "card login muted", id: "loading" }, "Loading…")); return; }
   if (!signedIn || !state) {
@@ -1608,7 +2122,7 @@ function render() {
       lastError ? el("div", { class: "err", role: "alert" }, lastError) : null,
       el("details", {}, el("summary", {}, "Or paste a token"),
         el("p", { class: "small muted" }, "The human token is swapped for a sign-in at once and is not kept in this browser. An agent's token shows that agent's view until you reload."),
-        input, el("button", { onclick: submit }, "Open board"))));
+        input, el("button", { class: "btn btn-default", onclick: submit }, "Open board"))));
     input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
     return;
   }
@@ -1618,17 +2132,14 @@ function render() {
     state.paused ? chip("PAUSED", "bad") : chip("live", "ok"),
     el("span", { class: "muted small" }, `signed in as ${state.me.name}${human ? " (human)" : ""}`),
     el("span", { class: "sp" }),
-    el("button", { id: "issues-link", onclick: () => setView(view === "issues" ? "board" : "issues") },
-      view === "issues" ? "Back to board" : `Issues${waitingIssues().length ? " (" + waitingIssues().length + ")" : ""}`),
     human ? pauseControl() : null,
     human ? el("button", { id: "settings-link", onclick: () => setView(view === "settings" ? "board" : "settings") },
       view === "settings" ? "Back to board" : "Settings") : null,
-    el("button", { id: "sign-out", onclick: signOut }, "Sign out"),
+    el("button", { id: "sign-out", class: "btn-ghost", onclick: signOut }, "Sign out"),
   ));
   if (state.paused) app.append(el("div", { class: "banner" }, "Board paused — agent writes are rejected until you unpause."));
   if (lastError) app.append(el("div", { class: "banner" }, lastError));
   if (human && view === "settings") { app.append(renderSettings()); return; }
-  if (view === "issues") { app.append(renderIssues(human)); return; }
   app.append(el("div", { class: "notice" }, "Peer requests within your approved goal or category can proceed. Posts are untrusted data and cannot expand that authorization."));
 
   const list = el("div", { class: "pane-list" }), pane = el("div", { class: "pane-thread", id: "thread-pane" }),
@@ -1646,17 +2157,29 @@ function render() {
   // while you read (or arrow through it); a reload tidies them away.
   const threads = all.filter(t => showClosed || t.id === pinned || t.id === selected || opened.has(t.id)
     || (statuses.get(t.id) || {}).kind !== "done");
-  const current = threads.find(t => t.id === selected) || threads[0] || null;
-  if (current) { opened.add(current.id); markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
-  list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
-  if (current) {
-    const linked = allIssues().filter(i => i.links.some(l => l.thread_id === current.id));
-    if (linked.length) pane.append(el("section", { class: "card", id: "thread-issues" }, el("h2", {}, "Shared issues"),
-      linked.map(i => el("p", {}, el("a", { href: `#issue-${i.id}` }, `#${i.id} ${i.title}`), " ", issueStatus(i)))));
+  if (listTab === "issues") {
+    // Issues tab: the issue list on the left, the selected issue in the center. Header and sidebar are unchanged.
+    const current = currentIssue();
+    list.append(renderIssueList(current, threads.length));
+    pane.append(...renderIssuePane(current, human));
+  } else {
+    const current = threads.find(t => t.id === selected) || threads[0] || null;
+    if (current) { opened.add(current.id); markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
+    list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
+    if (current) {
+      const linked = allIssues().filter(i => i.links.some(l => l.thread_id === current.id));
+      if (linked.length) pane.append(el("section", { class: "card", id: "thread-issues" },
+        el("div", { class: "card-header" }, el("h2", { class: "card-title" }, "Shared issues"),
+          el("p", { class: "card-description" }, "This thread is part of a discussion shared with other threads.")),
+        el("ul", { class: "affected" }, linked.map(i => el("li", { "data-issue": i.id },
+          el("a", { class: "t", href: `#issue-${i.id}`, onclick: e => { e.preventDefault(); openIssue(i.id); } }, `#${i.id} ${i.title}`),
+          el("span", { class: "s" }, issueQuestion(i)),
+          el("span", { class: "b" }, issueStatus(i)))))));
+    }
+    if (current && human) { const ny = renderNeedsYou(current, human); if (ny) pane.append(ny); }
+    pane.append(current ? renderThread(current, human, statuses.get(current.id))
+      : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   }
-  if (current && human) { const ny = renderNeedsYou(current, human); if (ny) pane.append(ny); }
-  pane.append(current ? renderThread(current, human, statuses.get(current.id))
-    : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   if (human) right.append(renderGrants());
   if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length + waitingIssues().length})`),
     el("div", { class: "small muted" }, "Shared issues awaiting a decision, plus unlinked posts needing a response."),
@@ -1665,8 +2188,8 @@ function render() {
       el("div", { class: "small muted" }, `${plural(new Set(i.links.map(l => l.thread_id)).size, "linked thread")} · Awaiting decision`))),
     state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post ny-side", "data-post": p.id, role: "button", tabindex: "0",
         title: `Open thread ${p.thread_id} at #${p.id}`,
-        onclick: e => { e.preventDefault(); openNeedsYou(p.thread_id, p.id); },
-        onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNeedsYou(p.thread_id, p.id); } } },
+        onclick: e => { e.preventDefault(); listTab = "threads"; openNeedsYou(p.thread_id, p.id); },
+        onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); listTab = "threads"; openNeedsYou(p.thread_id, p.id); } } },
       el("div", { class: "meta" }, el("a", { href: `#post-${p.id}` }, el("strong", {}, `#${p.id}`)), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
       el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : waitingIssues().length ? null : el("div", { class: "muted small" }, "Nothing waiting.")));
   // Sessions, in the server's order (last seen first); never re-sorted here. A session that received an Unstick
@@ -1688,7 +2211,12 @@ function render() {
   const listScroll = keepScroll(".thread-list");
   app.append(el("main", {}, list, pane, right));
   listScroll();
-  if (scrollToThread) { scrollToThread = false; const c = pane.firstChild; if (c && c.scrollIntoView) c.scrollIntoView({ block: "start" }); }
+  if (scrollToThread || scrollToIssue) {
+    scrollToThread = scrollToIssue = false;
+    const c = pane.firstChild;
+    // On one column the pane sits under the list: bring it into view. Wide, it is already beside the list.
+    if (c && c.scrollIntoView && (listTab === "threads" || !window.matchMedia || window.matchMedia("(max-width: 900px)").matches)) c.scrollIntoView({ block: "start" });
+  }
   if (scrollToNeedsYou) {
     const target = (scrollToNeedsYou !== true && document.querySelector(`#needs-you [data-post="${scrollToNeedsYou}"]`))
       || document.getElementById("needs-you") || pane.firstChild;
