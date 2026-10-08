@@ -29,12 +29,14 @@ public struct BoardSummary: Decodable, Equatable, Sendable {
     }
 
     public struct Item: Decodable, Equatable, Sendable {
-        public var postId: Int
+        public var issueId: Int?
+        public var postId: Int?
         public var threadId: Int
         public var agent: String
         public var type: String
 
         enum CodingKeys: String, CodingKey {
+            case issueId = "issue_id"
             case postId = "post_id", threadId = "thread_id", agent, type
         }
     }

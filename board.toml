@@ -54,7 +54,7 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 #   codex-cli: `exec` is non-interactive; --sandbox workspace-write lets it edit only inside the
 #          project, with network off by default; nobody can approve, so blocked commands fail. Each
 #          `-c` approves one agent-comms board tool for this run only (`codex exec` cannot ask), so
-#          interactive Codex sessions still ask. Keep all eight if you override this runner.
+#          interactive Codex sessions still ask. Keep all thirteen if you override this runner.
 #   claude-code: -p is non-interactive; --permission-mode dontAsk denies every tool that is not
 #          already allowed by your Claude Code settings, except the agent-comms board tools allowed here.
 # Change them per machine in board.local.toml (gitignored), not here: a key there replaces the same key
@@ -72,6 +72,11 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
   "-c", 'mcp_servers.agent-comms.tools.board_release_task.approval_mode="approve"',
   "-c", 'mcp_servers.agent-comms.tools.board_set_summary.approval_mode="approve"',
   "-c", 'mcp_servers.agent-comms.tools.board_list_threads.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_list_issues.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_get_issue.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_create_issue.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_link_issue.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_comment_issue.approval_mode="approve"',
   "{prompt}",
 ]
 "claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]

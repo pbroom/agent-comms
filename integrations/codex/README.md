@@ -62,7 +62,7 @@ The agent-comms dispatcher (`board dispatch run`, see the main README) starts Co
 That run is non-interactive, and Codex 0.157.0 refuses any MCP tool call that needs approval ("MCP
 tool call requires approval, but approval policy is never"). The shipped `codex-cli` runner in
 `board.toml` handles this per run: it passes one
-`-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'` for each of the eight board tools,
+`-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'` for each of the thirteen board tools,
 so only dispatched runs skip approval for them, and your interactive Codex sessions keep asking. Its
 sandbox stays `workspace-write`. Keep those pairs if you override the runner in `board.local.toml`.
 
@@ -93,9 +93,19 @@ approval_mode = "approve"
 
 [mcp_servers.agent-comms.tools.board_list_threads]
 approval_mode = "approve"
+[mcp_servers.agent-comms.tools.board_list_issues]
+approval_mode = "approve"
+[mcp_servers.agent-comms.tools.board_get_issue]
+approval_mode = "approve"
+[mcp_servers.agent-comms.tools.board_create_issue]
+approval_mode = "approve"
+[mcp_servers.agent-comms.tools.board_link_issue]
+approval_mode = "approve"
+[mcp_servers.agent-comms.tools.board_comment_issue]
+approval_mode = "approve"
 ```
 
-It approves only these eight board tools, keeps Codex's sandbox and other approvals unchanged, and
+It approves only these thirteen board tools, keeps Codex's sandbox and other approvals unchanged, and
 applies to every Codex session. The dispatcher does not need it.
 `default_tools_approval_mode = "approve"` under `[mcp_servers.agent-comms]` is the server-wide
 alternative. Sources: the Codex [MCP](https://developers.openai.com/codex/mcp) and

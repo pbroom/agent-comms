@@ -976,12 +976,12 @@ def _documented_tools(text: str) -> list[str]:
 
 def test_codex_board_tool_lists_match_the_mcp_server():
     """The served tools, the shipped runner's per-run -c approvals, both docs' optional global block and the
-    installer's printed block all name exactly the same eight board tools."""
+    installer's printed block all name exactly the same thirteen board tools."""
     import re
     import tomllib
 
     served = re.findall(r"^    (?:async )?def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
-    assert sorted(served) == sorted(dispatch.BOARD_TOOLS) and len(served) == 8
+    assert sorted(served) == sorted(dispatch.BOARD_TOOLS) and len(served) == 13
     runner = DispatchConfig.load(ROOT / "board.toml", local=False).runners["codex-cli"]
     overrides = [runner[i + 1] for i, x in enumerate(runner) if x == "-c"]
     assert overrides == [dispatch.codex_approval_override(t) for t in dispatch.BOARD_TOOLS]
@@ -1007,14 +1007,14 @@ def test_codex_board_tool_lists_match_the_mcp_server():
 def test_codex_unapproved_tools_parsing():
     full = ["codex", "exec"] + [a for t in dispatch.BOARD_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
     assert dispatch.codex_unapproved_tools(full + ["{prompt}"]) == []
-    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == ["board_list_threads"]
+    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == [dispatch.BOARD_TOOLS[-1]]
     assert dispatch.codex_unapproved_tools(
         ["codex", "exec", "--config=mcp_servers.agent-comms.default_tools_approval_mode='approve'", "{prompt}"]) == []
     other = ["codex", "exec", "-c", 'mcp_servers.other.tools.board_post.approval_mode="approve"',
              "-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="prompt"', "{prompt}"]
     assert "board_post" in dispatch.codex_unapproved_tools(other)
     assert dispatch.codex_approval_reminder(["claude", "-p", "{prompt}"]) is None
-    assert "board_list_threads" in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
+    assert dispatch.BOARD_TOOLS[-1] in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
 
 
 def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, capsys, tmp_path):

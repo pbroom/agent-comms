@@ -9,7 +9,7 @@ when it is a short plain identifier and is null otherwise.
 
 `GET /api/needs-you` (`needs_you_list`, also human only) is the one deliberate exception: the human chose to see
 short previews in their own menu, so each item carries its post body cleaned to one plain line of at most 80
-characters ("sealed post" for a sealed post). The summary itself stays counts-only.
+characters ("sealed post" for a sealed post), or the cleaned title for a shared issue. The summary itself stays counts-only.
 """
 
 from __future__ import annotations
@@ -60,6 +60,33 @@ def preview(body: str | None, sealed: bool) -> str:
     return SEALED_PREVIEW if sealed else clean(body or "", PREVIEW_CHARS)
 
 
+def _awaiting_issues(board: Board, limit: int, *, previews: bool = False) -> tuple[int, list[dict]]:
+    """Only server identifiers enter summary; free text is selected solely for the preview endpoint."""
+    where = "i.status = 'open' AND i.needs_human = 1"
+    count = board.conn.execute(f"SELECT COUNT(*) FROM issues i WHERE {where}").fetchone()[0]
+    rows = board.conn.execute(f"""SELECT i.id, i.created_by, i.updated_at,
+                (SELECT l.thread_id FROM issue_links l WHERE l.issue_id=i.id ORDER BY l.thread_id LIMIT 1) thread_id,
+                (SELECT l.post_id FROM issue_links l WHERE l.issue_id=i.id AND l.post_id IS NOT NULL
+                 ORDER BY l.post_id LIMIT 1) post_id {', i.title' if previews else ''}
+            FROM issues i WHERE {where} ORDER BY i.updated_at DESC, i.id DESC LIMIT ?""", (limit,))
+    items = []
+    for r in rows:
+        item = {"issue_id": r["id"], "post_id": r["post_id"], "thread_id": r["thread_id"] or 0,
+                "agent": r["created_by"], "type": "issue", "_time": r["updated_at"]}
+        if previews:
+            item.update(needs_response=True, task_id=None, task_status=None, decision_status=None,
+                        sealed=False, preview=preview(r["title"], False))
+        items.append(item)
+    return count, items
+
+
+def _merge_needs(posts: list[dict], issues: list[dict], limit: int) -> list[dict]:
+    items = sorted(posts + issues, key=lambda i: (i["_time"], i.get("issue_id", 0), i["post_id"] or 0), reverse=True)[:limit]
+    for item in items:
+        item.pop("_time")
+    return items
+
+
 def needs_you_list(board: Board, p: Principal) -> dict:
     """`GET /api/needs-you`, human only: the dashboard's "Needs you" items, newest first, with a short preview.
 
@@ -71,7 +98,7 @@ def needs_you_list(board: Board, p: Principal) -> dict:
     count = conn.execute(f"SELECT COUNT(*) FROM posts p WHERE {board.NEEDS_YOU}").fetchone()[0]
     items = []
     for r in conn.execute(
-            f"""SELECT p.id, p.thread_id, p.agent, p.type, p.needs_response, p.task_id, p.sealed, p.final, p.body,
+            f"""SELECT p.id, p.thread_id, p.agent, p.type, p.needs_response, p.task_id, p.sealed, p.final, p.body, p.created_at,
                        tk.status AS task_status
                 FROM posts p LEFT JOIN tasks tk ON tk.id = p.task_id
                 WHERE {board.NEEDS_YOU} ORDER BY p.id DESC LIMIT ?""", (NEEDS_YOU_LIST_MAX,)):
@@ -80,7 +107,10 @@ def needs_you_list(board: Board, p: Principal) -> dict:
                       "task_status": r["task_status"],
                       "decision_status": ("final" if r["final"] else "proposal") if r["type"] == "decision" else None,
                       "sealed": bool(r["sealed"]),
-                      "preview": preview(r["body"], bool(r["sealed"]))})
+                      "preview": preview(r["body"], bool(r["sealed"])), "_time": r["created_at"]})
+    issue_count, issues = _awaiting_issues(board, NEEDS_YOU_LIST_MAX, previews=True)
+    count += issue_count
+    items = _merge_needs(items, issues, NEEDS_YOU_LIST_MAX)
     return {"count": count, "items": items, "projects": _projects(board, {i["thread_id"] for i in items})}
 
 
@@ -89,10 +119,14 @@ def human_summary(board: Board, p: Principal, config: dispatch.DispatchConfig) -
     conn, now = board.conn, board.now()
 
     needs_count = conn.execute(f"SELECT COUNT(*) FROM posts p WHERE {board.NEEDS_YOU}").fetchone()[0]
-    needs_items = [{"post_id": r["id"], "thread_id": r["thread_id"], "agent": r["agent"], "type": r["type"]}
-                   for r in conn.execute(f"""SELECT p.id, p.thread_id, p.agent, p.type FROM posts p
+    needs_items = [{"post_id": r["id"], "thread_id": r["thread_id"], "agent": r["agent"], "type": r["type"], "_time": r["created_at"]}
+                   for r in conn.execute(f"""SELECT p.id, p.thread_id, p.agent, p.type, p.created_at FROM posts p
                                              WHERE {board.NEEDS_YOU} ORDER BY p.id DESC LIMIT ?""",
                                          (NEEDS_YOU_ITEMS,))]
+
+    issue_count, issues = _awaiting_issues(board, NEEDS_YOU_ITEMS)
+    needs_count += issue_count
+    needs_items = _merge_needs(needs_items, issues, NEEDS_YOU_ITEMS)
 
     # Where a newly registered human session would start reading (the furthest any of the human's sessions
     # acked in each thread), never counting the human's own posts, as `board read` does.

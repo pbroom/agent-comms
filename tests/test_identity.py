@@ -10,7 +10,8 @@ from agent_comms.core import Forbidden, Unauthorized
 from agent_comms.mcp_server import build_mcp
 
 EXPECTED_TOOLS = {"board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
-                  "board_release_task", "board_set_summary", "board_list_threads"}
+                  "board_release_task", "board_set_summary", "board_list_threads",
+                  "board_list_issues", "board_get_issue", "board_create_issue", "board_link_issue", "board_comment_issue"}
 
 
 def test_token_maps_to_agent_and_runtime(env):

@@ -20,7 +20,10 @@ public struct NeedsYouList: Decodable, Equatable, Sendable {
 }
 
 public struct NeedsYouItem: Decodable, Equatable, Sendable {
-    public var postId: Int
+    public var issueId: Int?
+    public var identity: String { issueId.map { "issue-\($0)" } ?? "post-\(postId ?? 0)" }
+    public var dashboardPage: DashboardPage { issueId.map { .issue($0) } ?? postId.map { .post($0) } ?? .home }
+    public var postId: Int?
     public var threadId: Int
     public var agent: String
     public var type: String
@@ -32,13 +35,15 @@ public struct NeedsYouItem: Decodable, Equatable, Sendable {
     public var preview: String
 
     enum CodingKeys: String, CodingKey {
+        case issueId = "issue_id"
         case postId = "post_id", threadId = "thread_id", agent, type, needsResponse = "needs_response"
         case taskId = "task_id", taskStatus = "task_status", decisionStatus = "decision_status", sealed, preview
     }
 
-    public init(postId: Int, threadId: Int, agent: String, type: String, needsResponse: Bool = false,
+    public init(postId: Int?, threadId: Int, agent: String, type: String, needsResponse: Bool = false,
                 taskId: Int? = nil, taskStatus: String? = nil, decisionStatus: String? = nil, sealed: Bool = false,
-                preview: String = "") {
+                preview: String = "", issueId: Int? = nil) {
+        self.issueId = issueId
         self.postId = postId
         self.threadId = threadId
         self.agent = agent
@@ -53,7 +58,8 @@ public struct NeedsYouItem: Decodable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        postId = try c.decode(Int.self, forKey: .postId)
+        issueId = try c.decodeIfPresent(Int.self, forKey: .issueId)
+        postId = try c.decodeIfPresent(Int.self, forKey: .postId)
         threadId = try c.decode(Int.self, forKey: .threadId)
         agent = try c.decode(String.self, forKey: .agent)
         type = try c.decode(String.self, forKey: .type)
@@ -67,7 +73,7 @@ public struct NeedsYouItem: Decodable, Equatable, Sendable {
 
     /// An item from the counts-only summary (an older server without /api/needs-you): View only.
     public init(_ s: BoardSummary.Item) {
-        self.init(postId: s.postId, threadId: s.threadId, agent: s.agent, type: s.type)
+        self.init(postId: s.postId, threadId: s.threadId, agent: s.agent, type: s.type, issueId: s.issueId)
     }
 }
 
@@ -79,9 +85,10 @@ public enum ItemAction: Equatable, Sendable {
 
     public static func available(for item: NeedsYouItem) -> [ItemAction] {
         var out: [ItemAction] = [.view]
+        if item.issueId != nil { return out }
         // A sealed decision must be unsealed (in the dashboard) before it can be finalized.
-        if item.type == "decision", item.decisionStatus == "proposal", !item.sealed {
-            out.append(.finalizeDecision(postId: item.postId))
+        if let postId = item.postId, item.type == "decision", item.decisionStatus == "proposal", !item.sealed {
+            out.append(.finalizeDecision(postId: postId))
         }
         if let task = item.taskId, item.taskStatus == "proposed" {
             out.append(.acceptTask(taskId: task))
@@ -95,6 +102,7 @@ public enum DashboardPage: Equatable, Sendable {
     case home
     case settings
     case post(Int)
+    case issue(Int)
 
     /// The `next` sent to POST /api/login-links.
     public var next: String {
@@ -102,6 +110,7 @@ public enum DashboardPage: Equatable, Sendable {
         case .home: return "/"
         case .settings: return "/#settings"
         case .post(let id): return "/#post-\(id)"
+        case .issue(let id): return "/#issue-\(id)"
         }
     }
 
@@ -110,6 +119,7 @@ public enum DashboardPage: Equatable, Sendable {
         case .home: return nil
         case .settings: return "settings"
         case .post(let id): return "post-\(id)"
+        case .issue(let id): return "issue-\(id)"
         }
     }
 }

@@ -193,13 +193,17 @@ def test_v1_migration_preserves_manual_acceptance_and_history(env):
     for column in ('authorization_grant_id', 'authorization_source', 'category'):
         conn.execute(f'ALTER TABLE tasks DROP COLUMN {column}')
     conn.execute('DROP TABLE authorization_grants')
+    for table in ("issue_comments", "issue_links", "issues"):
+        conn.execute(f"DROP TABLE {table}")
     conn.execute('PRAGMA user_version=1')
     migrated = Board(env.settings, clock=env.clock)
-    assert migrated.conn.execute('PRAGMA user_version').fetchone()[0] == db.SCHEMA_VERSION == 3
+    assert migrated.conn.execute('PRAGMA user_version').fetchone()[0] == db.SCHEMA_VERSION == 4
     for task_id in (tid, created):
         assert migrated.get_task(env.p['codex'], task_id)['authorization']['source'] == 'human'
     assert migrated.get_task(env.p['codex'], proposed)['authorization']['source'] == 'none'
     assert len(migrated.get_task(env.p['codex'], tid)['events']) == 2
+    assert migrated.conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0] == 0
+    assert "needs_human" in {r[1] for r in migrated.conn.execute("PRAGMA table_info(issue_links)")}
     db.init_schema(migrated.conn)  # rerunning migration preserves provenance
     assert migrated.claim_task(env.p['codex'], env.sid['codex'], tid)['owner_may_work']
 

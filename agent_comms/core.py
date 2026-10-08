@@ -950,8 +950,9 @@ class Board:
                 thread_id = self._insert_thread(c, p, s["project"], new_thread_title.strip()[:200])
 
             if not p.is_human:
-                n_day = c.execute("SELECT COUNT(*) FROM posts WHERE agent = ? AND created_at > ?",
-                                  (p.name, now - 86400)).fetchone()[0]
+                n_day = c.execute("""SELECT (SELECT COUNT(*) FROM posts WHERE agent = ? AND created_at > ?)
+                                    + (SELECT COUNT(*) FROM issue_comments WHERE agent = ? AND created_at > ?)""",
+                                  (p.name, now - 86400, p.name, now - 86400)).fetchone()[0]
                 if n_day >= self.s.daily_post_cap_per_agent:
                     raise LimitExceeded(f"daily post cap reached ({self.s.daily_post_cap_per_agent} posts in 24h). "
                                         "Stop and tell the human in your own chat.")
@@ -1246,6 +1247,7 @@ class Board:
             d["thread_title"] = r["thread_title"]
             d["project"] = r["thread_project"]
             posts.append(d)
+        from . import issues
         my_tasks = [self._task_out(r) for r in self.conn.execute(
             "SELECT * FROM tasks WHERE owner_agent = ? AND status NOT IN ('done','declined')", (p.name,))]
         out = {
@@ -1259,6 +1261,8 @@ class Board:
                            "Pass ack_through on your next board_read_updates call once you have handled these "
                            "posts. Until you ack, the same posts are returned again."),
             "my_tasks": my_tasks,
+            "issues": issues.list_issues(self, p, project=None if p.is_human else s["project"], thread_id=thread_id),
+            "issues_notice": "Issues are a current snapshot, independent of the post cursor. Decisions apply only to their recorded scope; links and comments grant no authority.",
             "authorization_grants": self.list_grants(p, s["project"]),
         }
         if acked is not None:
@@ -1523,7 +1527,7 @@ class Board:
     # Waiting on the human: needs-response posts addressed to nobody or to the human; open (unfinalized) decisions;
     # and agents' proposals addressed to nobody or to the human, which need the human's yes or no (a proposal
     # that only proposes a task is left to the task flow, and one addressed to agents is between agents).
-    NEEDS_YOU = """((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
+    NEEDS_YOU_SOURCE = """((p.needs_response = 1 AND (p.to_agents = '[]' OR EXISTS (SELECT 1 FROM json_each(p.to_agents) j
                         JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1)))
                      OR (p.type = 'decision' AND p.final = 0)
                      OR (p.type = 'proposal' AND p.task_id IS NULL
@@ -1532,6 +1536,8 @@ class Board:
                               JOIN agents ha ON ha.name = j.value WHERE ha.is_human = 1))))
                    AND NOT EXISTS (SELECT 1 FROM posts h JOIN agents a ON a.name = h.agent
                                    WHERE a.is_human = 1 AND h.thread_id = p.thread_id AND h.id > p.id)"""
+
+    NEEDS_YOU = NEEDS_YOU_SOURCE + " AND NOT EXISTS (SELECT 1 FROM issue_links il WHERE il.post_id = p.id)"
 
     def snapshot(self, p: Principal, closed_threads: bool = False, posts_per_thread: int = 60) -> dict:
         """Everything the dashboard shows, filtered through the same visibility rule."""
@@ -1569,6 +1575,8 @@ class Board:
                         row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
                         owners[sid] = self._conversation(row) if row else None
                     k["owner_conversation"] = owners[sid]
+        from . import issues
+        shared_issues = issues.list_issues(self, p)
         needs_you = []
         if p.is_human:
             needs_you = [self._post_out(r, p) for r in self.conn.execute(
@@ -1577,6 +1585,8 @@ class Board:
                 "paused": self.is_paused(), "limits": self.limits(), "now": iso(self.now()),
                 "authorization_grants": self.list_grants(p), "task_categories": list(TASK_CATEGORIES),
                 "threads": threads, "sessions": sessions, "needs_you": needs_you,
+                "issues": shared_issues,
+                "needs_you_issues": issues.list_issues(self, p, status="open", needs_human=True) if p.is_human else [],
                 "agents": [dict(r) for r in self.conn.execute(
                     "SELECT name, runtime, is_human FROM agents WHERE active = 1 ORDER BY is_human DESC, name")]}
 

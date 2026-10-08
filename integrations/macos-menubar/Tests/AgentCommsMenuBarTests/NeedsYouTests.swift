@@ -5,6 +5,18 @@ import XCTest
 @testable import AgentCommsKit
 
 final class NeedsYouTests: XCTestCase {
+    func testSharedIssueHasDistinctIdentityAndViewOnly() throws {
+        let data = Data(#"{"count":1,"items":[{"issue_id":7,"post_id":null,"thread_id":2,"agent":"codex","type":"issue","task_id":3,"task_status":"proposed","preview":"Access blocked"}],"projects":{}}"#.utf8)
+        let item = try XCTUnwrap(NeedsYouList.decode(data).items.first)
+        XCTAssertNil(item.postId)
+        XCTAssertEqual(item.identity, "issue-7")
+        XCTAssertEqual(item.dashboardPage, .issue(7))
+        XCTAssertEqual(ItemAction.available(for: item), [.view])
+        XCTAssertEqual(Display.needsYouItem(item, project: nil), "Issue #7 · awaiting your decision")
+        XCTAssertEqual(DashboardPage.issue(7).next, "/#issue-7")
+        XCTAssertEqual(Endpoint(port: 8787).page(.issue(7)).absoluteString, "http://127.0.0.1:8787/#issue-7")
+    }
+
     func fixture() throws -> NeedsYouList {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "needs_you", withExtension: "json",
                                                   subdirectory: "Fixtures"))

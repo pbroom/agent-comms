@@ -127,15 +127,19 @@ def test_v2_database_migrates_and_keeps_sessions(env):
     conn = env.board.conn
     for column in ("client_kind", "client_session_id"):
         conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
+    for table in ("issue_comments", "issue_links", "issues"):
+        conn.execute(f"DROP TABLE {table}")
     conn.execute("PRAGMA user_version=2")
     before = conn.execute("SELECT id, agent, project FROM sessions ORDER BY id").fetchall()
     migrated = Board(env.settings, clock=env.clock)
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 3
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 4
     cols = {r[1] for r in migrated.conn.execute("PRAGMA table_info(sessions)")}
     assert {"client_kind", "client_session_id"} <= cols
     assert [tuple(r) for r in migrated.conn.execute("SELECT id, agent, project FROM sessions ORDER BY id")] == \
         [tuple(r) for r in before]
     assert client_row(env, env.sid["codex"]) == (None, None)
+    assert migrated.conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0] == 0
+    assert "needs_human" in {r[1] for r in migrated.conn.execute("PRAGMA table_info(issue_links)")}
     db.init_schema(migrated.conn)   # idempotent
     sid = migrated.register_session(env.p["claude"], PROJECT, client=("claude-code", CLAUDE_ID))["session_id"]
     assert client_row(env, sid) == ("claude-code", CLAUDE_ID)

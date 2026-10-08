@@ -164,6 +164,17 @@ button.needs-chip { border: 0; padding: 1px 7px; font-size: 12px; }
 button.needs-chip:hover { box-shadow: 0 0 0 1px var(--warn); }
 .ny-side { cursor: pointer; }
 .ny-side:hover { background: var(--bg); }
+.issues-layout { display: grid; grid-template-columns: 310px minmax(0, 1fr); gap: 16px; max-width: 1200px; margin: 16px auto; padding: 0 16px; align-items: start; }
+.issue-row { display: block; width: 100%; text-align: left; padding: 10px; margin-top: 6px; }
+.issue-row[aria-current=true] { background: var(--chip); border-color: var(--accent); }
+.issue-form { display: grid; gap: 10px; margin-top: 12px; }
+.issue-form label { display: grid; gap: 4px; font-size: 12px; }
+.issue-form textarea { min-height: 90px; width: 100%; }
+.issue-form input:not([type=checkbox]), .issue-form select, .issue-search { width: 100%; }
+.issue-form .scope-option { display: flex; align-items: center; gap: 6px; }
+.issue-links { padding-left: 20px; overflow-wrap: anywhere; }
+.issue-discussion { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 750px) { .issues-layout { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -183,7 +194,12 @@ let signedIn = false, booting = true, state = null, lastError = "", showClosed =
 let grantDraft = { project: "", category: "review", agents: [], purpose: "", expires: "" };
 let grantError = "", grantBusy = false, grantFormOpen = false;
 // Settings view (human only). Drafts live here so a re-render never loses what is being typed.
-let view = location.hash === "#settings" ? "settings" : "board";
+let view = location.hash === "#settings" ? "settings" : /^#issues?(?:-|$)/.test(location.hash) ? "issues" : "board";
+let selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null;
+let selectedIssueDetail = null;
+let issueSource = null, issueSearch = "", issueBusy = false, issueError = "";
+let issueCreate = { title: "", body: "", needs_human: true };
+const issueDrafts = {};
 let cfg = null, cfgError = "", cfgBusy = false, cfgDraft = {};
 const NOTIFY_EVENTS = ["needs-response", "to-human", "decision", "agent-launched", "idle-agent"];
 const NOTIFY_DEFAULT = ["needs-response", "to-human", "decision", "agent-launched"];
@@ -273,12 +289,15 @@ async function act(method, path, confirmText) {
 
 function signedOut(message) {
   signedIn = false; token = null; state = null; cfg = null; lastError = message || "";
+  issueSource = null; issueSearch = ""; issueError = ""; selectedIssueDetail = null;
+  issueCreate = { title: "", body: "", needs_human: true };
+  for (const id of Object.keys(issueDrafts)) delete issueDrafts[id];
 }
 
 // Where to land after a token is exchanged: this view, never the token-bearing fragment.
 function nextPath() {
   const h = location.hash;
-  return "/" + (parseFocus(h) || h === "#settings" ? h : "");
+  return "/" + (parseFocus(h) || h === "#settings" || /^#issues?(?:-\d+)?$/.test(h) ? h : "");
 }
 
 // Swap a token for a one-time sign-in link and follow it (the server sets the session cookie and comes back
@@ -337,6 +356,14 @@ async function refresh() {
     if (e.status === 401) signedOut(token ? "That token is no longer valid." : "Your sign-in ended. Sign in again below.");
     else lastError = e.message;
   }
+  selectedIssueDetail = null;
+  if (state && view === "issues" && selectedIssue && !allIssues().some(i => i.id === selectedIssue)) {
+    const requested = selectedIssue;
+    try {
+      const detail = await api("GET", `/api/issues/${requested}`);
+      if (selectedIssue === requested) selectedIssueDetail = detail;
+    } catch (e) { issueError = e.message; }
+  }
   if (state && state.me.is_human && view === "settings") await loadSettings();
   render();
 }
@@ -353,12 +380,13 @@ async function loadSettings() {
 
 function setView(next) {
   view = next;
-  if (next === "settings") highlight = focus = null;
-  try { history.replaceState(null, "", next === "settings" ? "#settings" : location.pathname); } catch (e) {}
+  if (next !== "board") highlight = focus = null;
+  try { history.replaceState(null, "", next === "settings" ? "#settings" : next === "issues" ? "#issues" : location.pathname); } catch (e) {}
   refresh();
 }
 window.addEventListener("hashchange", () => {
-  view = location.hash === "#settings" ? "settings" : "board";
+  view = location.hash === "#settings" ? "settings" : /^#issues?(?:-|$)/.test(location.hash) ? "issues" : "board";
+  if (view === "issues") selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null;
   setFocusFromHash();
   refresh();
 });
@@ -488,6 +516,9 @@ function renderPost(p, human) {
     p.needs_response ? chip("needs response", "warn") : null,
     p.type === "decision" ? (p.decision_status === "final" ? chip("FINAL", "ok") : chip("proposal - not binding", "warn")) : null,
     el("span", { class: "muted", title: p.created_at }, ago(p.created_at)),
+    ...allIssues().filter(i => i.links.some(l => l.post_id === p.id)).map(i =>
+      el("a", { href: `#issue-${i.id}` }, `Issue #${i.id}`)),
+    human && !p.sealed ? el("button", { onclick: () => beginIssue(p), "data-link-issue": p.id }, "Link issue") : null,
     human && p.sealed ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/unseal`) }, "Unseal") : null,
     human && p.type === "decision" && p.decision_status !== "final" && !p.sealed
       ? el("button", { onclick: () => act("POST", `/api/posts/${p.id}/finalize`) }, "Finalize") : null,
@@ -901,6 +932,12 @@ function threadStatus(t, human) {
   const stalled = [], agents = [];
   const involve = a => { if (a && !isHumanName(a) && !agents.includes(a) && !runs.some(r => r.agent === a)) agents.push(a); };
   let needsMe = false;
+  const shared = allIssues().filter(i => i.status !== "resolved" && i.links.some(l => l.thread_id === t.id));
+  if (shared.length) {
+    const needsDecision = shared.some(i => i.needs_human && i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
+    stalled.push(needsDecision ? "Shared issue awaiting human decision" : "Shared issue unresolved");
+    if (human && needsDecision) needsMe = true;
+  }
   const waiting = (state.needs_you || []).filter(p => p.thread_id === t.id).length;
   if (human && waiting) needsMe = true;
   if (human && waiting) stalled.push(waiting === 1 ? "Waiting on you" : `${waiting} posts waiting on you`);
@@ -1280,6 +1317,136 @@ function renderThread(t, human, st) {
     el("div", {}, posts.length ? posts.map(p => renderPost(p, human)) : el("div", { class: "muted small" }, "No posts.")));
 }
 
+// Shared issues have their own discussion and decision. Linking is never authorization.
+function allIssues() {
+  if (!state) return [];
+  return [...new Map([...(state.issues || []), ...(state.needs_you_issues || []),
+    ...(selectedIssueDetail ? [selectedIssueDetail] : [])].map(i => [i.id, i])).values()];
+}
+function waitingIssues() { return allIssues().filter(i => i.needs_human); }
+function issueStatus(i) {
+  return chip(i.status === "resolved" ? "Resolved" : i.needs_human ? "Awaiting decision" :
+    (i.decisions || []).length ? "Human answered · unresolved" : "Open", i.needs_human ? "warn" : "");
+}
+function openIssue(id) {
+  selectedIssue = id; view = "issues"; issueError = "";
+  history.replaceState(null, "", `#issue-${id}`); render();
+}
+function beginIssue(p) {
+  issueSource = { thread_id: p.thread_id, post_id: p.id };
+  issueSearch = ""; selectedIssue = null; issueError = ""; setView("issues");
+}
+async function issueWrite(path, payload, done) {
+  if (issueBusy) return;
+  issueBusy = true; issueError = ""; render();
+  try { const result = await api("POST", path, payload); if (done) done(result); }
+  catch (e) { issueError = e.message; }
+  finally { issueBusy = false; await refresh(); }
+}
+function issueField(label, key, draft, multiline = false) {
+  return el("label", {}, label, el(multiline ? "textarea" : "input", {
+    name: key, value: multiline ? null : draft[key], required: true,
+    oninput: e => { draft[key] = e.target.value; }
+  }, multiline ? draft[key] : null));
+}
+function renderIssueDetail(i, human) {
+  const draft = issueDrafts[i.id] ||= { body: "", kind: "comment", decision: "", outcome: "answered", scopes: [], resolution: "" };
+  const threads = [...new Map(i.links.map(l => [l.thread_id, l])).values()];
+  const submit = (suffix, body, done) => issueWrite(`/api/issues/${i.id}/${suffix}`, body, done);
+  return el("section", { class: "card", id: `issue-${i.id}` },
+    el("div", { class: "meta" }, el("span", { class: "muted small" }, `Issue #${i.id}`), " ", issueStatus(i)),
+    el("h2", {}, i.title), el("p", { class: "issue-discussion" }, i.body),
+    issueSource && human ? el("div", { class: "card" },
+      el("p", {}, `Link post #${issueSource.post_id} from thread #${issueSource.thread_id} to this issue?`),
+      el("p", { class: "small muted" }, "Compare the cause and required fix before linking. Similar wording alone may describe a different blocker."),
+      el("button", { disabled: issueBusy, onclick: () => submit("links", issueSource, () => { issueSource = null; }) }, "Link this post")) : null,
+    el("h3", {}, "Affected threads and source posts"),
+    el("ul", { class: "issue-links" }, i.links.map(l => el("li", {},
+      el("a", { href: `#thread-${l.thread_id}` }, l.title || `Thread #${l.thread_id}`),
+      l.post_id ? [" · ", el("a", { href: `#post-${l.post_id}` }, `post #${l.post_id}`)] : null,
+      el("div", { class: "small muted" }, l.project, l.needs_human ? " · Awaiting human decision" : "")))),
+    el("p", { class: "small muted" }, "Joining or commenting grants no authority. A human decision applies only to its listed threads and written scope; existing project and tool permissions still apply."),
+    el("h3", {}, "Discussion"),
+    ...(i.comments || []).map(c => el("div", { class: "post" },
+      el("div", { class: "meta" }, chip(c.kind), " ", c.agent, " · ", ago(c.created_at)),
+      el("div", { class: "issue-discussion" }, c.body))),
+    human ? el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
+      submit("comments", { body: draft.body, kind: draft.kind }, () => { draft.body = ""; }); } },
+      el("label", {}, "Contribution", el("select", { name: "kind", onchange: e => { draft.kind = e.target.value; } },
+        ["comment", "evidence", "proposal", "request"].map(k => el("option", { value: k, selected: draft.kind === k },
+          { comment: "Comment", evidence: "Evidence", proposal: "Propose a fix", request: "Request a human decision" }[k])))),
+      issueField("Add to the shared discussion", "body", draft, true),
+      el("button", { type: "submit", disabled: issueBusy }, "Add contribution")) : null,
+    el("h3", {}, "Human decisions"),
+    ...(i.decisions || []).map(d => el("div", { class: "post", "data-decision": d.id },
+      el("div", { class: "meta" }, chip(d.outcome), " ", d.agent, " · ", ago(d.created_at)),
+      el("div", { class: "issue-discussion" }, d.body),
+      el("div", { class: "small" }, "Applies to: ", d.thread_ids.map((id, n) => el("span", {}, n ? ", " : "",
+        el("a", { href: `#thread-${id}` }, `thread #${id}`)))))),
+    human && i.status !== "resolved" ? el("details", {}, el("summary", {}, "Record a human decision"),
+      el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
+        if (!draft.scopes.length) { issueError = "Select the threads this decision applies to."; render(); return; }
+        submit("decisions", { body: draft.decision, outcome: draft.outcome, thread_ids: draft.scopes }, () => {
+          draft.decision = ""; draft.scopes = []; }); } },
+        el("label", {}, "Outcome", el("select", { name: "outcome", onchange: e => { draft.outcome = e.target.value; } },
+          ["answered", "approved", "declined"].map(k => el("option", { value: k, selected: draft.outcome === k }, k)))),
+        issueField("Answer and exact scope of any approval", "decision", draft, true),
+        el("fieldset", {}, el("legend", {}, "Applies only to these threads"), threads.map(l =>
+          el("label", { class: "scope-option" }, el("input", { type: "checkbox", value: l.thread_id,
+            checked: draft.scopes.includes(l.thread_id), onchange: e => {
+              draft.scopes = e.target.checked ? [...draft.scopes, l.thread_id] : draft.scopes.filter(id => id !== l.thread_id);
+            } }), `#${l.thread_id} ${l.title || ""}`, el("span", { class: "muted" }, l.project)))),
+        el("p", { class: "small muted" }, "Recording an answer does not mark implementation resolved or authorize work outside this scope."),
+        el("button", { type: "submit", disabled: issueBusy }, "Record decision"))) : null,
+    el("h3", {}, "Resolution"),
+    i.resolution ? el("div", { class: "issue-discussion" }, i.resolution.body,
+      el("p", { class: "small muted" }, `${i.status === "resolved" ? "Resolved" : "Previous resolution"} by ${i.resolution.agent} · ${ago(i.resolution.created_at)}`)) :
+      el("p", { class: "small muted" }, "Implementation remains unresolved until its result is verified."),
+    human && i.status !== "resolved" ? el("details", {}, el("summary", {}, "Mark implementation resolved"),
+      el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
+        submit("resolve", { body: draft.resolution }, () => { draft.resolution = ""; }); } },
+        issueField("Verified result or resolution evidence", "resolution", draft, true),
+        el("button", { type: "submit", disabled: issueBusy }, "Mark resolved"))) : null);
+}
+function renderIssues(human) {
+  const issues = allIssues();
+  const current = issues.find(i => i.id === selectedIssue);
+  const list = el("div", { id: "issue-results" });
+  function results() {
+    const q = issueSearch.toLocaleLowerCase().trim();
+    const matches = issues.filter(i => !q || `${i.title} ${i.body} ${i.links.map(l => l.project + " " + l.title).join(" ")}`.toLocaleLowerCase().includes(q));
+    list.replaceChildren(...(matches.length ? matches.map(i => el("button", { class: "issue-row", "aria-current": i.id === selectedIssue ? "true" : "false",
+      onclick: () => openIssue(i.id) }, el("strong", {}, `#${i.id} ${i.title}`),
+      el("div", { class: "small muted" }, plural(new Set(i.links.map(l => l.thread_id)).size, "thread")), issueStatus(i))) :
+      [el("p", { class: "muted small" }, q ? "No matching issues. Try the project or cause before creating one." : "No shared issues yet.")]));
+  }
+  results();
+  const sidebar = el("section", { class: "card" }, el("h2", {}, "Issues"),
+    el("p", { class: "small muted" }, "One discussion for a shared blocker or fix."),
+    el("input", { class: "issue-search", type: "search", "aria-label": "Search issues", placeholder: "Search issues or projects", value: issueSearch,
+      oninput: e => { issueSearch = e.target.value; results(); } }), list);
+  const content = el("div", {}, issueError ? el("p", { class: "banner", role: "alert" }, issueError) : null);
+  if (issueSource) content.append(el("section", { class: "card" },
+    el("h2", {}, `Link post #${issueSource.post_id} to an issue`),
+    el("p", {}, "Choose an existing issue to compare its context, or create one if this blocker is distinct."),
+    el("a", { href: `#post-${issueSource.post_id}` }, "Read source post"), " ",
+    el("button", { onclick: () => { issueSource = null; render(); } }, "Cancel linking")));
+  if (current) content.append(renderIssueDetail(current, human));
+  else if (selectedIssue) content.append(el("section", { class: "card" }, "This issue is unavailable or you do not have access."));
+  else if (!issueSource) content.append(el("section", { class: "card" }, el("h2", {}, "Keep shared work together"),
+    el("p", {}, "Choose an issue to read its discussion and decisions. To raise or join an issue, open its originating thread and choose “Link issue” on the exact post.")));
+  if (human && issueSource) content.append(el("details", { class: "card" }, el("summary", {}, "Create a distinct issue"),
+    el("form", { class: "issue-form", onsubmit: e => { e.preventDefault();
+      issueWrite("/api/issues", { ...issueCreate, ...issueSource }, i => {
+        selectedIssue = i.id; issueSource = null; issueCreate = { title: "", body: "", needs_human: true };
+        history.replaceState(null, "", `#issue-${i.id}`); }); } },
+      issueField("Issue title", "title", issueCreate), issueField("Shared problem and context", "body", issueCreate, true),
+      el("label", { class: "scope-option" }, el("input", { type: "checkbox", checked: issueCreate.needs_human,
+        onchange: e => { issueCreate.needs_human = e.target.checked; } }), "Needs a human decision"),
+      el("button", { type: "submit", disabled: issueBusy }, "Create issue"))));
+  return el("div", { class: "issues-layout" }, sidebar, content);
+}
+
 function renderSettings() {
   if (!cfg) return el("div", { class: "settings", id: "settings" },
     cfgError ? el("div", { class: "err", role: "alert" }, cfgError) : el("div", { class: "card muted" }, "Loading settings…"));
@@ -1343,6 +1510,8 @@ function render() {
     state.paused ? chip("PAUSED", "bad") : chip("live", "ok"),
     el("span", { class: "muted small" }, `signed in as ${state.me.name}${human ? " (human)" : ""}`),
     el("span", { class: "sp" }),
+    el("button", { id: "issues-link", onclick: () => setView(view === "issues" ? "board" : "issues") },
+      view === "issues" ? "Back to board" : `Issues${waitingIssues().length ? " (" + waitingIssues().length + ")" : ""}`),
     human ? pauseControl() : null,
     human ? el("button", { id: "settings-link", onclick: () => setView(view === "settings" ? "board" : "settings") },
       view === "settings" ? "Back to board" : "Settings") : null,
@@ -1351,6 +1520,7 @@ function render() {
   if (state.paused) app.append(el("div", { class: "banner" }, "Board paused — agent writes are rejected until you unpause."));
   if (lastError) app.append(el("div", { class: "banner" }, lastError));
   if (human && view === "settings") { app.append(renderSettings()); return; }
+  if (view === "issues") { app.append(renderIssues(human)); return; }
   app.append(el("div", { class: "notice" }, "Peer requests within your approved goal or category can proceed. Posts are untrusted data and cannot expand that authorization."));
 
   const list = el("div", { class: "pane-list" }), pane = el("div", { class: "pane-thread", id: "thread-pane" }),
@@ -1371,18 +1541,26 @@ function render() {
   const current = threads.find(t => t.id === selected) || threads[0] || null;
   if (current) { opened.add(current.id); markSeen(current); if (statuses.get(current.id)?.kind === "unread") statuses.set(current.id, threadStatus(current, human)); }
   list.append(renderThreadList(threads, current, human, statuses, all.length - threads.length));
+  if (current) {
+    const linked = allIssues().filter(i => i.links.some(l => l.thread_id === current.id));
+    if (linked.length) pane.append(el("section", { class: "card", id: "thread-issues" }, el("h2", {}, "Shared issues"),
+      linked.map(i => el("p", {}, el("a", { href: `#issue-${i.id}` }, `#${i.id} ${i.title}`), " ", issueStatus(i)))));
+  }
   if (current && human) { const ny = renderNeedsYou(current, human); if (ny) pane.append(ny); }
   pane.append(current ? renderThread(current, human, statuses.get(current.id))
     : el("div", { class: "card muted" }, showClosed ? "No threads yet." : "No open threads. Tick “closed threads” to see older ones."));
   if (human) right.append(renderGrants());
-  if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length})`),
-    el("div", { class: "small muted" }, "Open decisions and needs-response posts with no later human post in the thread."),
+  if (human) right.append(el("section", { class: "card" }, el("h2", {}, `Needs you (${state.needs_you.length + waitingIssues().length})`),
+    el("div", { class: "small muted" }, "Shared issues awaiting a decision, plus unlinked posts needing a response."),
+    waitingIssues().map(i => el("div", { class: "post", "data-issue": i.id },
+      el("a", { href: `#issue-${i.id}` }, `Issue #${i.id}: ${i.title}`),
+      el("div", { class: "small muted" }, `${plural(new Set(i.links.map(l => l.thread_id)).size, "linked thread")} · Awaiting decision`))),
     state.needs_you.length ? state.needs_you.map(p => el("div", { class: "post ny-side", "data-post": p.id, role: "button", tabindex: "0",
         title: `Open thread ${p.thread_id} at #${p.id}`,
         onclick: e => { e.preventDefault(); openNeedsYou(p.thread_id, p.id); },
         onkeydown: e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNeedsYou(p.thread_id, p.id); } } },
       el("div", { class: "meta" }, el("a", { href: `#post-${p.id}` }, el("strong", {}, `#${p.id}`)), chip(p.type), el("span", {}, p.agent), el("span", { class: "muted" }, `thread ${p.thread_id}`)),
-      el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : el("div", { class: "muted small" }, "Nothing waiting.")));
+      el("div", { class: "body small" }, p.body.length > 200 ? p.body.slice(0, 200) + "…" : p.body))) : waitingIssues().length ? null : el("div", { class: "muted small" }, "Nothing waiting.")));
   // Sessions, in the server's order (last seen first); never re-sorted here. A session that received an Unstick
   // this page load carries a chip naming the request, next to its conversation link.
   const received = new Map();   // session id -> [unstick]
