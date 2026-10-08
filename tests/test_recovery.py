@@ -143,3 +143,52 @@ def test_exact_routing_carries_recovery_link_until_successor_pickup(env):
     pickup(env,originals[0])
     assert row(env,obligation)['state']=='finished'
     assert row(env,originals[0])['state']=='started'
+
+
+def test_repickup_after_block_can_retire(env):
+    _, originals, obligation=setup(env,2)
+    pickup(env,originals[0])
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],originals[0]['id'],'codex','blocked','temporary')
+    pickup(env,originals[1]); pickup(env,originals[0])
+    assert row(env,obligation)['state']=='finished'
+
+
+def test_evidenced_finish_before_other_pickup_can_retire(env):
+    tid, originals, obligation=setup(env,2)
+    pickup(env,originals[0])
+    evidence=env.post('codex',tid,'verified completion')
+    requests.progress(env.board,env.p['codex'],env.sid['codex'],originals[0]['id'],'codex','finished','done',[evidence['id']])
+    pickup(env,originals[1])
+    assert row(env,obligation)['state']=='finished'
+    assert row(env,originals[0])['state']=='finished'
+    assert row(env,originals[1])['state']=='started'
+
+
+def authorized_successor(e,tmp_path):
+    post,old,new,project=ended_owner(e,tmp_path)
+    task=e.accepted_task(post['thread_id'])
+    e.board.claim_task(e.p['codex'],new,task)
+    return post,old,new,project
+
+
+def test_active_authorized_successor_preserves_own_dirty_artifacts(env,tmp_path):
+    import pathlib
+    post,old,new,project=authorized_successor(env,tmp_path)
+    artifact=pathlib.Path(project,'audit-evidence.md'); artifact.write_text('ongoing')
+    out=recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
+    assert out['assigned_session']==new and out['state']=='queued'
+    assert artifact.read_text()=='ongoing'
+
+
+@pytest.mark.parametrize('gate',['old_lease','old_live','other_peer','git_operation'])
+def test_active_successor_exception_still_fences_old_owner_and_peers(env,tmp_path,gate):
+    import pathlib
+    post,old,new,project=authorized_successor(env,tmp_path)
+    if gate=='old_lease':
+        task=env.accepted_task(post['thread_id']); env.board.claim_task(env.p['codex'],old,task)
+    elif gate=='old_live':
+        env.clock.advance(1); env.board.conn.execute('UPDATE sessions SET last_seen=? WHERE id=?',(env.clock(),old))
+    elif gate=='other_peer': env.session('claude',project=project)
+    else: pathlib.Path(project,'.git','MERGE_HEAD').write_text('pending')
+    with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
+    assert row(env,post)['assigned_session']==old

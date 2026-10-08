@@ -50,6 +50,21 @@ def record(board, p, recovery_post_id, recipient, sources):
                        (PREFIX + str(recovery_post_id) + '.' + recipient, json.dumps(value), p.name, board.now()))
 
 
+def _same_execution(board, item, row):
+    """Follow a contiguous audited lifecycle without crossing reassignment."""
+    if not item.get('picked_up') or row['assigned_session'] != item['pickup_session']:
+        return False
+    events = list(board.conn.execute(
+        'SELECT * FROM request_events WHERE post_id=? AND recipient=? AND version>? AND version<=? ORDER BY version',
+        (item['post_id'], item['recipient'], item['pickup_version'], row['version'])))
+    return (len(events) == row['version'] - item['pickup_version'] and all(
+        event['version'] == item['pickup_version'] + i + 1
+        and event['assigned_session'] == item['pickup_session']
+        and event['assigned_agent'] == row['assigned_agent']
+        and event['state'] in ('started', 'blocked', 'finished')
+        for i, event in enumerate(events)))
+
+
 def after_pickup(board, p, session_id, source, previous):
     """Called after the guarded started transition under its existing write lock."""
     from . import requests, decision_actions
@@ -65,7 +80,8 @@ def after_pickup(board, p, session_id, source, previous):
         if link.get('retired'):
             continue
         matching = [s for s in link['sources'] if s['post_id'] == source['id'] and s['recipient'] == previous['recipient']
-                    and s['version'] == previous['version'] and not s['picked_up']]
+                    and ((s['version'] == previous['version'] and not s['picked_up'])
+                         or _same_execution(board, s, previous))]
         if not matching:
             continue
         raw = board.conn.execute('SELECT sealed FROM posts WHERE id=?', (link['post_id'],)).fetchone()
@@ -88,8 +104,9 @@ def after_pickup(board, p, session_id, source, previous):
                 break
             original = board.get_post(p, item['post_id'])
             work = next(r for r in original['requests'] if r['recipient'] == item['recipient'])
-            if (original['sealed'] or work['state'] != 'started' or work['version'] != item['pickup_version']
-                    or work['assigned_session'] != item['pickup_session']):
+            if (original['sealed'] or work['state'] not in ('started', 'finished')
+                    or not _same_execution(board, item, work)
+                    or (work['state'] == 'finished' and not work['evidence_post_ids'])):
                 ready = False
                 break
             decision_actions.assert_execution_authorized(board, original['id'], work['assigned_agent'])
@@ -132,7 +149,7 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
                 or type(run.get('ended_at')) not in (int, float)
                 or not old['last_seen'] <= run['ended_at'] <= board.now()):
             raise Conflict('old dispatcher is live, unknown, or outside this exact request')
-        blocker = workstreams._inactive(board, old, {'post_id': post_id, 'thread_id': post['thread_id']})
+        blocker = _ownership_blocker(board, old, session_id, post)
         if blocker:
             raise Conflict(blocker)
         decision_actions.assert_execution_authorized(board, post_id, p.name)
@@ -165,9 +182,50 @@ def after_route(board, p, source, previous):
         changed = False
         for item in link['sources']:
             if (item['post_id'] == source['id'] and item['recipient'] == previous['recipient']
-                    and item['version'] == previous['version'] and not item['picked_up']):
+                    and ((item['version'] == previous['version'] and not item['picked_up'])
+                         or _same_execution(board, item, previous))):
+                item['picked_up'] = False
                 item['version'] = current['version']
                 changed = True
         if changed:
             board.conn.execute('UPDATE board_state SET value=?,updated_by=?,updated_at=? WHERE key=?',
                                (json.dumps(link), p.name, board.now(), record['key']))
+
+
+def _ownership_blocker(board, old, session_id, post):
+    """Allow this authorized successor's work, without treating peers as idle."""
+    import os
+    from . import workstreams
+    from .dispatch import ACTIVE
+    current = board.conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+    path = os.path.realpath(old['worktree'] or old['project'])
+    same = path == os.path.realpath(current['worktree'] or current['project'])
+    leases = list(board.conn.execute("SELECT * FROM tasks WHERE owner_session=? AND thread_id=? AND status='working' AND lease_expires_at>?",
+                                     (session_id, post['thread_id'], board.now())))
+    authorized = any(board._task_authorization_active(t, current['agent']) for t in leases)
+    if not same or not authorized:
+        return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']})
+    for lease in board.conn.execute("SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session WHERE t.status IN ('working','blocked') AND t.lease_expires_at>?", (board.now(),)):
+        if lease['id'] == old['id'] or (lease['id'] != session_id and os.path.realpath(lease['worktree'] or lease['project']) == path):
+            return 'Old owner or another session still holds an active task lease'
+    for peer in board.conn.execute('''SELECT s.*,a.state,a.recorded_at FROM sessions s
+            JOIN agents identity ON identity.name=s.agent LEFT JOIN session_activity a ON a.session_id=s.id
+            WHERE s.id NOT IN (?,?) AND identity.active=1 AND identity.is_human=0 AND s.last_seen>=?''',
+            (old['id'],session_id,board.now()-90)):
+        if (os.path.realpath(peer['worktree'] or peer['project']) == path
+                and (peer['state'] != 'idle' or peer['recorded_at'] is None or not board.now()-90 <= peer['recorded_at'] <= board.now())):
+            return 'Another live session in the owner worktree has active or unknown activity'
+    for record in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
+        run = json.loads(record['value'])
+        if run.get('status') in ACTIVE and (run.get('agent') == old['agent'] or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path)):
+            return 'Owner dispatcher run is active or unresolved'
+    try:
+        project = board._thread_row(post['thread_id'])['project']
+        if os.path.realpath(workstreams._git(path,'rev-parse','--path-format=absolute','--git-common-dir')) != os.path.realpath(workstreams._git(project,'rev-parse','--path-format=absolute','--git-common-dir')):
+            return 'Owner worktree belongs to another repository'
+        gitdir = workstreams._git(path,'rev-parse','--absolute-git-dir')
+        if any(os.path.exists(os.path.join(gitdir,name)) for name in ('MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','index.lock')):
+            return 'Owner worktree has an unfinished Git operation'
+    except Conflict as exc:
+        return str(exc)
+    return None
