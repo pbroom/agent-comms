@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 10  # v10: exact human-answer links and conservative legacy attention boundary
+SCHEMA_VERSION = 11  # v11: audited backfill of answered pre-tracking requests
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
@@ -304,8 +305,64 @@ def init_schema(conn: sqlite3.Connection) -> None:
         for column in ("client_kind", "client_session_id", "dispatch_run_id"):
             if column not in session_columns:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+        if conn.execute('PRAGMA user_version').fetchone()[0] < 11:
+            _backfill_legacy_requests(conn)
         _install_managed_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _backfill_legacy_requests(conn: sqlite3.Connection) -> None:
+    """v11: finish pre-tracking requests that the recipient visibly answered, with an audit event.
+
+    Before v7 a reply in the thread was how a request got answered, so those posts have no
+    request_progress rows and read as queued forever. Only posts older than tracking are touched:
+    all of them when upgrading from before v7, otherwise those created before the first explicit
+    request event (a v7+ board with no events is left alone). A recipient is finished only if it
+    later posted unsealed in the same thread or the linked task is terminal. Unanswered requests
+    keep their virtual queued row, so they stay strict and spend no routing attempt. Post seq is
+    unchanged, so nothing is redelivered.
+    """
+    if conn.execute('PRAGMA user_version').fetchone()[0] < 7:
+        cutoff = float('inf')
+    else:
+        cutoff = conn.execute('SELECT MIN(created_at) FROM request_events').fetchone()[0]
+        if cutoff is None:
+            return
+    now = conn.execute("SELECT CAST(strftime('%s','now') AS REAL)").fetchone()[0]
+    humans = {r[0]: r[1] for r in conn.execute('SELECT name,is_human FROM agents')}
+    managed = {r[0] for r in conn.execute('SELECT post_id FROM continuations')}
+    posts = conn.execute('''SELECT p.id,p.thread_id,p.agent,p.type,p.needs_response,p.to_agents,p.task_id,
+            t.status AS task_status FROM posts p LEFT JOIN tasks t ON t.id=p.task_id
+            WHERE p.created_at<? ORDER BY p.id''', (cutoff,)).fetchall()
+    for post in posts:
+        if post['id'] in managed or post['type'] == 'decision':
+            continue
+        if not (post['needs_response'] or post['type'] in ('request', 'handoff', 'question')
+                or humans.get(post['agent'])):
+            continue
+        for recipient in dict.fromkeys(json.loads(post['to_agents'])):
+            if recipient == post['agent'] or humans.get(recipient, 1):
+                continue
+            if conn.execute('SELECT 1 FROM request_progress WHERE post_id=? AND recipient=?',
+                            (post['id'], recipient)).fetchone():
+                continue
+            reply = conn.execute('SELECT MIN(id) FROM posts WHERE thread_id=? AND agent=? AND id>? AND sealed=0',
+                                 (post['thread_id'], recipient, post['id'])).fetchone()[0]
+            if reply is not None:
+                reason, evidence = f'legacy: answered by #{reply}', [reply]
+            elif post['task_status'] in ('done', 'declined'):
+                reason, evidence = f"legacy: task {post['task_id']} is {post['task_status']}", []
+            else:
+                continue
+            conn.execute('''INSERT INTO request_progress
+                (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
+                VALUES (?,?,'finished',?,NULL,?,?,1,?)''',
+                (post['id'], recipient, recipient, reason, json.dumps(evidence), now))
+            conn.execute('''INSERT INTO request_events
+                (post_id,recipient,actor,session_id,event_source,state,assigned_agent,assigned_session,
+                 reason,evidence_post_ids,version,created_at)
+                VALUES (?,?,NULL,NULL,'migration','finished',?,NULL,?,?,1,?)''',
+                (post['id'], recipient, recipient, reason, json.dumps(evidence), now))
 
 
 def _install_managed_writer_fence(conn: sqlite3.Connection) -> None:
