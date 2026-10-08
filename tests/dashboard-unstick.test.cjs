@@ -190,3 +190,45 @@ test('the note and the Sessions panel show which sessions received it, with thei
   assert.deepEqual([...document.querySelectorAll('#unstick-sessions a')].map(a => a.textContent), ['Open in ChatGPT', 'Open in Claude']);
   } finally { dom.window.close(); }   // a failed assertion must not leave the page's refresh timer running
 });
+
+test('after a click the button reads "Sending…" until the agent restarts, then leaves', async () => {
+  const t = thread(1, [post(10, 1, { to: ['codex'], needs_response: true })]);
+  const runs = [];
+  let unstickCalls = 0;
+  const reply = u => u === '/api/threads/1/unstick' ? (unstickCalls++, ok({ post_id: 61, agents: ['codex'], rule_id: 9,
+    dispatcher_running: true, paused: false, live_agents: [], no_runner: [], sessions: [], reasons: [] })) : fail(404, 'nf');
+  const { dom, document, win } = await setup({ threads: [t], reply, runs });
+  const rowButton = () => document.querySelector('button.unstick-row');
+  assert.ok(rowButton().classList.contains('unstick-btn'), 'shared style with a hover state');
+  rowButton().click();
+  await settle();
+  for (const b of [rowButton(), document.getElementById('unstick')]) {
+    assert.equal(b.textContent, 'Sending…');
+    assert.ok(b.classList.contains('sending') && b.disabled, 'tracing outline, not clickable again');
+  }
+  t.posts.push(post(61, 1, { agent: 'human', to: ['codex'], needs_response: true, created_at: new Date().toISOString() }));
+  await win.refresh(); await settle(20);
+  assert.equal(rowButton() && rowButton().textContent, 'Sending…', 'still waiting: the request alone is not a restart');
+  rowButton().click(); await settle(20);
+  assert.equal(unstickCalls, 1, 'no second send while waiting');
+  runs.push({ thread_id: 1, agent: 'codex', run_id: 's61-codex' });
+  await win.refresh(); await settle(20);
+  assert.equal(document.querySelector('.unstick-btn.sending'), null, 'the launch clears it');
+  assert.equal(rowButton(), null, 'and the thread is no longer stalled, so the button leaves');
+  dom.window.close();
+});
+
+test('"Sending…" stops at once when nothing can restart (dispatcher not running) and on errors', async () => {
+  const t = thread(1, [post(10, 1, { to: ['codex'], needs_response: true })]);
+  const down = await setup({ threads: [t], reply: () => ok({ post_id: 62, agents: ['codex'], rule_id: 9,
+    dispatcher_running: false, paused: false, live_agents: [], no_runner: [], sessions: [], reasons: [] }) });
+  down.document.querySelector('button.unstick-row').click(); await down.settle?.() ; await settle();
+  assert.equal(down.document.querySelector('.unstick-btn.sending'), null);
+  assert.match(down.document.getElementById('unstick-result').textContent, /dispatcher isn't running/);
+  down.dom.window.close();
+  const err = await setup({ threads: [t], reply: () => fail(409, 'unstick was used on this thread less than 2 minutes ago') });
+  err.document.querySelector('button.unstick-row').click(); await settle();
+  assert.equal(err.document.querySelector('.unstick-btn.sending'), null);
+  assert.ok(err.document.querySelector('button.unstick-row'), 'the button is back to "Unstick" so you can retry');
+  err.dom.window.close();
+});
