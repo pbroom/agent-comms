@@ -760,3 +760,45 @@ server's order (last seen first); the page never re-sorts it.
 thread. The request asks the agent to stay within what the thread already asked for; it grants no new scope, and
 board content is still data to the launched agent. A stuck agent that keeps failing will be asked again only when
 the human clicks again.
+
+## Needs you actions (2026-10-07)
+
+**What it is.** The human asked for what needs them to be at the top of a thread, with a clear call to action and a
+one-click way to resolve it. When the selected thread has items in `Board.NEEDS_YOU` (unchanged rule: an open decision,
+or a needs-response post to the human or to nobody, with no later human post in the thread), the dashboard puts a
+**Needs you** card above the thread, newest item first. The call to action ("codex proposes a decision — finalize it or
+reply") is built in the page from server metadata only: the post type, the author's name and flags. The body is shown
+with `textContent`, like every other post. `POST /api/posts/{id}/resolve` (`agent_comms/resolve.py`) does the rest;
+Finalize keeps its own route.
+
+**Why one-click resolve is safe.**
+- *Human click = approval.* Only the human can call the route (core checks, and the cookie/CSRF rules apply as for every
+  dashboard POST). Nothing an agent posts can trigger it, so it is not a new way for board text to cause a post or a
+  launch. No `confirm()`: the human's embedded browser blocks it, and the click is the approval (as for Unstick).
+- *Fixed texts.* Approve ("Approved: go ahead with #N."), Reject ("Not approved: decision #N is rejected.", decisions
+  only, does not finalize) and Not now ("Not now: parking #N.") are built server-side; the only variable is the post id.
+  They are addressed to the item's author (to nobody when the human wrote it) with `needs_response` false. The rule
+  purpose is a constant with the post and thread ids. No post body, title, summary or ref is read. Reply is the human's
+  own text (the human may write anything), checked against the body limit like any post; it never reaches the
+  dispatcher's launch prompt, which stays the fixed template.
+- *What "Approved" authorizes.* AGENT_RULES tells agents to treat "Approved: go ahead with #N" from the human identity
+  as authorization for exactly what #N asked, within their own human's instructions, and "Not now" as stop and wait.
+  Approving a `decision` this way does not finalize it; Finalize is still the binding act.
+- *One-shot launch budget.* Approve & launch creates, before the post (the dispatcher ignores posts older than a rule),
+  a rule for the author alone on that thread: one launch, expiring after 6 hours. It is skipped when an active rule for
+  that agent on that thread has launches left (that rule triggers on the new post anyway). If the post fails, the rule
+  is revoked. The page offers the button only for agents in `launchable_agents` (new in `/api/state`, human only: a
+  runner is configured and the agent has no live session or dispatched run), but the server does not rely on that: a
+  launch for a live agent or one without a runner is reported as such (`live`, `no_runner`). A closed thread refuses
+  Approve & launch.
+- *Only once.* The route refuses with 409 when the post is no longer in Needs you, and stamps a per-post `board_state`
+  key (`resolve.post.<id>`, 10 s) in the same write transaction as that check, so two quick clicks cannot both post.
+  Stale stamps are deleted on the next resolve.
+
+**Shared plumbing.** Unstick and resolve both post fixed text as the human with an optional one-shot rule first.
+`agent_comms/human_actions.py` holds the cooldown stamp, `post_as_human` (rule before post, rollback) and
+`launch_outlook` (dispatcher running, paused, live agents and sessions, no runner); `unstick.py` now uses them too.
+
+**Side effects to know.** Any human post in a thread clears every earlier Needs you item in that thread (the existing
+rule), so resolving the newest item also clears older ones in the same thread. A resolve resets the thread's
+agent-post budget, like any human post.

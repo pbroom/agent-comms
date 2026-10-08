@@ -18,18 +18,16 @@ Guardrails (DESIGN_NOTES "Unstick"):
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from . import db, dispatch
+from . import dispatch, human_actions
 from .core import TERMINAL, Board, Conflict, Principal
 
 UNSTICK_COOLDOWN_SECONDS = 120
-UNSTICK_RULE_HOURS = 6
+UNSTICK_RULE_HOURS = human_actions.RULE_HOURS
 STATE_PREFIX = "unstick.thread."
 MAX_IDS_PER_AGENT = 5    # post ids listed per agent in the body; the rest are counted
 MAX_REASONS = 20         # reasons listed in the body (keeps it far below the body size limit)
-MAX_SESSIONS = 20        # live session ids returned to the page
 
 PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and propose a prevention; "
            "stay within the thread's existing request.")
@@ -105,29 +103,6 @@ def build_body(agents: list[str], reasons: list[dict]) -> str:
     return f"Unstick: this thread is stalled on {who} ({'; '.join(parts)}). {BODY_INSTRUCTIONS}"
 
 
-def _reserve(board: Board, p: Principal, thread_id: int) -> None:
-    """Check and stamp the per-thread cooldown in one write transaction (two clicks cannot both pass)."""
-    key, now = STATE_PREFIX + str(thread_id), board.now()
-    with db.write_tx(board.conn) as c:
-        row = c.execute("SELECT value FROM board_state WHERE key = ?", (key,)).fetchone()
-        try:
-            last = float(json.loads(row["value"])) if row else None
-        except (TypeError, ValueError):
-            last = None
-        if last is not None and now - last < UNSTICK_COOLDOWN_SECONDS:
-            wait = int(UNSTICK_COOLDOWN_SECONDS - (now - last)) + 1
-            raise Conflict(f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
-                           f"give the agents a moment (try again in {wait} s)")
-        c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,
-                     updated_at = excluded.updated_at""", (key, json.dumps(now), p.name, now))
-
-
-def _release(board: Board, thread_id: int) -> None:
-    with db.write_tx(board.conn) as c:
-        c.execute("DELETE FROM board_state WHERE key = ?", (STATE_PREFIX + str(thread_id),))
-
-
 def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig) -> dict[str, Any]:
     board._require_human(p, "unstick a thread")
     thread = board._thread_row(thread_id)
@@ -137,41 +112,20 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
     if not agents:
         raise Conflict("nothing here is waiting on an agent (no unanswered requests to an agent, blocked tasks or "
                        "expired leases); if the thread is waiting on you, reply to it")
-    _reserve(board, p, thread_id)
-    rule = None
+    key = STATE_PREFIX + str(thread_id)
+    human_actions.reserve_cooldown(
+        board, p, key, UNSTICK_COOLDOWN_SECONDS,
+        lambda wait: (f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
+                      f"give the agents a moment (try again in {wait} s)"))
     try:
-        covered = {a for r in board.active_dispatch_rules(p) if r["thread_id"] == thread_id for a in r["agents"]}
-        uncovered = [a for a in agents if a not in covered]
-        if uncovered:
-            # Before the post: the dispatcher only triggers on posts created at or after a rule.
-            rule = board.create_dispatch_rule(p, thread_id=thread_id, agents=uncovered,
-                                              purpose=PURPOSE.format(thread=thread_id), max_launches=len(uncovered),
-                                              expires_at=board.now() + UNSTICK_RULE_HOURS * 3600)
-        post = board.create_post(p, board.human_session(p), body=build_body(agents, reasons), type="request",
-                                 thread_id=thread_id, to=agents, needs_response=True)
+        post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons),
+                                                 type="request", to=agents, needs_response=True, launch=agents,
+                                                 purpose=PURPOSE.format(thread=thread_id))
     except Exception:
-        if rule is not None:
-            board.revoke_dispatch_rule(p, rule["id"])
-        _release(board, thread_id)
+        human_actions.release_cooldown(board, key)
         raise
-    status = dispatch.loop_status(board, config)
-    now, window = board.now(), config.live_minutes * 60
-    live = [a for a in agents if (board.conn.execute("SELECT MAX(last_seen) FROM sessions WHERE agent = ?", (a,))
-                                  .fetchone()[0] or float("-inf")) >= now - window]
-    if status.get("running"):
-        live += [a for a in sorted({r.get("agent") for r in dispatch._active_records(board)} & set(agents))
-                 if a not in live]
-    runtimes = {r["name"]: r["runtime"] for r in board.conn.execute("SELECT name, runtime FROM agents")}
-    # Where the request will be seen now: the target agents' sessions inside the dispatcher's live window (the
-    # dispatcher's own notion of live), most recently seen first. Sessions a launch registers later are found by
-    # the page from their start time.
-    marks = ",".join("?" * len(agents))
-    sessions = [r["id"] for r in board.conn.execute(
-        f"""SELECT id FROM sessions WHERE agent IN ({marks}) AND last_seen >= ?
-            ORDER BY last_seen DESC, id DESC LIMIT {MAX_SESSIONS}""", (*agents, now - window))]
+    # Where the request will be seen now (`sessions`): the target agents' sessions inside the dispatcher's live
+    # window, most recently seen first. Sessions a launch registers later are found by the page from their start time.
     return {"post_id": post["id"], "thread_id": thread_id, "agents": agents,
             "rule_id": rule["id"] if rule else None,
-            "dispatcher_running": bool(status.get("running")), "paused": board.is_paused(),
-            "live_agents": live, "sessions": sessions,
-            "no_runner": [a for a in agents if config.runner_for(a, runtimes.get(a)) is None],
-            "reasons": reasons}
+            **human_actions.launch_outlook(board, config, agents), "reasons": reasons}
