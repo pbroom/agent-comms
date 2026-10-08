@@ -281,16 +281,30 @@ def test_reconnect_invalidates_other_target_inflight_attempt(env):
     ('http://127.0.0.1./x', 'http://127.0.0.1:80'),
     ('http://[0:0:0:0:0:0:0:1]/x', 'http://[::1]:80'),
     ('http://[::FFFF:127.0.0.1]:80/x', 'http://[::ffff:7f00:1]:80'),
+    # UTS #46 non-transitional, as browsers resolve them (Python's built-in IDNA 2003 codec maps ß to ss).
+    ('https://faß.de/x', 'https://xn--fa-hia.de:443'),
+    ('https://FAß.de/x', 'https://xn--fa-hia.de:443'),
+    ('https://ς.gr/x', 'https://xn--3xa.gr:443'),
+    ('https://a_b.example/x', 'https://a_b.example:443'),
+    ('http://example.com:0/x', 'http://example.com:0'),                # port 0 is not the default port
 ])
 def test_target_canonicalizes_host_spellings(spelling, origin):
     assert br.target(spelling)[1] == origin
 
 
 @pytest.mark.parametrize('bad', ['http://256.0.0.1/', 'http://1.2.3.4.5/', 'http://0x1g.0.0.1/', 'http://a..b/',
-                                 'http://[::1%25en0]/', 'http://ex%2fample.com/', 'http://%00x/', 'http://4294967296/'])
+                                 'http://[::1%25en0]/', 'http://ex%2fample.com/', 'http://%00x/', 'http://4294967296/',
+                                 'http://1.2.3.09/', 'http://example.09/', 'http://a‍b.com/'])
 def test_target_refuses_hosts_a_browser_would_refuse(bad):
     with pytest.raises(Invalid):
         br.target(bad)
+
+
+def test_ss_and_sharp_s_hosts_keep_separate_gates(env):
+    br.report_failure(env.board, env.p['codex'], env.sid['codex'], 'https://faß.de/', CTX, 'policy_denied', 'denied')
+    assert br.readiness(env.board, env.sid['codex'], 'https://xn--fa-hia.de/') == 'policy_denied'
+    assert br.readiness(env.board, env.sid['codex'], 'https://fass.de/') != 'policy_denied'
+    assert br.target('http://example.com:0/')[0] == 'http://example.com:0/'
 
 
 def test_unstarted_browser_work_cannot_be_finished_without_a_ready_probe(env):

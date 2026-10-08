@@ -10,6 +10,7 @@ dependencies = [
     { name = "anyio" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "idna" },
     { name = "mcp" },
     { name = "uvicorn" },
 ]
@@ -24,6 +25,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "idna", specifier = ">=3.7" },
     { name = "mcp", specifier = ">=1.10" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]

@@ -10,6 +10,8 @@ import secrets
 import ipaddress
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+import idna
+
 from . import db, requests
 from .core import Conflict, Forbidden, Invalid, LimitExceeded
 
@@ -90,7 +92,9 @@ def _ipv6_text(addr):
 
 def canonical_host(raw):
     """The host as a browser resolves it, so a deny gate cannot be sidestepped by spelling the same host differently:
-    percent-decoded, IDNA-encoded (Unicode, full-width and mixed-case labels become one ASCII form), lowercased,
+    percent-decoded, IDNA-encoded the way browsers do (UTS #46, non-transitional: `faß.de` is `xn--fa-hia.de`, not
+    `fass.de`; Unicode, full-width and mixed-case labels become one ASCII form; a non-ASCII host the `idna` package
+    refuses is refused here too), lowercased,
     without a trailing dot, and IP literals in their one canonical form (WHATWG: `127.1`, `0x7f.0.0.1`,
     `2130706433` and `0177.0.0.1` are all 127.0.0.1; IPv6 is compressed and bracketed). Raises ValueError."""
     host = unquote(raw)
@@ -100,16 +104,23 @@ def canonical_host(raw):
         return '[' + _ipv6_text(ipaddress.IPv6Address(host)) + ']'
     if any(c in host for c in '\x00/\\?#@[]<>^|%') or any(ord(c) < 0x21 for c in host):
         raise ValueError('forbidden host character')
-    try:
-        host = host.encode('idna').decode('ascii').lower()
-    except UnicodeError:
-        raise ValueError('invalid international host name') from None
+    if host.isascii():
+        host = host.lower()
+    else:
+        try:
+            host = idna.encode(host, uts46=True, transitional=False).decode('ascii').lower()
+        except (idna.IDNAError, UnicodeError):
+            raise ValueError('invalid international host name') from None
+        if any(c in host for c in '\x00/\\?#@[]<>^|%:') or any(ord(c) < 0x21 for c in host):
+            raise ValueError('forbidden host character')
     if host.endswith('.'):
         host = host[:-1]
     labels = host.split('.')
     if not host or '' in labels:
         raise ValueError('empty host label')
-    if _ipv4_number(labels[-1]) is not None:              # "ends in a number": an IPv4 address, or invalid
+    last = labels[-1]
+    if (last.isascii() and last.isdigit()) or _ipv4_number(last) is not None:   # WHATWG "ends in a number":
+        # an IPv4 address, or an invalid host (`1.2.3.09`: 09 is not octal), never a domain name
         if len(labels) > 4:
             raise ValueError('invalid IPv4 address')
         nums = [_ipv4_number(x) for x in labels]
@@ -127,7 +138,7 @@ def target(value):
         u = urlsplit(value)
         if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password:
             raise ValueError()
-        port = u.port or (443 if u.scheme == 'https' else 80)
+        port = u.port if u.port is not None else (443 if u.scheme == 'https' else 80)   # :0 is not the default
         host = canonical_host(u.hostname)
         origin = f'{u.scheme}://{host}:{port}'
     except ValueError:
