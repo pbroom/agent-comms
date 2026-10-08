@@ -161,7 +161,7 @@ def test_choose_posts_server_built_text_to_the_author(qenv, option, rank, label)
     assert out == {"action": "choose", "post_id": out["post_id"], "resolved_post_id": p["id"], "thread_id": qenv.tid,
                    "to": ["codex"], "option_id": option}
     reply = qenv.board.get_post(qenv.p["human"], out["post_id"])
-    assert (reply["agent"], reply["type"], reply["to"], reply["needs_response"]) == ("human", "status", ["codex"], False)
+    assert (reply["agent"], reply["type"], reply["to"], reply["needs_response"]) == ("human", "status", ["codex"], option == "ship")
     assert reply["body"] == f'Chose option {option} ("{label}", {rank}) for #{p["id"]}.'
     assert reply["decision_question"] is None
     for text in (reply["body"], r.text):

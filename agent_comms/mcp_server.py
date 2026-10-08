@@ -309,6 +309,13 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                             expected_version: StrictInt, session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: capabilities.route(board, principal(ctx), session(ctx, session_id), post_id, recipient, required_capabilities, expected_version))
 
+    @mcp.tool(description="Repost an exact queued or blocked request to another thread using an existing human issue decision covering that source and destination. No new scope or permissions; successor evidence reconciles only its original request." + DATA_WARNING)
+    def board_repost_request(post_id: StrictInt, recipient: str, expected_version: StrictInt,
+                             target_thread_id: StrictInt, session_id: int | None = None, ctx: Context = None) -> dict:
+        from . import decision_actions
+        return run(lambda: decision_actions.repost(board, principal(ctx), session(ctx, session_id), post_id,
+                                                    recipient, expected_version, target_thread_id))
+
     from . import browser_mcp
     browser_mcp.install(mcp, board, principal, session, run, DATA_WARNING)
     return mcp

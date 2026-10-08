@@ -108,9 +108,9 @@ test('cards per plain item: decisions get Finalize and Reject; Approve & launch 
   const q = post(14, 1, { type: 'question', agent: 'claude-code', needs_response: true });
   const { dom, document } = await setup({ threads: [thread(1, [d, sealedD, q])], needsYou: [q, sealedD, d], launchable: ['codex'] });
   try {
-    assert.deepEqual(cards(document, 12), ['Finalize the decision', 'Approve as proposed', 'Approve & launch codex',
+    assert.deepEqual(cards(document, 12), ['Finalize the decision', 'Approve as proposed', 'Approve and allow one launch',
       'Reject the decision', 'Not now', 'Write your own reply']);
-    assert.deepEqual(cards(document, 13), ['Approve as proposed', 'Approve & launch codex', 'Reject the decision', 'Not now',
+    assert.deepEqual(cards(document, 13), ['Approve as proposed', 'Approve and allow one launch', 'Reject the decision', 'Not now',
       'Write your own reply'], 'a sealed decision cannot be finalized until unsealed');
     assert.deepEqual(cards(document, 14), ['Approve as proposed', 'Not now', 'Write your own reply'], 'claude-code is not launchable');
     // Nothing is picked: one primary button, disabled, that says what to do.
@@ -131,10 +131,10 @@ test('each card + primary button calls the resolve endpoint once, with no confir
       'Parked #14; told codex not now (post #91).'],
     ['reject', 'Reject decision', { type: 'decision' }, { action: 'reject', post_id: 92, resolved_post_id: 14, to: ['codex'] },
       'Rejected decision #14; told codex (post #92).'],
-    ['approve_launch', 'Approve & launch codex', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 93,
+    ['approve_launch', 'Approve and allow launch', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 93,
       resolved_post_id: 14, to: ['codex'], agent: 'codex', rule_id: 5, dispatcher_running: true, paused: false, live: false, no_runner: false },
       'Approved #14 and launched codex (dispatcher running; it starts within seconds) (post #93).'],
-    ['approve_launch', 'Approve & launch codex', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 94,
+    ['approve_launch', 'Approve and allow launch', { type: 'request', needs_response: true }, { action: 'approve_launch', post_id: 94,
       resolved_post_id: 14, to: ['codex'], agent: 'codex', rule_id: 6, dispatcher_running: false, paused: false, live: false, no_runner: false },
       "Approved #14 (post #94). The dispatcher isn't running — start it with `board dispatch run` to launch codex."],
   ];
@@ -416,5 +416,35 @@ test('selective closeout retains original request and evidence without hiding ot
     assert.doesNotMatch(source.querySelector('.meta').textContent, /needs response/);
     assert.equal(source.querySelector('.attention-resolution a').getAttribute('href'), '#post-12');
     assert.equal(source.querySelector('img'), null);
+  } finally { dom.window.close(); }
+});
+
+test('mechanical close exposes exact target, version and evidence before execution', async () => {
+  const q = QUESTION();
+  q.options[1].action = { type: 'close', post_id: 3, recipient: 'codex', expected_version: 2, evidence_post_ids: [4] };
+  const p = post(11, 1, { type: 'question', needs_response: true, decision_question: q });
+  const { dom, document, calls } = await setup({ threads: [thread(1, [p])], needsYou: [p] });
+  try {
+    await pick(document, 1);
+    const node = document.querySelector('#needs-you [data-post="11"]');
+    assert.match(node.textContent, /Closes request #3\/codex \(version 2\) using evidence #4/);
+    card(document,11,'option:ship').click();
+    assert.equal(primary(document,11).textContent, 'Choose and close');
+    assert.equal(node.querySelector('.ny-assign').hidden, true);
+    primary(document,11).click(); await settle();
+    assert.deepEqual(calls.find(c => c.u.endsWith('/11/resolve')).body, {action:'choose',option_id:'ship'});
+  } finally { dom.window.close(); }
+});
+
+test('assign approved work sends explicit selected implementer, never parses notes', async () => {
+  const p = post(11,1,{type:'question',needs_response:true,decision_question:QUESTION()});
+  const { dom, win, document, calls } = await setup({threads:[thread(1,[p])],needsYou:[p]});
+  try {
+    await pick(document,1);
+    card(document,11,'option:ship').click();
+    const select = document.querySelector('#needs-you [data-post="11"] select');
+    select.value='claude-code'; select.dispatchEvent(new win.Event('change'));
+    primary(document,11).click(); await settle();
+    assert.equal(calls.find(c => c.u.endsWith('/11/resolve')).body.delivery_agent,'claude-code');
   } finally { dom.window.close(); }
 });

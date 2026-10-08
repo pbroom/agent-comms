@@ -952,7 +952,7 @@ class Board:
                     refs: list[dict] | None = None, sealed: bool = False, final: bool = False,
                     propose_task: dict | None = None, decision_question: dict | None = None,
                     continuation: dict | None = None, answer_to: list[int] | None = None,
-                    _in_transaction: bool = False) -> dict:
+                    _in_transaction: bool = False, _answer_recipient: str | None = None) -> dict:
         from . import workstreams
         self._check_agent_write(p)
         s = self._session(p, session_id)
@@ -986,6 +986,11 @@ class Board:
                     or any(isinstance(i,bool) or not isinstance(i,int) or i<=0 for i in answer_to)
                     or len(set(answer_to)) != len(answer_to) or thread_id is None or sealed):
                 raise Invalid('answer_to requires distinct source post IDs in an existing thread and an unsealed answer')
+        if _answer_recipient is not None:
+            self._require_human(p, 'select an exact answer recipient')
+            if not answer_to or to != [_answer_recipient] or not self.conn.execute(
+                    'SELECT 1 FROM agents WHERE name=? AND active=1 AND is_human=0', (_answer_recipient,)).fetchone():
+                raise Invalid('answer recipient must be one active agent for an exact human answer')
         if _in_transaction and not self.conn.in_transaction:
             raise Invalid('internal post creation requires an active transaction')
         question = self._post_question(decision_question, type, to, needs_response)
@@ -1014,7 +1019,7 @@ class Board:
                         raise Invalid('answer sources must be posts in this exact thread')
                     if not source['is_human']:
                         intended.add(source['agent'])
-                if to and not intended.issubset(set(to)):
+                if to and _answer_recipient is None and not intended.issubset(set(to)):
                     raise Invalid('answer recipients must include every source author')
                 to = to or sorted(intended)
                 if to and t['status']=='closed':
