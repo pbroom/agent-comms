@@ -50,6 +50,7 @@ def test_distinct_recorded_owners_require_choice(env):
         c.execute('UPDATE posts SET to_agents=? WHERE id=?', ('["grok"]', post['id']))
         c.execute("INSERT INTO request_progress(post_id,recipient,state,assigned_agent,updated_at) VALUES(?,?,'queued',?,?)",
                   (post['id'], 'grok', 'grok', env.clock()))
+        c.execute('UPDATE request_progress SET version=1 WHERE post_id=?', (post['id'],))
     result = approval_owners.delivery(env.board, post)
     assert result['recipient'] is None and result['requires_choice']
     assert result['candidates'] == ['codex', 'grok']
@@ -125,3 +126,12 @@ def test_human_post_metadata_and_agent_visibility(env):
     human_view = env.board.get_post(env.p["human"], post["id"])
     assert human_view["approval_delivery"]["recipient"] == "codex"
     assert "approval_delivery" not in env.board.get_post(env.p["claude"], post["id"])
+
+
+def test_task_owner_takes_precedence_over_unassigned_addressee(env):
+    post = owned_source(env)
+    with db.write_tx(env.board.conn) as c:
+        c.execute('UPDATE posts SET to_agents=? WHERE id=?', ('["grok"]', post['id']))
+    result = approval_owners.delivery(env.board, post)
+    assert result['recipient'] == 'codex' and not result['requires_choice']
+    assert result['candidates'] == ['codex']

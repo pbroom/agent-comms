@@ -40,8 +40,13 @@ work: normal task, request, host and dispatcher checks remain responsible for th
         if task and task['owner_agent']:
             evidence.append({'kind': 'task_owner', 'task_id': task['id'],
                              'agent': task['owner_agent'], 'session_id': task['owner_session']})
+    has_task_owner = bool(evidence)
     for row in for_post(board, post):
         if row["state"] == "finished":
+            continue
+        # A default queued addressee has not claimed execution ownership. A
+        # recorded task owner is stronger evidence than that initial envelope.
+        if has_task_owner and row["version"] == 0 and row["assigned_session"] is None:
             continue
         evidence.append({'kind': 'request_assignment', 'post_id': post['id'],
                          'recipient': row['recipient'], 'agent': row['assigned_agent'],
