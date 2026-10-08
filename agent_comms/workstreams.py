@@ -677,6 +677,40 @@ def release_ended_deliveries(board, p):
         return released
 
 
+def _delivery_run_ids(board, managed):
+    """The continuation's reserved run plus every recorded dispatcher run for its post."""
+    post_id = managed['post_id']
+    run_ids = [managed['dispatch_run_id']] if managed['dispatch_run_id'] else []
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+        try:
+            run = json.loads(value)
+        except ValueError:
+            continue
+        if isinstance(run, dict) and post_id in run.get('request_ids', []) and run.get('run_id') not in run_ids:
+            run_ids.append(run.get('run_id'))
+    return run_ids
+
+
+def delivery_reset(board, managed):
+    """Human-only dashboard metadata for reset_delivery: {'reserved', 'resettable'}. `resettable` when a fallback
+    delivery is stuck (its run is still reserved, or ended without registering and was not reset yet, so the
+    dispatcher will not try again) and nothing for this post is active: when reset_delivery would act. Ids and
+    states only; reset_delivery repeats every check under the write lock."""
+    reserved = managed['dispatch_run_id'] is not None
+    row = board.conn.execute('SELECT state FROM request_progress WHERE post_id=? AND recipient=?',
+                             (managed['post_id'], managed['recipient'])).fetchone()
+    thread = board.conn.execute('SELECT status FROM threads WHERE id=?', (managed['thread_id'],)).fetchone()
+    if (managed['epoch'] < 1 or row is None or row['state'] == 'finished'
+            or thread is None or thread['status'] != 'open'):
+        return {'reserved': reserved, 'resettable': False}
+    run_ids = [r for r in _delivery_run_ids(board, managed) if isinstance(r, str)]
+    if not run_ids or any(not _reservation_ended(board, r) for r in run_ids):
+        return {'reserved': reserved, 'resettable': False}
+    stuck = reserved or any(run is not None and not run.get('reset_by_human')
+                            for run in (_run_record(board, r) for r in run_ids))
+    return {'reserved': reserved, 'resettable': stuck}
+
+
 def reset_delivery(board, p, session_id, post_id, expected_version):
     """Human only: retry a failed fallback delivery. Refused while its run is still active. Clears the reservation,
     marks the failed run as reset (so the dispatcher may make one new delivery attempt under its existing approval
@@ -698,14 +732,7 @@ def reset_delivery(board, p, session_id, post_id, expected_version):
             raise Conflict('continuation thread must be open')
         if managed['epoch'] < 1:
             raise Conflict('no fallback delivery has been assigned yet')
-        run_ids = [managed['dispatch_run_id']] if managed['dispatch_run_id'] else []
-        for (value,) in c.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
-            try:
-                run = json.loads(value)
-            except ValueError:
-                continue
-            if isinstance(run, dict) and post_id in run.get('request_ids', []) and run.get('run_id') not in run_ids:
-                run_ids.append(run.get('run_id'))
+        run_ids = _delivery_run_ids(board, managed)
         for run_id in run_ids:
             if isinstance(run_id, str) and not _reservation_ended(board, run_id):
                 raise Conflict('the delivery run is still active or registered a session; stop it or let it finish first')

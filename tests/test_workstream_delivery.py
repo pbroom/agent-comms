@@ -304,3 +304,23 @@ def test_scan_recovers_lost_pending_trigger_past_mark_without_duplicate(delivery
         worker.tick()
     assert len(env.spawner.calls) == 1
     assert env.board.conn.execute('SELECT COUNT(*) FROM continuations').fetchone()[0] == 1
+
+
+def test_human_sees_when_a_stuck_delivery_can_be_reset(delivery_env):
+    stack, worker, rule, post = delivery_env
+    env = stack['env']
+
+    def reset_state(who='human'):
+        return env.board.get_post(env.p[who], post['id'])['continuation'].get('delivery_reset')
+    assert reset_state() == {'reserved': False, 'resettable': False}      # nothing delivered yet
+    worker.tick()
+    assert reset_state() == {'reserved': True, 'resettable': False}       # the run is live
+    env.spawner.children[0].code = 0
+    worker._reap(env.board.now())                                         # it exited without registering
+    assert reset_state() == {'reserved': True, 'resettable': True}
+    worker.tick()                                                         # the dispatcher released the reservation
+    assert reset_state() == {'reserved': False, 'resettable': True}       # still stuck: it will not retry
+    assert reset_state('claude') is None                                  # human-only metadata
+    workstreams.reset_delivery(env.board, env.p['human'], env.sid['human'], post['id'],
+                               current(stack, post)['version'])
+    assert reset_state() == {'reserved': False, 'resettable': False}
