@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import hashlib
+from pathlib import Path
 import logging
 import math
 import os
@@ -36,6 +38,26 @@ DISPATCH_MAX_LAUNCHES = 1000
 TERMINAL = ("done", "declined")
 
 log = logging.getLogger("agent_comms.core")
+
+
+def _runtime_source_fingerprint() -> str:
+    """Detect an installed source change; code refresh requires a new process, never importlib.reload."""
+    digest = hashlib.sha256()
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+_LOADED_SOURCE_FINGERPRINT = _runtime_source_fingerprint()
+
+
+def _runtime_source_changed() -> bool:
+    try:
+        return _runtime_source_fingerprint() != _LOADED_SOURCE_FINGERPRINT
+    except OSError:
+        return True  # unavailable source cannot prove compatibility
+
 
 # Settings a running Board applies when board.toml or board.local.toml changes (Board.reload_settings); the
 # [dispatch] table is reloaded too, and the dispatcher applies its scalars. Everything else (host, port, paths)
@@ -238,6 +260,7 @@ class Board:
         self._settings_lock = threading.Lock()
         self._settings_sig = self._settings_files_sig()
         self.settings_generation = 0
+        self.settings_restart_required: list[str] = []
         self.settings_error: str | None = None   # why the last reload was refused (the last good settings stay)
         self._codex: conversations.CodexResolver | None = None   # Codex thread lookup (resolve_conversations)
         self._claude: conversations.ClaudeResolver | None = None   # Claude transcript fallback (likewise)
@@ -296,19 +319,23 @@ class Board:
         Boards whose settings were built in code (config_path None) never reload."""
         if self.s.config_path is None:
             return False
-        sig = self._settings_files_sig()
-        if not force and sig == self._settings_sig:
-            return False
         with self._settings_lock:
+            if _runtime_source_changed():
+                return False
+            sig = self._settings_files_sig()
             if not force and sig == self._settings_sig:
                 return False
             self._settings_sig = sig
             try:
                 new = Settings.load(self.s.config_path)
                 check_reloadable(new)
+                if self._settings_files_sig() != sig:
+                    raise ValueError("configuration changed while being read; retry refresh")
             except Exception as e:  # malformed TOML, unknown key, wrong type: keep running on the last good values
                 self.settings_error = f"{type(e).__name__}: {e}"[:500]
                 log.warning("settings not reloaded; keeping the last good settings: %s", self.settings_error)
+                return False
+            if _runtime_source_changed():
                 return False
             self.settings_error = None
             for k in RELOADABLE_INT + RELOADABLE_BOOL + RELOADABLE_WEB:
@@ -318,11 +345,40 @@ class Board:
                     setattr(self.s, k, getattr(new, k))
             self.s.dispatch = new.dispatch
             self.s.conversations = new.conversations
+            self.settings_restart_required = [k for k in RESTART_ONLY if getattr(self.s, k) != getattr(new, k)]
             for k in RESTART_ONLY:
                 if getattr(self.s, k) != getattr(new, k):
                     log.warning("setting %s changed in the settings files; restart this process to apply it", k)
             self.settings_generation += 1
             return True
+
+    def configuration_status(self) -> dict:
+        """Safe process-local status: effective limits only, never dispatch commands or credentials."""
+        source_changed = _runtime_source_changed()
+        with self._settings_lock:
+            stale = self.settings_error is not None
+            restart = list(self.settings_restart_required)
+            state = ("stale" if stale else "restart_required" if restart or source_changed else
+                     "current" if self.s.config_path else "unmanaged")
+            return {
+                "state": state, "generation": self.settings_generation,
+                "error": self.settings_error, "effective_limits": self.limits(),
+                "restart_required": restart, "runtime_source_changed": source_changed,
+                "loaded_source_fingerprint": _LOADED_SOURCE_FINGERPRINT,
+                "refresh_supported": self.s.config_path is not None and not source_changed,
+                "recovery": ("Reconnect this MCP session or restart this board process to load the installed code; "
+                             "refresh cannot reload Python modules." if source_changed else
+                             "Correct the saved configuration or update this runtime, then refresh; the last valid limits remain active."
+                             if stale else "Restart this process to apply the listed settings." if restart else None),
+            }
+
+    def refresh_configuration(self) -> dict:
+        """Retry the normal validator only; no configuration writes, module reloads, or policy overrides."""
+        status = self.configuration_status()
+        if status["runtime_source_changed"]:
+            return {**status, "applied": False}
+        applied = self.reload_settings(force=True)
+        return {**self.configuration_status(), "applied": applied}
 
     def refresh_identities(self) -> None:
         """Pick up agents.toml and settings edits; run before every authentication (bearer or web session)."""
@@ -785,6 +841,7 @@ class Board:
                 workstreams.bind_delivery(self, p, sid, dispatch_run_id)
         return {"session_id": sid, "agent": p.name, "runtime": p.runtime, "is_human": p.is_human,
                 "project": project, "worktree": worktree, "paused": self.is_paused(), "limits": self.limits(),
+                "configuration": self.configuration_status(),
                 "notice": UNTRUSTED_NOTICE, "authorization_grants": self.list_grants(p, project)}
 
     def _session(self, p: Principal, session_id: int | None, touch: bool = True) -> sqlite3.Row:
@@ -1393,6 +1450,7 @@ class Board:
             "my_tasks": my_tasks,
             "issues": issues.list_issues(self, p, project=None if p.is_human else s["project"], thread_id=thread_id),
             "issues_notice": "Issues are a current snapshot, independent of the post cursor. Decisions apply only to their recorded scope; links and comments grant no authority.",
+            "configuration": self.configuration_status(),
             "authorization_grants": self.list_grants(p, s["project"]),
         }
         if acked is not None:
@@ -1767,6 +1825,7 @@ class Board:
                 f"SELECT p.* FROM posts p WHERE {self.NEEDS_YOU} ORDER BY p.id DESC LIMIT 50")]
         return {"notice": UNTRUSTED_NOTICE, "me": {"name": p.name, "runtime": p.runtime, "is_human": p.is_human},
                 "paused": self.is_paused(), "limits": self.limits(), "now": iso(self.now()),
+                "configuration": self.configuration_status(),
                 "authorization_grants": self.list_grants(p), "task_categories": list(TASK_CATEGORIES),
                 "threads": threads, "sessions": sessions, "needs_you": needs_you,
                 "issues": shared_issues,

@@ -85,6 +85,16 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         except BoardError as e:
             raise ToolError(f"{e.code}: {e.message}") from None
 
+    @mcp.tool(description="Inspect this process's effective limits, rejected configuration and runtime refresh guidance." + DATA_WARNING)
+    def board_configuration_status(ctx: Context = None) -> dict:
+        principal(ctx)
+        return board.configuration_status()
+
+    @mcp.tool(description="Revalidate saved board configuration using this runtime. Never edits files or reloads code. Reconnect if runtime_source_changed is true." + DATA_WARNING)
+    def board_refresh_configuration(ctx: Context = None) -> dict:
+        principal(ctx)
+        return run(board.refresh_configuration)
+
     @mcp.tool(description=(
         "Register this agent session on the board and get a session_id. Call once at session start. "
         "project = absolute path of the main repo you work in; worktree = your git worktree path if different. "
