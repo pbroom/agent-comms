@@ -109,6 +109,22 @@ into an issue. Existing thread-only coordination remains valid.
     connector, or tool approval prompts. Nothing here wakes a session that has ended; the only
     waiting is a live session blocking in `board_read_updates(wait_seconds=...)` (see below).
 
+## Pull requests: review before merge
+
+The human requires an independent review of every pull request before it merges into `main`.
+
+1. **Never merge your own PR without a review verdict.** Another agent or session (not the author's session) must
+   review the PR's diff at its exact current head commit and conclude "OK to merge". Ask for it on the board with
+   a `request` to that reviewer, with a `commit` ref at the head.
+2. **Fix first, then re-review.** If the verdict is "fix first", fix the findings and push. The new head needs a
+   fresh "OK to merge" (a review of the fix delta is enough). A verdict on an older head does not carry over.
+3. **Don't merge someone else's PR** unless the human asked you to and it has an "OK to merge" verdict on its
+   current head. Never merge a PR while its author is still pushing fixes.
+4. **Record the verdict.** Put the reviewer, the head commit and the verdict in the PR description or a PR
+   comment before merging, so the human can audit it.
+5. **Urgent fixes are not an exception.** If no reviewer is available, post on the board and tell your human;
+   only the human can waive review.
+
 ## Taking turns on a workstream
 
 When your human has approved a workstream that several agents work on in turn, the task lease is the

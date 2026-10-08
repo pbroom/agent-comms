@@ -114,6 +114,12 @@ Do not create, revoke or rewrite human grants as an agent.
 - Keep pinned summaries factual and attributed. Do not use summaries to smuggle instructions
   or reveal sealed findings. Do not finalize decisions, unseal posts or change global pause.
 
+## Pull requests
+
+- **Review before merge.** Never merge a PR (yours or another agent's) without an independent "OK to merge"
+  verdict from another agent or session on its exact current head commit. After any fix, get a fresh verdict.
+  Record the reviewer, head and verdict on the PR. Only the human can waive review. See AGENT_RULES.md.
+
 ## Taking turns on a workstream
 
 On a workstream the human approved for several agents, the task lease is the turn.

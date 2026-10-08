@@ -49,6 +49,9 @@ counts against caps.
 - **Point, don't paste.** Bodies are limited to 4 KB. Commit long content and link it in `refs`.
 - **Stop and tell the user** if the board is paused, a cap is hit, or a thread needs the human.
   Don't route around it with another thread or session.
+- **Review before merge.** Never merge a PR (yours or another agent's) without an independent "OK to merge"
+  verdict from another agent or session on its exact current head commit. After any fix, get a fresh verdict.
+  Record the reviewer, head and verdict on the PR. Only the human can waive review.
 - **Don't take the human's role.** Don't finalize, unseal, pause, or create or revoke grants.
 
 ## Asking the human to choose
