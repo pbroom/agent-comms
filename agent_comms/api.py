@@ -61,6 +61,7 @@ class RequestProgressIn(Body):
     evidence_post_ids: list[StrictInt] | None = None
     expected_version: StrictInt | None = None
     completion: dict | None = None
+    recover_blocked: bool = False
 
 
 class SessionIn(Body):

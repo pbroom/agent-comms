@@ -60,8 +60,11 @@ def test_v8_upgrade_preserves_existing_requests_sessions_and_grants(stack):
     conn=env.board.conn
     before={name:[tuple(r) for r in conn.execute('SELECT * FROM '+name)]
             for name in ('posts','request_progress','sessions','authorization_grants')}
+    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'managed_%'").fetchall():
+        conn.execute('DROP TRIGGER '+row[0])
     conn.execute('DROP TABLE continuations')
     conn.execute('DROP TABLE session_activity')
+    conn.execute('DROP TABLE managed_write_permit')
     conn.execute('ALTER TABLE tasks DROP COLUMN continuation_scope')
     conn.execute('PRAGMA user_version=8')
     db.init_schema(conn)
@@ -70,3 +73,38 @@ def test_v8_upgrade_preserves_existing_requests_sessions_and_grants(stack):
     for name,rows in before.items():
         assert [tuple(r) for r in conn.execute('SELECT * FROM '+name)]==rows
     assert conn.execute('SELECT COUNT(*) FROM continuations').fetchone()[0]==0
+
+
+def test_direct_assignment_cannot_replace_target_binding_with_generic_probe(env):
+    import pytest
+    from agent_comms import requests
+    from agent_comms.core import Conflict
+    from test_browser_routing import capability, proof
+    post=env.post('human',env.thread(),type='request',to=['codex'])
+    capability(env)
+    proof(env)
+    with pytest.raises(Conflict,match='target'):
+        requests.assign(env.board,env.p['human'],env.sid['human'],post['id'],'codex',env.sid['codex'],
+                        0,'verified browser',['browser:desktop'])
+
+
+def test_managed_browser_contract_cannot_be_downgraded_by_caller(stack):
+    import pytest
+    from agent_comms import capabilities, workstreams
+    from agent_comms.core import Conflict
+    from test_workstreams import create,current,probe
+    from test_browser_routing import proof
+    env=stack['env']
+    post=create(stack,required_capabilities=['browser:desktop'])
+    env.clock.advance(121)
+    for name in ('codex','claude'):
+        proof(env,name)
+        capabilities.register(env.board,env.p[name],env.sid[name],['browser:desktop','git:write'],
+                              'Probe in executing browser context',activity='idle')
+    routed=capabilities.route(env.board,env.p['human'],env.sid['human'],post['id'],'codex',
+                              ['git:write'],current(stack,post)['version'])
+    assert routed['assigned_session']==env.sid['codex']
+    assert 'bound target' in routed['continuation']['blocker']
+    assert workstreams.delivery(env.board,post['id'],'claude') is None
+    with pytest.raises(Conflict,match='bound target'):
+        env.board.claim_task(env.p['codex'],env.sid['codex'],post['task_id'])

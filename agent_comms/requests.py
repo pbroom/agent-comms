@@ -70,11 +70,54 @@ def _save(board, p, session_id, row, state, reason, evidence, assigned_agent, as
     board.conn.execute('UPDATE posts SET seq=?,revised_at=? WHERE id=?',(seq,now,row['post_id']))
 
 
+def _recover_blocked(board, p, session_id, post, row, state, evidence, expected_version, managed):
+    """Terminal reconciliation only; never move execution ownership or grant work."""
+    if managed is not None:
+        raise Forbidden('managed continuations cannot use blocked request recovery')
+    if p.is_human or p.name != row['assigned_agent']:
+        raise Forbidden('only the same assigned agent may recover its blocked request')
+    if row['state'] != 'blocked' or state != 'finished':
+        raise Conflict('recovery only permits blocked to finished')
+    if type(expected_version) is not int or expected_version != row['version']:
+        raise Conflict('recovery requires the exact current request version')
+    if not evidence:
+        raise Invalid('recovery requires explicit same-thread verification evidence')
+    old = board.conn.execute('SELECT * FROM sessions WHERE id=?',(row['assigned_session'],)).fetchone()
+    if old is None or old['id'] == session_id or old['agent'] != p.name or not old['dispatch_run_id']:
+        raise Conflict('recovery requires another session bound to an ended dispatcher run')
+    record = board.conn.execute('SELECT value FROM board_state WHERE key=?',('dispatch.run.'+old['dispatch_run_id'],)).fetchone()
+    try:
+        run = json.loads(record['value']) if record else None
+    except (ValueError,TypeError):
+        run = None
+    if (not isinstance(run,dict) or run.get('agent') != p.name or run.get('thread_id') != post['thread_id']
+            or run.get('status') not in ('exited','gone','stopped','timeout','spawn_failed')
+            or type(run.get('ended_at')) not in (int,float)
+            or not old['last_seen'] <= run['ended_at'] <= board.now()):
+        raise Conflict('old dispatcher run is live, unknown, or does not match this request')
+    if board.conn.execute('SELECT 1 FROM tasks WHERE owner_session=? AND lease_expires_at>?',
+                          (old['id'],board.now())).fetchone():
+        raise Conflict('old session still holds an active task lease')
+    updated = board.conn.execute('SELECT updated_at FROM request_progress WHERE post_id=? AND recipient=?',
+                                 (post['id'],row['recipient'])).fetchone()
+    fresh = False
+    for pid in evidence:
+        item = board.conn.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
+        if (item and item['id'] != post['id'] and item['thread_id'] == post['thread_id'] and not item['sealed']
+                and item['agent'] == p.name and item['session_id'] == session_id
+                and updated and item['created_at'] >= updated['updated_at']):
+            fresh = True
+    if not fresh:
+        raise Invalid('recovery requires new verification evidence posted by this current session after the block')
+
+
 def progress(board, p, session_id, post_id, recipient, state, reason='', evidence_post_ids=None, expected_version=None,
-             completion=None):
+             completion=None, recover_blocked=False):
     from . import workstreams
     if expected_version is not None and (type(expected_version) is not int or expected_version < 0):
         raise Invalid('expected_version must be a nonnegative integer')
+    if type(recover_blocked) is not bool:
+        raise Invalid('recover_blocked must be a boolean')
     if state not in STATES:
         raise Invalid('state must be queued, started, blocked, or finished')
     if not isinstance(reason, str) or len(reason.encode()) > board.s.body_max_bytes:
@@ -91,13 +134,18 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             from . import browser_readiness
             browser_readiness.assert_request_ready(board,post_id,recipient,session_id)
         managed = workstreams.get_for_post(board, post_id)
+        if recover_blocked:
+            _recover_blocked(board,p,session_id,post,row,state,evidence,expected_version,managed)
+            reason = 'Terminal recovery from ended session '+str(row['assigned_session'])+': '+reason
+            if len(reason.encode()) > board.s.body_max_bytes:
+                raise Invalid('recovery reason exceeds the body limit')
         if managed is not None and state == 'finished' and not evidence:
             raise Invalid('managed completion requires same-thread evidence post IDs')
         if not p.is_human and p.name not in (post['agent'],row['assigned_agent']):
             raise Forbidden('only the author or assigned recipient may update a request')
         if not p.is_human and p.name == post['agent'] and p.name != row['assigned_agent'] and state not in ('finished','blocked'):
             raise Forbidden('only the assigned recipient may acknowledge execution')
-        if not p.is_human and p.name == row['assigned_agent'] and row['assigned_session'] not in (None,session_id) and not (p.name == post['agent'] and state == 'finished'):
+        if not recover_blocked and not p.is_human and p.name == row['assigned_agent'] and row['assigned_session'] not in (None,session_id) and not (p.name == post['agent'] and state == 'finished'):
             raise Conflict('request is owned by another session')
         if row['state'] == 'started' and state == 'blocked' and (p.name != row['assigned_agent'] or session_id != row['assigned_session']):
             raise Conflict('only the executing session may release a started request as blocked')
@@ -122,7 +170,7 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             raise Conflict('use explicit reassignment to queue a request again')
         workstreams.guard_progress(board,p,session_id,row,state,expected_version,completion)
         owner = row['assigned_session']
-        if p.name == row['assigned_agent']:
+        if p.name == row['assigned_agent'] and not recover_blocked:
             owner = session_id
         _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner)
         workstreams.after_save(board,p,session_id,row,state)
@@ -172,6 +220,9 @@ def assign(board,p,session_id,post_id,recipient,target_session_id,expected_versi
         if not capabilities.eligible(board,target_session_id,project,required_capabilities):
             raise Conflict('target lacks fresh verified capabilities in this project')
         from . import browser_readiness
+        if (capabilities.requires_browser(required_capabilities)
+                and browser_readiness.requirement(board,post_id,recipient) is None):
+            raise Conflict('bind the exact browser target before assigning browser work')
         browser_readiness.assert_request_ready(board,post_id,recipient,target_session_id)
         if row['assigned_session']==target_session_id and row['state']=='queued':
             return row

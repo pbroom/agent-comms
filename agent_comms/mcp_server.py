@@ -282,15 +282,16 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
 
-    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
+    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. recover_blocked=true narrowly finishes your same-agent generic blocked request from a proven ended dispatcher session: requires exact expected_version and new current-session verification evidence in the same thread; never transfers execution or bypasses managed completion. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
     def board_request_progress(post_id: StrictInt, recipient: str,
                                state: Literal["queued", "started", "blocked", "finished"],
                                reason: str = "", evidence_post_ids: list[StrictInt] | None = None,
                                expected_version: StrictInt | None = None,
                                completion: dict | None = None,
+                               recover_blocked: bool = False,
                                session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
-                   recipient, state, reason, evidence_post_ids, expected_version, completion))
+                   recipient, state, reason, evidence_post_ids, expected_version, completion, recover_blocked))
 
     @mcp.tool(description="Read explicit progress history for exactly one original request recipient." + DATA_WARNING)
     def board_request_history(post_id: StrictInt, recipient: str, ctx: Context = None) -> dict:

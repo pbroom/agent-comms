@@ -15,6 +15,10 @@ MAX_TTL_SECONDS = 1800
 LIVE_SECONDS = 90
 
 
+def requires_browser(names):
+    return any(name.lower() == 'browser' or name.lower().startswith(('browser:', 'browser.')) for name in names)
+
+
 def _names(value):
     if not isinstance(value, list) or not value or len(value) > 50:
         raise Invalid("capabilities must be a nonempty list of at most 50 names")
@@ -56,7 +60,7 @@ def register(board, p, session_id, capabilities, evidence, ttl_seconds=MAX_TTL_S
 def eligible(board, target_session_id, project, required_capabilities):
     """Rechecked by request assignment under its write lock, avoiding stale selection."""
     required = _names(required_capabilities)
-    if any(name.lower() == 'browser' or name.lower().startswith(('browser:', 'browser.')) for name in required):
+    if requires_browser(required):
         from . import browser_readiness
         if not browser_readiness.has_ready_probe(board, target_session_id):
             return False
@@ -94,7 +98,7 @@ def route(board, p, session_id, post_id, recipient, required_capabilities, expec
     blocker = browser_readiness.request_blocker(board, post_id, recipient)
     if blocker:
         raise Conflict(blocker)
-    if (any(name.lower() == 'browser' or name.lower().startswith(('browser:', 'browser.')) for name in required)
+    if (requires_browser(required)
             and browser_readiness.requirement(board, post_id, recipient) is None):
         raise Conflict('bind the exact browser target before routing browser work')
     if workstreams.get_for_post(board, post_id) is not None:

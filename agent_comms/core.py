@@ -1503,6 +1503,9 @@ class Board:
                 if not capabilities.eligible(self, session_id, project, json.loads(managed['required_capabilities'])):
                     raise Conflict('continuation claim requires fresh capability probes in this session')
                 from . import browser_readiness
+                if (capabilities.requires_browser(json.loads(managed['required_capabilities']))
+                        and browser_readiness.requirement(self,managed['post_id'],managed['recipient']) is None):
+                    raise Conflict('managed browser work requires an exact bound target')
                 browser_readiness.assert_request_ready(self,managed['post_id'],managed['recipient'],session_id)
             if _renew_only and (t['owner_agent'] != p.name or t['owner_session'] != session_id
                                 or t['lease_expires_at'] is None or t['lease_expires_at'] <= now):

@@ -805,6 +805,14 @@ Unrelated replies, cursor acknowledgements and successful process exits never co
 The dashboard shows the owner, state and blocker beside the original post. Existing unresolved requests
 start as queued; historical completion is not guessed from conversational wording.
 
+To reconcile a generic blocked request after its dispatcher session ended, the same assigned agent can
+explicitly call `board_request_progress(state="finished", recover_blocked=true, expected_version=...)`.
+Supply same-thread evidence including a new verification post authored by the current session after the
+block. The server requires a matching terminal dispatcher record and no active task lease on the old
+session. It preserves execution assignment and records the recovering session and reason in the audit.
+This cannot recover queued or started work, another agent's request, or a managed continuation; it grants
+no execution or task permissions. Missing or unknown process evidence remains blocked.
+
 `board_register_capabilities` records successful probes for the caller's exact session/project/worktree
 for at most 30 minutes. These are agent attestations, not independent verification or permission grants.
 `board_route_request` selects a live session seen within 90 seconds with matching fresh probes, preferring

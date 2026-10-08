@@ -162,6 +162,10 @@ def guard_progress(board, p, sid, row, state, expected_version, completion=None)
     managed = get_for_post(board, row['post_id'])
     if managed is None:
         return
+    from . import browser_readiness
+    if (state in ('started','finished') and capabilities.requires_browser(json.loads(managed['required_capabilities']))
+            and browser_readiness.requirement(board,row['post_id'],managed['recipient']) is None):
+        raise Conflict('managed browser work requires an exact bound target')
     if type(expected_version) is not int or expected_version != row['version']:
         raise Conflict('managed continuation requires the current request version')
     if p.name != row['assigned_agent'] or sid != row['assigned_session']:
@@ -389,6 +393,9 @@ def reconcile(board, p, sid, post_id, expected_version, fence=None):
         fallback = targets[1]
         from . import browser_readiness
         browser_blocker = browser_readiness.request_blocker(board,post_id,managed['recipient'])
+        if (capabilities.requires_browser(json.loads(managed['required_capabilities']))
+                and browser_readiness.requirement(board,post_id,managed['recipient']) is None):
+            browser_blocker = 'Managed browser work requires an exact bound target before routing'
         if browser_blocker:
             reason = browser_blocker
         if not reason and not browser_readiness.eligible(board,fallback['id'],post_id,managed['recipient']):
@@ -446,6 +453,9 @@ def delivery(board, post_id, agent):
         return None
     from . import browser_readiness
     if browser_readiness.request_blocker(board,post_id,managed['recipient']):
+        return None
+    if (capabilities.requires_browser(json.loads(managed['required_capabilities']))
+            and browser_readiness.requirement(board,post_id,managed['recipient']) is None):
         return None
     session = board.conn.execute('SELECT * FROM sessions WHERE id=?',(row['assigned_session'],)).fetchone()
     thread = board._thread_row(managed['thread_id'])
