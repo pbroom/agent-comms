@@ -562,3 +562,53 @@ def test_configuration_changed_during_validation_is_not_applied(senv, monkeypatc
     assert senv.board.reload_settings() is False
     assert senv.board.s.daily_post_cap_per_agent == 200
     assert 'changed while being read' in senv.board.settings_error
+
+
+@pytest.mark.parametrize("source_unavailable", [False, True])
+def test_authenticated_http_refresh_does_not_apply_config_with_changed_runtime(senv, monkeypatch, source_unavailable):
+    from agent_comms import core
+    generation = senv.board.settings_generation
+    limits = senv.board.limits()
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+    saved = senv.local.read_bytes()
+    def fingerprint():
+        if source_unavailable:
+            raise OSError('source unavailable')
+        return 'new-runtime-source'
+    monkeypatch.setattr(core, '_runtime_source_fingerprint', fingerprint)
+    for method, path in [('GET', '/api/configuration'), ('POST', '/api/configuration/refresh')]:
+        response = senv.client.request(method, path, headers=senv.h('codex'))
+        assert response.status_code == 200
+        status = response.json()
+        assert status['runtime_source_changed'] is True
+        assert status['effective_limits'] == limits
+        assert status['generation'] == generation
+        if method == 'POST':
+            assert status['applied'] is False
+    assert senv.board.reload_settings(force=True) is False
+    assert senv.board.limits() == limits
+    assert senv.local.read_bytes() == saved
+
+
+def test_authenticated_mcp_refresh_does_not_apply_config_with_changed_runtime(senv, monkeypatch):
+    import asyncio
+    from mcp import Client
+    from agent_comms import core
+    from agent_comms.mcp_server import build_mcp
+    monkeypatch.setenv('AGENT_COMMS_TOKEN', senv.tokens['codex'])
+    generation, limits = senv.board.settings_generation, senv.board.limits()
+    senv.local.write_text('[limits]\ndaily_post_cap_per_agent = 1000\n')
+    monkeypatch.setattr(core, '_runtime_source_fingerprint', lambda: 'new-runtime-source')
+    async def run():
+        async with Client(build_mcp(senv.board, 'stdio')) as client:
+            for tool in ['board_configuration_status', 'board_refresh_configuration']:
+                result = await client.call_tool(tool, {})
+                assert not result.is_error
+                status = json.loads(result.content[0].text)
+                assert status['runtime_source_changed'] is True
+                assert status['effective_limits'] == limits
+                assert status['generation'] == generation
+                if tool == 'board_refresh_configuration':
+                    assert status['applied'] is False
+    asyncio.run(run())
+    assert senv.board.limits() == limits
