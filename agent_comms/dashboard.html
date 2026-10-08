@@ -1875,13 +1875,23 @@ function renderDecisionPanel(i, where, onSuccess) {
   const q = i.decision_question, draft = issueDraft(i), threads = issueThreads(i);
   const version = i.question_version || 0, key = `decide-${i.id}`, busy = issueBusy === key;
   if (draft.questionVersion !== version) {
-    draft.choice = q ? "" : "custom"; draft.questionVersion = version; draft.scopes = null; draft.attempted = false;
+    draft.choice = q ? "" : "custom"; draft.questionVersion = version; draft.scopes = null; draft.attempted = false; draft.delivery_agents = {};
   }
   if (!Array.isArray(draft.scopes)) {
     const flagged = threads.filter(l => l.needs_human);
     draft.scopes = (flagged.length ? flagged : threads).map(l => l.thread_id);
   }
   const uid = `${where}-${i.id}`, limit = bodyLimit();
+  draft.delivery_agents ||= {};
+  const activeAgents = (state.agents || []).filter(a => !a.is_human && a.active !== false && a.active !== 0);
+  const sourceLinks = [...new Map((i.links || []).filter(l => l.post_id && l.covers_post !== false &&
+    l.source_post && l.source_post.approval_delivery && !isHumanName(l.source_post.agent)).map(l => [l.post_id, l])).values()];
+  const currentOutcome = () => draft.choice === "custom" ? draft.outcome : (option(draft.choice || "") || {}).outcome;
+  const assignedSource = l => {
+    const name = draft.delivery_agents[l.post_id] ?? l.source_post.approval_delivery.recipient;
+    return activeAgents.some(a => a.name === name) ? name : "";
+  };
+  const missingOwner = () => currentOutcome() === "approved" && sourceLinks.find(l => draft.scopes.includes(l.thread_id) && !assignedSource(l));
   // Linked posts this issue's question does not cover (the server's `covers_post`, fixed when each was linked): they
   // ask their own question, so this answer does not answer them; each is its own Needs you item until answered.
   const separate = [...new Set((i.links || []).filter(l => l.post_id && l.covers_post === false).map(l => l.post_id))]
@@ -1890,7 +1900,8 @@ function renderDecisionPanel(i, where, onSuccess) {
   const problem = () => !draft.choice ? "Choose an option or write your own answer."
     : draft.choice === "custom" && !draft.decision.trim() ? "Write your answer, or choose an option."
     : draft.choice === "custom" && bytes(draft.decision.trim()) > limit ? `Your answer is too long (${bytes(draft.decision.trim())} / ${limit} bytes).`
-    : !draft.scopes.length ? "Select the threads this decision applies to." : "";
+    : !draft.scopes.length ? "Select the threads this decision applies to."
+    : missingOwner() ? `Choose who should carry out post #${missingOwner().post_id}.` : "";
 
   const send = el("button", { type: "submit", class: "btn btn-warning btn-md", "data-decide": i.id });
   const hint = el("span", { class: "hint", id: `decide-hint-${uid}` });
@@ -1909,6 +1920,8 @@ function renderDecisionPanel(i, where, onSuccess) {
     hint.classList.toggle("err", !!(p && draft.attempted));
     if (p && draft.attempted) hint.setAttribute("role", "alert"); else hint.removeAttribute("role");
     custom.hidden = draft.choice !== "custom";
+    assignments.hidden = currentOutcome() !== "approved" || !sourceLinks.length;
+    for (const row of assignments.children) row.hidden = !draft.scopes.includes(Number(row.dataset.thread));
     if (area) area.required = draft.choice === "custom";
     count.textContent = `${n} of ${plural(threads.length, "thread")}`;
   };
@@ -1945,6 +1958,15 @@ function renderDecisionPanel(i, where, onSuccess) {
         } }),
       el("span", {}, `#${l.thread_id} ${l.title || ""}`)))));
 
+  const assignments = el("div", { class: "issue-assignments" }, sourceLinks.map(l => {
+    const selectId = `issue-owner-${uid}-${l.post_id}`;
+    return el("div", { class: "custom ny-assign", "data-thread": l.thread_id },
+      el("label", { class: "field-label", for: selectId }, `Approved work for post #${l.post_id}`),
+      el("select", { id: selectId, disabled: busy, onchange: e => { draft.delivery_agents[l.post_id] = e.target.value; sync(); } },
+        el("option", { value: "", selected: !assignedSource(l) }, "Choose an agent"),
+        activeAgents.map(a => el("option", { value: a.name, selected: assignedSource(l) === a.name }, a.name))));
+  }));
+
   const form = el("form", { class: "decision issue-answer", "data-decision-form": i.id, novalidate: true, onsubmit: e => {
     e.preventDefault();
     if (issueBusy) return;
@@ -1952,6 +1974,10 @@ function renderDecisionPanel(i, where, onSuccess) {
     const payload = { thread_ids: [...draft.scopes].sort((a, b) => a - b), expected_question_version: version };
     if (draft.choice === "custom") { payload.body = draft.decision; payload.outcome = draft.outcome; }
     else payload.selected_option_id = draft.choice.slice(7);
+    if (currentOutcome() === "approved") {
+      const choices = sourceLinks.filter(l => draft.scopes.includes(l.thread_id)).map(l => [String(l.post_id), assignedSource(l)]);
+      if (choices.length) payload.delivery_agents = Object.fromEntries(choices);
+    }
     issueWrite(`/api/issues/${i.id}/decisions`, payload, () => {
       draft.choice = q ? "" : "custom"; draft.decision = ""; draft.scopes = null; draft.attempted = false;
     }, key, r => {
@@ -1961,7 +1987,7 @@ function renderDecisionPanel(i, where, onSuccess) {
       return text;
     });
   } },
-    choices, custom, scopes,
+    choices, custom, scopes, assignments,
     el("p", { class: "note" }, "Options are suggestions until you send. Your answer applies only to the selected threads, grants no other authority, and does not mark the implementation resolved."),
     separate.length ? el("p", { class: "note", "data-separate": separate.join(",") },
       `${separate.length === 1 ? "Linked post" : "Linked posts"} ${separate.map(id => "#" + id).join(", ")} ${separate.length === 1 ? "asks its" : "each ask their"} own question: this answer does not answer ${separate.length === 1 ? "it" : "them"}. Answer ${separate.length === 1 ? "it" : "each"} on ${separate.length === 1 ? "its" : "their"} own (${separate.length === 1 ? "it is its" : "each is its"} own Needs you item until answered).`) : null,

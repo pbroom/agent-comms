@@ -116,7 +116,7 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
                 continue
             sources, eligible = [], True
             for reason in own_reasons:
-                for source_id in reason['post_ids']:
+                for source_id in dict.fromkeys(reason['post_ids']):
                     source = board.get_post(p, source_id)
                     rows = [r for r in source['requests'] if r['assigned_agent'] == agent and r['state'] != 'finished']
                     if (not rows or workstreams.get_for_post(board, source_id) is not None or
@@ -130,7 +130,8 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
                             break
                         sources.append({'post_id': source_id, 'recipient': row['recipient'], 'version': row['version']})
             if eligible and sources and len(sources) <= 100:
-                recovery.record(board, p, post['id'], agent, sources)
+                unique = {(r['post_id'], r['recipient']): r for r in sources}
+                recovery.record(board, p, post['id'], agent, list(unique.values()), requires_diagnostics=True)
 
     try:
         post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons),

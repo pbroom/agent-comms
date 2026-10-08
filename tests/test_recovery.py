@@ -303,3 +303,17 @@ def test_nonmatching_live_dispatch_is_still_fenced(env,tmp_path,field):
     env.board.conn.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
         (key,json.dumps(run),'codex',env.clock()))
     with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
+
+
+def test_unstick_deduplicates_post_with_multiple_recipients_assigned_to_one_agent(env):
+    import json
+    from agent_comms.dispatch import DispatchConfig
+    tid=env.thread()
+    source=env.post('human',tid,'shared unfinished work','request',to=['codex','claude'])
+    prior=next(r for r in source['requests'] if r['recipient']=='claude')
+    with db.write_tx(env.board.conn):
+        requests._save(env.board,env.p['human'],env.sid['human'],prior,'queued','explicit reassignment',[], 'codex',env.sid['codex'])
+    result=unstick.unstick(env.board,env.p['human'],tid,DispatchConfig())
+    stored=env.board.conn.execute('SELECT value FROM board_state WHERE key=?',
+        (recovery.PREFIX+str(result['post_id'])+'.codex',)).fetchone()
+    assert len(json.loads(stored['value'])['sources'])==2

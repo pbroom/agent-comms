@@ -4,15 +4,15 @@ const fs = require('node:fs');
 const {JSDOM} = require('jsdom');
 const html = fs.readFileSync(require('node:path').join(__dirname, '../agent_comms/dashboard.html'), 'utf8');
 const settle = () => new Promise(r => setTimeout(r, 60));
-async function setup(delivery, configuration) {
+async function setup(delivery, configuration, issue) {
   const calls=[];
   const post={id:1, seq:1, thread_id:1, agent:'claude-code', type:'proposal', body:'Apply approved fix', to:[], needs_response:true,
     created_at:new Date().toISOString(), refs:[], requests:[], approval_delivery:delivery};
   const state={me:{name:'human',is_human:true},paused:false,agents:[{name:'human',is_human:1},{name:'claude-code'},{name:'codex'}],
-    sessions:[],limits:{body_max_bytes:4096},authorization_grants:[],task_categories:[],active_runs:[],issues:[],needs_you_issues:[],
+    sessions:[],limits:{body_max_bytes:4096},authorization_grants:[],task_categories:[],active_runs:[],issues:issue?[issue]:[],needs_you_issues:issue?[issue]:[],
     needs_you:[post],configuration,threads:[{id:1,title:'Recovery',project:'/repo',status:'open',created_at:post.created_at,
       posts:[post],tasks:[],task_counts:{},agent_posts_since_human:0,thread_cap:1000}]};
-  const dom=new JSDOM(html,{url:'http://127.0.0.1:8787/',runScripts:'dangerously',beforeParse(win){
+  const dom=new JSDOM(html,{url:'http://127.0.0.1:8787/'+(issue?'#issue-'+issue.id:''),runScripts:'dangerously',beforeParse(win){
     win.HTMLElement.prototype.scrollIntoView=function(){};
     win.fetch=async (url,opts={})=>{
       let data;
@@ -53,4 +53,25 @@ test('source mismatch asks for reconnect without pretending settings refresh rel
   const {dom,d}=await setup(null,{state:'restart_required',runtime_source_changed:true,refresh_supported:false,recovery:'Reconnect this MCP session or restart this board process.',effective_limits:{}});
   try {const notice=d.getElementById('configuration-notice');assert.match(notice.textContent,/needs reconnecting/);assert.equal(notice.querySelector('button'),null);}
   finally {dom.window.close();}
+});
+
+
+test('shared approval requires only ambiguous selected sources and sends exact scoped owners',async()=>{
+  const at=new Date().toISOString();
+  const issue={id:9,title:'Shared recovery',body:'Scoped approval',status:'open',needs_human:true,created_by:'codex',created_at:at,updated_at:at,comments:[],decisions:[],resolution:null,
+    links:[{thread_id:1,post_id:1,title:'First',project:'/repo',needs_human:true,covers_post:true,source_post:{id:1,agent:'claude-code',approval_delivery:{recipient:'codex',requires_choice:false}}},
+      {thread_id:2,post_id:2,title:'Second',project:'/repo2',needs_human:true,covers_post:true,source_post:{id:2,agent:'claude-code',approval_delivery:{recipient:null,requires_choice:true}}}]};
+  const {dom,d,calls}=await setup(null,null,issue);
+  try {
+    const form=d.querySelector('[data-decision-form="9"]');assert.ok(form);
+    const area=form.querySelector('[name="decision"]');area.value='Approve scoped work';area.dispatchEvent(new dom.window.Event('input'));
+    form.querySelector('input[name="outcome"][value="approved"]').click();
+    assert.equal(form.querySelector('[data-decide="9"]').disabled,true);
+    assert.equal(form.querySelector('.issue-assignments select').value,'codex');
+    form.querySelector('.scope input[value="2"]').click();
+    assert.equal(form.querySelector('[data-decide="9"]').disabled,false);
+    form.dispatchEvent(new dom.window.Event('submit',{cancelable:true,bubbles:true}));await settle();
+    const call=calls.find(c=>c.url==='/api/issues/9/decisions');
+    assert.deepEqual(call.body.delivery_agents,{'1':'codex'});assert.deepEqual(call.body.thread_ids,[1]);
+  } finally {dom.window.close();}
 });
