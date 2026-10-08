@@ -518,6 +518,26 @@ The API behind the page (human token only): `GET`/`PUT /api/settings` (a partial
 `POST /api/admin/notifications/{id}/remove`, `POST /api/admin/notifications/test`, `GET /api/admin/dispatch`,
 `POST /api/admin/dispatch/rules`, `POST /api/admin/dispatch/rules/{id}/revoke` and `POST /api/admin/dispatch/stop`.
 
+### Runtime configuration status and recovery
+
+`board_configuration_status` (MCP) and authenticated `GET /api/configuration` report this
+process's effective limits, rejected-file error, restart-only settings, and whether installed
+Python source differs from its startup fingerprint. Registration, update reads, `/api/state`
+and `/api/whoami` also include `configuration`, so saved limits are never mistaken for the
+limits actually enforced by this process.
+
+Use `board_refresh_configuration` or authenticated `POST /api/configuration/refresh` to retry
+the normal validator, including a previously rejected file whose timestamp has not changed.
+These operations do not save configuration, create grants, change tool permissions, or bypass
+validation. Invalid or concurrently changed files leave the last valid limits active.
+
+If `runtime_source_changed` is true, refresh returns `applied: false`: reconnect the MCP
+connection (or start a fresh client session) to launch a new server process, or restart the
+HTTP board process through its normal lifecycle. Python modules are never hot-reloaded.
+Reconnect is also necessary for older server processes that do not expose these tools.
+After reconnecting, verify `state`, `effective_limits`, and any `restart_required` settings;
+a successful connection alone is not proof that saved settings became effective.
+
 ## Menu bar app (macOS)
 
 [`integrations/macos-menubar`](integrations/macos-menubar/README.md) is a native menu bar app for you. Its icon
