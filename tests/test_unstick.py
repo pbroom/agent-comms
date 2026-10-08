@@ -87,7 +87,7 @@ def test_agent_computation(uenv):
     a1 = ask(e, "claude", ["codex"])                         # codex never replied: stuck
     a2 = ask(e, "claude", ["codex", "human"])                # the human is never "stuck" here
     ask(e, "claude", ["grok"], sealed=True)                  # sealed: grok cannot read it
-    fyi = e.post("claude", e.tid, "fyi " + INJECTION, to=["grok"])  # not needs_response, but the last word
+    fyi = e.post("claude", e.tid, "request " + INJECTION, "request", to=["grok"])  # implicit ask
     blocked = claimed_task(e, "grok")
     e.board.transition_task(e.p["grok"], e.sid["grok"], blocked, "blocked", "stuck " + INJECTION)
     expired = claimed_task(e, "claude")
@@ -291,9 +291,26 @@ def test_a_dispatcher_tick_after_unstick_launches_the_stuck_agent(tmp_path):
     assert [(x["thread_id"], x["agent"]) for x in state["active_runs"]] == [(tid, "codex")]
 
 
-def test_last_post_to_an_agent_counts_even_without_needs_response(uenv):
-    uenv.post("codex", uenv.tid, "fyi " + INJECTION, to=["claude"])  # the thread's last word: a plain post
+def test_last_request_to_an_agent_counts_even_without_needs_response(uenv):
+    uenv.post("codex", uenv.tid, "please reply " + INJECTION, "request", to=["claude"])
     agents, reasons = unstick.stuck_agents(uenv.board, uenv.tid)
     assert agents == ["claude"] and reasons[0]["kind"] == "unanswered"
     uenv.post("claude", uenv.tid, "replied")                  # claude has the last word now: nothing waits
     assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])
+
+
+@pytest.mark.parametrize("post_type", ["status", "finding"])
+@pytest.mark.parametrize("needs_response", [False, True])
+def test_informational_completion_requires_explicit_response_intent(uenv, post_type, needs_response):
+    refs = [{"kind": "file", "path": "example.py", "rev": "abc123"}] if post_type == "finding" else []
+    p = uenv.post("claude", uenv.tid, "Complete", post_type, to=["codex"],
+                  needs_response=needs_response, refs=refs)
+    expected = (["codex"], [{"kind": "unanswered", "agent": "codex", "post_ids": [p["id"]]}])
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == (expected if needs_response else ([], []))
+    assert call(uenv).status_code == (200 if needs_response else 409)
+
+
+def test_human_approval_status_still_waits_on_recipient(uenv):
+    p = uenv.post("human", uenv.tid, "Approved: go ahead", "status", to=["codex"])
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == (
+        ["codex"], [{"kind": "unanswered", "agent": "codex", "post_ids": [p["id"]]}])

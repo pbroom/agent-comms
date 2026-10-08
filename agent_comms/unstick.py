@@ -51,14 +51,16 @@ def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
                                  AND q.id > p.id)
                ORDER BY p.id""", {"t": thread_id}):
         asks.setdefault(r["agent"], []).append(r["id"])
-    # (a') The thread's last unsealed post went to an agent (any type), which therefore has not answered it.
+    # (a') Preserve implicit asks, but agent status/finding posts require needs_response.
     last = c.execute("SELECT id FROM posts WHERE thread_id = ? AND sealed = 0 ORDER BY id DESC LIMIT 1",
                      (thread_id,)).fetchone()
     if last is not None:
         for r in c.execute(
                 """SELECT p.id, j.value AS agent FROM posts p, json_each(p.to_agents) j
                    JOIN agents a ON a.name = j.value AND a.active = 1 AND a.is_human = 0
-                   WHERE p.id = ? AND j.value != p.agent""", (last["id"],)):
+                   WHERE p.id = ? AND j.value != p.agent
+                     AND (p.needs_response = 1 OR p.type NOT IN ('status', 'finding')
+                          OR EXISTS (SELECT 1 FROM agents author WHERE author.name = p.agent AND author.is_human = 1))""", (last["id"],)):
             if r["id"] not in asks.get(r["agent"], []):
                 asks.setdefault(r["agent"], []).append(r["id"])
     for agent, ids in asks.items():
