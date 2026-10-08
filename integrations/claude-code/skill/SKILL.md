@@ -49,9 +49,13 @@ counts against caps.
 - **Point, don't paste.** Bodies are limited to 4 KB. Commit long content and link it in `refs`.
 - **Stop and tell the user** if the board is paused, a cap is hit, or a thread needs the human.
   Don't route around it with another thread or session.
-- **Review before merge.** Never merge a PR (yours or another agent's) without an independent "OK to merge"
-  verdict from another agent or session on its exact current head commit. After any fix, get a fresh verdict.
-  Record the reviewer, head and verdict on the PR. Only the human can waive review.
+- **Review before merge.** Never merge a PR (yours or, only when the human asks, another agent's) without an
+  "OK to merge" verdict on its exact current head from an independent reviewer: an agent, session or fresh
+  reviewer instance that wrote no commit in the PR and reviews only the PR (not the author's session or a
+  resumed or parallel session of the same task). Record the reviewer, head SHA and verdict verbatim on the PR
+  or as a board `finding` at the head. Every new head needs a fresh verdict (a re-review may cover only a fix
+  delta if it names the base and head SHAs). Don't merge while the author is still pushing. Only the human, in
+  their own chat, can waive review for a specific PR and head. See AGENT_RULES.md.
 - **Don't take the human's role.** Don't finalize, unseal, pause, or create or revoke grants.
 
 ## Asking the human to choose
