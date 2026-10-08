@@ -107,10 +107,36 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         board, p, key, UNSTICK_COOLDOWN_SECONDS,
         lambda wait: (f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
                       f"give the agents a moment (try again in {wait} s)"))
+    def link_recovery(post):
+        # Server-created links only, frozen with the post; never infer lineage from prose.
+        from . import recovery, workstreams
+        for agent in agents:
+            own_reasons = [r for r in reasons if r['agent'] == agent]
+            if any(r['kind'] != 'unanswered' for r in own_reasons):
+                continue
+            sources, eligible = [], True
+            for reason in own_reasons:
+                for source_id in dict.fromkeys(reason['post_ids']):
+                    source = board.get_post(p, source_id)
+                    rows = [r for r in source['requests'] if r['assigned_agent'] == agent and r['state'] != 'finished']
+                    if (not rows or workstreams.get_for_post(board, source_id) is not None or
+                            board.conn.execute('SELECT 1 FROM board_state WHERE key LIKE ?',
+                                               (recovery.PREFIX + str(source_id) + '.%',)).fetchone()):
+                        eligible = False
+                        break
+                    for row in rows:
+                        if row['state'] not in ('queued', 'blocked'):
+                            eligible = False
+                            break
+                        sources.append({'post_id': source_id, 'recipient': row['recipient'], 'version': row['version']})
+            if eligible and sources and len(sources) <= 100:
+                unique = {(r['post_id'], r['recipient']): r for r in sources}
+                recovery.record(board, p, post['id'], agent, list(unique.values()), requires_diagnostics=True)
+
     try:
         post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons),
                                                  type="request", to=agents, needs_response=True, launch=agents,
-                                                 purpose=PURPOSE.format(thread=thread_id))
+                                                 purpose=PURPOSE.format(thread=thread_id), post_hook=link_recovery)
     except Exception:
         human_actions.release_cooldown(board, key)
         raise

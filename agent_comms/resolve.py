@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any
 import json
 
-from . import dispatch, human_actions, db, decision_actions, requests
+from . import dispatch, human_actions, db, decision_actions, requests, approval_owners
 from .core import Board, Conflict, Invalid, Principal
 
 ACTIONS = ("approve", "approve_launch", "reject", "not_now", "reply", "choose", "ask_options")
@@ -95,12 +95,6 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
             raise Invalid(f"post #{post_id} already has structured options; choose one or reply")
         if not to_author:
             raise Invalid(f"post #{post_id} was not written by an active agent, so there is no one to ask")
-    if action == "approve_launch":
-        if not to_author:
-            raise Invalid(f"post #{post_id} was not written by an active agent, so there is no one to launch")
-        if board._thread_row(item["thread_id"])["status"] != "open":
-            raise Conflict(f"thread {item['thread_id']} is closed; reopen it first")
-
     def still_needs_you(c) -> None:
         if not _needs_you(c, post_id):
             raise Conflict(f"post #{post_id} no longer needs you (it was already handled)")
@@ -108,12 +102,33 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
         c.execute("DELETE FROM board_state WHERE key LIKE ? AND updated_at < ?",
                   (STATE_PREFIX + "%", board.now() - RESOLVE_COOLDOWN_SECONDS))
 
-    if delivery_agent is not None:
-        if not (action in ('approve', 'approve_launch') or (action == 'choose' and option['outcome'] == 'approved' and not option.get('action'))):
-            raise Invalid('assign to is only for an approved agent action')
-        if not board.conn.execute('SELECT 1 FROM agents WHERE name=? AND active=1 AND is_human=0', (delivery_agent,)).fetchone():
-            raise Invalid('assign to requires an active agent')
-        to_author = [delivery_agent]
+    deliver = action in ('approve', 'approve_launch') or (
+        action == 'choose' and option['outcome'] == 'approved' and not option.get('action'))
+    if delivery_agent is not None and not deliver:
+        raise Invalid('assign to is only for an approved agent action')
+    selected_delivery = None
+    answer_recipient = None
+    if deliver:
+        selected_delivery = approval_owners.delivery(board, item, delivery_agent)
+        if selected_delivery['requires_choice']:
+            raise Invalid(selected_delivery['reason'])
+        answer_recipient = selected_delivery['recipient']
+        to_author = [answer_recipient] if answer_recipient else []
+
+    def check_delivery():
+        if not _needs_you(board.conn, post_id):
+            raise Conflict(f'post #{post_id} no longer needs you (it was already handled)')
+        if selected_delivery is not None:
+            current = approval_owners.delivery(board, item, delivery_agent)
+            if current['requires_choice'] or current['recipient'] != answer_recipient:
+                raise Conflict('recorded implementer changed; reload before approving')
+
+    if action == "approve_launch":
+        if not to_author:
+            raise Invalid(f"post #{post_id} was not written by an active agent, so there is no one to launch")
+        if board._thread_row(item["thread_id"])["status"] != "open":
+            raise Conflict(f"thread {item['thread_id']} is closed; reopen it first")
+
     if option and option.get('action'):
         return _mechanical(board, p, item, option, question, note)
 
@@ -139,7 +154,7 @@ def resolve(board: Board, p: Principal, post_id: int, action: str, text: str | N
     try:
         post, rule = human_actions.post_as_human(
             board, p, thread_id=item["thread_id"], body=body, type=type_, to=to_author, needs_response=needs_response,
-            launch=launch, purpose=PURPOSE.format(post=post_id, thread=item["thread_id"]),answer_to=[post_id], answer_recipient=delivery_agent)
+            launch=launch, purpose=PURPOSE.format(post=post_id, thread=item["thread_id"]),answer_to=[post_id], answer_recipient=answer_recipient, post_check=check_delivery)
     except Exception:
         human_actions.release_cooldown(board, key)
         raise

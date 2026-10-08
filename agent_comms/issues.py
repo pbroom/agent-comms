@@ -171,6 +171,10 @@ def get_issue(board, p, issue_id):
         link["needs_human"] = bool(link["needs_human"])
         # Whether this issue's answer answers the linked post (None for a thread link).
         link["covers_post"] = bool(link["covers_post"]) if link["post_id"] is not None else None
+        if p.is_human and link['post_id'] is not None:
+            source = board.get_post(p, link['post_id'])
+            link['source_post'] = {'id': source['id'], 'agent': source['agent'],
+                                   'approval_delivery': source['approval_delivery']}
     out["comments"], out["decisions"], out["resolutions"] = [], [], []
     out["resolution"] = None
     for r in board.conn.execute("SELECT * FROM issue_comments WHERE issue_id=? ORDER BY id", (issue_id,)):
@@ -308,7 +312,7 @@ def comment_issue(board, p, session_id, issue_id, body, kind="comment", decision
     return get_issue(board, p, issue_id)
 
 
-def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answered", selected_option_id=None, expected_question_version=None):
+def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answered", selected_option_id=None, expected_question_version=None, delivery_agents=None):
     board._require_human(p, "decide a shared issue")
     if selected_option_id is None:
         body = _body(board, body)
@@ -316,6 +320,14 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         raise Invalid("outcome must be answered, approved, or declined")
     if not isinstance(thread_ids, list) or not thread_ids or any(type(t) is not int for t in thread_ids):
         raise Invalid("thread_ids must explicitly select linked threads")
+    if delivery_agents is None:
+        delivery_agents = {}
+    if not isinstance(delivery_agents, dict) or any(
+        not isinstance(key, str) or not key.isascii() or not key.isdigit()
+        or int(key) <= 0 or str(int(key)) != key or not isinstance(value, str)
+        for key, value in delivery_agents.items()
+    ):
+        raise Invalid('delivery_agents must map exact source post IDs to active agents')
     answer_posts = []
     with db.write_tx(board.conn) as c:
         row = _row(board, issue_id)
@@ -349,6 +361,12 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
             LEFT JOIN posts p ON p.id=l.post_id LEFT JOIN agents a ON a.name=p.agent WHERE l.issue_id=?
             AND l.thread_id IN (SELECT value FROM json_each(?)) ORDER BY l.id''',(issue_id,json.dumps(thread_ids))).fetchall()
         decision['issue_link_ids'] = [link['id'] for link in frozen_links]
+        eligible_sources = {str(link['post_id']) for link in frozen_links
+                            if link['post_id'] is not None and not link['source_is_human'] and link['covers_post']}
+        if delivery_agents and (outcome != 'approved' or not set(delivery_agents) <= eligible_sources):
+            raise Invalid('delivery_agents may only select covered source posts in this approved scope')
+        if delivery_agents:
+            decision['delivery_agents'] = dict(delivery_agents)
         latest = c.execute("SELECT * FROM issue_comments WHERE issue_id=? AND kind='decision' ORDER BY id DESC LIMIT 1",
                            (issue_id,)).fetchone()
         if (latest is not None and latest['body']==body and latest['outcome']==outcome
@@ -360,20 +378,38 @@ def decide_issue(board, p, session_id, issue_id, body, thread_ids, outcome="answ
         event_id = _event(board, p, session_id, issue_id, "decision", body, outcome, scope, decision)
         for tid in sorted(set(thread_ids)):
             selected = [link for link in frozen_links if link['thread_id']==tid]
-            # Answer only the source posts this issue's question covers (issue_links.covers_post). A linked post
-            # asking its own, different question keeps its own Needs you item; the issue's answer is not its answer.
-            source_ids = sorted({link['post_id'] for link in selected
-                                 if link['post_id'] is not None and not link['source_is_human'] and link['covers_post']})
-            intended = {link['source_agent'] or link['agent'] for link in selected}
-            recipients = [agent for agent in sorted(intended) if c.execute(
-                'SELECT 1 FROM agents WHERE name=? AND is_human=0',(agent,)).fetchone()]
-            answer = board.create_post(p,session_id,thread_id=tid,type='status',
-                body=f'Human answer for issue #{issue_id} ({outcome}):\n{body}',to=recipients,
-                answer_to=source_ids or None,_in_transaction=True)
-            answer_posts.append(answer)
-            for link in selected:
-                c.execute('''INSERT INTO issue_answer_links(decision_comment_id,issue_link_id,answer_post_id,question_version)
-                    VALUES (?,?,?,?)''',(event_id,link['id'],answer['id'],row['question_version']))
+            # A separate exact source can have a separate implementer. Grouping
+            # never changes which question or link the answer actually covers.
+            groups = []
+            if outcome == 'approved':
+                from .approval_owners import delivery
+                owners, remaining = {}, []
+                for link in selected:
+                    if str(link['post_id']) not in eligible_sources:
+                        remaining.append(link)
+                        continue
+                    selected_owner = delivery(board, {'id': link['post_id']}, delivery_agents.get(str(link['post_id'])))
+                    if selected_owner['requires_choice'] or selected_owner['recipient'] is None:
+                        raise Invalid(f"post #{link['post_id']}: {selected_owner['reason']}; choose an active agent")
+                    owners.setdefault(selected_owner['recipient'], []).append(link)
+                groups.extend((links, owner) for owner, links in sorted(owners.items()))
+                if remaining:
+                    groups.append((remaining, None))
+            else:
+                groups.append((selected, None))
+            for group, owner in groups:
+                source_ids = sorted({link['post_id'] for link in group
+                                     if link['post_id'] is not None and not link['source_is_human'] and link['covers_post']})
+                intended = {link['source_agent'] or link['agent'] for link in group}
+                recipients = [owner] if owner else [agent for agent in sorted(intended) if c.execute(
+                    'SELECT 1 FROM agents WHERE name=? AND is_human=0', (agent,)).fetchone()]
+                answer = board.create_post(p,session_id,thread_id=tid,type='status',
+                    body=f'Human answer for issue #{issue_id} ({outcome}):\n{body}',to=recipients,
+                    answer_to=source_ids or None,_answer_recipient=owner,_in_transaction=True)
+                answer_posts.append(answer)
+                for link in group:
+                    c.execute('''INSERT INTO issue_answer_links(decision_comment_id,issue_link_id,answer_post_id,question_version)
+                        VALUES (?,?,?,?)''',(event_id,link['id'],answer['id'],row['question_version']))
         c.execute(
             "UPDATE issue_links SET needs_human=0 WHERE issue_id=? AND thread_id IN (SELECT value FROM json_each(?))",
             (issue_id, json.dumps(thread_ids)),
