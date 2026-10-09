@@ -15,7 +15,40 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
 SECTIONS = ("server", "limits", "tasks", "web")
-NOT_SETTINGS = {"dispatch", "conversations", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
+NOT_SETTINGS = {"dispatch", "conversations", "unstick", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
+PREVENTION_KEYS = ("prevention_owner", "prevention_thread")   # the [unstick] table (prevention_config)
+
+
+@dataclass(frozen=True)
+class PreventionConfig:
+    """[unstick] prevention_owner / prevention_thread: where Unstick and automatic recovery send prevention
+    proposals (agent_comms/prevention.py). Off unless both are set."""
+    owner: str
+    thread_id: int
+
+
+def prevention_config(table: object) -> PreventionConfig | None:
+    """The [unstick] table, validated strictly: only prevention_owner (an agent name) and prevention_thread (a thread
+    id, a positive whole number), both or neither. None when off (absent, or both left empty). Raises ValueError."""
+    if table is None:
+        return None
+    if not isinstance(table, dict):
+        raise ValueError("[unstick] must be a table")
+    unknown = sorted(set(table) - set(PREVENTION_KEYS))
+    if unknown:
+        raise ValueError(f"unknown setting [unstick] {unknown[0]}; known: {', '.join(PREVENTION_KEYS)}")
+    owner = table.get("prevention_owner", "")
+    thread = table.get("prevention_thread", 0)
+    if not isinstance(owner, str) or (owner and not NAME_RE.match(owner)):
+        raise ValueError("[unstick] prevention_owner must be an agent name (lowercase letters, digits, - and _), "
+                         "or \"\" for off")
+    if isinstance(thread, bool) or not isinstance(thread, int) or thread < 0:
+        raise ValueError("[unstick] prevention_thread must be a thread id (a positive whole number), or 0 for off")
+    if not owner and not thread:
+        return None
+    if not owner or not thread:
+        raise ValueError("[unstick] set both prevention_owner and prevention_thread, or neither")
+    return PreventionConfig(owner, thread)
 
 
 def deep_merge(base: dict, over: dict) -> dict:
@@ -57,6 +90,9 @@ class Settings:
     # The raw [conversations] table: dashboard links to agents' own conversations; validated by
     # conversations.ConversationConfig.
     conversations: dict = field(default_factory=dict)
+    # The raw [unstick] table: the prevention inbox (prevention_owner, prevention_thread); validated strictly by
+    # prevention_config when the settings are read, so a bad value is refused at start and on reload.
+    unstick: dict = field(default_factory=dict)
     # The board.toml these settings came from (board.local.toml is beside it), or None when they were built in
     # code. Not a setting: it lets a running Board hot-reload them (Board.reload_settings) and the Settings page
     # save edits to board.local.toml.
@@ -101,6 +137,8 @@ class Settings:
                 setattr(s, k, Path(v).expanduser() if k.endswith("_path") else v)
         s.dispatch = data.get("dispatch", {})
         s.conversations = data.get("conversations", {})
+        s.unstick = data.get("unstick", {})
+        prevention_config(s.unstick)   # strict: raises ValueError naming the bad key
         for p in ("db_path", "agents_path"):
             val = getattr(s, p)
             if not val.is_absolute():

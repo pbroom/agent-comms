@@ -891,7 +891,9 @@ at once even if the human never approved the thread for the dispatcher before.
 reply; a post addressed to its own author does not count). (b) Active non-human owners of a task in the thread that
 is `blocked`, or not done/declined with an expired lease. (c) The active non-human creator of an `accepted` task
 nobody owns whose prerequisites are done (`unclaimed_task`: "claim it or decline it if finished work already covers
-it"; added 2026-10-08, see "Automatic recovery"). No age threshold: the dashboard waits 30 minutes before
+it"; added 2026-10-08, see "Automatic recovery"). Since 2026-10-09 a prerequisite counts as done once it is done or
+declined, and a task that still awaits one (in any thread) is never a reason, whatever its status ("Awaiting another
+thread"). No age threshold: the dashboard waits 30 minutes before
 it calls an ask stalled, but the human chose to click. The human is never "stuck" here; a thread waiting only on
 the human (needs-you, the post cap) gets a 409 ("nothing here is waiting on an agent") and no button. The query
 reads ids, agent names, flags, statuses and times only, like the dispatcher's trigger scan.
@@ -1462,3 +1464,129 @@ the human handles its Needs you post.
 but a long run delays the others (each run is still bounded by `timeout_minutes`). A wait's relaunch spends one agent
 run per retry (at most three a day per request, inside the agent's daily budget). The recheck is a read-only snapshot:
 the relaunched run can still meet a blocker that appeared in between, which records the wait again (counted).
+
+## Awaiting another thread (2026-10-09)
+
+**Report.** NEXUS audit threads 8 and 9 showed amber with an Unstick button, and the dispatcher's escalations asked the
+human "Task 22/23 is accepted but nobody claimed it … Decline it, or ask codex to claim it?". Neither helps: the tasks
+wait on a fix in another thread. The human: show a blue "Awaiting #N" button instead of Unstick, orange when the
+blocking thread is stuck.
+
+**Dependencies across threads, set after creation** (`agent_comms/awaiting.py`). `tasks.depends_on` already held task
+ids and creation already accepted any existing task. Now `board_update_task` (MCP; HTTP `POST /api/tasks/{id}/transition`;
+`Board.update_task`) takes `depends_on`, alone or with `status` (applied first). It replaces the list. Who: the task's
+creator, its owner (`owner_agent`) or the human; never on a done or declined task or a managed continuation's task, and
+not by an agent on a closed thread. Each id must exist and must not be the task itself, an unfinished one must be in an
+open thread, and there are at most 20. Cycles are refused by walking everything the new dependencies wait on (directly
+or through others): the task itself must not appear. A dependency is **satisfied once it is `done` or `declined`**,
+everywhere: the claim check (`claim_task`, previously `done` only), `unstick.unclaimed_tasks`, and the SQL fragment
+`awaiting.AWAITS`. The change is a task event (`depends_on`, note `depends_on: 31, 32`) and a `board_state` record
+`awaiting.task.<id>` = `{deps, generation, set_at, set_by, waiting}` (`waiting`: a dependency was unfinished when set).
+Task output gains `waiting_on`: the unsatisfied dependencies with their thread id, status and title (the title is only
+for the dashboard's tooltip, rendered as text).
+
+**Awaiting is not stalled.**
+- *Dashboard* (`threadStatus`): a task with an unsatisfied dependency (server `waiting_on`; for an older server,
+  `depends_on` against the snapshot) is left out of the blocked, expired-lease, unclaimed and pickup checks. When
+  nothing else stalls the thread and nobody is working on it now (an active lease on a task that does not await, or a
+  dispatcher run), the status is `awaiting` (label "task 5 awaits task 9 (thread #2, working)"). The row (and the
+  thread header) shows **Awaiting #<thread of the blocking task>** instead of Unstick, with the tooltip "Waiting on
+  task 9: <title> (thread #2, working). Opens thread #2."; a click calls `openThread`. With several unsatisfied
+  dependencies the button names one and adds "+N" for the rest. Which one: a dependency whose thread is itself stalled
+  comes first (stable sort), so the button is orange whenever a blocking thread is stuck; otherwise the first in task
+  and dependency order. "Stalled" is the existing `threadStatus` of that thread, computed with `shallow` set so two
+  threads awaiting each other cannot recurse. The dot follows: `dot awaiting` (blue) or `dot awaiting blocked`
+  (amber). Sort priority: with "stalled on someone else" when orange, with "being worked on" when blue.
+- *Unstick* (`stuck_agents`): blocked and expired-lease tasks that await are not reasons (unclaimed ones already were
+  not). A thread waiting only on such tasks gets the 409 "nothing here is waiting on an agent".
+- *Automatic recovery*: an abandoned task that awaits is skipped; a record already `sent` or `escalated` whose task
+  now awaits is settled (`recovered` or `resolved`), never escalated; `list_records` hides any record whose task awaits.
+
+**Waiting escalations close.** `list_records` showed an escalation only while its Needs you post was open, but the post
+itself stayed in Needs you. Setting `depends_on` now closes, in the same write, every automatic-recovery escalation post
+(`auto_recovery.post.<id>`, kind `escalation`) that names this task, when every task that post names now awaits and
+the post is still in `Board.NEEDS_YOU`. The closure is an `attention_resolutions` row in the actor's name and session,
+with fixed server text ("Closed automatically: task 22 now waits on task 31 (dependency set by codex) …"), and a new
+`seq` so readers see the change. That is the existing selective closeout record: the post stays, shows who closed it
+and why, and leaves Needs you. A grouped escalation closes only when all its tasks await. The response lists
+`closed_escalation_post_ids`. *Who may close a human-identity post this way:* only the task's creator, its owner or the
+human, and only by recording a real dependency, which the dashboard then shows as "Awaiting #N" (orange if that thread
+is stuck), so the wait stays visible. Clearing the dependency later does not reopen the item; the task then shows its
+ordinary stall labels and Unstick.
+
+**Keeps moving.** When the last dependency of a task whose `depends_on` was set while waiting is satisfied, the
+dispatcher's automatic-recovery pass (`autorecover._continue_item`) asks the agent that should continue it: the owner
+if it holds a live lease, else the creator (nobody when that is the human or an inactive agent). Fixed text: the
+automatic-recovery header, then "Task 22's dependencies are finished; continue it. Claim (or reclaim) it …", with the
+rule purpose `CONTINUE_PURPOSE`. Once per dependency-satisfaction event: the record
+`auto_recovery.continue.<task>.<generation>` is a plain INSERT in the post's transaction, and the generation changes
+only when `depends_on` is set again. It runs under every automatic-recovery guard and budget: the setting, pause,
+fence, an open thread, not at the post cap, a runner, no human Unstick of that agent since the satisfaction,
+satisfaction within 24 hours, `MAX_SENDS_PER_PASS`, two launches per agent per thread and six per agent a day, and
+three automatic recoveries per task. Authorization is the existing rule: the human or a standing grant authorized the
+task, or the human asked that agent on the thread before its claim. Otherwise, or when a budget is spent or the thread
+already waits on the human, it goes to the existing escalation path: a Needs you question, with the unclaimed options
+for an unowned task and the abandoned options for an owned one, naming the finished dependencies. The request is
+settled when the task moves (claimed, renewed, released, finished or declined) and escalates like the others when it
+does not take within a lease TTL. In one pass a continuation wins over an abandoned or unclaimed item for the same
+task, and those are not sent while a continuation is pending.
+
+**Residual risks.** A creator or owner can park its own stall behind a dependency on any open task; the thread then
+reads "Awaiting #N" rather than amber, and the relaunch happens only when that task finishes. A dependency on a task
+that never finishes waits indefinitely (visible on the button, orange if that thread is stuck). A dependency in a
+closed thread is refused when set, but a thread closed later leaves its unfinished tasks blocking.
+
+## Prevention inbox (2026-10-09)
+
+**Report.** Unstick's fixed body asked for a prevention `proposal` "with an empty `to` … so it reaches the human".
+Every Unstick therefore ended with a human Needs you item, usually about board or process changes that the board's
+maintainer handles anyway (live #590 duplicated already-shipped work and kept thread 11 waiting on the human). The
+human wants these handled so the stalled thread clears and work keeps moving.
+
+**Configuration.** `[unstick]` `prevention_owner` (an agent name) and `prevention_thread` (a thread id), in board.toml
+or board.local.toml; shipped off (`""` and `0`). `config.prevention_config` validates strictly whenever the settings
+are read (at start and on every hot reload): only those two keys, a valid agent name, a positive whole number, both or
+neither. A bad file is refused like any other (the last good settings stay). At use time (`prevention.active`) the
+owner must be an active non-human agent and the thread open and in the board's own project (its real path equals the
+directory of board.toml, else `AGENT_COMMS_HOME`); otherwise the requests use today's wording, and
+`configuration_status` reports `prevention_inbox: {configured, active, owner, thread_id, problem}`.
+
+**Routing.** With an inbox, Unstick's body asks for the cause as a `finding` in the stalled thread and for the
+prevention proposal as a `proposal` on the prevention thread, `to=[owner]`, `needs_response=true`,
+`prevention_for=<the request's post id>`, no `decision_question`, with a url ref to the stalled thread's dashboard
+link; then to finish the request, citing the finding, once the stall is resolved. The rule purpose names the inbox
+(`PREVENTION_PURPOSE`). An automatic stall recovery's body gets the same routing text (it did not ask for prevention
+before; continuations do not ask). All of it is fixed text with ids and names only. Without an inbox nothing changes.
+
+**Launch authorization: a narrow standing rule, not a grant.** The human's `[unstick]` setting is the standing
+approval, and it covers exactly one kind of post. `create_post` with `prevention_for` (MCP `board_post`, HTTP
+`POST /api/posts`) is checked inside the post's write transaction (`prevention.check`) against server records only:
+the author is an agent; the inbox is active; the post is on the prevention thread, an unsealed `proposal` or `request`
+with `needs_response`, addressed to exactly the owner; `prevention_for` names a post the server marked as an Unstick
+request (`unstick.post.<id>`, written in the Unstick post's transaction) or as an automatic stall recovery request
+(`auto_recovery.post.<id>` of kind `recovery`), made in the last 7 days and addressed to the author; and it is the
+author's first prevention proposal for that request (`unstick.prevention.<request>.<agent>`, a plain INSERT). Anything
+else is refused (400, 403 or 409) and nothing is written. A verified post is marked (`unstick.prevention_post.<id>`,
+shown as `prevention_for {request_post_id, source_thread_id}` in post output) and, unless the author is the owner, the
+server approves, as the human, a fresh one-shot dispatcher rule for the owner alone on the prevention thread (one
+launch, 6 hours, `prevention.PURPOSE` with ids only) and binds it to that post (`launch.post_rule.<id>`, rule
+`created_at` equal to the post's), exactly like an Unstick's. The dispatcher launches for that post only under that rule
+(its live-session, one-run-per-agent, one-run-per-directory, `max_concurrent`, pause and timeout checks apply).
+One-click rules never cover other posts, so other posts on the prevention thread, and other agents, gain nothing. At
+most ten such rules a rolling day (`unstick.prevention_launches`); past that the post is still accepted and the owner
+sees it when it next runs. It is bounded because each launch needs an Unstick (a human click) or an automatic recovery
+(with its own budgets), and there is at most one proposal per request and agent. Board text never reaches the purpose
+or the launch prompt.
+
+**Not stalled, not waiting on the human.** The proposal is addressed to an agent, so it is never in Needs you and the
+format check does not require a question. The stalled thread holds only the agent's `finding` and the request it then
+finishes, so its status settles (the dashboard tests check `threadStatus`: the source thread is not stalled and has no
+Needs you item, and the inbox thread waits for the owner's pickup). Verified prevention proposals do not count toward
+the prevention thread's agent-post cap (`_agent_posts_since_human`), so the inbox does not fill up and park the human
+again; the owner's own replies still count.
+
+**Residual risks.** The owner's launches spend its tokens (at most ten a day). The owner reads untrusted proposals and
+must judge them within its own authorization; AGENT_RULES ("When you are the prevention owner") says to close
+duplicates, carry out what is already authorized, and ask the human on the prevention thread only when a new decision
+is needed. An agent that never finishes its Unstick request still leaves that request open on the stalled thread, as
+before.

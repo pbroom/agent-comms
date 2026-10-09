@@ -127,6 +127,7 @@ class PostIn(Body):
     answer_to: list[StrictInt] | None = None
     request_reply: RequestReplyIn | None = None
     idempotency_key: str | None = None
+    prevention_for: StrictInt | None = None   # a prevention proposal for this Unstick/recovery request (prevention.py)
     session_id: int | None = None
 
 
@@ -179,8 +180,9 @@ class SessionOnly(Body):
 
 
 class TransitionIn(Body):
-    status: Literal["proposed", "accepted", "working", "blocked", "done", "declined"]
+    status: Literal["proposed", "accepted", "working", "blocked", "done", "declined"] | None = None
     note: str | None = None
+    depends_on: list[StrictInt] | None = None   # replaces the task's dependencies (awaiting.py); [] clears them
     session_id: int | None = None
 
 
@@ -582,7 +584,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     @app.post("/api/tasks/{task_id}/transition")
     def transition(task_id: int, body: TransitionIn, request: Request, p: Principal = P):
-        return board.transition_task(p, sid(p, request, body.session_id), task_id, body.status, body.note)
+        return board.update_task(p, sid(p, request, body.session_id), task_id, body.status, body.note,
+                                 body.depends_on)
 
     @app.get("/api/grants")
     def grants(project: str | None = None, p: Principal = P):

@@ -43,6 +43,13 @@ is the standing approval that a click on Unstick would otherwise give, and only 
   request held by a sticky browser denial (browser_readiness.request_blocker) is never relaunched around: it goes
   straight to the human.
 
+A continuation (DESIGN_NOTES "Awaiting another thread"): a task whose depends_on was set while a dependency was
+unfinished (awaiting.STATE_PREFIX) is awaiting that work, so it is never treated as stalled here. When its last
+dependency is done or declined, the dispatcher asks the agent that should continue it (its owner if that holds a live
+lease, else its creator) with the fixed text "task N's dependencies are finished; continue it", once per
+dependency-satisfaction event (CONTINUE_PREFIX, keyed by the depends_on generation), under the same guards, budgets
+and authorization rules as an unclaimed or abandoned task; otherwise it escalates the same way.
+
 A third case (DESIGN_NOTES "Automatic owner handoff"): a *recovery wait*. board_recover_request_owner hit a transient
 blocker (another session or run still busy in the owner's checkout) and recorded a wait (recovery.WAIT_PREFIX). Under
 the same setting, fence and pause guards, the dispatcher relaunches that agent once the worktree is free, at most
@@ -55,8 +62,8 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import browser_readiness, db, human_actions, issues, recovery, requests, unstick, workstreams
-from .core import Board, Conflict, Principal, iso
+from . import awaiting, browser_readiness, db, human_actions, issues, recovery, requests, unstick, workstreams
+from .core import TERMINAL, Board, Conflict, Principal, iso
 
 log = logging.getLogger("agent_comms.autorecover")
 
@@ -80,6 +87,7 @@ LIST_MAX = 100                      # records sent to the dashboard
 PREFIX = "auto_recovery."
 TASK_PREFIX = PREFIX + "task."              # <task id>.<lease_expires_at>: abandoned work
 UNCLAIMED_PREFIX = PREFIX + "unclaimed."    # <task id>: an unclaimed task
+CONTINUE_PREFIX = PREFIX + "continue."      # <task id>.<depends_on generation>: its dependencies finished
 POST_PREFIX = PREFIX + "post."              # <post id>: a post made automatically (core.Board.NOT_AUTOMATIC)
 BUDGET_PREFIX = PREFIX + "budget."          # <agent>.<thread id>: launch times in the rolling window
 AGENT_BUDGET_PREFIX = PREFIX + "agent_budget."  # <agent>: launch times in the rolling window, all threads
@@ -97,6 +105,14 @@ INSTRUCTIONS = ("Reclaim an abandoned task with board_claim_task first, then tak
 PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting auto_recover_stalled_work): reclaim, "
            "finish, release or decline the abandoned or unclaimed tasks named in the recovery request; stay within "
            "the thread's existing request.")
+CONTINUE_INSTRUCTIONS = ("Claim (or reclaim) it with board_claim_task, then finish it, or release it with a `status` "
+                         "saying what remains. Stay within what this thread already asked for, and reply to this "
+                         "request (request_reply) when you are done or blocked.")
+CONTINUE_PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting auto_recover_stalled_work): "
+                    "continue the tasks named in the request, whose dependencies are finished; stay within the "
+                    "thread's existing request.")
+# With a prevention inbox (prevention.py), a stall recovery also asks for the cause and a prevention proposal there.
+PREVENTION_INSTRUCTIONS = "Post a `finding` with the cause of the stall in this thread. {prevention}"
 ESCALATION = ("Automatic recovery did not take (sent by the dispatcher under the human's board setting "
               "auto_recover_stalled_work; not a human click): {items}. No further automatic launches will be made "
               "for {them}. This needs you: {next}")
@@ -112,6 +128,10 @@ def task_key(task_id: int, lease_expires_at: float) -> str:
 
 def unclaimed_key(task_id: int) -> str:
     return f"{UNCLAIMED_PREFIX}{int(task_id)}"
+
+
+def continue_key(task_id: int, generation: int) -> str:
+    return f"{CONTINUE_PREFIX}{int(task_id)}.{int(generation)}"
 
 
 def budget_key(agent: str, thread_id: int) -> str:
@@ -172,7 +192,7 @@ def _update(conn, key: str, value: Any, now: float) -> None:
 
 def _records(conn) -> list[tuple[str, dict]]:
     out = []
-    for prefix in (TASK_PREFIX, UNCLAIMED_PREFIX):
+    for prefix in (TASK_PREFIX, UNCLAIMED_PREFIX, CONTINUE_PREFIX):
         for key, value in _keys(conn, prefix):
             try:
                 rec = json.loads(value)
@@ -320,6 +340,8 @@ def _abandoned_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
     if r["owner_session"] is not None and conn.execute(
             "SELECT 1 FROM tasks WHERE owner_session = ? AND lease_expires_at > ?", (r["owner_session"], now)).fetchone():
         return None     # it still holds a live lease elsewhere: active
+    if awaiting.awaits(conn, r["id"]) or _continuing(conn, r["id"]):
+        return None     # it waits on unfinished dependencies (awaiting, not stalled), or was just asked to continue
     key = task_key(r["id"], r["lease_expires_at"])
     if _get(conn, key) is not None or workstreams.get_for_task(board, r["id"]) is not None:
         return None     # already handled once, or a managed continuation with its own reconciliation
@@ -353,7 +375,7 @@ def _unclaimed_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
     thread = conn.execute("SELECT status FROM threads WHERE id = ?", (r["thread_id"],)).fetchone()
     key = unclaimed_key(r["id"])
     if (thread is None or thread["status"] != "open" or _get(conn, key) is not None
-            or workstreams.get_for_task(board, r["id"]) is not None):
+            or workstreams.get_for_task(board, r["id"]) is not None or _continuing(conn, r["id"])):
         return None
     if (runner_for(r["created_by"]) is None or at_cap(r["thread_id"])
             or _unstuck_since(conn, r["thread_id"], r["created_by"], r["updated_at"])):
@@ -369,6 +391,77 @@ def _unclaimed_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
         return item, ("its creator accepted it, not you or a standing grant, so nothing was launched; claim it, "
                       "decline it, or Unstick")
     return item, _waits_on_human(board, r["thread_id"])
+
+
+def _continuing(conn, task_id: int) -> bool:
+    """An automatic request to continue this task (its dependencies finished) is still pending."""
+    return any(isinstance(rec, dict) and rec.get("state") == "sent"
+               for rec in (_get(conn, key) for key, _ in _keys(conn, f"{CONTINUE_PREFIX}{int(task_id)}.").fetchall()))
+
+
+def _satisfied_at(conn, deps: list[int]) -> float | None:
+    """When the last of these dependencies became done or declined (task events, else the task's last change)."""
+    latest = None
+    for dep in deps:
+        at = conn.execute("""SELECT MAX(at) FROM task_events WHERE task_id = ? AND to_status IN ('done', 'declined')""",
+                          (dep,)).fetchone()[0]
+        if at is None:
+            row = conn.execute("SELECT updated_at FROM tasks WHERE id = ?", (dep,)).fetchone()
+            at = row["updated_at"] if row else None
+        if at is not None:
+            latest = at if latest is None else max(latest, at)
+    return latest
+
+
+def _continue_item(board: Board, key: str, value: str, runner_for, now: float,
+                   at_cap) -> tuple[dict, str | None] | None:
+    """(item, reason to go straight to the human or None) for a task whose dependencies just finished, or None.
+    Only a depends_on set while a dependency was unfinished counts (awaiting.STATE_PREFIX `waiting`), once per
+    generation; the satisfaction must be recent (MAX_STALL_AGE_SECONDS)."""
+    conn = board.conn
+    try:
+        rec = json.loads(value)
+        task_id = int(key[len(awaiting.STATE_PREFIX):])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(rec, dict) or not rec.get("waiting") or type(rec.get("generation")) is not int:
+        return None
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None or task["status"] in TERMINAL:
+        return None
+    deps = awaiting.deps_of(task)
+    if not deps or deps != rec.get("deps") or awaiting.unsatisfied(conn, deps):
+        return None     # still waiting, or its dependencies were changed since
+    ckey = continue_key(task_id, rec["generation"])
+    if _get(conn, ckey) is not None:
+        return None     # this satisfaction was already handled
+    satisfied = _satisfied_at(conn, deps)
+    if satisfied is None or satisfied < now - MAX_STALL_AGE_SECONDS:
+        return None
+    thread = conn.execute("SELECT status FROM threads WHERE id = ?", (task["thread_id"],)).fetchone()
+    if thread is None or thread["status"] != "open" or workstreams.get_for_task(board, task_id) is not None:
+        return None
+    live_owner = (task["owner_agent"] is not None and task["lease_expires_at"] is not None
+                  and task["lease_expires_at"] > now)
+    agent = task["owner_agent"] if live_owner else task["created_by"]
+    identity = conn.execute("SELECT active, is_human FROM agents WHERE name = ?", (agent,)).fetchone()
+    if identity is None or not identity["active"] or identity["is_human"]:
+        return None     # the human (or an inactive agent) continues it: nothing to launch
+    if runner_for(agent) is None or at_cap(task["thread_id"]) or _unstuck_since(conn, task["thread_id"], agent,
+                                                                                  satisfied):
+        return None
+    item = {"kind": "continue", "key": ckey, "task_id": task_id, "thread_id": task["thread_id"], "agent": agent,
+            "owner_session": task["owner_session"], "task_status": task["status"],
+            "lease_expires_at": task["lease_expires_at"], "generation": rec["generation"], "depends_on": deps,
+            "satisfied_at": satisfied, "stalled_since": satisfied}
+    if _attempts(conn, task_id) >= MAX_PER_TASK:
+        return item, f"the limit of {MAX_PER_TASK} automatic recoveries for this task is reached"
+    owner_session = task["owner_session"] if agent == task["owner_agent"] else None
+    if not (_human_authorized(board, task_id, agent)
+            or _human_asked_first(board, task_id, task["thread_id"], owner_session, agent)):
+        return item, (f"neither you nor a standing grant authorized this work (no request of yours to {agent} on the "
+                      "thread before the task was claimed), so nothing was launched")
+    return item, _waits_on_human(board, task["thread_id"])
 
 
 def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str], Any],
@@ -408,7 +501,20 @@ def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str],
             continue
         if out is not None:
             found.append(out)
+    # Continuations: tasks set to wait on other work whose last dependency is now done or declined.
+    for key, value in _keys(conn, awaiting.STATE_PREFIX).fetchall():
+        try:
+            out = _continue_item(board, key, value, runner_for, now, at_cap)
+        except Exception:
+            log.exception("automatic continuation skipped %s", key)
+            continue
+        if out is not None:
+            found.append(out)
 
+    # One item per task: a continuation (its dependencies just finished) is the more precise event, so it wins over
+    # an expired lease or an unclaimed task found for the same task in this pass.
+    continuing = {item["task_id"] for item, _ in found if item["kind"] == "continue"}
+    found = [(item, reason) for item, reason in found if item["kind"] == "continue" or item["task_id"] not in continuing]
     groups: dict[tuple[int, str], list[dict]] = {}
     direct: list[tuple[str, dict]] = []
     for item, reason in found:
@@ -444,6 +550,8 @@ def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str],
 
 
 def _describe(item: dict) -> str:
+    if item["kind"] == "continue":
+        return f"task {item['task_id']}'s dependencies are finished; continue it"
     if item["kind"] == "abandoned":
         text = (f"task {item['task_id']} was abandoned: its lease expired and owner session "
                 f"{item['owner_session']} has not been seen since")
@@ -455,12 +563,26 @@ def _describe(item: dict) -> str:
             "if finished work already covers it")
 
 
-def build_body(items: list[dict]) -> str:
-    """The fixed request text. Only ids and agent names (server-stamped) vary; nothing an agent wrote."""
-    parts = [_describe(x) for x in items]
-    if len(parts) > MAX_ITEMS:
-        parts = parts[:MAX_ITEMS] + [f"{len(parts) - MAX_ITEMS} more"]
-    return f"{HEADER} This thread is stalled on you ({'; '.join(parts)}). {INSTRUCTIONS}"
+def build_body(items: list[dict], prevention: str | None = None) -> str:
+    """The fixed request text. Only ids and agent names (server-stamped) vary; nothing an agent wrote. `prevention`:
+    the prevention inbox's routing text (prevention.instructions), asked for stalls only."""
+    stalls = [x for x in items if x["kind"] != "continue"]
+    continues = [x for x in items if x["kind"] == "continue"]
+    out = [HEADER]
+    if continues:
+        parts = [_describe(x) for x in continues][:MAX_ITEMS]
+        if len(continues) > MAX_ITEMS:
+            parts.append(f"{len(continues) - MAX_ITEMS} more")
+        text = "; ".join(parts)
+        out.append(text[0].upper() + text[1:] + ". " + CONTINUE_INSTRUCTIONS)
+    if stalls:
+        parts = [_describe(x) for x in stalls]
+        if len(parts) > MAX_ITEMS:
+            parts = parts[:MAX_ITEMS] + [f"{len(parts) - MAX_ITEMS} more"]
+        out.append(f"This thread is stalled on you ({'; '.join(parts)}). {INSTRUCTIONS}")
+        if prevention:
+            out.append(PREVENTION_INSTRUCTIONS.format(prevention=prevention))
+    return " ".join(out)
 
 
 def _guard(board: Board, fence: tuple[str, str], items: list[dict], agent: str, thread_id: int) -> Callable[[], None]:
@@ -501,9 +623,13 @@ def _send(board: Board, human: Principal, fence: tuple[str, str], thread_id: int
         for x in items:
             _upsert(conn, attempts_key(x["task_id"]), _attempts(conn, x["task_id"]) + 1, now)
 
+    from . import prevention
+    inbox = prevention.active(board) if any(x["kind"] != "continue" for x in items) else None
+    body = build_body(items, prevention.instructions(board, inbox, thread_id) if inbox else None)
+    purpose = (CONTINUE_PURPOSE if all(x["kind"] == "continue" for x in items) else PURPOSE).format(thread=thread_id)
     post, _ = human_actions.post_as_human(
-        board, human, thread_id=thread_id, body=build_body(items), type="request", to=[agent], needs_response=True,
-        launch=[agent], purpose=PURPOSE.format(thread=thread_id), post_check=_guard(board, fence, items, agent, thread_id),
+        board, human, thread_id=thread_id, body=body, type="request", to=[agent], needs_response=True,
+        launch=[agent], purpose=purpose, post_check=_guard(board, fence, items, agent, thread_id),
         post_hook=record)
     log.info("automatic recovery: asked %s on thread %s about tasks %s (post %s)", agent, thread_id,
              [x["task_id"] for x in items], post["id"])
@@ -518,6 +644,10 @@ def _settled(rec: dict, task) -> bool:
     (abandoned work); claimed, finished or declined (an unclaimed task)."""
     if task is None:
         return True
+    if rec["kind"] == "continue":
+        return (task["status"] in TERMINAL or task["status"] != rec.get("task_status")
+                or task["lease_expires_at"] != rec.get("lease_expires_at")
+                or task["owner_session"] != rec.get("owner_session"))
     if rec["kind"] == "abandoned":
         return (task["status"] not in ("working", "blocked") or task["lease_expires_at"] != rec.get("lease_expires_at")
                 or task["owner_session"] != rec.get("owner_session"))
@@ -565,7 +695,8 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
             continue
         try:
             task = conn.execute("SELECT * FROM tasks WHERE id = ?", (rec["task_id"],)).fetchone()
-            if _settled(rec, task):
+            # A task that now waits on unfinished dependencies is awaiting that work: the stall is over.
+            if _settled(rec, task) or awaiting.awaits(conn, rec["task_id"]):
                 settled.append((key, rec | {"state": "recovered" if rec["state"] == "sent" else "resolved",
                                             "resolved_at": now}))
                 continue
@@ -592,6 +723,8 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
                     minutes = board.s.lease_ttl_minutes
                     reason = (f"the task was not reclaimed or settled within {minutes} minutes of the automatic "
                               "recovery" if rec["kind"] == "abandoned" else
+                              f"the task was not claimed or continued within {minutes} minutes of the automatic "
+                              "request to continue it" if rec["kind"] == "continue" else
                               f"the task was not claimed or declined within {minutes} minutes of the automatic recovery")
             if reason:
                 failing.setdefault(rec["thread_id"], []).append((key, rec, reason, detail))
@@ -629,7 +762,7 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
 def _escalation_body(entries: list[tuple[dict, str]], structured: bool = True) -> str:
     parts = []
     for rec, reason in entries[:MAX_ITEMS]:
-        what = "abandoned" if rec["kind"] == "abandoned" else "unclaimed"
+        what = {"abandoned": "abandoned", "continue": "dependencies finished"}.get(rec["kind"], "unclaimed")
         parts.append(f"task {rec['task_id']} ({what}, {rec['agent']}): {reason}")
     if len(entries) > MAX_ITEMS:
         parts.append(f"{len(entries) - MAX_ITEMS} more")
@@ -680,12 +813,17 @@ def escalation_question(board: Board, thread_id: int, entries: list[tuple[dict, 
             "recommended_option_id": "unstick"}
     rec, reason = entries[0]
     task_id, agent = rec["task_id"], rec["agent"]
-    task = board.conn.execute("SELECT status, owner_session FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    task = board.conn.execute("SELECT status, owner_session, owner_agent FROM tasks WHERE id = ?", (task_id,)).fetchone()
     status = task["status"] if task else rec.get("task_status")
+    kind = rec["kind"]
+    if kind == "continue":
+        # A task whose dependencies finished: unowned, it is asked of its creator like an unclaimed task; owned, it
+        # is its owner's to continue like abandoned work.
+        kind = "unclaimed" if task is None or task["owner_agent"] is None else "abandoned"
     context = (f"Thread #{thread_id}, task {task_id} ({status or 'unknown status'}), "
-               f"{'created by' if rec['kind'] == 'unclaimed' else 'owned by'} {agent}. Why it came to you: {reason}. "
+               f"{'created by' if kind == 'unclaimed' else 'owned by'} {agent}. Why it came to you: {reason}. "
                "No further automatic launches will be made for it.")
-    if rec["kind"] == "unclaimed":
+    if kind == "unclaimed":
         # Recommend asking the creator, never declining: an unclaimed task is often real unfinished work (live post
         # #592 recommended declining an unfinished audit continuation). The creator checks the finished work and
         # declines the task only with evidence that it is covered; declining blind would drop work.
@@ -701,7 +839,9 @@ def escalation_question(board: Board, thread_id: int, entries: list[tuple[dict, 
                        "on it. Costs nothing to run, but if work remains it is dropped and has to be proposed again."),
                        {"type": "decline_task", "task_id": task_id,
                         "expected_status": status if status in ("proposed", "accepted") else "accepted"})]
-        return {"question": f"Task {task_id} is accepted but nobody claimed it, and automatic recovery did not take. "
+        lead = (f"Task {task_id}'s dependencies are finished but nobody continued it"
+                if rec["kind"] == "continue" else f"Task {task_id} is accepted but nobody claimed it")
+        return {"question": f"{lead}, and automatic recovery did not take. "
                             f"Ask {agent} to claim it or decline it if finished work covers it?",
                 "context": context, "options": options, "recommended_option_id": "ask-creator"}
     if status == "blocked" and not rec.get("browser_denied"):
@@ -729,7 +869,9 @@ def escalation_question(board: Board, thread_id: int, entries: list[tuple[dict, 
     relaunch = _unstick_option("relaunch", f"Relaunch {agent} (Unstick)", thread_id, [agent],
                                f"reclaim task {task_id} and finish or release it"
                                + ("; change the browser permission first, or it stops at the same denial" if denied else ""))
-    return {"question": f"Task {task_id} was abandoned by {agent} and automatic recovery did not take. "
+    lead = (f"Task {task_id}'s dependencies are finished but {agent} did not continue it" if rec["kind"] == "continue"
+            else f"Task {task_id} was abandoned by {agent}")
+    return {"question": f"{lead} and automatic recovery did not take. "
                         + (f"Release it, or relaunch {agent}?" if denied else f"Relaunch {agent}, or release the task?"),
             "context": context, "options": [relaunch, release],
             "recommended_option_id": release["id"] if denied else "relaunch"}
@@ -1094,7 +1236,17 @@ def prune(board: Board, force: bool = False) -> int:
     if not force and isinstance(last, (int, float)) and now - last < PRUNE_EVERY_SECONDS:
         return 0
     gone: list[str] = []
-    for prefix in (TASK_PREFIX, UNCLAIMED_PREFIX):
+    for key, _ in _keys(conn, awaiting.STATE_PREFIX).fetchall():
+        # A depends_on record matters until its task is finished or declined (it may wait longer than a week).
+        try:
+            task_id = int(key[len(awaiting.STATE_PREFIX):])
+        except ValueError:
+            gone.append(key)
+            continue
+        task = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None or task["status"] in ("done", "declined"):
+            gone.append(key)
+    for prefix in (TASK_PREFIX, UNCLAIMED_PREFIX, CONTINUE_PREFIX):
         for key, value, updated in _keys(conn, prefix, "key, value, updated_at"):
             try:
                 rec = json.loads(value)
@@ -1167,6 +1319,8 @@ def list_records(board: Board, p: Principal) -> list[dict]:
         thread = conn.execute("SELECT status FROM threads WHERE id = ?", (rec.get("thread_id"),)).fetchone()
         if thread is None or thread["status"] != "open":
             continue
+        if awaiting.awaits(conn, rec["task_id"]):
+            continue    # the task now waits on other work: not stalled, nothing waits on the human here
         if rec["state"] == "escalated":
             note = rec.get("escalation_post_id")
             if (not isinstance(note, int) or conn.execute(

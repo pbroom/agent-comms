@@ -394,6 +394,7 @@ class Board:
                     setattr(self.s, k, getattr(new, k))
             self.s.dispatch = new.dispatch
             self.s.conversations = new.conversations
+            self.s.unstick = new.unstick
             self.settings_restart_required = [k for k in RESTART_ONLY if getattr(self.s, k) != getattr(new, k)]
             for k in RESTART_ONLY:
                 if getattr(self.s, k) != getattr(new, k):
@@ -419,11 +420,20 @@ class Board:
                 "restart_required": restart, "runtime_source_changed": source_changed,
                 "loaded_source_fingerprint": _LOADED_SOURCE_FINGERPRINT,
                 "refresh_supported": self.s.config_path is not None,
+                "prevention_inbox": self._prevention_status(),
                 "recovery": ("Correct the saved configuration, then refresh; the last valid limits remain active."
                              if stale else "Restart this process to apply the listed settings." if restart else
                              "Settings still apply; reconnect this MCP session or restart this board process to run "
                              "the installed code (refresh cannot reload Python modules)." if source_changed else None),
             }
+
+    def _prevention_status(self) -> dict | None:
+        from . import prevention
+        try:
+            return prevention.status(self)
+        except Exception:   # status only; never fail a read over it
+            log.exception("could not read the prevention inbox status")
+            return None
 
     def refresh_configuration(self, p: Principal) -> dict:
         """Human only. Retry the normal validator only; no configuration writes, module reloads, or policy
@@ -614,7 +624,7 @@ class Board:
 
     def create_dispatch_rule(self, p: Principal, *, thread_id: int, agents: list[str], purpose: str,
                              max_launches: int, expires_at: float | None = None,
-                             _in_transaction: bool = False) -> dict:
+                             _in_transaction: bool = False, _created_at: float | None = None) -> dict:
         """Approve a workstream: the dispatcher may launch these agents for posts on this thread. `_in_transaction`:
         insert inside the caller's open write transaction (a one-click action that commits or rolls back as one)."""
         self._require_human(p, "approve a dispatcher workstream")
@@ -652,7 +662,7 @@ class Board:
             rid = c.execute("""INSERT INTO subscriptions(agent, project, thread_id, events, channel, target, active,
                                  created_at) VALUES (?,?,?,?,?,?,1,?)""",
                             (p.name, thread["project"], thread_id, json.dumps(["post.created"]), DISPATCH_CHANNEL,
-                             json.dumps(target), self.now())).lastrowid
+                             json.dumps(target), self.now() if _created_at is None else _created_at)).lastrowid
         return self._dispatch_rule_out(self._dispatch_rows(rid)[0])
 
     def list_dispatch_rules(self, p: Principal, include_inactive: bool = False) -> list[dict]:
@@ -1067,9 +1077,13 @@ class Board:
     NOT_AUTOMATIC = "NOT EXISTS (SELECT 1 FROM board_state bs WHERE bs.key = 'auto_recovery.post.' || {post}.id)"
 
     def _agent_posts_since_human(self, thread_id: int) -> int:
+        # A verified prevention proposal (prevention.py) answers a human or automatic Unstick/recovery request, so it
+        # is bounded by those and does not count toward the prevention thread's cap.
+        from .prevention import NOT_PREVENTION
+        not_prevention = NOT_PREVENTION.format(post="p")
         posts = self.conn.execute(
             f"""SELECT COUNT(*) FROM posts p JOIN agents a ON a.name = p.agent
-               WHERE p.thread_id = :t AND a.is_human = 0 AND p.id > COALESCE(
+               WHERE p.thread_id = :t AND a.is_human = 0 AND {not_prevention} AND p.id > COALESCE(
                  (SELECT MAX(p2.id) FROM posts p2 JOIN agents a2 ON a2.name = p2.agent
                   WHERE p2.thread_id = :t AND a2.is_human = 1 AND {self.NOT_AUTOMATIC.format(post='p2')}), 0)""",
             {"t": thread_id},
@@ -1120,7 +1134,11 @@ class Board:
                     propose_task: dict | None = None, decision_question: dict | None = None,
                     continuation: dict | None = None, answer_to: list[int] | None = None,
                     _in_transaction: bool = False, _answer_recipient: str | None = None,
-                    request_reply: dict | None = None, idempotency_key: str | None = None) -> dict:
+                    request_reply: dict | None = None, idempotency_key: str | None = None,
+                    prevention_for: int | None = None) -> dict:
+        if prevention_for is not None and (request_reply is not None or idempotency_key is not None):
+            raise Invalid("send a prevention proposal (prevention_for) as its own post, without request_reply or "
+                          "idempotency_key")
         if request_reply is not None or idempotency_key is not None:
             from . import request_replies
             return request_replies.create(self, p, session_id, request_reply, idempotency_key,
@@ -1232,6 +1250,12 @@ class Board:
                     raise Invalid('continuation recipients must be its recorded owner and fallback')
                 to = list(dict.fromkeys(targets))
 
+            prevention_checked = None
+            if prevention_for is not None:
+                from . import prevention
+                prevention_checked = prevention.check(self, c, p, prevention_for=prevention_for, thread_id=thread_id,
+                                                      post_type=type, to=to, needs_response=needs_response,
+                                                      sealed=sealed, now=now)
             if not p.is_human:
                 n_day = c.execute("""SELECT (SELECT COUNT(*) FROM posts WHERE agent = ? AND created_at > ?)
                                     + (SELECT COUNT(*) FROM issue_comments WHERE agent = ? AND created_at > ?)""",
@@ -1240,7 +1264,7 @@ class Board:
                     raise LimitExceeded(f"daily post cap reached ({self.s.daily_post_cap_per_agent} posts in 24h). "
                                         "Stop and tell the human in your own chat.")
                 n_thread = self._agent_posts_since_human(thread_id)
-                if n_thread >= self.s.max_agent_posts_per_thread_without_human:
+                if n_thread >= self.s.max_agent_posts_per_thread_without_human and prevention_checked is None:
                     raise LimitExceeded(
                         f"thread {thread_id} has {n_thread} agent posts since the last human post "
                         f"(cap {self.s.max_agent_posts_per_thread_without_human}). The conversation needs the human: "
@@ -1269,6 +1293,8 @@ class Board:
                 c.execute("UPDATE tasks SET proposed_by_post = ? WHERE id = ?", (post_id, task_id))
             if continuation is not None:
                 workstreams.create(self, p, session_id, post_id, continuation)
+            if prevention_checked is not None:
+                prevention.record(self, c, p, post_id, prevention_checked, now)
             for source_id in answer_to or []:
                 c.execute('INSERT INTO answer_links(source_post_id,answer_post_id,created_at) VALUES (?,?,?)',
                           (source_id,post_id,now))
@@ -1442,6 +1468,10 @@ class Board:
             if p.is_human:   # for the dashboard's "Reset stuck delivery" (a human-only route)
                 d['continuation']['delivery_reset'] = workstreams.delivery_reset(self, managed)
         d["addressed_to_me"] = p.name in to
+        from .prevention import for_post as prevention_for
+        forwarded = prevention_for(self, r["id"])
+        if forwarded is not None:
+            d["prevention_for"] = forwarded
         if self.conn.execute("SELECT 1 FROM board_state WHERE key = ?",
                              ("auto_recovery.post." + str(r["id"]),)).fetchone():
             d["automatic"] = True   # posted by the dispatcher as the human (autorecover.py), not a human click
@@ -1779,6 +1809,9 @@ class Board:
              "lease_expires_at": iso(r["lease_expires_at"]), "lease_state": state, "lease_seconds_left": left,
              "intends_files": json.loads(r["intends_files"]), "depends_on": json.loads(r["depends_on"]),
              "created_by": r["created_by"], "created_at": iso(r["created_at"]), "updated_at": iso(r["updated_at"])}
+        # The dependencies that are neither done nor declined, with their thread: the task awaits them (awaiting.py).
+        from . import awaiting
+        d["waiting_on"] = awaiting.waiting_on(self.conn, r) if d["depends_on"] else []
         d['category'] = r['category']
         d['continuation_scope'] = json.loads(r['continuation_scope']) if r['continuation_scope'] else None
         d['authorization'] = {'source': r['authorization_source'], 'grant_id': r['authorization_grant_id'],
@@ -1867,7 +1900,9 @@ class Board:
                 renewed = False
                 deps = json.loads(t["depends_on"])
                 if deps:
-                    q = f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(deps))}) AND status != 'done'"
+                    # A dependency is satisfied once it is done or declined (awaiting.py), in any thread.
+                    q = (f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(deps))}) "
+                         "AND status NOT IN ('done', 'declined')")
                     open_deps = [r[0] for r in c.execute(q, deps)]
                     if open_deps:
                         raise Conflict(f"task {task_id} depends on unfinished tasks {open_deps}")
@@ -1907,6 +1942,28 @@ class Board:
         out["renewed"] = renewed
         if warnings:
             out["file_conflict_warnings"] = warnings
+        return out
+
+    def set_task_dependencies(self, p: Principal, session_id: int, task_id: int, depends_on: Any) -> dict:
+        """Replace a task's depends_on (its creator, its owner or the human): ids of tasks in any thread, no cycles.
+        See awaiting.set_dependencies."""
+        from . import awaiting
+        return awaiting.set_dependencies(self, p, session_id, task_id, depends_on)
+
+    def update_task(self, p: Principal, session_id: int, task_id: int, status: str | None = None,
+                    note: str | None = None, depends_on: Any = None) -> dict:
+        """board_update_task / POST /api/tasks/{id}/transition: set depends_on first (when given), then the status
+        (when given). At least one of the two."""
+        if status is None and depends_on is None:
+            raise Invalid("give a status, depends_on, or both")
+        out = None
+        if depends_on is not None:
+            out = self.set_task_dependencies(p, session_id, task_id, depends_on)
+        if status is not None:
+            closed = (out or {}).get("closed_escalation_post_ids")
+            out = self.transition_task(p, session_id, task_id, status, note)
+            if closed is not None:
+                out["closed_escalation_post_ids"] = closed
         return out
 
     def renew_task(self, p: Principal, session_id: int, task_id: int) -> dict:

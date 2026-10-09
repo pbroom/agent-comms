@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from . import dispatch, human_actions
+from . import awaiting, dispatch, human_actions
 from .core import TERMINAL, Board, Conflict, Principal
 
 UNSTICK_COOLDOWN_SECONDS = 120
@@ -35,6 +35,22 @@ PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and pr
 BODY_INSTRUCTIONS = ("Find the root cause of the stall, resolve it now, and post a `finding` with the cause plus a "
                      "`proposal` for preventing it next time, with an empty `to` and a `decision_question` so it "
                      "reaches the human. Stay within what this thread already asked for.")
+# With a prevention inbox ([unstick] prevention_owner / prevention_thread, prevention.py): the cause stays here, the
+# prevention proposal goes to the inbox's owner, not to the human.
+PREVENTION_PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and send a prevention proposal to "
+                      "the prevention inbox (thread {inbox}, {owner}); stay within the thread's existing request.")
+BODY_INSTRUCTIONS_INBOX = ("Find the root cause of the stall, resolve it now, and post a `finding` with the cause in "
+                           "this thread. {prevention} Stay within what this thread already asked for.")
+
+
+def instructions(board: Board, thread_id: int) -> tuple[str, str]:
+    """(body instructions, rule purpose) for an Unstick on this thread: today's wording, or the prevention inbox's."""
+    from . import prevention
+    cfg = prevention.active(board)
+    if cfg is None:
+        return BODY_INSTRUCTIONS, PURPOSE.format(thread=thread_id)
+    return (BODY_INSTRUCTIONS_INBOX.format(prevention=prevention.instructions(board, cfg, thread_id)),
+            PREVENTION_PURPOSE.format(thread=thread_id, inbox=cfg.thread_id, owner=cfg.owner))
 
 
 def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
@@ -54,13 +70,15 @@ def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
                 asks.setdefault(agent, []).append(post["id"])
     for agent, ids in asks.items():
         reasons.append({"kind": "unanswered", "agent": agent, "post_ids": ids})
-    # (b) Tasks whose owner is blocked or let the lease expire.
+    # (b) Tasks whose owner is blocked or let the lease expire. A task that waits on unfinished dependencies (in any
+    # thread) is awaiting that work, not stalled: Unstick cannot help it (awaiting.py).
     marks = ",".join("?" * len(TERMINAL))
     for r in c.execute(
             f"""SELECT tk.id, tk.status, tk.owner_agent, tk.lease_expires_at FROM tasks tk
                 JOIN agents a ON a.name = tk.owner_agent AND a.active = 1 AND a.is_human = 0
                 WHERE tk.thread_id = ? AND tk.status NOT IN ({marks})
                   AND (tk.status = 'blocked' OR (tk.lease_expires_at IS NOT NULL AND tk.lease_expires_at <= ?))
+                  AND NOT {awaiting.AWAITS.format(t='tk')}
                 ORDER BY tk.id""", (thread_id, *TERMINAL, now)):
         kind = "blocked_task" if r["status"] == "blocked" else "expired_lease"
         reasons.append({"kind": kind, "agent": r["owner_agent"], "task_id": r["id"]})
@@ -76,11 +94,12 @@ def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
 
 
 def unclaimed_tasks(board: Board, thread_id: int | None = None, updated_before: float | None = None) -> list:
-    """Accepted, unowned tasks created by an active non-human agent whose prerequisites are all done, oldest first.
-    Rows carry id, thread_id, created_by and updated_at only (never the title)."""
-    q = """SELECT tk.id, tk.thread_id, tk.created_by, tk.updated_at, tk.depends_on FROM tasks tk
+    """Accepted, unowned tasks created by an active non-human agent whose prerequisites are all done or declined (in
+    any thread; awaiting.py), oldest first. Rows carry id, thread_id, created_by and updated_at only (never the
+    title)."""
+    q = f"""SELECT tk.id, tk.thread_id, tk.created_by, tk.updated_at, tk.depends_on FROM tasks tk
            JOIN agents a ON a.name = tk.created_by AND a.active = 1 AND a.is_human = 0
-           WHERE tk.status = 'accepted' AND tk.owner_agent IS NULL"""
+           WHERE tk.status = 'accepted' AND tk.owner_agent IS NULL AND NOT {awaiting.AWAITS.format(t='tk')}"""
     args: list = []
     if thread_id is not None:
         q += " AND tk.thread_id = ?"
@@ -88,15 +107,7 @@ def unclaimed_tasks(board: Board, thread_id: int | None = None, updated_before: 
     if updated_before is not None:
         q += " AND tk.updated_at <= ?"
         args.append(updated_before)
-    out = []
-    for r in board.conn.execute(q + " ORDER BY tk.id", args):
-        deps = json.loads(r["depends_on"] or "[]")
-        if deps and board.conn.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE id IN ({','.join('?' * len(deps))}) AND status = 'done'",
-                deps).fetchone()[0] != len(set(deps)):
-            continue
-        out.append(r)
-    return out
+    return list(board.conn.execute(q + " ORDER BY tk.id", args))
 
 
 AGENT_PREFIX = "unstick.agent."      # <thread id>.<agent>: when an Unstick last asked this agent on this thread
@@ -146,7 +157,7 @@ def _ids(ids: list[int]) -> str:
     return shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
 
 
-def build_body(agents: list[str], reasons: list[dict]) -> str:
+def build_body(agents: list[str], reasons: list[dict], instructions: str = BODY_INSTRUCTIONS) -> str:
     """The fixed request text. Only ids and agent names (server-stamped) vary; nothing an agent wrote."""
     parts = []
     for x in reasons:
@@ -163,7 +174,7 @@ def build_body(agents: list[str], reasons: list[dict]) -> str:
     if len(parts) > MAX_REASONS:
         parts = parts[:MAX_REASONS] + [f"{len(parts) - MAX_REASONS} more"]
     who = "you" if len(agents) == 1 else ", ".join(agents)
-    return f"Unstick: this thread is stalled on {who} ({'; '.join(parts)}). {BODY_INSTRUCTIONS}"
+    return f"Unstick: this thread is stalled on {who} ({'; '.join(parts)}). {instructions}"
 
 
 def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig | None, *,
@@ -191,8 +202,12 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         board, p, key, UNSTICK_COOLDOWN_SECONDS,
         lambda wait: (f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
                       f"give the agents a moment (try again in {wait} s)"), _in_transaction=_in_transaction)
+    text, purpose = instructions(board, thread_id)
+
     def link_recovery(post):
         record_coverage(board, p, thread_id, agents)    # in the post's transaction: rolls back with it
+        from . import prevention
+        prevention.mark_unstick_post(board, post["id"], p.name)   # a prevention proposal may name it
         # Server-created links only, frozen with the post; never infer lineage from prose.
         from . import recovery, workstreams
         for agent in agents:
@@ -219,9 +234,9 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
                 recovery.record(board, p, post['id'], agent, list(unique.values()), requires_diagnostics=True)
 
     try:
-        post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons),
+        post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons, text),
                                                  type="request", to=agents, needs_response=True, launch=agents,
-                                                 purpose=PURPOSE.format(thread=thread_id), post_hook=link_recovery,
+                                                 purpose=purpose, post_hook=link_recovery,
                                                  _in_transaction=_in_transaction)
     except Exception:
         if not _in_transaction:     # inside the caller's transaction, its rollback undoes the stamp
