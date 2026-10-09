@@ -99,6 +99,46 @@ def unclaimed_tasks(board: Board, thread_id: int | None = None, updated_before: 
     return out
 
 
+AGENT_PREFIX = "unstick.agent."      # <thread id>.<agent>: when an Unstick last asked this agent on this thread
+SCOPED_PREFIX = "unstick.scoped."    # <thread id>: the thread stamp of the latest Unstick that recorded its agents
+
+
+def _stamp(conn, key: str) -> float | None:
+    row = conn.execute("SELECT value FROM board_state WHERE key = ?", (key,)).fetchone()
+    try:
+        value = json.loads(row["value"]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def record_coverage(board: Board, p: Principal, thread_id: int, agents: list[str]) -> None:
+    """Record which agents this Unstick asked, stamped with the thread's cooldown stamp it just reserved. Call inside
+    the post's write transaction. The thread stamp (STATE_PREFIX) stays the double-click cooldown for the whole thread;
+    these per-agent stamps say whose stall the human already took up (unstuck_since), so a one-click Unstick
+    for one agent does not silence automatic recovery for another agent's stall on the same thread."""
+    at = _stamp(board.conn, STATE_PREFIX + str(thread_id))
+    if at is None:
+        return
+    rows = [(AGENT_PREFIX + f"{thread_id}.{a}", at) for a in agents] + [(SCOPED_PREFIX + str(thread_id), at)]
+    for key, value in rows:
+        board.conn.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
+                              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,
+                              updated_at = excluded.updated_at""", (key, json.dumps(value), p.name, board.now()))
+
+
+def unstuck_since(conn, thread_id: int, agent: str, since: float) -> bool:
+    """An Unstick on this thread asked `agent` at or after `since`. A thread stamp written before agents were recorded
+    (no SCOPED_PREFIX record for that stamp) counts for every agent, as it did."""
+    at = _stamp(conn, STATE_PREFIX + str(thread_id))
+    if at is None or at < since:
+        return False
+    if _stamp(conn, SCOPED_PREFIX + str(thread_id)) != at:
+        return True     # the latest stamp is a legacy, unscoped one: it covered the whole thread
+    asked = _stamp(conn, AGENT_PREFIX + f"{thread_id}.{agent}")
+    return asked is not None and asked >= since
+
+
 def _ids(ids: list[int]) -> str:
     shown = [f"#{i}" for i in ids[:MAX_IDS_PER_AGENT]]
     if len(ids) > MAX_IDS_PER_AGENT:
@@ -152,6 +192,7 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         lambda wait: (f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
                       f"give the agents a moment (try again in {wait} s)"), _in_transaction=_in_transaction)
     def link_recovery(post):
+        record_coverage(board, p, thread_id, agents)    # in the post's transaction: rolls back with it
         # Server-created links only, frozen with the post; never infer lineage from prose.
         from . import recovery, workstreams
         for agent in agents:

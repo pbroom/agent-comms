@@ -379,6 +379,72 @@ def test_release_and_unstick_notify_too(aenv):
     assert created == [out["action_result"]["unstick_post_id"], out["receipt_post_id"], out["post_id"]]
 
 
+def claude_lease_expiring_beside_an_unclaimed_codex_escalation(env):
+    """Thread T: codex's self-accepted task is escalated to the human (unclaimed), while claude's lease on a
+    human-accepted task has expired but is still inside an interactive session's grace."""
+    agent_task(env, accepted_by="self")
+    claude_sid = env.session("claude")
+    theirs = env.accepted_task(env.tid, title="claude's")
+    env.board.claim_task(env.p["claude"], claude_sid, theirs)
+    env.clock.advance(autorecover.UNCLAIMED_AFTER_SECONDS + 60)
+    env.d.tick()
+    [note] = auto_posts(env)
+    assert records(env) and all(r["agent"] == "codex" for r in records(env).values()), "claude is still in grace"
+    return theirs, note
+
+
+def claude_recoveries(env):
+    return [p for p in auto_posts(env) if p["type"] == "request" and p["to"] == ["claude"]]
+
+
+def test_a_one_click_unstick_for_one_agent_leaves_another_agents_stall_to_automatic_recovery(aenv):
+    """Re-review of #56: the narrowed Unstick wrote the thread-wide stamp, and automatic recovery then skipped every
+    agent's stall on the thread, so claude's abandoned task never reached anyone."""
+    theirs, note = claude_lease_expiring_beside_an_unclaimed_codex_escalation(aenv)
+    out = choose(aenv, note["id"], "ask-creator")
+    assert out["action_result"]["agents"] == ["codex"]
+    assert unstick.unstuck_since(aenv.board.conn, aenv.tid, "codex", 0)
+    assert not unstick.unstuck_since(aenv.board.conn, aenv.tid, "claude", 0)
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    [asked] = claude_recoveries(aenv)
+    assert f"task {theirs} was abandoned" in asked["body"]
+
+
+def test_a_full_unstick_still_covers_every_agent_it_asked(aenv):
+    """Control: the dashboard's Unstick asked claude too, so automatic recovery does not ask claude again."""
+    theirs, note = claude_lease_expiring_beside_an_unclaimed_codex_escalation(aenv)
+    out = unstick.unstick(aenv.board, aenv.p["human"], aenv.tid, aenv.config)
+    assert sorted(out["agents"]) == ["claude", "codex"]
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    assert claude_recoveries(aenv) == []
+
+
+def test_an_unstick_stamp_from_before_agents_were_recorded_covers_every_agent(env):
+    tid = env.thread()
+    env.board.conn.execute("INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'human', ?)",
+                           (unstick.STATE_PREFIX + str(tid), json.dumps(100.0), 100.0))
+    assert unstick.unstuck_since(env.board.conn, tid, "claude", 50) and unstick.unstuck_since(env.board.conn, tid, "x", 100)
+    assert not unstick.unstuck_since(env.board.conn, tid, "claude", 101)
+
+
+def test_notifications_never_announce_another_writers_post(aenv, monkeypatch):
+    task, note = unclaimed_escalation(aenv)
+    real = resolve._notify_committed
+    other = {}
+
+    def another_writer_first(board, p, new_posts, action, result):
+        other["post"] = aenv.post("claude", aenv.tid, "committed in between")    # after the commit, before notify
+        return real(board, p, new_posts, action, result)
+    monkeypatch.setattr(resolve, "_notify_committed", another_writer_first)
+    aenv.rec.events.clear()
+    out = choose(aenv, note["id"], "decline")
+    announced = [p["post_id"] for e, p in aenv.rec.events if e == "post.created"]
+    assert announced.count(other["post"]["id"]) == 1, "only the other writer's own create_post announced it"
+    assert announced == [other["post"]["id"], out["receipt_post_id"], out["post_id"]]
+
+
 def test_a_one_click_unstick_asks_only_the_named_agents(aenv):
     """An agent-written question can trigger Unstick for the agents it names only, never every stuck agent."""
     agent_task(aenv, accepted_by="self")                                   # codex is stuck here ...

@@ -1220,7 +1220,14 @@ answer commit together, a retry returns the stored receipt, and the answer link 
   can launch to the agents it names. 409 when none of them is still stuck. It runs in the caller's transaction
   (`unstick.unstick(..., _in_transaction=True)`, passed on to `reserve_cooldown`, `create_dispatch_rule` and
   `post_as_human`), so a refusal or any later failure (the receipt, the answer) rolls the stamp, rule, binding and
-  post back together, and a retry works.
+  post back together, and a retry works. *Coverage is per agent* (re-review of #56): the thread stamp
+  (`unstick.thread.<thread>`) stays the thread-wide double-click cooldown, but automatic recovery's "the human already
+  unstuck this stall" check (`unstick.unstuck_since`) now asks whether an Unstick asked *that stall's agent*:
+  every Unstick records `unstick.agent.<thread>.<agent>` for each agent it asked and `unstick.scoped.<thread>` (both
+  with the thread stamp's time, in the post's transaction). Otherwise a one-click Unstick for codex would have
+  silenced automatic recovery and escalation for claude's stall on the same thread. A full Unstick covers every agent
+  it asked, as before; a thread stamp written before agents were recorded (no matching `scoped` record) still covers
+  every agent.
 - `decline_task {task_id, expected_status}`: 409 unless the task is still in that status and nobody holds a live
   lease on it.
 - `release_task {task_id, expected_owner_session}`: clears the owner and lease and returns the task to `accepted`;
@@ -1231,7 +1238,9 @@ an unpaused board (409). They write task events as the human with a note naming 
 them to their own questions; only the human's choice runs them, so they grant nothing by themselves. Once the answer
 commits, `resolve._notify_committed` sends the events the same changes made one by one would have: `post.created` for
 every post the transaction made (the Unstick request, the receipt, the answer), and `task.transition` or
-`task.released`. A retry that returns the stored receipt sends nothing.
+`task.released`. The posts are collected inside the transaction (which holds the write lock) and announced after the
+commit, so a post another writer commits in between is never announced twice. A retry that returns the stored receipt
+sends nothing.
 
 *Fallback.* If the question cannot be built or validated, the escalation still posts, as a plain `status` whose body
 says to open the thread and Unstick, reassign or decline (not "pick one of the options below").

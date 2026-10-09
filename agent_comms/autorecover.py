@@ -220,11 +220,11 @@ def _ids(ids: list[int]) -> str:
     return unstick._ids(ids)
 
 
-def _unstuck_since(conn, thread_id: int, since: float) -> bool:
-    """The human clicked Unstick on this thread after the stall began: they already asked, so the dispatcher does not
-    ask (and launch) a second time for the same stall."""
-    at = _get(conn, unstick.STATE_PREFIX + str(thread_id))
-    return isinstance(at, (int, float)) and not isinstance(at, bool) and at >= since
+def _unstuck_since(conn, thread_id: int, agent: str | None, since: float) -> bool:
+    """The human's Unstick on this thread asked this stall's agent after the stall began: they already asked, so the
+    dispatcher does not ask (and launch) a second time for the same stall. An Unstick limited to other agents (a
+    one-click decision action) leaves this agent's stall to automatic recovery (unstick.unstuck_since)."""
+    return unstick.unstuck_since(conn, thread_id, agent or "", since)
 
 
 def _waits_on_human(board: Board, thread_id: int) -> str | None:
@@ -317,7 +317,7 @@ def _abandoned_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
     if _get(conn, key) is not None or workstreams.get_for_task(board, r["id"]) is not None:
         return None     # already handled once, or a managed continuation with its own reconciliation
     if (runner_for(r["owner_agent"]) is None or at_cap(r["thread_id"])
-            or _unstuck_since(conn, r["thread_id"], r["lease_expires_at"])):
+            or _unstuck_since(conn, r["thread_id"], r["owner_agent"], r["lease_expires_at"])):
         return None
     held = _held_requests(conn, r["owner_session"], r["thread_id"])
     item = {"kind": "abandoned", "key": key, "task_id": r["id"], "thread_id": r["thread_id"],
@@ -349,7 +349,7 @@ def _unclaimed_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
             or workstreams.get_for_task(board, r["id"]) is not None):
         return None
     if (runner_for(r["created_by"]) is None or at_cap(r["thread_id"])
-            or _unstuck_since(conn, r["thread_id"], r["updated_at"])):
+            or _unstuck_since(conn, r["thread_id"], r["created_by"], r["updated_at"])):
         return None
     if conn.execute("SELECT 1 FROM tasks WHERE thread_id = ? AND owner_agent = ? AND lease_expires_at > ?",
                     (r["thread_id"], r["created_by"], now)).fetchone():
@@ -468,7 +468,7 @@ def _guard(board: Board, fence: tuple[str, str], items: list[dict], agent: str, 
         for x in items:
             if conn.execute("SELECT 1 FROM board_state WHERE key = ?", (x["key"],)).fetchone():
                 raise Conflict(f"{x['key']} was already recovered")
-            if _unstuck_since(conn, thread_id, x["stalled_since"]):
+            if _unstuck_since(conn, thread_id, agent, x["stalled_since"]):
                 raise Conflict(f"the human unstuck thread {thread_id} meanwhile")
         if _budget_reason(conn, agent, thread_id, board.now()):
             raise Conflict(f"the automatic launch budget for {agent} is spent")
@@ -892,7 +892,7 @@ def list_records(board: Board, p: Principal) -> list[dict]:
             note = rec.get("escalation_post_id")
             if (not isinstance(note, int) or conn.execute(
                     f"SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}", (note,)).fetchone() is None
-                    or _unstuck_since(conn, rec["thread_id"], rec.get("escalated_at") or 0)):
+                    or _unstuck_since(conn, rec["thread_id"], rec.get("agent"), rec.get("escalated_at") or 0)):
                 continue    # the human answered it or unstuck the thread: nothing waits on them here any more
         out.append({"kind": rec["kind"], "task_id": rec["task_id"], "thread_id": rec["thread_id"],
                     "agent": rec.get("agent"), "owner_session": rec.get("owner_session"),
