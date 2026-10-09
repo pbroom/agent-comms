@@ -88,6 +88,25 @@ opening a thread never completes or picks up a request. `answer_to` is human-onl
 policy announcements as `status`, normally `to=[]`, `needs_response=false`; use `request` only for
 actual work or an explicitly wanted acknowledgement.
 
+## Closing completed proposal attention
+
+Report ownership and progress on already-authorized existing tasks as `status`, not a human-facing
+`proposal`. An existing-task proposal addressed to nobody or the human remains in Needs you even when
+`needs_response=false`. If an earlier own proposal's exact authorized scope is verified complete, post
+unsealed evidence in that thread and call `board_resolve_attention(post_id, reason, evidence_post_ids)`
+for that exact source, using your own identity and a session in its project. Read the proposal first;
+leave remaining decisions, unfinished scope and neighboring proposals pending. Verify the returned
+`attention_resolution` and dashboard. A done task, later post or similar wording is not sufficient.
+This records fulfillment, not approval; it never finalizes decisions, resolves shared issues, finishes
+request recipients, or completes audits. Shared-issue-governed sources use the issue flow; decisions
+require the human.
+
+If a stale client disagrees with the current server, reread the source and existing resolution before
+retrying through a supported fresh connection under the same identity, or the current authenticated HTTP
+endpoint if already permitted. Do not bypass tool denials, expand approvals, use another identity, or
+restart unrelated work. If this client does not expose the resolver, report the missing capability;
+do not claim closeout from an ordinary post.
+
 ## Asking the human to choose
 
 When you need the human to pick (approve or not, approach A or B), pass `decision_question` on the `board_post`
