@@ -1369,7 +1369,14 @@ function threadStatus(t, human) {
   // waits on the human, with the precise reason.
   // The server lists an escalation only while its Needs you post is still open and the thread was not unstuck since
   // (autorecover.list_records); once the human handles it, the ordinary labels for the task apply again.
-  const recoveries = (state.auto_recovery || []).filter(r => r.thread_id === t.id);
+  const autoRecords = (state.auto_recovery || []).filter(r => r.thread_id === t.id);
+  // Recovery waits (kind "recovery_wait"): an agent's ownership recovery hit a transient blocker (another run or
+  // session busy in the owner's checkout). The board retries by itself once the worktree is free (at most
+  // max_retries a day), so the request, the requests and tasks the blocked attempt left waiting (covered_*) are the
+  // board's turn, not stalls on the human; only a wait whose retries ran out ("escalated") needs you.
+  const waits = autoRecords.filter(r => r.kind === "recovery_wait");
+  const recoveries = autoRecords.filter(r => r.kind !== "recovery_wait");
+  const waitingPosts = new Set(), waitingTasks = new Set();
   const recoveredTasks = new Set(recoveries.map(r => r.task_id));
   const recovering = new Map(recoveries.filter(r => r.state === "sent" && r.kind === "abandoned" && r.owner_session != null)
     .map(r => [r.owner_session, r.agent]));
@@ -1386,9 +1393,26 @@ function threadStatus(t, human) {
       (runs.some(x => x.agent === r.agent) ? pending : pickup).push(label);
     }
   }
-  const blocked = t.tasks.filter(k => k.status === "blocked" && !recoveredTasks.has(k.id));
+  for (const w of waits) {
+    const max = Number(w.max_retries) || 3, used = Number(w.retries_used) || 0;
+    const what = `#${w.request_post_id} · ${w.agent}`;
+    if (w.state === "escalated") {
+      stalled.push(`${what}: automatic recovery retries ran out: ${w.reason || "it did not take"} — needs you`);
+      if (human) needsMe = true;
+      involve(w.agent);
+      continue;
+    }
+    for (const id of [w.request_post_id, ...(w.covered_post_ids || [])]) waitingPosts.add(id);
+    for (const id of w.covered_task_ids || []) waitingTasks.add(id);
+    const label = w.state === "relaunched"
+      ? `${what}: worktree free; automatic retry ${used}/${max} sent to ${w.agent}${w.post_id ? ` (#${w.post_id})` : ""}`
+      : `${what}: waiting for the worktree to be free; automatic retry ${Math.min(used + 1, max)}/${max}`;
+    (runs.some(x => x.agent === w.agent) ? pending : pickup).push(label);
+  }
+  const blocked = t.tasks.filter(k => k.status === "blocked" && !recoveredTasks.has(k.id) && !waitingTasks.has(k.id));
   if (blocked.length) stalled.push(plural(blocked.length, "blocked task"));
-  const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status) && !recoveredTasks.has(k.id));
+  const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status)
+    && !recoveredTasks.has(k.id) && !waitingTasks.has(k.id));
   if (expired.length) stalled.push("A task lease expired");
   for (const k of [...blocked, ...expired]) involve(k.owner_agent);
   // Only a human post lifts the cap: it is "on you" for the human only (an agent's view sorts it as someone else's).
@@ -1411,7 +1435,7 @@ function threadStatus(t, human) {
   });
   for (const r of obligations) {
     const agent = r.assigned_agent || r.recipient;
-    if (isHumanName(agent)) continue;
+    if (isHumanName(agent) || waitingPosts.has(r.post_id)) continue;   // shown once, as its recovery wait
     const label = `#${r.post_id} · ${agent}${r.assigned_session ? " s" + r.assigned_session : ""}`;
     if (r.pickupState !== "waiting" && recovering.has(r.assigned_session)) {
       // Held by a session that abandoned its work: the automatic recovery asks a new session to take it over.

@@ -148,3 +148,54 @@ test('the page trusts the server for which escalations are open (needs_you in th
   assert.match(dot(open.document, 1, 'stalled'), /automatic recovery of task 22 failed: .* — needs you/);
   open.dom.window.close();
 });
+
+// Recovery waits (autorecover.list_records kind "recovery_wait"): ownership recovery hit a transient blocker; the
+// board retries by itself once the owner worktree is free, so it is not the human's turn.
+const recoveryWait = (extra = {}) => ({ kind: 'recovery_wait', task_id: null, thread_id: 1, agent: 'codex',
+  owner_session: 70, request_post_id: 103, recipient: 'codex', post_id: null, state: 'waiting',
+  reason: 'Another live session in the owner worktree has active or unknown activity', detail: null,
+  escalation_post_id: null, held_request_ids: [103], covered_post_ids: [120], covered_task_ids: [22],
+  retries_used: 0, max_retries: 3, sent_at: null, escalated_at: null, ...extra });
+
+test('a recovery wait shows the automatic retry, not "needs you"', async () => {
+  // #103 is held by the abandoned session 70; the blocked attempt left its own request #120 and task 22 blocked.
+  const held = { post_id: 103, recipient: 'codex', assigned_agent: 'codex', assigned_session: 70, state: 'started',
+    reason: 'on it', deadline_at: null, overdue: false };
+  const own = { post_id: 120, recipient: 'codex', assigned_agent: 'codex', assigned_session: 105, state: 'blocked',
+    reason: 'Another live session in the owner worktree has active or unknown activity', deadline_at: null, overdue: false };
+  const t = thread(1, { tasks: [task(22, { status: 'blocked', lease_state: 'expired' })], pickup: pickup({ blocked: [held, own] }) });
+  const page = await setup({ threads: [t], autoRecovery: [recoveryWait()] });
+  const label = dot(page.document, 1, 'unread');
+  assert.match(label, /#103 · codex: waiting for the worktree to be free; automatic retry 1\/3/);
+  assert.doesNotMatch(label, /needs you|blocked task|#120|lease expired/);
+  await pick(page.document, 1);
+  assert.equal(page.document.getElementById('unstick'), null, 'nothing to unstick while the board retries');
+  page.dom.window.close();
+
+  // Relaunched (retry 2 of 3 sent) while the run is going: the board's work in progress.
+  const again = await setup({ threads: [t], autoRecovery: [recoveryWait({ state: 'relaunched', retries_used: 2, post_id: 130 })],
+    runs: [{ thread_id: 1, agent: 'codex', run_id: 's130-codex', started_at: MINUTES_AGO(1) }] });
+  assert.match(dot(again.document, 1, 'active'), /#103 · codex: worktree free; automatic retry 2\/3 sent to codex \(#130\)/);
+  again.dom.window.close();
+
+  // A wait for another thread does not hide this thread's own stalls.
+  const other = await setup({ threads: [t], autoRecovery: [recoveryWait({ thread_id: 2 })] });
+  assert.match(dot(other.document, 1, 'stalled'), /#120 · codex s105: blocked/);
+  other.dom.window.close();
+});
+
+test('a recovery wait whose retries ran out needs the human with the reason', async () => {
+  const note = post(140, 1, { type: 'question', needs_response: true, body: 'Automatic recovery did not take' });
+  const t = thread(1, { posts: [post(100, 1), note], pickup: pickup() });
+  const page = await setup({ threads: [t], needsYou: [note], autoRecovery: [recoveryWait({ state: 'escalated',
+    retries_used: 3, escalation_post_id: 140, escalated_at: MINUTES_AGO(1),
+    reason: '3 automatic retries in 24 hours did not recover it ' + INJECTION })] });
+  const label = dot(page.document, 1, 'stalled');
+  assert.match(label, /#103 · codex: automatic recovery retries ran out: 3 automatic retries in 24 hours did not recover it .* — needs you/);
+  assert.equal(page.win.pwned, undefined, 'text stays text');
+  await pick(page.document, 1);
+  const b = page.document.getElementById('unstick');
+  assert.ok(b && b.title.includes('codex'), 'the human can Unstick codex');
+  assert.deepEqual(page.prompts, []);
+  page.dom.window.close();
+});

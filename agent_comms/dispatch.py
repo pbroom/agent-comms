@@ -15,8 +15,9 @@ Guardrails:
 - Runners are argv templates from board.toml (or board.local.toml), keyed by agent name or runtime, spawned without a shell, with a minimal environment that
   carries no board token (the agent's own MCP launcher reads its protected token file). An agent without
   a configured runner is never launched.
-- One run per agent, a global concurrency cap, a wall-clock timeout per run, no launches while the board is
-  paused, each launch spends one unit of the rule's budget, and each launch notifies the human.
+- One run per agent, one run per run directory (threads sharing a checkout take turns), a global concurrency cap,
+  a wall-clock timeout per run, no launches while the board is paused, each launch spends one unit of the rule's
+  budget, and each launch notifies the human.
 - Browser-bound requests launch only for a Codex runner the human gave a scoped headless browser
   ([dispatch.headless_browser]), never past a sticky policy denial, and the run must probe the target itself.
 """
@@ -620,6 +621,7 @@ class _Run:
     terminated_at: float | None = None
     killed: bool = False
     timed_out: bool = False
+    cwd: str | None = None    # the run directory: one dispatched run per directory at a time (Dispatcher._busy_dirs)
 
 
 def _active_records(board: Board) -> list[dict]:
@@ -1003,6 +1005,11 @@ class Dispatcher:
             if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
                     or (not item.get('managed') and self._live(agent, now))):
                 continue
+            # One dispatched run per run directory: two runs in one checkout (threads of one project, or two agents)
+            # see each other's uncommitted changes and fence each other's recovery (recovery._ownership_blocker).
+            # The trigger waits, like it does behind max_concurrent, and launches in seq order once it is free.
+            if self._dir_key(self.config.worktrees.get(rule["project"], rule["project"])) in self._busy_dirs(foreign):
+                continue
             error = self._preflight(agent, rule)
             if item.get('post_id'):
                 error = self._browser_blocker(item['post_id'], agent) or error
@@ -1191,6 +1198,17 @@ class Dispatcher:
             found = bound(thread_posts)
         return found
 
+    @staticmethod
+    def _dir_key(path: Any) -> str | None:
+        return os.path.realpath(path) if isinstance(path, str) and path else None
+
+    def _busy_dirs(self, foreign: list[dict]) -> set[str]:
+        """Run directories of the dispatched runs that may still be going: this loop's children and live runs an
+        earlier dispatcher left (`foreign`, from check_orphans)."""
+        dirs = {self._dir_key(r.cwd) for r in self.running.values()} | {self._dir_key(r.get("cwd")) for r in foreign}
+        dirs.discard(None)
+        return dirs
+
     def _own_ids(self) -> set[str]:
         return {r.run_id for r in self.running.values()}
 
@@ -1281,7 +1299,8 @@ class Dispatcher:
             self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"], run_id)
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
-        self.running[agent] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path))
+        self.running[agent] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path),
+                                   cwd=cwd)
         try:
             started = self.process_start(child.pid)
         except Exception:

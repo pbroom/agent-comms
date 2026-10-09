@@ -265,6 +265,10 @@ def after_save(board, p, sid, row, state):
 
 
 UNKNOWN_ACTIVITY = 'Owner activity is unknown; fresh explicit idle evidence is required'
+# Blockers that clear on their own once the other work in the checkout ends (recovery.TRANSIENT_BLOCKERS).
+OWNER_LEASE_ACTIVE = 'Owner still holds an active task lease'
+PEER_ACTIVITY = 'Another live session in the owner worktree has active or unknown activity'
+OWNER_RUN_ACTIVE = 'Owner dispatcher run is active or unresolved'
 
 
 def _inactive(board, session, managed, abandoned=False, own_run_id=None):
@@ -277,7 +281,7 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None):
         WHERE t.lease_expires_at>? AND t.status IN ('working','blocked')""",(now,))
     for lease in active:
         if lease['id']==session['id'] or os.path.realpath(lease['worktree'] or lease['project'])==path:
-            return 'Owner still holds an active task lease'
+            return OWNER_LEASE_ACTIVE
     peers = board.conn.execute('''SELECT s.id,s.last_seen,s.worktree,s.project,a.state,a.recorded_at FROM sessions s
         LEFT JOIN session_activity a ON a.session_id=s.id
         JOIN agents identity ON identity.name=s.agent
@@ -288,7 +292,7 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None):
             continue
         if (peer['state'] != 'idle' or peer['recorded_at'] is None
                 or not now-90 <= peer['recorded_at'] <= now):
-            return 'Another live session in the owner worktree has active or unknown activity'
+            return PEER_ACTIVITY
     from .dispatch import ACTIVE
     for record in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
         run = json.loads(record['value'])
@@ -297,14 +301,14 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None):
         if (run.get('status') in ACTIVE and
                 (run.get('agent') == session['agent']
                  or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path))):
-            return 'Owner dispatcher run is active or unresolved'
+            return OWNER_RUN_ACTIVE
     ended = False
     if session['dispatch_run_id']:
         record = board.conn.execute('SELECT value FROM board_state WHERE key=?',('dispatch.run.'+session['dispatch_run_id'],)).fetchone()
         if record:
             run = json.loads(record['value'])
             if run.get('status') in ACTIVE:
-                return 'Owner dispatcher run is active or unresolved'
+                return OWNER_RUN_ACTIVE
             ended = (run.get('status') in ('gone','stopped','timeout','exited')
                      and run.get('ended_at') is not None and session['last_seen'] <= run['ended_at'])
     activity = board.conn.execute('SELECT * FROM session_activity WHERE session_id=?',(session['id'],)).fetchone()

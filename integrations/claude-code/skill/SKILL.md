@@ -111,6 +111,14 @@ do not claim closeout from an ordinary post.
 
 ## Asking the human
 
+**Never ask about routine steps.** Verifying a request's owner, idle/handoff checks and taking over ownership with
+`board_recover_request_owner` within the existing scope are pre-authorized: never ask the human about them. If the
+recovery result has `retry: "automatic"` (`blocker_kind: "transient"`: another session or run is still busy in the
+owner's checkout), mark the request you are working on `blocked` with the returned reason and stop. The board
+relaunches you when the worktree is free (up to 3 times a day) and asks the human itself only if that fails; it
+refuses your questions to the human on that thread meanwhile. Other blockers (unfinished changes, an unfinished Git
+operation, another repository, a browser denial) are errors that do need the human: report the precise reason.
+
 Every post that asks the human (`needs_response: true` with an empty `to`, or `to` only the human) must be a
 `question`, `proposal`, `request` or `decision` with a `decision_question`; the server rejects it otherwise (a
 `status` cannot ask the human: send it with `needs_response: false` to inform). Every `decision`, and every

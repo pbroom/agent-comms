@@ -42,6 +42,11 @@ is the standing approval that a click on Unstick would otherwise give, and only 
   option and an alternative, most of them one-click decision actions (Unstick, decline or release the task). A
   request held by a sticky browser denial (browser_readiness.request_blocker) is never relaunched around: it goes
   straight to the human.
+
+A third case (DESIGN_NOTES "Automatic owner handoff"): a *recovery wait*. board_recover_request_owner hit a transient
+blocker (another session or run still busy in the owner's checkout) and recorded a wait (recovery.WAIT_PREFIX). Under
+the same setting, fence and pause guards, the dispatcher relaunches that agent once the worktree is free, at most
+recovery.WAIT_RETRIES times per request per rolling day, and only then asks the human (_process_waits).
 """
 
 from __future__ import annotations
@@ -288,7 +293,8 @@ def tick(board: Board, human: Principal, *, runner_for: Callable[[str], Any], fe
     budget = {"escalations": MAX_ESCALATIONS_PER_PASS}
     escalated = _evaluate(board, human, fence, live_seconds, budget)
     sent = _detect_and_send(board, human, runner_for, fence, budget)
-    return {"sent": sent, "escalated": escalated}
+    waits = _process_waits(board, human, runner_for, fence, live_seconds, budget)
+    return {"sent": sent, "escalated": escalated, "retried": waits["retried"], "wait_escalated": waits["escalated"]}
 
 
 def _held_requests(conn, session_id: int | None, thread_id: int) -> list:
@@ -678,16 +684,24 @@ def escalation_question(board: Board, thread_id: int, entries: list[tuple[dict, 
                f"{'created by' if rec['kind'] == 'unclaimed' else 'owned by'} {agent}. Why it came to you: {reason}. "
                "No further automatic launches will be made for it.")
     if rec["kind"] == "unclaimed":
-        options = [_option("decline", f"Decline task {task_id}", (
-                       f"Marks task {task_id} declined, so the thread no longer waits on it. Costs nothing to run; right "
-                       "when finished work already covers it. If work remains, it has to be proposed again."),
+        # Recommend asking the creator, never declining: an unclaimed task is often real unfinished work (live post
+        # #592 recommended declining an unfinished audit continuation). The creator checks the finished work and
+        # declines the task only with evidence that it is covered; declining blind would drop work.
+        options = [_option("ask-creator", f"Ask {agent} to claim it or decline it if covered", (
+                       f"Runs Unstick on thread #{thread_id}, as if you clicked it, for {agent} only: posts a request "
+                       f"as you asking {agent} to check task {task_id} against the finished work and decide with "
+                       "evidence: claim it and finish it if work remains, or decline it citing the work that already "
+                       f"covers it. Allows one launch of {agent}. Costs an agent run (tokens); the server refuses it "
+                       "if the thread no longer waits on them or was unstuck in the last two minutes."),
+                       {"type": "unstick", "thread_id": thread_id, "agents": [agent]}),
+                   _option("decline", f"Decline task {task_id}", (
+                       f"Marks task {task_id} declined now, without anyone checking it, so the thread no longer waits "
+                       "on it. Costs nothing to run, but if work remains it is dropped and has to be proposed again."),
                        {"type": "decline_task", "task_id": task_id,
-                        "expected_status": status if status in ("proposed", "accepted") else "accepted"}),
-                   _unstick_option("ask-creator", f"Ask {agent} to claim it (Unstick)", thread_id, [agent],
-                                   f"claim task {task_id}, or decline it if finished work already covers it")]
+                        "expected_status": status if status in ("proposed", "accepted") else "accepted"})]
         return {"question": f"Task {task_id} is accepted but nobody claimed it, and automatic recovery did not take. "
-                            f"Decline it, or ask {agent} to claim it?",
-                "context": context, "options": options, "recommended_option_id": "decline"}
+                            f"Ask {agent} to claim it or decline it if finished work covers it?",
+                "context": context, "options": options, "recommended_option_id": "ask-creator"}
     if status == "blocked" and not rec.get("browser_denied"):
         return {"question": f"Task {task_id} is blocked and its owner {agent} went silent. Relaunch {agent} to report "
                             "what it needs?",
@@ -813,6 +827,254 @@ def _escalate_new(board, human, fence, thread_id, items: list[tuple[str, dict]])
     return _post_escalation(board, human, fence, thread_id, entries, new=True)
 
 
+# ---------------------------------------------------------------- recovery waits (transient ownership blockers)
+#
+# board_recover_request_owner records a wait (recovery.WAIT_PREFIX) when ownership recovery hit a transient blocker:
+# another session or dispatcher run still busy in the owner's checkout. Verifying an owner and handing work over within
+# the existing scope is routine (the human, 2026-10-09: "this should always be 'yes'"), so the agent stops and the
+# dispatcher relaunches it once the worktree is free, at most recovery.WAIT_RETRIES times per request per rolling day.
+# Only then, or after MAX_WAIT_SECONDS, does it ask the human.
+
+MAX_WAIT_SECONDS = 24 * 3600
+WAIT_BODY = (HEADER + " The owner worktree of request #{post} (recipient {recipient}) is free now: recover the request "
+             "from session {old} with board_recover_request_owner (reread its version first) and resume the work it "
+             "asked for.{also} Automatic retry {n} of {max}. Verifying the owner and taking over ownership within the "
+             "request's existing scope is routine and pre-authorized: do not ask the human about it. If recovery is "
+             "blocked again for a transient reason, mark this request blocked with the returned reason and stop; the "
+             "board retries. Stay within what this thread already asked for, and reply to this request "
+             "(request_reply) when you are done or blocked.")
+WAIT_PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting auto_recover_stalled_work): the owner "
+                "worktree is free; recover request #{post} and resume it; stay within the thread's existing request.")
+WAIT_ESCALATION = ("Automatic recovery did not take (sent by the dispatcher under the human's board setting "
+                   "auto_recover_stalled_work; not a human click): request #{post} ({agent}) is still held by session "
+                   "{old}: {reason}. No further automatic retries will be made for it. This needs you: {next}")
+WAIT_ESCALATION_NEXT = "pick one of the options below, or open the thread and check the named request."
+WAIT_ESCALATION_NEXT_PLAIN = "open the thread and check the named request, then Unstick it or reassign the request."
+
+
+def _wait_authorized(board: Board, human: Principal, wait: dict) -> bool:
+    """The human asked for this request: they wrote it, its task is human- or grant-authorized, or a dispatch approval
+    of theirs (not a one-click one) covers this agent on the thread. Otherwise no automatic launch."""
+    post = board.conn.execute("""SELECT p.task_id, a.is_human FROM posts p JOIN agents a ON a.name = p.agent
+                                 WHERE p.id = ?""", (wait["post_id"],)).fetchone()
+    if post is None:
+        return False
+    if post["is_human"]:
+        return True
+    if post["task_id"] is not None and _human_authorized(board, post["task_id"], wait["agent"]):
+        return True
+    one_click = human_actions.one_click_rule_ids(board)
+    return any(r["thread_id"] == wait["thread_id"] and wait["agent"] in r["agents"] and r["id"] not in one_click
+               and r["state"] in ("active", "exhausted")
+               for r in board.list_dispatch_rules(human, include_inactive=True))
+
+
+def _relaunch_in_flight(board: Board, wait: dict, live_seconds: float) -> bool:
+    """The last automatic relaunch is still under way: its launch waits in the dispatcher, or its request is not
+    blocked or finished and one lease TTL has not passed since the launch (or the post)."""
+    post_id, sent = wait.get("relaunch_post_id"), wait.get("relaunched_at")
+    if type(post_id) is not int or type(sent) not in (int, float):
+        return False
+    row = _request_row(board, post_id, wait["agent"])
+    if row is None or row["state"] in ("blocked", "finished"):
+        return False
+    launched = _launched_at(board, post_id, wait["agent"])
+    if launched is None and _queued(board, {"agent": wait["agent"], "thread_id": wait["thread_id"],
+                                            "post_id": post_id}, live_seconds):
+        return True
+    return board.now() < max(launched or 0, sent) + board.s.lease_ttl_minutes * 60
+
+
+def _wait_action(board: Board, human: Principal, runner_for, wait: dict, now: float, live_seconds: float,
+                 at_cap) -> tuple[str, Any] | None:
+    """What to do with one live wait now: ("settle", (state, why)), ("update", fields), ("send", None),
+    ("escalate", reason), or None (keep waiting)."""
+    conn, agent, thread_id = board.conn, wait["agent"], wait["thread_id"]
+    if not recovery.wait_live(board, wait):
+        return "settle", ("resolved", "the request was recovered, reassigned or finished")
+    thread = conn.execute("SELECT status FROM threads WHERE id = ?", (thread_id,)).fetchone()
+    if thread is None or thread["status"] != "open":
+        return None     # nothing is launched on a closed thread; reopening it resumes the wait
+    if _unstuck_since(conn, thread_id, agent, wait.get("recorded_at") or 0):
+        return "settle", ("resolved", "the human unstuck the thread")
+    if wait["state"] == "relaunched" and _relaunch_in_flight(board, wait, live_seconds):
+        return None
+    blocker = recovery.transient_blocker(board, wait)
+    first = wait.get("first_recorded_at")
+    if type(first) in (int, float) and now - first >= MAX_WAIT_SECONDS:
+        return "escalate", ("the owner worktree did not become free within 24 hours" + (f" ({blocker})" if blocker else
+                            ", or the agent could not be relaunched in that time"))
+    if blocker is not None:
+        if wait["state"] != "waiting" or wait.get("blocker") != blocker:
+            return "update", {"state": "waiting", "blocker": blocker}
+        return None
+    if len(recovery.retries_used(wait, now)) >= recovery.WAIT_RETRIES:
+        return "escalate", (f"{recovery.WAIT_RETRIES} automatic retries in 24 hours did not recover it, although the "
+                            "owner worktree was free")
+    identity = conn.execute("SELECT active, is_human FROM agents WHERE name = ?", (agent,)).fetchone()
+    if identity is None or not identity["active"] or identity["is_human"]:
+        return None
+    if runner_for(agent) is None:
+        return "escalate", f"no runner is configured for {agent}, so the dispatcher cannot relaunch it"
+    if not _wait_authorized(board, human, wait):
+        return "escalate", (f"neither you, a standing grant nor a dispatch approval of yours asked {agent} for request "
+                            f"#{wait['post_id']}, so nothing was launched")
+    if at_cap(thread_id) or len(_times(conn, agent_budget_key(agent), now)) >= AGENT_DAILY_BUDGET:
+        return None     # the thread needs a human post first, or the agent's daily launch budget frees up later
+    return "send", None
+
+
+def _process_waits(board: Board, human: Principal, runner_for: Callable[[str], Any], fence: tuple[str, str],
+                   live_seconds: float, budget: dict) -> dict:
+    """One pass over the recorded recovery waits: settle the ones that moved on, relaunch an agent whose owner worktree
+    is free (bounded per pass and per request), escalate the ones whose retries ran out."""
+    conn = board.conn
+    out: dict[str, list] = {"retried": [], "escalated": []}
+    cap: dict[int, bool] = {}
+
+    def at_cap(thread_id: int) -> bool:
+        if thread_id not in cap:
+            cap[thread_id] = _at_cap(board, thread_id)
+        return cap[thread_id]
+
+    for key, wait in recovery.waits(conn):
+        if wait.get("state") not in recovery.WAITING:
+            continue
+        now = board.now()
+        try:
+            action = _wait_action(board, human, runner_for, wait, now, live_seconds, at_cap)
+            if action is None:
+                continue
+            kind, arg = action
+            if kind in ("settle", "update"):
+                fields = ({"state": arg[0], "settled_at": now, "settled_reason": arg[1]} if kind == "settle" else arg)
+                with db.write_tx(conn) as c:
+                    if _get(c, key) == wait:
+                        _update(c, key, wait | fields, now)
+            elif kind == "send" and len(out["retried"]) < MAX_SENDS_PER_PASS:
+                out["retried"].append(_send_wait_retry(board, human, fence, key, wait))
+            elif kind == "escalate" and budget["escalations"] > 0:
+                if _escalate_wait(board, human, fence, key, wait, arg) is not None:
+                    budget["escalations"] -= 1
+                    out["escalated"].append(key)
+        except Exception:
+            log.exception("could not handle recovery wait %s", key)
+    return out
+
+
+def _send_wait_retry(board: Board, human: Principal, fence: tuple[str, str], key: str, wait: dict) -> int:
+    """Relaunch the agent once with the fixed automatic-recovery request (ids and names only), under a fresh one-shot
+    rule, and record the retry in the same transaction."""
+    now = board.now()
+    agent, thread_id, post_id = wait["agent"], wait["thread_id"], wait["post_id"]
+    used = recovery.retries_used(wait, now)
+
+    def check() -> None:
+        conn = board.conn
+        if not _owner_ok(conn, fence):
+            raise Conflict("another dispatcher owns this board now")
+        if board.is_paused() or not enabled(board):
+            raise Conflict("automatic recovery is paused or switched off")
+        if _get(conn, key) != wait:
+            raise Conflict(f"{key} changed meanwhile")
+        if len(recovery.retries_used(wait, board.now())) >= recovery.WAIT_RETRIES:
+            raise Conflict(f"the automatic retries for request #{post_id} are spent")
+        if len(_times(conn, agent_budget_key(agent), board.now())) >= AGENT_DAILY_BUDGET:
+            raise Conflict(f"the daily automatic launch budget for {agent} is spent")
+
+    def record(post: dict) -> None:
+        conn = board.conn
+        _insert(conn, POST_PREFIX + str(post["id"]), {"kind": "recovery_wait_retry", "thread_id": thread_id,
+                                                     "agent": agent, "request_post_id": post_id}, now)
+        _update(conn, key, wait | {"state": "relaunched", "relaunch_post_id": post["id"], "relaunched_at": now,
+                                   "rule_id": human_actions.post_rule_id(board, post["id"]), "retries": used + [now],
+                                   "relaunch_post_ids": ((wait.get("relaunch_post_ids") or []) + [post["id"]])[-10:]},
+                now)
+        _upsert(conn, agent_budget_key(agent), _times(conn, agent_budget_key(agent), now) + [now], now)
+
+    covered = [i for i in wait.get("covered_post_ids") or [] if type(i) is int][:MAX_ITEMS]
+    also = (f" The blocked attempt (session {wait['session_id']}) left request{'s' if len(covered) > 1 else ''} "
+            f"{_ids(covered)} waiting: recover and resume {'them' if len(covered) > 1 else 'it'} the same way."
+            if covered and type(wait.get("session_id")) is int else "")
+    body = WAIT_BODY.format(post=post_id, recipient=wait["recipient"], old=wait["old_session"], also=also,
+                            n=len(used) + 1, max=recovery.WAIT_RETRIES)
+    post, _ = human_actions.post_as_human(
+        board, human, thread_id=thread_id, body=body, type="request", to=[agent], needs_response=True, launch=[agent],
+        purpose=WAIT_PURPOSE.format(thread=thread_id, post=post_id), post_check=check, post_hook=record)
+    log.info("automatic recovery: the owner worktree of request %s is free; relaunching %s (retry %s, post %s)",
+             post_id, agent, len(used) + 1, post["id"])
+    return post["id"]
+
+
+def wait_question(wait: dict, reason: str) -> dict:
+    """The structured question when a wait's retries ran out: relaunch the agent with a one-click Unstick (recommended)
+    or leave it. Server facts only (ids, agent names, the server's reason)."""
+    post, agent, thread, old = wait["post_id"], wait["agent"], wait["thread_id"], wait["old_session"]
+    return {
+        "question": f"Request #{post} is still held by {agent}'s old session {old}, and automatic recovery did not "
+                    f"take. Relaunch {agent} to recover it?",
+        "context": f"Thread #{thread}, request #{post} (recipient {wait['recipient']}), assigned to {agent}, held by "
+                   f"session {old}. Why it came to you: {reason}. No further automatic retries will be made for it.",
+        "options": [
+            _unstick_option("relaunch", f"Relaunch {agent} to recover request #{post} (Unstick)"[:200], thread, [agent],
+                            f"recover request #{post} from session {old} and resume it"),
+            _option("leave", "Leave it for now", (
+                f"Launches nothing and takes this item out of Needs you. Costs nothing now; request #{post} stays with "
+                f"session {old} until you act on the thread."))],
+        "recommended_option_id": "relaunch"}
+
+
+def _escalate_wait(board: Board, human: Principal, fence: tuple[str, str], key: str, wait: dict,
+                   reason: str) -> int | None:
+    """Tell the human, once, with a one-click question; the wait is then `escalated` (or `suppressed`, silently, over
+    the per-agent daily escalation cap). Revokes the last relaunch's one-shot rule. Returns the post id or None."""
+    now, agent, thread_id = board.now(), wait["agent"], wait["thread_id"]
+    if not _escalations_left(board.conn, agent, now):
+        with db.write_tx(board.conn) as c:
+            if _get(c, key) == wait:
+                _update(c, key, wait | {"state": "suppressed", "reason": reason, "escalated_at": now}, now)
+        log.warning("recovery wait %s needs the human, but the daily cap of escalation posts for %s is reached", key,
+                    agent)
+        return None
+
+    def check() -> None:
+        if not _owner_ok(board.conn, fence):
+            raise Conflict("another dispatcher owns this board now")
+        if board.is_paused() or not enabled(board):
+            raise Conflict("automatic recovery is paused or switched off")
+        if _get(board.conn, key) != wait:
+            raise Conflict(f"{key} changed meanwhile")
+        if not _escalations_left(board.conn, agent, board.now()):
+            raise Conflict(f"the daily cap of escalation posts for {agent} is reached")
+
+    def record(post: dict) -> None:
+        _insert(board.conn, POST_PREFIX + str(post["id"]), {"kind": "escalation", "thread_id": thread_id,
+                                                           "request_post_ids": [wait["post_id"]]}, now)
+        _upsert(board.conn, escalations_key(agent), _times(board.conn, escalations_key(agent), now) + [now], now)
+        _update(board.conn, key, wait | {"state": "escalated", "reason": reason, "escalated_at": now,
+                                         "escalation_post_id": post["id"]}, now)
+
+    try:
+        question = wait_question(wait, reason)
+        issues._question(board, question)
+    except Exception:
+        log.exception("could not build the question for recovery wait %s; posting it without one", key)
+        question = None
+    body = WAIT_ESCALATION.format(post=wait["post_id"], agent=agent, old=wait["old_session"], reason=reason,
+                                  next=WAIT_ESCALATION_NEXT if question else WAIT_ESCALATION_NEXT_PLAIN)
+    post, _ = human_actions.post_as_human(
+        board, human, thread_id=thread_id, body=body, type="question" if question else "status", to=[],
+        needs_response=True, decision_question=question, post_check=check, post_hook=record)
+    rule_id = wait.get("rule_id")
+    if type(rule_id) is int:
+        try:
+            board.revoke_dispatch_rule(human, rule_id)
+        except Exception:
+            log.exception("could not revoke recovery wait rule %s", rule_id)
+    log.warning("recovery wait %s: %s; told the human in post %s", key, reason, post["id"])
+    return post["id"]
+
+
 # ---------------------------------------------------------------- pruning
 
 
@@ -854,6 +1116,17 @@ def prune(board: Board, force: bool = False) -> int:
             continue
         task = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if task is None or task["status"] in ("done", "declined"):
+            gone.append(key)
+    for key, value, updated in _keys(conn, recovery.WAIT_PREFIX, "key, value, updated_at"):
+        # Settled waits (and their retry history, which only matters for a day) go after RECORD_TTL_SECONDS; a live
+        # one escalates within MAX_WAIT_SECONDS, so it never sits here that long.
+        try:
+            wait = json.loads(value)
+        except (TypeError, ValueError):
+            wait = None
+        post = wait.get("post_id") if isinstance(wait, dict) else None
+        if (not isinstance(wait, dict) or conn.execute("SELECT 1 FROM posts WHERE id = ?", (post,)).fetchone() is None
+                or updated < now - RECORD_TTL_SECONDS):
             gone.append(key)
     for key, value, updated in _keys(conn, recovery.RECLAIMED_PREFIX, "key, value, updated_at"):
         try:
@@ -901,5 +1174,35 @@ def list_records(board: Board, p: Principal) -> list[dict]:
                     "held_request_ids": rec.get("held_request_ids") or [],
                     "sent_at": iso(rec.get("sent_at")), "escalated_at": iso(rec.get("escalated_at")),
                     "_order": rec.get("escalated_at") or rec.get("sent_at") or 0})
+    # Recovery waits (kind "recovery_wait"): the board waits for the owner worktree of request_post_id to be free and
+    # retries by itself (`waiting`, `relaunched`: not the human's turn), or its retries ran out (`escalated`, shown
+    # until the human handles that Needs you post). post_id is the latest automatic relaunch request, if any.
+    now = board.now()
+    for _, wait in recovery.waits(conn):
+        state = wait.get("state")
+        if state not in ("waiting", "relaunched", "escalated"):
+            continue
+        thread = conn.execute("SELECT status FROM threads WHERE id = ?", (wait.get("thread_id"),)).fetchone()
+        if thread is None or thread["status"] != "open":
+            continue
+        if state == "escalated":
+            note = wait.get("escalation_post_id")
+            if (type(note) is not int or conn.execute(
+                    f"SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}", (note,)).fetchone() is None
+                    or _unstuck_since(conn, wait["thread_id"], wait["agent"], wait.get("escalated_at") or 0)):
+                continue
+        elif not recovery.wait_live(board, wait):
+            continue
+        ints = lambda v: [x for x in v if type(x) is int] if isinstance(v, list) else []   # noqa: E731
+        out.append({"kind": "recovery_wait", "task_id": None, "thread_id": wait["thread_id"], "agent": wait["agent"],
+                    "owner_session": wait.get("old_session"), "request_post_id": wait["post_id"],
+                    "recipient": wait.get("recipient"), "post_id": wait.get("relaunch_post_id"), "state": state,
+                    "reason": wait.get("reason") if state == "escalated" else wait.get("blocker"), "detail": None,
+                    "escalation_post_id": wait.get("escalation_post_id"), "held_request_ids": [wait["post_id"]],
+                    "covered_post_ids": ints(wait.get("covered_post_ids")),
+                    "covered_task_ids": ints(wait.get("covered_task_ids")),
+                    "retries_used": len(recovery.retries_used(wait, now)), "max_retries": recovery.WAIT_RETRIES,
+                    "sent_at": iso(wait.get("relaunched_at")), "escalated_at": iso(wait.get("escalated_at")),
+                    "_order": wait.get("escalated_at") or wait.get("relaunched_at") or wait.get("recorded_at") or 0})
     out.sort(key=lambda r: r.pop("_order"), reverse=True)
     return out[:LIST_MAX]

@@ -64,10 +64,14 @@ def test_an_unclaimed_escalation_is_a_structured_question_from_server_facts(aenv
     assert (note["agent"], note["type"], note["to"], note["needs_response"]) == ("human", "question", [], True)
     assert note["body"].startswith("Automatic recovery did not take") and "not a human click" in note["body"]
     opts, rec = options(note)
-    assert rec == "decline" and list(opts) == ["decline", "ask-creator"]
+    # Asking the creator is recommended, never a blind decline: the task may be real unfinished work.
+    assert rec == "ask-creator" and list(opts) == ["ask-creator", "decline"]
     assert opts["decline"]["action"] == {"type": "decline_task", "task_id": task, "expected_status": "accepted"}
     assert opts["ask-creator"]["action"] == {"type": "unstick", "thread_id": aenv.tid, "agents": ["codex"]}
-    assert opts["decline"]["label"] == f"Decline task {task}" and "codex" in opts["ask-creator"]["label"]
+    assert opts["decline"]["label"] == f"Decline task {task}"
+    assert opts["ask-creator"]["label"] == "Ask codex to claim it or decline it if covered"
+    assert "decide with evidence" in opts["ask-creator"]["description"]
+    assert "dropped" in opts["decline"]["description"]
     text = json.dumps(note["decision_question"])
     assert not any(m in text for m in MARKERS)
     item = next(p for p in aenv.board.snapshot(aenv.p["human"])["needs_you"] if p["id"] == note["id"])
