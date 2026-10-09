@@ -3,8 +3,9 @@
 #
 #   install.sh [--preapprove-board-tools]
 #
-# --preapprove-board-tools  also print the Codex config block that pre-approves the 8 agent-comms board tools
-#     for EVERY Codex session. Optional: dispatched runs (`board dispatch run`) already get these approvals for
+# --preapprove-board-tools  also print the Codex config block that pre-approves the 27 agent-comms board tools
+#     that dispatched runs get (every tool except board_resolve_attention, which stays opt-in) for EVERY Codex
+#     session. Optional: dispatched runs (`board dispatch run`) already get these approvals for
 #     that run only, from the -c overrides in the board.toml codex-cli runner. Use this only if you also want
 #     interactive Codex sessions to skip approval for the board tools. Codex CLI 0.157 has no command that saves
 #     tool approvals, so this prints the block for you to paste into ~/.codex/config.toml; it never edits that file.
@@ -46,9 +47,13 @@ Optional: to let interactive Codex sessions call the agent-comms board tools wit
 board.toml codex-cli runner approves the board tools per run). This script does not edit the file.
 
 MSG
-  for tool in board_register board_read_updates board_post board_claim_task board_update_task \
-              board_release_task board_set_summary board_list_threads \
-              board_list_issues board_get_issue board_create_issue board_link_issue board_comment_issue; do
+  for tool in board_register board_read_updates board_post board_claim_task \
+              board_update_task board_release_task board_set_summary board_list_threads \
+              board_list_issues board_get_issue board_create_issue board_link_issue \
+              board_comment_issue board_request_progress board_request_history board_register_capabilities \
+              board_route_request board_recover_request_owner board_repost_request board_configuration_status \
+              board_refresh_configuration board_bind_browser_request board_browser_begin_probe board_browser_probe \
+              board_browser_failure board_browser_reconnect board_browser_status; do
     printf '[mcp_servers.agent-comms.tools.%s]\napproval_mode = "approve"\n\n' "$tool"
   done
 fi

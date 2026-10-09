@@ -74,9 +74,10 @@ EDITABLE: dict[str, Spec] = {s.key: s for s in (
 del _d
 
 # Recognised but deliberately not editable from a browser.
-FILE_ONLY = {"host", "port", "db_path", "agents_path", "runners", "env", "worktrees"}
+FILE_ONLY = {"host", "port", "db_path", "agents_path", "runners", "env", "worktrees", "headless_browser"}
 FILE_ONLY_WHY = ("is not editable from the dashboard. host, port and paths need a restart, and the dispatcher's "
-                 "runners, env and worktrees decide what runs on this machine; edit board.local.toml by hand")
+                 "runners, env, worktrees and headless browser decide what runs on this machine; edit "
+                 "board.local.toml by hand")
 # [web] sign-in session lifetimes: a signed-in browser must not be able to extend its own sign-in.
 WEB_FILE_ONLY = {"session_days", "session_max_days"}
 WEB_FILE_ONLY_WHY = ("is not editable from the dashboard: a signed-in browser must not be able to lengthen its own "

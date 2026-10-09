@@ -998,49 +998,94 @@ def _documented_tools(text: str) -> list[str]:
     return re.findall(r'^\[mcp_servers\.agent-comms\.tools\.(\w+)\]\napproval_mode = "approve"$', text, re.M)
 
 
-def test_codex_board_tool_lists_match_the_mcp_server():
-    """The served tools, the shipped runner's per-run -c approvals, both docs' optional global block and the
-    installer's printed block retain the thirteen preapproved tools; selective closeout is opt-in."""
-    import re
+def _served_tools(board) -> set[str]:
+    """What the real MCP server serves (browser_mcp.install included), over both transports."""
+    import asyncio
+    from agent_comms.mcp_server import build_mcp
+
+    served = set()
+    for transport in ("stdio", "http"):
+        served |= {t.name for t in asyncio.run(build_mcp(board, transport).list_tools())}
+    return served
+
+
+def test_every_served_tool_is_classified_for_codex_exactly_once(env):
+    """Adding a tool to the MCP server without deciding whether dispatched Codex runs pre-approve it fails here.
+    (The old check regex-scanned mcp_server.py only and missed every tool browser_mcp.py serves.)"""
+    pre, opt = dispatch.CODEX_PREAPPROVED_TOOLS, dispatch.CODEX_OPT_IN_TOOLS
+    assert len(set(pre)) == len(pre) and len(set(opt)) == len(opt)
+    assert not set(pre) & set(opt)
+    served = _served_tools(env.board)
+    assert served == set(pre) | set(opt), {"unclassified": served - set(pre) - set(opt),
+                                           "not served": (set(pre) | set(opt)) - served}
+    assert opt == ("board_resolve_attention",)                 # selective closeout is opt-in
+    browser = {"board_bind_browser_request", "board_browser_begin_probe", "board_browser_probe",
+               "board_browser_failure", "board_browser_reconnect", "board_browser_status"}
+    assert browser <= set(pre) and browser <= served           # the tools whose absence stalled dispatched runs
+    assert {"board_recover_request_owner", "board_repost_request", "board_configuration_status",
+            "board_refresh_configuration"} <= set(pre)
+
+
+def test_codex_preapproved_tools_match_runner_docs_and_installer():
+    """The shipped runner's per-run -c approvals, both docs' optional global block and the installer's printed
+    block all list exactly CODEX_PREAPPROVED_TOOLS, in order."""
     import tomllib
 
-    served = re.findall(r"^    (?:async )?def (board_\w+)\(", (ROOT / "agent_comms/mcp_server.py").read_text(), re.M)
-    assert set(served) == set(dispatch.BOARD_TOOLS) | {"board_configuration_status", "board_refresh_configuration", "board_recover_request_owner", "board_resolve_attention", "board_request_progress", "board_request_history",
-                                                       "board_register_capabilities", "board_route_request", "board_repost_request"}
-    assert "board_resolve_attention" not in dispatch.BOARD_TOOLS
+    pre = list(dispatch.CODEX_PREAPPROVED_TOOLS)
     runner = DispatchConfig.load(ROOT / "board.toml", local=False).runners["codex-cli"]
     overrides = [runner[i + 1] for i, x in enumerate(runner) if x == "-c"]
-    assert overrides == [dispatch.codex_approval_override(t) for t in dispatch.BOARD_TOOLS + dispatch.REQUEST_TOOLS]
+    assert overrides == [dispatch.codex_approval_override(t) for t in pre]
     assert overrides[0] == 'mcp_servers.agent-comms.tools.board_register.approval_mode="approve"'
+    assert not any("board_resolve_attention" in x for x in runner)
     assert dispatch.codex_unapproved_tools(runner) == [] and dispatch.codex_approval_reminder(runner) is None
     assert runner[:6] == ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write"]
     assert runner[-1] == "{prompt}" and dispatch.risky_flags(runner) == []
     for doc in ("README.md", "integrations/codex/README.md"):
         text = (ROOT / doc).read_text()
-        assert _documented_tools(text) == list(dispatch.BOARD_TOOLS), doc
+        assert _documented_tools(text) == pre, doc
         block = text.split("```toml\n[mcp_servers.agent-comms.tools.")[1].split("```")[0]
         parsed = tomllib.loads("[mcp_servers.agent-comms.tools." + block)
-        assert parsed["mcp_servers"]["agent-comms"]["tools"] == {t: {"approval_mode": "approve"}
-                                                                for t in dispatch.BOARD_TOOLS}
+        assert parsed["mcp_servers"]["agent-comms"]["tools"] == {t: {"approval_mode": "approve"} for t in pre}
         assert "optional" in text.lower()
     script = (ROOT / "integrations/codex/install.sh").read_text()
     listed = script.split("for tool in ")[1].split("; do")[0].replace("\\\n", " ").split()
-    assert listed == list(dispatch.BOARD_TOOLS)
+    assert listed == pre
     assert "--preapprove-board-tools" in script
     assert ">>" not in script and "tee " not in script          # it prints the block; it never writes config
 
 
 def test_codex_unapproved_tools_parsing():
-    full = ["codex", "exec"] + [a for t in dispatch.BOARD_TOOLS + dispatch.REQUEST_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
+    pre = dispatch.CODEX_PREAPPROVED_TOOLS
+    full = ["codex", "exec"] + [a for t in pre for a in ("-c", dispatch.codex_approval_override(t))]
     assert dispatch.codex_unapproved_tools(full + ["{prompt}"]) == []
-    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == [dispatch.REQUEST_TOOLS[-1]]
+    assert dispatch.codex_unapproved_tools(full[:-2] + ["{prompt}"]) == [pre[-1]]
     assert dispatch.codex_unapproved_tools(
         ["codex", "exec", "--config=mcp_servers.agent-comms.default_tools_approval_mode='approve'", "{prompt}"]) == []
     other = ["codex", "exec", "-c", 'mcp_servers.other.tools.board_post.approval_mode="approve"',
              "-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="prompt"', "{prompt}"]
     assert "board_post" in dispatch.codex_unapproved_tools(other)
     assert dispatch.codex_approval_reminder(["claude", "-p", "{prompt}"]) is None
-    assert dispatch.REQUEST_TOOLS[-1] in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
+    assert pre[-1] in dispatch.codex_approval_reminder(full[:-2] + ["{prompt}"])
+    # The runner this machine used before: it approved only the first seventeen, so browser preflight stalled.
+    old = ["codex", "exec"] + [a for t in pre[:17] for a in ("-c", dispatch.codex_approval_override(t))] + ["{prompt}"]
+    assert dispatch.codex_unapproved_tools(old) == list(pre[17:])
+    assert "board_bind_browser_request" in dispatch.codex_approval_reminder(old)
+
+
+def test_codex_runner_missing_browser_approvals_is_refused_with_named_tools(denv):
+    pre = dispatch.CODEX_PREAPPROVED_TOOLS
+    denv.config.runners["codex"] = (["codex", "exec"] + [a for t in pre if not t.startswith("board_browser")
+                                                         for a in ("-c", dispatch.codex_approval_override(t))]
+                                    + ["{prompt}"])
+    allow(denv, agents=["codex"], max_launches=3)
+    post = human_post(denv, ["codex"])
+    denv.d.tick()
+    assert not denv.spawner.calls
+    assert runs(denv)[0]["status"] == "preflight_failed"
+    assert "board_browser_begin_probe" in runs(denv)[0]["error"] and "board_post" not in runs(denv)[0]["error"]
+    request = denv.board.get_post(denv.p["human"], post["id"])["requests"][0]
+    assert request["state"] == "blocked" and "board_browser_probe" in request["reason"]
+    assert denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 3
 
 
 def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, capsys, tmp_path):

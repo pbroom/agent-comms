@@ -17,6 +17,8 @@ Guardrails:
   a configured runner is never launched.
 - One run per agent, a global concurrency cap, a wall-clock timeout per run, no launches while the board is
   paused, each launch spends one unit of the rule's budget, and each launch notifies the human.
+- Browser-bound requests launch only for a Codex runner the human gave a scoped headless browser
+  ([dispatch.headless_browser]), never past a sticky policy denial, and the run must probe the target itself.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,8 +66,10 @@ BASE_ENV = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "LC_AL
             "__CF_USER_TEXT_ENCODING")
 
 
-def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[int] | None = None, run_id: str | None = None) -> str:
-    """The fixed launch prompt. Deliberately takes no post: post text can never reach an agent this way."""
+def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[int] | None = None, run_id: str | None = None,
+                 headless_browser: bool = False) -> str:
+    """The fixed launch prompt. Deliberately takes no post: post text can never reach an agent this way (nor a bound
+    browser target: its origins go only into the browser server's own argv, see headless_browser_overrides)."""
     for v in (thread_id, rule_id):
         if isinstance(v, bool) or not isinstance(v, int):
             raise TypeError("thread_id and rule_id must be integers")
@@ -82,6 +87,8 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[i
         if not isinstance(run_id, str) or not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in run_id):
             raise TypeError("invalid dispatcher run ID")
         prompt += " Register your session with dispatch_run_id=" + run_id + "."
+    if headless_browser:
+        prompt += HEADLESS_PROMPT
     return prompt
 
 
@@ -89,23 +96,41 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[i
 # never"). The shipped codex-cli runner therefore approves the board tools for that run only, with one
 # `-c mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"` override per tool; interactive Codex sessions
 # keep asking. (A global pre-approval in ~/.codex/config.toml also works, but is optional.)
-BOARD_TOOLS = ("board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
-               "board_release_task", "board_set_summary", "board_list_threads",
-               "board_list_issues", "board_get_issue", "board_create_issue", "board_link_issue", "board_comment_issue")
-REQUEST_TOOLS = ("board_request_progress", "board_request_history", "board_register_capabilities", "board_route_request")
+#
+# The single source of truth: every tool the agent-comms MCP server serves is in exactly one of these two sets, and
+# tests/test_dispatch.py enumerates the tools the real server serves (browser_mcp included) to enforce it, so a new
+# tool cannot ship unclassified. The shipped runner, both READMEs' optional block and install.sh list
+# CODEX_PREAPPROVED_TOOLS in this order. Every one of them is gated server-side (identity, session, lease, request
+# ownership, human-only checks); approving the call only lets `codex exec` make it.
+CODEX_PREAPPROVED_TOOLS = (
+    # coordination
+    "board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
+    "board_release_task", "board_set_summary", "board_list_threads",
+    "board_list_issues", "board_get_issue", "board_create_issue", "board_link_issue", "board_comment_issue",
+    # explicit request lifecycle and its bookkeeping (recover/repost move ownership records only)
+    "board_request_progress", "board_request_history", "board_register_capabilities", "board_route_request",
+    "board_recover_request_owner", "board_repost_request",
+    # configuration status (refresh is human-only server-side)
+    "board_configuration_status", "board_refresh_configuration",
+    # browser readiness: these record binding, probe and failure evidence; none operates a browser
+    "board_bind_browser_request", "board_browser_begin_probe", "board_browser_probe", "board_browser_failure",
+    "board_browser_reconnect", "board_browser_status",
+)
+# Never pre-approved for a dispatched run: selective closeout is opt-in (an interactive session asks the human).
+CODEX_OPT_IN_TOOLS = ("board_resolve_attention",)
 CODEX_SERVER = "agent-comms"
 
 
-def codex_approval_override(tool: str) -> str:
-    return f'mcp_servers.{CODEX_SERVER}.tools.{tool}.approval_mode="approve"'
+def codex_approval_override(tool: str, server: str = CODEX_SERVER) -> str:
+    return f'mcp_servers.{server}.tools.{tool}.approval_mode="approve"'
 
 
 def uses_codex(template: list[str] | None) -> bool:
     return bool(template) and os.path.basename(template[0]) == "codex"
 
 
-def codex_unapproved_tools(template: list[str]) -> list[str]:
-    """Board tools a Codex runner does not approve through `-c`/`--config` overrides in its own argv."""
+def _codex_overrides(template: list[str]) -> list[str]:
+    """The `key=value` strings of a Codex argv's `-c`/`--config` overrides."""
     values = []
     for i, x in enumerate(template):
         if x in ("-c", "--config") and i + 1 < len(template):
@@ -114,8 +139,13 @@ def codex_unapproved_tools(template: list[str]) -> list[str]:
             values.append(x[len("--config="):])
         elif x.startswith("-c") and len(x) > 2:
             values.append(x[2:].lstrip("="))
+    return values
+
+
+def codex_unapproved_tools(template: list[str]) -> list[str]:
+    """Pre-approved board tools a Codex runner does not approve through `-c`/`--config` overrides in its own argv."""
     approved = set()
-    for v in values:
+    for v in _codex_overrides(template):
         key, _, val = v.partition("=")
         key, val = key.strip(), val.strip().strip("\"'")
         if val != "approve":
@@ -125,11 +155,11 @@ def codex_unapproved_tools(template: list[str]) -> list[str]:
         prefix, suffix = f"mcp_servers.{CODEX_SERVER}.tools.", ".approval_mode"
         if key.startswith(prefix) and key.endswith(suffix):
             approved.add(key[len(prefix):-len(suffix)])
-    return [t for t in BOARD_TOOLS + REQUEST_TOOLS if t not in approved]
+    return [t for t in CODEX_PREAPPROVED_TOOLS if t not in approved]
 
 
 def codex_approval_reminder(template: list[str] | None) -> str | None:
-    """A warning when a Codex runner would start without approvals for the board tools, else None."""
+    """Why a Codex runner cannot be launched (it lacks approvals for pre-approved board tools), else None."""
     if not uses_codex(template):
         return None
     missing = codex_unapproved_tools(template)
@@ -139,6 +169,215 @@ def codex_approval_reminder(template: list[str] | None) -> str | None:
             f"{', '.join(missing)}). `codex exec` cannot ask for approval, so those calls will fail. Add "
             "`\"-c\", \"mcp_servers.agent-comms.tools.<tool>.approval_mode=\\\"approve\\\"\"` per tool, as the shipped "
             "board.toml codex-cli runner does (README \"Dispatcher\")")
+
+
+# ---------------------------------------------------------------- headless browser for dispatched Codex runs
+#
+# Opt-in ([dispatch.headless_browser]): a dispatched Codex run gets its own Playwright MCP server, injected into its
+# argv with `-c` overrides for that run only, so the dispatcher can relaunch browser-bound work itself. The browser
+# is always headless with an in-memory profile (`--isolated`: no saved cookies, never the human's or a desktop
+# chat's browser), blocks service workers, writes into a fresh per-run directory that is removed when the run ends,
+# and has its page requests routed to the bound origins (`--allowed-origins`). Playwright documents that list as NOT a
+# security boundary: it does not apply to redirects, WebSocket connections or service-worker requests. The controls
+# remain the board's binding, the fresh headless probe evidence and the sticky policy-denied gate, plus a tool set
+# with no way to run arbitrary script (see HEADLESS_BROWSER_TOOLS).
+HEADLESS_BROWSER_SERVER = "headless_browser"
+# The only browser tools a dispatched run may call, each approved for that run (and nothing else enabled: Codex's
+# `enabled_tools` is the control; a tool a newer Playwright adds stays hidden until it is added here).
+# Never enabled or approved:
+# - browser_run_code_unsafe: Playwright code in the MCP server's Node process, outside Codex's sandbox.
+# - browser_evaluate: page JavaScript could open `new WebSocket(...)` to any host, which the origin routing does not
+#   cover, from a browser that runs outside Codex's sandbox.
+# - browser_file_upload, browser_drop: they read local files.
+HEADLESS_BROWSER_TOOLS = (
+    "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_take_screenshot", "browser_find",
+    "browser_click", "browser_hover", "browser_type", "browser_press_key", "browser_fill_form",
+    "browser_select_option", "browser_drag", "browser_handle_dialog", "browser_wait_for", "browser_resize",
+    "browser_tabs", "browser_close", "browser_console_messages", "browser_network_requests",
+    "browser_network_request", "browser_emulate_media",
+)
+HEADLESS_BROWSER_DENIED = ("browser_run_code_unsafe", "browser_evaluate", "browser_file_upload", "browser_drop")
+HEADLESS_BROWSERS = ("chrome", "msedge", "firefox", "webkit")
+# Flags the dispatcher sets itself on every run.
+HEADLESS_MANAGED_FLAGS = ("--headless", "--isolated", "--block-service-workers", "--browser", "--allowed-origins",
+                          "--output-dir")
+# Every other option element (one starting with "-") must be one of these known-harmless ones. An allowlist, not a
+# denylist: Playwright MCP adds options every release (0.0.83 has about fifty), and an unknown one could widen what
+# the browser reaches (a profile, a running browser, a proxy, local files, injected scripts, secrets, TLS bypass).
+# The first group is for the `npx` launcher; the rest only change presentation, timing or narrow the browser further.
+HEADLESS_ALLOWED_FLAGS = (
+    "--offline", "--prefer-offline", "-y", "--yes",
+    "--blocked-origins", "--codegen", "--console-level", "--device", "--file-paths", "--idle-timeout",
+    "--image-responses", "--mobile", "--no-webmcp", "--output-max-size", "--sandbox", "--snapshot-boxes",
+    "--snapshot-mode", "--test-id-attribute", "--timeout-action", "--timeout-navigation", "--timeout-settle",
+    "--user-agent", "--viewport-size",
+)
+HEADLESS_PROMPT = (
+    " A scoped headless browser is attached to this run as the headless_browser MCP server. For browser work use "
+    "only the headless_browser tools: never another browser, a desktop connection, curl or raw CDP. Before any "
+    "browser step, perform a fresh headless probe of the bound target: board_browser_begin_probe, then "
+    "board_browser_probe with context kind \"headless\" from this run. Report any browser failure with "
+    "board_browser_failure; a policy denial is final, so never retry or route around it."
+)
+
+
+def _has_control(value: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)
+
+
+@dataclass
+class HeadlessBrowserConfig:
+    """`[dispatch.headless_browser]`: which Codex runners get a scoped headless browser, and the MCP server to run."""
+
+    runners: list[str] = field(default_factory=list)   # runner keys (codex runners only); empty: off
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    browser: str = "chrome"
+
+    @classmethod
+    def from_dict(cls, d: Any) -> "HeadlessBrowserConfig":
+        where = "[dispatch.headless_browser]"
+        if not isinstance(d, dict):
+            raise ValueError(f"{where} must be a table")
+        c = cls()
+        for k, v in d.items():
+            if k == "runners":
+                if (not isinstance(v, list) or not all(isinstance(x, str) and x for x in v)
+                        or len(set(v)) != len(v)):
+                    raise ValueError(f"{where} runners must be a list of distinct runner keys")
+                c.runners = list(v)
+            elif k == "command":
+                if not isinstance(v, str) or not v.strip() or "{" in v or "}" in v or _has_control(v):
+                    raise ValueError(f"{where} command must be the MCP server executable")
+                if os.path.basename(v) in SHELLS or any(r in v.lower() for r in RISKY_FLAGS):
+                    raise ValueError(f"{where} command must be the MCP server itself, never a shell or wrapper "
+                                     "that re-parses arguments")
+                c.command = v
+            elif k == "args":
+                if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+                    raise ValueError(f"{where} args must be a list of strings")
+                for i, x in enumerate(v):
+                    flag = x.split("=", 1)[0]
+                    # Elements are named by position, never value (config errors reach the status page).
+                    if "{" in x or "}" in x or _has_control(x) or any(r in x.lower() for r in RISKY_FLAGS):
+                        raise ValueError(f"{where} args element {i} is not allowed")
+                    if flag in HEADLESS_MANAGED_FLAGS:
+                        raise ValueError(f"{where} args element {i} is set by the dispatcher for each run "
+                                         f"({', '.join(HEADLESS_MANAGED_FLAGS)}); remove it")
+                    if x.startswith("-") and flag not in HEADLESS_ALLOWED_FLAGS:
+                        raise ValueError(f"{where} args element {i} is not a known-harmless option; allowed: "
+                                         f"{', '.join(HEADLESS_ALLOWED_FLAGS)}")
+                c.args = list(v)
+            elif k == "browser":
+                if v not in HEADLESS_BROWSERS:
+                    raise ValueError(f"{where} browser must be one of {', '.join(HEADLESS_BROWSERS)}")
+                c.browser = v
+            else:
+                raise ValueError(f"unknown setting {where} {k}")
+        if c.runners and not c.command:
+            raise ValueError(f"{where} needs a command when runners are listed")
+        return c
+
+    def check_runners(self, runners: dict[str, list[str]]) -> None:
+        for key in self.runners:
+            template = runners.get(key)
+            if template is None:
+                raise ValueError(f"[dispatch.headless_browser] runner {key!r} is not under [dispatch.runners]")
+            if not uses_codex(template):
+                raise ValueError(f"[dispatch.headless_browser] runner {key!r} is not a Codex runner; only `codex` "
+                                 "runners can be given the headless browser")
+            if any(_names_browser_server(v) for v in _codex_overrides(template)):
+                raise ValueError(f"[dispatch.headless_browser] runner {key!r} configures "
+                                 f"mcp_servers.{HEADLESS_BROWSER_SERVER} itself; the dispatcher owns that server "
+                                 "for these runners")
+
+
+def _names_browser_server(override: str) -> bool:
+    """Whether a `-c key=value` override touches the reserved server in any spelling: dotted, quoted keys
+    (`mcp_servers."headless_browser".x`), the bare table (`mcp_servers.headless_browser={...}`) or an inline
+    `mcp_servers={...}` table that mentions it."""
+    key, _, value = override.partition("=")
+    plain = "".join(ch for ch in key if ch not in "\"' \t")
+    name = f"mcp_servers.{HEADLESS_BROWSER_SERVER}"
+    if plain == name or plain.startswith(name + "."):
+        return True
+    return plain == "mcp_servers" and HEADLESS_BROWSER_SERVER in value
+
+
+def _toml(value: Any) -> str:
+    # A JSON string or list of strings is a valid TOML value (ensure_ascii=False: no surrogate-pair escapes; JSON
+    # escapes C0 controls, and DEL, which TOML forbids raw, is escaped here).
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def plain_origins(origins: list[Any]) -> list[str]:
+    """Only plain `http(s)://host[:port]` origins (browser_readiness.is_plain_origin), sorted and distinct. Anything
+    else is dropped, never passed on: in --allowed-origins each entry becomes a URL glob, so `*` or `{a,b}` would
+    widen the browser's reach past a deny gate that compares exact origins."""
+    from . import browser_readiness
+    return sorted({o for o in origins if browser_readiness.is_plain_origin(o)})
+
+
+def headless_browser_overrides(config: HeadlessBrowserConfig, origins: list[str], output_dir: str) -> list[str]:
+    """The `-c` argv pairs that attach the scoped headless browser to one Codex run."""
+    origins = plain_origins(origins)
+    if not origins:
+        raise ValueError("a headless browser needs at least one bound origin")
+    args = list(config.args) + ["--headless", "--isolated", "--block-service-workers", "--browser", config.browser,
+                                "--allowed-origins", ";".join(origins), "--output-dir", output_dir]
+    pre = f"mcp_servers.{HEADLESS_BROWSER_SERVER}."
+    out = ["-c", pre + "command=" + _toml(config.command), "-c", pre + "args=" + _toml(args),
+           "-c", pre + "cwd=" + _toml(output_dir),   # files saved by explicit name land here, not in the project
+           # No variables passed through by name (PLAYWRIGHT_MCP_* can set options these flags do not). An empty
+           # `env={}` would merge with, not replace, a config file's env table, so Dispatcher._headless_blocker
+           # refuses to attach the browser while the Codex config defines this server at all.
+           "-c", pre + "env_vars=[]",
+           "-c", pre + "enabled_tools=" + _toml(list(HEADLESS_BROWSER_TOOLS))]
+    for tool in HEADLESS_BROWSER_TOOLS:
+        out += ["-c", codex_approval_override(tool, HEADLESS_BROWSER_SERVER)]
+    return out
+
+
+def codex_config_conflict(env: dict[str, str]) -> str | None:
+    """Why the run's Codex config (CODEX_HOME, else ~/.codex) blocks attaching the scoped browser, else None. Codex
+    merges `-c` overrides into its config file, so a `mcp_servers.headless_browser` table there (an `env`, other
+    tool approvals) would merge into the dispatcher's server; the name is reserved."""
+    home = env.get("CODEX_HOME") or os.path.join(env.get("HOME") or "~", ".codex")
+    path = Path(home).expanduser() / "config.toml"
+    try:
+        data = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return "cannot read the Codex config.toml to check that it leaves mcp_servers.headless_browser alone"
+
+    def defines(table: Any) -> bool:
+        servers = table.get("mcp_servers") if isinstance(table, dict) else None
+        return isinstance(servers, dict) and HEADLESS_BROWSER_SERVER in servers
+
+    profiles = data.get("profiles")
+    if defines(data) or (isinstance(profiles, dict) and any(defines(p) for p in profiles.values())):
+        return (f"the Codex config.toml defines mcp_servers.{HEADLESS_BROWSER_SERVER}; remove it (the dispatcher "
+                "owns that name, and settings there would merge into the scoped browser)")
+    return None
+
+
+def remove_browser_output(record: dict) -> None:
+    """Delete a finished run's browser output directory, only when it is exactly `<log dir>/<run id>-browser`."""
+    hb = record.get("headless_browser") if isinstance(record, dict) else None
+    out, run_id, log = (hb or {}).get("output_dir"), record.get("run_id"), record.get("log")
+    if not (isinstance(out, str) and isinstance(run_id, str) and isinstance(log, str)):
+        return
+    path = Path(out)
+    if path.name != f"{run_id}-browser" or path.parent != Path(log).parent or path.is_symlink():
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def with_headless_browser(template: list[str], overrides: list[str]) -> list[str]:
+    """The runner argv with the overrides placed just before the {prompt} element (options precede the prompt)."""
+    i = template.index("{prompt}")
+    return template[:i] + overrides + template[i:]
 
 
 def _forbidden_env(name: str) -> bool:
@@ -162,6 +401,7 @@ class DispatchConfig:
     env: dict[str, list[str]] = field(default_factory=dict)       # agent name or runtime -> extra env var NAMES
     worktrees: dict[str, str] = field(default_factory=dict)       # thread project -> directory to run in
     claude_tool_projects: list[str] = field(default_factory=list)
+    headless_browser: HeadlessBrowserConfig = field(default_factory=HeadlessBrowserConfig)
     live_minutes: float = 2.0
     poll_seconds: float = 5.0
     timeout_minutes: float = 30.0
@@ -216,9 +456,17 @@ class DispatchConfig:
                 if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                     raise ValueError("[dispatch] max_concurrent must be a positive integer")
                 c.max_concurrent = v
+            elif k == "headless_browser":
+                c.headless_browser = HeadlessBrowserConfig.from_dict(v)
             else:
                 raise ValueError(f"unknown setting [dispatch] {k}")
+        c.headless_browser.check_runners(c.runners)
         return c
+
+    def headless_browser_for(self, agent: str, runtime: str | None) -> bool:
+        """Whether this agent's runner (by name, else runtime) is a Codex runner given the headless browser."""
+        key = self.runner_key(agent, runtime)
+        return key is not None and key in self.headless_browser.runners and uses_codex(self.runners[key])
 
 
 def validate_runner(agent: str, template: Any) -> list[str]:
@@ -400,6 +648,7 @@ def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), n
             status = (ended_as or {}).get(d["run_id"], "gone")
             updates.append(d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
                                 "note": "ended while no dispatcher was watching it (exit code unknown)"})
+            remove_browser_output(d)
             continue
         if d["status"] != "orphaned":
             d = d | {"status": "orphaned", "note": note or "left running by an earlier dispatcher"}
@@ -743,6 +992,7 @@ class Dispatcher:
             error = self._preflight(agent, rule)
             if item.get('post_id'):
                 error = self._browser_blocker(item['post_id'], agent) or error
+            error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
             if delivery is not None:
                 configured_cwd = self.config.worktrees.get(rule['project'], rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
@@ -867,14 +1117,65 @@ class Dispatcher:
         post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
         if post is None:
             return 'request is unavailable'
+        headless = self.config.headless_browser_for(agent, self._runtime(agent))
         for row in requests.for_post(self.board, post):
             if row['assigned_agent'] == agent:
+                # The sticky policy-denied gate first, always: a denial is never routed around, headless or not.
                 reason = browser_readiness.request_blocker(self.board, post_id, row['recipient'])
                 if reason:
                     return reason
-                if browser_readiness.requirement(self.board, post_id, row['recipient']):
-                    return 'Browser-bound work needs a verified existing browser session; a generic CLI cannot inherit its probe'
+                req = browser_readiness.requirement(self.board, post_id, row['recipient'])
+                if req:
+                    if not headless:
+                        return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
+                                'inherit its probe (a Codex runner can be given a scoped headless browser with '
+                                '[dispatch.headless_browser])')
+                    if not browser_readiness.is_plain_origin(req['origin']):
+                        return 'bound browser target is not a plain http(s) origin; bind a new request'
         return None
+
+    def _headless_blocker(self, agent: str, thread_id: int, request_ids: list[int]) -> str | None:
+        """Before reserving a launch: a run that will get the browser server needs its command on the run's PATH."""
+        if not self.config.headless_browser_for(agent, self._runtime(agent)):
+            return None
+        if not self._headless_origins(agent, thread_id, request_ids):
+            return None   # no browser server will be attached
+        env = child_env(agent, self.config, runtime=self._runtime(agent))
+        if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
+            return 'required headless browser command is unavailable'
+        return codex_config_conflict(env)
+
+    def _headless_origins(self, agent: str, thread_id: int, request_ids: list[int]) -> list[str]:
+        """The origins a headless browser for this run may request: those bound for the triggering request(s)'
+        recipients assigned to this agent or, when they bind none, those bound for this agent's other unfinished
+        requests in the thread (so an Unstick or recovery run in a browser-bound thread can still reach them).
+        A denied origin, a sealed post and anything but a plain http(s) origin are never included (dropped, not
+        raised: see plain_origins). Empty: no browser server is attached."""
+        from . import browser_readiness
+        project = self.board.conn.execute('SELECT project FROM threads WHERE id=?', (thread_id,)).fetchone()
+
+        def bound(post_ids: list[int]) -> list[str]:
+            origins: set[str] = set()
+            for post_id in post_ids:
+                post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+                if post is None or post['thread_id'] != thread_id or post['sealed']:
+                    continue
+                for row in requests.for_post(self.board, post):
+                    if row['state'] == 'finished' or row['assigned_agent'] != agent:
+                        continue
+                    req = browser_readiness.requirement(self.board, post_id, row['recipient'])
+                    if req and project and not browser_readiness._gate(self.board, project['project'],
+                                                                        req['origin'])['denied']:
+                        origins.add(req['origin'])
+            return plain_origins(list(origins))
+
+        found = bound(request_ids)
+        if not found:
+            thread_posts = [r[0] for r in self.board.conn.execute(
+                'SELECT DISTINCT b.post_id FROM browser_requirements b JOIN posts p ON p.id=b.post_id '
+                'WHERE p.thread_id=? ORDER BY b.post_id', (thread_id,))]
+            found = bound(thread_posts)
+        return found
 
     def _own_ids(self) -> set[str]:
         return {r.run_id for r in self.running.values()}
@@ -921,7 +1222,16 @@ class Dispatcher:
                 raise FileNotFoundError(f"run directory {cwd!r} does not exist")
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.log_dir, 0o700)
-            prompt = build_prompt(thread_id, rule["id"], rule["purpose"], record["request_ids"], run_id)
+            browser = None
+            if self.config.headless_browser_for(agent, self._runtime(agent)):
+                origins = self._headless_origins(agent, thread_id, record["request_ids"])
+                if origins:   # nothing bound: no browser server at all
+                    out_dir = self.log_dir / f"{run_id}-browser"
+                    out_dir.mkdir(mode=0o700)   # fresh per run; never reused
+                    browser = {"origins": origins, "output_dir": str(out_dir)}
+                    record["headless_browser"] = browser
+            prompt = build_prompt(thread_id, rule["id"], rule["purpose"], record["request_ids"], run_id,
+                                  headless_browser=browser is not None)
             if item.get('managed'):
                 prompt += (' This is an assigned dependent continuation. Read its current request and continuation '
                            'contract, register fresh successful capability probes in this exact environment, then '
@@ -943,6 +1253,9 @@ class Dispatcher:
                 prompt = runner_preflight.PROMPT
                 template = template + ["--session-id", session, "--output-format", "stream-json",
                                        "--verbose", "--max-turns", "6"]
+            if browser is not None:
+                template = with_headless_browser(template, headless_browser_overrides(
+                    self.config.headless_browser, browser["origins"], browser["output_dir"]))
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
             child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
                                  log_path=log_path)
@@ -950,6 +1263,7 @@ class Dispatcher:
             self.board.refund_dispatch_launch(self.human, rule["id"])
             record |= {"status": "spawn_failed", "ended_at": now, "error": f"{type(e).__name__}: {e}"[:300]}
             self._record(record)
+            remove_browser_output(record)
             self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"], run_id)
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
@@ -1011,6 +1325,7 @@ class Dispatcher:
         rec = self._get(self.RUN_PREFIX + run.run_id) or {}
         rec |= {"status": status, "exit_code": code, "ended_at": self.board.now()}
         self._record(rec)
+        remove_browser_output(rec)
         for post_id in rec.get("request_ids", []):
             self._request_failure(post_id, run.agent, "Runner ended without explicit request completion: "
                                   + status + " (exit " + str(code) + ")" + (": " + rec["error"] if rec.get("error") else ""), run.run_id)

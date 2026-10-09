@@ -294,7 +294,9 @@ def test_target_canonicalizes_host_spellings(spelling, origin):
 
 @pytest.mark.parametrize('bad', ['http://256.0.0.1/', 'http://1.2.3.4.5/', 'http://0x1g.0.0.1/', 'http://a..b/',
                                  'http://[::1%25en0]/', 'http://ex%2fample.com/', 'http://%00x/', 'http://4294967296/',
-                                 'http://1.2.3.09/', 'http://example.09/', 'http://a‍b.com/'])
+                                 'http://1.2.3.09/', 'http://example.09/', 'http://a‍b.com/',
+                                 'http://*/', 'https://*.example.com/', 'https://{a,b}.example/', 'http://a,b/',
+                                 'http://a\x7fb/', 'http://-a.example/'])
 def test_target_refuses_hosts_a_browser_would_refuse(bad):
     with pytest.raises(Invalid):
         br.target(bad)
