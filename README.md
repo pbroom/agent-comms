@@ -826,22 +826,31 @@ args = ["--offline", "-y", "@playwright/mcp@0.0.83"]     # pinned; --offline nev
 browser = "chrome"                                       # installed Google Chrome; or msedge, firefox, webkit
 ```
 
-For each launch of a listed runner, the dispatcher looks up the origins bound for the triggering request (the
-recipients assigned to that agent) or, when it binds none, for the thread's unfinished requests (so an Unstick
-or recovery run in a browser-bound thread still gets them). A denied origin is never included. With no bound
-origin it attaches nothing. Otherwise it adds, for that run only, `-c` overrides that define a
-`headless_browser` MCP server:
+`args` is an allowlist: any element that starts with `-` must be a known-harmless option (`--offline`,
+`--prefer-offline`, `-y`/`--yes` for npx; `--viewport-size`, `--timeout-*`, `--console-level`, `--device`,
+`--mobile`, `--snapshot-mode`, `--no-webmcp`, `--blocked-origins` and a few other presentation or timing options).
+Options that reach further (a profile, a running browser over CDP or the extension, a proxy, local files, injected
+scripts, secrets, TLS bypass, a config file, extra capabilities) and options Playwright adds in later releases are
+refused, as are the options the dispatcher sets itself.
 
-- `--headless --isolated` always (an in-memory profile: no saved cookies, never your browser or a desktop
-  chat's), `--browser` from the setting, `--allowed-origins` set to the bound origins, and `--output-dir` (and the
-  server's working directory) set to a fresh mode-700 directory beside the run's log, `data/dispatch/<run>-browser`.
+For each launch of a listed runner, the dispatcher looks up the origins bound for the triggering request (its
+recipients assigned to that agent) or, when it binds none, for that agent's other unfinished requests in the
+thread (so an Unstick or recovery run in a browser-bound thread still gets them). Another agent's requests,
+finished requests, sealed posts and denied origins are never used, and only plain `http(s)://host[:port]` origins
+pass: anything else is dropped (and binding refuses it in the first place; see below). With no origin left it
+attaches nothing. Otherwise it adds, for that run only, `-c` overrides that define a `headless_browser` MCP server:
+
+- `--headless --isolated --block-service-workers` always (an in-memory profile: no saved cookies, never your
+  browser or a desktop chat's), `--browser` from the setting, `--allowed-origins` set to the bound origins, and
+  `--output-dir` (and the server's working directory) set to a fresh mode-700 directory beside the run's log,
+  `data/dispatch/<run>-browser`, which is deleted when the run ends. Copy anything you need out of it first.
+- `env_vars = []`, so no `PLAYWRIGHT_MCP_*` variable is passed through by name.
 - `enabled_tools` and per-tool approvals for a fixed set only: navigate, navigate back, snapshot, screenshot,
   find, click, hover, type, press key, fill form, select option, drag, handle dialog, wait for, resize, tabs,
-  close, console messages, network requests, emulate media and evaluate. `browser_run_code_unsafe` (Playwright
-  code in the server's own Node process, outside Codex's sandbox), `browser_file_upload` and `browser_drop`
-  (they read local files) are never enabled or approved, so `codex exec` refuses them. `browser_evaluate` is
-  allowed: it runs JavaScript inside the page, in the isolated profile and behind the same request routing, so
-  it reaches nothing the page's own UI does not, and audits need it to read computed state.
+  close, console messages, network requests and emulate media. Never enabled or approved, so `codex exec` refuses
+  them: `browser_run_code_unsafe` (Playwright code in the server's own Node process, outside Codex's sandbox),
+  `browser_evaluate` (page JavaScript could open a WebSocket to any host; see the limits below), and
+  `browser_file_upload` and `browser_drop` (they read local files).
 - One fixed sentence in the launch prompt: use only the `headless_browser` tools for browser work, and make a
   fresh headless probe of the bound target (`board_browser_begin_probe`, then `board_browser_probe` with context
   kind `headless`) before any browser step. The target URL is never put in the prompt.
@@ -849,15 +858,29 @@ origin it attaches nothing. Otherwise it adds, for that run only, `-c` overrides
 The run then has to earn readiness like any other context: its session is bound to the run
 (`dispatch_run_id`), it cannot attest a desktop context, and starting the request requires its own fresh probe.
 The sticky policy-denied gate is checked first and blocks the launch exactly as before; a denial is never routed
-around by switching to the headless browser. Playwright documents `--allowed-origins` as **not** a security
-boundary (it does not apply to redirects), so treat it as scoping, not containment: the board's binding, the
-probe evidence and the denial gate remain the controls. The browser server runs outside Codex's
-`workspace-write` sandbox, as every Codex MCP server does, so it can reach the network even though the run's
-shell commands cannot. The server name `headless_browser` is reserved for this: the dispatcher refuses a runner
-that configures it itself, and it should not be defined in `~/.codex/config.toml` either (that file's tool
-approvals would merge into it). If `command` is not on the run's `PATH`, a browser-bound launch is refused with a
-preflight failure rather than started blind. The setting is read when `board dispatch run` starts, like the
-runners.
+around by switching to the headless browser.
+
+**What `--allowed-origins` does not do.** Playwright documents it as **not** a security boundary. It routes the
+page's ordinary requests, but it does not apply to redirects, to WebSocket connections, or to requests made by
+service workers. That is why service workers are blocked and no tool that runs arbitrary page script is enabled,
+but a page on a bound origin can still open a WebSocket or redirect elsewhere on its own. Treat the allowlist as
+scoping, not containment: the controls are the board's binding, the probe evidence and the denial gate. The
+browser server runs outside Codex's `workspace-write` sandbox, as every Codex MCP server does, so it can reach
+the network even though the run's shell commands cannot.
+
+**Bound origins are plain.** Each origin becomes a URL glob in `--allowed-origins` (`*` matches any host,
+`{a,b}` either), and the deny gate compares exact origins, so a bound target like `https://*/` would have let a run
+reach every host, a denied one included. Binding now accepts only hosts made of letters, digits, hyphens,
+underscores and dots (punycode `xn--` labels included), canonical IPv4 or bracketed IPv6 addresses, and the
+dispatcher drops anything else it finds stored. A bound request whose stored origin is not plain fails preflight
+before any launch is spent.
+
+**Reserved name.** The dispatcher refuses a runner that configures `mcp_servers.headless_browser` itself (in any
+`-c`/`--config` spelling), and it will not attach the browser while the run's Codex config (`$CODEX_HOME/config.toml`,
+else `~/.codex/config.toml`, profiles included) defines that server, because Codex merges `-c` overrides into the
+file and settings there would merge into the scoped browser. If `command` is not on the run's `PATH`, a launch that
+would get the browser is refused with a preflight failure rather than started blind. The setting is read when
+`board dispatch run` starts, like the runners.
 
 ## The rules, as enforced
 

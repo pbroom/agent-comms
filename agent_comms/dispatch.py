@@ -31,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -175,32 +176,41 @@ def codex_approval_reminder(template: list[str] | None) -> str | None:
 # Opt-in ([dispatch.headless_browser]): a dispatched Codex run gets its own Playwright MCP server, injected into its
 # argv with `-c` overrides for that run only, so the dispatcher can relaunch browser-bound work itself. The browser
 # is always headless with an in-memory profile (`--isolated`: no saved cookies, never the human's or a desktop
-# chat's browser), writes into a fresh per-run directory, and is limited to the origins bound for the work
-# (`--allowed-origins`). Playwright documents that list as NOT a security boundary (it does not follow redirects);
-# the controls remain the board's binding, the fresh headless probe evidence and the sticky policy-denied gate.
+# chat's browser), blocks service workers, writes into a fresh per-run directory that is removed when the run ends,
+# and has its page requests routed to the bound origins (`--allowed-origins`). Playwright documents that list as NOT a
+# security boundary: it does not apply to redirects, WebSocket connections or service-worker requests. The controls
+# remain the board's binding, the fresh headless probe evidence and the sticky policy-denied gate, plus a tool set
+# with no way to run arbitrary script (see HEADLESS_BROWSER_TOOLS).
 HEADLESS_BROWSER_SERVER = "headless_browser"
-# The only browser tools a dispatched run may call, each approved for that run (and nothing else enabled).
-# browser_evaluate runs JavaScript in the page (renderer-sandboxed, in the isolated profile, behind the same request
-# routing), which reaches nothing that click/type/fill cannot reach through the page's own UI, and audits need it to
-# read computed state. Never approved, never enabled: browser_run_code_unsafe (Playwright code in the MCP server's
-# Node process, outside Codex's sandbox), browser_file_upload and browser_drop (they read local files).
+# The only browser tools a dispatched run may call, each approved for that run (and nothing else enabled: Codex's
+# `enabled_tools` is the control; a tool a newer Playwright adds stays hidden until it is added here).
+# Never enabled or approved:
+# - browser_run_code_unsafe: Playwright code in the MCP server's Node process, outside Codex's sandbox.
+# - browser_evaluate: page JavaScript could open `new WebSocket(...)` to any host, which the origin routing does not
+#   cover, from a browser that runs outside Codex's sandbox.
+# - browser_file_upload, browser_drop: they read local files.
 HEADLESS_BROWSER_TOOLS = (
     "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_take_screenshot", "browser_find",
     "browser_click", "browser_hover", "browser_type", "browser_press_key", "browser_fill_form",
     "browser_select_option", "browser_drag", "browser_handle_dialog", "browser_wait_for", "browser_resize",
     "browser_tabs", "browser_close", "browser_console_messages", "browser_network_requests",
-    "browser_network_request", "browser_emulate_media", "browser_evaluate",
+    "browser_network_request", "browser_emulate_media",
 )
-HEADLESS_BROWSER_DENIED = ("browser_run_code_unsafe", "browser_file_upload", "browser_drop")
+HEADLESS_BROWSER_DENIED = ("browser_run_code_unsafe", "browser_evaluate", "browser_file_upload", "browser_drop")
 HEADLESS_BROWSERS = ("chrome", "msedge", "firefox", "webkit")
-# Flags the dispatcher sets itself, and flags that would widen what the server can reach (a profile, a running
-# browser, local files, page-injected scripts, another config file, a listening port, extra capabilities).
-HEADLESS_MANAGED_FLAGS = ("--headless", "--isolated", "--browser", "--allowed-origins", "--output-dir")
-HEADLESS_FORBIDDEN_FLAGS = (
-    "--allow-unrestricted-file-access", "--allowed-hosts", "--caps", "--cdp-endpoint", "--cdp-header", "--config",
-    "--endpoint", "--extension", "--grant-permissions", "--host", "--init-page", "--init-script", "--no-sandbox",
-    "--port", "--profile-dir-name", "--save-session", "--secrets", "--shared-browser-context", "--storage-state",
-    "--user-data-dir",
+# Flags the dispatcher sets itself on every run.
+HEADLESS_MANAGED_FLAGS = ("--headless", "--isolated", "--block-service-workers", "--browser", "--allowed-origins",
+                          "--output-dir")
+# Every other option element (one starting with "-") must be one of these known-harmless ones. An allowlist, not a
+# denylist: Playwright MCP adds options every release (0.0.83 has about fifty), and an unknown one could widen what
+# the browser reaches (a profile, a running browser, a proxy, local files, injected scripts, secrets, TLS bypass).
+# The first group is for the `npx` launcher; the rest only change presentation, timing or narrow the browser further.
+HEADLESS_ALLOWED_FLAGS = (
+    "--offline", "--prefer-offline", "-y", "--yes",
+    "--blocked-origins", "--codegen", "--console-level", "--device", "--file-paths", "--idle-timeout",
+    "--image-responses", "--mobile", "--no-webmcp", "--output-max-size", "--sandbox", "--snapshot-boxes",
+    "--snapshot-mode", "--test-id-attribute", "--timeout-action", "--timeout-navigation", "--timeout-settle",
+    "--user-agent", "--viewport-size",
 )
 HEADLESS_PROMPT = (
     " A scoped headless browser is attached to this run as the headless_browser MCP server. For browser work use "
@@ -209,6 +219,10 @@ HEADLESS_PROMPT = (
     "board_browser_probe with context kind \"headless\" from this run. Report any browser failure with "
     "board_browser_failure; a policy denial is final, so never retry or route around it."
 )
+
+
+def _has_control(value: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value)
 
 
 @dataclass
@@ -233,7 +247,7 @@ class HeadlessBrowserConfig:
                     raise ValueError(f"{where} runners must be a list of distinct runner keys")
                 c.runners = list(v)
             elif k == "command":
-                if not isinstance(v, str) or not v.strip() or "{" in v or "}" in v:
+                if not isinstance(v, str) or not v.strip() or "{" in v or "}" in v or _has_control(v):
                     raise ValueError(f"{where} command must be the MCP server executable")
                 if os.path.basename(v) in SHELLS or any(r in v.lower() for r in RISKY_FLAGS):
                     raise ValueError(f"{where} command must be the MCP server itself, never a shell or wrapper "
@@ -245,14 +259,14 @@ class HeadlessBrowserConfig:
                 for i, x in enumerate(v):
                     flag = x.split("=", 1)[0]
                     # Elements are named by position, never value (config errors reach the status page).
-                    if "{" in x or "}" in x or any(r in x.lower() for r in RISKY_FLAGS):
+                    if "{" in x or "}" in x or _has_control(x) or any(r in x.lower() for r in RISKY_FLAGS):
                         raise ValueError(f"{where} args element {i} is not allowed")
                     if flag in HEADLESS_MANAGED_FLAGS:
                         raise ValueError(f"{where} args element {i} is set by the dispatcher for each run "
                                          f"({', '.join(HEADLESS_MANAGED_FLAGS)}); remove it")
-                    if flag in HEADLESS_FORBIDDEN_FLAGS:
-                        raise ValueError(f"{where} args element {i} would widen what the headless browser can "
-                                         "reach; it is not allowed")
+                    if x.startswith("-") and flag not in HEADLESS_ALLOWED_FLAGS:
+                        raise ValueError(f"{where} args element {i} is not a known-harmless option; allowed: "
+                                         f"{', '.join(HEADLESS_ALLOWED_FLAGS)}")
                 c.args = list(v)
             elif k == "browser":
                 if v not in HEADLESS_BROWSERS:
@@ -272,30 +286,92 @@ class HeadlessBrowserConfig:
             if not uses_codex(template):
                 raise ValueError(f"[dispatch.headless_browser] runner {key!r} is not a Codex runner; only `codex` "
                                  "runners can be given the headless browser")
-            prefix = f"mcp_servers.{HEADLESS_BROWSER_SERVER}."
-            if any(v.strip().startswith(prefix) for v in _codex_overrides(template)):
-                raise ValueError(f"[dispatch.headless_browser] runner {key!r} configures {prefix}* itself; the "
-                                 "dispatcher owns that server for these runners")
+            if any(_names_browser_server(v) for v in _codex_overrides(template)):
+                raise ValueError(f"[dispatch.headless_browser] runner {key!r} configures "
+                                 f"mcp_servers.{HEADLESS_BROWSER_SERVER} itself; the dispatcher owns that server "
+                                 "for these runners")
+
+
+def _names_browser_server(override: str) -> bool:
+    """Whether a `-c key=value` override touches the reserved server in any spelling: dotted, quoted keys
+    (`mcp_servers."headless_browser".x`), the bare table (`mcp_servers.headless_browser={...}`) or an inline
+    `mcp_servers={...}` table that mentions it."""
+    key, _, value = override.partition("=")
+    plain = "".join(ch for ch in key if ch not in "\"' \t")
+    name = f"mcp_servers.{HEADLESS_BROWSER_SERVER}"
+    if plain == name or plain.startswith(name + "."):
+        return True
+    return plain == "mcp_servers" and HEADLESS_BROWSER_SERVER in value
 
 
 def _toml(value: Any) -> str:
-    # A JSON string or list of strings is a valid TOML value (ensure_ascii=False: no surrogate-pair escapes).
-    return json.dumps(value, ensure_ascii=False)
+    # A JSON string or list of strings is a valid TOML value (ensure_ascii=False: no surrogate-pair escapes; JSON
+    # escapes C0 controls, and DEL, which TOML forbids raw, is escaped here).
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def plain_origins(origins: list[Any]) -> list[str]:
+    """Only plain `http(s)://host[:port]` origins (browser_readiness.is_plain_origin), sorted and distinct. Anything
+    else is dropped, never passed on: in --allowed-origins each entry becomes a URL glob, so `*` or `{a,b}` would
+    widen the browser's reach past a deny gate that compares exact origins."""
+    from . import browser_readiness
+    return sorted({o for o in origins if browser_readiness.is_plain_origin(o)})
 
 
 def headless_browser_overrides(config: HeadlessBrowserConfig, origins: list[str], output_dir: str) -> list[str]:
     """The `-c` argv pairs that attach the scoped headless browser to one Codex run."""
-    if not origins or any(not isinstance(o, str) or not o or ";" in o for o in origins):
+    origins = plain_origins(origins)
+    if not origins:
         raise ValueError("a headless browser needs at least one bound origin")
-    args = list(config.args) + ["--headless", "--isolated", "--browser", config.browser,
+    args = list(config.args) + ["--headless", "--isolated", "--block-service-workers", "--browser", config.browser,
                                 "--allowed-origins", ";".join(origins), "--output-dir", output_dir]
     pre = f"mcp_servers.{HEADLESS_BROWSER_SERVER}."
     out = ["-c", pre + "command=" + _toml(config.command), "-c", pre + "args=" + _toml(args),
            "-c", pre + "cwd=" + _toml(output_dir),   # files saved by explicit name land here, not in the project
+           # No variables passed through by name (PLAYWRIGHT_MCP_* can set options these flags do not). An empty
+           # `env={}` would merge with, not replace, a config file's env table, so Dispatcher._headless_blocker
+           # refuses to attach the browser while the Codex config defines this server at all.
+           "-c", pre + "env_vars=[]",
            "-c", pre + "enabled_tools=" + _toml(list(HEADLESS_BROWSER_TOOLS))]
     for tool in HEADLESS_BROWSER_TOOLS:
         out += ["-c", codex_approval_override(tool, HEADLESS_BROWSER_SERVER)]
     return out
+
+
+def codex_config_conflict(env: dict[str, str]) -> str | None:
+    """Why the run's Codex config (CODEX_HOME, else ~/.codex) blocks attaching the scoped browser, else None. Codex
+    merges `-c` overrides into its config file, so a `mcp_servers.headless_browser` table there (an `env`, other
+    tool approvals) would merge into the dispatcher's server; the name is reserved."""
+    home = env.get("CODEX_HOME") or os.path.join(env.get("HOME") or "~", ".codex")
+    path = Path(home).expanduser() / "config.toml"
+    try:
+        data = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return "cannot read the Codex config.toml to check that it leaves mcp_servers.headless_browser alone"
+
+    def defines(table: Any) -> bool:
+        servers = table.get("mcp_servers") if isinstance(table, dict) else None
+        return isinstance(servers, dict) and HEADLESS_BROWSER_SERVER in servers
+
+    profiles = data.get("profiles")
+    if defines(data) or (isinstance(profiles, dict) and any(defines(p) for p in profiles.values())):
+        return (f"the Codex config.toml defines mcp_servers.{HEADLESS_BROWSER_SERVER}; remove it (the dispatcher "
+                "owns that name, and settings there would merge into the scoped browser)")
+    return None
+
+
+def remove_browser_output(record: dict) -> None:
+    """Delete a finished run's browser output directory, only when it is exactly `<log dir>/<run id>-browser`."""
+    hb = record.get("headless_browser") if isinstance(record, dict) else None
+    out, run_id, log = (hb or {}).get("output_dir"), record.get("run_id"), record.get("log")
+    if not (isinstance(out, str) and isinstance(run_id, str) and isinstance(log, str)):
+        return
+    path = Path(out)
+    if path.name != f"{run_id}-browser" or path.parent != Path(log).parent or path.is_symlink():
+        return
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def with_headless_browser(template: list[str], overrides: list[str]) -> list[str]:
@@ -572,6 +648,7 @@ def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), n
             status = (ended_as or {}).get(d["run_id"], "gone")
             updates.append(d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
                                 "note": "ended while no dispatcher was watching it (exit code unknown)"})
+            remove_browser_output(d)
             continue
         if d["status"] != "orphaned":
             d = d | {"status": "orphaned", "note": note or "left running by an earlier dispatcher"}
@@ -915,6 +992,7 @@ class Dispatcher:
             error = self._preflight(agent, rule)
             if item.get('post_id'):
                 error = self._browser_blocker(item['post_id'], agent) or error
+            error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
             if delivery is not None:
                 configured_cwd = self.config.worktrees.get(rule['project'], rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
@@ -1046,45 +1124,57 @@ class Dispatcher:
                 reason = browser_readiness.request_blocker(self.board, post_id, row['recipient'])
                 if reason:
                     return reason
-                if browser_readiness.requirement(self.board, post_id, row['recipient']):
+                req = browser_readiness.requirement(self.board, post_id, row['recipient'])
+                if req:
                     if not headless:
                         return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
                                 'inherit its probe (a Codex runner can be given a scoped headless browser with '
                                 '[dispatch.headless_browser])')
-                    path = child_env(agent, self.config, runtime=self._runtime(agent)).get("PATH")
-                    if shutil.which(self.config.headless_browser.command, path=path) is None:
-                        return 'required headless browser command is unavailable'
+                    if not browser_readiness.is_plain_origin(req['origin']):
+                        return 'bound browser target is not a plain http(s) origin; bind a new request'
         return None
 
+    def _headless_blocker(self, agent: str, thread_id: int, request_ids: list[int]) -> str | None:
+        """Before reserving a launch: a run that will get the browser server needs its command on the run's PATH."""
+        if not self.config.headless_browser_for(agent, self._runtime(agent)):
+            return None
+        if not self._headless_origins(agent, thread_id, request_ids):
+            return None   # no browser server will be attached
+        env = child_env(agent, self.config, runtime=self._runtime(agent))
+        if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
+            return 'required headless browser command is unavailable'
+        return codex_config_conflict(env)
+
     def _headless_origins(self, agent: str, thread_id: int, request_ids: list[int]) -> list[str]:
-        """The origins a headless browser for this run may request: those bound for the triggering request(s)
-        assigned to this agent or, when they bind none, those bound for the thread's unfinished requests (so an
-        Unstick or recovery run in a browser-bound thread can still reach them). A denied origin is never included.
-        Empty: no browser server is attached."""
+        """The origins a headless browser for this run may request: those bound for the triggering request(s)'
+        recipients assigned to this agent or, when they bind none, those bound for this agent's other unfinished
+        requests in the thread (so an Unstick or recovery run in a browser-bound thread can still reach them).
+        A denied origin, a sealed post and anything but a plain http(s) origin are never included (dropped, not
+        raised: see plain_origins). Empty: no browser server is attached."""
         from . import browser_readiness
         project = self.board.conn.execute('SELECT project FROM threads WHERE id=?', (thread_id,)).fetchone()
 
-        def bound(post_ids: list[int], own: bool) -> list[str]:
+        def bound(post_ids: list[int]) -> list[str]:
             origins: set[str] = set()
             for post_id in post_ids:
                 post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
                 if post is None or post['thread_id'] != thread_id or post['sealed']:
                     continue
                 for row in requests.for_post(self.board, post):
-                    if row['state'] == 'finished' or (own and row['assigned_agent'] != agent):
+                    if row['state'] == 'finished' or row['assigned_agent'] != agent:
                         continue
                     req = browser_readiness.requirement(self.board, post_id, row['recipient'])
                     if req and project and not browser_readiness._gate(self.board, project['project'],
                                                                         req['origin'])['denied']:
                         origins.add(req['origin'])
-            return sorted(origins)
+            return plain_origins(list(origins))
 
-        found = bound(request_ids, own=True)
+        found = bound(request_ids)
         if not found:
             thread_posts = [r[0] for r in self.board.conn.execute(
                 'SELECT DISTINCT b.post_id FROM browser_requirements b JOIN posts p ON p.id=b.post_id '
                 'WHERE p.thread_id=? ORDER BY b.post_id', (thread_id,))]
-            found = bound(thread_posts, own=False)
+            found = bound(thread_posts)
         return found
 
     def _own_ids(self) -> set[str]:
@@ -1173,6 +1263,7 @@ class Dispatcher:
             self.board.refund_dispatch_launch(self.human, rule["id"])
             record |= {"status": "spawn_failed", "ended_at": now, "error": f"{type(e).__name__}: {e}"[:300]}
             self._record(record)
+            remove_browser_output(record)
             self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"], run_id)
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
@@ -1234,6 +1325,7 @@ class Dispatcher:
         rec = self._get(self.RUN_PREFIX + run.run_id) or {}
         rec |= {"status": status, "exit_code": code, "ended_at": self.board.now()}
         self._record(rec)
+        remove_browser_output(rec)
         for post_id in rec.get("request_ids", []):
             self._request_failure(post_id, run.agent, "Runner ended without explicit request completion: "
                                   + status + " (exit " + str(code) + ")" + (": " + rec["error"] if rec.get("error") else ""), run.run_id)

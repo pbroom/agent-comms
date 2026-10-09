@@ -404,37 +404,60 @@ the request and spends no budget. A machine whose `board.local.toml` overrides t
 a browser requirement, so browser-bound work whose desktop owner went away could never be resumed by the
 dispatcher. The human chose to let dispatched Codex runs drive a scoped headless browser instead. With
 `[dispatch.headless_browser]` naming a Codex runner, the dispatcher injects a Playwright MCP server into that
-run's argv with `-c` overrides: `--headless --isolated`, `--browser`, `--allowed-origins` from
-`browser_requirements` (the triggering request's recipients assigned to the agent, else the thread's unfinished
-requests, never a denied origin; none bound means no server), a fresh per-run `--output-dir` that is also the
-server's `cwd` (so explicitly named files do not land in the repo), `enabled_tools` set to a fixed list and a
-per-run approval for each. `browser_run_code_unsafe` runs Playwright code in the server's Node process, outside
-Codex's sandbox; `browser_file_upload` and `browser_drop` read local files: none is enabled or approved.
-`browser_evaluate` is approved: page-context JavaScript in a renderer-sandboxed, in-memory profile behind the same
-routing reaches nothing the page's UI cannot, and audits need computed state. The prompt gains one fixed sentence
-(use only these tools; probe fresh with context kind `headless` before any browser step); the bound URL never
-enters the prompt, because an agent can bind it.
+run's argv with `-c` overrides: `--headless --isolated --block-service-workers`, `--browser`, `--allowed-origins`
+from `browser_requirements` (the triggering request's recipients assigned to the agent, else that agent's other
+unfinished requests in the thread; never another agent's, a sealed post's or a denied origin; none means no
+server), a fresh per-run `--output-dir` that is also the server's `cwd` (so explicitly named files do not land in
+the repo) and is deleted when the run ends (on exit, spawn failure, or when an orphan is found gone), `env_vars =
+[]`, `enabled_tools` set to a fixed list and a per-run approval for each. Never enabled or approved:
+`browser_run_code_unsafe` (Playwright code in the server's Node process, outside Codex's sandbox),
+`browser_evaluate` (page script can open a WebSocket to any host, which the origin routing does not cover, from a
+browser that runs outside Codex's sandbox), `browser_file_upload` and `browser_drop` (they read local files).
+`enabled_tools` is the real control: whatever a newer Playwright serves, Codex exposes only that list. The prompt
+gains one fixed sentence (use only these tools; probe fresh with context kind `headless` before any browser step);
+the bound URL never enters the prompt, because an agent can bind it.
+
+**Plain origins only.** Playwright turns each `--allowed-origins` entry into a URL glob (`*` matches any run of
+non-slash characters, `{a,b}` alternates), while the deny gate compares exact origin strings. A bound target such
+as `https://*:443/x` would therefore have allowed every HTTPS host and stepped around a denial of a specific one.
+`browser_readiness.canonical_host` now refuses any domain label that is not letters, digits, underscore and
+hyphen (no hyphen at either end; IDNA output is `xn--` labels), so `*`, `{`, `}`, `,`, `;`, DEL and other controls
+fail at bind time. Underscore stays allowed because it is an existing, tested part of host canonicalization and
+has no glob meaning. Independently, `dispatch.plain_origins` keeps only `http(s)://host[:port]` origins with such
+a host, a canonical IPv4 or a canonical bracketed IPv6 address, and drops anything else, so an origin stored before
+this check, or by anything else, can neither widen the glob nor put an invalid TOML character into the argv. A
+triggering request whose own stored origin is not plain fails preflight before a launch is reserved.
 
 The config is validated like a runner: the runner key must exist and be `codex`; the command must not be a
-shell or carry placeholders or bypass flags; args may not set the flags the dispatcher owns (`--headless`,
-`--isolated`, `--browser`, `--allowed-origins`, `--output-dir`) or widen reach (`--extension`, `--cdp-endpoint`,
-`--user-data-dir`, `--storage-state`, `--config`, `--init-script`, `--allow-unrestricted-file-access`,
-`--no-sandbox`, `--caps`, a listening `--port`/`--host`, ...); and a listed runner may not configure
-`mcp_servers.headless_browser.*` itself. Errors name argv elements by position, never by value.
+shell or carry placeholders, controls or bypass flags; and `args` is an allowlist. Every element starting with
+`-` must be a known-harmless option (npx's `--offline`/`--prefer-offline`/`-y`, and Playwright's presentation,
+timing and narrowing options); the dispatcher-owned flags are refused by name. An allowlist rather than a denylist
+because Playwright adds options every release (0.0.83 has about fifty) and several widen reach (`--extension`,
+`--cdp-endpoint`, `--user-data-dir`, `--storage-state`, `--executable-path`, `--proxy-server`,
+`--ignore-https-errors`, `--secrets`, `--grant-permissions`, `--save-session`, `--config`, `--init-script`,
+`--caps`, ...); a denylist would admit the next one silently. A listed runner may not configure
+`mcp_servers.headless_browser` in any spelling (dotted, quoted keys, the bare table; inline tables are already
+refused because runner elements cannot contain braces). And because Codex merges `-c` overrides into its config
+file (an empty `env={}` override does not clear a file's `env` table, verified with `codex mcp get`), the
+dispatcher refuses to attach the browser while the run's Codex config (`CODEX_HOME`, else `~/.codex`, profiles
+included) defines that server at all. Errors name argv elements by position, never by value.
 
 **What still holds.** The sticky policy-denied gate (`browser_readiness.request_blocker`) is checked before the
 headless path, at preflight and again at launch, and a denied origin is excluded from the thread fallback.
 Readiness is unchanged: a dispatched session's execution key is its `dispatch_run_id`, it cannot attest a desktop
-context, and `started` requires its own fresh, complete probe (tested end to end through the dispatcher).
+context, and `started` requires its own fresh, complete probe (tested end to end through the dispatcher). The
+browser-command check runs whenever the server will be attached, the thread fallback included.
 
-**Residual risks.** Playwright states that `--allowed-origins` is not a security boundary and does not cover
-redirects, so it scopes the browser but does not contain it; the controls are the binding, the probe and the
-denial gate. The server runs outside Codex's `workspace-write` sandbox (every Codex MCP server does), so it has
-network access the run's shell commands lack. A page can show the agent text, which is untrusted data like board
-content. Approved interaction tools can change the bound app's state through its UI, as a human tester could.
-Values in `~/.codex/config.toml` under `mcp_servers.headless_browser` would merge into the injected server,
-which is why the name is documented as reserved. The npx package is pinned and run `--offline`; a cache that lacks
-it fails the run's browser start, which the agent reports as `browser_missing`.
+**Residual risks.** Playwright states that `--allowed-origins` is not a security boundary: it does not cover
+redirects, WebSocket connections or service-worker requests. Service workers are blocked and no arbitrary-script
+tool is enabled, but a page on a bound origin can still redirect or open a WebSocket by itself, so the allowlist
+scopes the browser without containing it; the controls are the binding, the probe and the denial gate. The server
+runs outside Codex's `workspace-write` sandbox (every Codex MCP server does), so it has network access the run's
+shell commands lack. A page can show the agent text, which is untrusted data like board content. Approved
+interaction tools can change the bound app's state through its UI, as a human tester could. Browser output is
+deleted when the run ends, so evidence the agent wants to keep must be posted or copied first. The npx package is
+pinned and run `--offline`; a cache that lacks it fails the run's browser start, which the agent reports as
+`browser_missing`.
 
 ## Settings page (2026-10-07)
 

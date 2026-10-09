@@ -6,6 +6,7 @@ browser adapter and report its result from the context that will execute the wor
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import ipaddress
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -53,6 +54,38 @@ CREATE TABLE IF NOT EXISTS browser_events (
 );
 CREATE INDEX IF NOT EXISTS browser_events_time ON browser_events(created_at);
 """
+
+
+# One domain label as stored: letters, digits, underscore and hyphen only (punycode `xn--` labels included), never a
+# hyphen at either end. Anything else (`*`, `{`, `}`, `,`, `;`, `?`, DEL and other controls) is refused: a bound
+# origin becomes a Playwright URL glob in a dispatched run's --allowed-origins, where `*` and `{a,b}` would widen it.
+_LABEL = re.compile(r'[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?')
+_ORIGIN = re.compile(r'(https?)://(\[[0-9a-f:]+\]|[a-z0-9_.-]+)(?::([0-9]{1,5}))?')
+
+
+def is_plain_origin(value):
+    """True only for `http(s)://host[:port]` whose host is dotted plain labels, a canonical IPv4 address or a
+    canonical bracketed IPv6 address. Used to drop anything else before it can reach a browser allowlist."""
+    if not isinstance(value, str):
+        return False
+    m = _ORIGIN.fullmatch(value)
+    if not m:
+        return False
+    host, port = m.group(2), m.group(3)
+    if port is not None and int(port) > 65535:
+        return False
+    if host.startswith('['):
+        try:
+            return '[' + _ipv6_text(ipaddress.IPv6Address(host[1:-1])) + ']' == host
+        except ValueError:
+            return False
+    labels = host.split('.')
+    if labels[-1].isdigit():
+        try:
+            return str(ipaddress.IPv4Address(host)) == host
+        except ValueError:
+            return False
+    return all(_LABEL.fullmatch(label) for label in labels)
 
 
 def _ipv4_number(part):
@@ -128,6 +161,8 @@ def canonical_host(raw):
             raise ValueError('invalid IPv4 address')
         value = nums[-1] + sum(n * 256 ** (3 - i) for i, n in enumerate(nums[:-1]))
         return str(ipaddress.IPv4Address(value))
+    if not all(_LABEL.fullmatch(label) for label in labels):
+        raise ValueError('host must be plain letters, digits, hyphens and dots')
     return host
 
 

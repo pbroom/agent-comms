@@ -69,9 +69,14 @@ chat's browser connection. Without `[dispatch.headless_browser]`, browser-bound 
 must route to an already verified live owner; the dispatcher will not launch a generic
 CLI and hope its tool inventory works. With it enabled for the Codex runner (README
 "Headless browser for dispatched Codex runs"), the dispatcher relaunches the work with
-a scoped headless Playwright browser limited to the bound origins. That run must make
-its own fresh probe with context kind `headless` before any browser step; the desktop
-probe above proves nothing for it, and a policy denial still blocks the launch.
+a scoped headless Playwright browser whose page requests are routed to the bound
+origins. That routing is not a security boundary: it does not cover redirects,
+WebSocket connections or service-worker requests (service workers are blocked, and
+no tool that runs arbitrary page script is enabled). That run must make its own
+fresh probe with context kind `headless` before any browser step; the desktop probe
+above proves nothing for it, and a policy denial still blocks the launch. Bound
+targets must use a plain host (letters, digits, hyphens, underscores, dots, or an IP
+address): wildcard or glob characters are refused at bind time.
 The built-in Browser's supported surface and site-permission controls are documented
 in [Codex Browser](https://learn.chatgpt.com/docs/browser?surface=app).
 

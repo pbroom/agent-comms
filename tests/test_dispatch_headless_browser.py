@@ -33,8 +33,14 @@ def config(**browser) -> DispatchConfig:
 
 
 @pytest.fixture
-def benv(denv):  # noqa: F811
-    """denv with a real-shaped Codex runner (all approvals) given the headless browser."""
+def benv(denv, tmp_path, monkeypatch):  # noqa: F811
+    """denv with a real-shaped Codex runner (all approvals) given the headless browser, and an empty HOME (the
+    dispatcher reads the run's Codex config)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    denv.home = home
     fresh = config()
     denv.config.runners = fresh.runners
     denv.config.headless_browser = fresh.headless_browser
@@ -100,14 +106,16 @@ def test_valid_config_and_lookup_by_runner_key():
     ({"args": ["--headless"]}, "set by the dispatcher"),
     ({"args": ["--output-dir", "/tmp/x"]}, "set by the dispatcher"),
     ({"args": ["--browser=firefox"]}, "set by the dispatcher"),
-    ({"args": ["--extension"]}, "widen"),
-    ({"args": ["--cdp-endpoint=http://127.0.0.1:9222"]}, "widen"),
-    ({"args": ["--user-data-dir", "/x"]}, "widen"),
-    ({"args": ["--config", "/x.json"]}, "widen"),
-    ({"args": ["--allow-unrestricted-file-access"]}, "widen"),
-    ({"args": ["--init-script", "/x.js"]}, "widen"),
-    ({"args": ["--no-sandbox"]}, "widen"),
-    ({"args": ["--caps=devtools"]}, "widen"),
+    ({"args": ["--block-service-workers"]}, "set by the dispatcher"),
+    ({"args": ["--offline", "\x7f"]}, "not allowed"),
+    ({"args": ["@playwright/mcp@0.0.83\n--extension"]}, "not allowed"),
+    ({"command": "npx\x7f"}, "command"),
+    *[({"args": [flag]}, "not a known-harmless option|is not allowed") for flag in (
+        "--extension", "--cdp-endpoint=http://127.0.0.1:9222", "--user-data-dir", "--config", "--endpoint",
+        "--allow-unrestricted-file-access", "--init-script", "--init-page", "--no-sandbox", "--caps=devtools",
+        "--executable-path", "--ignore-https-errors", "--secrets", "--storage-state", "--proxy-server=http://p:1",
+        "--proxy-bypass", "--grant-permissions", "--save-session", "--shared-browser-context", "--port", "--host",
+        "--allowed-hosts", "--profile-dir-name", "--cdp-header", "-p", "--package=@evil/mcp", "--some-future-flag")],
     ({"args": ["{prompt}"]}, "not allowed"),
     ({"args": ["--dangerously-bypass-approvals-and-sandbox"]}, "not allowed"),
     ({"browser": "lynx"}, "browser must be"),
@@ -126,11 +134,31 @@ def test_command_required_when_enabled_and_errors_do_not_echo_values():
     assert "someone" not in str(e.value) and "element 1" in str(e.value)
 
 
-def test_runner_that_configures_the_browser_server_itself_is_refused():
-    own = CODEX[:-1] + ["-c", 'mcp_servers.headless_browser.tools.browser_run_code_unsafe.approval_mode="approve"',
-                        "{prompt}"]
-    with pytest.raises(ValueError, match="owns that server"):
+def test_allowlisted_options_are_accepted():
+    c = config(args=["--offline", "-y", "@playwright/mcp@0.0.83", "--viewport-size", "1280x720",
+                     "--timeout-navigation=30000", "--console-level", "error", "--no-webmcp"])
+    assert c.headless_browser.args[-1] == "--no-webmcp"
+    assert config(command="node", args=["/opt/pw/node_modules/@playwright/mcp/cli.js"]).headless_browser.command == "node"
+
+
+@pytest.mark.parametrize("override", [
+    'mcp_servers.headless_browser.tools.browser_run_code_unsafe.approval_mode="approve"',
+    'mcp_servers.headless_browser={command="node", args=["x.js"]}',
+    'mcp_servers."headless_browser".tools.browser_evaluate.approval_mode="approve"',
+    "mcp_servers.'headless_browser'.env={PLAYWRIGHT_MCP_ALLOWED_ORIGINS=\"*\"}",
+    '"mcp_servers"."headless_browser".enabled_tools=["browser_evaluate"]',
+    'mcp_servers . headless_browser . env_vars=["PLAYWRIGHT_MCP_CONFIG"]',
+    'mcp_servers={headless_browser={command="node"}}',
+])
+@pytest.mark.parametrize("form", ["-c", "--config", "joined"])
+def test_runner_that_configures_the_browser_server_itself_is_refused(override, form):
+    extra = {"-c": ["-c", override], "--config": ["--config", override], "joined": ["--config=" + override]}[form]
+    own = CODEX[:-1] + extra + ["{prompt}"]
+    # Inline-table forms contain braces, which validate_runner already refuses in any runner element.
+    with pytest.raises(ValueError, match="owns that server|placeholders must be whole"):
         DispatchConfig.from_dict({"runners": {"codex": own}, "headless_browser": BROWSER})
+    if "{" not in override:   # fine while that runner is not given the browser (its config is the human's)
+        assert DispatchConfig.from_dict({"runners": {"codex": own}}).runners["codex"] == own
 
 
 def test_local_overlay_enables_it(tmp_path, monkeypatch):
@@ -165,8 +193,10 @@ def test_overrides_are_scoped_and_never_approve_unsafe_tools(tmp_path):
     o = overrides_of(argv)
     load = lambda k: tomllib.loads("v = " + o["mcp_servers.headless_browser." + k])["v"]  # noqa: E731
     assert load("command") == "npx" and load("cwd") == out
-    assert load("args") == ["--offline", "-y", "@playwright/mcp@0.0.83", "--headless", "--isolated", "--browser",
-                            "chrome", "--allowed-origins", ORIGIN + ";http://localhost:6006", "--output-dir", out]
+    assert load("args") == ["--offline", "-y", "@playwright/mcp@0.0.83", "--headless", "--isolated",
+                            "--block-service-workers", "--browser", "chrome",
+                            "--allowed-origins", ORIGIN + ";http://localhost:6006", "--output-dir", out]
+    assert load("env_vars") == [] and "mcp_servers.headless_browser.env" not in o   # see codex_config_conflict
     assert load("enabled_tools") == list(dispatch.HEADLESS_BROWSER_TOOLS)
     approved = {k.split(".")[3] for k, v in o.items()
                 if k.startswith("mcp_servers.headless_browser.tools.") and v == '"approve"'}
@@ -174,15 +204,17 @@ def test_overrides_are_scoped_and_never_approve_unsafe_tools(tmp_path):
     for unsafe in dispatch.HEADLESS_BROWSER_DENIED:
         assert unsafe not in approved and unsafe not in load("enabled_tools")
         assert not any(unsafe in x for x in argv)
-    assert "browser_evaluate" in approved   # page-context JS only; see dispatch.HEADLESS_BROWSER_TOOLS
+    assert "browser_evaluate" not in approved   # page JS could open a WebSocket the origin routing does not cover
     assert dispatch.risky_flags(argv) == [] and dispatch.codex_unapproved_tools(argv) == []
     with pytest.raises(ValueError, match="bound origin"):
         dispatch.headless_browser_overrides(config().headless_browser, [], out)
 
 
 def test_every_playwright_tool_is_classified():
-    """@playwright/mcp 0.0.83 serves exactly these (listed from the real server). Each is approved or never
-    enabled; a tool a newer version adds is neither, so `enabled_tools` keeps it hidden until someone decides."""
+    """A hand-pinned copy of what @playwright/mcp 0.0.83 listed when run on 2026-10-08 (this test does not start the
+    server, so it cannot notice a newer version's additions). It only checks that our two lists cover that
+    inventory without overlap. The real control is Codex's `enabled_tools`, which exposes only
+    HEADLESS_BROWSER_TOOLS whatever the server offers."""
     inventory = {"browser_close", "browser_resize", "browser_console_messages", "browser_handle_dialog",
                  "browser_emulate_media", "browser_evaluate", "browser_file_upload", "browser_drop", "browser_find",
                  "browser_fill_form", "browser_press_key", "browser_type", "browser_navigate",
@@ -248,6 +280,65 @@ def test_each_run_gets_a_fresh_output_directory(benv):
     assert len(dirs) == 2 and dirs[0] != dirs[1]
 
 
+# ---------------------------------------------------------------- origins: plain only, at bind time and at launch
+
+
+@pytest.mark.parametrize("url", ["https://*:443/x", "https://*.example.com/", "https://{a,b}.example/",
+                                 "http://a,b.example/", "http://a;b.example/", "http://a\x7fb.example/",
+                                 "http://a\x01b.example/", "http://a[b]/", "http://-a.example/"])
+def test_bind_refuses_hosts_that_are_not_plain(benv, url):
+    post = human_post(benv, ["codex"])
+    with pytest.raises(Invalid):
+        br.bind_request(benv.board, benv.p["human"], benv.sid["human"], post["id"], "codex", url)
+    assert br.requirement(benv.board, post["id"], "codex") is None
+
+
+def test_plain_origin_filter():
+    good = ["http://127.0.0.1:5185", "https://xn--bcher-kva.de:443", "http://[::1]:80", "http://localhost",
+            "https://a_b.example:443"]
+    bad = ["https://*:443", "https://{a,b}:443", "http://a,b:80", "http://a;b:80", "http://a\x7f:80", "http://a b:80",
+           "ftp://x:21", "http://x:99999", "http://1.2.3:80", "http://[::FFFF:127.0.0.1]:80", "http://x/", "", None]
+    assert dispatch.plain_origins(good + bad) == sorted(good)
+    with pytest.raises(ValueError, match="bound origin"):
+        dispatch.headless_browser_overrides(config().headless_browser, bad[:-1], "/tmp/x")
+
+
+def _raw_bind(env, post_id, recipient, origin):
+    """A requirement written before bind-time validation (or by anything else): bypasses target()."""
+    from agent_comms import db
+    with db.write_tx(env.board.conn) as c:
+        c.execute("INSERT INTO browser_requirements VALUES (?,?,?,?)", (post_id, recipient, origin + "/", origin))
+
+
+@pytest.mark.parametrize("origin", ["https://*:443", "http://a\x7fb:80", "https://{a,b}:443"])
+def test_launch_drops_a_stored_wildcard_or_control_origin(benv, origin):
+    """A malformed stored origin never reaches the argv (no glob, no invalid TOML for Codex to die on), and is
+    refused at preflight, before a launch is reserved, rather than as a spawn failure."""
+    allow(benv, agents=["codex"], max_launches=3)
+    post = human_post(benv, ["codex"])
+    _raw_bind(benv, post["id"], "codex", origin)
+    benv.d.tick()
+    assert not benv.spawner.calls
+    assert runs(benv)[0]["status"] == "preflight_failed" and "plain http(s) origin" in runs(benv)[0]["error"]
+    assert benv.board.list_dispatch_rules(benv.p["human"])[0]["launches_left"] == 3
+    assert benv.d._headless_origins("codex", benv.tid, [post["id"]]) == []
+
+
+def test_thread_fallback_drops_malformed_origins_and_keeps_plain_ones(benv):
+    early = human_post(benv, ["codex"])                   # before the approval: never triggers by itself
+    _raw_bind(benv, early["id"], "codex", "https://*:443")
+    plain = bound_request(benv)
+    benv.clock.advance(1)
+    allow(benv, agents=["codex"])
+    follow_up = human_post(benv, ["codex"], body="Unstick")
+    benv.d.tick()
+    assert runs(benv)[0]["request_ids"] == [follow_up["id"]]
+    argv = benv.spawner.calls[0]["argv"]
+    args = browser_args(argv)
+    assert args[args.index("--allowed-origins") + 1] == ORIGIN and "*" not in " ".join(argv[:-1])
+    assert plain["id"] != early["id"]
+
+
 @pytest.mark.parametrize("denied_first", [True, False])
 def test_policy_denied_gate_still_blocks_headless_launch(benv, denied_first):
     """The sticky gate is checked before the headless path, whichever came first; it is never routed around."""
@@ -286,26 +377,127 @@ def test_unbound_thread_gets_no_browser_server(benv):
     assert dispatch.HEADLESS_PROMPT not in argv[-1] and "headless_browser" not in runs(benv)[0]
 
 
-def test_unbound_follow_up_in_a_browser_bound_thread_gets_the_thread_origins(benv):
-    """An Unstick or recovery run is triggered by a post that binds nothing; it still gets the thread's bound
-    origins of unfinished requests, never a denied one or a finished one."""
-    allow(benv, agents=["claude"])                       # the bound request waits for another agent
-    bound_request(benv, to="claude")
-    finished = bound_request(benv, url="http://localhost:7007/done", to="claude")
-    requests.progress(benv.board, benv.p["human"], benv.sid["human"], finished["id"], "claude", "finished", "Done")
-    denied = bound_request(benv, url=OTHER, to="claude")
+def test_unbound_follow_up_in_a_browser_bound_thread_gets_this_agents_thread_origins(benv):
+    """An Unstick or recovery run is triggered by a post that binds nothing; it gets the origins bound for this
+    agent's unfinished requests in the thread: never another agent's, a finished one's or a denied one's."""
+    # Written before the approval, so none of these triggers a launch by itself.
+    mine = bound_request(benv)                                                 # codex, queued: included
+    bound_request(benv, url="http://localhost:6007/other", to="claude")        # another agent's: excluded
+    finished = bound_request(benv, url="http://localhost:7007/done")
+    requests.progress(benv.board, benv.p["human"], benv.sid["human"], finished["id"], "codex", "finished", "Done")
+    denied = bound_request(benv, url=OTHER)
     br.report_failure(benv.board, benv.p["claude"], benv.sid["claude"], OTHER, DESKTOP, "policy_denied",
                       "User declined the browser action")
     assert benv.board.get_post(benv.p["human"], denied["id"])["requests"][0]["state"] == "blocked"
-    benv.config.runners["claude"] = ["claude", "-p", "{prompt}"]
+    benv.clock.advance(1)
     allow(benv, agents=["codex"])
     follow_up = human_post(benv, ["codex"], body="Unstick: resume the browser audit")
     benv.d.tick()
-    call = next(c for c in benv.spawner.calls if c["argv"][0] == "codex")
-    args = browser_args(call["argv"])
+    assert len(benv.spawner.calls) == 1
+    args = browser_args(benv.spawner.calls[0]["argv"])
     assert args[args.index("--allowed-origins") + 1] == ORIGIN
-    record = next(r for r in runs(benv) if r["agent"] == "codex")
+    record = runs(benv)[0]
     assert record["request_ids"] == [follow_up["id"]] and record["headless_browser"]["origins"] == [ORIGIN]
+    assert mine["id"] not in record["request_ids"]
+
+
+def test_other_agents_bound_requests_give_no_browser(benv):
+    bound_request(benv, to="claude")
+    benv.clock.advance(1)
+    allow(benv, agents=["codex"])
+    human_post(benv, ["codex"], body="Unrelated code task")
+    benv.d.tick()
+    assert not any("headless_browser" in x for x in benv.spawner.calls[0]["argv"][:-1])
+
+
+def test_missing_browser_command_also_blocks_a_thread_fallback_launch(benv, monkeypatch):
+    bound_request(benv)                                   # before the approval
+    benv.clock.advance(1)
+    monkeypatch.setattr(dispatch.shutil, "which", lambda exe, **kw: None if exe == "npx" else "/fake/" + exe)
+    allow(benv, agents=["codex"], max_launches=2)
+    human_post(benv, ["codex"], body="Unstick")
+    benv.d.tick()
+    assert not benv.spawner.calls
+    assert runs(benv)[0]["error"] == "required headless browser command is unavailable"
+    assert benv.board.list_dispatch_rules(benv.p["human"])[0]["launches_left"] == 2
+
+
+@pytest.mark.parametrize("text", [
+    '[mcp_servers.headless_browser.env]\nPLAYWRIGHT_MCP_CDP_ENDPOINT = "http://127.0.0.1:9222"\n',
+    '[mcp_servers.headless_browser.tools.browser_run_code_unsafe]\napproval_mode = "approve"\n',
+    '[profiles.work.mcp_servers.headless_browser]\ncommand = "node"\n',
+    'not = valid = toml\n',
+])
+def test_codex_config_defining_the_browser_server_blocks_the_launch(benv, text):
+    (benv.home / ".codex").mkdir()
+    (benv.home / ".codex" / "config.toml").write_text(text)
+    allow(benv, agents=["codex"], max_launches=2)
+    bound_request(benv)
+    benv.d.tick()
+    assert not benv.spawner.calls
+    assert "mcp_servers.headless_browser" in runs(benv)[0]["error"]
+    assert benv.board.list_dispatch_rules(benv.p["human"])[0]["launches_left"] == 2
+
+
+def test_codex_config_check_follows_codex_home_and_ignores_other_servers(benv, tmp_path):
+    (benv.home / ".codex").mkdir()
+    (benv.home / ".codex" / "config.toml").write_text('[mcp_servers.agent-comms]\ncommand = "bash"\n')
+    other = tmp_path / "codex-work"
+    other.mkdir()
+    (other / "config.toml").write_text('[mcp_servers.headless_browser]\ncommand = "node"\n')
+    assert dispatch.codex_config_conflict({"HOME": str(benv.home)}) is None
+    assert "headless_browser" in dispatch.codex_config_conflict({"HOME": str(benv.home), "CODEX_HOME": str(other)})
+    assert dispatch.codex_config_conflict({"HOME": str(tmp_path / "nobody")}) is None
+
+
+# ---------------------------------------------------------------- browser output is removed when the run ends
+
+
+def test_browser_output_is_removed_when_the_run_ends(benv):
+    allow(benv, agents=["codex"])
+    bound_request(benv)
+    benv.d.tick()
+    out = Path(runs(benv)[0]["headless_browser"]["output_dir"])
+    (out / "page.yml").write_text("snapshot")
+    (out / "sub").mkdir()
+    benv.spawner.children[0].code = 0
+    benv.d.tick()
+    assert runs(benv)[0]["status"] == "exited" and not out.exists()
+    assert benv.log_dir.is_dir()                          # only the run's own folder goes
+
+
+def test_browser_output_is_removed_after_a_spawn_failure(benv):
+    benv.spawner.fail_for = {"codex"}
+    allow(benv, agents=["codex"])
+    bound_request(benv)
+    benv.d.tick()
+    record = runs(benv)[0]
+    assert record["status"] == "spawn_failed"
+    assert not Path(record["headless_browser"]["output_dir"]).exists()
+
+
+def test_browser_output_of_an_orphan_is_removed_once_it_is_gone(benv):
+    allow(benv, agents=["codex"])
+    bound_request(benv)
+    benv.d.tick()
+    out = Path(runs(benv)[0]["headless_browser"]["output_dir"])
+    benv.d.release_loop()                                 # the dispatcher dies; its child is now an orphan
+    benv.spawner.children[0].code = 0
+    dispatch.check_orphans(benv.board, benv.procs.probe)
+    assert runs(benv)[0]["status"] == "gone" and not out.exists()
+
+
+@pytest.mark.parametrize("record", [
+    {"run_id": "r1", "log": "/tmp/x/r1.log", "headless_browser": {"output_dir": "/tmp/x/other-browser"}},
+    {"run_id": "r1", "log": "/tmp/x/r1.log", "headless_browser": {"output_dir": "/tmp/y/r1-browser"}},
+    {"run_id": "r1", "log": "/tmp/x/r1.log", "headless_browser": {"output_dir": "/tmp/x/../r1-browser"}},
+    {"run_id": "r1", "log": "/tmp/x/r1.log"},
+])
+def test_remove_browser_output_only_touches_the_runs_own_folder(record, monkeypatch):
+    removed = []
+    monkeypatch.setattr(dispatch.shutil, "rmtree", lambda p, **kw: removed.append(p))
+    dispatch.remove_browser_output(record)
+    assert removed == []
 
 
 def test_dispatched_headless_probe_reaches_ready_and_starts_the_bound_request(benv):

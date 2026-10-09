@@ -110,12 +110,14 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 
 # A scoped headless browser for dispatched Codex runs, so the dispatcher can relaunch browser-bound work itself
 # (README "Headless browser for dispatched Codex runs"). Off: no runner is listed. Turn it on per machine in
-# board.local.toml. For each run of a listed Codex runner whose request (or, failing that, thread) has a bound
-# browser target, the dispatcher adds a `headless_browser` MCP server to that run only, always with --headless
-# --isolated (in-memory profile), a fresh --output-dir, --allowed-origins set to the bound origins, and per-run
-# approvals for a fixed set of browser tools (never browser_run_code_unsafe, browser_file_upload or browser_drop).
-# Playwright's --allowed-origins is not a security boundary (it does not cover redirects); the board's binding,
-# the run's own fresh headless probe and the sticky policy-denied gate remain the controls.
+# board.local.toml. For each run of a listed Codex runner whose request (or, failing that, that agent's other
+# unfinished requests in the thread) has a bound browser target, the dispatcher adds a `headless_browser` MCP
+# server to that run only, always with --headless --isolated (in-memory profile) --block-service-workers, a fresh
+# --output-dir (deleted when the run ends), --allowed-origins set to the bound plain origins, and per-run approvals
+# for a fixed set of browser tools (never browser_run_code_unsafe, browser_evaluate, browser_file_upload or
+# browser_drop). Playwright's --allowed-origins is not a security boundary (it does not cover redirects, WebSockets
+# or service-worker requests); the board's binding, the run's own fresh headless probe and the sticky
+# policy-denied gate remain the controls. `args` accepts only known-harmless options (README).
 [dispatch.headless_browser]
 runners = []                # e.g. ["codex-cli"]: Codex runner keys only
 # command = "npx"           # the Playwright MCP server, run without a shell
