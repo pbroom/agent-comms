@@ -290,7 +290,8 @@ def tick(board: Board, human: Principal, *, runner_for: Callable[[str], Any], fe
         prune(board)
     except Exception:
         log.exception("could not prune automatic recovery records")
-    budget = {"escalations": MAX_ESCALATIONS_PER_PASS}
+    # Both kinds of launch (stall recoveries and recovery-wait relaunches) share one per-pass send cap.
+    budget = {"escalations": MAX_ESCALATIONS_PER_PASS, "sends": MAX_SENDS_PER_PASS}
     escalated = _evaluate(board, human, fence, live_seconds, budget)
     sent = _detect_and_send(board, human, runner_for, fence, budget)
     waits = _process_waits(board, human, runner_for, fence, live_seconds, budget)
@@ -421,10 +422,11 @@ def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str],
         if spent:
             direct += [(spent, x) for x in items]
             continue
-        if len(sent) >= MAX_SENDS_PER_PASS:
+        if budget.get("sends", MAX_SENDS_PER_PASS) <= 0:
             continue    # the next pass picks it up
         try:
             sent.append(_send(board, human, fence, thread_id, agent, items))
+            budget["sends"] = budget.get("sends", MAX_SENDS_PER_PASS) - 1
         except Exception:
             log.exception("automatic recovery for %s on thread %s failed", agent, thread_id)
     by_thread: dict[int, list[tuple[str, dict]]] = {}
@@ -836,8 +838,9 @@ def _escalate_new(board, human, fence, thread_id, items: list[tuple[str, dict]])
 # Only then, or after MAX_WAIT_SECONDS, does it ask the human.
 
 MAX_WAIT_SECONDS = 24 * 3600
-WAIT_BODY = (HEADER + " The owner worktree of request #{post} (recipient {recipient}) is free now: recover the request "
-             "from session {old} with board_recover_request_owner (reread its version first) and resume the work it "
+WAIT_BODY = (HEADER + " The owner worktree of request #{post} (recipient {recipient}) is free now: claim (or reclaim) "
+             "the request's task first if it has one with board_claim_task, then recover the request from session "
+             "{old} with board_recover_request_owner (reread its version first) and resume the work it "
              "asked for.{also} Automatic retry {n} of {max}. Verifying the owner and taking over ownership within the "
              "request's existing scope is routine and pre-authorized: do not ask the human about it. If recovery is "
              "blocked again for a transient reason, mark this request blocked with the returned reason and stop; the "
@@ -853,13 +856,15 @@ WAIT_ESCALATION_NEXT_PLAIN = "open the thread and check the named request, then 
 
 
 def _wait_authorized(board: Board, human: Principal, wait: dict) -> bool:
-    """The human asked for this request: they wrote it, its task is human- or grant-authorized, or a dispatch approval
-    of theirs (not a one-click one) covers this agent on the thread. Otherwise no automatic launch."""
-    post = board.conn.execute("""SELECT p.task_id, a.is_human FROM posts p JOIN agents a ON a.name = p.agent
-                                 WHERE p.id = ?""", (wait["post_id"],)).fetchone()
+    """The human asked for this request: they wrote it (by hand: a post the dispatcher made as the human, marked
+    automatic, does not count, as in Board.NOT_AUTOMATIC), its task is human- or grant-authorized, or a dispatch
+    approval of theirs (not a one-click one) covers this agent on the thread. Otherwise no automatic launch."""
+    post = board.conn.execute(f"""SELECT p.task_id, a.is_human, {Board.NOT_AUTOMATIC.format(post='p')} AS by_hand
+                                  FROM posts p JOIN agents a ON a.name = p.agent WHERE p.id = ?""",
+                              (wait["post_id"],)).fetchone()
     if post is None:
         return False
-    if post["is_human"]:
+    if post["is_human"] and post["by_hand"]:
         return True
     if post["task_id"] is not None and _human_authorized(board, post["task_id"], wait["agent"]):
         return True
@@ -951,8 +956,9 @@ def _process_waits(board: Board, human: Principal, runner_for: Callable[[str], A
                 with db.write_tx(conn) as c:
                     if _get(c, key) == wait:
                         _update(c, key, wait | fields, now)
-            elif kind == "send" and len(out["retried"]) < MAX_SENDS_PER_PASS:
+            elif kind == "send" and budget.get("sends", MAX_SENDS_PER_PASS) > 0:
                 out["retried"].append(_send_wait_retry(board, human, fence, key, wait))
+                budget["sends"] = budget.get("sends", MAX_SENDS_PER_PASS) - 1
             elif kind == "escalate" and budget["escalations"] > 0:
                 if _escalate_wait(board, human, fence, key, wait, arg) is not None:
                     budget["escalations"] -= 1

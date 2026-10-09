@@ -271,15 +271,18 @@ PEER_ACTIVITY = 'Another live session in the owner worktree has active or unknow
 OWNER_RUN_ACTIVE = 'Owner dispatcher run is active or unresolved'
 
 
-def _inactive(board, session, managed, abandoned=False, own_run_id=None):
+def _inactive(board, session, managed, abandoned=False, own_run_id=None, successor=None):
     """Why `session` cannot be treated as inactive, or None. `abandoned` (recovery.abandonment proved the session has
     been silent since its task lease expired) counts like an ended dispatcher run; `own_run_id` is the successor's own
-    dispatcher run, which is not the old owner's."""
+    dispatcher run, which is not the old owner's; `successor` is the session taking over (recovery), whose own leases
+    and activity in the checkout are not someone else's work there. The checkout's Git state is still inspected."""
     now = board.now()
     path = os.path.realpath(session['worktree'] or session['project'])
     active = board.conn.execute("""SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session
         WHERE t.lease_expires_at>? AND t.status IN ('working','blocked')""",(now,))
     for lease in active:
+        if successor is not None and successor != session['id'] and lease['id'] == successor:
+            continue
         if lease['id']==session['id'] or os.path.realpath(lease['worktree'] or lease['project'])==path:
             return OWNER_LEASE_ACTIVE
     peers = board.conn.execute('''SELECT s.id,s.last_seen,s.worktree,s.project,a.state,a.recorded_at FROM sessions s
@@ -288,7 +291,7 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None):
         WHERE s.id!=? AND s.last_seen>=? AND identity.active=1 AND identity.is_human=0''',
         (session['id'],now-90))
     for peer in peers:
-        if os.path.realpath(peer['worktree'] or peer['project']) != path:
+        if peer['id'] == successor or os.path.realpath(peer['worktree'] or peer['project']) != path:
             continue
         if (peer['state'] != 'idle' or peer['recorded_at'] is None
                 or not now-90 <= peer['recorded_at'] <= now):

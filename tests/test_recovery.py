@@ -118,7 +118,11 @@ def test_ended_transfer_preserves_ownership_on_gates(env,tmp_path,monkeypatch,ga
     post,old,new,project=ended_owner(env,tmp_path)
     version=1
     if gate=='dirty': pathlib.Path(project,'unfinished.txt').write_text('preserve')
-    elif gate=='active': env.board.conn.execute("UPDATE session_activity SET state='active' WHERE session_id=?",(new,))
+    elif gate=='active':
+        # Another session active in the shared checkout. (The successor's own activity is not someone else's work
+        # there: it is excluded since the automatic owner handoff review, while the checkout's Git state still counts.)
+        peer=env.session('claude',project=project)
+        env.board.conn.execute('INSERT INTO session_activity(session_id,state,recorded_at) VALUES (?,?,?)',(peer,'active',env.clock()))
     elif gate=='stale': version=0
     elif gate=='unknown': env.board.conn.execute("DELETE FROM board_state WHERE key='dispatch.run.ended'")
     else: monkeypatch.setattr(browser_readiness,'request_blocker',lambda *a:'host denied')

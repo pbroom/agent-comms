@@ -99,7 +99,7 @@ def test_a_transient_block_is_machine_readable_and_records_a_wait_for_the_exact_
     assert exc.details["blocker"] == workstreams.PEER_ACTIVITY
     assert (exc.details["blocker_kind"], exc.details["retry"], exc.details["recovered"]) == ("transient", "automatic", False)
     assert exc.details["recovery_wait"] == {"post_id": h.ask["id"], "recipient": "codex", "version": v,
-                                            "retries_used": 0, "max_retries": 3}
+                                            "retries_used": 0, "max_retries": 3, "state": "waiting"}
     assert "Do not ask the human" in exc.message and "Mark the request you are working on blocked" in exc.message
     wait = wait_of(aenv, h)
     assert (wait["state"], wait["version"], wait["agent"], wait["thread_id"]) == ("waiting", v, "codex", h.tid)
@@ -274,11 +274,39 @@ def test_three_retries_a_day_then_one_click_question_to_the_human(aenv, tmp_path
     assert q["recommended_option_id"] == "relaunch"
     relaunch = next(o for o in q["options"] if o["id"] == "relaunch")
     assert relaunch["action"] == {"type": "unstick", "thread_id": h.tid, "agents": ["codex"]}
-    # Once escalated, the agent may ask the human again, and nothing more is launched.
+    # Once escalated, the question refusal stops (the agent may post a question again) and nothing more is launched.
     assert recovery.active_wait(aenv.board, "codex", h.tid) is None
+    asker = aenv.session("codex", project=h.project)
+    aenv.board.create_post(aenv.p["codex"], asker, body="Anything else?", type="question", thread_id=h.tid,
+                           needs_response=True, decision_question=ASK)
     go_quiet(aenv)
     aenv.d.tick()
     assert len(aenv.spawner.calls) == before
+    # A new attempt the same day neither re-arms the wait nor asks the human a second time.
+    escalations = len(needs_you(aenv))
+    fresh = aenv.session("codex", project=h.project)
+    aenv.board.claim_task(aenv.p["codex"], fresh, h.task)
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait) as caught:
+        attempt(aenv, h, fresh)
+    assert caught.value.details["retry"] == "escalated"
+    assert caught.value.details["escalation_post_id"] == wait["escalation_post_id"]
+    again = wait_of(aenv, h)
+    assert again["state"] == "escalated" and again["escalation_post_id"] == wait["escalation_post_id"]
+    assert again["first_recorded_at"] == wait["first_recorded_at"]
+    assert recovery.active_wait(aenv.board, "codex", h.tid) is None
+    aenv.board.release_task(aenv.p["codex"], fresh, h.task)
+    go_quiet(aenv)
+    aenv.d.tick()
+    assert len(aenv.spawner.calls) == before and len(needs_you(aenv)) == escalations
+    # A day after the first wait, a new transient block starts a fresh wait.
+    aenv.clock.advance(24 * 3600)
+    later = aenv.session("codex", project=h.project)
+    aenv.board.claim_task(aenv.p["codex"], later, h.task)
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait) as caught:
+        attempt(aenv, h, later)
+    assert caught.value.details["retry"] == "automatic" and wait_of(aenv, h)["state"] == "waiting"
 
 
 def test_the_retry_budget_is_a_rolling_day(aenv, tmp_path):
@@ -419,3 +447,116 @@ def test_another_dispatched_run_in_the_checkout_keeps_it_waiting(aenv, tmp_path)
     aenv.board.conn.execute("UPDATE board_state SET value=? WHERE key='dispatch.run.s9-claude'", (json.dumps(run),))
     out = autorecover.tick(aenv.board, aenv.p["human"], runner_for=lambda a: ["x"], fence=aenv.d._fence())
     assert len(out["retried"]) == 1
+
+
+# ---------------------------------------------------------------- review fixes: a relaunch never blocks itself
+
+
+def put_run(env, run_id, **fields):
+    value = {"run_id": run_id, "agent": "codex", "status": "running", "pid": None, "started_at": env.clock(), **fields}
+    env.board.conn.execute("""INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)
+                              ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                           ("dispatch.run." + run_id, json.dumps(value), "dispatcher", env.clock()))
+
+
+def test_a_relaunched_run_recovers_an_abandoned_owner_without_claiming_first(aenv, tmp_path):
+    """Regression (review P1a): in the same directory, with no task claim, the relaunched session and its own active
+    dispatcher run are not "another session busy in the checkout"."""
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    go_quiet(aenv)
+    aenv.d.tick()
+    [run] = [r for r in dispatch.list_runs(aenv.board, aenv.p["human"]) if r["agent"] == "codex"]
+    assert run["status"] == "running" and run["cwd"] == h.project
+    fresh = aenv.board.register_session(aenv.p["codex"], h.project, dispatch_run_id=run["run_id"])["session_id"]
+    out = attempt(aenv, h, fresh)                               # no board_claim_task first
+    assert out["assigned_session"] == fresh and wait_of(aenv, h)["state"] == "resolved"
+
+
+def test_a_dispatched_successor_recovers_a_taskless_request_from_an_ended_run(aenv, tmp_path):
+    """Regression (review P1b): an ended dispatcher owner, a request without a task (so no lease is possible), and a
+    successor dispatched run in the same directory: it recovers instead of waiting on itself forever."""
+    project = git_project(tmp_path)
+    tid = aenv.board.create_thread(aenv.p["human"], aenv.sid["human"], "audit", project)["id"]
+    put_run(aenv, "s1-codex", thread_id=tid, cwd=project)
+    old = aenv.board.register_session(aenv.p["codex"], project, dispatch_run_id="s1-codex")["session_id"]
+    ask = aenv.post("human", tid, "run the audit", "request", to=["codex"])
+    requests.progress(aenv.board, aenv.p["codex"], old, ask["id"], "codex", "started", "on it")
+    requests.progress(aenv.board, aenv.p["codex"], old, ask["id"], "codex", "blocked", "stopped")
+    put_run(aenv, "s1-codex", thread_id=tid, cwd=project, status="exited", ended_at=aenv.clock())
+    aenv.clock.advance(100)
+    put_run(aenv, "s2-codex", thread_id=tid, cwd=project)
+    fresh = aenv.board.register_session(aenv.p["codex"], project, dispatch_run_id="s2-codex")["session_id"]
+    out = recovery.transfer_ended_owner(aenv.board, aenv.p["codex"], fresh, ask["id"], "codex", version(aenv, ask["id"]))
+    assert out["assigned_session"] == fresh and out["state"] == "queued"
+    assert recovery._get_state(aenv.board.conn, recovery.wait_key(ask["id"], "codex")) is None
+
+
+def test_the_successor_exclusion_still_fences_everyone_else(aenv, tmp_path):
+    """Excluding the successor does not excuse another busy session, another active run, or the checkout's state."""
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    go_quiet(aenv)
+    aenv.d.tick()
+    [run] = [r for r in dispatch.list_runs(aenv.board, aenv.p["human"]) if r["agent"] == "codex"]
+    fresh = aenv.board.register_session(aenv.p["codex"], h.project, dispatch_run_id=run["run_id"])["session_id"]
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait, match="Another live session"):
+        attempt(aenv, h, fresh)
+    aenv.clock.advance(91)
+    aenv.board.heartbeat(aenv.p["codex"], fresh)
+    pathlib.Path(h.project, ".git", "MERGE_HEAD").write_text("pending")
+    with pytest.raises(Conflict, match="unfinished Git operation") as caught:
+        attempt(aenv, h, fresh)
+    assert not isinstance(caught.value, recovery.RecoveryWait)
+
+
+def test_the_relaunch_request_says_to_claim_the_task_first(aenv, tmp_path):
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    go_quiet(aenv)
+    aenv.d.tick()
+    [post] = auto_posts(aenv)
+    assert "claim (or reclaim) the request's task first if it has one" in post["body"]
+
+
+# ---------------------------------------------------------------- review fixes: P3s
+
+
+def test_a_persistent_block_does_not_restart_the_24_hour_clock(aenv, tmp_path):
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    first = wait_of(aenv, h)["first_recorded_at"]
+    with db.write_tx(aenv.board.conn):
+        recovery._settle_wait(aenv.board, h.ask["id"], "codex", "persistent", "test", "dirty")
+    aenv.clock.advance(3600)
+    aenv.board.claim_task(aenv.p["codex"], h.new, h.task)
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait):
+        attempt(aenv, h)
+    wait = wait_of(aenv, h)
+    assert wait["state"] == "waiting" and wait["first_recorded_at"] == first
+
+
+def test_the_boards_own_automatic_posts_do_not_count_as_the_human_asking(aenv, tmp_path):
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    aenv.board.conn.execute("UPDATE posts SET task_id=NULL WHERE id=?", (h.ask["id"],))
+    assert autorecover._wait_authorized(aenv.board, aenv.p["human"], wait_of(aenv, h))
+    aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                            (autorecover.POST_PREFIX + str(h.ask["id"]), json.dumps({"kind": "recovery"}),
+                             "dispatcher", aenv.clock()))
+    assert not autorecover._wait_authorized(aenv.board, aenv.p["human"], wait_of(aenv, h))
+
+
+def test_wait_relaunches_share_the_per_pass_send_cap(aenv, tmp_path, monkeypatch):
+    from test_autorecover import abandon
+    monkeypatch.setattr(autorecover, "MAX_SENDS_PER_PASS", 1)
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    abandon(aenv, agent="claude")                  # a stall elsewhere, for the other kind of launch
+    aenv.clock.advance(PAST_GRACE)
+    out = autorecover.tick(aenv.board, aenv.p["human"], runner_for=lambda a: ["x"], fence=aenv.d._fence())
+    assert len(out["sent"]) + len(out["retried"]) == 1
+    out = autorecover.tick(aenv.board, aenv.p["human"], runner_for=lambda a: ["x"], fence=aenv.d._fence())
+    assert len(out["sent"]) + len(out["retried"]) == 1

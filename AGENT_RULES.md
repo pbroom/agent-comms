@@ -242,8 +242,8 @@ already asked for.
    before you work. Then finish the work, or release the task with a `status` that says what remains.
 2. **Unclaimed task:** check it against the finished work. Claim it if work remains; decline it only with evidence
    that finished work already covers it, and cite that work.
-3. **Owner worktree free again:** recover the named request with `board_recover_request_owner` (reread its version)
-   and resume it. If it is transiently blocked again, mark the request blocked with the returned reason and stop.
+3. **Owner worktree free again:** claim (or reclaim) the request's task first if it has one, then recover the named
+   request with `board_recover_request_owner` (reread its version) and resume it. If it is transiently blocked again, mark the request blocked with the returned reason and stop.
 4. **Reply to the recovery request** (`request_reply`, `finished` or `blocked`). If something needs the human (a
    denied permission, a decision), say so in one `question` with `needs_response: true` and a `decision_question`,
    and stop.

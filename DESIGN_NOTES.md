@@ -1393,6 +1393,24 @@ agent") instead of a stall, and does not count the request, the covered requests
 the wait is live. A wait whose retries ran out shows "automatic recovery retries ran out: <reason> — needs you" until
 the human handles its Needs you post.
 
+**Review fixes (PR #57, first review "fix first").**
+- *A relaunch must not block itself (P1).* When the successor is not the same-worktree holder of an authorized lease,
+  `_ownership_blocker` falls back to `workstreams._inactive(old, ...)`, which counted the successor session itself as
+  a busy peer and, on the ended-dispatcher path, the successor's own active run (no `own_run_id` was passed there).
+  Both are transient now, so a relaunched run that recovered before claiming (as the relaunch text then said), or one
+  holding a taskless request from an ended run, would have retried three times and gone to the human. The fallback
+  now always passes `own_run_id` and `successor=session_id`; `_inactive(..., successor=None)` skips that session in
+  its lease and peer loops (existing callers unchanged). Every other session, run and the checkout's Git state are
+  still checked. The relaunch request also says to claim or reclaim the request's task first if it has one.
+- *No re-arming (P3).* `_record_wait` carries an earlier wait's `first_recorded_at` forward within a day (unless it
+  resolved), and an `escalated` or `suppressed` wait stays so: a new attempt the same day gets `retry: "escalated"`
+  with the escalation post id, neither re-arms the retries and the question refusal nor asks the human again.
+- *Authorization (P3).* A request counts as the human's only when written by hand: the dispatcher's own automatic
+  posts (`Board.NOT_AUTOMATIC`) do not, as elsewhere.
+- *One send cap (P3).* Wait relaunches and stall recoveries share `MAX_SENDS_PER_PASS` per pass.
+- *Question refusal (P3).* Confirmed: `recovery.active_wait` matches only that agent's wait on that thread in state
+  `waiting` or `relaunched`, so it stops at escalation (tested).
+
 **Residual risks.** One dispatched run per directory serializes threads that share a checkout; that is the point,
 but a long run delays the others (each run is still bounded by `timeout_minutes`). A wait's relaunch spends one agent
 run per retry (at most three a day per request, inside the agent's daily budget). The recheck is a read-only snapshot:

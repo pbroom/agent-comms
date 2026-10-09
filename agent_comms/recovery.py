@@ -250,6 +250,9 @@ WAIT_PREFIX = 'auto_recovery.wait.'     # <post id>.<recipient>: a recovery wait
 WAIT_RETRIES = 3                        # automatic relaunches per request per rolling day (autorecover.py)
 WAIT_WINDOW_SECONDS = 24 * 3600
 WAITING = ('waiting', 'relaunched')     # wait states that still wait on the board, not on the human
+ESCALATED = ('escalated', 'suppressed')  # the board's retries ran out and it went to the human (or the cap held it)
+WAIT_ESCALATED_NEXT_STEP = ('The board already took this to the human (Needs you); do not ask again. Mark the request '
+                            'you are working on blocked with this reason and stop.')
 WAIT_NEXT_STEP = ('Do not ask the human: verifying an owner and taking over ownership within the existing scope is '
                   'routine and pre-authorized, and this blocker clears by itself. Mark the request you are working on '
                   'blocked with this reason and stop. The board relaunches you when the owner worktree is free.')
@@ -348,13 +351,21 @@ def _record_wait(board, p, session_id, post_id, recipient, expected_version, old
         tasks = [t['id'] for t in board.conn.execute(
             """SELECT id FROM tasks WHERE thread_id=? AND owner_session IN (?,?) AND status IN ('working','blocked')
                ORDER BY id""", (post['thread_id'], session_id, old_id))]
-        first = prev.get('first_recorded_at') if prev.get('state') in WAITING else None
+        # Within a day of the first wait on this request, an earlier wait carries forward: its start (so the 24-hour
+        # cap holds) and, once it went to the human (escalated, or suppressed over the escalation cap), that state
+        # too, so a new attempt neither re-arms the retries and the question refusal nor asks the human again. A wait
+        # that resolved (the request was recovered) or is older than a day starts afresh; retries always carry.
+        first = prev.get('first_recorded_at')
+        carried = (prev.get('state') not in (None, 'resolved') and type(first) in (int, float)
+                   and now - first < WAIT_WINDOW_SECONDS)
         wait = {'post_id': post_id, 'recipient': recipient, 'version': row['version'], 'agent': p.name,
                 'thread_id': post['thread_id'], 'old_session': old_id, 'session_id': session_id, 'worktree': path,
                 'blocker': blocker, 'blocker_kind': 'transient', 'state': 'waiting', 'recorded_at': now,
-                'first_recorded_at': first if type(first) in (int, float) else now,
+                'first_recorded_at': first if carried else now,
                 'retries': retries_used(prev, now), 'relaunch_post_ids': (prev.get('relaunch_post_ids') or [])[-10:],
                 'covered_post_ids': held[:20], 'covered_task_ids': tasks[:20]}
+        if carried and prev.get('state') in ESCALATED:
+            wait.update({k: prev[k] for k in ('state', 'reason', 'escalated_at', 'escalation_post_id') if k in prev})
         _put_state(board, key, wait, p.name)
     return wait
 
@@ -395,8 +406,15 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
         used = len(retries_used(wait, board.now()))
         details = {'recovered': False, 'blocker': block.blocker, 'blocker_kind': 'transient', 'retry': 'automatic',
                    'recovery_wait': {'post_id': post_id, 'recipient': recipient, 'version': wait['version'],
-                                     'retries_used': used, 'max_retries': WAIT_RETRIES},
+                                     'retries_used': used, 'max_retries': WAIT_RETRIES, 'state': wait['state']},
                    'next_step': WAIT_NEXT_STEP}
+        if wait['state'] in ESCALATED:
+            # The board's retries for this request already ran out and it asked the human itself: nothing more for
+            # the agent to ask, and no further automatic retry.
+            details.update(retry='escalated', next_step=WAIT_ESCALATED_NEXT_STEP,
+                           escalation_post_id=wait.get('escalation_post_id'))
+            raise RecoveryWait(f'{block.blocker}. This blocker is transient, but the automatic retries for this '
+                               f'request ran out today. {WAIT_ESCALATED_NEXT_STEP}', details) from None
         raise RecoveryWait(f'{block.blocker}. This blocker is transient: the board retries automatically '
                            f'(automatic retries used: {used} of {WAIT_RETRIES} per 24 hours). {WAIT_NEXT_STEP}',
                            details) from None
@@ -526,10 +544,10 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
                                      (session_id, post['thread_id'], board.now())))
     authorized = any(board._task_authorization_active(t, current['agent']) for t in leases)
     if not same or not authorized:
-        if abandoned:
-            return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']},
-                                         abandoned=True, own_run_id=current['dispatch_run_id'])
-        return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']})
+        # The successor's own session, leases and dispatcher run are never "someone else busy in the checkout": a
+        # relaunched run recovering before (or without) a task claim would otherwise block itself.
+        return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']},
+                                     abandoned=abandoned, own_run_id=current['dispatch_run_id'], successor=session_id)
     for lease in board.conn.execute("SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session WHERE t.status IN ('working','blocked') AND t.lease_expires_at>?", (board.now(),)):
         if lease['id'] == old['id'] or (lease['id'] != session_id and os.path.realpath(lease['worktree'] or lease['project']) == path):
             return SHARED_LEASE_ACTIVE
