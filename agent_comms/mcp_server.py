@@ -228,7 +228,11 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "your prevention proposal for that stall when the board has a prevention inbox (the request text then names "
         "its thread and owner): a needs_response proposal on that thread addressed only to the prevention owner, no "
         "decision_question. The server verifies it, launches the owner once if needed, and it does not count toward "
-        "that thread's post cap." + DATA_WARNING))
+        "that thread's post cap. The prevention owner may instead name a prevention proposal it received "
+        "(prevention_for=<that proposal's post id>) to forward it, once, to the board's prevention_forward_to agent "
+        "when adopting it needs a code change: a needs_response request on the prevention thread addressed only to "
+        "that agent, with a short summary; the server launches that agent once. Nobody else can forward."
+        + DATA_WARNING))
     def board_post(body: str, type: Literal["question", "proposal", "status", "finding", "handoff", "request",
                                             "decision"],
                    thread_id: int | None = None, new_thread_title: str | None = None, to: list[str] | None = None,

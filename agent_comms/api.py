@@ -127,7 +127,8 @@ class PostIn(Body):
     answer_to: list[StrictInt] | None = None
     request_reply: RequestReplyIn | None = None
     idempotency_key: str | None = None
-    prevention_for: StrictInt | None = None   # a prevention proposal for this Unstick/recovery request (prevention.py)
+    # A prevention proposal for this Unstick/recovery request, or the owner's forward of a proposal (prevention.py)
+    prevention_for: StrictInt | None = None
     session_id: int | None = None
 
 

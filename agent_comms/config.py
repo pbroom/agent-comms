@@ -16,20 +16,23 @@ RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
 SECTIONS = ("server", "limits", "tasks", "web")
 NOT_SETTINGS = {"dispatch", "conversations", "unstick", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
-PREVENTION_KEYS = ("prevention_owner", "prevention_thread")   # the [unstick] table (prevention_config)
+PREVENTION_KEYS = ("prevention_owner", "prevention_thread", "prevention_forward_to")   # [unstick] (prevention_config)
 
 
 @dataclass(frozen=True)
 class PreventionConfig:
     """[unstick] prevention_owner / prevention_thread: where Unstick and automatic recovery send prevention
-    proposals (agent_comms/prevention.py). Off unless both are set."""
+    proposals (agent_comms/prevention.py). Off unless both are set. prevention_forward_to (optional): the agent the
+    owner may forward a proposal to when it needs a code change (a triage owner forwarding to the maintainer)."""
     owner: str
     thread_id: int
+    forward_to: str | None = None
 
 
 def prevention_config(table: object) -> PreventionConfig | None:
     """The [unstick] table, validated strictly: only prevention_owner (an agent name) and prevention_thread (a thread
-    id, a positive whole number), both or neither. None when off (absent, or both left empty). Raises ValueError."""
+    id, a positive whole number), both or neither, plus the optional prevention_forward_to (an agent name other than
+    the owner, only with an owner). None when off (absent, or both left empty). Raises ValueError."""
     if table is None:
         return None
     if not isinstance(table, dict):
@@ -44,11 +47,19 @@ def prevention_config(table: object) -> PreventionConfig | None:
                          "or \"\" for off")
     if isinstance(thread, bool) or not isinstance(thread, int) or thread < 0:
         raise ValueError("[unstick] prevention_thread must be a thread id (a positive whole number), or 0 for off")
+    forward_to = table.get("prevention_forward_to", "")
+    if not isinstance(forward_to, str) or (forward_to and not NAME_RE.match(forward_to)):
+        raise ValueError("[unstick] prevention_forward_to must be an agent name (lowercase letters, digits, - and _), "
+                         "or \"\" for off")
     if not owner and not thread:
+        if forward_to:
+            raise ValueError("[unstick] prevention_forward_to needs prevention_owner and prevention_thread")
         return None
     if not owner or not thread:
         raise ValueError("[unstick] set both prevention_owner and prevention_thread, or neither")
-    return PreventionConfig(owner, thread)
+    if forward_to == owner:
+        raise ValueError("[unstick] prevention_forward_to must be another agent than prevention_owner")
+    return PreventionConfig(owner, thread, forward_to or None)
 
 
 def deep_merge(base: dict, over: dict) -> dict:
@@ -215,13 +226,49 @@ def create_agent(path: Path, name: str, runtime: str, is_human: bool = False, ro
     return token
 
 
+def token_dir() -> Path:
+    return Path(os.environ.get("AGENT_COMMS_TOKEN_DIR", "~/.config/agent-comms")).expanduser()
+
+
+def agent_token_file(name: str) -> Path:
+    """~/.config/agent-comms/<name>.token: the file `board mcp --agent <name>` reads."""
+    if not NAME_RE.match(name):
+        raise ValueError("invalid agent name")
+    return token_dir() / f"{name}.token"
+
+
+def write_private(path: Path, text: str, overwrite: bool = False) -> None:
+    """Write a file only its owner can read (mode 600, its directory 700). Refuses to replace an existing file unless
+    `overwrite`, and never follows a symlink."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or (path.exists() and not overwrite):
+        raise ValueError(f"{path} already exists")
+    tmp = path.with_name(path.name + ".tmp")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    tmp.replace(path)
+
+
+def agent_mcp_config(name: str) -> dict:
+    """A Claude Code MCP config (for `claude --strict-mcp-config --mcp-config <file>`) whose agent-comms server signs in
+    as `name`: this checkout's stdio launcher, which reads ~/.config/agent-comms/<name>.token. No secrets in it."""
+    if not NAME_RE.match(name):
+        raise ValueError("invalid agent name")
+    launcher = REPO_ROOT / "integrations" / "claude-code" / "stdio.sh"
+    return {"mcpServers": {"agent-comms": {"type": "stdio", "command": "bash", "args": [str(launcher)],
+                                           "env": {"AGENT_COMMS_HOME": str(home()), "AGENT_COMMS_AGENT": name}}}}
+
+
 def load_agent_token(name: str) -> str:
     """Read ~/.config/agent-comms/<name>.token, refusing files others could read or swap."""
     import stat
 
     if not NAME_RE.match(name):
         raise ValueError("invalid agent name")
-    path = Path(os.environ.get("AGENT_COMMS_TOKEN_DIR", "~/.config/agent-comms")).expanduser() / f"{name}.token"
+    path = agent_token_file(name)
     try:
         meta = path.lstat()
     except OSError as e:

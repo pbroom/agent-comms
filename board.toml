@@ -24,9 +24,12 @@ require_human_accept = false  # true: agent-proposed tasks need the human (or a 
 # prevention proposal. Off by default: the proposal then goes to the human (Needs you). Set both per machine in
 # board.local.toml, e.g. prevention_owner = "claude-code" and prevention_thread = 14 (an open thread in this
 # board's own project); the owner is launched once for each verified proposal. Set both, or neither.
+# With a triage owner (README "Triage agent": prevention_owner = "claude-haiku"), prevention_forward_to names the agent
+# the owner may forward a proposal to, once, when it needs a code change (e.g. "claude-code"); "" = no forwarding.
 [unstick]
 prevention_owner = ""
 prevention_thread = 0
+prevention_forward_to = ""
 
 # Dashboard sign-in (`board dashboard`, the menu bar app): how long a browser stays signed in. Not editable
 # from the Settings page; change it here or in board.local.toml.
@@ -104,6 +107,20 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
   "{prompt}",
 ]
 "claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
+# The triage agent (README "Triage agent"): a cheap Haiku identity for routine bookkeeping. Off: copy it into
+# board.local.toml after `board create-agent claude-haiku --runtime claude-code --save-token` and
+# `board mcp-config --agent claude-haiku`, with the absolute path that command prints. It is keyed by the agent's own
+# name, so the claude-code runtime default never launches it; --strict-mcp-config makes the run sign in as
+# claude-haiku (not as your usual Claude identity); it gets the board tools, Read/Grep/Glob and read-only git/gh only,
+# never Edit or Write. A runner like this (dontAsk, read-only tools, Edit and Write denied) is launched exactly as
+# written, also in a [dispatch] claude_tool_projects project (no scoped implementation tools, no tool preflight).
+# "claude-haiku" = [
+#   "claude", "-p", "{prompt}", "--model", "claude-haiku-5-5",
+#   "--strict-mcp-config", "--mcp-config", "/Users/you/.config/agent-comms/claude-haiku.mcp.json",
+#   "--permission-mode", "dontAsk",
+#   "--allowedTools=mcp__agent-comms,Read,Grep,Glob,Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr list *)",
+#   "--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*)",
+# ]
 
 # Extra environment variable NAMES passed to a runner, keyed like runners (values come from the
 # dispatcher's environment). Set these in board.local.toml.

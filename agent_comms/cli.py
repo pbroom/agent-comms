@@ -17,7 +17,8 @@ import time
 import webbrowser
 from pathlib import Path
 
-from .config import Settings, create_agent, human_token_file, load_agent_token, read_agents
+from .config import (Settings, agent_mcp_config, agent_token_file, create_agent, human_token_file, load_agent_token,
+                     read_agents, write_private)
 from .core import Board, BoardError, TASK_CATEGORIES
 from .notify import DEFAULT_IDLE_MINUTES, DEFAULT_NOTIFY_EVENTS, NOTIFY_EVENTS
 
@@ -110,6 +111,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--runtime", required=True, help="e.g. claude-code, codex-cli, chatgpt, grok")
     s.add_argument("--human", action="store_true")
     s.add_argument("--rotate", action="store_true", help="issue a new token for an existing agent")
+    s.add_argument("--save-token", action="store_true",
+                   help="write the token to ~/.config/agent-comms/<name>.token (mode 600; the file `board mcp --agent "
+                        "<name>` reads) instead of printing it")
+    s = sub.add_parser("mcp-config", help="write a Claude Code MCP config that signs in as this agent, for a "
+                                          "dispatcher runner's --strict-mcp-config --mcp-config (no secrets in it)")
+    s.add_argument("--agent", required=True, help="an existing non-human agent, e.g. claude-haiku")
+    s.add_argument("--out", help="where to write it (default ~/.config/agent-comms/<agent>.mcp.json)")
+    s.add_argument("--force", action="store_true", help="replace an existing file")
     sub.add_parser("agents", help="list agents")
 
     s = sub.add_parser("read", help="show unread posts (everything, as the human)")
@@ -505,8 +514,32 @@ def _run(a, out) -> None:
         print("Next: board create-agent claude --runtime claude-code   (one per agent)")
         return
     if a.cmd == "create-agent":
+        if a.save_token:
+            if a.human:
+                raise SystemExit("--save-token is for agents; `board init` saves the human token")
+            f = agent_token_file(a.name)
+            if (f.exists() or f.is_symlink()) and not a.rotate:
+                raise SystemExit(f"{f} already exists; pass --rotate to replace the agent's token")
         token = create_agent(settings.agents_path, a.name, a.runtime, a.human, a.rotate)
+        if a.save_token:
+            write_private(f, token + "\n", overwrite=a.rotate)
+            print(f"Agent {a.name!r} ({a.runtime}). Token saved to {f} (mode 600); `board mcp --agent {a.name}` "
+                  "reads it.")
+            return
         print(f"Agent {a.name!r} ({a.runtime}). Token (shown once, store it in that agent's MCP config):\n{token}")
+        return
+    if a.cmd == "mcp-config":
+        spec = read_agents(settings.agents_path).get(a.agent)
+        if spec is None or spec.is_human:
+            raise SystemExit(f"no agent {a.agent!r} in {settings.agents_path}: board create-agent {a.agent} "
+                             "--runtime claude-code --save-token")
+        f = Path(a.out).expanduser() if a.out else agent_token_file(a.agent).with_name(f"{a.agent}.mcp.json")
+        write_private(f.absolute(), json.dumps(agent_mcp_config(a.agent), indent=2) + "\n", overwrite=a.force)
+        print(f"Wrote {f.absolute()} (agent-comms signs in as {a.agent!r}). In a runner: \"--strict-mcp-config\", "
+              f"\"--mcp-config\", \"{f.absolute()}\"")
+        if not agent_token_file(a.agent).exists():
+            print(f"Note: {agent_token_file(a.agent)} is missing; create it with "
+                  f"`board create-agent {a.agent} --runtime {spec.runtime} --rotate --save-token`.")
         return
     if a.cmd == "agents":
         for x in read_agents(settings.agents_path).values():

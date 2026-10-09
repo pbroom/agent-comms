@@ -26,6 +26,78 @@ PROMPT = (
 )
 
 
+# A read-only Claude runner (the triage agent's): board tools, reading files and read-only git/gh, with Edit and Write
+# explicitly denied. An opted-in project keeps it as configured (no scoped override, no tool preflight): replacing its
+# tools with ALLOWED would widen it to commits and test runs.
+READ_ONLY_TOOLS = frozenset((
+    "mcp__agent-comms", "Read", "Grep", "Glob",
+    "Bash(git log *)", "Bash(git show *)", "Bash(git status *)", "Bash(git diff *)", "Bash(git rev-parse *)",
+    "Bash(gh pr view *)", "Bash(gh pr list *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
+))
+_READ_ONLY_FORBIDDEN = {"--settings", "--add-dir", "--permission-prompt-tool", "--allow-dangerously-skip-permissions",
+                        "--dangerously-skip-permissions"}
+
+
+def split_tools(value: str) -> list[str]:
+    """A Claude --allowedTools value: names separated by commas or spaces, except inside parentheses."""
+    out, cur, depth = [], "", 0
+    for ch in value:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        if depth == 0 and ch in ", ":
+            if cur:
+                out.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _flag_values(template: list[str], names: set[str]) -> list[str] | None:
+    """Every value given to these flags (`--flag=v` or `--flag v1 v2 ...` up to the next option or {prompt})."""
+    found, i = None, 0
+    while i < len(template):
+        arg = template[i]
+        flag = arg.split("=", 1)[0]
+        i += 1
+        if flag not in names:
+            continue
+        found = found or []
+        if "=" in arg:
+            found.append(arg.split("=", 1)[1])
+            continue
+        while i < len(template) and not template[i].startswith("-") and template[i] != "{prompt}":
+            found.append(template[i])
+            i += 1
+    return found
+
+
+def read_only(template: list[str]) -> bool:
+    """A `claude` runner that declares itself read-only: permission mode dontAsk (exactly), --allowedTools naming only
+    READ_ONLY_TOOLS (or single agent-comms tools), --disallowedTools naming both Edit and Write, and no flag that could
+    add grants or bypass permissions. The explicit Edit/Write denial is the declaration: the shipped claude-code runner
+    (board tools only, nothing denied) is not read-only, so an opted-in project still gives it the scoped tools."""
+    import os
+    if not template or os.path.basename(template[0]) != "claude":
+        return False
+    if any(a.split("=", 1)[0] in _READ_ONLY_FORBIDDEN or "bypass" in a.lower() or "dangerously" in a.lower()
+           for a in template):
+        return False
+    modes = _flag_values(template, {"--permission-mode"})
+    if modes != ["dontAsk"]:
+        return False
+    denied = {t for v in (_flag_values(template, {"--disallowedTools", "--disallowed-tools"}) or [])
+              for t in split_tools(v)}
+    if not {"Edit", "Write"} <= denied:
+        return False
+    tools = [t for v in (_flag_values(template, {"--allowedTools", "--allowed-tools"}) or []) for t in split_tools(v)]
+    return bool(tools) and all(t in READ_ONLY_TOOLS or t.startswith("mcp__agent-comms__") for t in tools)
+
+
 def scoped_template(template: list[str]) -> list[str]:
     """Replace additive broad grants for this opted-in launch; keep existing deny rules."""
     replaced = {"--allowedTools", "--allowed-tools", "--permission-mode"}

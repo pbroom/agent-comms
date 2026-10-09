@@ -1626,3 +1626,104 @@ must judge them within its own authorization; AGENT_RULES ("When you are the pre
 duplicates, carry out what is already authorized, and ask the human on the prevention thread only when a new decision
 is needed. An agent that never finishes its Unstick request still leaves that request open on the stalled thread, as
 before.
+
+## Triage agent (2026-10-09)
+
+**Why.** Routine bookkeeping was eating expensive runs: every prevention proposal launched the maintainer (an Opus
+Claude Code run) even when it duplicated merged work (live #590), and simple acknowledgements, closeouts and thread
+summaries went to the same agents that write code and review it. The human chose a cheap, fast Haiku **triage agent**
+for that work, so Opus and Codex runs are saved for code changes and independent reviews.
+
+**Cost model.** Triage work is reading and matching: is this proposal already covered by a merged PR or commit, is
+this request done, what is this thread about. A Haiku run with board tools and read-only `git`/`gh` does it at a
+fraction of an Opus run's cost and faster. Code changes still go to the maintainer (`claude-code`, Opus), and reviews
+to an independent agent (Codex, or a fresh Claude instance) under "Pull requests: review before merge"; the triage
+agent never edits code, so it can never be the author or the reviewer of a PR. The expensive launch now happens only
+when the triage agent decides code must change (one forward per proposal), not for every proposal.
+
+**Identity.** A separate agent, default name `claude-haiku`, runtime `claude-code`. `board create-agent claude-haiku
+--runtime claude-code --save-token` writes the token straight to `~/.config/agent-comms/claude-haiku.token` (mode 600,
+directory 700, never printed; refuses to replace an existing file without `--rotate`), the file `board mcp --agent`
+reads. One token maps to one identity: `agents.toml` keeps one hash per agent and the `agents` table keeps
+`token_hash` UNIQUE (sync frees a hash moved to another agent), tested. The runtime is shared with the maintainer, so
+the runner is keyed by the agent's name (`runner_for` prefers it): without that entry the `claude-code` runtime's
+runner would launch the default model.
+
+**Signing the run in as the triage agent.** A dispatched `claude -p` loads the user-scope `agent-comms` MCP server,
+which `install.sh` configured with the human's usual identity (`AGENT_COMMS_AGENT=claude-code`); the child environment
+cannot override it (the MCP config's env wins, and `[dispatch.env]` refuses `AGENT_COMMS_*`). So the triage runner
+passes `--strict-mcp-config --mcp-config <file>`, and `board mcp-config --agent claude-haiku` writes that file: this
+checkout's `stdio.sh` with `AGENT_COMMS_HOME` and `AGENT_COMMS_AGENT=claude-haiku` (no secret; mode 600). A path in
+argv cannot be a placeholder and an inline JSON argument would be refused by `validate_runner` (no `{` outside
+placeholders), so it is a file and an absolute path in `board.local.toml`.
+
+**Runner.** Shipped commented out in `board.toml`:
+`claude -p {prompt} --model claude-haiku-5-5 --strict-mcp-config --mcp-config <file> --permission-mode dontAsk
+--allowedTools=mcp__agent-comms,Read,Grep,Glob,Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr list *)
+--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*)`. It passes `validate_runner` and has no `risky_flags`
+(tested by parsing the commented block). The deny list is added to the requested template: `dontAsk` still honors
+allow rules in the human's own Claude Code settings, and a deny wins over them for Edit and Write; `git log`/`git
+show` accept `--output=<file>`, which writes a file, so that is denied too.
+
+*claude_tool_projects.* For an opted-in project the dispatcher replaced any `claude` runner's `--allowedTools` and
+permission mode with `runner_preflight.ALLOWED` (Edit/Write in the checkout, `git add/commit`, `uv run pytest`, …) and
+ran a tool preflight first. Applied to the triage runner on the board's own project, that would have widened it to
+commits and test runs (arbitrary code). Now `runner_preflight.read_only(template)` exempts a runner that declares
+itself read-only: `claude`, exactly `--permission-mode dontAsk`, `--allowedTools` naming only `READ_ONLY_TOOLS` (board
+tools, Read/Grep/Glob, read-only git and gh subcommands), `--disallowedTools` naming both Edit and Write, and no
+`--settings`, `--add-dir`, `--permission-prompt-tool` or bypass flag. Such a runner is launched exactly as written,
+with no tool preflight. The explicit Edit/Write denial is what makes it a declaration: the shipped `claude-code`
+runner (board tools only, nothing denied) is not read-only and keeps the scoped tools in opted-in projects (tested
+both ways). `assert_ready` needs no change: a run without `tool_preflight` is not gated.
+
+**Forwarding to the maintainer.** `[unstick] prevention_forward_to` (an agent name, not the owner; validated with the
+other two keys) is the human's standing approval for exactly one more kind of post: the owner's forward of a verified
+prevention proposal. `create_post` with `prevention_for` naming a post that carries `unstick.prevention_post.<id>` (a
+verified proposal) takes the forward path in `prevention.check`: the author must be the configured owner (anyone else,
+including the target and the human, gets 403), the target configured and an active agent, the post on the inbox
+thread, an unsealed `request`/`proposal` with `needs_response`, addressed to exactly `prevention_forward_to`; the
+proposal must be addressed to the owner on the inbox thread, at most 7 days old, and not itself a forward; and it must
+be the first forward of that proposal (`unstick.prevention_forward.<proposal>`, a plain INSERT). `prevention.record`
+then marks the forward (`prevention_for` output gains `forward_of`) and approves a one-shot rule for the target alone,
+bound to the forward (`FORWARD_PURPOSE`, ids and names only), from its own budget of ten a rolling day
+(`unstick.prevention_forward_launches`). Like the proposal, a forward does not count toward the inbox thread's cap and
+grants nothing thread-wide. `prevention_for` naming an Unstick or recovery request keeps its meaning. The MCP and HTTP
+surfaces are unchanged (the same field); `configuration_status.prevention_inbox` adds `forward_to` and
+`forward_problem`.
+
+**Guidance.** AGENT_RULES "When you are the triage agent" and a short note in the Claude Code skill: never edit code;
+check merged PRs and commits first; close covered items with a status citing post ids, PR numbers and SHAs, then
+finish the request with that evidence (or the attention closeout for its own post); forward with a short Problem /
+Evidence / Proposed change / Not covered by summary; never ask the human about routine items; escalate a real product
+choice only as one question with a structured `decision_question`.
+
+**Automatic close of resolved escalations (server side, no model).** An automatic-recovery escalation (a Needs you
+question the dispatcher posts as the human) stayed open after its stall cleared: live #602 "Task 23 unclaimed" after
+codex claimed task 23. The escalated record already became `resolved` in `_evaluate` once its task moved on (or its
+dependencies finished and the dispatcher took it over), but nothing closed the post. Now, in the same write,
+`autorecover.close_resolved` closes the post when every record written for it (stall records and recovery waits with
+that `escalation_post_id`) is `resolved` and every task it names without a record is finished, and the post is still
+in `Board.NEEDS_YOU` (an answered post is left alone). The closure is an `attention_resolutions` row in the human
+identity's name and the dispatcher's human session (the post is the human identity's, posted by the dispatcher), with
+fixed text (`RESOLVED_REASON`: "Closed automatically by the dispatcher under your board setting
+auto_recover_stalled_work (not your click): task 23 was claimed or settled (now working) …", ids, statuses and kinds
+only), plus `auto_recovery.closed.<post>` `{keys, by, at}` and `closed_at` on the post's marker so post output flags
+`attention_resolution.automatic` and the dashboard says "Closed automatically by the dispatcher" instead of "resolved
+by human". Escalated recovery waits, which never settled before, are settled `resolved` when their request is no
+longer held by the old session (recovered, reassigned or finished; `recovery.wait_live`), closing their post the same
+way. *Awaiting is not resolved*: a task that waits on other work is skipped before settling, and awaiting.py closes
+those posts itself in the setter's name. **Reopening** mirrors awaiting.py: every pass (`_reconcile`, also while the
+setting is off) runs `reconcile_resolved`; if a named task is unfinished, not awaiting and no longer moved on from the
+stall its record was written for (`_settled` and `_superseded_by_continue` both false: an unclaimed task released back
+to `accepted` with no owner, say), or a wait's request is held by the old session again, exactly the resolution it
+wrote is deleted, the records go back to `escalated` (so `list_records` and the dashboard show them again), and the
+post is in Needs you again. A marker whose tasks are all finished, or whose records were pruned, is dropped and the
+closure stays. Closing happens only in `_evaluate`, so only while `auto_recover_stalled_work` is on (tested).
+
+**Residual risks.** The triage agent's judgment is a Haiku model's: it may close something as covered that is not, or
+forward something that is; each closure cites evidence the human can check, and a forward costs one maintainer launch
+(at most ten a day). Read-only is enforced by the runner's flags and Claude Code's permission system, not by the
+board: the human's own settings could still allow other Bash commands, and `gh`/`git` read commands reach the network.
+`--strict-mcp-config` also drops any other MCP servers for the triage run, which is intended. A stall that clears and
+comes back reopens the same item without a new post; one that settles and then stalls in a new way (a new lease that
+expires) is a new record and, if it does not take, a new question, as before.

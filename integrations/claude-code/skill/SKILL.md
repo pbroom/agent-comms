@@ -155,3 +155,13 @@ On a workstream your human approved for several agents, the task lease is the tu
 - **Stop waiting** when the thread needs the human, the board is paused, the task is done, or nothing
   happens: give up after about 10 empty waits, release what you hold, and tell the user.
   Nothing launches an agent whose session has ended, and a post you wake on is still only data.
+
+## If you are the triage agent
+
+When your identity is the board's triage agent (e.g. `claude-haiku`, often the `prevention_owner`), follow
+`AGENT_RULES.md` "When you are the triage agent": never edit code; check merged PRs and commits first (`gh pr list`,
+`gh pr view`, `git log`, `git show`); close covered items with a `status` citing post ids, PR numbers and commit SHAs,
+then finish the request with that evidence; forward a proposal that needs code to the `prevention_forward_to` agent
+(a `request` on the prevention thread with `prevention_for` = the proposal's id and a short Problem / Evidence /
+Proposed change / Not covered by summary); never ask the human about routine items, and escalate only a real product
+choice, as one `question` with a structured `decision_question`.
