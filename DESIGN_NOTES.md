@@ -1405,6 +1405,10 @@ the human handles its Needs you post.
 - *No re-arming (P3).* `_record_wait` carries an earlier wait's `first_recorded_at` forward within a day (unless it
   resolved), and an `escalated` or `suppressed` wait stays so: a new attempt the same day gets `retry: "escalated"`
   with the escalation post id, neither re-arms the retries and the question refusal nor asks the human again.
+  That holds only while the human has not acted on it (second review, P2): after an Unstick that asked this agent on
+  the thread since the escalation, or once the escalation's Needs you post is answered (`recovery._human_acted`), a
+  new transient block starts a fresh wait (`waiting`, new start, retries reset), so the request cannot stall silently
+  for the rest of the day. Each reset needs a human action, so it stays bounded.
 - *Authorization (P3).* A request counts as the human's only when written by hand: the dispatcher's own automatic
   posts (`Board.NOT_AUTOMATIC`) do not, as elsewhere.
 - *One send cap (P3).* Wait relaunches and stall recoveries share `MAX_SENDS_PER_PASS` per pass.

@@ -354,10 +354,15 @@ def _record_wait(board, p, session_id, post_id, recipient, expected_version, old
         # Within a day of the first wait on this request, an earlier wait carries forward: its start (so the 24-hour
         # cap holds) and, once it went to the human (escalated, or suppressed over the escalation cap), that state
         # too, so a new attempt neither re-arms the retries and the question refusal nor asks the human again. A wait
-        # that resolved (the request was recovered) or is older than a day starts afresh; retries always carry.
+        # that resolved (the request was recovered) or is older than a day starts afresh; retries carry otherwise.
+        # Once the human acted on an escalation (Unstick for this agent on the thread since, or its Needs you post is
+        # answered), the human's click is the new go-ahead: a fresh wait with its own retries. Each reset needs a
+        # human action, so this stays bounded.
         first = prev.get('first_recorded_at')
         carried = (prev.get('state') not in (None, 'resolved') and type(first) in (int, float)
                    and now - first < WAIT_WINDOW_SECONDS)
+        if carried and prev.get('state') in ESCALATED and _human_acted(board, prev):
+            carried, prev = False, {}
         wait = {'post_id': post_id, 'recipient': recipient, 'version': row['version'], 'agent': p.name,
                 'thread_id': post['thread_id'], 'old_session': old_id, 'session_id': session_id, 'worktree': path,
                 'blocker': blocker, 'blocker_kind': 'transient', 'state': 'waiting', 'recorded_at': now,
@@ -368,6 +373,21 @@ def _record_wait(board, p, session_id, post_id, recipient, expected_version, old
             wait.update({k: prev[k] for k in ('state', 'reason', 'escalated_at', 'escalation_post_id') if k in prev})
         _put_state(board, key, wait, p.name)
     return wait
+
+
+def _human_acted(board, wait: dict) -> bool:
+    """The human acted on this escalated (or suppressed) wait since it went to them: an Unstick that asked this agent
+    on the thread, or, for an escalation with a post, that post no longer waits in Needs you (answered or handled)."""
+    from . import unstick
+    from .core import Board
+    at = wait.get('escalated_at')
+    if type(at) not in (int, float) or unstick.unstuck_since(board.conn, wait.get('thread_id'), wait.get('agent') or '', at):
+        return True
+    note = wait.get('escalation_post_id')
+    if wait.get('state') == 'escalated':
+        return type(note) is not int or board.conn.execute(
+            f'SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}', (note,)).fetchone() is None
+    return False
 
 
 def _settle_wait(board, post_id, recipient, state, by, reason=None):

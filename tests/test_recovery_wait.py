@@ -244,6 +244,82 @@ def test_the_relaunched_run_recovers_and_settles_the_wait(aenv, tmp_path):
     assert autorecover.list_records(aenv.board, aenv.p["human"]) == []
 
 
+def exhaust_retries(aenv, h):
+    """Three relaunches that each hit the transient block again; the next free pass escalates."""
+    for n in (1, 2, 3):
+        go_quiet(aenv)
+        aenv.d.tick()
+        assert len(wait_of(aenv, h)["retries"]) == n
+        aenv.spawner.children[-1].code = 0
+        fresh = aenv.session("codex", project=h.project)
+        aenv.board.claim_task(aenv.p["codex"], fresh, h.task)
+        aenv.board.heartbeat(aenv.p["claude"], h.peer)
+        with pytest.raises(recovery.RecoveryWait):
+            attempt(aenv, h, fresh)
+        aenv.board.release_task(aenv.p["codex"], fresh, h.task)
+        aenv.d.tick()
+    go_quiet(aenv)
+    aenv.d.tick()
+    wait = wait_of(aenv, h)
+    assert wait["state"] == "escalated"
+    return wait
+
+
+def test_after_the_human_unsticks_an_escalation_a_new_block_retries_again(aenv, tmp_path):
+    """Regression (re-review P2): the human's Unstick on the escalation is a new go-ahead. A transient block after it
+    starts a fresh wait (retry='automatic', retries reset) instead of silently carrying the escalated state."""
+    from agent_comms import resolve
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    escalated = exhaust_retries(aenv, h)
+    out = resolve.resolve(aenv.board, aenv.p["human"], escalated["escalation_post_id"], "choose", None, aenv.config,
+                          option_id="relaunch")
+    assert out["action_result"]["agents"] == ["codex"]
+    assert escalated["escalation_post_id"] not in needs_you(aenv)
+    go_quiet(aenv)
+    aenv.d.tick()                                     # the Unstick's own launch of codex
+    unstick_runs = len(aenv.spawner.calls)
+    fresh = aenv.session("codex", project=h.project)
+    aenv.board.claim_task(aenv.p["codex"], fresh, h.task)
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait) as caught:
+        attempt(aenv, h, fresh)
+    assert caught.value.details["retry"] == "automatic"
+    assert caught.value.details["recovery_wait"]["retries_used"] == 0
+    wait = wait_of(aenv, h)
+    assert wait["state"] == "waiting" and wait["retries"] == [] and wait["first_recorded_at"] > escalated["escalated_at"]
+    assert recovery.active_wait(aenv.board, "codex", h.tid) is not None
+    aenv.board.release_task(aenv.p["codex"], fresh, h.task)
+    for child in aenv.spawner.children:
+        child.code = 0                                # the Unstick's run ends too
+    aenv.d.tick()
+    go_quiet(aenv)
+    aenv.d.tick()
+    wait = wait_of(aenv, h)
+    assert wait["state"] == "relaunched" and len(wait["retries"]) == 1
+    assert len(aenv.spawner.calls) == unstick_runs + 1, "relaunched once the worktree is free"
+
+
+def test_an_escalation_the_human_has_not_handled_stays_escalated(aenv, tmp_path):
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    escalated = exhaust_retries(aenv, h)
+    fresh = aenv.session("codex", project=h.project)
+    aenv.board.claim_task(aenv.p["codex"], fresh, h.task)
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait) as caught:
+        attempt(aenv, h, fresh)
+    assert caught.value.details["retry"] == "escalated"
+    assert wait_of(aenv, h)["escalation_post_id"] == escalated["escalation_post_id"]
+    # Answering its Needs you post in the human's own words also counts as acting on it.
+    aenv.board.create_post(aenv.p["human"], aenv.sid["human"], body="Look at it tomorrow", type="status",
+                           thread_id=h.tid, answer_to=[escalated["escalation_post_id"]])
+    assert escalated["escalation_post_id"] not in needs_you(aenv)
+    with pytest.raises(recovery.RecoveryWait) as caught:
+        attempt(aenv, h, fresh)
+    assert caught.value.details["retry"] == "automatic" and wait_of(aenv, h)["state"] == "waiting"
+
+
 def test_three_retries_a_day_then_one_click_question_to_the_human(aenv, tmp_path):
     h = blocked_handoff(aenv, tmp_path)
     blocked(aenv, h)
