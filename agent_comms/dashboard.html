@@ -1412,15 +1412,22 @@ function threadStatus(t, human) {
     const who = [...working.map(k => `${k.owner_agent} working on task ${k.id}`), ...pending];
     return { kind: "active", label: who.join("; ") };
   }
-  // An open discussion or unresolved shared issue is not proof of processing or completion.
-  if (shared.length) return null;
-  if (projected) return projected.complete ? { kind: "done", label: "All recorded work finished" } : null;
   const recorded = posts.flatMap(p => p.requests || []);
-  if ((recorded.length || t.tasks.length) && recorded.every(r => r.state === "finished")
-      && t.tasks.every(k => ["done", "declined"].includes(k.status))) {
-    return { kind: "done", label: "All recorded work finished" };
+  const ownWorkDone = projected ? !!projected.complete
+    : (recorded.length || t.tasks.length) > 0 && recorded.every(r => r.state === "finished")
+      && t.tasks.every(k => ["done", "declined"].includes(k.status));
+  if (shared.length) {
+    // An open shared issue alone is not proof of processing or completion. But once this thread's own work is
+    // finished and the human has answered every open issue linked to it (for this thread), the thread is done: the
+    // issue stays open, and visible, in the Issues tab until its implementation is marked resolved.
+    const answeredHere = i => (i.decisions || []).some(d => (d.thread_ids || []).includes(t.id));
+    if (ownWorkDone && shared.every(answeredHere)) {
+      const ids = shared.map(i => "#" + i.id).join(", ");
+      return { kind: "done", label: `All recorded work finished; shared issue ${ids} answered (still open in Issues)` };
+    }
+    return null;
   }
-  return null;
+  return ownWorkDone ? { kind: "done", label: "All recorded work finished" } : null;
 }
 
 function statusDot(st) {
