@@ -325,7 +325,64 @@ def test_an_agent_cannot_loop_through_its_own_abandoned_tasks_across_threads(aen
         aenv.d.tick()
     assert aenv.spawner.calls == [], "nothing the human authorized: no launch"
     notes = [p for p in aenv.board.snapshot(aenv.p["human"])["needs_you"]]
-    assert len(notes) == 6 and all("neither you nor a standing grant authorized this work" in p["body"] for p in notes)
+    assert len(notes) == autorecover.ESCALATION_DAILY_CAP == 5, "at most five posts about one agent a day"
+    assert all("neither you nor a standing grant authorized this work" in p["body"] for p in notes)
+    assert sorted(r["state"] for r in records(aenv).values()) == ["escalated"] * 5 + ["suppressed"]
+
+
+def test_thirty_abandoned_threads_give_five_needs_you_posts(aenv):
+    for n in range(30):
+        own_silent_task(aenv, f"flood {n}")
+    aenv.clock.advance(PAST_GRACE)
+    for _ in range(10):
+        aenv.d.tick()
+    assert aenv.spawner.calls == []
+    assert len(aenv.board.snapshot(aenv.p["human"])["needs_you"]) == 5
+    states = [r["state"] for r in records(aenv).values()]
+    assert states.count("escalated") == 5 and states.count("suppressed") == 25
+    # Suppressed stalls get no dashboard record (the plain stalled labels show them), and nothing is posted later.
+    assert len(autorecover.list_records(aenv.board, aenv.p["human"])) == 5
+    aenv.clock.advance(60)
+    aenv.d.tick()
+    assert len(aenv.board.snapshot(aenv.p["human"])["needs_you"]) == 5
+    # The cap is per rolling day and is pruned with the budgets.
+    aenv.clock.advance(autorecover.BUDGET_WINDOW_SECONDS)
+    autorecover.prune(aenv.board, force=True)
+    assert not aenv.board.conn.execute("SELECT 1 FROM board_state WHERE key LIKE 'auto_recovery.escalations.%'").fetchone()
+
+
+def test_the_escalation_cap_is_rechecked_inside_the_transaction(aenv, monkeypatch):
+    own_silent_task(aenv, "one")
+    aenv.clock.advance(PAST_GRACE)
+    real = autorecover._escalations_left
+    calls = {"n": 0}
+
+    def spent_on_recheck(conn, agent, now):
+        calls["n"] += 1
+        return calls["n"] == 1 and real(conn, agent, now)    # free at the scan, spent by the time of the write
+    monkeypatch.setattr(autorecover, "_escalations_left", spent_on_recheck)
+    aenv.d.tick()
+    assert aenv.board.snapshot(aenv.p["human"])["needs_you"] == []
+
+
+def test_only_a_human_request_to_the_agent_before_the_claim_authorizes_a_launch(aenv):
+    def thread_with(post_kw):
+        sid = aenv.session("codex")
+        tid = aenv.board.create_thread(aenv.p["codex"], sid, "t", PROJECT)["id"]
+        if post_kw:
+            aenv.post("human", tid, "hello", **post_kw)
+        aenv.clock.advance(1)
+        task = aenv.board.create_task(aenv.p["codex"], sid, tid, title="t")["id"]
+        aenv.board.claim_task(aenv.p["codex"], sid, task)
+        return tid
+    status = thread_with({"type": "status"})
+    other = thread_with({"type": "request", "to": ["claude"]})
+    asked = thread_with({"type": "handoff", "to": ["codex"]})
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    by_thread = {r["thread_id"]: r["state"] for r in records(aenv).values()}
+    assert by_thread == {status: "escalated", other: "escalated", asked: "sent"}
+    assert len(aenv.spawner.calls) == 1
 
 
 def test_a_human_post_before_the_claim_authorizes_the_abandoned_launch(aenv):

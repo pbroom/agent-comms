@@ -222,7 +222,7 @@ asked for.
 
 There is at most one automatic attempt per stall, two per agent per thread and six per agent a day. If it does not
 take, the human is told and decides what happens next. Work the human never authorized (a task you proposed and
-accepted or claimed yourself, on a thread where the human had not posted), a `blocked` task, or a thread that
+accepted or claimed yourself, on a thread where the human had not sent you a request or handoff), a `blocked` task, or a thread that
 already waits on the human goes to the human, not to an automatic launch: don't rely on the dispatcher to clean up
 after you.
 
