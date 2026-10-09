@@ -567,3 +567,99 @@ def test_a_declined_dependency_asks_to_remove_it_before_claiming(aenv):
     marker = aenv.board.conn.execute("SELECT value FROM board_state WHERE key = ?",
                                      (autorecover.POST_PREFIX + str(post["id"]),)).fetchone()[0]
     assert json.loads(marker)["kind"] == "continue"
+
+
+# ---------------------------------------------------------------- re-review: nobody asked, missed reconciles
+
+
+def silent_blocked_owner(env):
+    """The human's task #1: codex claims it, blocks it and goes silent; automatic recovery tells the human (a blocked
+    task goes to the human, not to a launch). codex, the expired owner, then makes it wait on claude's task, which
+    closes that escalation. Returns (task, escalation post, claude's task)."""
+    task = env.accepted_task(env.tid, title="TASK " + INJECTION)
+    sid = env.session("codex")
+    env.board.claim_task(env.p["codex"], sid, task)
+    env.board.transition_task(env.p["codex"], sid, task, "blocked")
+    env.clock.advance(PAST_GRACE)
+    env.d.tick()
+    [note] = auto_posts(env)
+    assert note["id"] in needs_you(env) and env.spawner.calls == []
+    theirs = own_task(env, agent="claude")
+    out = env.board.update_task(env.p["codex"], sid, task, depends_on=[theirs])
+    assert out["closed_escalation_post_ids"] == [note["id"]] and note["id"] not in needs_you(env)
+    return task, note, theirs
+
+
+def finish_theirs(env, theirs, status="done"):
+    if status == "done":
+        env.board.claim_task(env.p["claude"], env.sid["claude"], theirs)
+    env.board.transition_task(env.p["claude"], env.sid["claude"], theirs, status)
+
+
+def test_the_expired_owner_is_asked_when_the_creator_is_the_human(aenv):
+    task, note, theirs = silent_blocked_owner(aenv)
+    finish_theirs(aenv, theirs)
+    assert note["id"] not in needs_you(aenv), "pending: the dispatcher decides on its next pass"
+    aenv.clock.advance(5 * 60)
+    aenv.d.tick()
+    [req] = [p for p in auto_posts(aenv) if p["type"] == "request"]
+    assert req["to"] == ["codex"] and f"Task {task}'s dependencies are finished; continue it." in req["body"]
+    assert aenv.spawner.agents() == ["codex-cli-fake"]
+    assert note["id"] not in needs_you(aenv), "taken over by the request to continue"
+    aenv.d.tick()
+    stall = [r for r in records(aenv).values() if r["kind"] == "abandoned"]
+    assert [r["state"] for r in stall] == ["resolved"]
+
+
+@pytest.mark.parametrize("why", ["no_runner", "inactive"])
+def test_nobody_to_ask_reopens_the_escalation(aenv, monkeypatch, why):
+    task, note, theirs = silent_blocked_owner(aenv)
+    if why == "no_runner":
+        monkeypatch.setattr(aenv.d, "_runner", lambda agent: None)
+    else:
+        aenv.board.conn.execute("UPDATE agents SET active = 0 WHERE name = 'codex'")
+    finish_theirs(aenv, theirs)
+    aenv.clock.advance(5 * 60)
+    aenv.d.tick()
+    assert aenv.spawner.calls == [] and [p for p in auto_posts(aenv) if p["type"] == "request"] == []
+    assert note["id"] in needs_you(aenv), "the escalation is back: nobody was asked to continue"
+    gen = awaiting.state(aenv.board.conn, task)["generation"]
+    assert awaiting.continue_record(aenv.board.conn, task, gen)["state"] == "none"
+    stall = [r for r in records(aenv).values() if r["kind"] == "abandoned"]
+    assert [r["state"] for r in stall] == ["escalated"], "the stall record is not resolved"
+    if why == "no_runner":
+        assert [r["task_id"] for r in autorecover.list_records(aenv.board, aenv.p["human"])] == [task]
+    for _ in range(2):
+        aenv.clock.advance(LEASE)
+        aenv.d.tick()
+    assert note["id"] in needs_you(aenv) and len(auto_posts(aenv)) == 1, "no churn"
+
+
+def test_switched_off_recovery_reopens_a_satisfied_closure(aenv):
+    task, note, theirs = silent_blocked_owner(aenv)
+    aenv.board.s.auto_recover_stalled_work = False
+    finish_theirs(aenv, theirs)
+    assert note["id"] not in needs_you(aenv)
+    aenv.d.tick()
+    assert note["id"] in needs_you(aenv) and aenv.spawner.calls == []
+
+
+def test_a_declined_dependency_that_ends_the_wait_unsatisfied_reopens_at_once(aenv):
+    task, note = escalated_task(aenv)
+    theirs, mine = own_task(aenv, agent="claude"), own_task(aenv)
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[theirs, mine])
+    assert note["id"] not in needs_you(aenv)
+    finish_theirs(aenv, theirs, status="declined")      # mine does not count and is unfinished: not satisfied
+    assert not awaiting.awaits(aenv.board.conn, task) and not awaiting.satisfied(aenv.board.conn, task)
+    assert note["id"] in needs_you(aenv), "reopened by the transition itself, without a dispatcher pass"
+
+
+def test_the_dispatcher_pass_is_a_backstop(aenv):
+    task, note = escalated_task(aenv)
+    other, fix = other_task(aenv)
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    # A change no reconcile hook sees (here: the thread closed behind the board's back).
+    aenv.board.conn.execute("UPDATE threads SET status = 'closed' WHERE id = ?", (other,))
+    assert note["id"] not in needs_you(aenv)
+    aenv.d.tick()
+    assert note["id"] in needs_you(aenv)

@@ -306,7 +306,12 @@ def tick(board: Board, human: Principal, *, runner_for: Callable[[str], Any], fe
     """One pass, called by the dispatcher loop that owns the board, after its own pause check. Prunes (hourly), checks
     earlier recoveries (settled, or escalated to the human), then sends new ones. Returns what it did (ids only)."""
     board._require_human(human, "run automatic recovery")
-    if not enabled(board) or board.is_paused() or not _owner_ok(board.conn, fence):
+    if board.is_paused() or not _owner_ok(board.conn, fence):
+        return {"sent": [], "escalated": []}
+    if not enabled(board):
+        # Switched off: no request to continue will come, so escalations closed for tasks whose dependencies finished
+        # come back now (and any whose wait was dropped).
+        _reconcile(board, no_continue=True)
         return {"sent": [], "escalated": []}
     try:
         prune(board)
@@ -317,7 +322,16 @@ def tick(board: Board, human: Principal, *, runner_for: Callable[[str], Any], fe
     escalated = _evaluate(board, human, fence, live_seconds, budget)
     sent = _detect_and_send(board, human, runner_for, fence, budget)
     waits = _process_waits(board, human, runner_for, fence, live_seconds, budget)
+    _reconcile(board)   # the backstop: any closure whose task stopped awaiting is checked every pass
     return {"sent": sent, "escalated": escalated, "retried": waits["retried"], "wait_escalated": waits["escalated"]}
+
+
+def _reconcile(board: Board, no_continue: bool = False) -> None:
+    try:
+        with db.write_tx(board.conn) as c:
+            awaiting.reconcile_closures(board, c, board.now(), no_continue=no_continue)
+    except Exception:
+        log.exception("could not reconcile closed escalations")
 
 
 def _held_requests(conn, session_id: int | None, thread_id: int) -> list:
@@ -416,10 +430,13 @@ def _satisfied_at(conn, deps: list[int]) -> float | None:
 
 
 def _continue_item(board: Board, key: str, value: str, runner_for, now: float,
-                   at_cap) -> tuple[dict, str | None] | None:
-    """(item, reason to go straight to the human or None) for a task whose dependencies just finished, or None.
-    Only a depends_on set while a dependency was unfinished counts (awaiting.STATE_PREFIX `waiting`), once per
-    generation; the satisfaction must be recent (MAX_STALL_AGE_SECONDS)."""
+                   at_cap) -> tuple[dict, str | None] | tuple[str, dict] | None:
+    """(item, reason to go straight to the human or None) for a task whose dependencies just finished, or None when
+    there is nothing to do. Only a depends_on set while the task was awaiting counts (awaiting.STATE_PREFIX
+    `waiting`), once per generation. When the dependencies finished but nobody can be asked (too old, closed thread,
+    no agent, no runner, at the post cap, unstuck since), it returns ("none", record): the caller records that, so
+    the escalation closed while the task waited comes back (awaiting.reconcile_closures) instead of staying closed
+    with nobody asked."""
     conn = board.conn
     try:
         rec = json.loads(value)
@@ -437,21 +454,33 @@ def _continue_item(board: Board, key: str, value: str, runner_for, now: float,
     ckey = continue_key(task_id, rec["generation"])
     if _get(conn, ckey) is not None:
         return None     # this satisfaction was already handled
+    def cannot(why: str, agent: str | None = None) -> tuple[str, dict]:
+        return "none", {"kind": "continue", "key": ckey, "task_id": task_id, "thread_id": task["thread_id"],
+                        "agent": agent, "generation": rec["generation"], "state": "none", "reason": why}
+
     satisfied = _satisfied_at(conn, deps)
     if satisfied is None or satisfied < now - MAX_STALL_AGE_SECONDS:
-        return None
+        return cannot("its dependencies finished more than 24 hours ago")
     thread = conn.execute("SELECT status FROM threads WHERE id = ?", (task["thread_id"],)).fetchone()
     if thread is None or thread["status"] != "open" or workstreams.get_for_task(board, task_id) is not None:
-        return None
+        return cannot("its thread is closed")
+    # Who continues it: the owner while it holds a live lease, else the creator, else (the creator is the human or
+    # inactive) the owner whose lease expired, as abandoned-work recovery would.
+    def usable(name):
+        row = conn.execute("SELECT active, is_human FROM agents WHERE name = ?", (name,)).fetchone() if name else None
+        return row is not None and row["active"] and not row["is_human"]
     live_owner = (task["owner_agent"] is not None and task["lease_expires_at"] is not None
                   and task["lease_expires_at"] > now)
-    agent = task["owner_agent"] if live_owner else task["created_by"]
-    identity = conn.execute("SELECT active, is_human FROM agents WHERE name = ?", (agent,)).fetchone()
-    if identity is None or not identity["active"] or identity["is_human"]:
-        return None     # the human (or an inactive agent) continues it: nothing to launch
-    if runner_for(agent) is None or at_cap(task["thread_id"]) or _unstuck_since(conn, task["thread_id"], agent,
-                                                                                  satisfied):
-        return None
+    agent = next((a for a in ([task["owner_agent"]] if live_owner else [task["created_by"], task["owner_agent"]])
+                  if usable(a)), None)
+    if agent is None:
+        return cannot("no active agent owns or created it")
+    if runner_for(agent) is None:
+        return cannot(f"no runner is configured for {agent}", agent)
+    if at_cap(task["thread_id"]):
+        return cannot("the thread is at its agent-post cap", agent)
+    if _unstuck_since(conn, task["thread_id"], agent, satisfied):
+        return cannot("you unstuck the thread since", agent)
     item = {"kind": "continue", "key": ckey, "task_id": task_id, "thread_id": task["thread_id"], "agent": agent,
             "owner_session": task["owner_session"], "task_status": task["status"],
             "lease_expires_at": task["lease_expires_at"], "generation": rec["generation"], "depends_on": deps,
@@ -504,14 +533,30 @@ def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str],
         if out is not None:
             found.append(out)
     # Continuations: tasks set to wait on other work whose last dependency is now done or declined.
+    nobody: list[dict] = []
     for key, value in _keys(conn, awaiting.STATE_PREFIX).fetchall():
         try:
             out = _continue_item(board, key, value, runner_for, now, at_cap)
         except Exception:
             log.exception("automatic continuation skipped %s", key)
             continue
-        if out is not None:
+        if out is not None and out[0] == "none":
+            nobody.append(out[1])
+        elif out is not None:
             found.append(out)
+    if nobody:
+        # Recorded in one write (fenced): nobody can be asked to continue these, so the escalations closed while they
+        # waited come back right away.
+        try:
+            with db.write_tx(conn) as c:
+                if _owner_ok(c, fence) and not board.is_paused() and enabled(board):
+                    for rec in nobody:
+                        if _get(c, rec["key"]) is None:
+                            _insert(c, rec["key"], {k: v for k, v in rec.items() if k != "key"} | {"sent_at": None,
+                                                                                               "recorded_at": now}, now)
+                    awaiting.reconcile_closures(board, c, now)
+        except Exception:
+            log.exception("could not record continuations nobody can take")
 
     # One item per task: a continuation (its dependencies just finished) is the more precise event, so it wins over
     # an expired lease or an unclaimed task found for the same task in this pass.
@@ -665,13 +710,26 @@ def _settled(rec: dict, task) -> bool:
 
 
 def _superseded_by_continue(conn, rec: dict, task) -> bool:
-    """The task's dependencies, set after this stall record, have all finished: the automatic request to continue
-    it (a "continue" record) takes over, so the older stall record is settled rather than escalated again."""
+    """The task's dependencies, set after this stall record, have all finished AND the dispatcher has taken it over
+    for that generation (a request to continue it, or a new question to the human): the older stall record is
+    settled rather than escalated again. Without such a record (none yet, nobody could be asked, or suppressed) the
+    stall record keeps its ordinary course."""
     if rec.get("kind") == "continue" or task is None or not awaiting.satisfied(conn, task["id"], task):
         return False
     st = awaiting.state(conn, task["id"]) or {}
+    took = awaiting.continue_record(conn, task["id"], st.get("generation"))
+    if took is None or took.get("state") not in awaiting.CONTINUE_TAKES_OVER:
+        return False
     at = st.get("set_at")
     return type(at) in (int, float) and at >= (rec.get("escalated_at") or rec.get("sent_at") or 0)
+
+
+def _continue_pending(conn, task) -> bool:
+    """The task's dependencies just finished and the dispatcher has not decided yet whether it can ask anyone to
+    continue it: its stall record waits for this pass's decision instead of escalating first."""
+    if task is None or not awaiting.satisfied(conn, task["id"], task):
+        return False
+    return awaiting.continue_record(conn, task["id"], (awaiting.state(conn, task["id"]) or {}).get("generation")) is None
 
 
 def _launched_at(board: Board, post_id: int, agent: str) -> float | None:
@@ -715,8 +773,8 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
             continue
         try:
             task = conn.execute("SELECT * FROM tasks WHERE id = ?", (rec["task_id"],)).fetchone()
-            if awaiting.awaits(conn, rec["task_id"]):
-                continue    # awaiting other work: neither settled nor escalated; it resumes if the wait is dropped
+            if awaiting.awaits(conn, rec["task_id"]) or (rec.get("kind") != "continue" and _continue_pending(conn, task)):
+                continue    # awaiting other work, or about to be continued: neither settled nor escalated yet
             if _settled(rec, task) or _superseded_by_continue(conn, rec, task):
                 settled.append((key, rec | {"state": "recovered" if rec["state"] == "sent" else "resolved",
                                             "resolved_at": now}))

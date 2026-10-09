@@ -2071,11 +2071,18 @@ class Board:
             if status in ('done','declined'):
                 from . import issues
                 issues.reconcile_completed(self,p,session_id,t['thread_id'])
-        note_event = ("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
+            # A status change can end another task's wait on this one (finished, declined) or this task's own: an
+            # escalation closed while it waited comes back unless the wait ended in a request to continue
+            # (awaiting.reconcile_closures; the dispatcher's pass is the backstop).
+            from . import awaiting
+            reopened = awaiting.reconcile_closures(self, c, now)
+        notes = [("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})]
+        notes += [("attention.reopened", {"post_id": i}) for i in reopened]
         if _notes is not None:
-            _notes.append(note_event)
+            _notes.extend(notes)
         else:
-            self._notify(*note_event)
+            for event, payload in notes:
+                self._notify(event, payload)
         out = self.get_task(p, task_id, events=False)
         if status == "done" and not p.is_human:
             out.update(self._leftover_tasks(p.name, t["thread_id"], task_id))

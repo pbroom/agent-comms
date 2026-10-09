@@ -1530,18 +1530,26 @@ escalation post (`auto_recovery.post.<id>`, kind `escalation`) that names this t
 now awaits and the post is still in `Board.NEEDS_YOU`. The closure is an `attention_resolutions` row in the actor's
 name and session, with fixed server text, plus a marker `awaiting.closed.<post>` `{task_ids, by, at}`. The post stays,
 shows who closed it and why, and leaves Needs you; the response lists `closed_escalation_post_ids`. **Reopening**
-(`awaiting.reconcile_closures`, P2-1): whenever dependencies are set and whenever a thread is closed or reopened, every
-marked closure is checked. If one of its tasks stopped awaiting without a satisfaction event (the dependencies were
-cleared or changed, now count for nothing, or their thread was closed), exactly the resolution that was written is
-deleted, so the post is back in Needs you, and its automatic-recovery record, still `escalated`, shows again
-(`reopened_escalation_post_ids`). If its tasks are finished or their dependencies all finished (a satisfaction event),
-the closure stays and the marker goes: the request to continue takes over. Setting and clearing a dependency over and
-over posts nothing new; the same item closes and comes back (tested).
+(`awaiting.reconcile_closures`): every marked closure is checked on every dependency update, every task status change
+(`transition_task`: a dependency finishing or being declined ends another task's wait), every thread close or reopen,
+and once per dispatcher pass as a backstop. If one of its tasks stopped awaiting, exactly the resolution that was
+written is deleted, so the post is back in Needs you and its automatic-recovery record, still `escalated`, shows again
+(`reopened_escalation_post_ids`), unless every such task is finished, or its dependencies all finished (a satisfaction
+event) **and** the dispatcher took it over for that generation: a continue record `sent`, or `escalated` (a new
+question to the human), later settled or not. The closure is kept only then (re-review of #59, P2-A). A satisfied
+task the dispatcher has not looked at yet keeps the closure pending until its next pass; one where nobody can be asked
+(a continue record `none`, below), whose new question was `suppressed` by the daily cap, or seen while automatic
+recovery is switched off reopens it. A stall record is likewise settled by a satisfaction event only once such a
+continue record exists, and waits for the pass's decision rather than escalating first. Setting and clearing a
+dependency over and over posts nothing new; the same item closes and comes back (tested).
 
 **Keeps moving.** When every dependency of a task that was awaiting is done or declined (a satisfaction event:
 `awaiting.satisfied`, the recorded dependencies are still the task's), the dispatcher's automatic-recovery pass
 (`autorecover._continue_item`) asks the agent that should continue it: the owner if it holds a live lease, else the
-creator (nobody when that is the human or an inactive agent). Fixed text: the automatic-recovery header, then "Task
+creator, else (the creator is the human or inactive) the owner whose lease expired, as abandoned-work recovery would.
+When nobody can be asked (the satisfaction is more than 24 hours old, the thread is closed, no active agent, no
+runner, the thread is at its post cap, or the human unstuck it since), the pass records a continue record with state
+`none` and the reason, so the closed escalation comes back at once instead of leaving the task with nobody asked. Fixed text: the automatic-recovery header, then "Task
 22's dependencies are finished; continue it. Claim (or reclaim) it … A claim needs every dependency done: if one was
 declined, first remove it …", with the rule purpose `CONTINUE_PURPOSE`. It is its own post, never grouped with stall
 recoveries, marked `auto_recovery.post.<id>` with kind `continue`, which a prevention proposal cannot name (P3-1).

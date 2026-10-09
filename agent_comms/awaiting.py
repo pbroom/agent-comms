@@ -18,8 +18,12 @@ finished, and must not wait (directly or through others) on this task. When the 
 to wait this way is done or declined (a *satisfaction event*), the dispatcher asks the agent that should continue it
 (autorecover._continue_item), once per STATE_PREFIX generation.
 
-Closed escalations come back: if a task stops awaiting without a satisfaction event (its dependencies were cleared or
-changed, or a blocking thread was closed), every escalation closed for it is reopened (reconcile_closures).
+Closed escalations come back: if a task stops awaiting (its dependencies were cleared, changed, declined or closed
+away), every escalation closed for it is reopened (reconcile_closures), unless its dependencies all finished and the
+dispatcher took the task over for that generation (a request to continue it, or a new question to the human). If
+nobody can be asked to continue it, or automatic recovery is switched off, the escalation comes back too.
+reconcile_closures runs on every dependency update, task status change and thread close or reopen, and once per
+dispatcher pass as a backstop.
 
 Only ids, statuses and agent names are read here, plus a dependency's title for the dashboard's tooltip (rendered as
 text). Nothing an agent wrote reaches a post, a rule purpose or a launch prompt.
@@ -305,12 +309,34 @@ def _bump(c, post_id: int, now: float) -> None:
     c.execute("UPDATE posts SET seq = ?, revised_at = ? WHERE id = ?", (seq, now, post_id))
 
 
-def reconcile_closures(board: Board, c, now: float) -> list[int]:
-    """Inside a write: reopen every escalation this module closed whose tasks no longer all await, unless the tasks
-    that stopped awaiting did so through a satisfaction event (their dependencies finished: the dispatcher's request
-    to continue takes over) or are finished. Reopening deletes exactly the resolution written when it was closed, so
-    the post is back in Needs you and its automatic-recovery record (still `escalated`) shows again. A closure whose
-    tasks are all finished or satisfied is kept and its marker dropped. Returns the reopened post ids."""
+CONTINUE_TAKES_OVER = ("sent", "escalated", "recovered", "resolved")   # continue-record states that answer a closure
+
+
+def continue_record(c, task_id: int, generation: Any) -> dict | None:
+    """The dispatcher's record of the request to continue this task for this depends_on generation
+    (autorecover.CONTINUE_PREFIX), or None while there is none."""
+    if type(generation) is not int:
+        return None
+    row = c.execute("SELECT value FROM board_state WHERE key = ?",
+                    (f"auto_recovery.continue.{int(task_id)}.{generation}",)).fetchone()
+    try:
+        value = json.loads(row["value"]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def reconcile_closures(board: Board, c, now: float, *, no_continue: bool = False) -> list[int]:
+    """Inside a write: reopen every escalation this module closed whose tasks no longer all await, unless each task
+    that stopped awaiting is finished, or its dependencies finished (a satisfaction event) AND the dispatcher has taken
+    it over with a request to continue it (or a new question to the human) for that generation. A satisfied task with
+    no continue record yet keeps the closure pending (the dispatcher's next pass decides); one whose continue record
+    says nobody can be asked (`none`) or whose question was suppressed reopens it, as does every satisfied task when
+    `no_continue` (automatic recovery is switched off, so no request will come). Reopening deletes exactly the
+    resolution written when it was closed, so the post is back in Needs you and its automatic-recovery record (still
+    `escalated`) shows again. A closure whose tasks are all finished or taken over is kept and its marker dropped.
+    Called from set_dependencies, every task status change, thread close/reopen, and each dispatcher pass. Returns
+    the reopened post ids."""
     lo, hi = CLOSED_PREFIX, CLOSED_PREFIX[:-1] + chr(ord(CLOSED_PREFIX[-1]) + 1)
     reopened = []
     for key, value in c.execute("SELECT key, value FROM board_state WHERE key >= ? AND key < ?", (lo, hi)).fetchall():
@@ -324,7 +350,16 @@ def reconcile_closures(board: Board, c, now: float) -> list[int]:
         settled, back = True, False
         for i in task_ids:
             row = c.execute("SELECT * FROM tasks WHERE id = ?", (i,)).fetchone()
-            if row is None or row["status"] in TERMINAL or satisfied(c, i, row):
+            if row is None or row["status"] in TERMINAL:
+                continue
+            if satisfied(c, i, row):
+                rec = continue_record(c, i, (state(c, i) or {}).get("generation"))
+                if rec is not None and rec.get("state") in CONTINUE_TAKES_OVER:
+                    continue
+                if rec is not None or no_continue:
+                    back = True
+                else:
+                    settled = False     # pending: the dispatcher has not looked at it yet
                 continue
             if awaits(c, i):
                 settled = False
