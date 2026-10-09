@@ -459,6 +459,10 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
         for key, t in sorted(config.runners.items()):
             if warning := dispatch.codex_approval_reminder(t):
                 print(f"note (runner {key}): {warning}", file=sys.stderr)
+        hb = config.headless_browser
+        for key in hb.runners:
+            print(f"runner {key}: browser-bound requests get a scoped headless browser ({hb.command} "
+                  f"{' '.join(hb.args)}, {hb.browser}, bound origins only)", file=sys.stderr)
         if not config.runners:
             print("no runners configured in [dispatch.runners] (board.toml / board.local.toml): nothing will be "
                   "launched", file=sys.stderr)

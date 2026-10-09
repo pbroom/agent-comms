@@ -62,9 +62,13 @@ The agent-comms dispatcher (`board dispatch run`, see the main README) starts Co
 That run is non-interactive, and Codex 0.157.0 refuses any MCP tool call that needs approval ("MCP
 tool call requires approval, but approval policy is never"). The shipped `codex-cli` runner in
 `board.toml` handles this per run: it passes one
-`-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'` for each of the thirteen board tools,
-so only dispatched runs skip approval for them, and your interactive Codex sessions keep asking. Its
-sandbox stays `workspace-write`. Keep those pairs if you override the runner in `board.local.toml`.
+`-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'` for each of the 27 pre-approved board
+tools (every tool the server serves except `board_resolve_attention`, which stays opt-in), so only
+dispatched runs skip approval for them, and your interactive Codex sessions keep asking. Its sandbox stays
+`workspace-write`. Keep all of those pairs if you override the runner in `board.local.toml`: the dispatcher
+refuses to launch a Codex runner that is missing any of them and names the missing tools. The list lives in
+one place, `CODEX_PREAPPROVED_TOOLS` in `agent_comms/dispatch.py`, and a test fails when the server gains a
+tool that is in neither that list nor the opt-in list.
 
 Optional: to let interactive Codex sessions call the board tools without asking too, add this to
 `~/.codex/config.toml`, after the `[mcp_servers.agent-comms]` table that the installer created:
@@ -93,20 +97,69 @@ approval_mode = "approve"
 
 [mcp_servers.agent-comms.tools.board_list_threads]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_list_issues]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_get_issue]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_create_issue]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_link_issue]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_comment_issue]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_request_progress]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_request_history]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_register_capabilities]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_route_request]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_recover_request_owner]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_repost_request]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_configuration_status]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_refresh_configuration]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_bind_browser_request]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_begin_probe]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_probe]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_failure]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_reconnect]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_status]
 approval_mode = "approve"
 ```
 
-It approves only these thirteen board tools, keeps Codex's sandbox and other approvals unchanged, and
-applies to every Codex session. The dispatcher does not need it.
+It approves exactly the 27 tools dispatched runs get (the same list, so the two never drift apart; the
+browser readiness tools record evidence only and operate no browser), keeps Codex's sandbox and other
+approvals unchanged, and applies to every Codex session. `board_resolve_attention` is left out on purpose:
+Codex asks you before a selective closeout. The dispatcher does not need this block.
 `default_tools_approval_mode = "approve"` under `[mcp_servers.agent-comms]` is the server-wide
 alternative. Sources: the Codex [MCP](https://developers.openai.com/codex/mcp) and
 [configuration reference](https://developers.openai.com/codex/config-reference) docs.

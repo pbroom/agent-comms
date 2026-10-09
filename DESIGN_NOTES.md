@@ -353,7 +353,7 @@ told*:
   whole argv elements and shells or re-parsing wrappers are refused as the executable. A runner is
   looked up by agent name, then by the agent's runtime; the shipped defaults are keyed by runtime
   (`codex-cli`, `claude-code`) and keep each CLI's own guardrails on: `codex exec --sandbox
-  workspace-write` (plus per-run approvals for the eight board tools only) and `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`.
+  workspace-write` (plus per-run approvals for the pre-approved board tools only; see "Codex tool approvals" below) and `claude -p --permission-mode dontAsk --allowedTools=mcp__agent-comms`.
   Per-machine choices (e.g. `acceptEdits`) go in the gitignored `board.local.toml`, which
   `Settings.load()` merges over `board.toml` (tables merge per key; lists such as runners replace). Bypass flags are the human's
   opt-in, and `board dispatch run` warns about them. An agent without a runner is never launched.
@@ -371,12 +371,70 @@ database. Records and the pending set live in `board_state` (`dispatch.run.<id>`
 so they are visible to the human but not tamper-proof. If the dispatcher process is killed outright,
 its children keep running unwatched until the next `run` adopts them as orphans (counted, and timed
 out when verified) or `stop` terminates them; in between, nothing enforces their timeout. `codex exec`
-cannot approve MCP calls, so the shipped Codex runner approves the eight board tools for that run
+cannot approve MCP calls, so the shipped Codex runner approves the pre-approved board tools for that run
 only (`-c mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"`); a dispatched Codex can
 therefore post and claim without asking, within the board's caps, while interactive Codex sessions
 keep asking. The overrides assume the MCP server is named `agent-comms`. The timeout still applies while the board is paused. With the runtime fallback, the CLI
 that starts signs in as the identity in its own MCP config; if two identities share a runtime, give each
 its own runner under its agent name so the right one is launched.
+
+### Codex tool approvals and a headless browser for dispatched runs (2026-10-08)
+
+**Why dispatched Codex runs stalled.** `codex exec` (Codex 0.157) refuses any MCP tool call that needs approval
+("MCP tool call requires approval, but approval policy is never"). The codex-cli runner approved board tools one
+by one from two hand-kept lists, and tools added later were never added to them: all six browser readiness tools
+(served from `browser_mcp.py`), `board_recover_request_owner`, `board_repost_request` and the two configuration
+tools. A dispatched run therefore died at its required browser-binding preflight. The drift test regex-scanned
+`mcp_server.py` only, so it could not see the tools `browser_mcp.py` serves.
+
+**One source of truth.** `dispatch.CODEX_PREAPPROVED_TOOLS` and `dispatch.CODEX_OPT_IN_TOOLS` classify every tool
+the server serves. The test builds the real MCP server (both transports, `browser_mcp.install` included), lists
+what it serves, and requires every tool to be in exactly one set, so a new tool fails CI until someone decides.
+Pre-approved: everything except `board_resolve_attention`, which stays opt-in (selective closeout asks the human
+in an interactive session; a dispatched run cannot). The browser tools only record binding, probe and failure
+evidence and operate no browser; recover and repost move ownership bookkeeping only; refresh is human-only
+server-side. All of them are gated by the server regardless of client approval. The shipped runner, both
+READMEs' optional global block and `install.sh` render that same list (tests tie them together). The optional
+interactive block now uses the full pre-approved list rather than a hand-picked subset: two lists are what
+drifted, and an interactive Codex chat doing a browser audit needs the browser tools as much as a dispatched run.
+A Codex runner missing any pre-approved tool is not launched: preflight fails, records the missing tool names on
+the request and spends no budget. A machine whose `board.local.toml` overrides the runner must add the new pairs.
+
+**A scoped headless browser (opt-in).** Before, `_browser_blocker` refused to launch any CLI for a request with
+a browser requirement, so browser-bound work whose desktop owner went away could never be resumed by the
+dispatcher. The human chose to let dispatched Codex runs drive a scoped headless browser instead. With
+`[dispatch.headless_browser]` naming a Codex runner, the dispatcher injects a Playwright MCP server into that
+run's argv with `-c` overrides: `--headless --isolated`, `--browser`, `--allowed-origins` from
+`browser_requirements` (the triggering request's recipients assigned to the agent, else the thread's unfinished
+requests, never a denied origin; none bound means no server), a fresh per-run `--output-dir` that is also the
+server's `cwd` (so explicitly named files do not land in the repo), `enabled_tools` set to a fixed list and a
+per-run approval for each. `browser_run_code_unsafe` runs Playwright code in the server's Node process, outside
+Codex's sandbox; `browser_file_upload` and `browser_drop` read local files: none is enabled or approved.
+`browser_evaluate` is approved: page-context JavaScript in a renderer-sandboxed, in-memory profile behind the same
+routing reaches nothing the page's UI cannot, and audits need computed state. The prompt gains one fixed sentence
+(use only these tools; probe fresh with context kind `headless` before any browser step); the bound URL never
+enters the prompt, because an agent can bind it.
+
+The config is validated like a runner: the runner key must exist and be `codex`; the command must not be a
+shell or carry placeholders or bypass flags; args may not set the flags the dispatcher owns (`--headless`,
+`--isolated`, `--browser`, `--allowed-origins`, `--output-dir`) or widen reach (`--extension`, `--cdp-endpoint`,
+`--user-data-dir`, `--storage-state`, `--config`, `--init-script`, `--allow-unrestricted-file-access`,
+`--no-sandbox`, `--caps`, a listening `--port`/`--host`, ...); and a listed runner may not configure
+`mcp_servers.headless_browser.*` itself. Errors name argv elements by position, never by value.
+
+**What still holds.** The sticky policy-denied gate (`browser_readiness.request_blocker`) is checked before the
+headless path, at preflight and again at launch, and a denied origin is excluded from the thread fallback.
+Readiness is unchanged: a dispatched session's execution key is its `dispatch_run_id`, it cannot attest a desktop
+context, and `started` requires its own fresh, complete probe (tested end to end through the dispatcher).
+
+**Residual risks.** Playwright states that `--allowed-origins` is not a security boundary and does not cover
+redirects, so it scopes the browser but does not contain it; the controls are the binding, the probe and the
+denial gate. The server runs outside Codex's `workspace-write` sandbox (every Codex MCP server does), so it has
+network access the run's shell commands lack. A page can show the agent text, which is untrusted data like board
+content. Approved interaction tools can change the bound app's state through its UI, as a human tester could.
+Values in `~/.codex/config.toml` under `mcp_servers.headless_browser` would merge into the injected server,
+which is why the name is documented as reserved. The npx package is pinned and run `--offline`; a cache that lacks
+it fails the run's browser start, which the agent reports as `browser_missing`.
 
 ## Settings page (2026-10-07)
 

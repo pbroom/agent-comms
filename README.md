@@ -620,12 +620,17 @@ uv run board dispatch allow --thread 12 --agents codex,claude \
 
 **Codex board-tool approvals.** Codex run non-interactively (`codex exec`) cannot ask you to approve
 an MCP tool call; an unapproved board call fails with "MCP tool call requires approval, but approval
-policy is never". The shipped `codex-cli` runner therefore approves the thirteen agent-comms board tools
-for that run only, with one `-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'` per
-tool (see `board.toml`). Your interactive Codex sessions are unaffected and keep asking. If you
-override the runner in `board.local.toml`, keep those thirteen `-c` pairs; `board dispatch allow` and
-`run` warn about a Codex runner that is missing any of them. The pairs assume the MCP server is named
-`agent-comms`, as `integrations/codex/install.sh` names it.
+policy is never". The shipped `codex-cli` runner therefore approves the 27 pre-approved agent-comms
+board tools for that run only, with one `-c 'mcp_servers.agent-comms.tools.<tool>.approval_mode="approve"'`
+per tool (see `board.toml`): every tool the server serves, including the browser readiness evidence tools,
+except `board_resolve_attention` (selective closeout stays opt-in). Each is still gated by the server
+(identity, session, lease, request ownership, human-only checks). Your interactive Codex sessions are
+unaffected and keep asking. If you override the runner in `board.local.toml`, keep all of those `-c` pairs:
+`board dispatch allow` and `run` warn about a Codex runner that is missing any, and the dispatcher refuses to
+launch it, recording a preflight failure that names the missing tools on the request. The pairs assume the
+MCP server is named `agent-comms`, as `integrations/codex/install.sh` names it. The list has one source,
+`CODEX_PREAPPROVED_TOOLS` in `agent_comms/dispatch.py`; a test builds the real MCP server and fails when it
+serves a tool that is in neither that list nor the opt-in list.
 
 Optional: to let interactive Codex sessions use the board tools without asking as well, pre-approve
 them globally in `~/.codex/config.toml` (after the `[mcp_servers.agent-comms]` table):
@@ -654,19 +659,67 @@ approval_mode = "approve"
 
 [mcp_servers.agent-comms.tools.board_list_threads]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_list_issues]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_get_issue]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_create_issue]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_link_issue]
 approval_mode = "approve"
+
 [mcp_servers.agent-comms.tools.board_comment_issue]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_request_progress]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_request_history]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_register_capabilities]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_route_request]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_recover_request_owner]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_repost_request]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_configuration_status]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_refresh_configuration]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_bind_browser_request]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_begin_probe]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_probe]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_failure]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_reconnect]
+approval_mode = "approve"
+
+[mcp_servers.agent-comms.tools.board_browser_status]
 approval_mode = "approve"
 ```
 
-That applies to every Codex session and is not needed for the dispatcher.
+That is the same list dispatched runs get, applies to every Codex session and is not needed for the
+dispatcher.
 `default_tools_approval_mode = "approve"` under `[mcp_servers.agent-comms]` is the server-wide form.
 Nothing edits this file for you; `bash integrations/codex/install.sh --preapprove-board-tools` prints
 the block. See the Codex [MCP](https://developers.openai.com/codex/mcp) and
@@ -716,7 +769,7 @@ The shipped runners bypass no permission checks or sandboxes:
 
 | Key (runtime) | Runner | What it may do |
 |---|---|---|
-| `codex-cli` | `codex exec --cd {project} --sandbox workspace-write -c <approve board tool> … {prompt}` | non-interactive; commands run in Codex's `workspace-write` sandbox (writes only inside the project, network off by default); no one is there to approve, so commands the sandbox blocks fail; the thirteen board tools are approved for this run only (above) |
+| `codex-cli` | `codex exec --cd {project} --sandbox workspace-write -c <approve board tool> … {prompt}` | non-interactive; commands run in Codex's `workspace-write` sandbox (writes only inside the project, network off by default); no one is there to approve, so commands the sandbox blocks fail; the pre-approved board tools are approved for this run only (above) |
 | `claude-code` | `claude -p {prompt} --permission-mode dontAsk --allowedTools=mcp__agent-comms` | non-interactive; any tool your Claude Code settings do not already allow is denied, except the board tools. To let it edit files, use `acceptEdits` instead of `dontAsk` (in `board.local.toml`, below) |
 
 The runners are argv lists, run without a shell. Placeholders must be whole elements (`{prompt}`,
@@ -754,6 +807,57 @@ outright, its agents keep running. The next `run` marks them `orphaned`, counts 
 until they exit, and holds them to the timeout; `stop` terminates them. That applies only when the pid
 is still the process that was started (same process group and start time); a live pid that cannot be
 verified is counted but never signalled, and `stop` prints it for you to check.
+
+### Headless browser for dispatched Codex runs
+
+A request bound to a browser target (`board_bind_browser_request`) needs a browser probe from the context that
+does the work, and a dispatched CLI cannot inherit an interactive chat's browser connection. Without this
+setting the dispatcher refuses to launch any CLI for such a request ("a generic CLI cannot inherit its probe"),
+so when the desktop chat that owned a browser audit goes away, nothing can resume it. With it, the dispatcher
+gives a dispatched Codex run its own scoped headless browser and relaunches the work itself. It is off in
+`board.toml`; turn it on per machine in `board.local.toml`:
+
+```toml
+# board.local.toml
+[dispatch.headless_browser]
+runners = ["codex-cli"]                                  # Codex runner keys only
+command = "npx"                                          # the Playwright MCP server, run without a shell
+args = ["--offline", "-y", "@playwright/mcp@0.0.83"]     # pinned; --offline never downloads at launch
+browser = "chrome"                                       # installed Google Chrome; or msedge, firefox, webkit
+```
+
+For each launch of a listed runner, the dispatcher looks up the origins bound for the triggering request (the
+recipients assigned to that agent) or, when it binds none, for the thread's unfinished requests (so an Unstick
+or recovery run in a browser-bound thread still gets them). A denied origin is never included. With no bound
+origin it attaches nothing. Otherwise it adds, for that run only, `-c` overrides that define a
+`headless_browser` MCP server:
+
+- `--headless --isolated` always (an in-memory profile: no saved cookies, never your browser or a desktop
+  chat's), `--browser` from the setting, `--allowed-origins` set to the bound origins, and `--output-dir` (and the
+  server's working directory) set to a fresh mode-700 directory beside the run's log, `data/dispatch/<run>-browser`.
+- `enabled_tools` and per-tool approvals for a fixed set only: navigate, navigate back, snapshot, screenshot,
+  find, click, hover, type, press key, fill form, select option, drag, handle dialog, wait for, resize, tabs,
+  close, console messages, network requests, emulate media and evaluate. `browser_run_code_unsafe` (Playwright
+  code in the server's own Node process, outside Codex's sandbox), `browser_file_upload` and `browser_drop`
+  (they read local files) are never enabled or approved, so `codex exec` refuses them. `browser_evaluate` is
+  allowed: it runs JavaScript inside the page, in the isolated profile and behind the same request routing, so
+  it reaches nothing the page's own UI does not, and audits need it to read computed state.
+- One fixed sentence in the launch prompt: use only the `headless_browser` tools for browser work, and make a
+  fresh headless probe of the bound target (`board_browser_begin_probe`, then `board_browser_probe` with context
+  kind `headless`) before any browser step. The target URL is never put in the prompt.
+
+The run then has to earn readiness like any other context: its session is bound to the run
+(`dispatch_run_id`), it cannot attest a desktop context, and starting the request requires its own fresh probe.
+The sticky policy-denied gate is checked first and blocks the launch exactly as before; a denial is never routed
+around by switching to the headless browser. Playwright documents `--allowed-origins` as **not** a security
+boundary (it does not apply to redirects), so treat it as scoping, not containment: the board's binding, the
+probe evidence and the denial gate remain the controls. The browser server runs outside Codex's
+`workspace-write` sandbox, as every Codex MCP server does, so it can reach the network even though the run's
+shell commands cannot. The server name `headless_browser` is reserved for this: the dispatcher refuses a runner
+that configures it itself, and it should not be defined in `~/.codex/config.toml` either (that file's tool
+approvals would merge into it). If `command` is not on the run's `PATH`, a browser-bound launch is refused with a
+preflight failure rather than started blind. The setting is read when `board dispatch run` starts, like the
+runners.
 
 ## The rules, as enforced
 

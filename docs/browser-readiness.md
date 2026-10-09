@@ -65,8 +65,13 @@ NEXUS and opened/closed About showing LOCAL 1.43.17. This proves that desktop
 context only; the three audits remain unfinished and CLI access is not implied.
 
 The default local dispatcher uses `codex exec`, which does not inherit a desktop
-chat's browser connection. Browser-bound requests must route to an already verified
-live owner; do not launch the generic CLI runner and hope its tool inventory works.
+chat's browser connection. Without `[dispatch.headless_browser]`, browser-bound requests
+must route to an already verified live owner; the dispatcher will not launch a generic
+CLI and hope its tool inventory works. With it enabled for the Codex runner (README
+"Headless browser for dispatched Codex runs"), the dispatcher relaunches the work with
+a scoped headless Playwright browser limited to the bound origins. That run must make
+its own fresh probe with context kind `headless` before any browser step; the desktop
+probe above proves nothing for it, and a policy denial still blocks the launch.
 The built-in Browser's supported surface and site-permission controls are documented
 in [Codex Browser](https://learn.chatgpt.com/docs/browser?surface=app).
 

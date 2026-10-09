@@ -54,7 +54,9 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 #   codex-cli: `exec` is non-interactive; --sandbox workspace-write lets it edit only inside the
 #          project, with network off by default; nobody can approve, so blocked commands fail. Each
 #          `-c` approves one agent-comms board tool for this run only (`codex exec` cannot ask), so
-#          interactive Codex sessions still ask. Keep all thirteen if you override this runner.
+#          interactive Codex sessions still ask. Keep all of them if you override this runner: the
+#          dispatcher refuses to launch a Codex runner that is missing any (it names the missing ones).
+#          board_resolve_attention is deliberately absent (selective closeout is opt-in).
 #   claude-code: -p is non-interactive; --permission-mode dontAsk denies every tool that is not
 #          already allowed by your Claude Code settings, except the agent-comms board tools allowed here.
 # Change them per machine in board.local.toml (gitignored), not here: a key there replaces the same key
@@ -81,6 +83,16 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
   "-c", 'mcp_servers.agent-comms.tools.board_request_history.approval_mode="approve"',
   "-c", 'mcp_servers.agent-comms.tools.board_register_capabilities.approval_mode="approve"',
   "-c", 'mcp_servers.agent-comms.tools.board_route_request.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_recover_request_owner.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_repost_request.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_configuration_status.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_refresh_configuration.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_bind_browser_request.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_browser_begin_probe.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_browser_probe.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_browser_failure.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_browser_reconnect.approval_mode="approve"',
+  "-c", 'mcp_servers.agent-comms.tools.board_browser_status.approval_mode="approve"',
   "{prompt}",
 ]
 "claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
@@ -95,3 +107,17 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 # Run in a dedicated checkout instead of the thread's project directory (per machine: board.local.toml).
 [dispatch.worktrees]
 # "/absolute/path/to/repo" = "/absolute/path/to/repo-dispatch-worktree"
+
+# A scoped headless browser for dispatched Codex runs, so the dispatcher can relaunch browser-bound work itself
+# (README "Headless browser for dispatched Codex runs"). Off: no runner is listed. Turn it on per machine in
+# board.local.toml. For each run of a listed Codex runner whose request (or, failing that, thread) has a bound
+# browser target, the dispatcher adds a `headless_browser` MCP server to that run only, always with --headless
+# --isolated (in-memory profile), a fresh --output-dir, --allowed-origins set to the bound origins, and per-run
+# approvals for a fixed set of browser tools (never browser_run_code_unsafe, browser_file_upload or browser_drop).
+# Playwright's --allowed-origins is not a security boundary (it does not cover redirects); the board's binding,
+# the run's own fresh headless probe and the sticky policy-denied gate remain the controls.
+[dispatch.headless_browser]
+runners = []                # e.g. ["codex-cli"]: Codex runner keys only
+# command = "npx"           # the Playwright MCP server, run without a shell
+# args = ["--offline", "-y", "@playwright/mcp@0.0.83"]   # pinned; --offline never downloads at launch
+# browser = "chrome"        # chrome (installed Google Chrome), msedge, firefox or webkit
