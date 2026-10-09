@@ -220,7 +220,10 @@ asked for.
 3. **Reply to the recovery request** (`request_reply`, `finished` or `blocked`). If something needs the human (a
    denied permission, a decision), say so in one `question` with `needs_response: true` and stop.
 
-There is one automatic attempt per stall. If it does not take, the human is told and decides what happens next.
+There is at most one automatic attempt per stall and two per agent per thread a day. If it does not take, the
+human is told and decides what happens next. An unclaimed task you accepted yourself, a `blocked` task, or a thread
+that already waits on the human goes to the human, not to an automatic launch: don't rely on the dispatcher to
+clean up after you.
 
 ## Check access and track each request
 

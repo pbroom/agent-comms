@@ -11,8 +11,16 @@ from .core import Conflict, Forbidden, Invalid
 
 PREFIX = 'request.recovery.'
 # A session abandoned its work when its task lease expired at least this long ago and it has not been seen since the
-# lease expired. The dashboard's grace (GRACE_MINUTES) and the automatic recovery use the same ten minutes.
+# lease expired: ten minutes (the dashboard's GRACE_MINUTES) for a dispatcher session, whose run the dispatcher
+# watches, and a full lease TTL for an interactive session, which may simply be quiet (abandon_grace).
 ABANDON_GRACE_SECONDS = 10 * 60
+
+
+def abandon_grace(board, session):
+    """How long after its lease expired a silent session counts as abandoned."""
+    if session is not None and session['dispatch_run_id']:
+        return ABANDON_GRACE_SECONDS
+    return max(ABANDON_GRACE_SECONDS, board.s.lease_ttl_minutes * 60)
 RECLAIMED_PREFIX = 'session.abandoned.'   # board_state: <session id>.<task id> -> the lease a reclaim replaced
 
 
@@ -35,7 +43,7 @@ def abandonment(board, old, thread_id):
     """Proof that session `old` abandoned its work in this thread, or None.
 
     Abandoned means all of: it holds no live task lease anywhere; a lease it held on a task in this thread (still
-    held, or replaced by a reclaim, see note_reclaimed_lease) expired at least ABANDON_GRACE_SECONDS ago; and the
+    held, or replaced by a reclaim, see note_reclaimed_lease) expired at least abandon_grace() ago; and the
     session has not been seen since that lease expired. A session that is still polling, or holds any live lease, is
     active, and one with no lease evidence is unknown: both stay protected. Metadata only."""
     if old is None:
@@ -55,8 +63,9 @@ def abandonment(board, old, thread_id):
         if (isinstance(item, dict) and item.get('session_id') == old['id'] and item.get('thread_id') == thread_id
                 and type(item.get('task_id')) is int and type(item.get('lease_expires_at')) in (int, float)):
             leases.append((item['task_id'], item['lease_expires_at']))
+    grace = abandon_grace(board, old)
     for task_id, expired in sorted(leases, key=lambda x: x[1]):
-        if expired + ABANDON_GRACE_SECONDS <= now and old['last_seen'] <= expired:
+        if expired + grace <= now and old['last_seen'] <= expired:
             return {'session_id': old['id'], 'task_id': task_id, 'lease_expires_at': expired}
     return None
 
@@ -218,7 +227,7 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
         if not ended and abandoned is None:
             raise Conflict('old owner is live, unknown, or outside this exact request: recovery needs an ended '
                            'dispatcher session, or a session whose task lease in this thread expired at least '
-                           f'{ABANDON_GRACE_SECONDS // 60} minutes ago and that has not been seen since')
+                           f'{int(abandon_grace(board, old)) // 60} minutes ago and that has not been seen since')
         blocker = _ownership_blocker(board, old, session_id, post, abandoned=abandoned is not None)
         if blocker:
             raise Conflict(blocker)
@@ -303,6 +312,10 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
         project = board._thread_row(post['thread_id'])['project']
         if os.path.realpath(workstreams._git(path,'rev-parse','--path-format=absolute','--git-common-dir')) != os.path.realpath(workstreams._git(project,'rev-parse','--path-format=absolute','--git-common-dir')):
             return 'Owner worktree belongs to another repository'
+        # An owner that only went silent (not a proven-ended run) may have left work behind: never take over a
+        # checkout with changes it did not commit, even as the authorized successor in the same worktree.
+        if abandoned and workstreams._git(path,'status','--porcelain=v1','--untracked-files=all'):
+            return 'Owner worktree contains unfinished changes; preserve it before takeover'
         gitdir = workstreams._git(path,'rev-parse','--absolute-git-dir')
         if any(os.path.exists(os.path.join(gitdir,name)) for name in ('MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','index.lock')):
             return 'Owner worktree has an unfinished Git operation'

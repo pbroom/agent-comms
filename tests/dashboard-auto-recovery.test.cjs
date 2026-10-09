@@ -97,11 +97,13 @@ test('a recovery that did not take waits on the human with the precise reason', 
 });
 
 test('a browser-denied escalation names the request and launches nothing', async () => {
-  const t = thread(1, { tasks: [task(22)], pickup: pickup() });
-  const page = await setup({ threads: [t], autoRecovery: [abandoned({ state: 'escalated', post_id: null,
+  const note = post(111, 1, { type: 'status', needs_response: true });
+  const t = thread(1, { tasks: [task(22)], posts: [post(100, 1), note], pickup: pickup() });
+  const page = await setup({ threads: [t], needsYou: [note], autoRecovery: [abandoned({ state: 'escalated', post_id: null,
+    escalation_post_id: 111,
     reason: 'request #102 is held by a browser policy denial; a human permission change is needed, so nothing was launched' })] });
   assert.match(dot(page.document, 1, 'stalled'),
-    /automatic recovery of task 22 failed: request #102 is held by a browser policy denial; .* — needs you/);
+    /automatic recovery of task 22 not launched: request #102 is held by a browser policy denial; .* — needs you/);
   page.dom.window.close();
 });
 
@@ -129,5 +131,16 @@ test('agents never get automatic recovery records and see the plain status', asy
   const t = thread(1, { tasks: [task(22)], pickup: pickup() });
   const page = await setup({ threads: [t], human: false, autoRecovery: [abandoned()] });
   assert.match(dot(page.document, 1, 'stalled'), /A task lease expired/);
+  page.dom.window.close();
+});
+
+test('an escalation the human already handled (its Needs you post is answered) falls back to the plain labels', async () => {
+  const note = post(110, 1, { type: 'status', needs_response: true });
+  const t = thread(1, { tasks: [task(22)], posts: [post(100, 1), note], pickup: pickup() });
+  const page = await setup({ threads: [t], needsYou: [], autoRecovery: [abandoned({ state: 'escalated',
+    reason: 'its recovery request #105 to codex is blocked', escalation_post_id: 110 })] });
+  const label = dot(page.document, 1, 'stalled');
+  assert.doesNotMatch(label, /automatic recovery/);
+  assert.match(label, /A task lease expired/);
   page.dom.window.close();
 });

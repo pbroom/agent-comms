@@ -1367,7 +1367,11 @@ function threadStatus(t, human) {
   // Automatic recoveries the dispatcher sent under the human's setting (state.auto_recovery, server records: ids, agent
   // names, states and the server's reason). A pending one is the agent's turn, not a stall; one that did not take
   // waits on the human, with the precise reason.
-  const recoveries = (state.auto_recovery || []).filter(r => r.thread_id === t.id);
+  // An escalation counts only while its Needs you post is still open (the server's Needs you state); once the human
+  // answers it or unsticks the thread, the ordinary labels for the task apply again.
+  const openAsks = new Set((state.needs_you || []).map(p => p.id));
+  const recoveries = (state.auto_recovery || []).filter(r => r.thread_id === t.id
+    && (r.state === "sent" || (r.state === "escalated" && openAsks.has(r.escalation_post_id))));
   const recoveredTasks = new Set(recoveries.map(r => r.task_id));
   const recovering = new Map(recoveries.filter(r => r.state === "sent" && r.kind === "abandoned" && r.owner_session != null)
     .map(r => [r.owner_session, r.agent]));
@@ -1375,7 +1379,8 @@ function threadStatus(t, human) {
   for (const r of recoveries) {
     const what = r.kind === "unclaimed" ? `unclaimed task ${r.task_id}` : `task ${r.task_id}`;
     if (r.state === "escalated") {
-      stalled.push(`automatic recovery of ${what} failed: ${r.reason || "it did not take"}${r.detail ? ": " + r.detail : ""} — needs you`);
+      // Escalated after a launch that did not take ("failed"), or sent to the human without one ("not launched").
+      stalled.push(`automatic recovery of ${what} ${r.post_id ? "failed" : "not launched"}: ${r.reason || "it did not take"}${r.detail ? ": " + r.detail : ""} — needs you`);
       if (human) needsMe = true;
       involve(r.agent);
     } else {

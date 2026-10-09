@@ -778,7 +778,8 @@ class Dispatcher:
         (autorecover.py), fenced on this loop's ownership token."""
         from . import autorecover
         try:
-            autorecover.tick(self.board, self.human, runner_for=self._runner, fence=self._fence())
+            autorecover.tick(self.board, self.human, runner_for=self._runner, fence=self._fence(),
+                             live_seconds=self.config.live_minutes * 60)
         except Exception:
             log.exception("automatic recovery pass failed")
 
