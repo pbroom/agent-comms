@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 import idna
 
 from . import db, requests
-from .core import Conflict, Forbidden, Invalid, LimitExceeded
+from .core import Conflict, Forbidden, Invalid, LimitExceeded, iso
 
 PROBE_TTL = 300
 LIVE_SECONDS = 90
@@ -347,17 +347,31 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
             'expires_at': expires, 'authority': 'self_reported_probe_not_authorization'}
 
 
+# The two failure kinds that write a sticky, project-wide gate for the origin. They mean only that the browser or its
+# host refused the bound origin itself (a site permission prompt declined, a host policy blocking that origin).
+GATE_FAILURES = ('policy_denied', 'host_permission')
+# Playwright MCP's refusal to write a file outside its output directory and workspace ("File access denied: <path> is
+# outside allowed roots. Allowed roots: ..."). It is about a local file path, never about the origin, so it can
+# never be a policy denial or host-permission failure. The phrase is Playwright's own and does not occur in a host
+# denial; a report that quotes it is refused before it can block every launch to that origin.
+FILE_PATH_REFUSAL = re.compile(r'outside\s+(?:the\s+)?allowed\s+roots', re.IGNORECASE)
+
+
 def report_failure(board, p, session_id, target_url, context, failure, evidence):
     url, origin = target(target_url)
     if failure not in ('policy_denied', 'disconnected', 'unreachable', 'browser_missing', 'host_permission', 'render_failed', 'interaction_failed'):
         raise Invalid('unknown browser failure kind')
     detail = _text(evidence, 'failure evidence')
+    if failure in GATE_FAILURES and FILE_PATH_REFUSAL.search(detail):
+        raise Invalid(f'not a {failure}: "outside allowed roots" is the browser tool refusing a local file path, not '
+                      'the browser or host refusing this origin. Save with a bare file name, copy the file from the '
+                      'path the tool reports, and do not report it as a browser failure')
     with db.write_tx(board.conn):
         board._check_agent_write(p)
         s = board._session(p,session_id)
         ctx = _context(context,s)
         gate = _gate(board,s['project'],origin)
-        if failure in ('policy_denied', 'host_permission'):
+        if failure in GATE_FAILURES:
             exists = board.conn.execute('SELECT 1 FROM browser_permission_gates WHERE project=? AND origin=?',
                                         (s['project'], origin)).fetchone()
             if not exists and not p.is_human and board.conn.execute(
@@ -407,6 +421,24 @@ def record_permission_change(board, p, session_id, project, origin_url, evidence
                            (detail,project,origin))
         _event(board,p,session_id,project,origin,'permission_change',detail)
     return {'status': 'fresh_probe_required', 'permission_granted_by_board': False}
+
+
+def denied_gates(board, p):
+    """Every sticky denied gate, for the human's dashboard: project, origin, the stored reason (agent-written evidence,
+    untrusted text), who first recorded the gate, and the latest denial event (who and when), with the epoch the
+    permission-change route expects."""
+    if not p.is_human:
+        raise Forbidden('only the human can list browser permission gates')
+    out = []
+    for g in board.conn.execute('SELECT * FROM browser_permission_gates WHERE denied=1 ORDER BY project, origin'):
+        ev = board.conn.execute(f"""SELECT actor, action, created_at FROM browser_events WHERE project=? AND origin=?
+            AND action IN ({",".join("?" * len(GATE_FAILURES))}) ORDER BY id DESC LIMIT 1""",
+            (g['project'], g['origin'], *GATE_FAILURES)).fetchone()
+        out.append({'project': g['project'], 'origin': g['origin'], 'reason': g['reason'], 'epoch': g['epoch'],
+                    'created_by': g['created_by'], 'failure': ev['action'] if ev else None,
+                    'recorded_by': ev['actor'] if ev else g['created_by'],
+                    'recorded_at': iso(ev['created_at']) if ev else None})
+    return {'gates': out}
 
 
 def readiness(board, session_id, target_url):

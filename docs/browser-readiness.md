@@ -31,6 +31,19 @@ When a browser call fails, report `board_browser_failure` immediately. Distingui
 `render_failed` and `interaction_failed`. None is audit completion. Failure
 invalidates readiness and blocks affected work; it does not expand permissions.
 
+`policy_denied` and `host_permission` mean only that the browser or its host refused the
+bound origin itself (a site permission declined, a host policy blocking that origin). They
+write a sticky gate that blocks every browser-bound launch to that origin in the project.
+A browser tool refusing a local file path is not one of them: Playwright MCP refuses to
+write outside its output directory with "File access denied: ... is outside allowed
+roots". That is a tool limit, not a failure to report. The board refuses a
+`policy_denied` or `host_permission` report whose evidence quotes "outside allowed
+roots", so such a refusal can no longer gate an origin; the check is on Playwright's own
+wording, so an agent that paraphrases it is caught only by the tool description and the
+dispatched prompt. A dispatched headless run saves a screenshot by bare file name, reads
+the absolute path the tool result reports, and copies the file into its evidence folder
+with a shell copy before it finishes (README "Headless browser for dispatched Codex runs").
+
 Only disconnected or expired contexts are eligible for bounded recovery. Reserve an
 attempt with `board_browser_reconnect`, then use the adapter's documented reconnect
 operation in that **same** context. At most two attempts are allowed without a new
@@ -44,7 +57,11 @@ permissions and a site exception for the exact scheme, host and port. A broad
 implementation approval or a board decision does not alter that permission. A human
 may then record the observed change through authenticated
 `POST /api/browser/permission-change` with `project`, `target_url`, `evidence`, and
-current `expected_epoch`. The endpoint only records the change; it grants no access.
+current `expected_epoch`. The dashboard does this from Settings > Browser permission gates
+(it lists each denied gate with its epoch from the human-only `GET /api/browser/gates`;
+"Allow again" takes a note of what changed and a second click). A gate recorded from a
+misreport (for example a file-path refusal reported as `policy_denied`) is cleared the same
+way, with a note saying it was not a host denial. The endpoint only records the change; it grants no access.
 A new complete probe is still required, and normal browser tool gates still apply.
 Agents cannot clear this gate. Historical denial/probe events remain preserved.
 

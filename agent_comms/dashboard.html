@@ -485,6 +485,8 @@ const NOTIFY_EVENTS = ["needs-response", "to-human", "decision", "agent-launched
 const NOTIFY_DEFAULT = ["needs-response", "to-human", "decision", "agent-launched"];
 let notifyDraft = { events: [...NOTIFY_DEFAULT], project: "", thread: "", idle: "" };
 let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
+// What the human typed to record with "Allow again" on a sticky browser gate, keyed by gateKey (project, origin).
+const gateDrafts = {};
 // Deep links: #post-<id>, #thread-<id>, #settings. `focus` is what still needs scrolling to; the highlight stays.
 let focus = null, focusTried = false, focusBusy = false, highlight = null;
 // Bumped by every navigation (a click, a link): deep-link work started before it is dropped (see applyFocus).
@@ -714,9 +716,10 @@ async function loadSettings() {
   try {
     const [settings, notifications, dispatch] = await Promise.all([
       api("GET", "/api/settings"), api("GET", "/api/admin/notifications"), api("GET", "/api/admin/dispatch")]);
-    let browsers = null;
+    let browsers = null, gates = null;
     try { browsers = await api("GET", "/api/web-sessions"); } catch (e) {}
-    cfg = { settings, notifications, dispatch, browsers };
+    try { gates = (await api("GET", "/api/browser/gates")).gates; } catch (e) {}
+    cfg = { settings, notifications, dispatch, browsers, gates };
   } catch (e) { cfgError = e.message; }
 }
 
@@ -1234,6 +1237,48 @@ function renderDispatch() {
       x.runs.map(r => el("tr", {}, el("td", {}, r.run_id), el("td", {}, r.agent), el("td", {}, String(r.thread_id)),
         el("td", {}, r.status), el("td", {}, r.started_at ? ago(r.started_at) : ""), el("td", {}, r.exit_code === null || r.exit_code === undefined ? "" : String(r.exit_code))))))
       : el("p", { class: "small muted" }, "No launches yet."));
+}
+
+// Sticky browser gates. An agent's policy_denied or host_permission report blocks every browser-bound launch to that
+// origin in that project until the human records a permission change (POST /api/browser/permission-change, which
+// records the change and grants nothing). "Allow again" is that record, behind the click-twice confirm. The reason is
+// agent-written evidence: shown as text, never trusted.
+const gateKey = g => "allow-gate-" + g.project + "\u0000" + g.origin;
+function renderBrowserGates() {
+  const gates = cfg.gates;
+  const when = iso => iso ? new Date(iso).toLocaleString() : "";
+  const allow = g => {
+    const key = gateKey(g), evidence = (gateDrafts[key] || "").trim();
+    if (!evidence) { cfgError = "Say what you changed or checked before allowing " + g.origin + " again."; return render(); }
+    cfgAct("POST", "/api/browser/permission-change",
+      { project: g.project, target_url: g.origin, evidence, expected_epoch: g.epoch }).then(ok => { if (ok) delete gateDrafts[key]; });
+  };
+  return el("section", { class: "card", id: "settings-browser-gates" },
+    el("h2", {}, "Browser permission gates"),
+    el("p", { class: "small muted" }, "When an agent reports that a browser or its host refused a site (policy_denied or host_permission), the board blocks every browser-bound launch to that origin in that project until you allow it again."),
+    el("p", { class: "small muted" }, "Allow again only after you have changed the actual permission (for Codex Browser: Settings > Browser > Agent permissions), or checked that the report was not a host refusal (for example, the browser tool refusing a screenshot path). Allowing again records a human permission change on the board. It changes no browser or host setting, and the next run must make a fresh probe of the site before any browser step. Requests the gate blocked are not restarted by this."),
+    gates === null || gates === undefined ? el("p", { class: "small muted" }, "Could not load the browser permission gates.")
+      : !gates.length ? el("p", { class: "small muted" }, "No browser origin is blocked.")
+      : gates.map((g, i) => {
+        const key = gateKey(g), id = "gate-evidence-" + i;
+        return el("div", { class: "post small", "data-gate": g.origin },
+          el("div", {}, el("strong", {}, g.origin), " ", chip(g.failure || "denied", "bad")),
+          el("div", { class: "muted" }, "Project: ", el("code", {}, g.project)),
+          el("div", { class: "muted", title: when(g.recorded_at) },
+            "Recorded by ", g.recorded_by || "unknown", g.recorded_at ? " · " + ago(g.recorded_at) : ""),
+          el("div", { class: "body" }, "Reason (as reported): ", g.reason),
+          el("div", { class: "settings-form" },
+            el("label", { for: id }, "What you changed or checked (recorded with the change)"),
+            el("input", { id, value: gateDrafts[key] || "", autocomplete: "off", maxlength: 1000, disabled: cfgBusy,
+              placeholder: "e.g. Added a site exception in Codex Settings > Browser",
+              oninput: e => {
+                gateDrafts[key] = e.target.value;
+                for (const b of confirmButtons(key)) b.disabled = cfgBusy || !e.target.value.trim();
+              } }),
+            el("div", { class: "actions" }, confirmButton(key, "Allow again", "Confirm allow again?",
+              `Allowing ${g.origin} again records a human permission change; the next run must probe it fresh.`,
+              () => allow(g), { class: "danger", disabled: cfgBusy || !(gateDrafts[key] || "").trim() }))));
+      }));
 }
 
 function renderBrowsers() {
@@ -2620,6 +2665,7 @@ function renderSettings() {
   return el("div", { class: "settings", id: "settings" },
     cfgError ? el("div", { class: "banner", role: "alert" }, cfgError) : null,
     renderBoardSection(),
+    renderBrowserGates(),
     el("section", { class: "card", id: "settings-limits" }, el("h2", {}, "Limits"), settingsTable("limits", "Save limits")),
     renderNotifications(),
     renderDispatch(),

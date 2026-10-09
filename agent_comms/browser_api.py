@@ -63,6 +63,12 @@ def install(app, board, principal, sid):
     def permission_change(body: PermissionChange, request: Request, p=P):
         return br.record_permission_change(board,p,sid(p,request,body.session_id),body.project,body.target_url,body.evidence,body.expected_epoch)
 
+    @app.get('/api/browser/gates')
+    def gates(p=P):
+        # Human only (checked in core): the dashboard's list of sticky denied gates, with the epoch that
+        # POST /api/browser/permission-change expects.
+        return br.denied_gates(board,p)
+
     @app.get('/api/browser/status')
     def status(request: Request, target_url: str, session_id: int | None = None, p=P):
         return br.status(board,p,sid(p,request,session_id),target_url)

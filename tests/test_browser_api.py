@@ -105,3 +105,27 @@ def test_mcp_browser_tools_and_report_protocol(env, monkeypatch):
             assert blocked.is_error
 
     asyncio.run(go())
+
+
+def test_http_gate_list_and_path_refusal_report(env):
+    client = TestClient(create_app(env.board))
+    refused = client.post('/api/browser/failure', headers=headers(env), json={
+        'target_url': URL, 'context': CONTEXT, 'failure': 'policy_denied',
+        'evidence': 'File access denied: /repo/x.png is outside allowed roots. Allowed roots: /out, /out'})
+    assert refused.status_code == 400 and 'local file path' in refused.text
+    assert client.get('/api/browser/gates', headers=headers(env, 'human')).json() == {'gates': []}
+    assert client.post('/api/browser/failure', headers=headers(env), json={
+        'target_url': URL, 'context': CONTEXT, 'failure': 'policy_denied',
+        'evidence': 'User declined the site'}).status_code == 200
+    assert client.get('/api/browser/gates', headers=headers(env)).status_code == 403
+    assert client.get('/api/browser/gates').status_code == 401
+    [gate] = client.get('/api/browser/gates', headers=headers(env, 'human')).json()['gates']
+    assert gate['origin'] == 'http://localhost:5185' and gate['recorded_by'] == 'codex'
+    # Exactly what the dashboard's "Allow again" sends (no session id: the human's own session is used).
+    human = {'Authorization': f'Bearer {env.tokens["human"]}'}
+    cleared = client.post('/api/browser/permission-change', headers=human, json={
+        'project': gate['project'], 'target_url': gate['origin'], 'evidence': 'Checked the host setting',
+        'expected_epoch': gate['epoch']})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json() == {'status': 'fresh_probe_required', 'permission_granted_by_board': False}
+    assert client.get('/api/browser/gates', headers=headers(env, 'human')).json() == {'gates': []}
