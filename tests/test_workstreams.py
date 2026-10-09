@@ -642,3 +642,14 @@ def test_dirty_detached_owner_cannot_hide_behind_clean_sibling_session(stack, tm
     assert current(stack, post)["assigned_session"] == env.sid["codex"]
     assert unfinished.read_text() == "Unsaved detached work must survive\n"
     assert git(replacement, "status", "--porcelain") == ""
+
+
+def test_a_declined_root_keeps_its_continuation_unclaimable(stack):
+    """Declined counts as finished only for awaiting and the automatic request to continue, never for claims."""
+    from agent_comms.core import Conflict
+    env = stack["env"]
+    post = create(stack)
+    env.board.transition_task(env.p["human"], env.sid["human"], stack["root"], "declined")
+    probe(stack, "codex", activity="active")
+    with pytest.raises(Conflict, match="unfinished"):
+        env.board.claim_task(env.p["codex"], env.sid["codex"], post["task_id"])

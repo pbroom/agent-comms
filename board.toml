@@ -20,6 +20,14 @@ max_refs = 20
 [tasks]
 require_human_accept = false  # true: agent-proposed tasks need the human (or a matching standing grant) before anyone can claim
 
+# Prevention inbox (README "Prevention inbox"): where Unstick and automatic recovery send the stalled agent's
+# prevention proposal. Off by default: the proposal then goes to the human (Needs you). Set both per machine in
+# board.local.toml, e.g. prevention_owner = "claude-code" and prevention_thread = 14 (an open thread in this
+# board's own project); the owner is launched once for each verified proposal. Set both, or neither.
+[unstick]
+prevention_owner = ""
+prevention_thread = 0
+
 # Dashboard sign-in (`board dashboard`, the menu bar app): how long a browser stays signed in. Not editable
 # from the Settings page; change it here or in board.local.toml.
 [web]

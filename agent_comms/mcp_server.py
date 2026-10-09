@@ -223,7 +223,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "required_checks, required_capabilities, ack_seconds: 10..3600}. This atomically creates one "
         "dependent task and request, deduplicated by thread/fix. Agent-created continuations must match "
         "the root task's immutable continuation_scope={fix_ref, descendants, agents, required_checks, "
-        "required_capabilities}, proposed before its authorization. Recipients are the recorded owners." + DATA_WARNING))
+        "required_capabilities}, proposed before its authorization. Recipients are the recorded owners. "
+        "prevention_for=<post id of an Unstick or automatic recovery request addressed to you>: marks this post as "
+        "your prevention proposal for that stall when the board has a prevention inbox (the request text then names "
+        "its thread and owner): a needs_response proposal on that thread addressed only to the prevention owner, no "
+        "decision_question. The server verifies it, launches the owner once if needed, and it does not count toward "
+        "that thread's post cap." + DATA_WARNING))
     def board_post(body: str, type: Literal["question", "proposal", "status", "finding", "handoff", "request",
                                             "decision"],
                    thread_id: int | None = None, new_thread_title: str | None = None, to: list[str] | None = None,
@@ -232,6 +237,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                    continuation: dict | None = None,
                    answer_to: list[StrictInt] | None = None,
                    request_reply: RequestReplyIn | None = None, idempotency_key: str | None = None,
+                   prevention_for: StrictInt | None = None,
                    session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         sid = session(ctx, session_id)
@@ -240,7 +246,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
             needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task,
             decision_question=decision_question, continuation=continuation, answer_to=answer_to,
             request_reply=request_reply.model_dump(exclude_none=True) if request_reply is not None else None,
-            idempotency_key=idempotency_key))
+            idempotency_key=idempotency_key, prevention_for=prevention_for))
 
     @mcp.tool(description=(
         "Claim a task lease before editing its files (atomic: only one session wins). Calling it again on a task "
@@ -257,14 +263,23 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Only the lease holder can mark done; moving to working/blocked as the holder renews the lease. "
         "Agents can accept and claim proposed tasks unless the human has turned on the require_human_accept gate; then they need human acceptance or a matching active standing grant. Revoked/expired grants block work. Add a note; post a 'status' when blocked. "
         "When you mark a task done, the response lists leftover_tasks: other accepted tasks you created in the same "
-        "thread that nobody has claimed. Claim each one if work remains, or decline it if the finished work covers it."
+        "thread that nobody has claimed. Claim each one if work remains, or decline it if the finished work covers it. "
+        "depends_on (the task's creator, its owner or the human; while leased, only the owner or the human) replaces "
+        "the ids of the tasks this one waits on ([] clears them; only the human can remove a dependency the human "
+        "set): use it when the task waits on work elsewhere, e.g. a fix in another thread. Ids must exist, be in the "
+        "task's project or the board's own project, and not form a cycle. While a dependency that counts (not on a "
+        "task you created yourself) is unfinished in an open thread, the task is 'awaiting', not stalled: no Unstick "
+        "or automatic-recovery escalation, and Needs you escalations about it close (they come back if you drop the "
+        "wait first). When the last dependency is done or declined, the dispatcher asks the owner (or creator) to "
+        "continue it; claims still need every dependency done. Give status, depends_on, or both (one transaction)."
         + DATA_WARNING))
     def board_update_task(task_id: int, status: Literal["proposed", "accepted", "working", "blocked", "done",
-                                                        "declined"],
-                          note: str | None = None, session_id: int | None = None, ctx: Context = None) -> dict:
+                                                        "declined"] | None = None,
+                          note: str | None = None, depends_on: list[int] | None = None,
+                          session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
         sid = session(ctx, session_id)
-        return run(lambda: board.transition_task(p, sid, task_id, status, note))
+        return run(lambda: board.update_task(p, sid, task_id, status, note, depends_on))
 
     @mcp.tool(description="Release your lease on a task so others can claim it (status returns to accepted)."
               + DATA_WARNING)
