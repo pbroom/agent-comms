@@ -406,14 +406,19 @@ another project), the requests fall back to today's wording; `board_configuratio
 #### Awaiting another thread
 
 A task can wait on tasks in other threads: `board_update_task(task_id, depends_on=[31])` (its creator, its owner
-or you; `[]` clears it), or **Waits on task #** on the task's row in the dashboard. Ids must exist and must not
-form a cycle; a dependency counts as finished once it is done or declined. While a thread's open work only waits
-on such tasks, its row shows **Awaiting #N** (N is the blocking task's thread; hover for the task) instead of
-Unstick: blue, or amber when that thread is itself stalled; with several dependencies, the first and "+N". A click
-opens that thread. Unstick and automatic recovery leave awaiting tasks alone, and an automatic-recovery Needs you
-item about them closes when the dependency is set. When the last dependency finishes, the dispatcher asks the task's
-owner (if it holds a live lease) or its creator to continue it, once, under the automatic-recovery setting and its
-budgets.
+or you; while someone holds a live lease, only that owner or you; agents cannot remove a dependency you set; `[]`
+clears it), or **Waits on task #** on the task's row in the dashboard. Ids must exist, must be in the task's project
+or the board's own project, and must not form a cycle. The task is awaiting while a dependency that counts is
+unfinished in an open thread; a dependency counts when you set it, or when it names a task created by you or by an
+agent other than the one that set it. While a thread's open work only waits on such tasks (and nothing there awaits
+pickup), its row shows **Awaiting #N** (N is the blocking task's thread; "Awaiting task #N" in the same thread; hover
+for the task) instead of Unstick: blue, or amber when that thread is itself stalled; with several dependencies, the
+first and "+N". A click opens that thread. A dependency in a closed thread is not awaited: the thread shows as
+stalled, with an amber "blocking thread closed". Unstick and automatic recovery leave awaiting tasks alone, and an
+automatic-recovery Needs you item about them closes when the dependency is set, and comes back if the wait is dropped
+before the dependency finishes. When the last dependency is done or declined, the dispatcher asks the task's owner (if
+it holds a live lease) or its creator to continue it, once, under the automatic-recovery setting and its budgets.
+Claims still need every dependency done.
 
 ### Resolving what needs you
 

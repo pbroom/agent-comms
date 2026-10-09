@@ -188,3 +188,47 @@ test('a source thread whose prevention proposal went to the inbox is neither sta
   assert.equal(row(document, 14).querySelector('.unstick-btn'), null);
   dom.window.close();
 });
+
+test('a dependency in a closed thread is not awaited: amber, "blocking thread closed"', async () => {
+  // The server lists it in blocked_by_closed, not waiting_on.
+  const closedDep = { ...dep(9, 2, 'working'), thread_status: 'closed' };
+  const t1 = thread(1, { tasks: [task(5, { depends_on: [9], waiting_on: [], blocked_by_closed: [closedDep],
+    created_at: MINUTES_AGO(5), updated_at: MINUTES_AGO(5) })] });
+  const { dom, document, win } = await setup({ threads: [t1] });
+  const st = win.threadStatus(t1, true);
+  assert.equal(st.kind, 'stalled');
+  assert.match(st.label, /task 5 waits on task 9 in thread #2, which is closed \(blocking thread closed\)/);
+  const r = row(document, 1);
+  assert.ok(r.querySelector('.dot').classList.contains('stalled'));
+  const b = r.querySelector('.awaiting-btn');
+  assert.ok(b && b.classList.contains('stalled'), 'amber Awaiting button');
+  assert.equal(b.textContent, 'Awaiting #2');
+  assert.match(b.title, /\(thread #2, working\): blocking thread closed\./);
+  dom.window.close();
+});
+
+test('a fresh pickup in the thread outranks awaiting', async () => {
+  const fresh = post(150, 1, { agent: 'claude', type: 'request', to: ['codex'], needs_response: true,
+    created_at: MINUTES_AGO(2) });
+  const t1 = thread(1, { tasks: [waits(5, [dep(9, 2)])], posts: [post(100, 1), fresh] });
+  const t2 = thread(2, { tasks: [working(9)] });
+  const { dom, document, win } = await setup({ threads: [t1, t2] });
+  const st = win.threadStatus(t1, true);
+  assert.equal(st.kind, 'unread');
+  assert.match(st.label, /#150 · codex: awaiting agent pickup/);
+  assert.equal(row(document, 1).querySelector('.awaiting-btn'), null);
+  dom.window.close();
+});
+
+test('a dependency in the same thread reads "Awaiting task #N"', async () => {
+  // Task 5 waits on task 6 in the same thread, which another thread's agent is not working on: awaiting.
+  const t1 = thread(1, { tasks: [waits(5, [dep(6, 1, 'accepted')]),
+    task(6, { created_by: 'human', status: 'proposed', created_at: MINUTES_AGO(5), updated_at: MINUTES_AGO(5) })] });
+  const { dom, win } = await setup({ threads: [t1] });
+  const st = win.threadStatus(t1, true);
+  assert.equal(st.kind, 'unread', 'task 6 itself awaits pickup, which comes first');
+  const fake = { kind: 'awaiting', blocking: [{ ...dep(6, 1, 'accepted') }], blockerStalled: false, label: 'x' };
+  const b = win.awaitingButton(t1, fake, 'row');
+  assert.equal(b.textContent, 'Awaiting task #6');
+  dom.window.close();
+});

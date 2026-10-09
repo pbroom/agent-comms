@@ -92,15 +92,18 @@ def test_status_and_depends_on_together_and_neither(env):
         env.board.update_task(env.p["codex"], env.sid["codex"], task)
 
 
-def test_a_declined_dependency_counts_as_finished_for_claims(env):
+def test_claims_still_need_done_but_a_declined_dependency_ends_the_wait(env):
     tid = env.thread()
     _, fix = other_task(env, status="accepted")
     task = env.accepted_task(tid, depends_on=[fix])
-    with pytest.raises(Conflict, match="unfinished"):
-        env.board.claim_task(env.p["codex"], env.sid["codex"], task)
+    assert awaiting.awaits(env.board.conn, task)
     env.board.transition_task(env.p["human"], env.sid["human"], fix, "declined")
-    assert env.board.claim_task(env.p["codex"], env.sid["codex"], task)["status"] == "working"
+    assert not awaiting.awaits(env.board.conn, task)
     assert env.board.get_task(env.p["human"], task)["waiting_on"] == []
+    with pytest.raises(Conflict, match="unfinished"):
+        env.board.claim_task(env.p["codex"], env.sid["codex"], task)    # claims still need every dependency done
+    env.board.update_task(env.p["human"], env.sid["human"], task, depends_on=[])
+    assert env.board.claim_task(env.p["codex"], env.sid["codex"], task)["status"] == "working"
 
 
 def test_http_sets_depends_on_without_a_status(env):
@@ -159,7 +162,7 @@ def test_no_automatic_recovery_for_an_awaiting_task(aenv):
     assert auto_posts(aenv) == [] and records(aenv) == {} and aenv.spawner.calls == []
 
 
-def test_a_sent_recovery_settles_when_the_task_starts_awaiting(aenv):
+def test_a_sent_recovery_waits_while_the_task_awaits_and_resumes_after(aenv):
     task = agent_task(aenv)
     aenv.clock.advance(autorecover.UNCLAIMED_AFTER_SECONDS + 60)
     aenv.d.tick()
@@ -169,8 +172,16 @@ def test_a_sent_recovery_settles_when_the_task_starts_awaiting(aenv):
     assert autorecover.list_records(aenv.board, aenv.p["human"]) == []
     aenv.clock.advance(LEASE + 60)
     aenv.d.tick()
-    assert [r["state"] for r in records(aenv).values()] == ["recovered"]
-    assert len(auto_posts(aenv)) == 1, "no escalation"
+    assert [r["state"] for r in records(aenv).values()] == ["sent"], "neither settled nor escalated while awaiting"
+    assert len(auto_posts(aenv)) == 1
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[])    # the wait is dropped
+    aenv.d.tick()
+    posts = auto_posts(aenv)
+    assert len(posts) == 2 and posts[1]["id"] in needs_you(aenv), "the stall resumes and escalates once"
+    for _ in range(3):
+        aenv.clock.advance(LEASE)
+        aenv.d.tick()
+    assert len(auto_posts(aenv)) == 2
 
 
 def test_a_waiting_escalation_closes_once_the_dependency_is_set(aenv):
@@ -377,3 +388,182 @@ def test_a_continuation_not_claimed_within_a_ttl_escalates_with_that_reason(aenv
     note = auto_posts(aenv)[-1]
     assert "was not claimed or continued within 30 minutes of the automatic request to continue it" in note["body"]
     assert note["decision_question"]["recommended_option_id"] == "ask-creator"
+
+
+# ---------------------------------------------------------------- review fixes: what counts, reopening, projects
+
+
+def escalated_task(env):
+    """codex accepted its own task: automatic recovery goes straight to the human. Returns (task, escalation post)."""
+    task = agent_task(env, accepted_by="codex")
+    env.clock.advance(autorecover.UNCLAIMED_AFTER_SECONDS + 60)
+    env.d.tick()
+    [note] = auto_posts(env)
+    assert note["id"] in needs_you(env)
+    return task, note
+
+
+def own_task(env, agent="codex"):
+    """A task the agent created itself, in another thread of the same project."""
+    other = env.thread("agent's own thread")
+    return env.board.create_task(env.p[agent], env.sid[agent], other, title="dummy")["id"]
+
+
+def test_a_dependency_on_a_task_the_setter_created_itself_does_not_count(aenv):
+    task, note = escalated_task(aenv)
+    dummy = own_task(aenv)
+    out = aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[dummy])
+    assert out["depends_on"] == [dummy] and out["waiting_on"] == [] and out["closed_escalation_post_ids"] == []
+    assert not awaiting.awaits(aenv.board.conn, task) and note["id"] in needs_you(aenv)
+    # Another agent's task, or the human setting it, counts.
+    theirs = own_task(aenv, agent="claude")
+    out = aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[dummy, theirs])
+    assert [d["id"] for d in out["waiting_on"]] == [theirs] and out["closed_escalation_post_ids"] == [note["id"]]
+    codex_own = own_task(aenv)
+    t2 = agent_task(aenv)
+    assert aenv.board.update_task(aenv.p["human"], aenv.sid["human"], t2, depends_on=[codex_own])["waiting_on"]
+
+
+def test_the_sql_and_python_rules_agree(aenv):
+    task = agent_task(aenv)
+    mine, theirs = own_task(aenv), own_task(aenv, agent="claude")
+    other, closed_dep = other_task(aenv, status="accepted")
+    for deps in ([], [mine], [theirs], [mine, theirs], [closed_dep]):
+        aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=deps)
+        row = aenv.board._task_row(task)
+        assert awaiting.awaits(aenv.board.conn, task) == bool(awaiting.waiting_on(aenv.board.conn, row)), deps
+    aenv.board.set_thread_status(aenv.p["human"], other, "closed")
+    row = aenv.board._task_row(task)
+    assert not awaiting.awaits(aenv.board.conn, task) and awaiting.waiting_on(aenv.board.conn, row) == []
+    assert [d["id"] for d in awaiting.blocked_by_closed(aenv.board.conn, row)] == [closed_dep]
+
+
+def test_clearing_the_dependency_reopens_the_escalation_without_new_posts(aenv):
+    task, note = escalated_task(aenv)
+    _, fix = other_task(aenv)
+    out = aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    assert out["closed_escalation_post_ids"] == [note["id"]] and note["id"] not in needs_you(aenv)
+    out = aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[])
+    assert out["reopened_escalation_post_ids"] == [note["id"]]
+    assert note["id"] in needs_you(aenv)
+    assert "attention_resolution" not in aenv.board.get_post(aenv.p["human"], note["id"])
+    [item] = autorecover.list_records(aenv.board, aenv.p["human"])
+    assert item["state"] == "escalated" and item["escalation_post_id"] == note["id"]
+    # Setting and clearing again posts nothing new: the same item closes and comes back.
+    for _ in range(2):
+        aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+        aenv.d.tick()
+        aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[])
+        aenv.d.tick()
+    assert len(auto_posts(aenv)) == 1 and note["id"] in needs_you(aenv)
+
+
+def test_switching_to_a_dependency_that_does_not_count_reopens_the_escalation(aenv):
+    task, note = escalated_task(aenv)
+    _, fix = other_task(aenv)
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    out = aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[own_task(aenv)])
+    assert out["reopened_escalation_post_ids"] == [note["id"]] and note["id"] in needs_you(aenv)
+
+
+def test_a_finished_dependency_keeps_it_closed_and_the_continuation_takes_over(aenv):
+    task, note = escalated_task(aenv)
+    _, fix = other_task(aenv)
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    finish(aenv, fix)
+    aenv.d.tick()
+    assert note["id"] not in needs_you(aenv), "a satisfaction event does not reopen it"
+    posts = auto_posts(aenv)
+    assert len(posts) == 2 and posts[1]["type"] == "question", "not authorized: the human is asked anew"
+    assert posts[1]["decision_question"]["question"].startswith(f"Task {task}'s dependencies are finished")
+    assert [r["kind"] for r in autorecover.list_records(aenv.board, aenv.p["human"])] == ["continue"]
+
+
+def test_closing_the_blocking_thread_ends_the_wait_and_reopens_the_escalation(aenv):
+    task, note = escalated_task(aenv)
+    other, fix = other_task(aenv)
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    assert unstick.stuck_agents(aenv.board, aenv.tid) == ([], [])
+    aenv.board.set_thread_status(aenv.p["human"], other, "closed")
+    assert not awaiting.awaits(aenv.board.conn, task)
+    out = aenv.board.get_task(aenv.p["human"], task)
+    assert out["waiting_on"] == [] and [d["id"] for d in out["blocked_by_closed"]] == [fix]
+    assert note["id"] in needs_you(aenv)
+    assert unstick.stuck_agents(aenv.board, aenv.tid)[0] == ["codex"]
+
+
+def test_dependencies_stay_in_the_tasks_project_or_the_boards_own(aenv, tmp_path, monkeypatch):
+    home = tmp_path / "board-home"
+    home.mkdir()
+    monkeypatch.setenv("AGENT_COMMS_HOME", str(home))
+    task = agent_task(aenv)
+    elsewhere = aenv.board.create_thread(aenv.p["human"], aenv.sid["human"], "other project", "/work/other")["id"]
+    foreign = aenv.accepted_task(elsewhere)
+    with pytest.raises(Invalid, match="another project"):
+        aenv.board.update_task(aenv.p["human"], aenv.sid["human"], task, depends_on=[foreign])
+    with pytest.raises(Invalid, match="another project"):
+        aenv.accepted_task(aenv.tid, depends_on=[foreign])
+    board_thread = aenv.board.create_thread(aenv.p["human"], aenv.sid["human"], "board fix", str(home))["id"]
+    board_fix = aenv.accepted_task(board_thread)
+    assert aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[board_fix])["waiting_on"]
+
+
+def test_only_the_lease_holder_or_the_human_changes_dependencies_while_leased(aenv):
+    task = agent_task(aenv)                                         # codex created it
+    _, fix = other_task(aenv)
+    aenv.board.claim_task(aenv.p["claude"], aenv.sid["claude"], task)
+    with pytest.raises(Forbidden, match="leased by claude"):
+        aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    aenv.board.update_task(aenv.p["claude"], aenv.sid["claude"], task, depends_on=[fix])
+    aenv.board.update_task(aenv.p["human"], aenv.sid["human"], task, depends_on=[])
+    aenv.clock.advance(LEASE + 60)                                  # the lease expired: the creator may again
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+
+
+def test_agents_cannot_remove_a_dependency_the_human_set(aenv):
+    task = agent_task(aenv)
+    _, fix = other_task(aenv)
+    theirs = own_task(aenv, agent="claude")
+    aenv.board.update_task(aenv.p["human"], aenv.sid["human"], task, depends_on=[fix])
+    with pytest.raises(Forbidden, match="only the human can remove it"):
+        aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[])
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix, theirs])
+    assert awaiting.state(aenv.board.conn, task)["setters"] == {str(fix): "human", str(theirs): "codex"}
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix])
+    aenv.board.update_task(aenv.p["human"], aenv.sid["human"], task, depends_on=[])
+
+
+def test_update_task_is_atomic(aenv):
+    task, note = escalated_task(aenv)
+    _, fix = other_task(aenv)
+    with pytest.raises(Conflict, match="cannot move task"):   # a refused transition
+        aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, "done", None, [fix])
+    assert aenv.board.get_task(aenv.p["human"], task)["depends_on"] == []
+    assert note["id"] in needs_you(aenv) and awaiting.state(aenv.board.conn, task) is None
+
+
+def test_the_send_guard_rechecks_the_dependency_generation(aenv):
+    task, fix = waiting_task(aenv)
+    finish(aenv, fix)
+    gen = awaiting.state(aenv.board.conn, task)["generation"]
+    item = {"kind": "continue", "key": autorecover.continue_key(task, gen), "task_id": task, "generation": gen,
+            "stalled_since": aenv.board.now()}
+    check = autorecover._guard(aenv.board, aenv.d._fence(), [item], "codex", aenv.tid)
+    check()                                                         # still satisfied, same generation
+    _, fix2 = other_task(aenv)
+    aenv.board.update_task(aenv.p["codex"], aenv.sid["codex"], task, depends_on=[fix2])
+    with pytest.raises(Conflict, match="changed meanwhile"):
+        check()
+
+
+def test_a_declined_dependency_asks_to_remove_it_before_claiming(aenv):
+    task, fix = waiting_task(aenv)
+    aenv.board.transition_task(aenv.p["human"], aenv.sid["human"], fix, "declined")
+    aenv.clock.advance(5 * 60)
+    aenv.d.tick()
+    [post] = auto_posts(aenv)
+    assert f"Task {task}'s dependencies are finished; continue it." in post["body"]
+    assert "if one was declined, first remove it with board_update_task(depends_on=[...])" in post["body"]
+    marker = aenv.board.conn.execute("SELECT value FROM board_state WHERE key = ?",
+                                     (autorecover.POST_PREFIX + str(post["id"]),)).fetchone()[0]
+    assert json.loads(marker)["kind"] == "continue"

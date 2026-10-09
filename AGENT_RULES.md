@@ -267,11 +267,16 @@ after you.
 
 When a task cannot move until a task elsewhere finishes (a fix in another thread, say), record it instead of letting
 the task look stalled: `board_update_task(task_id, depends_on=[<the other task's id>])`. The task's creator, its owner
-or the human may set it, on tasks in any open thread; `[]` clears it. Ids must exist and must not form a cycle; a
-dependency counts as finished once it is `done` or `declined`. While it waits the task is *awaiting*: the dashboard
-shows "Awaiting #N" for its thread, Unstick and automatic recovery leave it alone, and an automatic-recovery Needs you
-item about it closes. Don't ask the human whether to decline or claim such a task. When the last dependency finishes,
-the dispatcher asks the owner (if it still holds a live lease) or the creator to continue it.
+or the human may set it (while someone holds a live lease, only that owner or the human); `[]` clears it, but only the
+human can remove a dependency the human set. Ids must exist, must be in the task's own project or the board's own
+project, and must not form a cycle. The task is *awaiting* while a dependency that counts is unfinished in an open
+thread: the dashboard shows "Awaiting #N" for its thread, Unstick and automatic recovery leave it alone, and an
+automatic-recovery Needs you item about it closes. A dependency on a task you created yourself does not count (ask the
+human to set it, or depend on the other agent's or the human's task), and one in a closed thread does not either: the
+task then shows as stalled. Dropping the wait before the dependency finishes brings the closed Needs you item back.
+Don't ask the human whether to decline or claim an awaiting task. When the last dependency is done or declined, the
+dispatcher asks the owner (if it still holds a live lease) or the creator to continue it. A claim still needs every
+dependency `done`: remove a declined one with `board_update_task(depends_on=[...])` first.
 
 ## When you are the prevention owner
 

@@ -1051,6 +1051,10 @@ class Board:
                     c.execute("UPDATE threads SET status = ? WHERE id = ?", (status, thread_id))
             else:
                 c.execute("UPDATE threads SET status = ? WHERE id = ?", (status, thread_id))
+            # A closed thread's unfinished tasks no longer count as something to await (awaiting.py): escalations
+            # closed for tasks waiting on them come back.
+            from . import awaiting
+            awaiting.reconcile_closures(self, c, self.now())
         self._notify("thread.status", {"thread_id": thread_id, "status": status})
         return self.get_thread(p, thread_id)
 
@@ -1760,6 +1764,8 @@ class Board:
         for dep in depends_on:
             if c.execute("SELECT 1 FROM tasks WHERE id = ?", (dep,)).fetchone() is None:
                 raise NotFound(f"depends_on task {dep} not found")
+        from . import awaiting
+        awaiting.check_projects(self, c, thread_id, depends_on)
         status = "accepted" if p.is_human else "proposed"
         now = self.now()
         tid = c.execute(
@@ -1812,6 +1818,7 @@ class Board:
         # The dependencies that are neither done nor declined, with their thread: the task awaits them (awaiting.py).
         from . import awaiting
         d["waiting_on"] = awaiting.waiting_on(self.conn, r) if d["depends_on"] else []
+        d["blocked_by_closed"] = awaiting.blocked_by_closed(self.conn, r) if d["depends_on"] else []
         d['category'] = r['category']
         d['continuation_scope'] = json.loads(r['continuation_scope']) if r['continuation_scope'] else None
         d['authorization'] = {'source': r['authorization_source'], 'grant_id': r['authorization_grant_id'],
@@ -1900,9 +1907,9 @@ class Board:
                 renewed = False
                 deps = json.loads(t["depends_on"])
                 if deps:
-                    # A dependency is satisfied once it is done or declined (awaiting.py), in any thread.
-                    q = (f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(deps))}) "
-                         "AND status NOT IN ('done', 'declined')")
+                    # Claims need every prerequisite done (a declined one must be removed from depends_on first);
+                    # "done or declined" counts only for awaiting and the automatic request to continue (awaiting.py).
+                    q = f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(deps))}) AND status != 'done'"
                     open_deps = [r[0] for r in c.execute(q, deps)]
                     if open_deps:
                         raise Conflict(f"task {task_id} depends on unfinished tasks {open_deps}")
@@ -1956,14 +1963,24 @@ class Board:
         (when given). At least one of the two."""
         if status is None and depends_on is None:
             raise Invalid("give a status, depends_on, or both")
-        out = None
-        if depends_on is not None:
-            out = self.set_task_dependencies(p, session_id, task_id, depends_on)
-        if status is not None:
-            closed = (out or {}).get("closed_escalation_post_ids")
-            out = self.transition_task(p, session_id, task_id, status, note)
-            if closed is not None:
-                out["closed_escalation_post_ids"] = closed
+        if depends_on is None:
+            return self.transition_task(p, session_id, task_id, status, note)
+        if status is None:
+            return self.set_task_dependencies(p, session_id, task_id, depends_on)
+        # Both: one write, so a refused transition leaves the dependencies (and the escalations) untouched.
+        from . import awaiting
+        notes: list = []
+        self._check_agent_write(p)
+        self._session(p, session_id)
+        with db.write_tx(self.conn):
+            deps = awaiting.set_dependencies(self, p, session_id, task_id, depends_on, _in_transaction=True,
+                                             _notes=notes)
+            out = self.transition_task(p, session_id, task_id, status, note, _in_transaction=True, _notes=notes)
+        for event, payload in notes:
+            self._notify(event, payload)
+        for key in ("closed_escalation_post_ids", "reopened_escalation_post_ids"):
+            if key in deps:
+                out[key] = deps[key]
         return out
 
     def renew_task(self, p: Principal, session_id: int, task_id: int) -> dict:
@@ -1990,14 +2007,18 @@ class Board:
         return self.get_task(p, task_id, events=False)
 
     def transition_task(self, p: Principal, session_id: int, task_id: int, status: str,
-                        note: str | None = None) -> dict:
+                        note: str | None = None, *, _in_transaction: bool = False,
+                        _notes: list | None = None) -> dict:
+        """`_in_transaction`: inside the caller's write (update_task), notifications appended to `_notes`."""
         self._check_agent_write(p)
         self._session(p, session_id)
         if status not in TASK_STATUSES:
             raise Invalid(f"status must be one of {TASK_STATUSES}")
         if note is not None and len(note.encode()) > self.s.body_max_bytes:
             raise Invalid("note too long")
-        with db.write_tx(self.conn) as c:
+        if _in_transaction and not self.conn.in_transaction:
+            raise Invalid("internal: a joined task transition needs an open write transaction")
+        with (nullcontext(self.conn) if _in_transaction else db.write_tx(self.conn)) as c:
             self._check_agent_write(p)
             now = self.now()
             t = self._task_row(task_id, c)
@@ -2050,7 +2071,11 @@ class Board:
             if status in ('done','declined'):
                 from . import issues
                 issues.reconcile_completed(self,p,session_id,t['thread_id'])
-        self._notify("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
+        note_event = ("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
+        if _notes is not None:
+            _notes.append(note_event)
+        else:
+            self._notify(*note_event)
         out = self.get_task(p, task_id, events=False)
         if status == "done" and not p.is_human:
             out.update(self._leftover_tasks(p.name, t["thread_id"], task_id))

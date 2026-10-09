@@ -59,7 +59,7 @@ def configured(board: Board) -> PreventionConfig | None:
         return None     # settings are validated when read; a hand-built Settings with bad values counts as off
 
 
-def _home(board: Board) -> str:
+def board_home(board: Board) -> str:
     from .config import home
     path = board.s.config_path.parent if board.s.config_path is not None else home()
     return os.path.realpath(str(path))
@@ -75,8 +75,8 @@ def problem(board: Board, cfg: PreventionConfig) -> str | None:
         return f"prevention_thread {cfg.thread_id} does not exist"
     if thread["status"] != "open":
         return f"prevention_thread {cfg.thread_id} is closed"
-    if os.path.realpath(thread["project"] or "") != _home(board):
-        return f"prevention_thread {cfg.thread_id} is not in the board's own project ({_home(board)})"
+    if os.path.realpath(thread["project"] or "") != board_home(board):
+        return f"prevention_thread {cfg.thread_id} is not in the board's own project ({board_home(board)})"
     return None
 
 

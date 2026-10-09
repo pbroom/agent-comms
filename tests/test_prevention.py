@@ -269,3 +269,21 @@ def test_the_post_tool_and_http_take_prevention_for(penv):
                     json={"body": "Prevention", "type": "proposal", "thread_id": penv.inbox, "to": ["claude"],
                           "needs_response": True, "prevention_for": req["id"], "session_id": penv.sid["codex"]})
     assert r.status_code == 200 and r.json()["prevention_for"]["request_post_id"] == req["id"]
+
+
+def test_a_request_to_continue_is_not_a_stall_request(penv):
+    """Only Unstick and automatic stall recovery (abandoned or unclaimed work) can be answered with a prevention
+    proposal; the dispatcher's request to continue a task whose dependencies finished is recorded as kind "continue"."""
+    from test_autorecover import agent_task
+    task = agent_task(penv)
+    other = penv.thread("fix")
+    fix = penv.accepted_task(other)
+    penv.board.update_task(penv.p["codex"], penv.sid["codex"], task, depends_on=[fix])
+    penv.board.claim_task(penv.p["claude"], penv.sid["claude"], fix)
+    penv.board.transition_task(penv.p["claude"], penv.sid["claude"], fix, "done")
+    penv.clock.advance(5 * 60)
+    penv.d.tick()
+    [req] = [p for p in auto_posts(penv) if p["thread_id"] == penv.tid]
+    assert "dependencies are finished; continue it" in req["body"] and "prevention" not in req["body"]
+    with pytest.raises(Invalid, match="not an Unstick or automatic recovery request"):
+        forward(penv, req["id"])

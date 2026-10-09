@@ -1468,9 +1468,11 @@ function threadStatus(t, human, shallow = false) {
   // board's turn, not stalls on the human; only a wait whose retries ran out ("escalated") needs you.
   const waits = autoRecords.filter(r => r.kind === "recovery_wait");
   const recoveries = autoRecords.filter(r => r.kind !== "recovery_wait");
-  // Tasks that wait on unfinished dependencies (depends_on, in any thread; the server lists them as `waiting_on`,
-  // done or declined counting as finished) are awaiting that work: not stalled, not awaiting pickup. Unstick cannot
-  // help them; the "Awaiting #N" button opens the thread they wait on.
+  // Tasks that wait on unfinished dependencies (depends_on; the server lists the ones that count as `waiting_on`:
+  // unfinished, in an open thread, and not on a task the setting agent created itself) are awaiting that work: not
+  // stalled, not awaiting pickup. Unstick cannot help them; the "Awaiting #N" button opens the thread they wait on.
+  // A dependency in a closed thread (`blocked_by_closed`) is not awaited: it stalls the task ("blocking thread
+  // closed", amber).
   const taskStatus = new Map(state.threads.flatMap(x => x.tasks.map(k => [k.id, k.status])));
   const taskThread = new Map(state.threads.flatMap(x => x.tasks.map(k => [k.id, x.id])));
   const waitingOn = k => Array.isArray(k.waiting_on) ? k.waiting_on
@@ -1568,7 +1570,19 @@ function threadStatus(t, human, shallow = false) {
     }
     (at && stale(at) ? stalled : pickup).push(`task ${k.id} ${k.status}, awaiting agent pickup${at ? " for " + since(at) : ""}`);
   }
-  if (stalled.length) return { kind: "stalled", label: stalled.join("; "), needsMe, agents };
+  const closedBlocking = [];
+  for (const k of t.tasks) {
+    if (["done", "declined"].includes(k.status) || awaitingIds.has(k.id)) continue;
+    for (const d of Array.isArray(k.blocked_by_closed) ? k.blocked_by_closed : []) {
+      if (!d || !Number.isInteger(d.id)) continue;
+      stalled.push(`task ${k.id} waits on task ${d.id} in thread #${d.thread_id}, which is closed (blocking thread closed)`);
+      if (!closedBlocking.some(b => b.id === d.id)) closedBlocking.push({ ...d, task: k.id, closed: true, stalled: true });
+    }
+  }
+  if (stalled.length) return { kind: "stalled", label: stalled.join("; "), needsMe, agents,
+    ...(closedBlocking.length ? { blocking: closedBlocking, blockerStalled: true } : {}) };
+  // A fresh request or task waiting for pickup here comes first: it is this thread's own next step.
+  if (pickup.length) return { kind: "unread", label: pickup.join("; ") };
   // Nothing is stalled and the open work waits on other tasks: awaiting, unless someone is working here right now.
   const workingHere = working.some(k => !awaitingIds.has(k.id)) || runs.length;
   if (awaitingTasks.length && !workingHere) {
@@ -1585,10 +1599,9 @@ function threadStatus(t, human, shallow = false) {
     blocking.sort((a, b) => Number(b.stalled) - Number(a.stalled));   // stable: a stalled blocker first
     const label = awaitingTasks.map(k => `task ${k.id} awaits ` + waitingOn(k).map(d =>
       `task ${d.id}${Number.isInteger(d.thread_id) ? ` (thread #${d.thread_id}, ${d.status})` : ""}`).join(", ")).join("; ");
-    return { kind: "awaiting", label: [label, ...pickup, ...pending].join("; "), blocking,
+    return { kind: "awaiting", label: [label, ...pending].join("; "), blocking,
       blockerStalled: !!(blocking[0] && blocking[0].stalled) };
   }
-  if (pickup.length) return { kind: "unread", label: pickup.join("; ") };
   if (working.length || pending.length) {
     const who = [...working.map(k => `${k.owner_agent} working on task ${k.id}`), ...pending];
     return { kind: "active", label: who.join("; ") };
@@ -1655,20 +1668,22 @@ function unstickButton(t, st, human, where) {
 
 // "Awaiting #N" (list row and thread header) instead of Unstick when the thread's open work only waits on tasks in
 // other threads: blue, or amber when that thread is itself stalled. With several unfinished dependencies it names the
-// first and counts the rest ("+N"). A click opens the blocking thread.
+// first and counts the rest ("+N"). A click opens the blocking thread. A dependency in the same thread reads
+// "Awaiting task #N". A stalled thread whose task waits on a closed thread shows it too, amber ("blocking thread
+// closed"), next to Unstick.
 function awaitingButton(t, st, where) {
-  if (!st || st.kind !== "awaiting" || !st.blocking || !st.blocking.length) return null;
+  if (!st || !["awaiting", "stalled"].includes(st.kind) || !st.blocking || !st.blocking.length) return null;
   const d = st.blocking[0], more = st.blocking.length - 1;
   if (!Number.isInteger(d.thread_id)) return null;
   const rest = st.blocking.slice(1).map(b => `task ${b.id}` + (Number.isInteger(b.thread_id) ? ` (thread #${b.thread_id})` : ""));
   const tip = `Waiting on task ${d.id}${d.title ? ": " + d.title : ""} (thread #${d.thread_id}, ${d.status || "unfinished"})` +
-    (st.blockerStalled ? ". That thread is stalled." : ".") +
+    (d.closed ? ": blocking thread closed." : st.blockerStalled ? ". That thread is stalled." : ".") +
     (more ? ` Also waiting on ${more === 1 ? "1 more task" : more + " more tasks"}: ${rest.join(", ")}.` : "") +
     ` Opens thread #${d.thread_id}.`;
   return el("button", { class: "awaiting-btn" + (where === "row" ? " awaiting-row" : "") + (st.blockerStalled ? " stalled" : ""),
     id: where === "header" ? "awaiting" : null, "data-awaiting": t.id, "data-blocking-thread": d.thread_id, title: tip,
     onclick: e => { e.stopPropagation(); openThread(d.thread_id); } },
-    `Awaiting #${d.thread_id}` + (more ? ` +${more}` : ""));
+    (d.thread_id === t.id ? `Awaiting task #${d.id}` : `Awaiting #${d.thread_id}`) + (more ? ` +${more}` : ""));
 }
 
 function unstickTitle(agents) {

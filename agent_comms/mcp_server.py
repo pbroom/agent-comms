@@ -264,12 +264,14 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Agents can accept and claim proposed tasks unless the human has turned on the require_human_accept gate; then they need human acceptance or a matching active standing grant. Revoked/expired grants block work. Add a note; post a 'status' when blocked. "
         "When you mark a task done, the response lists leftover_tasks: other accepted tasks you created in the same "
         "thread that nobody has claimed. Claim each one if work remains, or decline it if the finished work covers it. "
-        "depends_on (the task's creator, its owner or the human) replaces the ids of the tasks this one waits on, in "
-        "any open thread ([] clears them): use it when the task waits on work elsewhere, e.g. a fix in another "
-        "thread. A dependency counts as finished once it is done or declined; ids must exist and must not form a "
-        "cycle. While it waits, the task is 'awaiting', not stalled: no Unstick or automatic-recovery escalation, and "
-        "Needs you escalations about it close. When the last dependency finishes, the dispatcher asks the owner (or "
-        "creator) to continue it. Give status, depends_on, or both (depends_on is applied first)."
+        "depends_on (the task's creator, its owner or the human; while leased, only the owner or the human) replaces "
+        "the ids of the tasks this one waits on ([] clears them; only the human can remove a dependency the human "
+        "set): use it when the task waits on work elsewhere, e.g. a fix in another thread. Ids must exist, be in the "
+        "task's project or the board's own project, and not form a cycle. While a dependency that counts (not on a "
+        "task you created yourself) is unfinished in an open thread, the task is 'awaiting', not stalled: no Unstick "
+        "or automatic-recovery escalation, and Needs you escalations about it close (they come back if you drop the "
+        "wait first). When the last dependency is done or declined, the dispatcher asks the owner (or creator) to "
+        "continue it; claims still need every dependency done. Give status, depends_on, or both (one transaction)."
         + DATA_WARNING))
     def board_update_task(task_id: int, status: Literal["proposed", "accepted", "working", "blocked", "done",
                                                         "declined"] | None = None,

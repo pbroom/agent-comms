@@ -106,8 +106,10 @@ PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting aut
            "finish, release or decline the abandoned or unclaimed tasks named in the recovery request; stay within "
            "the thread's existing request.")
 CONTINUE_INSTRUCTIONS = ("Claim (or reclaim) it with board_claim_task, then finish it, or release it with a `status` "
-                         "saying what remains. Stay within what this thread already asked for, and reply to this "
-                         "request (request_reply) when you are done or blocked.")
+                         "saying what remains. A claim needs every dependency done: if one was declined, first remove "
+                         "it with board_update_task(depends_on=[...]) or decline the task if nothing is left to do. "
+                         "Stay within what this thread already asked for, and reply to this request (request_reply) "
+                         "when you are done or blocked.")
 CONTINUE_PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting auto_recover_stalled_work): "
                     "continue the tasks named in the request, whose dependencies are finished; stay within the "
                     "thread's existing request.")
@@ -430,7 +432,7 @@ def _continue_item(board: Board, key: str, value: str, runner_for, now: float,
     if task is None or task["status"] in TERMINAL:
         return None
     deps = awaiting.deps_of(task)
-    if not deps or deps != rec.get("deps") or awaiting.unsatisfied(conn, deps):
+    if not awaiting.satisfied(conn, task_id, task):
         return None     # still waiting, or its dependencies were changed since
     ckey = continue_key(task_id, rec["generation"])
     if _get(conn, ckey) is not None:
@@ -519,11 +521,13 @@ def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str],
     direct: list[tuple[str, dict]] = []
     for item, reason in found:
         if reason is None:
-            groups.setdefault((item["thread_id"], item["agent"]), []).append(item)
+            # A continuation is its own post (kind "continue"), never grouped with stall recoveries: only a stall
+            # request can be answered with a prevention proposal (prevention._is_stall_request).
+            groups.setdefault((item["thread_id"], item["agent"], item["kind"] == "continue"), []).append(item)
         else:
             direct.append((reason, item))
     sent: list[int] = []
-    for (thread_id, agent), items in sorted(groups.items(), key=lambda g: min(x["stalled_since"] for x in g[1])):
+    for (thread_id, agent, _), items in sorted(groups.items(), key=lambda g: min(x["stalled_since"] for x in g[1])):
         spent = _budget_reason(conn, agent, thread_id, board.now())
         if spent:
             direct += [(spent, x) for x in items]
@@ -600,6 +604,11 @@ def _guard(board: Board, fence: tuple[str, str], items: list[dict], agent: str, 
                 raise Conflict(f"{x['key']} was already recovered")
             if _unstuck_since(conn, thread_id, agent, x["stalled_since"]):
                 raise Conflict(f"the human unstuck thread {thread_id} meanwhile")
+            if x["kind"] == "continue":
+                # Its dependencies must still be the finished ones it was found with (same depends_on generation).
+                current = awaiting.state(conn, x["task_id"]) or {}
+                if current.get("generation") != x["generation"] or not awaiting.satisfied(conn, x["task_id"]):
+                    raise Conflict(f"task {x['task_id']}'s dependencies changed meanwhile")
         if _budget_reason(conn, agent, thread_id, board.now()):
             raise Conflict(f"the automatic launch budget for {agent} is spent")
     return check
@@ -611,7 +620,8 @@ def _send(board: Board, human: Principal, fence: tuple[str, str], thread_id: int
 
     def record(post: dict) -> None:
         conn = board.conn
-        _insert(conn, POST_PREFIX + str(post["id"]), {"kind": "recovery", "thread_id": thread_id,
+        kind = "continue" if all(x["kind"] == "continue" for x in items) else "recovery"
+        _insert(conn, POST_PREFIX + str(post["id"]), {"kind": kind, "thread_id": thread_id,
                                                      "agent": agent, "task_ids": [x["task_id"] for x in items]}, now)
         rule_id = human_actions.post_rule_id(board, post["id"])   # bound to the post just before this hook
         for x in items:
@@ -652,6 +662,16 @@ def _settled(rec: dict, task) -> bool:
         return (task["status"] not in ("working", "blocked") or task["lease_expires_at"] != rec.get("lease_expires_at")
                 or task["owner_session"] != rec.get("owner_session"))
     return task["status"] != "accepted" or task["owner_agent"] is not None
+
+
+def _superseded_by_continue(conn, rec: dict, task) -> bool:
+    """The task's dependencies, set after this stall record, have all finished: the automatic request to continue
+    it (a "continue" record) takes over, so the older stall record is settled rather than escalated again."""
+    if rec.get("kind") == "continue" or task is None or not awaiting.satisfied(conn, task["id"], task):
+        return False
+    st = awaiting.state(conn, task["id"]) or {}
+    at = st.get("set_at")
+    return type(at) in (int, float) and at >= (rec.get("escalated_at") or rec.get("sent_at") or 0)
 
 
 def _launched_at(board: Board, post_id: int, agent: str) -> float | None:
@@ -695,8 +715,9 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
             continue
         try:
             task = conn.execute("SELECT * FROM tasks WHERE id = ?", (rec["task_id"],)).fetchone()
-            # A task that now waits on unfinished dependencies is awaiting that work: the stall is over.
-            if _settled(rec, task) or awaiting.awaits(conn, rec["task_id"]):
+            if awaiting.awaits(conn, rec["task_id"]):
+                continue    # awaiting other work: neither settled nor escalated; it resumes if the wait is dropped
+            if _settled(rec, task) or _superseded_by_continue(conn, rec, task):
                 settled.append((key, rec | {"state": "recovered" if rec["state"] == "sent" else "resolved",
                                             "resolved_at": now}))
                 continue
