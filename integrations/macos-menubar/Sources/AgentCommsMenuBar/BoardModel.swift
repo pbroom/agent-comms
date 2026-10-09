@@ -42,11 +42,7 @@ final class BoardModel: ObservableObject {
         launchAtLogin = loginItemAvailable && SMAppService.mainApp.status == .enabled
         observeMenu()
         // Quitting before the 60 s clear: clear now, if the clipboard still holds the copied token.
-        // Synchronous (not a Task), because the process exits right after this notification.
-        observers.append(NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { _ = self?.tokenCopier.clearNowIfUnchanged() }
-            })
+        observers.append(tokenCopier.clearWhenPosted(NSApplication.willTerminateNotification))
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let model = self else { return }
@@ -156,8 +152,9 @@ final class BoardModel: ObservableObject {
     /// "Copy board token" is offered only in the signed-in menu: the token file passed the safe loader and the
     /// board accepted the token.
     var canCopyToken: Bool {
-        if case .online = phase { return token != nil }
-        return false
+        var signedIn = false
+        if case .online = phase { signedIn = true }
+        return TokenCopier.isOffered(signedIn: signedIn, tokenLoaded: token != nil)
     }
 
     /// Copies the human token for the dashboard's "Or paste a token" sign-in: concealed and transient, cleared

@@ -87,10 +87,13 @@ token file passed the checks above and the board accepted the token (the menu sh
 
 - copies the token as plain text marked `org.nspasteboard.ConcealedType` and `org.nspasteboard.TransientType`, in
   one write, so clipboard managers that honor these markers neither show nor keep it;
+- keeps it on this Mac: Universal Clipboard does not offer it to your other devices;
 - clears the clipboard after 60 seconds, or when you quit the app, but only if the clipboard still holds that copy
-  (its change count is unchanged). Anything you copy afterwards is left alone;
+  (its change count is unchanged). Anything you copy afterwards is left alone. If another app wrote to the
+  clipboard at the same moment as the copy, the menu says the token will not be cleared automatically;
 - shows "Board token copied — clears from the clipboard in 60 s" in the menu, never the token. If the token
-  cannot be loaded, nothing is copied and the menu says why.
+  cannot be loaded, nothing is copied and the menu says why. If the clipboard refuses the write, the menu says
+  "Could not copy the board token" (the clipboard's previous contents are gone by then).
 
 **Open Dashboard** (or `board dashboard` in a terminal) is still the better way to sign in: it never puts the token
 anywhere but a request header.

@@ -11,15 +11,20 @@ public final class SystemPasteboard: TokenPasteboard {
 
     public var changeCount: Int { pasteboard.changeCount }
 
-    /// Builds one item with the string and the marker types, then writes it in a single `writeObjects`, so a
-    /// clipboard manager polling the pasteboard never sees the string without its concealed/transient markers.
-    public func replaceContents(string: String, markerTypes: [String]) -> Bool {
+    /// `.currentHostOnly` keeps the new contents on this Mac: Universal Clipboard does not offer them to the
+    /// human's other devices, where the 60 s clear could not reach them.
+    public func prepareForNewContents(currentHostOnly: Bool) -> Int {
+        pasteboard.prepareForNewContents(with: currentHostOnly ? .currentHostOnly : [])
+    }
+
+    /// One item with the string and the marker types, written in a single `writeObjects`, so a clipboard manager
+    /// polling the pasteboard never sees the string without its concealed/transient markers.
+    public func writeItem(string: String, markerTypes: [String]) -> Bool {
         let item = NSPasteboardItem()
         guard item.setString(string, forType: .string) else { return false }
         for type in markerTypes {
             guard item.setData(Data(), forType: NSPasteboard.PasteboardType(type)) else { return false }
         }
-        pasteboard.clearContents()
         return pasteboard.writeObjects([item])
     }
 

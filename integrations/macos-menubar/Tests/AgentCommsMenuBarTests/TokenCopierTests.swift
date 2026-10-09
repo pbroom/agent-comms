@@ -4,18 +4,30 @@ import XCTest
 
 @testable import AgentCommsKit
 
-/// A pasteboard that records writes. `changeCount` goes up on every change, as NSPasteboard's does.
+/// A pasteboard that records writes. Like NSPasteboard, `changeCount` goes up when the contents are cleared or
+/// prepared for new contents, not when the owner writes to contents it prepared.
 final class FakePasteboard: TokenPasteboard {
     private(set) var changeCount = 0
     private(set) var string: String?
     private(set) var types: [String] = []
+    private(set) var prepares: [Bool] = []        // the currentHostOnly flag of each prepare
     private(set) var writes = 0
     private(set) var clears = 0
     var refuseWrites = false
+    /// Runs inside `writeItem`, before the write: another app writing at the same moment.
+    var duringWrite: (() -> Void)?
 
-    func replaceContents(string: String, markerTypes: [String]) -> Bool {
-        if refuseWrites { return false }
+    func prepareForNewContents(currentHostOnly: Bool) -> Int {
+        prepares.append(currentHostOnly)
         changeCount += 1
+        string = nil
+        types = []
+        return changeCount
+    }
+
+    func writeItem(string: String, markerTypes: [String]) -> Bool {
+        duringWrite?()
+        if refuseWrites { return false }
         writes += 1
         self.string = string
         types = ["public.utf8-plain-text"] + markerTypes
@@ -72,6 +84,31 @@ final class TokenCopierTests: XCTestCase {
         XCTAssertTrue(pb.types.contains("org.nspasteboard.TransientType"))
         XCTAssertEqual(timer.delays, [60])
         XCTAssertTrue(copier.hasPendingClear)
+    }
+
+    /// Universal Clipboard must not carry the token to other devices, where the 60 s clear cannot reach it.
+    func testAsksForCurrentHostOnlyContents() {
+        let pb = FakePasteboard()
+        let timer = ManualScheduler()
+        let copier = TokenCopier(pasteboard: pb, schedule: timer.schedule)
+        copier.copy(load: { self.token })
+        copier.copy(load: { self.token })
+        XCTAssertEqual(pb.prepares, [true, true])
+    }
+
+    /// Another app writing between our prepare and our write must not be mistaken for our copy and cleared later.
+    func testAWriteByAnotherAppDuringTheCopySchedulesNoClear() {
+        let pb = FakePasteboard()
+        let timer = ManualScheduler()
+        let copier = TokenCopier(pasteboard: pb, schedule: timer.schedule)
+        pb.duringWrite = { pb.humanCopies("another app") }
+        let result = copier.copy(load: { self.token })
+        XCTAssertEqual(result, .copiedWithoutAutoClear)
+        XCTAssertFalse(result.description.contains("clears"))
+        XCTAssertTrue(timer.delays.isEmpty)
+        XCTAssertFalse(copier.hasPendingClear)
+        XCTAssertNil(copier.clearNowIfUnchanged())
+        XCTAssertEqual(pb.clears, 0)
     }
 
     func testClearsAfterTheTimerWhenNothingChanged() {
@@ -152,14 +189,53 @@ final class TokenCopierTests: XCTestCase {
         XCTAssertFalse(copier.hasPendingClear)
     }
 
-    func testARefusedWriteSchedulesNothing() {
+    func testARefusedWriteReportsFailureAndSchedulesNothing() {
         let pb = FakePasteboard()
+        pb.humanCopies("previous contents")
         pb.refuseWrites = true
         let timer = ManualScheduler()
         let copier = TokenCopier(pasteboard: pb, schedule: timer.schedule)
-        XCTAssertEqual(copier.copy(load: { self.token }), .notCopied(reason: "the clipboard refused the write"))
+        let result = copier.copy(load: { self.token })
+        guard case .notCopied = result else { return XCTFail("\(result)") }
+        XCTAssertTrue(result.description.hasPrefix("Could not copy the board token"), result.description)
+        XCTAssertTrue(result.description.contains("previous contents were cleared"), result.description)
+        XCTAssertFalse(result.description.contains("copied —"))
+        XCTAssertNil(pb.string)                      // nothing half-written, and honest about the lost contents
         XCTAssertTrue(timer.delays.isEmpty)
         XCTAssertFalse(copier.hasPendingClear)
+    }
+
+    /// The seam behind BoardModel.canCopyToken: offered only when signed in with a loaded token.
+    func testOfferedOnlyWhenSignedInWithALoadedToken() {
+        XCTAssertTrue(TokenCopier.isOffered(signedIn: true, tokenLoaded: true))
+        XCTAssertFalse(TokenCopier.isOffered(signedIn: true, tokenLoaded: false))
+        XCTAssertFalse(TokenCopier.isOffered(signedIn: false, tokenLoaded: true))
+        XCTAssertFalse(TokenCopier.isOffered(signedIn: false, tokenLoaded: false))
+    }
+
+    /// The seam behind BoardModel's willTerminate observer: the clear runs synchronously when it is posted.
+    func testClearsSynchronouslyWhenTheQuitNotificationIsPosted() {
+        let center = NotificationCenter()
+        let quit = Notification.Name("test.willTerminate")
+        let pb = FakePasteboard()
+        let timer = ManualScheduler()
+        let copier = TokenCopier(pasteboard: pb, schedule: timer.schedule)
+        let observer = copier.clearWhenPosted(quit, center: center)
+        defer { center.removeObserver(observer) }
+
+        copier.copy(load: { self.token })
+        center.post(name: quit, object: nil)
+        XCTAssertNil(pb.string)
+        XCTAssertEqual(pb.clears, 1)
+        XCTAssertFalse(copier.hasPendingClear)
+
+        copier.copy(load: { self.token })
+        pb.humanCopies("copied afterwards")
+        center.post(name: quit, object: nil)
+        XCTAssertEqual(pb.string, "copied afterwards")
+        XCTAssertEqual(pb.clears, 1)
+        center.post(name: Notification.Name("something.else"), object: nil)
+        XCTAssertEqual(pb.clears, 1)
     }
 
     func testTheTokenNeverAppearsInDescriptionsOrDumps() {
@@ -178,6 +254,7 @@ final class TokenCopierTests: XCTestCase {
                      String(describing: token), String(reflecting: token), "\(token)"]
         texts += outcomes.map(\.description)
         texts += [TokenClearOutcome.changedSince, .superseded].map(\.description)
+        texts.append(TokenCopyResult.copiedWithoutAutoClear.description)
         for value in [copier, copied, failed, token, outcomes] as [Any] {
             var dumped = ""
             dump(value, to: &dumped)
@@ -197,6 +274,7 @@ final class TokenCopierTests: XCTestCase {
         let pb = SystemPasteboard(ns)
         let timer = ManualScheduler()
         let copier = TokenCopier(pasteboard: pb, schedule: timer.schedule)
+        // .copied (not .copiedWithoutAutoClear) also shows that writing to prepared contents keeps changeCount.
         XCTAssertEqual(copier.copy(load: { self.token }), .copied(clearsInSeconds: 60))
         XCTAssertEqual(ns.pasteboardItems?.count, 1)
         XCTAssertEqual(ns.string(forType: .string), Self.secret)
