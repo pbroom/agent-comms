@@ -192,6 +192,29 @@ for (const complete of [false, true]) {
 }
 
 
+// The human chose: once a thread's own work is finished and they have answered the open shared issue for it, the
+// thread is done (hidden like completed threads); the issue itself stays open in the Issues tab until resolved.
+for (const complete of [true, false]) {
+  test(`an answered shared issue: done when the thread's own work is finished (complete=${complete})`, async () => {
+    const target = thread(1, []);
+    target.pickup = { waiting: [], processing: [], blocked: [], complete };
+    const issue = { id: 4, title: 'Fix re-reviews', body: 'b', status: 'open', needs_human: false,
+      created_by: 'codex', created_at: ago(50), updated_at: ago(40), comments: [], resolution: null,
+      decisions: [{ id: 19, outcome: 'approved', body: 'Approved', agent: 'human', created_at: ago(40), thread_ids: [1] }],
+      links: [{ thread_id: 1, post_id: 120, project: '/repo/app', title: target.title, needs_human: false }] };
+    const page = await setup({ threads: [target], issues: [issue], storage: { 'agent-comms-thread': '1' } });
+    try {
+      const dot = page.document.querySelector('li[data-thread="1"] .dot');
+      if (complete) {
+        assert.ok(dot && dot.classList.contains('done'), 'finished work + answered issue: done');
+        assert.match(dot.title, /shared issue #4 answered \(still open in Issues\)/);
+      } else {
+        assert.equal(dot, null, 'unfinished work is not shown as done just because the issue was answered');
+      }
+    } finally { page.dom.window.close(); }
+  });
+}
+
 test('an explicit supersession stays distinct from completion and preserves another recipient', async () => {
   const old = request('codex', 'finished'); old.disposition = 'superseded';
   old.reason = 'The optional candidate was replaced by the owner repair'; old.evidence_post_ids = [11];
