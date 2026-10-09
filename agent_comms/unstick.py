@@ -18,6 +18,7 @@ Guardrails (DESIGN_NOTES "Unstick"):
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from . import dispatch, human_actions
@@ -37,7 +38,8 @@ BODY_INSTRUCTIONS = ("Find the root cause of the stall, resolve it now, and post
 
 
 def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
-    """The active non-human agents this thread is waiting on, and why. Reads metadata only (ids, agents, flags,
+    """The active non-human agents this thread is waiting on, and why: unanswered requests, blocked tasks and expired
+    leases (their owner), and accepted tasks nobody claimed (their creator). Reads metadata only (ids, agents, flags,
     statuses, times), never bodies, titles or summaries. No age threshold: the human chose to ask."""
     c, now = board.conn, board.now()
     reasons: list[dict] = []
@@ -62,11 +64,39 @@ def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
                 ORDER BY tk.id""", (thread_id, *TERMINAL, now)):
         kind = "blocked_task" if r["status"] == "blocked" else "expired_lease"
         reasons.append({"kind": kind, "agent": r["owner_agent"], "task_id": r["id"]})
+    # (c) Accepted tasks nobody owns: the agent that created one is asked to claim it, or decline it when finished
+    # work already covers it. A task still waiting on unfinished prerequisites cannot be claimed and is left out.
+    for r in unclaimed_tasks(board, thread_id):
+        reasons.append({"kind": "unclaimed_task", "agent": r["created_by"], "task_id": r["id"]})
     agents: list[str] = []
     for x in reasons:
         if x["agent"] not in agents:
             agents.append(x["agent"])
     return agents, reasons
+
+
+def unclaimed_tasks(board: Board, thread_id: int | None = None, updated_before: float | None = None) -> list:
+    """Accepted, unowned tasks created by an active non-human agent whose prerequisites are all done, oldest first.
+    Rows carry id, thread_id, created_by and updated_at only (never the title)."""
+    q = """SELECT tk.id, tk.thread_id, tk.created_by, tk.updated_at, tk.depends_on FROM tasks tk
+           JOIN agents a ON a.name = tk.created_by AND a.active = 1 AND a.is_human = 0
+           WHERE tk.status = 'accepted' AND tk.owner_agent IS NULL"""
+    args: list = []
+    if thread_id is not None:
+        q += " AND tk.thread_id = ?"
+        args.append(thread_id)
+    if updated_before is not None:
+        q += " AND tk.updated_at <= ?"
+        args.append(updated_before)
+    out = []
+    for r in board.conn.execute(q + " ORDER BY tk.id", args):
+        deps = json.loads(r["depends_on"] or "[]")
+        if deps and board.conn.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE id IN ({','.join('?' * len(deps))}) AND status = 'done'",
+                deps).fetchone()[0] != len(set(deps)):
+            continue
+        out.append(r)
+    return out
 
 
 def _ids(ids: list[int]) -> str:
@@ -85,6 +115,9 @@ def build_body(agents: list[str], reasons: list[dict]) -> str:
             parts.append(f"{_ids(x['post_ids'])} {verb} had no reply from {x['agent']}")
         elif x["kind"] == "blocked_task":
             parts.append(f"task {x['task_id']} is blocked (owner {x['agent']})")
+        elif x["kind"] == "unclaimed_task":
+            parts.append(f"task {x['task_id']} is accepted but unclaimed (created by {x['agent']}): claim it or "
+                         "decline it if finished work already covers it")
         else:
             parts.append(f"the lease on task {x['task_id']} expired (owner {x['agent']})")
     if len(parts) > MAX_REASONS:
@@ -100,8 +133,8 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
         raise Conflict(f"thread {thread_id} is closed; reopen it first")
     agents, reasons = stuck_agents(board, thread_id)
     if not agents:
-        raise Conflict("nothing here is waiting on an agent (no unanswered requests to an agent, blocked tasks or "
-                       "expired leases); if the thread is waiting on you, reply to it")
+        raise Conflict("nothing here is waiting on an agent (no unanswered requests to an agent, blocked tasks, "
+                       "expired leases or unclaimed tasks); if the thread is waiting on you, reply to it")
     key = STATE_PREFIX + str(thread_id)
     human_actions.reserve_cooldown(
         board, p, key, UNSTICK_COOLDOWN_SECONDS,

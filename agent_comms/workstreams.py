@@ -267,7 +267,10 @@ def after_save(board, p, sid, row, state):
 UNKNOWN_ACTIVITY = 'Owner activity is unknown; fresh explicit idle evidence is required'
 
 
-def _inactive(board, session, managed):
+def _inactive(board, session, managed, abandoned=False, own_run_id=None):
+    """Why `session` cannot be treated as inactive, or None. `abandoned` (recovery.abandonment proved the session has
+    been silent since its task lease expired) counts like an ended dispatcher run; `own_run_id` is the successor's own
+    dispatcher run, which is not the old owner's."""
     now = board.now()
     path = os.path.realpath(session['worktree'] or session['project'])
     active = board.conn.execute("""SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session
@@ -289,6 +292,8 @@ def _inactive(board, session, managed):
     from .dispatch import ACTIVE
     for record in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
         run = json.loads(record['value'])
+        if own_run_id and run.get('run_id') == own_run_id:
+            continue
         if (run.get('status') in ACTIVE and
                 (run.get('agent') == session['agent']
                  or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path))):
@@ -309,7 +314,7 @@ def _inactive(board, session, managed):
                                    (session['id'],)).fetchone()[0]
     minimum = max(last_start or 0,last_work or 0)
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
-    if not ended and not idle:
+    if not ended and not idle and not abandoned:
         return UNKNOWN_ACTIVITY
     if not path or not os.path.isdir(path):
         return 'Owner worktree cannot be inspected'

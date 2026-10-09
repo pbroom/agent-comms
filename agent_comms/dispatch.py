@@ -768,8 +768,19 @@ class Dispatcher:
         # heartbeats must not indefinitely suppress a managed continuation.
         workstreams.tick(self.board, self.human, fence=self._fence())
         self._expire_generic_pickups()
+        # Before the scan, so a recovery request posted now is a trigger in this same pass.
+        self._auto_recover()
         pending = self._scan()
         self._launch_due(pending, now, foreign)
+
+    def _auto_recover(self) -> None:
+        """Automatic recovery of abandoned and unclaimed work under the human's board setting
+        (autorecover.py), fenced on this loop's ownership token."""
+        from . import autorecover
+        try:
+            autorecover.tick(self.board, self.human, runner_for=self._runner, fence=self._fence())
+        except Exception:
+            log.exception("automatic recovery pass failed")
 
     def _generic_pickups(self, rules):
         """Durable queued requests covered by an existing dispatch approval.

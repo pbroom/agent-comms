@@ -46,6 +46,9 @@ class Settings:
     body_max_bytes: int = 4096
     max_refs: int = 20
     require_human_accept: bool = False
+    # [tasks]: the dispatcher automatically asks the owner (or creator) of abandoned or orphaned work to recover it,
+    # once per stall (agent_comms/autorecover.py). The human's setting; agents cannot change it.
+    auto_recover_stalled_work: bool = True
     # [web]: dashboard sign-in sessions (see weblogin.py). File-only: the Settings page cannot change them.
     session_days: int = 30        # sliding: a session unused this long ends; use renews it (at most hourly)
     session_max_days: int = 90    # absolute: a session ends this long after sign-in, however much it is used
