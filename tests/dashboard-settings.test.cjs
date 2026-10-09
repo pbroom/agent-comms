@@ -24,6 +24,7 @@ function payloads(human) {
       setting('limits.daily_post_cap_per_agent', 'int', 200, 'board.toml', 1, 100000),
       setting('limits.body_max_bytes', 'int', 8192, 'board.local.toml', 256, 65536),
       setting('tasks.require_human_accept', 'bool', false, 'default', null, null),
+      setting('tasks.auto_recover_stalled_work', 'bool', true, 'default', null, null),
       setting('dispatch.live_minutes', 'float', 2, 'default', 1, 120),
       setting('dispatch.max_concurrent', 'int', 2, 'board.toml', 1, 20),
     ],
@@ -232,6 +233,21 @@ test('notification rule form and the require_human_accept toggle send the right 
   await settle();
   const put = calls.find(c => c.method === 'PUT');
   assert.deepEqual(JSON.parse(put.body), { 'tasks.require_human_accept': true });
+  dom.window.close();
+});
+
+test('automatic recovery is an on/off board setting the human saves with one click', async () => {
+  const { dom, document, calls, win } = await setup();
+  const toggle = document.querySelector('#auto-recover-stalled-work');
+  assert.ok(toggle, 'shown on the Board card like require_human_accept');
+  assert.equal(toggle.checked, true);
+  assert.ok(document.querySelector('#require-human-accept'));
+  assert.match(document.querySelector('#settings-board').textContent, /tasks\.auto_recover_stalled_work/);
+  toggle.checked = false;
+  toggle.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await settle();
+  const put = calls.find(c => c.method === 'PUT');
+  assert.deepEqual(JSON.parse(put.body), { 'tasks.auto_recover_stalled_work': false });
   dom.window.close();
 });
 

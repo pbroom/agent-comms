@@ -114,7 +114,7 @@ def redact_secrets(text: str) -> str:
 # needs a restart.
 RELOADABLE_INT = ("lease_ttl_minutes", "max_agent_posts_per_thread_without_human", "daily_post_cap_per_agent",
                   "body_max_bytes", "max_refs")
-RELOADABLE_BOOL = ("require_human_accept",)
+RELOADABLE_BOOL = ("require_human_accept", "auto_recover_stalled_work")
 RELOADABLE_WEB = ("session_days", "session_max_days")   # [web] sign-in session lifetimes (weblogin.py)
 WEB_DAYS_MAX = 3650
 RESTART_ONLY = ("host", "port", "db_path", "agents_path")
@@ -1041,21 +1041,25 @@ class Board:
 
     # ------------------------------------------------------------ posts
 
+    # A post the dispatcher made automatically as the human (autorecover.py) carries a board_state marker. It is not
+    # the human stepping in, so it does not lift the agent-post cap.
+    NOT_AUTOMATIC = "NOT EXISTS (SELECT 1 FROM board_state bs WHERE bs.key = 'auto_recovery.post.' || {post}.id)"
+
     def _agent_posts_since_human(self, thread_id: int) -> int:
         posts = self.conn.execute(
-            """SELECT COUNT(*) FROM posts p JOIN agents a ON a.name = p.agent
+            f"""SELECT COUNT(*) FROM posts p JOIN agents a ON a.name = p.agent
                WHERE p.thread_id = :t AND a.is_human = 0 AND p.id > COALESCE(
                  (SELECT MAX(p2.id) FROM posts p2 JOIN agents a2 ON a2.name = p2.agent
-                  WHERE p2.thread_id = :t AND a2.is_human = 1), 0)""",
+                  WHERE p2.thread_id = :t AND a2.is_human = 1 AND {self.NOT_AUTOMATIC.format(post='p2')}), 0)""",
             {"t": thread_id},
         ).fetchone()[0]
         # Each link is one creation/join event, including joins to distinct issues.
         # Include ties conservatively so a coarse clock cannot bypass the cap.
         links = self.conn.execute(
-            """SELECT COUNT(*) FROM issue_links l JOIN agents a ON a.name=l.agent
+            f"""SELECT COUNT(*) FROM issue_links l JOIN agents a ON a.name=l.agent
                WHERE l.thread_id=:t AND a.is_human=0 AND l.created_at >= COALESCE(
                  (SELECT MAX(p.created_at) FROM posts p JOIN agents h ON h.name=p.agent
-                  WHERE p.thread_id=:t AND h.is_human=1), 0)""",
+                  WHERE p.thread_id=:t AND h.is_human=1 AND {self.NOT_AUTOMATIC.format(post='p')}), 0)""",
             {"t": thread_id},
         ).fetchone()[0]
         return posts + links
@@ -1756,6 +1760,11 @@ class Board:
                 ev = "reclaim" if prev else "claim"
                 note = f"previous lease by {prev} (session {t['owner_session']}) expired" if prev else None
                 self._event(c, task_id, ev, t["status"], "working", p, session_id, note)
+                if prev and t["owner_session"] not in (None, session_id) and t["lease_expires_at"] is not None:
+                    # Keep the evidence that the old session went silent before its lease expired: the reclaim
+                    # overwrites the owner, and request ownership recovery (recovery.abandonment) needs it later.
+                    from . import recovery
+                    recovery.note_reclaimed_lease(c, t, p.name, now)
                 for r in c.execute(
                     """SELECT id, owner_agent, intends_files FROM tasks WHERE id != ? AND owner_agent IS NOT NULL
                        AND lease_expires_at >= ? AND status IN ('working','blocked')""", (task_id, now)):
@@ -1855,7 +1864,24 @@ class Board:
                 from . import issues
                 issues.reconcile_completed(self,p,session_id,t['thread_id'])
         self._notify("task.transition", {"task_id": task_id, "from": frm, "to": status, "agent": p.name})
-        return self.get_task(p, task_id, events=False)
+        out = self.get_task(p, task_id, events=False)
+        if status == "done" and not p.is_human:
+            out.update(self._leftover_tasks(p.name, t["thread_id"], task_id))
+        return out
+
+    LEFTOVER_NOTE = ("You created these accepted tasks in this thread and nobody has claimed them: {ids}. Claim one "
+                     "(board_claim_task) if work remains, or decline it (board_update_task status=declined) if the work "
+                     "you just finished already covers it. Don't leave it unclaimed: the thread shows as stalled.")
+
+    def _leftover_tasks(self, agent: str, thread_id: int, done_id: int) -> dict:
+        """The agent's own accepted, unowned tasks left in this thread after it finished one (ids and statuses only)."""
+        rows = self.conn.execute(
+            """SELECT id, status FROM tasks WHERE thread_id = ? AND id != ? AND created_by = ? AND status = 'accepted'
+               AND owner_agent IS NULL ORDER BY id""", (thread_id, done_id, agent)).fetchall()
+        if not rows:
+            return {}
+        return {"leftover_tasks": [{"id": r["id"], "status": r["status"]} for r in rows],
+                "leftover_note": self.LEFTOVER_NOTE.format(ids=", ".join(str(r["id"]) for r in rows))}
 
     # ------------------------------------------------------------ dashboard
 

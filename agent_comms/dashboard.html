@@ -1105,20 +1105,23 @@ function settingsTable(section, title) {
   ];
 }
 
+// One switch per on/off board setting (tasks.require_human_accept, tasks.auto_recover_stalled_work): a click saves it.
+function settingToggle(item, f) {
+  const id = item.name.replace(/_/g, "-");
+  return el("div", { class: "toggle", style: "margin-top:12px" },
+    el("input", { type: "checkbox", id, checked: item.value, disabled: cfgBusy || !f.writable,
+      onchange: e => { cfgAct("PUT", "/api/settings", { [item.key]: e.target.checked }); } }),
+    el("label", { for: id }, el("div", {}, item.label), el("code", { class: "muted" }, item.key)),
+    sourceChip(item.source));
+}
+
 function renderBoardSection() {
-  const accept = cfg.settings.settings.find(x => x.key === "tasks.require_human_accept");
+  const toggles = cfg.settings.settings.filter(x => x.type === "bool" && x.section === "tasks");
   const f = cfg.settings.files;
   return el("section", { class: "card", id: "settings-board" },
     el("h2", {}, "Board"),
     el("div", { class: "actions" }, state.paused ? chip("PAUSED", "bad") : chip("live", "ok"), pauseControl("settings")),
-    accept ? el("div", { class: "toggle", style: "margin-top:12px" },
-      el("input", { type: "checkbox", id: "require-human-accept", checked: accept.value, disabled: cfgBusy || !f.writable,
-        onchange: e => {
-          const on = e.target.checked;
-          cfgAct("PUT", "/api/settings", { "tasks.require_human_accept": on });
-        } }),
-      el("label", { for: "require-human-accept" }, el("div", {}, accept.label), el("code", { class: "muted" }, accept.key)),
-      sourceChip(accept.source)) : null,
+    toggles.map(item => settingToggle(item, f)),
     el("p", { class: "small muted" }, "Changes are saved to board.local.toml beside board.toml (never to board.toml) and take effect in running processes without a restart."),
     !f.writable ? el("div", { class: "err" }, "This board was not started from board.toml, so settings cannot be saved here.") : null,
     f.board_toml_error ? el("div", { class: "err" }, "board.toml: " + f.board_toml_error) : null,
@@ -1347,7 +1350,7 @@ function threadStatus(t, human) {
   const stalled = [], agents = [];
   const involve = a => { if (a && !isHumanName(a) && !agents.includes(a) && !runs.some(r => r.agent === a)) agents.push(a); };
   let needsMe = false;
-  const pending = [], pickup = [];
+  const pending = [];
   const shared = allIssues().filter(i => i.status !== "resolved" && i.links.some(l => l.thread_id === t.id));
   if (shared.length) {
     const needsDecision = shared.some(i => i.needs_human && i.links.some(l => l.thread_id === t.id && l.needs_human !== false));
@@ -1361,9 +1364,31 @@ function threadStatus(t, human) {
   // Name the items, so it is clear what blocks the thread (and not, say, an answered issue linked to it).
   if (human && waiting) stalled.push(waiting === 1 ? `Waiting on you: post #${waitingIds[0]}`
     : `${waiting} posts waiting on you: ${waitingIds.map(id => "#" + id).join(", ")}`);
-  const blocked = t.tasks.filter(k => k.status === "blocked");
+  // Automatic recoveries the dispatcher sent under the human's setting (state.auto_recovery, server records: ids, agent
+  // names, states and the server's reason). A pending one is the agent's turn, not a stall; one that did not take
+  // waits on the human, with the precise reason.
+  // The server lists an escalation only while its Needs you post is still open and the thread was not unstuck since
+  // (autorecover.list_records); once the human handles it, the ordinary labels for the task apply again.
+  const recoveries = (state.auto_recovery || []).filter(r => r.thread_id === t.id);
+  const recoveredTasks = new Set(recoveries.map(r => r.task_id));
+  const recovering = new Map(recoveries.filter(r => r.state === "sent" && r.kind === "abandoned" && r.owner_session != null)
+    .map(r => [r.owner_session, r.agent]));
+  const pickup = [];
+  for (const r of recoveries) {
+    const what = r.kind === "unclaimed" ? `unclaimed task ${r.task_id}` : `task ${r.task_id}`;
+    if (r.state === "escalated") {
+      // Escalated after a launch that did not take ("failed"), or sent to the human without one ("not launched").
+      stalled.push(`automatic recovery of ${what} ${r.post_id ? "failed" : "not launched"}: ${r.reason || "it did not take"}${r.detail ? ": " + r.detail : ""} — needs you`);
+      if (human) needsMe = true;
+      involve(r.agent);
+    } else {
+      const label = `automatic recovery sent to ${r.agent} for ${what}${r.post_id ? ` (#${r.post_id})` : ""}`;
+      (runs.some(x => x.agent === r.agent) ? pending : pickup).push(label);
+    }
+  }
+  const blocked = t.tasks.filter(k => k.status === "blocked" && !recoveredTasks.has(k.id));
   if (blocked.length) stalled.push(plural(blocked.length, "blocked task"));
-  const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status));
+  const expired = t.tasks.filter(k => k.lease_state === "expired" && !["done", "declined"].includes(k.status) && !recoveredTasks.has(k.id));
   if (expired.length) stalled.push("A task lease expired");
   for (const k of [...blocked, ...expired]) involve(k.owner_agent);
   // Only a human post lifts the cap: it is "on you" for the human only (an agent's view sorts it as someone else's).
@@ -1388,7 +1413,11 @@ function threadStatus(t, human) {
     const agent = r.assigned_agent || r.recipient;
     if (isHumanName(agent)) continue;
     const label = `#${r.post_id} · ${agent}${r.assigned_session ? " s" + r.assigned_session : ""}`;
-    if (r.pickupState === "blocked") {
+    if (r.pickupState !== "waiting" && recovering.has(r.assigned_session)) {
+      // Held by a session that abandoned its work: the automatic recovery asks a new session to take it over.
+      const by = recovering.get(r.assigned_session);
+      (runs.some(x => x.agent === by) ? pending : pickup).push(`${label}: held by an abandoned session; automatic recovery sent to ${by}`);
+    } else if (r.pickupState === "blocked") {
       stalled.push(`${label}: blocked${r.reason ? ": " + r.reason : ""}`); involve(agent);
     } else if (r.pickupState === "waiting") {
       const overdue = r.overdue || (r.deadline_at && now >= Date.parse(r.deadline_at));
@@ -1402,8 +1431,15 @@ function threadStatus(t, human) {
   const taskStatus = new Map(state.threads.flatMap(x => x.tasks.map(k => [k.id, k.status])));
   const waitsOnPrerequisites = k => Array.isArray(k.depends_on) && k.depends_on.some(id => taskStatus.get(id) !== "done");
   for (const k of t.tasks) {
-    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active" || waitsOnPrerequisites(k)) continue;
+    if (!["proposed", "accepted"].includes(k.status) || k.lease_state === "active" || waitsOnPrerequisites(k)
+        || recoveredTasks.has(k.id)) continue;
     const at = k.updated_at || k.created_at;
+    if (k.status === "accepted" && !k.owner_agent && k.created_by && !isHumanName(k.created_by) && at && stale(at)) {
+      // Nobody claimed it: its creator is asked to claim it, or decline it when finished work already covers it.
+      stalled.push(`task ${k.id} unclaimed for ${since(at)} (created by ${k.created_by})`);
+      involve(k.created_by);
+      continue;
+    }
     (at && stale(at) ? stalled : pickup).push(`task ${k.id} ${k.status}, awaiting agent pickup${at ? " for " + since(at) : ""}`);
   }
   if (stalled.length) return { kind: "stalled", label: stalled.join("; "), needsMe, agents };

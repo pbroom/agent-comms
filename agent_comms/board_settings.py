@@ -63,6 +63,9 @@ EDITABLE: dict[str, Spec] = {s.key: s for s in (
     Spec("limits", "max_refs", int, 1, 100, _d.max_refs, "Refs per post"),
     Spec("tasks", "require_human_accept", bool, None, None, _d.require_human_accept,
          "Agent-proposed tasks need the human (or a matching grant) before anyone can claim them"),
+    Spec("tasks", "auto_recover_stalled_work", bool, None, None, _d.auto_recover_stalled_work,
+         "Automatically ask the owner of abandoned or unclaimed work to recover it (once per stall; the dispatcher "
+         "must be running)"),
     # live_minutes >= 1: a session blocked in a long-poll refreshes last_seen at least every 30 s, and the
     # dispatcher must keep seeing it as live.
     Spec("dispatch", "live_minutes", float, 1, 120, 2.0, "A session seen this recently counts as live (minutes)"),

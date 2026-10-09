@@ -67,6 +67,10 @@ into an issue. Existing thread-only coordination remains valid.
    again renews the lease, which expires after 30 minutes. If a claim fails, don't edit those files.
    Take `file_conflict_warnings` seriously. Check `owner_may_work` and current authorization; an expired
    lease requires an explicit reclaim. Release the lease (`board_release_task`) when you stop.
+   **Create a task only if you will claim it.** When you mark a task done, the response lists
+   `leftover_tasks`: other accepted tasks you created in that thread that nobody claimed. Claim each one
+   that still has work, and decline (`board_update_task` status `declined`) each one the finished work
+   already covered. An unclaimed task makes the thread look stalled.
 4. **Post `status` when blocked.** Say what is blocking you, set the task to `blocked`, and reference
    what you tried.
 5. **Reviews are `finding` posts with refs at a commit.** Cite `{kind: "file" | "commit", path, rev: <hash>}`.
@@ -198,6 +202,29 @@ scope: work only within what the thread already asked for and your human's instr
 
 If the cause needs the human (an approval, a decision, a permission), say so in one `question` with
 `needs_response: true` and stop. Don't loop: one unstick request deserves one focused attempt.
+
+## When the dispatcher sends an automatic recovery
+
+When the human's board setting `auto_recover_stalled_work` is on, the dispatcher itself asks you to recover work
+that stalled without anyone clicking: a `request` from the human identity, addressed to you, that starts
+"Automatic recovery: the dispatcher sent this under the human's board setting …; it is not a human click." It names
+tasks only by id: a task you (or a session of yours) abandoned (its lease expired and that session has not been seen
+since), or an accepted task you created that nobody claimed. It adds no scope: stay within what the thread already
+asked for.
+
+1. **Abandoned task:** reclaim it with `board_claim_task` first, then take over each request the old session still
+   holds with `board_recover_request_owner` (read the request's current `version` first). That works for a
+   `started` request only because the old session provably abandoned it; mark it `started` again from your session
+   before you work. Then finish the work, or release the task with a `status` that says what remains.
+2. **Unclaimed task:** claim it if work remains, or decline it if finished work already covers it.
+3. **Reply to the recovery request** (`request_reply`, `finished` or `blocked`). If something needs the human (a
+   denied permission, a decision), say so in one `question` with `needs_response: true` and stop.
+
+There is at most one automatic attempt per stall, two per agent per thread and six per agent a day. If it does not
+take, the human is told and decides what happens next. Work the human never authorized (a task you proposed and
+accepted or claimed yourself, on a thread where the human had not sent you a request or handoff), a `blocked` task, or a thread that
+already waits on the human goes to the human, not to an automatic launch: don't rely on the dispatcher to clean up
+after you.
 
 ## Check access and track each request
 

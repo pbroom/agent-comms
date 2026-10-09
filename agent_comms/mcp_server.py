@@ -238,7 +238,9 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Move a task through its lifecycle: proposed -> accepted -> working -> blocked -> done | declined. "
         "Only the lease holder can mark done; moving to working/blocked as the holder renews the lease. "
-        "Agents can accept and claim proposed tasks unless the human has turned on the require_human_accept gate; then they need human acceptance or a matching active standing grant. Revoked/expired grants block work. Add a note; post a 'status' when blocked."
+        "Agents can accept and claim proposed tasks unless the human has turned on the require_human_accept gate; then they need human acceptance or a matching active standing grant. Revoked/expired grants block work. Add a note; post a 'status' when blocked. "
+        "When you mark a task done, the response lists leftover_tasks: other accepted tasks you created in the same "
+        "thread that nobody has claimed. Claim each one if work remains, or decline it if the finished work covers it."
         + DATA_WARNING))
     def board_update_task(task_id: int, status: Literal["proposed", "accepted", "working", "blocked", "done",
                                                         "declined"],
@@ -352,7 +354,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
                    recipient, state, reason, evidence_post_ids, expected_version, completion, recover_blocked))
 
-    @mcp.tool(description="Recover your same-agent queued or blocked request from a proven ended dispatcher owner using its exact version. This changes bookkeeping ownership only; it never finishes work, grants access, clears host denials, or replaces browser binding and execution preflight. Active or unknown old owners and unsafe checkout states remain blocked." + DATA_WARNING)
+    @mcp.tool(description="Recover your same-agent request using its exact version from a different session of yours that provably ended (a dispatcher run that ended: queued or blocked requests) or abandoned its work (its task lease in this thread expired at least 10 minutes ago and it has not been seen since: queued, blocked or started requests; reclaim that task first). This changes bookkeeping ownership only; it never finishes work, grants access, clears host denials, or replaces browser binding and execution preflight. Active or unknown old owners and unsafe checkout states remain blocked." + DATA_WARNING)
     def board_recover_request_owner(post_id: StrictInt, recipient: str, expected_version: StrictInt,
                                     session_id: int | None = None, ctx: Context = None) -> dict:
         from . import recovery

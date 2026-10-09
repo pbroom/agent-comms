@@ -417,6 +417,9 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
                                   if live and r.get("status") in dispatch.ACTIVE]
             # For "Approve & launch" in the Needs you callout: agents with a runner and no live session.
             out["launchable_agents"] = human_actions.launchable_agents(board, config)
+            # For the thread status dots: automatic recoveries pending or escalated to the human (autorecover.py).
+            from . import autorecover
+            out["auto_recovery"] = autorecover.list_records(board, p)
         return out
 
     # ---------------------------------------------------------------- sessions

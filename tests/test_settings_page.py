@@ -321,6 +321,18 @@ def test_running_board_sees_changed_daily_cap_and_require_human_accept(senv):
     assert other.limits()["require_human_accept"] is True
 
 
+def test_auto_recover_stalled_work_is_on_by_default_and_the_human_can_turn_it_off(senv):
+    item = by_key(senv.get().json())["tasks.auto_recover_stalled_work"]
+    assert item["value"] is True and item["type"] == "bool" and item["source"] == "default"
+    assert senv.put({"tasks.auto_recover_stalled_work": False}, who="codex").status_code == 403
+    assert senv.put({"tasks.auto_recover_stalled_work": "off"}).status_code == 400
+    assert senv.put({"tasks.auto_recover_stalled_work": False}).status_code == 200
+    assert senv.board.s.auto_recover_stalled_work is False
+    assert "auto_recover_stalled_work = false" in senv.local.read_text()
+    other = Board(Settings.load(), clock=senv.clock)          # another process loads it too
+    assert other.s.auto_recover_stalled_work is False
+
+
 def test_hand_edit_is_reloaded_like_agents_toml(senv):
     senv.local.write_text(LOCAL_TOML.replace("8192", "1024"))
     touch_later(senv.local)
