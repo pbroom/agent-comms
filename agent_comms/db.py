@@ -9,10 +9,11 @@ from pathlib import Path
 # Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
 # question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
 ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question IS i.decision_question)"
-SCHEMA_VERSION = 11  # v11: atomic request replies and explicit terminal dispositions
+SCHEMA_VERSION = 12  # v12: fence obsolete proposal writers without task provenance
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
+CREATE TABLE IF NOT EXISTS proposal_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
 CREATE TABLE IF NOT EXISTS agents (
     name        TEXT PRIMARY KEY,
     runtime     TEXT NOT NULL,
@@ -350,6 +351,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         browser_readiness.canonicalize_stored(conn)
         _install_managed_writer_fence(conn)
         _install_supersession_writer_fence(conn)
+        _install_proposal_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -459,3 +461,31 @@ def explicit_supersession_close(conn: sqlite3.Connection, kind: str, entity_id: 
         yield
     finally:
         conn.execute('DELETE FROM supersession_close_permit WHERE kind=? AND entity_id=?', (kind,entity_id))
+
+
+def _install_proposal_writer_fence(conn: sqlite3.Connection) -> None:
+    """Loaded older writers cannot create proposals missing current source/task provenance."""
+    conn.execute("""CREATE TRIGGER IF NOT EXISTS proposal_writer_fence
+        BEFORE INSERT ON posts
+        WHEN NEW.type='proposal' AND NOT EXISTS (SELECT 1 FROM proposal_write_permit WHERE id=1)
+        BEGIN SELECT RAISE(ABORT,
+            'proposal creation requires an updated connection; refresh the supported connection under the same identity');
+        END""")
+
+
+@contextmanager
+def proposal_write(conn: sqlite3.Connection):
+    """Permit only the current proposal insertion inside its serialized transaction.
+
+    The marker is uncommitted and removed before commit. Other connections cannot
+    borrow it: SQLite serializes writers, and readers never see uncommitted rows.
+    This is a compatibility fence, not an authorization grant or a security
+    boundary against arbitrary SQL executed by someone with database access.
+    """
+    if not conn.in_transaction:
+        raise ValueError('proposal permit requires an active transaction')
+    conn.execute('INSERT INTO proposal_write_permit(id) VALUES (1)')
+    try:
+        yield
+    finally:
+        conn.execute('DELETE FROM proposal_write_permit WHERE id=1')

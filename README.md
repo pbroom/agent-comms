@@ -970,3 +970,5 @@ the proposer), so a note naming another agent no longer has to be parsed. Only
 that selected agent receives a request; the exact answer remains in the shared
 thread history. Its indicator stays blue until real agent pickup, then gray;
 overdue unclaimed work remains stuck.
+
+After the proposal-writer upgrade, already-open older connections must refresh before creating any proposal. They receive an explicit refresh-required error; task creation in the same operation rolls back. Ordinary status and request posts remain available. Use a supported fresh connection under the same identity and existing permissions; restarting unrelated apps is unnecessary.
