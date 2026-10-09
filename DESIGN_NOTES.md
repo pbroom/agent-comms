@@ -460,6 +460,49 @@ deleted when the run ends, so evidence the agent wants to keep must be posted or
 pinned and run `--offline`; a cache that lacks it fails the run's browser start, which the agent reports as
 `browser_missing`.
 
+### Browser evidence files and the misreported denial (2026-10-09)
+
+**What happened.** Dispatched Codex audit runs (S1, S2, S3) had to keep screenshots in the run directory's evidence
+folder (`.audit-shared/screens/S1/...`). Playwright MCP writes only inside its output directory or its workspace
+(with no MCP roots from the client, the server's cwd; here both are the per-run `data/dispatch/<run>-browser`), so
+`browser_take_screenshot` with a path in the repo failed: "File access denied: ... is outside allowed roots"
+(checked against @playwright/mcp 0.0.83 with the dispatcher's exact flags). Codex reported that through
+`board_browser_failure` as `policy_denied`, which wrote the sticky project-wide gate for the Lab origin. Every
+browser-bound launch to it then stopped, and only the human route `POST /api/browser/permission-change` could clear
+it, with no dashboard control.
+
+**Screenshots: keep the output directory outside the run directory, and have the agent copy.** Two options. (a) The
+output directory stays where it is; the agent saves by bare file name and copies the file into its evidence folder
+with a shell `cp`. (b) Put it inside the run directory (`<cwd>/.agent-browser/<run>`). Chosen: (a). With (b) the
+browser server, which runs outside Codex's sandbox, would write into the worktree: every run would leave untracked
+files that `git status`, the dirty-worktree recovery checks and a careless `git add -A` all see, the dispatcher would
+need a `.gitignore` or an exclude entry it does not own, and its cleanup would delete inside a project directory
+instead of only its own `data/dispatch/<run>-browser` folder. (a) needs only what Codex already allows: verified with
+`codex sandbox -P :workspace` (Codex 0.157) that a command can read a mode-700 directory outside the workspace and
+`cp` from it into the workspace, while a write outside stays denied. The dispatcher now also passes
+`--file-paths absolute` (a managed flag, so a config may not set it), so the tool result reports the exact path to
+copy from rather than one relative to the server's cwd. The prompt's fixed browser sentence says all of this. Cleanup
+cannot race the copy: `remove_browser_output` runs only once the run's process is gone (exit, spawn failure, an
+orphan found dead), and the agent's `cp` is a child of that process. A test ticks the dispatcher while the run is
+alive and checks the files remain.
+
+**A path refusal cannot gate an origin.** `policy_denied` and `host_permission` now mean, in the tool description
+and the prompt, only that the browser or its host refused the bound origin itself. `report_failure` refuses those
+two kinds when the evidence matches Playwright's phrase "outside allowed roots" (case and spacing tolerant), with a
+message that says what to do instead. That phrase is specific to Playwright's file check and has nothing to do with
+an origin, so the false-positive risk is a genuine host denial whose evidence also quotes a file refusal, which the
+reporter can restate. Other kinds may still quote it (they do not write a gate). The check only catches the verbatim
+wording; a paraphrase ("screenshot path rejected") still relies on the documentation, because nothing structural in
+a free-text report distinguishes a paraphrased file refusal from a real denial.
+
+**Clearing a gate from the dashboard.** Settings > Browser permission gates lists denied gates from a new human-only
+`GET /api/browser/gates` (project, origin, stored reason, first recorder, latest denial's actor and time, and the
+epoch). "Allow again" needs a typed note (the route's required `evidence`) and the click-twice `confirmButton`, and
+calls the existing route with `expected_epoch`, so a gate re-denied meanwhile fails with a conflict instead of being
+cleared blind. The section says what the click does: records a human permission change, changes no host setting,
+the next run must probe fresh, and blocked requests are not restarted by it. The reason is agent-written and shown
+as text. The live gate from the incident is left for the human to clear.
+
 ## Settings page (2026-10-07)
 
 The human asked to manage board settings from the dashboard instead of editing TOML and running CLI

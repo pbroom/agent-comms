@@ -34,6 +34,7 @@ function page({ url = 'http://127.0.0.1:8787/' } = {}) {
       if (u === '/api/admin/notifications') return ok({ deliverable: false, rules: [] });
       if (u === '/api/admin/dispatch') return ok({ status: { running: false }, rules: [], runs: [], runners: {}, threads: [], agents: [] });
       if (u === '/api/web-sessions') return ok(browsers);
+      if (u === '/api/browser/gates') return ok({ gates: [] });
       calls.push(`${opts.method} ${u}`);
       return ok({});
     };

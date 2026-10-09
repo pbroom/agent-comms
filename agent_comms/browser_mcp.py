@@ -20,7 +20,7 @@ def install(mcp, board, principal, session, run, warning=""):
                             session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: br.report_probe(board,principal(ctx),session(ctx,session_id),target_url,context,evidence,attempt_id))
 
-    @mcp.tool(description='Record browser failure immediately. policy_denied/host_permission persist across identities and contexts; never reroute or retry denied access. Other failures invalidate readiness. This reports evidence, not authority.' + warning)
+    @mcp.tool(description='Record browser failure immediately. policy_denied/host_permission mean only that the browser or its host refused the bound origin itself (a site permission declined, a host policy blocking that origin); they write a sticky gate that blocks every launch to that origin in this project, across identities and contexts, until the human records a permission change. Never reroute or retry denied access. A browser tool refusing a local file path ("outside allowed roots") is not a browser failure: save with a bare file name and copy the file from the path the tool reports; such evidence is refused for those two kinds. Other failures invalidate readiness. This reports evidence, not authority.' + warning)
     def board_browser_failure(target_url: str, context: dict, failure: str, evidence: str,
                               session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: br.report_failure(board,principal(ctx),session(ctx,session_id),target_url,context,failure,evidence))

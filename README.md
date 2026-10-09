@@ -852,6 +852,7 @@ attaches nothing. Otherwise it adds, for that run only, `-c` overrides that defi
   browser or a desktop chat's), `--browser` from the setting, `--allowed-origins` set to the bound origins, and
   `--output-dir` (and the server's working directory) set to a fresh mode-700 directory beside the run's log,
   `data/dispatch/<run>-browser`, which is deleted when the run ends. Copy anything you need out of it first.
+  `--file-paths absolute` too, so every tool result reports the exact absolute path of a file it saved.
 - `env_vars = []`, so no `PLAYWRIGHT_MCP_*` variable is passed through by name.
 - `enabled_tools` and per-tool approvals for a fixed set only: navigate, navigate back, snapshot, screenshot,
   find, click, hover, type, press key, fill form, select option, drag, handle dialog, wait for, resize, tabs,
@@ -861,12 +862,32 @@ attaches nothing. Otherwise it adds, for that run only, `-c` overrides that defi
   `browser_file_upload` and `browser_drop` (they read local files).
 - One fixed sentence in the launch prompt: use only the `headless_browser` tools for browser work, and make a
   fresh headless probe of the bound target (`board_browser_begin_probe`, then `board_browser_probe` with context
-  kind `headless`) before any browser step. The target URL is never put in the prompt.
+  kind `headless`) before any browser step. The target URL is never put in the prompt. The same text says how to
+  keep a screenshot and what is not a denial (below).
+
+**Screenshots and other evidence files.** Playwright writes files only inside its output directory (and its
+working directory, the same folder) and refuses any other path with "File access denied: ... is outside allowed
+roots". The output directory stays outside the run directory on purpose: browser files never appear in the
+worktree, its Git state or the recovery checks that read it. So the prompt tells the agent to pass
+`browser_take_screenshot` a bare file name, read the absolute path the tool result reports, and copy the file into
+its evidence folder (for example `.audit-shared/screens/S1/`) with a shell `cp` before it finishes. Codex's
+`workspace-write` sandbox lets the run read that folder (reads are not limited to the workspace, writes are), and
+the dispatcher deletes the folder only after the run's process has exited, so the copy cannot race the cleanup.
+A refused path is a tool limit, not a host denial: the prompt says never to report it with `board_browser_failure`,
+and the board refuses a `policy_denied` or `host_permission` report whose evidence quotes "outside allowed roots".
 
 The run then has to earn readiness like any other context: its session is bound to the run
 (`dispatch_run_id`), it cannot attest a desktop context, and starting the request requires its own fresh probe.
 The sticky policy-denied gate is checked first and blocks the launch exactly as before; a denial is never routed
 around by switching to the headless browser.
+
+**Clearing a sticky gate.** Settings > Browser permission gates lists each denied origin (project, origin, the
+reported reason, who recorded it and when). After you change the actual host permission, or check that the report
+was not a host refusal, type what you changed or checked and click "Allow again" twice. That calls
+`POST /api/browser/permission-change` with the gate's current epoch: it records a human permission change on the
+board, changes no browser or host setting, and the next run must make a fresh probe before any browser step.
+Requests the gate blocked are not restarted by it. Agents cannot list or clear gates (`GET /api/browser/gates` and
+the change route are human-only).
 
 **What `--allowed-origins` does not do.** Playwright documents it as **not** a security boundary. It routes the
 page's ordinary requests, but it does not apply to redirects, to WebSocket connections, or to requests made by

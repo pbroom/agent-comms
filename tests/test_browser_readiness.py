@@ -385,3 +385,49 @@ def test_events_probes_and_attempts_are_pruned_after_retention(env):
     assert c.execute('SELECT COUNT(*) FROM browser_events').fetchone()[0] == 0
     assert c.execute('SELECT COUNT(*) FROM browser_probes').fetchone()[0] == 0
     assert [r[0] for r in c.execute('SELECT target_url FROM browser_probe_attempts')] == [URL]
+
+
+# Playwright MCP's own wording when a tool is asked to write outside its output directory and workspace.
+PATH_REFUSAL = ('Error: File access denied: /repo/.audit-shared/screens/S1/x.png is outside allowed roots. '
+                'Allowed roots: /board/data/dispatch/s1-codex-browser, /board/data/dispatch/s1-codex-browser')
+
+
+@pytest.mark.parametrize('failure', ['policy_denied', 'host_permission'])
+@pytest.mark.parametrize('evidence', [PATH_REFUSAL, 'browser_take_screenshot: path is OUTSIDE  allowed roots',
+                                      'screenshot refused, outside the allowed roots of the browser'])
+def test_a_file_path_refusal_is_never_recorded_as_a_denial(env, failure, evidence):
+    post = task(env)
+    with pytest.raises(Invalid, match='local file path'):
+        br.report_failure(env.board, env.p['codex'], env.sid['codex'], URL, CTX, failure, evidence)
+    assert env.board.conn.execute('SELECT COUNT(*) FROM browser_permission_gates').fetchone()[0] == 0
+    assert env.board.conn.execute('SELECT COUNT(*) FROM browser_events').fetchone()[0] == 0
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'missing_probe'
+    assert br.request_blocker(env.board, post['id'], 'codex') is None
+
+
+def test_other_failure_kinds_may_quote_a_path_refusal_and_real_denials_still_gate(env):
+    out = br.report_failure(env.board, env.p['codex'], env.sid['codex'], URL, CTX, 'interaction_failed', PATH_REFUSAL)
+    assert out['human_action_required'] is False
+    assert env.board.conn.execute('SELECT COUNT(*) FROM browser_permission_gates').fetchone()[0] == 0
+    fail(env, 'policy_denied')   # 'Adapter reported policy_denied'
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'policy_denied'
+
+
+def test_denied_gates_list_is_human_only_and_names_who_recorded_it(env):
+    with pytest.raises(Forbidden):
+        br.denied_gates(env.board, env.p['codex'])
+    assert br.denied_gates(env.board, env.p['human']) == {'gates': []}
+    br.report_failure(env.board, env.p['codex'], env.sid['codex'], URL, CTX, 'policy_denied', 'User declined <b>')
+    env.clock.advance(60)
+    br.report_failure(env.board, env.p['claude'], env.sid['claude'], URL, CTX, 'host_permission', 'Host blocked it')
+    br.report_failure(env.board, env.p['claude'], env.sid['claude'], URL, CTX, 'unreachable', 'not a gate')
+    [gate] = br.denied_gates(env.board, env.p['human'])['gates']
+    assert gate['project'] == PROJECT and gate['origin'] == 'http://localhost:5185'
+    assert gate['reason'] == 'Host blocked it' and gate['epoch'] == 2 and gate['created_by'] == 'codex'
+    assert gate['failure'] == 'host_permission' and gate['recorded_by'] == 'claude'
+    assert gate['recorded_at'].endswith('+00:00')
+    # The listed epoch is exactly what the permission-change record expects; afterwards the gate is gone.
+    br.record_permission_change(env.board, env.p['human'], env.sid['human'], gate['project'], gate['origin'],
+                                'Checked: not a host denial', gate['epoch'])
+    assert br.denied_gates(env.board, env.p['human']) == {'gates': []}
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'fresh_probe_required'

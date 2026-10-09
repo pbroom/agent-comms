@@ -203,24 +203,37 @@ HEADLESS_BROWSER_DENIED = ("browser_run_code_unsafe", "browser_evaluate", "brows
 HEADLESS_BROWSERS = ("chrome", "msedge", "firefox", "webkit")
 # Flags the dispatcher sets itself on every run.
 HEADLESS_MANAGED_FLAGS = ("--headless", "--isolated", "--block-service-workers", "--browser", "--allowed-origins",
-                          "--output-dir")
+                          "--output-dir", "--file-paths")
 # Every other option element (one starting with "-") must be one of these known-harmless ones. An allowlist, not a
 # denylist: Playwright MCP adds options every release (0.0.83 has about fifty), and an unknown one could widen what
 # the browser reaches (a profile, a running browser, a proxy, local files, injected scripts, secrets, TLS bypass).
 # The first group is for the `npx` launcher; the rest only change presentation, timing or narrow the browser further.
 HEADLESS_ALLOWED_FLAGS = (
     "--offline", "--prefer-offline", "-y", "--yes",
-    "--blocked-origins", "--codegen", "--console-level", "--device", "--file-paths", "--idle-timeout",
+    "--blocked-origins", "--codegen", "--console-level", "--device", "--idle-timeout",
     "--image-responses", "--mobile", "--no-webmcp", "--output-max-size", "--sandbox", "--snapshot-boxes",
     "--snapshot-mode", "--test-id-attribute", "--timeout-action", "--timeout-navigation", "--timeout-settle",
     "--user-agent", "--viewport-size",
 )
+# Files: Playwright writes only inside its output directory or its workspace (the server's cwd, here the same per-run
+# directory outside the run directory) and refuses any other path ("File access denied: ... is outside allowed
+# roots"). The output directory stays outside the project on purpose (no browser files in the worktree, its Git
+# state or the recovery checks that read it), so the agent saves by bare file name and copies the file into its
+# evidence folder itself: `--file-paths absolute` makes each tool result report the exact absolute path, and Codex's
+# workspace-write sandbox can read it (reads are not confined to the workspace; writes are). The directory is removed
+# only after the run's process has exited (see remove_browser_output), so the copy cannot race the cleanup.
 HEADLESS_PROMPT = (
     " A scoped headless browser is attached to this run as the headless_browser MCP server. For browser work use "
     "only the headless_browser tools: never another browser, a desktop connection, curl or raw CDP. Before any "
     "browser step, perform a fresh headless probe of the bound target: board_browser_begin_probe, then "
-    "board_browser_probe with context kind \"headless\" from this run. Report any browser failure with "
-    "board_browser_failure; a policy denial is final, so never retry or route around it."
+    "board_browser_probe with context kind \"headless\" from this run. The browser writes files only into its own "
+    "output directory outside this run directory, and each tool result reports the exact absolute path of the file "
+    "it saved: to keep a screenshot, pass browser_take_screenshot a bare file name (no directory), then copy the "
+    "file from that reported path into your evidence folder with a shell cp before you finish, because the output "
+    "directory is deleted when the run ends. A refused file path (\"outside allowed roots\") is a tool limit, not a "
+    "host denial: never report it with board_browser_failure. Report any other browser failure with "
+    "board_browser_failure; policy_denied and host_permission mean only that the browser or host refused the bound "
+    "origin itself. A policy denial is final, so never retry or route around it."
 )
 
 
@@ -327,7 +340,8 @@ def headless_browser_overrides(config: HeadlessBrowserConfig, origins: list[str]
     if not origins:
         raise ValueError("a headless browser needs at least one bound origin")
     args = list(config.args) + ["--headless", "--isolated", "--block-service-workers", "--browser", config.browser,
-                                "--allowed-origins", ";".join(origins), "--output-dir", output_dir]
+                                "--allowed-origins", ";".join(origins), "--output-dir", output_dir,
+                                "--file-paths", "absolute"]   # tool results report the exact path to copy from
     pre = f"mcp_servers.{HEADLESS_BROWSER_SERVER}."
     out = ["-c", pre + "command=" + _toml(config.command), "-c", pre + "args=" + _toml(args),
            "-c", pre + "cwd=" + _toml(output_dir),   # files saved by explicit name land here, not in the project
@@ -366,7 +380,9 @@ def codex_config_conflict(env: dict[str, str]) -> str | None:
 
 
 def remove_browser_output(record: dict) -> None:
-    """Delete a finished run's browser output directory, only when it is exactly `<log dir>/<run id>-browser`."""
+    """Delete a finished run's browser output directory, only when it is exactly `<log dir>/<run id>-browser`.
+    Called only once the run's process is gone (exit, spawn failure, or an orphan found dead), never while the agent
+    may still be copying evidence out of it."""
     hb = record.get("headless_browser") if isinstance(record, dict) else None
     out, run_id, log = (hb or {}).get("output_dir"), record.get("run_id"), record.get("log")
     if not (isinstance(out, str) and isinstance(run_id, str) and isinstance(log, str)):

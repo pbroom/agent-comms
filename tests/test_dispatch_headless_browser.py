@@ -107,6 +107,8 @@ def test_valid_config_and_lookup_by_runner_key():
     ({"args": ["--output-dir", "/tmp/x"]}, "set by the dispatcher"),
     ({"args": ["--browser=firefox"]}, "set by the dispatcher"),
     ({"args": ["--block-service-workers"]}, "set by the dispatcher"),
+    ({"args": ["--file-paths", "relative"]}, "set by the dispatcher"),   # results must report absolute paths
+    ({"args": ["--file-paths=relative"]}, "set by the dispatcher"),
     ({"args": ["--offline", "\x7f"]}, "not allowed"),
     ({"args": ["@playwright/mcp@0.0.83\n--extension"]}, "not allowed"),
     ({"command": "npx\x7f"}, "command"),
@@ -195,7 +197,8 @@ def test_overrides_are_scoped_and_never_approve_unsafe_tools(tmp_path):
     assert load("command") == "npx" and load("cwd") == out
     assert load("args") == ["--offline", "-y", "@playwright/mcp@0.0.83", "--headless", "--isolated",
                             "--block-service-workers", "--browser", "chrome",
-                            "--allowed-origins", ORIGIN + ";http://localhost:6006", "--output-dir", out]
+                            "--allowed-origins", ORIGIN + ";http://localhost:6006", "--output-dir", out,
+                            "--file-paths", "absolute"]
     assert load("env_vars") == [] and "mcp_servers.headless_browser.env" not in o   # see codex_config_conflict
     assert load("enabled_tools") == list(dispatch.HEADLESS_BROWSER_TOOLS)
     approved = {k.split(".")[3] for k, v in o.items()
@@ -232,6 +235,19 @@ def test_prompt_sentence_is_fixed():
     assert with_browser == plain + dispatch.HEADLESS_PROMPT
     assert "headless_browser tools" in with_browser and 'context kind "headless"' in with_browser
     assert "board_browser_begin_probe" in with_browser and "http" not in dispatch.HEADLESS_PROMPT
+
+
+def test_prompt_sentence_explains_where_screenshots_land_and_what_is_not_a_denial():
+    p = dispatch.HEADLESS_PROMPT
+    # Save by bare name; the result reports the exact path (--file-paths absolute); copy it out before the end.
+    assert "bare file name" in p and "exact absolute path" in p and "shell cp" in p
+    assert "deleted when the run ends" in p and "evidence folder" in p
+    # A path refusal is a tool limit, never reported as a failure; the gate kinds mean only an origin refusal.
+    assert '"outside allowed roots"' in p and "not a host denial" in p
+    assert "never report it with board_browser_failure" in p
+    assert "policy_denied and host_permission mean only" in p and "never retry or route around it" in p
+    # Still fixed text: no path, origin, run ID or board text can reach it.
+    assert "/" not in p and "{" not in p
 
 
 # ---------------------------------------------------------------- launching browser-bound work
@@ -464,6 +480,30 @@ def test_browser_output_is_removed_when_the_run_ends(benv):
     benv.d.tick()
     assert runs(benv)[0]["status"] == "exited" and not out.exists()
     assert benv.log_dir.is_dir()                          # only the run's own folder goes
+
+
+def test_browser_output_stays_outside_the_run_directory_and_survives_until_the_run_ends(benv):
+    """The agent copies screenshots out of the output directory itself (see HEADLESS_PROMPT): the directory is never
+    inside the run's cwd (no browser files in the worktree or its Git state), the browser reports absolute paths, and
+    nothing removes the directory while the run's process is alive, so the copy cannot race the cleanup."""
+    allow(benv, agents=["codex"])
+    bound_request(benv)
+    benv.d.tick()
+    record = runs(benv)[0]
+    out, cwd = Path(record["headless_browser"]["output_dir"]), Path(record["cwd"])
+    assert not out.resolve().is_relative_to(cwd.resolve()) and not cwd.resolve().is_relative_to(out.resolve())
+    args = browser_args(benv.spawner.calls[0]["argv"])
+    assert args[args.index("--file-paths") + 1] == "absolute"
+    assert tomllib.loads("v = " + overrides_of(benv.spawner.calls[0]["argv"])["mcp_servers.headless_browser.cwd"])["v"] \
+        == str(out)   # a bare file name lands in the output directory, not the project
+    (out / "page-1.png").write_bytes(b"png")
+    for _ in range(3):   # the run is still going: later ticks leave its files alone
+        benv.clock.advance(30)
+        benv.d.tick()
+    assert runs(benv)[0]["status"] == "running" and (out / "page-1.png").read_bytes() == b"png"
+    benv.spawner.children[0].code = 0
+    benv.d.tick()
+    assert not out.exists()
 
 
 def test_browser_output_is_removed_after_a_spawn_failure(benv):
