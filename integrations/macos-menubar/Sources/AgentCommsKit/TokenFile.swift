@@ -1,9 +1,9 @@
 import Darwin
 import Foundation
 
-/// The human's bearer token, held in memory only. Its descriptions are redacted so that printing, logging or
-/// string-interpolating it by mistake never reveals the value.
-public struct BearerToken: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+/// The human's bearer token, held in memory only. Its descriptions and mirror are redacted so that printing,
+/// logging, string-interpolating or `dump`ing it by mistake never reveals the value.
+public struct BearerToken: Sendable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
     private let value: String
 
     init(_ value: String) { self.value = value }
@@ -11,8 +11,12 @@ public struct BearerToken: Sendable, CustomStringConvertible, CustomDebugStringC
     /// The Authorization header value. Used only when building a request to 127.0.0.1.
     var headerValue: String { "Bearer \(value)" }
 
+    /// The bare token. Used only by `TokenCopier`, which puts it on the pasteboard concealed and auto-cleared.
+    var secret: String { value }
+
     public var description: String { "BearerToken(redacted)" }
     public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: [], displayStyle: .struct) }
 }
 
 public enum TokenFileError: Error, Equatable, CustomStringConvertible {

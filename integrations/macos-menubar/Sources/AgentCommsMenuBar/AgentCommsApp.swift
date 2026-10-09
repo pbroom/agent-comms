@@ -52,6 +52,9 @@ struct MenuContent: View {
 
         Divider()
         Button("Open Dashboard") { model.openDashboard() }
+        if model.canCopyToken {
+            Button("Copy board token") { model.copyToken() }
+        }
         Button("Open Settings") { model.openSettings() }
         if case .online(let summary) = model.phase {
             if summary.paused {
