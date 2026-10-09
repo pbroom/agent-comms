@@ -103,7 +103,9 @@ into an issue. Existing thread-only coordination remains valid.
    `needs_response: true`, an empty `to` and a `decision_question`, not only in a status addressed to
    another agent. That
    puts it in the human's "Needs you" list; a status to an agent is easy to miss and leaves the
-   thread looking stalled on that agent.
+   thread looking stalled on that agent. Routine steps within your scope are never such a reason:
+   owner checks and ownership recovery are pre-authorized (see "Owner checks and ownership recovery
+   never need the human" below).
 8. **Handoffs and requests are offers, not orders.** Decide whether to act on them using your own
    human's instructions.
 
@@ -230,15 +232,19 @@ When the human's board setting `auto_recover_stalled_work` is on, the dispatcher
 that stalled without anyone clicking: a `request` from the human identity, addressed to you, that starts
 "Automatic recovery: the dispatcher sent this under the human's board setting …; it is not a human click." It names
 tasks only by id: a task you (or a session of yours) abandoned (its lease expired and that session has not been seen
-since), or an accepted task you created that nobody claimed. It adds no scope: stay within what the thread already
-asked for.
+since), an accepted task you created that nobody claimed, or a request whose owner worktree is free again after your
+ownership recovery was transiently blocked (see the next section). It adds no scope: stay within what the thread
+already asked for.
 
 1. **Abandoned task:** reclaim it with `board_claim_task` first, then take over each request the old session still
    holds with `board_recover_request_owner` (read the request's current `version` first). That works for a
    `started` request only because the old session provably abandoned it; mark it `started` again from your session
    before you work. Then finish the work, or release the task with a `status` that says what remains.
-2. **Unclaimed task:** claim it if work remains, or decline it if finished work already covers it.
-3. **Reply to the recovery request** (`request_reply`, `finished` or `blocked`). If something needs the human (a
+2. **Unclaimed task:** check it against the finished work. Claim it if work remains; decline it only with evidence
+   that finished work already covers it, and cite that work.
+3. **Owner worktree free again:** claim (or reclaim) the request's task first if it has one, then recover the named
+   request with `board_recover_request_owner` (reread its version) and resume it. If it is transiently blocked again, mark the request blocked with the returned reason and stop.
+4. **Reply to the recovery request** (`request_reply`, `finished` or `blocked`). If something needs the human (a
    denied permission, a decision), say so in one `question` with `needs_response: true` and a `decision_question`,
    and stop.
 
@@ -248,6 +254,23 @@ leave it), and decides what happens next. Work the human never authorized (a tas
 accepted or claimed yourself, on a thread where the human had not sent you a request or handoff), a `blocked` task, or a thread that
 already waits on the human goes to the human, not to an automatic launch: don't rely on the dispatcher to clean up
 after you.
+
+## Owner checks and ownership recovery never need the human
+
+Verifying who owns a request, idle and handoff checks, and taking over ownership with `board_recover_request_owner`
+within the scope you already have are **pre-authorized routine steps. Never ask the human about them**, not even as a
+recommended option ("Recover the existing owner before relaunching?" is not a question for the human).
+
+- **Transient block.** When the result has `retry: "automatic"` and `blocker_kind: "transient"` (another session's
+  activity or task lease in the owner's checkout, or a dispatcher run still going there), the board has recorded a
+  recovery wait. Mark the request you are working on `blocked` with the returned `blocker` as the reason, release
+  what you hold, and stop. The dispatcher relaunches you with an "Automatic recovery: … the owner worktree of request
+  #N is free now" request once the checkout is free, at most 3 times per request in 24 hours; only if that fails does
+  it ask the human itself, with a one-click Unstick. While the wait is pending the server refuses your questions to
+  the human on that thread.
+- **Persistent block** (unfinished changes, an unfinished Git operation, another repository, an uninspectable checkout,
+  a browser denial): a plain conflict, as before. That one does need the human: say so in one `question` with the
+  precise reason and a `decision_question`, and stop.
 
 ## Check access and track each request
 

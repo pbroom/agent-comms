@@ -267,7 +267,9 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     @app.exception_handler(BoardError)
     async def board_error(_: Request, e: BoardError):
-        return JSONResponse({"error": e.code, "message": e.message}, status_code=e.status)
+        # Machine-readable extras some errors carry (recovery.RecoveryWait: blocker_kind, retry, recovery_wait).
+        extra = {k: v for k, v in (getattr(e, "details", None) or {}).items() if k not in ("error", "message")}
+        return JSONResponse({"error": e.code, "message": e.message, **extra}, status_code=e.status)
 
     def port_of(request: Request) -> int:
         return request.url.port or settings.port

@@ -321,6 +321,9 @@ def test_pause_blocks_launches_and_leaves_children_alone(denv):
     assert denv.board.take_dispatch_launch(denv.p["human"], 1, "claude") is None
     denv.board.set_paused(denv.p["human"], False)
     denv.d.tick()
+    assert denv.spawner.agents() == ["codex-cli-fake"]   # codex's run still uses the run directory
+    child.code = 0
+    denv.d.tick()
     assert denv.spawner.agents() == ["codex-cli-fake", "claude-fake"]
 
 
@@ -901,6 +904,9 @@ def test_runtime_fallback_for_two_agents_with_the_same_runtime(denv):
                  extra=[("claude-code", "claude-code")])          # a second identity, named like the runtime
     allow(denv, agents=["claude", "claude-code"])
     human_post(denv, ["claude", "claude-code"])
+    denv.d.tick()
+    assert denv.spawner.agents() == ["claude-by-runtime"]   # one run per run directory: the second waits
+    denv.spawner.children[0].code = 0
     denv.d.tick()
     assert denv.spawner.agents() == ["claude-by-runtime", "claude-by-runtime"]
     assert {r["agent"] for r in runs(denv)} == {"claude", "claude-code"}

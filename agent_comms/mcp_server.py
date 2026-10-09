@@ -214,6 +214,10 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "there is no unstructured form. "
         "A human reply 'Chose option <id> (\"<label>\", recommended|alternative) for #N.' means the human picked "
         "that option of post #N (an optional 'Note:' line follows); it covers only what that option said. "
+        "Never ask the human about routine steps already within scope: verifying a request's owner, idle/handoff "
+        "checks and ownership recovery (board_recover_request_owner) are pre-authorized. If recovery returns "
+        "retry='automatic' (a transient block), mark your request blocked with the returned reason and stop: the board "
+        "retries; it refuses your questions to the human on that thread while its retry is pending. "
         "For an authorized stack fix use an unsealed request/handoff with continuation={root_task_id, "
         "owner_session, fallback_session, fix_commit: full SHA, descendants: full refs/heads names, "
         "required_checks, required_capabilities, ack_seconds: 10..3600}. This atomically creates one "
@@ -373,12 +377,21 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
                    recipient, state, reason, evidence_post_ids, expected_version, completion, recover_blocked))
 
-    @mcp.tool(description="Recover your same-agent request using its exact version from a different session of yours that provably ended (a dispatcher run that ended: queued or blocked requests) or abandoned its work (its task lease in this thread expired at least 10 minutes ago and it has not been seen since: queued, blocked or started requests; reclaim that task first). This changes bookkeeping ownership only; it never finishes work, grants access, clears host denials, or replaces browser binding and execution preflight. Active or unknown old owners and unsafe checkout states remain blocked." + DATA_WARNING)
+    @mcp.tool(description="Recover your same-agent request using its exact version from a different session of yours that provably ended (a dispatcher run that ended: queued or blocked requests) or abandoned its work (its task lease in this thread expired at least 10 minutes ago and it has not been seen since: queued, blocked or started requests; reclaim that task first). This changes bookkeeping ownership only; it never finishes work, grants access, clears host denials, or replaces browser binding and execution preflight. Active or unknown old owners and unsafe checkout states remain blocked. "
+              "Verifying the owner and recovering ownership within the existing scope is routine and pre-authorized: never ask the human about it. "
+              "When another session or dispatcher run in the owner's checkout is still busy, the result is recovered=false with blocker_kind='transient' and retry='automatic': the board recorded the wait and relaunches you once the worktree is free (at most 3 retries a day, then it asks the human itself). Then mark the request you are working on blocked with the returned blocker and stop; do not ask the human. "
+              "Other blockers (unfinished changes, an unfinished Git operation, another repository, a browser denial) are errors: report those with the precise reason." + DATA_WARNING)
     def board_recover_request_owner(post_id: StrictInt, recipient: str, expected_version: StrictInt,
                                     session_id: int | None = None, ctx: Context = None) -> dict:
         from . import recovery
-        return run(lambda: recovery.transfer_ended_owner(board, principal(ctx), session(ctx, session_id),
-                                                         post_id, recipient, expected_version))
+
+        def recover():
+            try:
+                return recovery.transfer_ended_owner(board, principal(ctx), session(ctx, session_id),
+                                                     post_id, recipient, expected_version)
+            except recovery.RecoveryWait as wait:   # not an error to escalate: the board retries automatically
+                return {"error": wait.code, "message": wait.message, **wait.details}
+        return run(recover)
 
     @mcp.tool(description="Read explicit progress history for exactly one original request recipient." + DATA_WARNING)
     def board_request_history(post_id: StrictInt, recipient: str, ctx: Context = None) -> dict:

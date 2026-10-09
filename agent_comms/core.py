@@ -1187,6 +1187,20 @@ class Board:
             else:
                 thread_id = self._insert_thread(c, p, s["project"], new_thread_title.strip()[:200])
 
+            if not p.is_human and question is not None:
+                # Ownership recovery that hit a transient blocker is routine and retried by the board (a recorded
+                # recovery wait for this agent on this thread, recovery.active_wait); it never needs the human.
+                # Tied to that server record, never to the post's wording.
+                from . import recovery
+                wait = recovery.active_wait(self, p.name, thread_id)
+                if wait is not None:
+                    raise Invalid(
+                        f"recovery of request #{wait['post_id']} is waiting for its owner worktree to be free "
+                        f"({wait.get('blocker')}). That is routine and pre-authorized: the board retries "
+                        f"automatically (up to {recovery.WAIT_RETRIES} times a day) and asks the human itself only "
+                        "if the retries run out. Do not ask the human about it: mark your request blocked with that "
+                        "reason and stop.")
+
             if answer_to:
                 intended = set()
                 for source_id in answer_to:

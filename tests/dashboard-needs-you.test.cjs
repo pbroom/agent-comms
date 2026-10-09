@@ -440,17 +440,17 @@ test('mechanical close exposes exact target, version and evidence before executi
 });
 
 test('an automatic-recovery escalation renders as a question with one-click task actions', async () => {
-  const q = { question: 'Task 44 is accepted but nobody claimed it, and automatic recovery did not take. Decline it, or ask codex to claim it?',
+  const q = { question: 'Task 44 is accepted but nobody claimed it, and automatic recovery did not take. Ask codex to claim it or decline it if finished work covers it?',
     context: 'Thread #1, task 44 (accepted), created by codex.',
-    options: [{ id: 'decline', label: 'Decline task 44', description: 'Marks task 44 declined.', outcome: 'approved',
-                action: { type: 'decline_task', task_id: 44, expected_status: 'accepted' } },
-              { id: 'ask-creator', label: 'Ask codex to claim it (Unstick)', description: 'Runs Unstick.', outcome: 'approved',
-                action: { type: 'unstick', thread_id: 1, agents: ['codex'] } }],
-    recommended_option_id: 'decline' };
+    options: [{ id: 'ask-creator', label: 'Ask codex to claim it or decline it if covered', description: 'Runs Unstick; codex decides with evidence.', outcome: 'approved',
+                action: { type: 'unstick', thread_id: 1, agents: ['codex'] } },
+              { id: 'decline', label: 'Decline task 44', description: 'Marks task 44 declined.', outcome: 'approved',
+                action: { type: 'decline_task', task_id: 44, expected_status: 'accepted' } }],
+    recommended_option_id: 'ask-creator' };
   const p = post(110, 1, { agent: 'human', type: 'question', needs_response: true, automatic: true,
     body: 'Automatic recovery did not take ' + INJECTION, decision_question: q });
   const release = post(111, 1, { agent: 'human', type: 'question', needs_response: true, automatic: true,
-    decision_question: { ...q, options: [q.options[1], { id: 'release', label: 'Release task 45', description: 'Clears it.',
+    decision_question: { ...q, options: [q.options[0], { id: 'release', label: 'Release task 45', description: 'Clears it.',
       outcome: 'approved', action: { type: 'release_task', task_id: 45, expected_owner_session: 70 } }],
       recommended_option_id: 'ask-creator' } });
   const { dom, document, calls, win, prompts } = await setup({ threads: [thread(1, [p, release])], needsYou: [release, p] });
@@ -459,7 +459,7 @@ test('an automatic-recovery escalation renders as a question with one-click task
     const node = document.querySelector('#needs-you [data-post="110"]');
     assert.match(node.querySelector('.where').textContent, /post #110 by the dispatcher \(automatic, not your click\)/);
     assert.ok([...node.querySelectorAll('.chip')].some(c => c.textContent === 'automatic'));
-    assert.deepEqual(cards(document, 110), ['Decline task 44', 'Ask codex to claim it (Unstick)', 'Write your own reply']);
+    assert.deepEqual(cards(document, 110), ['Ask codex to claim it or decline it if covered', 'Decline task 44', 'Write your own reply']);
     assert.deepEqual(badges(document, 110), ['Recommended', 'Alternative', '']);
     assert.match(node.textContent, /Declines task 44 if it is still accepted/);
     assert.match(node.textContent, /Runs Unstick on thread #1 for codex only \(whichever the thread still waits on; nobody else is asked\)/);

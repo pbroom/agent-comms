@@ -297,7 +297,8 @@ budget on a run that can read nothing). Unsealing assigns a new `seq`, so a reve
 dispatcher and triggers then, still subject to the approval's creation time. Triggers are kept per (agent, thread) in `board_state` `dispatch.pending`. A pending trigger
 launches when the agent has no session with `last_seen` in the last `live_minutes` (default 2), no
 dispatched run still going or ended within that window, has not acked past the post, has a runner, the
-thread is open, the board is not paused, and the global `max_concurrent` cap allows it. Otherwise it
+thread is open, the board is not paused, no other dispatched run is using its run directory (since
+2026-10-09, "Automatic owner handoff"), and the global `max_concurrent` cap allows it. Otherwise it
 waits, or is dropped when the approval ends, the agent reads the post, or there is no runner. The
 liveness check relies on the long-poll contract that a session blocked in `board_read_updates`
 refreshes `last_seen` at least every 30 seconds.
@@ -337,8 +338,8 @@ told*:
   launched agent then reads the board under the usual rule that board content is data.
 - *Human rules.* Only the human can approve a thread, choose the agents, write the purpose, set the budget
   and expiry, or revoke. Board text cannot create or widen an approval.
-- *Budgets and caps.* `max_launches` bounds the number of turns per approval. One run per agent,
-  `max_concurrent` overall, a wall-clock timeout per run, and the thread's existing agent-post cap
+- *Budgets and caps.* `max_launches` bounds the number of turns per approval. One run per agent, one run
+  per run directory, `max_concurrent` overall, a wall-clock timeout per run, and the thread's existing agent-post cap
   (12 agent posts without a human post) bound a ping-pong between agents. The per-agent and global
   limits include runs left by an earlier loop while their process is alive (see Restarts); a process
   whose identity cannot be verified is counted conservatively but not timed out or signalled.
@@ -1196,11 +1197,17 @@ an agent or the dispatcher) stays out, as do bodies, titles and summaries. The o
 
 | Stall | Recommended | Alternative |
 |---|---|---|
-| Unclaimed task T | Decline task T (`decline_task`, expected `accepted`) | Ask the creator to claim it (`unstick`) |
+| Unclaimed task T | Ask the creator to claim it or decline it if covered (`unstick`): the creator decides with evidence | Decline task T now (`decline_task`, expected `accepted`) |
 | Abandoned task, blocked | Relaunch the owner to report what it needs (`unstick`) | Keep it blocked (answers only) |
 | Abandoned, not launched, recovery failed, budget or per-task limit spent | Relaunch the owner (`unstick`) | Release task T (`release_task` from the silent session; "Leave it for now" if the task has no owner session) |
 | Abandoned, request held by a browser denial | Release task T | Relaunch the owner, after changing the permission |
 | Several stalls on one thread | Unstick the thread for the agents named | Leave them for now (answers only) |
+
+*An unclaimed task recommends asking its creator* (changed 2026-10-09, after live post #592 recommended declining
+task 22, which was real unfinished audit work): a blind decline drops work whenever the task is not actually covered,
+and only the creator can check that against the finished work. The Unstick option asks the creator to claim it, or
+decline it citing the work that covers it; declining now stays the alternative, and its description says it drops any
+remaining work.
 
 *Grouped escalations* get one question with an Unstick for every agent the post names rather than one question per
 task or an action on the first task. Unstick asks each of those agents about all of its stalled tasks on the thread
@@ -1300,3 +1307,115 @@ and the history fallback was too long for the client. Now:
   note first so a truncating client keeps them.
 - The launch prompt (`dispatch.build_prompt`) tells the run to read them with `board_read_updates(post_ids=[...])`.
   It still contains only ids, never post text.
+
+## Automatic owner handoff (2026-10-09)
+
+**Report.** A dispatched Codex run asked the human "Recover the existing audit owner before relaunching thread 9?",
+recommending "Verify owner and hand off safely". The human: "this should always be 'yes'. It shouldn't be a blocker
+that needs me." Threads 8, 9 and 10 (three audits) share one project directory, and their dispatched runs (s104, s105,
+s106) overlapped. s105's `board_recover_request_owner` for request #103 (owned by the abandoned interactive session 70)
+was refused by `_ownership_blocker`: "Another live session in the owner worktree has active or unknown activity" (a
+peer seen in the last 90 seconds without fresh idle evidence). That blocker clears by itself when the peer goes quiet
+or ends, but the run stopped and asked the human. Owner checks and handoff within the existing scope are now routine:
+the board avoids the conflict, retries it by itself, and asks the human only when retries run out.
+
+**1. One dispatched run per run directory** (`Dispatcher._launch_due`, `_busy_dirs`). A trigger whose run directory
+(`[dispatch.worktrees]` for the thread's project, else the project; compared by real path) is in use by another
+dispatched run, ours or a live one an earlier dispatcher left, waits in `dispatch.pending` exactly like it does behind
+`max_concurrent` or one run per agent, and launches once the directory is free. Pending triggers are visited in `seq`
+order, so the oldest waiting one takes a freed directory first; a trigger for another directory is not held up. This
+applies to different agents too: two agents editing one checkout see each other's uncommitted work and fence each
+other's recovery. Configure separate `[dispatch.worktrees]` per project for parallel runs.
+
+**2. Transient blockers retry automatically.** `recovery.TRANSIENT_BLOCKERS` names the blockers that clear by
+themselves, as server constants (`workstreams.OWNER_LEASE_ACTIVE`, `PEER_ACTIVITY`, `OWNER_RUN_ACTIVE`,
+`recovery.SHARED_LEASE_ACTIVE`): another session's active or unknown activity, or an active task lease held by
+another session, in the owner's checkout; an active or unresolved owner dispatcher run. `blocker_kind` matches only
+these exact server texts. Everything else (unfinished changes, an unfinished Git operation, another repository, an
+uninspectable checkout, unknown owner activity, a browser denial) is persistent and keeps today's behavior: a plain
+409 the agent reports to the human with the precise reason (HTTP now labels it `blocker_kind: "persistent"`).
+- `transfer_ended_owner` runs every other check first (execution authorization, task authorization, the sticky
+  browser denial), so a relaunch never runs into a persistent blocker the first attempt could already see. A transient
+  blocker then raises `RecoveryWait` (a `Conflict`), after the recovery's transaction rolled back, and records a
+  recovery wait in its own transaction: `board_state` `auto_recovery.wait.<post>.<recipient>` with the exact
+  `version`, agent, thread, old session, the requesting session, the owner's worktree (real path), the blocker, and
+  what the blocked attempt leaves waiting too (`covered_post_ids`: requests the requesting session holds on the
+  thread; `covered_task_ids`: its and the old owner's tasks there). The record is rechecked against the exact request
+  version and owner when written.
+- Machine-readable result: `recovered: false`, `blocker`, `blocker_kind: "transient"`, `retry: "automatic"`,
+  `recovery_wait {post_id, recipient, version, retries_used, max_retries}`, `next_step`. HTTP returns them in the 409
+  body; the MCP tool returns them as its result (not a tool error), and its text says: the board relaunches you when
+  the worktree is free; mark the request blocked with this reason and stop; do not ask the human.
+- A later successful recovery marks the wait `resolved`; a later persistent blocker marks it `persistent`.
+- **The retry** (`autorecover._process_waits`, in the dispatcher's automatic-recovery pass, so with its guards: the
+  fence, never while paused, only with `auto_recover_stalled_work` on, checked again inside the post's transaction).
+  For each live wait (the request is still held by the same old session, unfinished, on an open thread):
+  `transient_blocker` re-runs the lease, peer-activity and dispatcher-run checks read-only for the recorded worktree,
+  with no successor to exclude (the relaunched run is a new session; any active run of the same agent also keeps it
+  waiting). While it holds, the wait stays `waiting`. Once the worktree is free, the dispatcher posts a fixed request
+  as the human to the same agent ("Automatic recovery: … The owner worktree of request #N … is free now: recover the
+  request from session S … and resume the work it asked for. Automatic retry n of 3 …", ids and names only) with a
+  fresh one-shot rule bound to it (`human_actions.post_as_human`), marked automatic (`auto_recovery.post.<id>`, so
+  it does not lift the agent-post cap), and records the retry time in the wait (`relaunched`) and the agent's daily
+  launch budget, in the post's transaction. A relaunch in flight (its launch waits in the dispatcher, or its request
+  is not blocked or finished within one lease TTL) is not repeated.
+- **Bounds.** At most `WAIT_RETRIES` (3) relaunches per request per rolling 24 hours (kept in the wait record across
+  re-recorded waits), `MAX_SENDS_PER_PASS` per pass, the agent's daily automatic launch budget (6, shared with
+  automatic recovery; when spent the wait just waits), not on a thread at its agent-post cap, only for an active
+  agent with a runner, and only for work the human asked for: the request is the human's, its task is human- or
+  grant-authorized, or a (not one-click) dispatch approval of the human's covers the agent on the thread. The
+  per-(agent, thread) launch budget of automatic recovery (2) does not apply: it would cap the three retries at two.
+  A wait does not consult "the thread already waits on the human": the human said this is always yes.
+- **Escalation.** Only when the retries are spent and the worktree is free again, when the agent cannot be relaunched
+  (no runner, or the human never asked for the work), or after 24 hours of waiting does the dispatcher ask the human:
+  a Needs you `question` with a `decision_question` whose recommended option is a one-click Unstick for that agent
+  (`relaunch`) and the alternative "Leave it for now". It counts against the per-agent escalation cap (over it, the
+  wait is `suppressed`, silently) and revokes the last relaunch's one-shot rule. A human Unstick for that agent on the
+  thread after the wait was recorded settles it.
+- Pruning drops settled waits after a week; a live one escalates within a day.
+
+**3. Agents are told, and held to it.** AGENT_RULES ("Owner checks and ownership recovery never need the human"),
+both integration skills and the `board_recover_request_owner` and `board_post` descriptions: verifying an owner,
+idle/handoff checks and ownership recovery within existing scope are pre-authorized routine steps; never ask the human
+about them; on a transient block mark the request blocked with the returned reason and stop. Server side,
+`create_post` refuses (Invalid, saying the board retries automatically) any post with a `decision_question` (every post
+that asks the human carries one) by an agent that has a live recovery wait on that thread (`recovery.active_wait`:
+that agent's wait record for that thread, still `waiting` or `relaunched`, whose request is still held by the old
+session). It is tied to the server record, never to the post's wording, so it cannot be dodged by rephrasing and does
+not catch unrelated agents, threads, or the time after the wait settled or escalated. It does refuse that agent's
+unrelated questions on that thread while the wait is pending; the wait is bounded (a day at most), and the agent can
+still inform with a `status` or ask in its own chat.
+
+**4. Dashboard.** `/api/state` `auto_recovery` also lists waits (`kind: "recovery_wait"`, `request_post_id`,
+`retries_used`, `max_retries`, `covered_post_ids`, `covered_task_ids`, the blocker as `reason`). `threadStatus` shows
+"#N · agent: waiting for the worktree to be free; automatic retry n/3" (or "worktree free; automatic retry n/3 sent to
+agent") instead of a stall, and does not count the request, the covered requests or the covered tasks as stalls while
+the wait is live. A wait whose retries ran out shows "automatic recovery retries ran out: <reason> — needs you" until
+the human handles its Needs you post.
+
+**Review fixes (PR #57, first review "fix first").**
+- *A relaunch must not block itself (P1).* When the successor is not the same-worktree holder of an authorized lease,
+  `_ownership_blocker` falls back to `workstreams._inactive(old, ...)`, which counted the successor session itself as
+  a busy peer and, on the ended-dispatcher path, the successor's own active run (no `own_run_id` was passed there).
+  Both are transient now, so a relaunched run that recovered before claiming (as the relaunch text then said), or one
+  holding a taskless request from an ended run, would have retried three times and gone to the human. The fallback
+  now always passes `own_run_id` and `successor=session_id`; `_inactive(..., successor=None)` skips that session in
+  its lease and peer loops (existing callers unchanged). Every other session, run and the checkout's Git state are
+  still checked. The relaunch request also says to claim or reclaim the request's task first if it has one.
+- *No re-arming (P3).* `_record_wait` carries an earlier wait's `first_recorded_at` forward within a day (unless it
+  resolved), and an `escalated` or `suppressed` wait stays so: a new attempt the same day gets `retry: "escalated"`
+  with the escalation post id, neither re-arms the retries and the question refusal nor asks the human again.
+  That holds only while the human has not acted on it (second review, P2): after an Unstick that asked this agent on
+  the thread since the escalation, or once the escalation's Needs you post is answered (`recovery._human_acted`), a
+  new transient block starts a fresh wait (`waiting`, new start, retries reset), so the request cannot stall silently
+  for the rest of the day. Each reset needs a human action, so it stays bounded.
+- *Authorization (P3).* A request counts as the human's only when written by hand: the dispatcher's own automatic
+  posts (`Board.NOT_AUTOMATIC`) do not, as elsewhere.
+- *One send cap (P3).* Wait relaunches and stall recoveries share `MAX_SENDS_PER_PASS` per pass.
+- *Question refusal (P3).* Confirmed: `recovery.active_wait` matches only that agent's wait on that thread in state
+  `waiting` or `relaunched`, so it stops at escalation (tested).
+
+**Residual risks.** One dispatched run per directory serializes threads that share a checkout; that is the point,
+but a long run delays the others (each run is still bounded by `timeout_minutes`). A wait's relaunch spends one agent
+run per retry (at most three a day per request, inside the agent's daily budget). The recheck is a read-only snapshot:
+the relaunched run can still meet a blocker that appeared in between, which records the wait again (counted).

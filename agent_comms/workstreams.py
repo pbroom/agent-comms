@@ -265,30 +265,37 @@ def after_save(board, p, sid, row, state):
 
 
 UNKNOWN_ACTIVITY = 'Owner activity is unknown; fresh explicit idle evidence is required'
+# Blockers that clear on their own once the other work in the checkout ends (recovery.TRANSIENT_BLOCKERS).
+OWNER_LEASE_ACTIVE = 'Owner still holds an active task lease'
+PEER_ACTIVITY = 'Another live session in the owner worktree has active or unknown activity'
+OWNER_RUN_ACTIVE = 'Owner dispatcher run is active or unresolved'
 
 
-def _inactive(board, session, managed, abandoned=False, own_run_id=None):
+def _inactive(board, session, managed, abandoned=False, own_run_id=None, successor=None):
     """Why `session` cannot be treated as inactive, or None. `abandoned` (recovery.abandonment proved the session has
     been silent since its task lease expired) counts like an ended dispatcher run; `own_run_id` is the successor's own
-    dispatcher run, which is not the old owner's."""
+    dispatcher run, which is not the old owner's; `successor` is the session taking over (recovery), whose own leases
+    and activity in the checkout are not someone else's work there. The checkout's Git state is still inspected."""
     now = board.now()
     path = os.path.realpath(session['worktree'] or session['project'])
     active = board.conn.execute("""SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session
         WHERE t.lease_expires_at>? AND t.status IN ('working','blocked')""",(now,))
     for lease in active:
+        if successor is not None and successor != session['id'] and lease['id'] == successor:
+            continue
         if lease['id']==session['id'] or os.path.realpath(lease['worktree'] or lease['project'])==path:
-            return 'Owner still holds an active task lease'
+            return OWNER_LEASE_ACTIVE
     peers = board.conn.execute('''SELECT s.id,s.last_seen,s.worktree,s.project,a.state,a.recorded_at FROM sessions s
         LEFT JOIN session_activity a ON a.session_id=s.id
         JOIN agents identity ON identity.name=s.agent
         WHERE s.id!=? AND s.last_seen>=? AND identity.active=1 AND identity.is_human=0''',
         (session['id'],now-90))
     for peer in peers:
-        if os.path.realpath(peer['worktree'] or peer['project']) != path:
+        if peer['id'] == successor or os.path.realpath(peer['worktree'] or peer['project']) != path:
             continue
         if (peer['state'] != 'idle' or peer['recorded_at'] is None
                 or not now-90 <= peer['recorded_at'] <= now):
-            return 'Another live session in the owner worktree has active or unknown activity'
+            return PEER_ACTIVITY
     from .dispatch import ACTIVE
     for record in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
         run = json.loads(record['value'])
@@ -297,14 +304,14 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None):
         if (run.get('status') in ACTIVE and
                 (run.get('agent') == session['agent']
                  or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path))):
-            return 'Owner dispatcher run is active or unresolved'
+            return OWNER_RUN_ACTIVE
     ended = False
     if session['dispatch_run_id']:
         record = board.conn.execute('SELECT value FROM board_state WHERE key=?',('dispatch.run.'+session['dispatch_run_id'],)).fetchone()
         if record:
             run = json.loads(record['value'])
             if run.get('status') in ACTIVE:
-                return 'Owner dispatcher run is active or unresolved'
+                return OWNER_RUN_ACTIVE
             ended = (run.get('status') in ('gone','stopped','timeout','exited')
                      and run.get('ended_at') is not None and session['last_seen'] <= run['ended_at'])
     activity = board.conn.execute('SELECT * FROM session_activity WHERE session_id=?',(session['id'],)).fetchone()

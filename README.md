@@ -754,9 +754,10 @@ that the agent can read. A sealed post does not trigger (the recipient could not
 unsealed it counts as new and can trigger then, if it was written after the approval.
 It does not launch an agent that has any session seen in the last 2 minutes (it may handle the post
 itself), that already read past the post, that has a dispatched run still going or that ended under
-2 minutes ago, or that has no runner. At most `max_concurrent` runs at once, one per agent, counting
-runs that an earlier dispatcher left running. A trigger that has to wait (agent busy or live, the cap,
-or a pause, even one that lands just before the launch) stays pending until it can launch or the
+2 minutes ago, or that has no runner. At most `max_concurrent` runs at once, one per agent and one per
+run directory (threads that share a checkout take turns; map projects to separate `[dispatch.worktrees]`
+to run them side by side), counting runs that an earlier dispatcher left running. A trigger that has to
+wait (agent busy or live, its run directory in use, the cap, or a pause, even one that lands just before the launch) stays pending until it can launch or the
 agent reads the post; it is dropped when the approval is revoked, expires or runs out.
 
 Each agent's command line comes from `[dispatch.runners]`. A runner is looked up by the agent's name

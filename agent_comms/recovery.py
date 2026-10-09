@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 
+from . import workstreams
 from .core import Conflict, Forbidden, Invalid
 
 PREFIX = 'request.recovery.'
@@ -216,6 +217,190 @@ def after_pickup(board, p, session_id, source, previous):
                            (json.dumps(link), p.name, board.now(), record['key']))
 
 
+class RecoveryWait(Conflict):
+    """Ownership recovery is blocked for a transient reason (TRANSIENT_BLOCKERS): other work in the owner's checkout
+    that ends by itself. Not a question for the human: the board recorded a recovery wait (WAIT_PREFIX) and the
+    dispatcher relaunches the agent once the worktree is free (autorecover.py). `details` is machine-readable and
+    goes into the HTTP error body and the MCP tool result."""
+
+    def __init__(self, message: str, details: dict):
+        super().__init__(message)
+        self.details = details
+
+
+class _PersistentBlock(Conflict):
+    """A blocker only the human (or another explicit action) can clear: today's behavior, a plain conflict."""
+
+    details = {'blocker_kind': 'persistent', 'retry': 'none'}
+
+
+class _TransientBlock(Exception):
+    def __init__(self, blocker: str, path: str, old_id: int):
+        super().__init__(blocker)
+        self.blocker, self.path, self.old_id = blocker, path, old_id
+
+
+# Blockers that clear on their own: another session's activity or task lease in the owner's checkout, or an owner
+# dispatcher run still going. Everything else _ownership_blocker returns (unfinished changes, an unfinished Git
+# operation, another repository, an uninspectable checkout, unknown owner activity) and a browser denial is persistent.
+SHARED_LEASE_ACTIVE = 'Old owner or another session still holds an active task lease'
+TRANSIENT_BLOCKERS = frozenset({workstreams.OWNER_LEASE_ACTIVE, SHARED_LEASE_ACTIVE, workstreams.PEER_ACTIVITY,
+                                workstreams.OWNER_RUN_ACTIVE})
+WAIT_PREFIX = 'auto_recovery.wait.'     # <post id>.<recipient>: a recovery waiting for its owner worktree to be free
+WAIT_RETRIES = 3                        # automatic relaunches per request per rolling day (autorecover.py)
+WAIT_WINDOW_SECONDS = 24 * 3600
+WAITING = ('waiting', 'relaunched')     # wait states that still wait on the board, not on the human
+ESCALATED = ('escalated', 'suppressed')  # the board's retries ran out and it went to the human (or the cap held it)
+WAIT_ESCALATED_NEXT_STEP = ('The board already took this to the human (Needs you); do not ask again. Mark the request '
+                            'you are working on blocked with this reason and stop.')
+WAIT_NEXT_STEP = ('Do not ask the human: verifying an owner and taking over ownership within the existing scope is '
+                  'routine and pre-authorized, and this blocker clears by itself. Mark the request you are working on '
+                  'blocked with this reason and stop. The board relaunches you when the owner worktree is free.')
+
+
+def blocker_kind(blocker: str) -> str:
+    """'transient' for a blocker that clears by itself (TRANSIENT_BLOCKERS), else 'persistent'. Matches only the
+    server's own constant texts, never agent-written text."""
+    return 'transient' if blocker in TRANSIENT_BLOCKERS else 'persistent'
+
+
+def wait_key(post_id: int, recipient: str) -> str:
+    return f'{WAIT_PREFIX}{int(post_id)}.{recipient}'
+
+
+def _get_state(conn, key):
+    row = conn.execute('SELECT value FROM board_state WHERE key=?', (key,)).fetchone()
+    try:
+        value = json.loads(row['value']) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _put_state(board, key, value, by):
+    board.conn.execute("""INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)
+                          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by,
+                          updated_at=excluded.updated_at""", (key, json.dumps(value), by, board.now()))
+
+
+def retries_used(wait: dict, now: float) -> list:
+    """The automatic relaunches of this wait's request within the rolling window."""
+    times = wait.get('retries') if isinstance(wait, dict) else None
+    return ([t for t in times if type(t) in (int, float) and t > now - WAIT_WINDOW_SECONDS]
+            if isinstance(times, list) else [])
+
+
+def wait_live(board, wait: dict) -> bool:
+    """The request this wait is about is still held by the same old session for the same agent, unfinished: nothing
+    else recovered, reassigned or finished it."""
+    from . import requests
+    if not isinstance(wait, dict) or type(wait.get('post_id')) is not int:
+        return False
+    post = board.conn.execute('SELECT * FROM posts WHERE id=?', (wait['post_id'],)).fetchone()
+    if post is None or post['sealed'] or post['thread_id'] != wait.get('thread_id'):
+        return False
+    row = next((r for r in requests.for_post(board, post) if r['recipient'] == wait.get('recipient')), None)
+    return (row is not None and row['state'] != 'finished' and row['assigned_agent'] == wait.get('agent')
+            and row['assigned_session'] == wait.get('old_session'))
+
+
+def waits(conn):
+    """Every recorded recovery wait, as (key, wait) pairs (an index range scan over board_state's primary key)."""
+    end = WAIT_PREFIX[:-1] + chr(ord(WAIT_PREFIX[-1]) + 1)
+    out = []
+    for key, value in conn.execute('SELECT key, value FROM board_state WHERE key >= ? AND key < ? ORDER BY key',
+                                   (WAIT_PREFIX, end)):
+        try:
+            wait = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(wait, dict) and type(wait.get('post_id')) is int and isinstance(wait.get('agent'), str):
+            out.append((key, wait))
+    return out
+
+
+def active_wait(board, agent: str, thread_id: int):
+    """The live recovery wait of this agent on this thread (its latest recovery attempt returned a transient block
+    and the board will retry), or None. Core uses it to refuse that agent's questions to the human meanwhile."""
+    for _, wait in waits(board.conn):
+        if (wait['agent'] == agent and wait.get('thread_id') == thread_id and wait.get('state') in WAITING
+                and wait_live(board, wait)):
+            return wait
+    return None
+
+
+def _record_wait(board, p, session_id, post_id, recipient, expected_version, old_id, blocker, path):
+    """Durably record (or refresh) the recovery wait for this exact request version, in its own transaction (the
+    recovery's own transaction rolled back). Keeps the retry history of an earlier wait on the same request, so the
+    rolling budget (WAIT_RETRIES) holds across relaunches. Returns the stored wait."""
+    from . import db, requests
+    with db.write_tx(board.conn):
+        post, row = requests._context(board, p, session_id, post_id, recipient)
+        if row['version'] != expected_version or row['assigned_session'] != old_id or row['assigned_agent'] != p.name:
+            raise Conflict('ownership recovery requires the exact current request version')
+        now = board.now()
+        key = wait_key(post_id, recipient)
+        prev = _get_state(board.conn, key) or {}
+        # What this blocked attempt leaves waiting too: the requests and tasks the requesting session holds on the
+        # thread (it marks them blocked and stops) and the old owner's tasks there. The dashboard shows them as part
+        # of the wait, not as separate stalls.
+        held = [r['post_id'] for r in board.conn.execute(
+            """SELECT q.post_id FROM request_progress q JOIN posts x ON x.id=q.post_id
+               WHERE q.assigned_session=? AND x.thread_id=? AND q.state!='finished' AND q.post_id!=?
+               ORDER BY q.post_id""", (session_id, post['thread_id'], post_id))]
+        tasks = [t['id'] for t in board.conn.execute(
+            """SELECT id FROM tasks WHERE thread_id=? AND owner_session IN (?,?) AND status IN ('working','blocked')
+               ORDER BY id""", (post['thread_id'], session_id, old_id))]
+        # Within a day of the first wait on this request, an earlier wait carries forward: its start (so the 24-hour
+        # cap holds) and, once it went to the human (escalated, or suppressed over the escalation cap), that state
+        # too, so a new attempt neither re-arms the retries and the question refusal nor asks the human again. A wait
+        # that resolved (the request was recovered) or is older than a day starts afresh; retries carry otherwise.
+        # Once the human acted on an escalation (Unstick for this agent on the thread since, or its Needs you post is
+        # answered), the human's click is the new go-ahead: a fresh wait with its own retries. Each reset needs a
+        # human action, so this stays bounded.
+        first = prev.get('first_recorded_at')
+        carried = (prev.get('state') not in (None, 'resolved') and type(first) in (int, float)
+                   and now - first < WAIT_WINDOW_SECONDS)
+        if carried and prev.get('state') in ESCALATED and _human_acted(board, prev):
+            carried, prev = False, {}
+        wait = {'post_id': post_id, 'recipient': recipient, 'version': row['version'], 'agent': p.name,
+                'thread_id': post['thread_id'], 'old_session': old_id, 'session_id': session_id, 'worktree': path,
+                'blocker': blocker, 'blocker_kind': 'transient', 'state': 'waiting', 'recorded_at': now,
+                'first_recorded_at': first if carried else now,
+                'retries': retries_used(prev, now), 'relaunch_post_ids': (prev.get('relaunch_post_ids') or [])[-10:],
+                'covered_post_ids': held[:20], 'covered_task_ids': tasks[:20]}
+        if carried and prev.get('state') in ESCALATED:
+            wait.update({k: prev[k] for k in ('state', 'reason', 'escalated_at', 'escalation_post_id') if k in prev})
+        _put_state(board, key, wait, p.name)
+    return wait
+
+
+def _human_acted(board, wait: dict) -> bool:
+    """The human acted on this escalated (or suppressed) wait since it went to them: an Unstick that asked this agent
+    on the thread, or, for an escalation with a post, that post no longer waits in Needs you (answered or handled)."""
+    from . import unstick
+    from .core import Board
+    at = wait.get('escalated_at')
+    if type(at) not in (int, float) or unstick.unstuck_since(board.conn, wait.get('thread_id'), wait.get('agent') or '', at):
+        return True
+    note = wait.get('escalation_post_id')
+    if wait.get('state') == 'escalated':
+        return type(note) is not int or board.conn.execute(
+            f'SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}', (note,)).fetchone() is None
+    return False
+
+
+def _settle_wait(board, post_id, recipient, state, by, reason=None):
+    """Mark a live wait for this request no longer waiting: 'resolved' (recovered) or 'persistent' (the latest
+    attempt hit a persistent blocker, which goes to the human as before). Call inside a write transaction."""
+    key = wait_key(post_id, recipient)
+    wait = _get_state(board.conn, key)
+    if wait is None or wait.get('state') not in WAITING:
+        return
+    wait.update(state=state, settled_at=board.now(), settled_reason=reason)
+    _put_state(board, key, wait, by)
+
+
 def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_version):
     """Recover bookkeeping ownership only; browser binding and execution stay gated.
 
@@ -227,8 +412,41 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
     ABANDON_GRACE_SECONDS ago, it has not been seen since, and it holds no live lease). Only an abandoned owner's
     `started` request can be taken over; queued and blocked requests work for both. Active or unknown owners stay
     blocked. If an abandoned session comes back, it has lost the request the same way it lost its lease.
+
+    A transient blocker (TRANSIENT_BLOCKERS: other work in the owner's checkout that ends by itself) raises
+    RecoveryWait, only after every other check passed, and records a recovery wait the dispatcher retries
+    (autorecover.py). A persistent blocker raises a plain Conflict, as before, and ends any wait for the request.
     """
-    from . import db, requests, workstreams, decision_actions, browser_readiness
+    from . import db
+    try:
+        return _transfer(board, p, session_id, post_id, recipient, expected_version)
+    except _TransientBlock as block:
+        wait = _record_wait(board, p, session_id, post_id, recipient, expected_version, block.old_id,
+                            block.blocker, block.path)
+        used = len(retries_used(wait, board.now()))
+        details = {'recovered': False, 'blocker': block.blocker, 'blocker_kind': 'transient', 'retry': 'automatic',
+                   'recovery_wait': {'post_id': post_id, 'recipient': recipient, 'version': wait['version'],
+                                     'retries_used': used, 'max_retries': WAIT_RETRIES, 'state': wait['state']},
+                   'next_step': WAIT_NEXT_STEP}
+        if wait['state'] in ESCALATED:
+            # The board's retries for this request already ran out and it asked the human itself: nothing more for
+            # the agent to ask, and no further automatic retry.
+            details.update(retry='escalated', next_step=WAIT_ESCALATED_NEXT_STEP,
+                           escalation_post_id=wait.get('escalation_post_id'))
+            raise RecoveryWait(f'{block.blocker}. This blocker is transient, but the automatic retries for this '
+                               f'request ran out today. {WAIT_ESCALATED_NEXT_STEP}', details) from None
+        raise RecoveryWait(f'{block.blocker}. This blocker is transient: the board retries automatically '
+                           f'(automatic retries used: {used} of {WAIT_RETRIES} per 24 hours). {WAIT_NEXT_STEP}',
+                           details) from None
+    except _PersistentBlock as exc:
+        with db.write_tx(board.conn):
+            _settle_wait(board, post_id, recipient, 'persistent', p.name, exc.message)
+        raise
+
+
+def _transfer(board, p, session_id, post_id, recipient, expected_version):
+    import os
+    from . import db, requests, decision_actions, browser_readiness
     with db.write_tx(board.conn):
         post, row = requests._context(board, p, session_id, post_id, recipient)
         if p.is_human or p.name != row['assigned_agent']:
@@ -248,8 +466,11 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
                            'dispatcher session, or a session whose task lease in this thread expired at least '
                            f'{int(abandon_grace(board, old)) // 60} minutes ago and that has not been seen since')
         blocker = _ownership_blocker(board, old, session_id, post, abandoned=abandoned is not None)
+        transient = None
         if blocker:
-            raise Conflict(blocker)
+            if blocker_kind(blocker) == 'persistent':
+                raise _PersistentBlock(blocker)
+            transient = blocker     # raised last: a relaunch must not run into a persistent blocker afterwards
         decision_actions.assert_execution_authorized(board, post_id, p.name)
         if post['task_id'] is not None:
             task = board._task_row(post['task_id'])
@@ -258,13 +479,52 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
         # Sticky host denials are not ownership problems and cannot be cleared here.
         blocker = browser_readiness.request_blocker(board, post_id, recipient)
         if blocker:
-            raise Conflict(blocker)
+            raise _PersistentBlock(blocker)
+        if transient:
+            # Nothing was written; the wait is recorded in its own transaction once this one rolled back.
+            raise _TransientBlock(transient, os.path.realpath(old['worktree'] or old['project']), old['id'])
         how = 'abandoned' if abandoned else 'ended'
         requests._save(board, p, session_id, row, 'queued',
                        f'Bookkeeping ownership recovered from {how} session {old["id"]}; execution preflight still required',
                        row['evidence_post_ids'], row['assigned_agent'], session_id)
         after_route(board, p, post, row)
+        _settle_wait(board, post_id, recipient, 'resolved', p.name, f'recovered by session {session_id}')
     return next(r for r in board.get_post(p, post_id)['requests'] if r['recipient'] == recipient)
+
+
+def transient_blocker(board, wait: dict):
+    """Read-only recheck for a recorded wait: the transient blocker that still holds the owner's worktree, or None
+    once it is free. The same lease, peer-activity and dispatcher-run checks as _ownership_blocker, with no
+    successor session to exclude (the relaunched run will be a new one): any live lease or active dispatcher run in
+    the checkout, any live peer there without fresh idle evidence, or any active run of the same agent keeps it
+    waiting. The full checks run again when the relaunched agent calls board_recover_request_owner."""
+    import os
+    from .dispatch import ACTIVE
+    now = board.now()
+    old = board.conn.execute('SELECT * FROM sessions WHERE id=?', (wait.get('old_session'),)).fetchone()
+    path = wait.get('worktree')
+    if old is None or not isinstance(path, str) or not path:
+        return None
+    for lease in board.conn.execute("""SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session
+                                       WHERE t.status IN ('working','blocked') AND t.lease_expires_at>?""", (now,)):
+        if lease['id'] == old['id'] or os.path.realpath(lease['worktree'] or lease['project']) == path:
+            return SHARED_LEASE_ACTIVE
+    for peer in board.conn.execute('''SELECT s.*,a.state,a.recorded_at FROM sessions s
+            JOIN agents identity ON identity.name=s.agent LEFT JOIN session_activity a ON a.session_id=s.id
+            WHERE s.id!=? AND identity.active=1 AND identity.is_human=0 AND s.last_seen>=?''', (old['id'], now - 90)):
+        if (os.path.realpath(peer['worktree'] or peer['project']) == path
+                and (peer['state'] != 'idle' or peer['recorded_at'] is None or not now - 90 <= peer['recorded_at'] <= now)):
+            return workstreams.PEER_ACTIVITY
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key >= 'dispatch.run.' AND key < 'dispatch.run/'"):
+        try:
+            run = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(run, dict) and run.get('status') in ACTIVE and (
+                run.get('agent') == old['agent']
+                or (isinstance(run.get('cwd'), str) and os.path.realpath(run['cwd']) == path)):
+            return workstreams.OWNER_RUN_ACTIVE
+    return None
 
 
 def after_route(board, p, source, previous):
@@ -304,20 +564,20 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
                                      (session_id, post['thread_id'], board.now())))
     authorized = any(board._task_authorization_active(t, current['agent']) for t in leases)
     if not same or not authorized:
-        if abandoned:
-            return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']},
-                                         abandoned=True, own_run_id=current['dispatch_run_id'])
-        return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']})
+        # The successor's own session, leases and dispatcher run are never "someone else busy in the checkout": a
+        # relaunched run recovering before (or without) a task claim would otherwise block itself.
+        return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']},
+                                     abandoned=abandoned, own_run_id=current['dispatch_run_id'], successor=session_id)
     for lease in board.conn.execute("SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session WHERE t.status IN ('working','blocked') AND t.lease_expires_at>?", (board.now(),)):
         if lease['id'] == old['id'] or (lease['id'] != session_id and os.path.realpath(lease['worktree'] or lease['project']) == path):
-            return 'Old owner or another session still holds an active task lease'
+            return SHARED_LEASE_ACTIVE
     for peer in board.conn.execute('''SELECT s.*,a.state,a.recorded_at FROM sessions s
             JOIN agents identity ON identity.name=s.agent LEFT JOIN session_activity a ON a.session_id=s.id
             WHERE s.id NOT IN (?,?) AND identity.active=1 AND identity.is_human=0 AND s.last_seen>=?''',
             (old['id'],session_id,board.now()-90)):
         if (os.path.realpath(peer['worktree'] or peer['project']) == path
                 and (peer['state'] != 'idle' or peer['recorded_at'] is None or not board.now()-90 <= peer['recorded_at'] <= board.now())):
-            return 'Another live session in the owner worktree has active or unknown activity'
+            return workstreams.PEER_ACTIVITY
     for record in board.conn.execute("SELECT key,value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
         run = json.loads(record['value'])
         current_run = (current['dispatch_run_id'] and record['key'] == 'dispatch.run.' + current['dispatch_run_id']
@@ -326,7 +586,7 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
         if current_run:
             continue
         if run.get('status') in ACTIVE and (run.get('agent') == old['agent'] or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path)):
-            return 'Owner dispatcher run is active or unresolved'
+            return workstreams.OWNER_RUN_ACTIVE
     try:
         project = board._thread_row(post['thread_id'])['project']
         if os.path.realpath(workstreams._git(path,'rev-parse','--path-format=absolute','--git-common-dir')) != os.path.realpath(workstreams._git(project,'rev-parse','--path-format=absolute','--git-common-dir')):
