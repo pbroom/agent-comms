@@ -1215,14 +1215,15 @@ class Board:
                 task_id = self._insert_task(c, p, session_id, thread_id, **self._task_fields(propose_task))
 
             seq = c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM posts").fetchone()[0]
-            post_id = c.execute(
-                """INSERT INTO posts(seq, thread_id, session_id, agent, type, body, to_agents, needs_response,
-                     task_id, refs, sealed, was_sealed, final, finalized_at, created_at, decision_question)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (seq, thread_id, session_id, p.name, type, body, json.dumps(to), int(bool(needs_response)),
-                 task_id, json.dumps(refs), int(bool(sealed)), int(bool(sealed)), int(bool(final)),
-                 now if final else None, now, json.dumps(question) if question else None),
-            ).lastrowid
+            with (db.proposal_write(c) if type == "proposal" else nullcontext()):
+                post_id = c.execute(
+                    """INSERT INTO posts(seq, thread_id, session_id, agent, type, body, to_agents, needs_response,
+                         task_id, refs, sealed, was_sealed, final, finalized_at, created_at, decision_question)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (seq, thread_id, session_id, p.name, type, body, json.dumps(to), int(bool(needs_response)),
+                     task_id, json.dumps(refs), int(bool(sealed)), int(bool(sealed)), int(bool(final)),
+                     now if final else None, now, json.dumps(question) if question else None),
+                ).lastrowid
             if propose_task is not None:
                 c.execute("UPDATE tasks SET proposed_by_post = ? WHERE id = ?", (post_id, task_id))
             if continuation is not None:

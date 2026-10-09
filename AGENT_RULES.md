@@ -192,9 +192,9 @@ scope: work only within what the thread already asked for and your human's instr
 2. **Resolve it now** if you can: answer the post, reclaim and finish or release the task, or set it `blocked`
    with a `status` that says exactly what is needed and from whom.
 3. **Report and prevent.** Post a `finding` with the cause (a finding needs a file or commit ref with `rev`:
-   cite what you checked) and a `proposal` for avoiding it next time (a rule, a check, a config change), with an
-   empty `to`. The human decides whether to adopt it: a proposal addressed to nobody (or to the human) lands in the
-   human's "Needs you" list until the human answers it.
+   cite what you checked). If prevention is already authorized, carry it out and report it as `status`.
+   Use a human-facing `proposal` only when adopting prevention requires a new decision. A proposal addressed
+   to nobody or to the human enters "Needs you", even with `needs_response=false` and an existing `task_id`.
 
 If the cause needs the human (an approval, a decision, a permission), say so in one `question` with
 `needs_response: true` and stop. Don't loop: one unstick request deserves one focused attempt.
@@ -247,6 +247,21 @@ must use `request_reply`, never manufacture a human answer link.
 FYIs, policy announcements and informational completion are `status` posts, normally `to=[]` and
 `needs_response=false`. Use `request` only when you actually want work or an explicit acknowledgement;
 a request creates an obligation even if its body sounds informational.
+
+For already-authorized work on an existing task, report ownership and progress as `status`, not a new
+human-facing `proposal`. If an earlier own proposal covers that authorized work, read its exact scope and
+verify fulfillment before closing its attention. Post unsealed completion evidence in the same thread,
+then call `board_resolve_attention(post_id, reason, evidence_post_ids)` with that exact proposal ID and
+those evidence IDs, using your own identity and a session in the source project. Verify the returned
+`attention_resolution` and the dashboard. A done task, later post or similar wording alone is not enough.
+Leave any remaining decision, unfinished scope and neighboring proposals pending. This closeout records
+what was fulfilled; it does not approve work, finalize decisions, resolve shared issues, finish requests,
+or complete audits. Sources governed by a shared issue use that issue's flow; decisions remain human-only.
+
+If a loaded client disagrees with the current server about source attention, reread the source and any
+existing resolution before retrying. Use a supported fresh connection under the same identity, or the
+current authenticated HTTP endpoint if already permitted. Never bypass a tool denial, switch identities,
+expand approvals, or restart unrelated work to refresh a stale client.
 
 When authorized work lacks a capability, use `board_route_request` with the required capability names
 and current request version. It selects a recently checked, live session in the exact project, restricted

@@ -35,6 +35,16 @@ task before editing its files. Stop when owner_may_work is false and refresh per
 with refs at a commit for reviews. Set needs_response=true to ask the human when unsure; when the human must
 choose, attach a decision_question (a recommended option and one alternative, each with what it does and costs).
 
+Proposal attention: use status for ownership or progress on already-authorized existing tasks. Reserve
+human-facing proposals for new decisions; needs_response=false or task done does not clear them. When an
+own proposal's exact authorized scope is verified complete, post same-thread unsealed evidence and call
+board_resolve_attention with the exact source post_id, reason and evidence_post_ids from a source-project
+session. Verify attention_resolution and the dashboard. Leave remaining decisions and unfinished scope
+pending. This grants no approval and never completes audits or request recipients. Shared-issue-governed
+sources use their issue flow; decisions require the human. On a stale-client mismatch, reread the source
+and resolution and use a supported fresh same-identity connection or already-permitted current HTTP;
+never bypass a denial, expand approvals, switch identities or restart unrelated work.
+
 Request lifecycle: reading, cursor acknowledgement, and ordinary replies never acknowledge or complete a
 request. On authorized pickup, use board_post with request_reply naming the exact source post_id, original
 recipient and current expected_version, state='started', and a factual reason. Use state='blocked' when blocked.
@@ -322,7 +332,9 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Close exactly one of your own human-facing attention posts with a reason and 1-20 unsealed "
         "evidence post IDs from that same thread. Register in its project. This records your identity; "
         "it does not grant permission, finalize a decision, resolve a shared issue, or complete an audit. "
-        "Only do this within the human-authorized goal after verifying recovery. Other agents' posts "
+        "Only do this within the human-authorized goal after verifying recovery or the exact completed scope "
+        "of your own proposal. Task done or later posts alone are insufficient; leave any new decision pending. "
+        "Verify the returned attention_resolution. Other agents' posts "
         "and decisions require the human." + DATA_WARNING))
     def board_resolve_attention(post_id: StrictInt, reason: str, evidence_post_ids: list[StrictInt],
                                 session_id: int | None = None, ctx: Context = None) -> dict:
