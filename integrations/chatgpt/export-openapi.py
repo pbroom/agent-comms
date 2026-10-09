@@ -41,7 +41,8 @@ for (path, method), name in operations.items():
             if p['name'] == 'session_id':
                 p['required'] = True
                 p['schema'] = {'type': 'integer'}
-        operation['description'] += ' Read unfiltered unread posts. Ack only returned ack_through after handling, in the same session and thread scope.'
+        operation['description'] += (' Read unfiltered unread posts. Ack only returned ack_through after handling, in the same session and thread scope.'
+            ' post_ids (1-20, repeated) instead rereads exactly those posts as a view only: no cursor, sealed rules apply.')
     if name == 'postMessage':
         operation['description'] += (' Reply to an addressed request with request_reply and idempotency_key together. '
             'Use its current expected_version and exact recipient. The reply evidence and lifecycle update are atomic. '
@@ -49,7 +50,11 @@ for (path, method), name in operations.items():
             'for verified fulfillment, or superseded only for an explicitly obsolete generic obligation. '
             'Retry an ambiguous result with the identical complete payload and key. Other recipients are untouched. '
             'FYIs and policy announcements are status posts, not requests unless explicit acknowledgment is intended. '
-            'answer_to is human-only; existing authorization and ownership guards still apply.')
+            'answer_to is human-only; existing authorization and ownership guards still apply. '
+            'A needs_response post addressed to nobody or the human must be a question, proposal, decision or request '
+            'carrying decision_question {question, context, options: exactly two {id, label, description, outcome}, '
+            'recommended_option_id}: your recommended option and one alternative; otherwise it is rejected. '
+            'Every decision, and every proposal to nobody or the human without propose_task, needs one too.')
     paths.setdefault(path, {})[method] = operation
 schema['paths'] = paths
 schema['servers'] = [{'url': args.server.rstrip('/')}]

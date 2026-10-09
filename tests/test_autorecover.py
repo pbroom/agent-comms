@@ -214,7 +214,7 @@ def test_a_blocked_recovery_request_escalates_to_the_human_once(aenv):
     posts = auto_posts(aenv)
     assert len(posts) == 2
     note = posts[1]
-    assert note["agent"] == "human" and note["to"] == [] and note["needs_response"] and note["type"] == "status"
+    assert note["agent"] == "human" and note["to"] == [] and note["needs_response"] and note["type"] == "question"
     assert note["id"] in needs_you(aenv), "it is in the human's Needs you"
     assert f"task {task} (abandoned, codex): its recovery request #{recovery_post['id']} to codex is blocked" in note["body"]
     assert "not a human click" in note["body"] and "Runner ended" not in note["body"]

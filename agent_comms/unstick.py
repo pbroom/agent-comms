@@ -33,8 +33,8 @@ MAX_REASONS = 20         # reasons listed in the body (keeps it far below the bo
 PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and propose a prevention; "
            "stay within the thread's existing request.")
 BODY_INSTRUCTIONS = ("Find the root cause of the stall, resolve it now, and post a `finding` with the cause plus a "
-                     "`proposal` for preventing it next time, with an empty `to` so it reaches the human. Stay within what this "
-                     "thread already asked for.")
+                     "`proposal` for preventing it next time, with an empty `to` and a `decision_question` so it "
+                     "reaches the human. Stay within what this thread already asked for.")
 
 
 def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
@@ -99,6 +99,46 @@ def unclaimed_tasks(board: Board, thread_id: int | None = None, updated_before: 
     return out
 
 
+AGENT_PREFIX = "unstick.agent."      # <thread id>.<agent>: when an Unstick last asked this agent on this thread
+SCOPED_PREFIX = "unstick.scoped."    # <thread id>: the thread stamp of the latest Unstick that recorded its agents
+
+
+def _stamp(conn, key: str) -> float | None:
+    row = conn.execute("SELECT value FROM board_state WHERE key = ?", (key,)).fetchone()
+    try:
+        value = json.loads(row["value"]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def record_coverage(board: Board, p: Principal, thread_id: int, agents: list[str]) -> None:
+    """Record which agents this Unstick asked, stamped with the thread's cooldown stamp it just reserved. Call inside
+    the post's write transaction. The thread stamp (STATE_PREFIX) stays the double-click cooldown for the whole thread;
+    these per-agent stamps say whose stall the human already took up (unstuck_since), so a one-click Unstick
+    for one agent does not silence automatic recovery for another agent's stall on the same thread."""
+    at = _stamp(board.conn, STATE_PREFIX + str(thread_id))
+    if at is None:
+        return
+    rows = [(AGENT_PREFIX + f"{thread_id}.{a}", at) for a in agents] + [(SCOPED_PREFIX + str(thread_id), at)]
+    for key, value in rows:
+        board.conn.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
+                              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,
+                              updated_at = excluded.updated_at""", (key, json.dumps(value), p.name, board.now()))
+
+
+def unstuck_since(conn, thread_id: int, agent: str, since: float) -> bool:
+    """An Unstick on this thread asked `agent` at or after `since`. A thread stamp written before agents were recorded
+    (no SCOPED_PREFIX record for that stamp) counts for every agent, as it did."""
+    at = _stamp(conn, STATE_PREFIX + str(thread_id))
+    if at is None or at < since:
+        return False
+    if _stamp(conn, SCOPED_PREFIX + str(thread_id)) != at:
+        return True     # the latest stamp is a legacy, unscoped one: it covered the whole thread
+    asked = _stamp(conn, AGENT_PREFIX + f"{thread_id}.{agent}")
+    return asked is not None and asked >= since
+
+
 def _ids(ids: list[int]) -> str:
     shown = [f"#{i}" for i in ids[:MAX_IDS_PER_AGENT]]
     if len(ids) > MAX_IDS_PER_AGENT:
@@ -126,7 +166,13 @@ def build_body(agents: list[str], reasons: list[dict]) -> str:
     return f"Unstick: this thread is stalled on {who} ({'; '.join(parts)}). {BODY_INSTRUCTIONS}"
 
 
-def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig) -> dict[str, Any]:
+def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig | None, *,
+            only_agents: list[str] | None = None, _in_transaction: bool = False) -> dict[str, Any]:
+    """`only_agents` (a decision action, decision_actions.py): ask and launch only those of these agents the thread
+    still waits on, with only their reasons; refuse (409) when none of them is. This bounds what a question (an agent
+    may write one) can launch to the agents it names. `_in_transaction`: run inside the caller's write transaction (the
+    human's answer to that question), so the cooldown stamp, the rule and the post commit or roll back with the
+    answer; the result then has no launch outlook (`config` is unused)."""
     board._require_human(p, "unstick a thread")
     thread = board._thread_row(thread_id)
     if thread["status"] != "open":
@@ -135,12 +181,18 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
     if not agents:
         raise Conflict("nothing here is waiting on an agent (no unanswered requests to an agent, blocked tasks, "
                        "expired leases or unclaimed tasks); if the thread is waiting on you, reply to it")
+    if only_agents is not None:
+        agents = [a for a in agents if a in only_agents]
+        reasons = [r for r in reasons if r["agent"] in agents]
+        if not agents:
+            raise Conflict(f"thread {thread_id} no longer waits on {', '.join(only_agents)}; reload before choosing")
     key = STATE_PREFIX + str(thread_id)
     human_actions.reserve_cooldown(
         board, p, key, UNSTICK_COOLDOWN_SECONDS,
         lambda wait: (f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
-                      f"give the agents a moment (try again in {wait} s)"))
+                      f"give the agents a moment (try again in {wait} s)"), _in_transaction=_in_transaction)
     def link_recovery(post):
+        record_coverage(board, p, thread_id, agents)    # in the post's transaction: rolls back with it
         # Server-created links only, frozen with the post; never infer lineage from prose.
         from . import recovery, workstreams
         for agent in agents:
@@ -169,10 +221,15 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
     try:
         post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons),
                                                  type="request", to=agents, needs_response=True, launch=agents,
-                                                 purpose=PURPOSE.format(thread=thread_id), post_hook=link_recovery)
+                                                 purpose=PURPOSE.format(thread=thread_id), post_hook=link_recovery,
+                                                 _in_transaction=_in_transaction)
     except Exception:
-        human_actions.release_cooldown(board, key)
+        if not _in_transaction:     # inside the caller's transaction, its rollback undoes the stamp
+            human_actions.release_cooldown(board, key)
         raise
+    if _in_transaction:
+        return {"post_id": post["id"], "thread_id": thread_id, "agents": agents,
+                "rule_id": rule["id"] if rule else None, "reasons": reasons}
     # Where the request will be seen now (`sessions`): the target agents' sessions inside the dispatcher's live
     # window, most recently seen first, and `sessions_detail`: those sessions in the snapshot's session shape (the
     # snapshot lists only the 30 most recently seen). Sessions a launch registers later are found by the page from

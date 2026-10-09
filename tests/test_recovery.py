@@ -2,6 +2,7 @@
 import pytest
 from agent_comms import db, recovery, requests, unstick
 from agent_comms.core import Conflict, Forbidden, Invalid
+from conftest import ASK
 
 
 def setup(e, count=1):
@@ -218,7 +219,7 @@ def test_unstick_records_exact_links_and_pickup_retires_only_recovery(env):
     assert row(env, obligation)['state'] == 'queued'
     refs = [{'kind':'artifact','path':f"board:post/{obligation['id']}"}]
     finding = env.post('codex',tid,'verified cause','finding',refs=refs+[{'kind':'commit','path':'repo','rev':'a'*40}])
-    proposal = env.post('codex',tid,'prevention','proposal',refs=refs)
+    proposal = env.post('codex',tid,'prevention','proposal',refs=refs, decision_question=ASK)
     diagnostic_pickup(env, source, [finding['id'],proposal['id']])
     assert row(env, source)['state'] == 'started'
     assert row(env, obligation)['state'] == 'finished'
@@ -254,7 +255,7 @@ def test_true_unstick_requires_diagnostic_deliverables(env):
     assert row(env,obligation)['state']=='queued'
     refs=[{'kind':'artifact','path':f"board:post/{obligation['id']}"}]
     finding=env.post('codex',tid,'root cause','finding',refs=refs+[{'kind':'commit','path':'repo','rev':'a'*40}])
-    proposal=env.post('codex',tid,'prevention','proposal',refs=refs)
+    proposal=env.post('codex',tid,'prevention','proposal',refs=refs, decision_question=ASK)
     diagnostic_pickup(env,source,[finding['id'],proposal['id']])
     assert row(env,obligation)['state']=='finished'
     assert row(env,source)['state']=='started'
@@ -270,7 +271,7 @@ def test_unstick_rejects_inexact_diagnostic_evidence(env,gate):
     if gate=='wrong_session': kwargs['session_id']=env.session('codex')
     author='claude' if gate=='wrong_author' else 'codex'
     finding=env.post(author,tid,'root cause','finding',refs=refs+[{'kind':'commit','path':'repo','rev':'a'*40}],**kwargs)
-    proposal=env.post('codex',tid,'prevention','proposal',refs=refs)
+    proposal=env.post('codex',tid,'prevention','proposal',refs=refs, decision_question=ASK)
     evidence=[finding['id'],proposal['id']]
     if gate=='missing_proposal': evidence=[finding['id']]
     if gate=='old_post':

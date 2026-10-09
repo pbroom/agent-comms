@@ -10,6 +10,21 @@ from agent_comms.core import Board, Principal
 
 PROJECT = "/work/repo"
 
+# Every agent post that asks the human (needs_response=true, to nobody or to the human) must carry a decision_question
+# (core.Board._check_asks_human_format). Tests that only need such a post use ASK: two options that only answer (no
+# approval, no mechanical action).
+ASK = {"question": "Which way?", "context": "",
+       "options": [{"id": "yes", "label": "Go ahead", "description": "Proceed as described", "outcome": "answered"},
+                   {"id": "no", "label": "Hold off", "description": "Do nothing for now", "outcome": "answered"}],
+       "recommended_option_id": "yes"}
+
+
+def legacy_plain(env, post_id: int, type: str | None = None) -> None:
+    """Make a post look like one stored before the format was enforced: no decision_question (and optionally
+    another type), as live boards still hold."""
+    env.board.conn.execute("UPDATE posts SET decision_question = NULL, type = COALESCE(?, type) WHERE id = ?",
+                           (type, post_id))
+
 
 @pytest.fixture(autouse=True)
 def _no_real_notifications(monkeypatch):

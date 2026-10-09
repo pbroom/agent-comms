@@ -6,6 +6,8 @@ from agent_comms import attention, db
 from agent_comms.api import create_app
 from agent_comms.core import Conflict, Forbidden, Invalid, NotFound, Paused
 
+from conftest import ASK
+
 
 def close(env, post, evidence, who="codex", **kw):
     return attention.close_attention(env.board, env.p[who], kw.pop("session_id", env.sid[who]),
@@ -15,7 +17,7 @@ def close(env, post, evidence, who="codex", **kw):
 
 def setup(env, who="codex"):
     thread = env.thread()
-    post = env.post(who, thread, "Browser unavailable", needs_response=True)
+    post = env.post(who, thread, "Browser unavailable", "question", needs_response=True, decision_question=ASK)
     evidence = env.post("codex", thread, "Verified desktop browser interaction; old workers unverified")
     return thread, post, evidence
 
@@ -25,8 +27,9 @@ def test_selective_three_thread_recovery_preserves_proposals_and_audits(env):
     for _ in range(3):
         thread = env.thread()
         audit = env.post("claude", thread, "Audit all controls", "request", to=["codex"], needs_response=True)
-        proposal = env.post("codex", thread, "Add a preflight", "proposal")
-        blocker = env.post("codex", thread, "Browser unavailable", needs_response=True)
+        proposal = env.post("codex", thread, "Add a preflight", "proposal", decision_question=ASK)
+        blocker = env.post("codex", thread, "Browser unavailable", "question", needs_response=True,
+                           decision_question=ASK)
         proof = env.post("codex", thread, "Browser interaction verified; audit incomplete")
         cases.append((thread, audit, proposal, blocker, proof))
     for thread, audit, proposal, blocker, proof in cases:
@@ -56,7 +59,7 @@ def test_authorship_project_session_pause_and_decision_guards(env):
     wrong_project = env.session("codex", project="/other")
     with pytest.raises(Forbidden, match="source project"):
         close(env, post, evidence, session_id=wrong_project)
-    decision = env.post("codex", thread, "Choose an approach", "decision")
+    decision = env.post("codex", thread, "Choose an approach", "decision", decision_question=ASK)
     with pytest.raises(Forbidden, match="decision"):
         close(env, decision, evidence)
     env.board.set_paused(env.p["human"], True)
@@ -82,7 +85,8 @@ def test_evidence_scope_and_sealed_visibility(env):
         close(env, post, hidden)
     with pytest.raises(Forbidden, match="unseal"):
         close(env, post, hidden, who="human")
-    private = env.post("codex", thread, "private source", sealed=True, needs_response=True)
+    private = env.post("codex", thread, "private source", "question", sealed=True, needs_response=True,
+                       decision_question=ASK)
     close(env, private, evidence)
     with pytest.raises(NotFound):
         env.board.get_post(env.p["claude"], private["id"])
@@ -102,7 +106,7 @@ def test_nonattention_and_linked_sources_cannot_be_closed(env):
     with pytest.raises(Conflict):
         close(env, proof, post)
     issues.create_issue(env.board, env.p["codex"], env.sid["codex"], title="Browser", body="blocked",
-                        thread_id=thread, post_id=post["id"])
+                        thread_id=thread, post_id=post["id"], decision_question=ASK)
     with pytest.raises(Conflict, match="shared issue"):
         close(env, post, proof)
 

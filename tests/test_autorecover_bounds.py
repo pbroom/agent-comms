@@ -10,7 +10,7 @@ import pytest
 from agent_comms import autorecover, recovery, unstick
 from agent_comms.core import Conflict
 
-from conftest import PROJECT
+from conftest import ASK, PROJECT
 from test_autorecover import (LEASE, PAST_GRACE, abandon, abandoned_request, aenv, agent_task, auto_posts,  # noqa: F401
                               records, version)
 
@@ -70,7 +70,7 @@ def test_the_launch_budget_per_agent_and_thread_stops_a_launch_loop(aenv):
         aenv.board.transition_task(aenv.p["human"], aenv.sid["human"], task, "declined")
         aenv.d.tick()
     assert len([p for p in auto_posts(aenv) if p["type"] == "request"]) == autorecover.AGENT_BUDGET == 2
-    note = [p for p in auto_posts(aenv) if p["type"] == "status"][-1]
+    note = [p for p in auto_posts(aenv) if p["type"] == "question"][-1]
     assert "automatic launch budget for codex on this thread (2 per 24 hours) is spent" in note["body"]
     assert len(aenv.spawner.calls) == 2
     aenv.clock.advance(autorecover.BUDGET_WINDOW_SECONDS)
@@ -85,7 +85,7 @@ def test_the_budget_counts_unclaimed_and_abandoned_together(aenv):
     aenv.clock.advance(autorecover.UNCLAIMED_AFTER_SECONDS + 60)
     aenv.d.tick()
     [note] = auto_posts(aenv)
-    assert note["type"] == "status" and "budget" in note["body"] and aenv.spawner.calls == []
+    assert note["type"] == "question" and "budget" in note["body"] and aenv.spawner.calls == []
 
 
 def test_a_self_accepted_unclaimed_task_goes_to_the_human_without_a_launch(aenv):
@@ -124,7 +124,8 @@ def test_a_blocked_task_goes_to_the_human_without_a_launch(aenv):
 
 def test_a_thread_waiting_on_the_human_gets_no_launch(aenv):
     abandon(aenv)
-    question = aenv.post("claude", aenv.tid, "which option?", "question", needs_response=True)
+    question = aenv.post("claude", aenv.tid, "which option?", "question", needs_response=True,
+                         decision_question=ASK)
     aenv.clock.advance(PAST_GRACE)
     aenv.d.tick()
     [note] = auto_posts(aenv)

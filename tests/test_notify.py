@@ -9,7 +9,7 @@ from agent_comms import notify
 from agent_comms.core import Board, Forbidden, Invalid
 from agent_comms.notify import HumanNotifier, MacOSDeliverer, Notification, osascript_argv
 
-from conftest import make_env
+from conftest import ASK, make_env
 
 REF = [{"kind": "commit", "path": "/work/repo", "rev": "abc123"}]
 SECRET = "SECRET-SEALED-TEXT"
@@ -61,9 +61,9 @@ def on(env, **kw):
 def test_notifies_on_question_for_human_addressed_and_decision(nenv):
     on(nenv)
     tid = nenv.thread()
-    nenv.post("claude", tid, "Which DB?", "question", needs_response=True)
+    nenv.post("claude", tid, "Which DB?", "question", needs_response=True, decision_question=ASK)
     nenv.post("codex", tid, "ping human", "status", to=["human"])
-    nenv.post("claude", tid, "Use SQLite", "decision")
+    nenv.post("claude", tid, "Use SQLite", "decision", decision_question=ASK)
     kinds = [n.kind for n in nenv.fake.sent]
     assert kinds == ["needs-response", "to-human", "decision"]
     first = nenv.fake.sent[0]
@@ -84,17 +84,24 @@ def test_does_not_notify_for_routine_posts_or_human_posts(nenv):
 
 
 def test_needs_response_addressed_to_human_and_agent_still_notifies(nenv):
-    on(nenv, events=["needs-response"])
     tid = nenv.thread()
-    nenv.post("claude", tid, "both of you", "question", to=["codex", "human"], needs_response=True)
+    # One stored before asking posts had to be the human's alone (made here with notifications still off) ...
+    r = nenv.post("claude", tid, "both of you", "question", to=["codex"], needs_response=True)
+    nenv.board.conn.execute("UPDATE posts SET to_agents = ? WHERE id = ?", ('["codex", "human"]', r["id"]))
+    on(nenv, events=["needs-response"])
+    # ... while a new post cannot ask the human and an agent at once.
+    with pytest.raises(Invalid):
+        nenv.post("claude", tid, "both of you", "question", to=["codex", "human"], needs_response=True)
+    assert nenv.fake.sent == []
+    nenv.board.notifier("post.created", {"post_id": r["id"]})
     assert [n.kind for n in nenv.fake.sent] == ["needs-response"]
 
 
 def test_event_selection_limits_what_notifies(nenv):
     on(nenv, events=["decision"])
     tid = nenv.thread()
-    nenv.post("claude", tid, "q", "question", needs_response=True)
-    nenv.post("claude", tid, "d", "decision")
+    nenv.post("claude", tid, "q", "question", needs_response=True, decision_question=ASK)
+    nenv.post("claude", tid, "d", "decision", decision_question=ASK)
     assert [n.kind for n in nenv.fake.sent] == ["decision"]
 
 
@@ -136,8 +143,8 @@ def test_sealed_first_post_does_not_burn_idle_nudge(nenv):
 
 def test_nothing_without_a_subscription(nenv):
     tid = nenv.thread()
-    nenv.post("claude", tid, "q", "question", needs_response=True)
-    nenv.post("claude", tid, "d", "decision", to=["human"])
+    nenv.post("claude", tid, "q", "question", needs_response=True, decision_question=ASK)
+    nenv.post("claude", tid, "d", "decision", to=["human"], decision_question=ASK)
     assert nenv.fake.sent == []
 
 
@@ -145,7 +152,7 @@ def test_off_stops_notifications(nenv):
     on(nenv)
     assert len(nenv.board.unsubscribe_notifications(nenv.p["human"])) == 1
     tid = nenv.thread()
-    nenv.post("claude", tid, "q", "question", needs_response=True)
+    nenv.post("claude", tid, "q", "question", needs_response=True, decision_question=ASK)
     assert nenv.fake.sent == [] and nenv.board.list_notification_subscriptions(nenv.p["human"]) == []
 
 
@@ -156,13 +163,13 @@ def test_project_and_thread_filters(nenv):
     other = b.create_thread(h, nenv.sid["human"], "elsewhere", "/work/other")["id"]
     on(nenv, project="/work/repo/", thread_id=t1)          # path normalized
     for t in (t1, t2, other):
-        nenv.post("claude", t, f"q{t}", "question", needs_response=True)
+        nenv.post("claude", t, f"q{t}", "question", needs_response=True, decision_question=ASK)
     assert [n.thread_ids for n in nenv.fake.sent] == [(t1,)]
     b.unsubscribe_notifications(h)
     nenv.fake.sent.clear()
     on(nenv, project="/work/other")
     for t in (t1, other):
-        nenv.post("claude", t, f"again {t}", "question", needs_response=True)
+        nenv.post("claude", t, f"again {t}", "question", needs_response=True, decision_question=ASK)
     assert [n.thread_ids for n in nenv.fake.sent] == [(other,)]
 
 
@@ -189,7 +196,7 @@ def test_rows_not_owned_by_the_human_are_ignored(nenv):
         "INSERT INTO subscriptions(agent, events, channel, active, created_at) VALUES ('claude', ?, 'macos', 1, 0)",
         (json.dumps(list(notify.NOTIFY_EVENTS)),))
     tid = nenv.thread()
-    nenv.post("codex", tid, "q", "question", needs_response=True)
+    nenv.post("codex", tid, "q", "question", needs_response=True, decision_question=ASK)
     assert nenv.fake.sent == []
 
 
@@ -212,7 +219,7 @@ def test_sealed_text_never_included(nenv):
     tid = nenv.thread()
     task = nenv.accepted_task(tid)
     nenv.post("codex", tid, SECRET, "finding", task_id=task, refs=REF, sealed=True, to=["codex", "human"])
-    nenv.post("claude", tid, SECRET, "decision", sealed=True)
+    nenv.post("claude", tid, SECRET, "decision", sealed=True, decision_question=ASK)
     assert len(nenv.fake.sent) == 2
     assert SECRET not in nenv.fake.text()
     assert all(n.message.endswith(": sealed post") for n in nenv.fake.sent)
@@ -222,7 +229,7 @@ def test_body_is_cleaned_and_truncated(nenv):
     on(nenv)
     tid = nenv.thread()
     body = "line1\nline2\t\x1b[31mred‮" + "x" * 300
-    nenv.post("claude", tid, body, "question", needs_response=True)
+    nenv.post("claude", tid, body, "question", needs_response=True, decision_question=ASK)
     msg = nenv.fake.sent[0].message
     assert "\n" not in msg and "\x1b" not in msg and "‮" not in msg
     assert msg.startswith("Needs your response: line1 line2 [31mred")
@@ -240,7 +247,7 @@ def test_deliverer_exception_does_not_break_create_post(nenv):
     nenv.board.notifier = HumanNotifier(nenv.board, deliverer=boom, min_interval=0)
     on(nenv)
     tid = nenv.thread()
-    r = nenv.post("claude", tid, "still posted", "question", needs_response=True)
+    r = nenv.post("claude", tid, "still posted", "question", needs_response=True, decision_question=ASK)
     assert nenv.board.get_post(nenv.p["human"], r["id"])["body"] == "still posted"
 
 
@@ -250,7 +257,7 @@ def test_raising_notifier_does_not_break_writes(nenv):
 
     nenv.board.notifier = boom
     tid = nenv.thread()
-    r = nenv.post("claude", tid, "ok", "question", needs_response=True)
+    r = nenv.post("claude", tid, "ok", "question", needs_response=True, decision_question=ASK)
     assert r["body"] == "ok"
     nenv.board.finalize(nenv.p["human"], nenv.post("human", tid, "d", "decision")["id"])
 
@@ -259,10 +266,10 @@ def test_broken_subscription_row_is_skipped(nenv):
     nenv.board.conn.execute("INSERT INTO subscriptions(agent, project, events, channel, active, created_at) "
                             "VALUES ('human', '/work/repo', 'not json', 'macos', 1, 0)")
     tid = nenv.thread()
-    nenv.post("claude", tid, "q", "question", needs_response=True)
+    nenv.post("claude", tid, "q", "question", needs_response=True, decision_question=ASK)
     assert nenv.fake.sent == []                       # the broken row alone notifies nothing, and doesn't crash
     on(nenv)                                          # a different scope, so the broken row stays active
-    nenv.post("claude", tid, "q2", "question", needs_response=True)
+    nenv.post("claude", tid, "q2", "question", needs_response=True, decision_question=ASK)
     assert len(nenv.fake.sent) == 1
     assert len(nenv.board.list_notification_subscriptions(nenv.p["human"])) == 2
 
@@ -275,7 +282,7 @@ def test_unavailable_deliverer_does_nothing(nenv):
     off = Off()
     nenv.board.notifier = HumanNotifier(nenv.board, deliverer=off, min_interval=0)
     on(nenv)
-    nenv.post("claude", nenv.thread(), "q", "question", needs_response=True)
+    nenv.post("claude", nenv.thread(), "q", "question", needs_response=True, decision_question=ASK)
     assert off.sent == []
 
 
@@ -336,7 +343,7 @@ def test_at_most_one_notification_per_post(nenv):
     on(nenv)
     tid = nenv.thread()
     # needs-response + to-human + decision all match: still one notification
-    r = nenv.post("claude", tid, "d", "decision", to=["human"], needs_response=True)
+    r = nenv.post("claude", tid, "d", "decision", to=["human"], needs_response=True, decision_question=ASK)
     assert len(nenv.fake.sent) == 1 and nenv.fake.sent[0].kind == "needs-response"
     # the same event replayed (e.g. a second notifier call) is deduped
     nenv.board.notifier("post.created", {"post_id": r["id"]})
@@ -348,7 +355,7 @@ def test_burst_is_coalesced(nenv):
     on(nenv)
     tid = nenv.thread()
     for i in range(5):
-        nenv.post("claude" if i % 2 else "codex", tid, f"q{i}", "question", needs_response=True)
+        nenv.post("claude" if i % 2 else "codex", tid, f"q{i}", "question", needs_response=True, decision_question=ASK)
     assert len(nenv.fake.sent) == 1               # first goes out immediately
     assert len(nenv.sched.calls) == 1             # one flush scheduled for the rest
     nenv.clock.advance(31)
@@ -365,9 +372,9 @@ def test_flush_waits_only_for_the_remaining_window(nenv):
     nenv.board.notifier = HumanNotifier(nenv.board, deliverer=nenv.fake, min_interval=30, schedule=nenv.sched)
     on(nenv)
     tid = nenv.thread()
-    nenv.post("claude", tid, "q1", "question", needs_response=True)        # sent at t0
+    nenv.post("claude", tid, "q1", "question", needs_response=True, decision_question=ASK)        # sent at t0
     nenv.clock.advance(28)
-    nenv.post("codex", tid, "q2", "question", needs_response=True)         # rejected 28 s into the window
+    nenv.post("codex", tid, "q2", "question", needs_response=True, decision_question=ASK)         # rejected 28 s into the window
     assert len(nenv.fake.sent) == 1
     assert [d for d, _ in nenv.sched.calls] == [pytest.approx(2.0)]        # not a full 30 s
     nenv.clock.advance(2)
@@ -375,7 +382,7 @@ def test_flush_waits_only_for_the_remaining_window(nenv):
     assert [n.message for n in nenv.fake.sent][1:] == ["Needs your response: q2"]
     # rejected at the very end of a window: the floor keeps the timer from spinning
     nenv.clock.advance(29.99)
-    nenv.post("claude", tid, "q3", "question", needs_response=True)
+    nenv.post("claude", tid, "q3", "question", needs_response=True, decision_question=ASK)
     assert [d for d, _ in nenv.sched.calls] == [notify.MIN_FLUSH_DELAY]
 
 
@@ -387,9 +394,9 @@ def test_rate_gate_is_shared_across_processes(nenv):
     nenv.board.notifier = HumanNotifier(nenv.board, deliverer=nenv.fake, min_interval=30, schedule=nenv.sched)
     on(nenv)
     tid = nenv.thread()
-    nenv.post("claude", tid, "q1", "question", needs_response=True)
+    nenv.post("claude", tid, "q1", "question", needs_response=True, decision_question=ASK)
     other.create_post(nenv.p["codex"], nenv.sid["codex"], body="q2", type="question", thread_id=tid,
-                      needs_response=True)
+                      needs_response=True, decision_question=ASK)
     assert len(nenv.fake.sent) == 1 and fake2.sent == [] and len(sched2.calls) == 1
     nenv.clock.advance(31)
     sched2.run()

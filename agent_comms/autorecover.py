@@ -36,8 +36,10 @@ is the standing approval that a click on Unstick would otherwise give, and only 
   stall (checked again inside the transaction).
 - Escalation. A recovery that does not take (its request ends `blocked`, or the task has not moved within one lease
   TTL of the actual launch, or of the post when the agent has a live interactive session and no launch is needed)
-  gets no further automatic launch: its one-shot rule is revoked and the human is told with a needs-response post
-  addressed to nobody (Board.NEEDS_YOU, the dashboard's "Needs you"), and the dashboard shows the precise reason. A
+  gets no further automatic launch: its one-shot rule is revoked and the human is told with a needs-response
+  `question` addressed to nobody (Board.NEEDS_YOU, the dashboard's "Needs you"), and the dashboard shows the precise
+  reason. The question carries a decision_question built from server facts only (escalation_question): a recommended
+  option and an alternative, most of them one-click decision actions (Unstick, decline or release the task). A
   request held by a sticky browser denial (browser_readiness.request_blocker) is never relaunched around: it goes
   straight to the human.
 """
@@ -48,7 +50,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import browser_readiness, db, human_actions, recovery, requests, unstick, workstreams
+from . import browser_readiness, db, human_actions, issues, recovery, requests, unstick, workstreams
 from .core import Board, Conflict, Principal, iso
 
 log = logging.getLogger("agent_comms.autorecover")
@@ -92,8 +94,11 @@ PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting aut
            "the thread's existing request.")
 ESCALATION = ("Automatic recovery did not take (sent by the dispatcher under the human's board setting "
               "auto_recover_stalled_work; not a human click): {items}. No further automatic launches will be made "
-              "for {them}. This needs you: open the thread and check the named request and task, then Unstick, "
-              "reassign or decline the task.")
+              "for {them}. This needs you: {next}")
+ESCALATION_NEXT = "pick one of the options below, or open the thread and check the named request and task."
+# Only when its question could not be built (escalation_question failed): then there are no options to pick.
+ESCALATION_NEXT_PLAIN = ("open the thread and check the named request and task, then Unstick, reassign or decline "
+                         "the task.")
 
 
 def task_key(task_id: int, lease_expires_at: float) -> str:
@@ -215,11 +220,11 @@ def _ids(ids: list[int]) -> str:
     return unstick._ids(ids)
 
 
-def _unstuck_since(conn, thread_id: int, since: float) -> bool:
-    """The human clicked Unstick on this thread after the stall began: they already asked, so the dispatcher does not
-    ask (and launch) a second time for the same stall."""
-    at = _get(conn, unstick.STATE_PREFIX + str(thread_id))
-    return isinstance(at, (int, float)) and not isinstance(at, bool) and at >= since
+def _unstuck_since(conn, thread_id: int, agent: str | None, since: float) -> bool:
+    """The human's Unstick on this thread asked this stall's agent after the stall began: they already asked, so the
+    dispatcher does not ask (and launch) a second time for the same stall. An Unstick limited to other agents (a
+    one-click decision action) leaves this agent's stall to automatic recovery (unstick.unstuck_since)."""
+    return unstick.unstuck_since(conn, thread_id, agent or "", since)
 
 
 def _waits_on_human(board: Board, thread_id: int) -> str | None:
@@ -312,7 +317,7 @@ def _abandoned_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
     if _get(conn, key) is not None or workstreams.get_for_task(board, r["id"]) is not None:
         return None     # already handled once, or a managed continuation with its own reconciliation
     if (runner_for(r["owner_agent"]) is None or at_cap(r["thread_id"])
-            or _unstuck_since(conn, r["thread_id"], r["lease_expires_at"])):
+            or _unstuck_since(conn, r["thread_id"], r["owner_agent"], r["lease_expires_at"])):
         return None
     held = _held_requests(conn, r["owner_session"], r["thread_id"])
     item = {"kind": "abandoned", "key": key, "task_id": r["id"], "thread_id": r["thread_id"],
@@ -322,6 +327,7 @@ def _abandoned_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
     denied = next((h["post_id"] for h in held
                    if browser_readiness.request_blocker(board, h["post_id"], h["recipient"])), None)
     if denied is not None:
+        item["browser_denied"] = True     # the escalation's question then recommends a release, not a relaunch
         return item, (f"request #{denied} is held by a browser policy denial; a human permission change is needed, "
                       "so nothing was launched")
     if r["status"] == "blocked":
@@ -343,7 +349,7 @@ def _unclaimed_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
             or workstreams.get_for_task(board, r["id"]) is not None):
         return None
     if (runner_for(r["created_by"]) is None or at_cap(r["thread_id"])
-            or _unstuck_since(conn, r["thread_id"], r["updated_at"])):
+            or _unstuck_since(conn, r["thread_id"], r["created_by"], r["updated_at"])):
         return None
     if conn.execute("SELECT 1 FROM tasks WHERE thread_id = ? AND owner_agent = ? AND lease_expires_at > ?",
                     (r["thread_id"], r["created_by"], now)).fetchone():
@@ -462,7 +468,7 @@ def _guard(board: Board, fence: tuple[str, str], items: list[dict], agent: str, 
         for x in items:
             if conn.execute("SELECT 1 FROM board_state WHERE key = ?", (x["key"],)).fetchone():
                 raise Conflict(f"{x['key']} was already recovered")
-            if _unstuck_since(conn, thread_id, x["stalled_since"]):
+            if _unstuck_since(conn, thread_id, agent, x["stalled_since"]):
                 raise Conflict(f"the human unstuck thread {thread_id} meanwhile")
         if _budget_reason(conn, agent, thread_id, board.now()):
             raise Conflict(f"the automatic launch budget for {agent} is spent")
@@ -612,7 +618,7 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
 # ---------------------------------------------------------------- escalation to the human
 
 
-def _escalation_body(entries: list[tuple[dict, str]]) -> str:
+def _escalation_body(entries: list[tuple[dict, str]], structured: bool = True) -> str:
     parts = []
     for rec, reason in entries[:MAX_ITEMS]:
         what = "abandoned" if rec["kind"] == "abandoned" else "unclaimed"
@@ -620,7 +626,97 @@ def _escalation_body(entries: list[tuple[dict, str]]) -> str:
     if len(entries) > MAX_ITEMS:
         parts.append(f"{len(entries) - MAX_ITEMS} more")
     them = "this stall" if len(entries) == 1 else "these stalls"
-    return ESCALATION.format(items="; ".join(parts), them=them)
+    return ESCALATION.format(items="; ".join(parts), them=them,
+                             next=ESCALATION_NEXT if structured else ESCALATION_NEXT_PLAIN)
+
+
+def _option(id_: str, label: str, description: str, action: dict | None = None) -> dict:
+    out = {"id": id_, "label": label, "description": description, "outcome": "approved" if action else "answered"}
+    if action:
+        out["action"] = action
+    return out
+
+
+def _unstick_option(id_: str, label: str, thread_id: int, agents: list[str], what: str) -> dict:
+    return _option(id_, label, (
+        f"Runs Unstick on thread #{thread_id}, as if you clicked it, for {', '.join(agents)} only: posts a request as you to "
+        f"whichever of them the thread still waits on to {what}, and allows one launch of each. Costs an agent run "
+        "(tokens); the server refuses it if the thread no longer waits on them or was unstuck in the last two minutes."),
+        {"type": "unstick", "thread_id": thread_id, "agents": agents})
+
+
+def escalation_question(board: Board, thread_id: int, entries: list[tuple[dict, str]]) -> dict:
+    """The structured question on an escalation post, so the human answers it in one click (Recommended, Alternative,
+    or their own reply). Built only from server-side facts: thread, task, post and session ids, agent names, the
+    task's current status and the server's own reason text; never anything an agent wrote (the recorded request
+    reason, `detail`, is left out). Each option either runs a bounded decision action (decision_actions.py: unstick,
+    decline_task, release_task, rechecked against the current state when chosen) or only answers.
+
+    One question per post. Several stalls on one thread (a grouped escalation) get one Unstick for the agents the post
+    names, which asks each of them about all of its stalled tasks on the thread at once, rather than an action on the
+    first task alone, which would leave the others hidden behind an answered item."""
+    if len(entries) > 1:
+        ids = [rec["task_id"] for rec, _ in entries]
+        agents = list(dict.fromkeys(rec["agent"] for rec, _ in entries))
+        shown = ", ".join(str(i) for i in ids[:MAX_ITEMS]) + (f" and {len(ids) - MAX_ITEMS} more" if len(ids) > MAX_ITEMS else "")
+        return {
+            "question": f"Automatic recovery did not take for {len(ids)} tasks on thread #{thread_id} (tasks {shown}). "
+                        "Unstick the thread?",
+            "context": "No further automatic launches will be made for them. Each task's reason is listed in the post.",
+            "options": [
+                _unstick_option("unstick", f"Unstick thread #{thread_id} (asks {', '.join(agents)})"[:200], thread_id,
+                                agents[:20], "reclaim, finish, release or decline each stalled task"),
+                _option("leave", "Leave them for now", (
+                    "Launches nothing and takes this item out of Needs you. Costs nothing now; the tasks stay stalled "
+                    "until you act on the thread (Unstick, or decline or release a task there)."))],
+            "recommended_option_id": "unstick"}
+    rec, reason = entries[0]
+    task_id, agent = rec["task_id"], rec["agent"]
+    task = board.conn.execute("SELECT status, owner_session FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    status = task["status"] if task else rec.get("task_status")
+    context = (f"Thread #{thread_id}, task {task_id} ({status or 'unknown status'}), "
+               f"{'created by' if rec['kind'] == 'unclaimed' else 'owned by'} {agent}. Why it came to you: {reason}. "
+               "No further automatic launches will be made for it.")
+    if rec["kind"] == "unclaimed":
+        options = [_option("decline", f"Decline task {task_id}", (
+                       f"Marks task {task_id} declined, so the thread no longer waits on it. Costs nothing to run; right "
+                       "when finished work already covers it. If work remains, it has to be proposed again."),
+                       {"type": "decline_task", "task_id": task_id,
+                        "expected_status": status if status in ("proposed", "accepted") else "accepted"}),
+                   _unstick_option("ask-creator", f"Ask {agent} to claim it (Unstick)", thread_id, [agent],
+                                   f"claim task {task_id}, or decline it if finished work already covers it")]
+        return {"question": f"Task {task_id} is accepted but nobody claimed it, and automatic recovery did not take. "
+                            f"Decline it, or ask {agent} to claim it?",
+                "context": context, "options": options, "recommended_option_id": "decline"}
+    if status == "blocked" and not rec.get("browser_denied"):
+        return {"question": f"Task {task_id} is blocked and its owner {agent} went silent. Relaunch {agent} to report "
+                            "what it needs?",
+                "context": context,
+                "options": [_unstick_option("relaunch", f"Relaunch {agent} to report what it needs", thread_id, [agent],
+                                            f"find out why task {task_id} is blocked and say exactly what it needs "
+                                            "and from whom"),
+                            _option("keep-blocked", "Keep it blocked", (
+                                f"Leaves task {task_id} blocked, launches nothing, and takes this item out of Needs "
+                                f"you. Costs nothing now; the task stays stalled until you or {agent} act on it."))],
+                "recommended_option_id": "relaunch"}
+    session = task["owner_session"] if task else rec.get("owner_session")
+    if isinstance(session, int) and not isinstance(session, bool) and session > 0:
+        release = _option("release", f"Release task {task_id}", (
+            f"Clears the lease of {agent}'s silent session {session} and returns task {task_id} to accepted, "
+            "unowned, so any agent can claim it. Launches nothing; requests that session still holds stay as they are "
+            "until an agent takes them over. Refused if the task changed hands since."),
+            {"type": "release_task", "task_id": task_id, "expected_owner_session": session})
+    else:
+        release = _option("leave", "Leave it for now", (
+            f"Launches nothing and takes this item out of Needs you; task {task_id} stays stalled until you act on it."))
+    denied = bool(rec.get("browser_denied"))
+    relaunch = _unstick_option("relaunch", f"Relaunch {agent} (Unstick)", thread_id, [agent],
+                               f"reclaim task {task_id} and finish or release it"
+                               + ("; change the browser permission first, or it stops at the same denial" if denied else ""))
+    return {"question": f"Task {task_id} was abandoned by {agent} and automatic recovery did not take. "
+                        + (f"Release it, or relaunch {agent}?" if denied else f"Relaunch {agent}, or release the task?"),
+            "context": context, "options": [relaunch, release],
+            "recommended_option_id": release["id"] if denied else "relaunch"}
 
 
 def _escalations_left(conn, agent: str, now: float) -> bool:
@@ -691,9 +787,18 @@ def _post_escalation(board: Board, human: Principal, fence: tuple[str, str], thr
             else:
                 _update(board.conn, key, out, now)
 
+    pairs = [(rec, reason) for _, rec, reason, _ in entries]
+    try:
+        question = escalation_question(board, thread_id, pairs)
+        issues._question(board, question)       # validated now, so a bad question cannot block the escalation itself
+    except Exception:
+        log.exception("could not build the question for the escalation on thread %s; posting it without one",
+                      thread_id)
+        question = None
     post, _ = human_actions.post_as_human(
-        board, human, thread_id=thread_id, body=_escalation_body([(rec, reason) for _, rec, reason, _ in entries]),
-        type="status", to=[], needs_response=True, post_check=check, post_hook=record)
+        board, human, thread_id=thread_id, body=_escalation_body(pairs, question is not None),
+        type="question" if question else "status",
+        to=[], needs_response=True, decision_question=question, post_check=check, post_hook=record)
     log.warning("automatic recovery did not take on thread %s (tasks %s); told the human in post %s", thread_id,
                 [rec["task_id"] for _, rec, *_ in entries], post["id"])
     return post["id"]
@@ -787,7 +892,7 @@ def list_records(board: Board, p: Principal) -> list[dict]:
             note = rec.get("escalation_post_id")
             if (not isinstance(note, int) or conn.execute(
                     f"SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}", (note,)).fetchone() is None
-                    or _unstuck_since(conn, rec["thread_id"], rec.get("escalated_at") or 0)):
+                    or _unstuck_since(conn, rec["thread_id"], rec.get("agent"), rec.get("escalated_at") or 0)):
                 continue    # the human answered it or unstuck the thread: nothing waits on them here any more
         out.append({"kind": rec["kind"], "task_id": rec["task_id"], "thread_id": rec["thread_id"],
                     "agent": rec.get("agent"), "owner_session": rec.get("owner_session"),

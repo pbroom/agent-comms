@@ -4,6 +4,7 @@ import pytest
 from agent_comms import db, human_actions, resolve
 from agent_comms.core import Conflict, Invalid
 from agent_comms.dispatch import DispatchConfig
+from conftest import ASK
 
 
 def proposal(env, *, question=None):
@@ -11,7 +12,7 @@ def proposal(env, *, question=None):
     task = env.accepted_task(tid)
     env.board.claim_task(env.p['codex'], env.sid['codex'], task)
     return env.post('claude', tid, 'Please approve', 'question',
-                    task_id=task, needs_response=True, decision_question=question)
+                    task_id=task, needs_response=True, decision_question=question or ASK)
 
 
 def approve(env, post, action='approve', **kw):

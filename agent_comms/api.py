@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import StrictInt, BaseModel, ConfigDict
@@ -537,11 +537,15 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.get("/api/updates")
     async def updates(request: Request, session_id: int | None = None, thread_id: int | None = None,
                       only: Literal["all", "addressed", "needs_response"] = "all", limit: int = 50,
-                      history: bool = False, wait_seconds: int = 0, p: Principal = P):
+                      history: bool = False, wait_seconds: int = 0,
+                      post_ids: list[int] | None = Query(None, description=(
+                          "Read exactly these posts (1-20 ids, repeat the parameter: post_ids=1&post_ids=2) as far "
+                          "as you may see them, without touching your cursor. Not combinable with the other filters.")),
+                      p: Principal = P):
         # async: wait_seconds > 0 long-polls without holding a worker thread (see Board.read_updates_async)
         s = await run_in_threadpool(sid, p, request, session_id)
         return await board.read_updates_async(p, s, thread_id=thread_id, only=only, limit=limit, history=history,
-                                              wait_seconds=wait_seconds)
+                                              wait_seconds=wait_seconds, post_ids=post_ids)
 
     @app.post("/api/updates/ack")
     def ack(body: AckIn, request: Request, p: Principal = P):

@@ -215,10 +215,19 @@ def _mechanical(board, p, item, option, question, note):
             return result
         if not _needs_you(c, item['id']):
             raise Conflict('this decision no longer needs you')
+        first_new_post = c.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM posts').fetchone()[0]
         result = decision_actions.execute(board, p, session_id, item, option['action'])
         action = option['action']
-        target = f"request #{action['post_id']}/{action['recipient']}"
-        if action['type'] == 'close':
+        target = f"request #{action.get('post_id')}/{action.get('recipient')}"
+        if action['type'] == 'unstick':
+            detail = (f"Unstuck thread #{item['thread_id']}: asked {', '.join(result['agents'])} in post "
+                      f"#{result['unstick_post_id']}" + (f" (one-shot launch rule {result['rule_id']})."
+                                                          if result['rule_id'] else "."))
+        elif action['type'] == 'decline_task':
+            detail = f"Declined task {result['task_id']}."
+        elif action['type'] == 'release_task':
+            detail = f"Released task {result['task_id']}: its lease is cleared and it is accepted again, unowned."
+        elif action['type'] == 'close':
             detail = f"Closed {target} using evidence " + ', '.join('#' + str(i) for i in action['evidence_post_ids']) + '.'
         elif action['type'] == 'route':
             detail = f"Routed {target} to session #{action['target_session_id']}; waiting for agent pickup."
@@ -237,4 +246,24 @@ def _mechanical(board, p, item, option, question, note):
                'action_result': result, 'receipt_post_id': receipt['id']}
         c.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
                   (key, json.dumps(out), p.name, board.now()))
-        return out
+        # Read inside the transaction (it holds the write lock, so posts from first_new_post on are exactly its own);
+        # announced only after the commit, so nothing is announced for a rolled-back answer or for other writers.
+        new_posts = [{'post_id': r['id'], 'thread_id': r['thread_id'], 'agent': r['agent'],
+                      'to': json.loads(r['to_agents']), 'needs_response': bool(r['needs_response']),
+                      'sealed': bool(r['sealed'])}
+                     for r in c.execute('SELECT id, thread_id, agent, to_agents, needs_response, sealed FROM posts '
+                                        'WHERE id >= ? ORDER BY id', (first_new_post,))]
+    _notify_committed(board, p, new_posts, option['action'], result)
+    return out
+
+
+def _notify_committed(board, p, new_posts, action, result):
+    """The events the same changes made one by one would have sent, once the answer's transaction committed: every
+    post it created (the action's own, the receipt and the answer) and the task change. Best effort, as elsewhere."""
+    for payload in new_posts:
+        board._notify('post.created', payload)
+    if action['type'] == 'decline_task':
+        board._notify('task.transition', {'task_id': result['task_id'], 'from': result['previous_status'],
+                                          'to': 'declined', 'agent': p.name})
+    elif action['type'] == 'release_task':
+        board._notify('task.released', {'task_id': result['task_id'], 'agent': p.name})

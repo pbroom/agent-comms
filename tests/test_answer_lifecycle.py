@@ -7,9 +7,11 @@ from agent_comms import db, issues, requests, resolve
 from agent_comms.core import Conflict, Forbidden, Invalid
 from agent_comms.dispatch import DispatchConfig
 
+from conftest import ASK
+
 
 def question(env, tid, author='codex', **kw):
-    return env.post(author,tid,type='question',to=['human'],needs_response=True,**kw)
+    return env.post(author,tid,type='question',to=['human'],needs_response=True,**{'decision_question':ASK,**kw})
 
 
 def pending(env):
@@ -89,7 +91,7 @@ def test_issue_answer_fanout_snapshots_exact_links_and_version(env):
     first,second=env.thread(),env.thread()
     one,two=question(env,first),question(env,second,'claude')
     issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Shared choice',body='Choose scope',
-                              thread_id=first,post_id=one['id'])
+                              thread_id=first,post_id=one['id'],decision_question=ASK)
     issues.link_issue(env.board,env.p['claude'],env.sid['claude'],issue['id'],second,two['id'])
     result=issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'First only',[first])
     assert result['needs_human']
@@ -146,7 +148,7 @@ def test_completion_never_closes_uncertain_or_unfinished_thread(env,blocker):
 def test_issue_auto_resolution_requires_every_linked_answer_complete(env):
     first,second=env.thread(),env.thread()
     one,two=question(env,first),question(env,second,'claude')
-    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=first,post_id=one['id'])
+    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=first,post_id=one['id'],decision_question=ASK)
     issues.link_issue(env.board,env.p['claude'],env.sid['claude'],issue['id'],second,two['id'])
     issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Both',[first,second])
     posts=[env.board.get_post(env.p['human'],r[0]) for r in env.board.conn.execute('SELECT DISTINCT answer_post_id FROM issue_answer_links ORDER BY answer_post_id')]
@@ -281,7 +283,7 @@ def test_changed_issue_decision_is_not_mistaken_for_retry(env,change):
 def test_exact_retry_after_completed_thread_does_not_reopen_or_duplicate(env):
     tid=env.thread()
     source=question(env,tid)
-    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=tid,post_id=source['id'])
+    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=tid,post_id=source['id'],decision_question=ASK)
     issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Yes',[tid])
     answer_id=env.board.conn.execute('SELECT answer_post_id FROM issue_answer_links').fetchone()[0]
     finish(env,env.board.get_post(env.p['human'],answer_id))
@@ -315,10 +317,10 @@ def test_proposal_about_an_existing_task_needs_the_human_but_propose_task_does_n
     tid = env.thread()
     created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
     task_id = env.accepted_task(tid, title='Existing task')
-    about = env.post('codex', tid, 'Change the approach on the existing task?', 'proposal', task_id=task_id)
+    about = env.post('codex', tid, 'Change the approach on the existing task?', 'proposal', task_id=task_id, decision_question=ASK)
     to_agents = env.post('codex', tid, 'Between us', 'proposal', task_id=task_id, to=['claude'])
     # The second proposal on the propose_task task is not the one that created it.
-    again = env.post('codex', tid, 'And on the new one too?', 'proposal', task_id=created['task_id'])
+    again = env.post('codex', tid, 'And on the new one too?', 'proposal', task_id=created['task_id'], decision_question=ASK)
     assert pending(env) == {about['id'], again['id']}
     assert created['id'] not in pending(env) and to_agents['id'] not in pending(env)
 
@@ -327,10 +329,10 @@ def test_migration_records_which_proposal_created_its_task(env):
     tid = env.thread()
     created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
     env.clock.advance(60)
-    about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'])
+    about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'], decision_question=ASK)
     c = env.board.conn
     done = env.accepted_task(tid, title='Finished long ago')
-    old_done = env.post('claude', tid, 'Old proposal on a finished task', 'proposal', task_id=done)
+    old_done = env.post('claude', tid, 'Old proposal on a finished task', 'proposal', task_id=done, decision_question=ASK)
     env.board.transition_task(env.p['human'], env.sid['human'], done, 'done')
     c = env.board.conn
     c.execute('ALTER TABLE tasks DROP COLUMN proposed_by_post')
@@ -341,5 +343,5 @@ def test_migration_records_which_proposal_created_its_task(env):
     assert {about['id'], old_done['id']} <= {r[0] for r in c.execute('SELECT source_post_id FROM legacy_attention_answers')}
     db.init_schema(c)                                    # idempotent
     # A proposal about an existing task posted after the upgrade does need the human.
-    fresh = env.post('codex', tid, 'And now this?', 'proposal', task_id=created['task_id'])
+    fresh = env.post('codex', tid, 'And now this?', 'proposal', task_id=created['task_id'], decision_question=ASK)
     assert pending(env) == {fresh['id']}

@@ -3,13 +3,17 @@ import json
 
 from agent_comms import issues, summary
 from agent_comms.dispatch import DispatchConfig
+from conftest import ASK, legacy_plain
 
 
 def test_shared_issue_replaces_linked_posts_and_answer_is_not_resolution(env):
     b, p, sid = env.board, env.p, env.sid
     t1, t2 = env.thread(), env.thread()
-    a = env.post('claude', t1, 'first blocker', needs_response=True)
-    z = env.post('codex', t2, 'second blocker', needs_response=True)
+    # Plain asks, as stored before every asking post had to carry a decision_question: the issue covers them.
+    a = env.post('claude', t1, 'first blocker', 'question', needs_response=True, decision_question=ASK)
+    z = env.post('codex', t2, 'second blocker', 'question', needs_response=True, decision_question=ASK)
+    legacy_plain(env, a['id'], 'status')
+    legacy_plain(env, z['id'], 'status')
     issue = issues.create_issue(b, p['claude'], sid['claude'], title='PRIVATE TITLE',
                                body='PRIVATE BODY', thread_id=t1, post_id=a['id'])
     issues.link_issue(b, p['codex'], sid['codex'], issue['id'], t2, z['id'])
@@ -36,7 +40,7 @@ def test_issue_without_post_and_existing_posts_share_limit(env):
     b, p, sid = env.board, env.p, env.sid
     thread = env.thread()
     for n in range(11):
-        env.post('claude', thread, f'question {n}', needs_response=True)
+        env.post('claude', thread, f'question {n}', 'question', needs_response=True, decision_question=ASK)
     env.clock.advance(1)
     issue = issues.create_issue(b, p['codex'], sid['codex'], title='A\nclean\u202etitle',
                                body='details', thread_id=thread)

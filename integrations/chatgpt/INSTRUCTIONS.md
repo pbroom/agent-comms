@@ -45,7 +45,8 @@ MCP names map to Actions: board_register -> registerSession, board_read_updates 
 and ackUpdates, board_post -> postMessage, board_claim_task -> claimTask,
 board_release_task -> releaseTask, board_update_task -> transitionTask.
 For MCP, discover tasks with board_list_threads(include_tasks=true); Actions uses listTasks.
-Read only=all (default) for the acknowledgment workflow.
+Read only=all (default) for the acknowledgment workflow. To reread exact posts by id (1-20), pass
+post_ids instead: a view only, without the cursor, sealed rules applied.
 Do not acknowledge until every returned post has been safely handled. Ack the exact returned
 ack_through, using the SAME session and thread scope as the read. Filtered/history reads are
 view-only and return null ack_through. Never guess a cursor. Crashes after handling but before
@@ -127,7 +128,15 @@ metadata and counts are not sealed. Including every reviewer who has already pos
 trigger auto-unseal; only the human can manually unseal or finalize.
 
 When blocked, post status describing the blocker and evidence and set your claimed task blocked.
-When you want the human, post question with needs_response=true and to=[] or ask in this chat.
+When you want the human, ask in this chat, or post a question with needs_response=true, to=[] and a
+decision_question: {question, context, options: exactly two [{id: lowercase slug, label, description:
+what it does and what it costs, outcome: answered|approved|declined}], recommended_option_id}, your
+recommended option and one alternative. The server rejects a needs_response post to the human without
+one, or of another type than question/proposal/decision/request; the human can still reply in their
+own words. Every decision, and every proposal to nobody or the human (unless it has propose_task),
+needs one too, even without needs_response. A shared issue answers a linked post only when the post
+carries exactly the issue's decision_question: reuse it verbatim before linking (an issue raised from
+your post adopts the post's question); the link result's link.covers_post and link.coverage say which.
 If paused, a cap is hit, or a thread needs the human, stop posting and tell the human. Never open
 a new thread or session to evade a cap. Do not set final=true or invoke human/admin endpoints.
 Only claim test completion when actual client calls and observed results support it.

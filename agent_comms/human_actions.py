@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import nullcontext
 from typing import Any, Callable
 
 from . import db, dispatch
@@ -22,11 +23,14 @@ MAX_SESSIONS = 20   # live session ids returned to the page
 
 
 def reserve_cooldown(board: Board, p: Principal, key: str, seconds: float, refuse: Callable[[int], str],
-                     check: Callable[[sqlite3.Connection], None] | None = None) -> None:
+                     check: Callable[[sqlite3.Connection], None] | None = None, _in_transaction: bool = False) -> None:
     """Refuse (409, `refuse(wait_seconds)`) when `key` was stamped less than `seconds` ago, else stamp it now. `check`
-    runs first inside the same write transaction, so a precondition and the stamp cannot race."""
+    runs first inside the same write transaction, so a precondition and the stamp cannot race. `_in_transaction`: use
+    the caller's open write transaction instead of a new one."""
     now = board.now()
-    with db.write_tx(board.conn) as c:
+    if _in_transaction and not board.conn.in_transaction:
+        raise Conflict("internal: a joined cooldown needs an open write transaction")
+    with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)) as c:
         if check is not None:
             check(c)
         row = c.execute("SELECT value FROM board_state WHERE key = ?", (key,)).fetchone()
@@ -132,26 +136,35 @@ def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type
                   needs_response: bool, launch: list[str] | None = None,
                   purpose: str | None = None, answer_to: list[int] | None = None, answer_recipient: str | None = None,
                   post_check: Callable[[], None] | None = None,
-                  post_hook: Callable[[dict], None] | None = None) -> tuple[dict, dict | None]:
+                  post_hook: Callable[[dict], None] | None = None, decision_question: dict | None = None,
+                  _in_transaction: bool = False) -> tuple[dict, dict | None]:
     """Post fixed text as the human, in the human's own board session. With `launch`, first approve a fresh one-shot
     dispatcher rule (one launch each, RULE_HOURS) for exactly those agents, and record it against the post
     (POST_RULE_PREFIX): the dispatcher launches for this post only under this rule, so its purpose is the one quoted
     in the launch prompt. An existing rule is never counted as covering the launch (it may carry another purpose,
     or be picked for another post). The rule comes first because the dispatcher only triggers on posts created at or
-    after a rule; if the post then fails, the rule is revoked. Returns (post, rule or None)."""
+    after a rule; if the post then fails, the rule is revoked. Returns (post, rule or None).
+
+    `decision_question`: a structured question built from server-side facts only (autorecover's escalations).
+    `_in_transaction`: run inside the caller's open write transaction (a decision action): the rule, the post and the
+    binding then commit or roll back with the caller, so nothing is revoked here on failure."""
     board._require_human(p, "post as the human")
+    if _in_transaction and not board.conn.in_transaction:
+        raise Conflict("internal: a joined post needs an open write transaction")
     rule = None
     try:
         if launch:
             agents = list(dict.fromkeys(launch))
             rule = board.create_dispatch_rule(p, thread_id=thread_id, agents=agents, purpose=purpose or "",
-                                              max_launches=len(agents), expires_at=board.now() + RULE_HOURS * 3600)
+                                              max_launches=len(agents), expires_at=board.now() + RULE_HOURS * 3600,
+                                              _in_transaction=_in_transaction)
         human_sid = board.human_session(p)
-        with db.write_tx(board.conn):
+        with (nullcontext(board.conn) if _in_transaction else db.write_tx(board.conn)):
             if post_check is not None:
                 post_check()
             post = board.create_post(p, human_sid, body=body, type=type, thread_id=thread_id, to=to,
                                      needs_response=needs_response, answer_to=answer_to,
+                                     decision_question=decision_question,
                                      _answer_recipient=answer_recipient, _in_transaction=True)
             if rule is not None:
                 board.conn.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
@@ -161,7 +174,7 @@ def post_as_human(board: Board, p: Principal, *, thread_id: int, body: str, type
             if post_hook is not None:
                 post_hook(post)
     except Exception:
-        if rule is not None:
+        if rule is not None and not _in_transaction:
             board.revoke_dispatch_rule(p, rule["id"])
         raise
     return post, rule

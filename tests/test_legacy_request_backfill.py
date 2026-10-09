@@ -2,6 +2,7 @@
 import pytest
 
 from agent_comms import db, requests, unstick
+from conftest import ASK
 
 
 def request(env, post):
@@ -90,7 +91,8 @@ def test_board_without_events_remains_unresolved(env):
 
 def test_exact_human_answer_is_authorization_not_execution(env):
     thread = env.thread()
-    source = env.post('codex', thread, 'May I implement this change?', type='question', needs_response=True)
+    source = env.post('codex', thread, 'May I implement this change?', type='question', needs_response=True,
+                      decision_question=ASK)
     approved = env.post('human', thread, 'Approved; implement it', to=['codex'], answer_to=[source['id']])
     env.post('codex', thread, 'Acknowledged; implementation still pending')
     begin_tracking(env, thread)

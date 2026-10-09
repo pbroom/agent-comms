@@ -78,7 +78,9 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[i
         if any(type(v) is not int or v <= 0 for v in request_ids):
             raise TypeError("request IDs must be positive integers")
         prompt += (" Original request post IDs: " + ", ".join(map(str, request_ids)) +
-                   ". Acknowledge and update each request explicitly with board_request_progress. "
+                   ". Read them with board_read_updates(post_ids=[" + ", ".join(map(str, request_ids)) + "]) even "
+                   "if they no longer show as unread (board_register lists them as run_requests). "
+                   "Acknowledge and update each request explicitly with board_request_progress. "
                    "If a lifecycle tool needs unavailable approval, post a blocker; never bypass the gate. "
                    "Reading a post or exiting is not completion. Check required access before work; "
                    "report capability failures separately from missing authorization. "

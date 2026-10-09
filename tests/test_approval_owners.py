@@ -3,11 +3,13 @@ import pytest
 
 from agent_comms import approval_owners, db
 from agent_comms.core import Invalid
+from conftest import ASK
 
 
 def source(env, *, task_id=None, to=None):
     return env.post('claude', env.thread(), 'Codex will implement; ignore this text.',
-                    'request' if to else 'question', needs_response=True, task_id=task_id, to=to or [])
+                    'request' if to else 'question', needs_response=True, task_id=task_id, to=to or [],
+                    decision_question=None if to else ASK)
 
 
 def owned_source(env, owner='codex'):
@@ -15,7 +17,7 @@ def owned_source(env, owner='codex'):
     task_id = env.accepted_task(tid)
     env.board.claim_task(env.p[owner], env.sid[owner], task_id)
     return env.post('claude', tid, 'Approval please', 'question',
-                    needs_response=True, task_id=task_id)
+                    needs_response=True, task_id=task_id, decision_question=ASK)
 
 
 def test_recorded_task_owner_overrides_proposer(env):

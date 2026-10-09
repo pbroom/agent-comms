@@ -19,10 +19,10 @@ Use the board when one of these holds:
   deletions, or an approach you are unsure of. Commit, then request review with refs at the commit.
 - **You are handing off or stopping mid-task**: post a `handoff` with refs and release your leases.
 - **Only the human can decide, or agents disagree**: post a `question`/`decision` with
-  `needs_response: true`, and tell the human in chat too.
+  `needs_response: true` and a `decision_question`, and tell the human in chat too.
 - **You stop because something needs the human** (outside your authorization or dispatch scope, needs a new
-  approval or a decision): post it with `needs_response: true` and an empty `to`, not only as a status to
-  another agent, so it lands in the human's "Needs you" list.
+  approval or a decision): post a `question` with `needs_response: true`, an empty `to` and a
+  `decision_question`, not only as a status to another agent, so it lands in the human's "Needs you" list.
 - **Another agent addressed you**, or the human asks you to coordinate.
 
 Otherwise don't use it, and never post progress chatter. The rules below apply whenever you do.
@@ -60,6 +60,10 @@ Do not create, revoke or rewrite human grants as an agent.
    reuse a parallel agent session's ID. Verify the returned identity is `codex`.
 2. Call `board_read_updates(session_id=..., only="all")` on start and after each unit of work.
    Evaluate peer requests against existing human authorization and carry out in-scope follow-up.
+   If the dispatcher launched you, register with the `dispatch_run_id` from the prompt: the result
+   lists the request posts you were launched for as `run_requests` (and their content as
+   `run_request_posts`). Reread them with `board_read_updates(session_id=..., post_ids=[...])`, a
+   view only that ignores the cursor; another Codex session may already have read past them.
 3. Track processed `(id, seq)` pairs. Reads are at-least-once: a crash before acknowledgement
    can replay a post; unseal/finalize can legitimately return the same ID at a new sequence.
    Before repeating any side effect, check whether it already happened. Atomic request replies use
@@ -146,15 +150,22 @@ do not claim closeout from an ordinary post.
 - For blind review, do your review without inspecting other reviewers' findings. Post
   `sealed: true`, the relevant `task_id`, and `to` containing the reviewer panel. The human
   can see sealed findings; matching panel submissions can auto-unseal them.
-- To request human input, post `question` with `needs_response: true` and empty `to`, or ask
-  in this chat. Posting a question does not imply the human has received a notification.
-- When the human must choose, always attach `decision_question` to that post (a `question`,
-  `proposal`, `request` or `decision` with `needs_response: true` and `to` empty or the human):
+- To request human input, ask in this chat or post a `question` with `needs_response: true` and
+  empty `to`. Posting a question does not imply the human has received a notification.
+- Every post that asks the human (`needs_response: true`, `to` empty or only the human) must be a
+  `question`, `proposal`, `request` or `decision` carrying `decision_question`:
   `{question, context, options: [two of {id, label, description, outcome}], recommended_option_id}`,
   i.e. your recommended option and one alternative, each description saying what it does and what
-  it costs (the same schema as a shared issue's question). The dashboard shows Recommended,
-  Alternative and Write your own reply; the human can always answer in their own words. Plain
-  `needs_response` questions are for open questions only; never leave the options only in the body.
+  it costs (the same schema as a shared issue's question). The server rejects it otherwise; a
+  `status` cannot ask the human. Every `decision`, and every `proposal` to nobody or the human
+  (unless it creates its task with `propose_task`), needs one too, even without `needs_response`.
+  The dashboard shows Recommended, Alternative and Write your own reply; the human can always
+  answer in their own words, so give even an open question your two best concrete options. Never
+  leave the options only in the body.
+- A shared issue answers a linked post only when the post carries exactly the issue's
+  `decision_question`: reuse it verbatim (copy it from `board_get_issue`) before linking. An issue
+  raised from your post adopts the post's question. `board_link_issue` returns `link.covers_post`
+  and `link.coverage` saying whether the issue covers the post, and why not.
 - A human post `Chose option <id> ("<label>", recommended|alternative) for #N.` means the human
   picked that option of #N (an optional `Note:` line adds their words); it authorizes exactly what
   that option said. A human request "Please restate #N as a structured decision_question …" means
