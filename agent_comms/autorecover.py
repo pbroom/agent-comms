@@ -16,18 +16,21 @@ is the standing approval that a click on Unstick would otherwise give, and only 
 - Only the dispatcher loop that owns the board (its fence token is checked inside the post's write transaction),
   never while the board is paused, only while the setting is on, only on open threads not at their agent-post cap,
   and only for an active non-human agent that has a configured runner.
-- Only recent stalls (MAX_STALL_AGE_SECONDS), at most MAX_SENDS_PER_PASS launches per pass, and a durable launch
-  budget of AGENT_BUDGET per (agent, thread) per rolling day across both kinds, so an agent cannot get itself
-  launched over and over (claim and go silent, or create, accept and abandon its own tasks).
-- An unclaimed task launches only when the human accepted it or an active standing grant covers it; one its own
-  creator accepted goes to the human instead. A `blocked` task, and any stall on a thread that already waits on the
-  human (a Needs you post, or a shared issue awaiting the human), also goes to the human, never to a launch.
+- Only recent stalls (MAX_STALL_AGE_SECONDS), at most MAX_SENDS_PER_PASS launches per pass, and durable launch
+  budgets per rolling day across both kinds: AGENT_BUDGET per (agent, thread) and AGENT_DAILY_BUDGET per agent over
+  all threads, so an agent cannot get itself launched over and over.
+- Only work the human authorized launches. Abandoned work: the task is human- or grant-authorized, or the human
+  posted on the thread (not automatically) before the task was claimed; otherwise an agent could open a thread,
+  claim its own task, go silent and be launched, again and again. An unclaimed task: the human accepted it or an
+  active standing grant covers it. Anything else goes to the human instead. A `blocked` task, and any stall on a
+  thread that already waits on the human (a Needs you post, or a shared issue awaiting the human), also goes to the
+  human, never to a launch.
 - Fixed server-side text. The body and the rule purpose vary only in thread, task, post and session ids and agent
   names; nothing an agent wrote (bodies, titles, summaries, request reasons) is read into them. The body says plainly
   that it is an automatic recovery under the human's setting, not a human click. The post is marked automatic
   (POST_PREFIX), so it does not lift the agent-post cap (Board.NOT_AUTOMATIC) and the dashboard can label it.
 - Once only. At most one automatic recovery per (task id, lease_expires_at) for abandoned work, one per task for an
-  unclaimed task, and MAX_PER_TASK over a task's lifetime. Each is recorded durably in `board_state` in the same
+  unclaimed task, and MAX_PER_TASK until the task is finished or declined (ATTEMPTS_PREFIX counters). Each is recorded durably in `board_state` in the same
   transaction as the post, so a restarted dispatcher never repeats it. Not after the human clicked Unstick on the
   stall (checked again inside the transaction).
 - Escalation. A recovery that does not take (its request ends `blocked`, or the task has not moved within one lease
@@ -57,8 +60,9 @@ MAX_STALL_AGE_SECONDS = 24 * 3600   # older stalls are left to the human (no flo
 MAX_SENDS_PER_PASS = 3              # recovery requests (each may launch an agent) per dispatcher pass
 MAX_ESCALATIONS_PER_PASS = 5        # posts to the human per pass
 AGENT_BUDGET = 2                    # automatic launches per (agent, thread) ...
+AGENT_DAILY_BUDGET = 6              # ... and per agent across all threads ...
 BUDGET_WINDOW_SECONDS = 24 * 3600   # ... per rolling day
-MAX_PER_TASK = 3                    # automatic recoveries of one task, over its lifetime
+MAX_PER_TASK = 3                    # automatic recoveries of one task, until it is finished or declined
 RECORD_TTL_SECONDS = 7 * 24 * 3600  # settled records and replaced-lease evidence are pruned after this
 PRUNE_EVERY_SECONDS = 3600
 MAX_ITEMS = 20                      # items named in one post (the rest are counted)
@@ -69,6 +73,8 @@ TASK_PREFIX = PREFIX + "task."              # <task id>.<lease_expires_at>: aban
 UNCLAIMED_PREFIX = PREFIX + "unclaimed."    # <task id>: an unclaimed task
 POST_PREFIX = PREFIX + "post."              # <post id>: a post made automatically (core.Board.NOT_AUTOMATIC)
 BUDGET_PREFIX = PREFIX + "budget."          # <agent>.<thread id>: launch times in the rolling window
+AGENT_BUDGET_PREFIX = PREFIX + "agent_budget."  # <agent>: launch times in the rolling window, all threads
+ATTEMPTS_PREFIX = PREFIX + "attempts."      # <task id>: automatic recoveries sent, kept until the task is terminal
 PRUNED_KEY = PREFIX + "pruned_at"
 
 HEADER = ("Automatic recovery: the dispatcher sent this under the human's board setting auto_recover_stalled_work; "
@@ -97,6 +103,14 @@ def unclaimed_key(task_id: int) -> str:
 
 def budget_key(agent: str, thread_id: int) -> str:
     return f"{BUDGET_PREFIX}{agent}.{int(thread_id)}"
+
+
+def agent_budget_key(agent: str) -> str:
+    return f"{AGENT_BUDGET_PREFIX}{agent}"
+
+
+def attempts_key(task_id: int) -> str:
+    return f"{ATTEMPTS_PREFIX}{int(task_id)}"
 
 
 def enabled(board: Board) -> bool:
@@ -163,15 +177,31 @@ def _at_cap(board: Board, thread_id: int) -> bool:
 
 
 def _attempts(conn, task_id: int) -> int:
-    lo, hi = _range(f"{TASK_PREFIX}{task_id}.")
-    return conn.execute("SELECT COUNT(*) FROM board_state WHERE (key >= ? AND key < ?) OR key = ?",
-                        (lo, hi, unclaimed_key(task_id))).fetchone()[0]
+    """Automatic recoveries sent for this task. The counter outlives the per-stall records (pruned after a week) and is
+    dropped only when the task is finished, declined or deleted, so MAX_PER_TASK holds for the task's whole life."""
+    count = _get(conn, attempts_key(task_id))
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
+
+def _times(conn, key: str, now: float) -> list[float]:
+    times = _get(conn, key)
+    return [t for t in times if isinstance(t, (int, float)) and not isinstance(t, bool)
+            and t > now - BUDGET_WINDOW_SECONDS] if isinstance(times, list) else []
 
 
 def _budget_used(conn, agent: str, thread_id: int, now: float) -> list[float]:
-    times = _get(conn, budget_key(agent, thread_id))
-    return [t for t in times if isinstance(t, (int, float)) and not isinstance(t, bool)
-            and t > now - BUDGET_WINDOW_SECONDS] if isinstance(times, list) else []
+    return _times(conn, budget_key(agent, thread_id), now)
+
+
+def _budget_reason(conn, agent: str, thread_id: int, now: float) -> str | None:
+    """Why the agent may not be launched automatically now (a spent launch budget), or None."""
+    if len(_budget_used(conn, agent, thread_id, now)) >= AGENT_BUDGET:
+        return (f"the automatic launch budget for {agent} on this thread ({AGENT_BUDGET} per 24 hours) is spent, so "
+                "nothing was launched")
+    if len(_times(conn, agent_budget_key(agent), now)) >= AGENT_DAILY_BUDGET:
+        return (f"the daily automatic launch budget for {agent} ({AGENT_DAILY_BUDGET} per 24 hours across all "
+                "threads) is spent, so nothing was launched")
+    return None
 
 
 def _ids(ids: list[int]) -> str:
@@ -197,6 +227,21 @@ def _waits_on_human(board: Board, thread_id: int) -> str | None:
     if row is not None:
         return f"the thread is waiting on your decision on issue #{row['id']}, so nothing was launched"
     return None
+
+
+def _human_asked_first(board: Board, task_id: int, thread_id: int, owner_session: int | None) -> bool:
+    """The human took part in this thread before the task's current claim: a post by the human identity that is not
+    an automatic one (Board.NOT_AUTOMATIC), created at or before the claim (or before the task, if no claim event is
+    found). An agent cannot write such a post, so it cannot open a thread, claim, go silent and get launched."""
+    claimed = board.conn.execute(
+        """SELECT MAX(at) FROM task_events WHERE task_id = ? AND event IN ('claim', 'reclaim')
+           AND (session_id = ? OR ? IS NULL)""", (task_id, owner_session, owner_session)).fetchone()[0]
+    if claimed is None:
+        claimed = board.conn.execute("SELECT created_at FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+    return board.conn.execute(
+        f"""SELECT 1 FROM posts p JOIN agents a ON a.name = p.agent AND a.is_human = 1
+            WHERE p.thread_id = ? AND p.created_at <= ? AND {Board.NOT_AUTOMATIC.format(post='p')} LIMIT 1""",
+        (thread_id, claimed)).fetchone() is not None
 
 
 def _human_authorized(board: Board, task_id: int, agent: str) -> bool:
@@ -272,6 +317,10 @@ def _abandoned_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
         return item, "the task was blocked when its owner went silent and may be waiting on you, so nothing was launched"
     if _attempts(conn, r["id"]) >= MAX_PER_TASK:
         return item, f"the limit of {MAX_PER_TASK} automatic recoveries for this task is reached"
+    if not (_human_authorized(board, r["id"], r["owner_agent"])
+            or _human_asked_first(board, r["id"], r["thread_id"], r["owner_session"])):
+        return item, ("neither you nor a standing grant authorized this work (no post of yours on the thread before "
+                      "the task was claimed), so nothing was launched")
     return item, _waits_on_human(board, r["thread_id"])
 
 
@@ -345,9 +394,9 @@ def _detect_and_send(board: Board, human: Principal, runner_for: Callable[[str],
             direct.append((reason, item))
     sent: list[int] = []
     for (thread_id, agent), items in sorted(groups.items(), key=lambda g: min(x["stalled_since"] for x in g[1])):
-        if len(_budget_used(conn, agent, thread_id, now)) >= AGENT_BUDGET:
-            direct += [(f"the automatic launch budget for {agent} on this thread ({AGENT_BUDGET} per 24 hours) is "
-                        "spent, so nothing was launched", x) for x in items]
+        spent = _budget_reason(conn, agent, thread_id, board.now())
+        if spent:
+            direct += [(spent, x) for x in items]
             continue
         if len(sent) >= MAX_SENDS_PER_PASS:
             continue    # the next pass picks it up
@@ -404,8 +453,8 @@ def _guard(board: Board, fence: tuple[str, str], items: list[dict], agent: str, 
                 raise Conflict(f"{x['key']} was already recovered")
             if _unstuck_since(conn, thread_id, x["stalled_since"]):
                 raise Conflict(f"the human unstuck thread {thread_id} meanwhile")
-        if len(_budget_used(conn, agent, thread_id, board.now())) >= AGENT_BUDGET:
-            raise Conflict(f"the automatic launch budget for {agent} on thread {thread_id} is spent")
+        if _budget_reason(conn, agent, thread_id, board.now()):
+            raise Conflict(f"the automatic launch budget for {agent} is spent")
     return check
 
 
@@ -423,6 +472,9 @@ def _send(board: Board, human: Principal, fence: tuple[str, str], thread_id: int
             rec.update(post_id=post["id"], rule_id=rule_id, sent_at=now, state="sent")
             _insert(conn, x["key"], rec, now)
         _upsert(conn, budget_key(agent, thread_id), _budget_used(conn, agent, thread_id, now) + [now], now)
+        _upsert(conn, agent_budget_key(agent), _times(conn, agent_budget_key(agent), now) + [now], now)
+        for x in items:
+            _upsert(conn, attempts_key(x["task_id"]), _attempts(conn, x["task_id"]) + 1, now)
 
     post, _ = human_actions.post_as_human(
         board, human, thread_id=thread_id, body=build_body(items), type="request", to=[agent], needs_response=True,
@@ -613,8 +665,9 @@ def _escalate_new(board, human, fence, thread_id, items: list[tuple[str, dict]])
 
 def prune(board: Board, force: bool = False) -> int:
     """At most hourly: drop recovery records of finished, declined or deleted tasks and any older than
-    RECORD_TTL_SECONDS, spent launch budgets, and replaced-lease evidence that is used up (the old session holds no
-    unfinished request) or stale. Post markers stay: they keep automatic posts from lifting the agent-post cap."""
+    RECORD_TTL_SECONDS, spent launch budgets, attempt counters of finished, declined or deleted tasks, and
+    replaced-lease evidence that is used up (the old session holds no unfinished request) or stale. Post markers stay:
+    they keep automatic posts from lifting the agent-post cap."""
     conn, now = board.conn, board.now()
     last = _get(conn, PRUNED_KEY)
     if not force and isinstance(last, (int, float)) and now - last < PRUNE_EVERY_SECONDS:
@@ -631,12 +684,23 @@ def prune(board: Board, force: bool = False) -> int:
                                 (rec.get("task_id") if isinstance(rec, dict) else None,)).fetchone()
             if task is None or task["status"] in ("done", "declined") or updated < now - RECORD_TTL_SECONDS:
                 gone.append(key)
-    for key, value in _keys(conn, BUDGET_PREFIX):
+    for prefix in (BUDGET_PREFIX, AGENT_BUDGET_PREFIX):
+        for key, value in _keys(conn, prefix):
+            try:
+                times = json.loads(value)
+            except (TypeError, ValueError):
+                times = []
+            if not isinstance(times, list) or not any(
+                    isinstance(t, (int, float)) and t > now - BUDGET_WINDOW_SECONDS for t in times):
+                gone.append(key)
+    for key, _ in _keys(conn, ATTEMPTS_PREFIX):
         try:
-            times = json.loads(value)
-        except (TypeError, ValueError):
-            times = []
-        if not any(isinstance(t, (int, float)) and t > now - BUDGET_WINDOW_SECONDS for t in times or []):
+            task_id = int(key[len(ATTEMPTS_PREFIX):])
+        except ValueError:
+            gone.append(key)
+            continue
+        task = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if task is None or task["status"] in ("done", "declined"):
             gone.append(key)
     for key, value, updated in _keys(conn, recovery.RECLAIMED_PREFIX, "key, value, updated_at"):
         try:

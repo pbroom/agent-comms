@@ -17,10 +17,29 @@ ABANDON_GRACE_SECONDS = 10 * 60
 
 
 def abandon_grace(board, session):
-    """How long after its lease expired a silent session counts as abandoned."""
-    if session is not None and session['dispatch_run_id']:
+    """How long after its lease expired a silent session counts as abandoned: ten minutes for a session the dispatcher
+    launched, a full lease TTL otherwise. A dispatcher session that was seen after its run ended (the human resumed
+    that conversation interactively) is treated as interactive, and so is one whose run record is missing."""
+    full = max(ABANDON_GRACE_SECONDS, board.s.lease_ttl_minutes * 60)
+    if session is None or not session['dispatch_run_id']:
+        return full
+    record = board.conn.execute('SELECT value FROM board_state WHERE key=?',
+                                ('dispatch.run.' + session['dispatch_run_id'],)).fetchone()
+    try:
+        run = json.loads(record['value']) if record else None
+    except (TypeError, ValueError):
+        run = None
+    if not isinstance(run, dict):
+        return full
+    from .dispatch import ACTIVE
+    if run.get('status') in ACTIVE:
         return ABANDON_GRACE_SECONDS
-    return max(ABANDON_GRACE_SECONDS, board.s.lease_ttl_minutes * 60)
+    ended = run.get('ended_at')
+    if type(ended) in (int, float) and session['last_seen'] <= ended:
+        return ABANDON_GRACE_SECONDS
+    return full
+
+
 RECLAIMED_PREFIX = 'session.abandoned.'   # board_state: <session id>.<task id> -> the lease a reclaim replaced
 
 

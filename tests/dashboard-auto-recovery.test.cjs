@@ -134,13 +134,17 @@ test('agents never get automatic recovery records and see the plain status', asy
   page.dom.window.close();
 });
 
-test('an escalation the human already handled (its Needs you post is answered) falls back to the plain labels', async () => {
-  const note = post(110, 1, { type: 'status', needs_response: true });
-  const t = thread(1, { tasks: [task(22)], posts: [post(100, 1), note], pickup: pickup() });
-  const page = await setup({ threads: [t], needsYou: [], autoRecovery: [abandoned({ state: 'escalated',
+test('the page trusts the server for which escalations are open (needs_you in the snapshot is capped)', async () => {
+  const t = thread(1, { tasks: [task(22)], pickup: pickup() });
+  // Handled: the server no longer lists it, so the plain labels apply.
+  const handled = await setup({ threads: [t], autoRecovery: [] });
+  const plain = dot(handled.document, 1, 'stalled');
+  assert.doesNotMatch(plain, /automatic recovery/);
+  assert.match(plain, /A task lease expired/);
+  handled.dom.window.close();
+  // Open, but its post is beyond the snapshot's capped needs_you list: still shown.
+  const open = await setup({ threads: [t], needsYou: [], autoRecovery: [abandoned({ state: 'escalated',
     reason: 'its recovery request #105 to codex is blocked', escalation_post_id: 110 })] });
-  const label = dot(page.document, 1, 'stalled');
-  assert.doesNotMatch(label, /automatic recovery/);
-  assert.match(label, /A task lease expired/);
-  page.dom.window.close();
+  assert.match(dot(open.document, 1, 'stalled'), /automatic recovery of task 22 failed: .* — needs you/);
+  open.dom.window.close();
 });

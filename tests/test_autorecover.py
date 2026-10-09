@@ -272,10 +272,9 @@ def test_a_browser_denied_request_goes_to_the_human_without_a_launch(aenv, monke
 
 def test_at_most_max_per_task_automatic_recoveries(aenv):
     sid, task, _ = abandon(aenv, started=False)
-    for i in range(autorecover.MAX_PER_TASK):
-        aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
-                                (autorecover.task_key(task, i), json.dumps({"kind": "abandoned", "task_id": task,
-                                 "thread_id": aenv.tid, "state": "recovered"}), "dispatcher", aenv.clock()))
+    # Earlier recoveries of this task, long enough ago that their per-stall records were pruned: the counter remains.
+    aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                            (autorecover.attempts_key(task), json.dumps(autorecover.MAX_PER_TASK), "dispatcher", 0))
     aenv.clock.advance(PAST_GRACE)
     aenv.d.tick()
     [note] = auto_posts(aenv)

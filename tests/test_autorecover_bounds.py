@@ -18,6 +18,9 @@ from test_autorecover import (LEASE, PAST_GRACE, abandon, abandoned_request, aen
 def test_a_dispatched_session_is_abandoned_after_ten_minutes_an_interactive_one_after_a_lease(aenv):
     sid, task, _ = abandon(aenv, started=False)
     aenv.board.conn.execute("UPDATE sessions SET dispatch_run_id='gone-run' WHERE id=?", (sid,))
+    run = {"run_id": "gone-run", "agent": "codex", "thread_id": aenv.tid, "status": "exited", "ended_at": aenv.clock()}
+    aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                            ("dispatch.run.gone-run", json.dumps(run), "dispatcher", aenv.clock()))
     other = aenv.thread("interactive")
     isid = aenv.session("claude")
     itask = aenv.accepted_task(other)
@@ -289,3 +292,73 @@ def test_a_quiet_interactive_owner_within_a_lease_ttl_is_not_abandoned(env, tmp_
     env.board.claim_task(env.p["codex"], new, task)
     with pytest.raises(Conflict, match="30 minutes ago"):
         recovery.transfer_ended_owner(env.board, env.p["codex"], new, ask["id"], "codex", version(env, ask))
+
+
+def test_a_dispatched_session_resumed_interactively_gets_the_full_grace(aenv):
+    sid, task, _ = abandon(aenv, started=False)
+    run = {"run_id": "r1", "agent": "codex", "thread_id": aenv.tid, "status": "exited", "ended_at": aenv.clock()}
+    aenv.board.conn.execute("UPDATE sessions SET dispatch_run_id='r1' WHERE id=?", (sid,))
+    aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                            ("dispatch.run.r1", json.dumps(run), "dispatcher", aenv.clock()))
+    aenv.clock.advance(60)
+    aenv.board.heartbeat(aenv.p["codex"], sid)        # seen after its run ended: the human resumed it
+    session = aenv.board.conn.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+    assert recovery.abandon_grace(aenv.board, session) == LEASE
+    aenv.clock.advance(LEASE + autorecover.GRACE_SECONDS + 60)
+    aenv.d.tick()
+    assert records(aenv) == {}
+
+
+def own_silent_task(env, title):
+    """An agent opens its own thread, claims a task it proposed itself (require_human_accept is off), goes silent."""
+    sid = env.session("codex")
+    tid = env.board.create_thread(env.p["codex"], sid, title, PROJECT)["id"]
+    task = env.board.create_task(env.p["codex"], sid, tid, title="t")["id"]
+    env.board.claim_task(env.p["codex"], sid, task)
+    return tid, task
+
+
+def test_an_agent_cannot_loop_through_its_own_abandoned_tasks_across_threads(aenv):
+    for n in range(6):
+        own_silent_task(aenv, f"cycle {n}")
+        aenv.clock.advance(PAST_GRACE)
+        aenv.d.tick()
+    assert aenv.spawner.calls == [], "nothing the human authorized: no launch"
+    notes = [p for p in aenv.board.snapshot(aenv.p["human"])["needs_you"]]
+    assert len(notes) == 6 and all("neither you nor a standing grant authorized this work" in p["body"] for p in notes)
+
+
+def test_a_human_post_before_the_claim_authorizes_the_abandoned_launch(aenv):
+    sid = aenv.session("codex")
+    tid = aenv.board.create_thread(aenv.p["codex"], sid, "asked by the human", PROJECT)["id"]
+    aenv.post("human", tid, "please take this on", "request", to=["codex"])
+    aenv.clock.advance(1)
+    task = aenv.board.create_task(aenv.p["codex"], sid, tid, title="t")["id"]
+    aenv.board.claim_task(aenv.p["codex"], sid, task)
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    assert len(aenv.spawner.calls) == 1
+
+
+def test_an_automatic_post_does_not_count_as_the_human_asking(aenv):
+    tid, task = own_silent_task(aenv, "auto only")
+    # A marked automatic post from an earlier recovery is on the thread, before the claim.
+    note = aenv.post("human", tid, "automatic", "status")
+    aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                            (autorecover.POST_PREFIX + str(note["id"]), "{}", "dispatcher", aenv.clock()))
+    aenv.board.conn.execute("UPDATE posts SET created_at=? WHERE id=?", (aenv.clock() - 60, note["id"]))
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    assert aenv.spawner.calls == []
+
+
+def test_a_per_agent_daily_budget_across_threads(aenv):
+    aenv.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                            (autorecover.agent_budget_key("codex"), json.dumps([aenv.clock()] * 6), "dispatcher",
+                             aenv.clock()))
+    abandon(aenv)
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    [note] = auto_posts(aenv)
+    assert "daily automatic launch budget for codex (6 per 24 hours across all threads) is spent" in note["body"]
+    assert aenv.spawner.calls == []

@@ -1060,7 +1060,8 @@ The human asked for both to resolve by themselves whenever they recur.
 the pause check and the fence check, before the trigger scan so its post triggers in the same pass):
 - *Abandoned work*: a `working` task whose lease expired while its owner session has not been seen since, for longer
   than the session's grace (`recovery.abandon_grace`): 10 minutes for a dispatcher session (the dispatcher watches
-  its run), a full lease TTL for an interactive one (it may only be quiet). The session must hold no live lease
+  its run), a full lease TTL for an interactive one (it may only be quiet). A dispatcher session seen after its run
+  ended (the human resumed that conversation interactively), or one whose run record is gone, gets the full TTL. The session must hold no live lease
   anywhere; the owner must be an active non-human agent with a runner; the thread must be open. The request names the
   task, the old session and the requests that session still holds.
 - *An unclaimed task*: `accepted`, unowned, prerequisites done, unchanged for 40 minutes (the dashboard's 30-minute
@@ -1081,20 +1082,30 @@ this under the human's board setting auto_recover_stalled_work; it is not a huma
 **Bounds** (after an independent review of the first version):
 - *Recent stalls only.* A stall that began more than 24 hours ago (`MAX_STALL_AGE_SECONDS`: the lease expiry, or the
   unclaimed task's last change) is left to the human, so an upgrade cannot launch every old stall at once. There is
-  no upgrade watermark: stalls a few hours old when the setting arrives are still recovered.
+  no upgrade watermark: stalls a few hours old when the setting arrives are still recovered, so the first passes
+  after an upgrade may send a short burst, bounded by the per-pass and per-agent limits below. We accept that.
 - *Per pass.* At most three recovery requests (`MAX_SENDS_PER_PASS`) and five posts to the human per dispatcher pass;
   the rest wait for the next pass, oldest stall first.
-- *Per agent and thread.* A durable launch budget (`auto_recovery.budget.<agent>.<thread>`: the send times in a
-  rolling 24 hours, written in the post's transaction) of two automatic launches per agent per thread, across both
-  kinds. When it is spent, the stall goes to the human instead. Together with the next rule this stops an agent from
-  getting itself launched over and over (claim and go silent; or create, accept, leave and decline its own tasks).
-- *Who decides.* An unclaimed task launches its creator only when the human accepted the task or an active standing
-  grant covers it. One its own creator accepted (`require_human_accept` is off by default) goes to the human, who
+- *Per agent.* Durable launch budgets (the send times in a rolling 24 hours, written in the post's transaction): two
+  automatic launches per agent per thread (`auto_recovery.budget.<agent>.<thread>`) and six per agent across all
+  threads (`auto_recovery.agent_budget.<agent>`), across both kinds. When either is spent, the stall goes to the human
+  instead. Together with the next rule this stops an agent from getting itself launched over and over (claim and go
+  silent; create, accept, leave and decline its own tasks; or do either on a fresh thread each time).
+- *Who decides.* Only work the human authorized launches anyone. Abandoned work launches its owner only when the task
+  is human- or grant-authorized, or the human identity posted on the thread (an ordinary post, not an automatic one)
+  at or before the task's current claim: an agent cannot write such a post, so it cannot open a thread, claim a task
+  it proposed itself, go silent and be launched (a review probed six such cycles against the first version: six
+  launches, nothing in Needs you). An unclaimed task launches its creator only when the human accepted the task or an
+  active standing grant covers it. One its own creator accepted (`require_human_accept` is off by default) goes to the human, who
   keeps Unstick. A `blocked` task, and any stall on a thread that already waits on the human (a `Board.NEEDS_YOU`
-  post, or a shared issue awaiting the human's decision), also goes to the human, never to a launch.
+  post, or a shared issue awaiting the human's decision), also goes to the human, never to a launch. So while one
+  Needs you item is open on a thread, every new stall there waits for the human too; that is deliberate (the human
+  is already needed there) and bounded.
 - *Once only.* `auto_recovery.task.<task>.<lease_expires_at>` (abandoned work: one per lease) and
   `auto_recovery.unclaimed.<task>` (one per task) are written with a plain INSERT in the post's transaction, so a
-  restarted dispatcher never repeats one; at most three automatic recoveries per task over its lifetime.
+  restarted dispatcher never repeats one. At most three automatic recoveries per task until it is finished or
+  declined: a per-task counter (`auto_recovery.attempts.<task>`) outlives the per-stall records, which are pruned
+  after a week.
 - *In the transaction.* The loop's fence token, the pause flag, the setting, the once-only keys, the launch budget and
   a human Unstick of the same stall are all checked again inside the post's write transaction. A failed check rolls
   the post back and revokes the rule. No automatic request is sent for a stall the human already unstuck.
@@ -1102,13 +1113,14 @@ this under the human's board setting auto_recover_stalled_work; it is not a huma
   (`Board.NOT_AUTOMATIC` in `_agent_posts_since_human`). Nothing is sent on a thread at its cap.
 - *Robust.* Each candidate row is checked in its own try/except, so one bad row is logged and skipped. Records are
   read by primary-key range, not `LIKE`. At most hourly, records of finished, declined or deleted tasks and any older
-  than 7 days are pruned, as are spent budgets and replaced-lease evidence that is used up (the old session holds no
+  than 7 days are pruned, as are spent budgets, attempt counters of finished, declined or deleted tasks, and
+  replaced-lease evidence that is used up (the old session holds no
   unfinished request) or older than 7 days. Post markers stay (they keep the cap rule true).
 
 **Taking over the work.** `board_recover_request_owner` (`recovery.transfer_ended_owner`) now also accepts an old
 owner that *abandoned* its work (`recovery.abandonment`): a different session of the same agent that holds no live
-lease, whose lease on a task in the request's thread expired at least its grace ago (10 minutes for a dispatcher
-session, a lease TTL for an interactive one), and which has not been seen since that expiry. Only then may a
+lease, whose lease on a task in the request's thread expired at least its grace ago (`recovery.abandon_grace`, as
+above), and which has not been seen since that expiry. Only then may a
 `started` request be taken over (it is queued again for the new session, which must mark it `started` itself, so
 browser and tool preflight still run). Queued and blocked requests work as before, from an ended dispatcher run too.
 Active owners (seen since, or holding any live lease) and unknown ones (no lease evidence) stay blocked, as do sticky
@@ -1151,7 +1163,7 @@ note: the agent's other accepted, unowned tasks in that thread, to claim or decl
 if you will claim it; when you finish, decline your own leftovers the finished work covered.
 
 **Residual risks.** Each automatic recovery can spend one launch (the agent's tokens): bounded by two per agent per
-thread per day, three per pass, one per stall and three per task, plus the dispatcher's one run per agent,
+thread and six per agent per day, three per pass, one per stall and three per task, plus the dispatcher's one run per agent,
 `max_concurrent` and timeout; the human can switch the setting off, pause the board, or revoke the rule. Abandonment
 is inferred from `last_seen`: an interactive session that is alive but makes no board call for its whole lease plus
 another lease TTL looks abandoned; if it comes back it finds its lease and requests taken (never a dirty checkout),
