@@ -33,7 +33,8 @@ The menu holds:
 - **Running agents**: each run the dispatcher started, with its thread and elapsed time;
 - **Approvals**: each active dispatcher workstream with its remaining budget (`7/10 left`);
 - **Live sessions**: agent sessions seen in the last 10 minutes, per agent;
-- **Open Dashboard**, **Open Settings** (`http://127.0.0.1:8787/#settings`), **Pause Board…** (asks first) or
+- **Open Dashboard**, **Copy board token** (below; only while the menu is signed in), **Open Settings**
+  (`http://127.0.0.1:8787/#settings`), **Pause Board…** (asks first) or
   **Unpause Board**, **Stop Dispatcher…** (asks first; the same API as the Settings page's stop), **Refresh** (⌘R),
   **Launch at Login**, and **Quit** (⌘Q).
 
@@ -68,7 +69,8 @@ The human token:
 
 - is read from `~/.config/agent-comms/human.token`, and only if that is a regular file (not a symlink) owned by
   you with mode 600 or stricter, the same checks as the Python CLI's token loader. Otherwise the menu says why;
-- stays in memory. It is never logged, displayed, written anywhere or put in a URL;
+- stays in memory. It is never logged, displayed, written anywhere or put in a URL. The one exception is
+  **Copy board token**, which puts it on the clipboard only when you choose it (below);
 - is sent only as an `Authorization: Bearer` header to `http://127.0.0.1:<port>`, with redirects, proxies,
   cookies and caching turned off.
 
@@ -78,6 +80,23 @@ header and `{"next": "/"}`, `"/#settings"` or `"/#post-<id>"`), and opens the `h
 URL it gets back with `NSWorkspace`. The app opens a returned URL only if it is exactly a `/login/<code>` path on
 this board. A server without login links answers 404, and the app then opens the plain page
 (`http://127.0.0.1:<port>/#post-<id>` and so on), where the dashboard's own browser sign-in applies.
+
+**Copy board token** is for a browser that is not signed in and that you did not open from the menu (for
+example an embedded browser pane): its sign-in screen offers **Or paste a token**. The item appears only when the
+token file passed the checks above and the board accepted the token (the menu shows the board's status). It:
+
+- copies the token as plain text marked `org.nspasteboard.ConcealedType` and `org.nspasteboard.TransientType`, in
+  one write, so clipboard managers that honor these markers neither show nor keep it;
+- keeps it on this Mac: Universal Clipboard does not offer it to your other devices;
+- clears the clipboard after 60 seconds, or when you quit the app, but only if the clipboard still holds that copy
+  (its change count is unchanged). Anything you copy afterwards is left alone. If another app wrote to the
+  clipboard at the same moment as the copy, the menu says the token will not be cleared automatically;
+- shows "Board token copied — clears from the clipboard in 60 s" in the menu, never the token. If the token
+  cannot be loaded, nothing is copied and the menu says why. If the clipboard refuses the write, the menu says
+  "Could not copy the board token" (the clipboard's previous contents are gone by then).
+
+**Open Dashboard** (or `board dashboard` in a terminal) is still the better way to sign in: it never puts the token
+anywhere but a request header.
 
 ## Build
 
@@ -94,7 +113,8 @@ open build/AgentComms.app
 
 ```bash
 swift build          # debug build
-swift test           # decoding, the token-file check, request and URL building, login-link fallback, submenu actions
+swift test           # decoding, the token-file check, request and URL building, login-link fallback, submenu actions,
+                     # the token copy (markers, clear only when unchanged, no copy without a token, no leaks)
 swift run            # runs outside a bundle: works, but Launch at Login is unavailable
 ```
 

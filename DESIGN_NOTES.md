@@ -483,6 +483,49 @@ check and read. The token stays in memory. It is sent only as an `Authorization:
 string the menu shows is rebuilt from ids and re-validated names. "Start Board
 Server" spawns `uv run --project <repo> board serve --port <port>` through `Process` with an explicit argv, no
 shell, output to a mode-600 log under the repo's `data/`, and an environment stripped of token-like names.
+
+**Copy board token (2026-10-08).** The human sometimes uses a browser that is not signed in and was not opened
+from the menu (an embedded browser pane), and its sign-in screen offers "Or paste a token". Hunting for
+`~/.config/agent-comms/human.token` each time was slow, so the signed-in menu has **Copy board token** next to
+Open Dashboard. It is shown only while the token file has passed the loader's checks and the board accepted the
+token (the `.online` phase). The clipboard is a place other programs read, so the copy is guarded:
+- *Concealed and transient.* The token goes on the general pasteboard as one item (a single `writeObjects`, so a
+  poller never sees the string without its markers) holding the string plus `org.nspasteboard.ConcealedType` and
+  `org.nspasteboard.TransientType` (the nspasteboard.org convention). Clipboard managers that honor them neither
+  show nor record it.
+- *This Mac only.* The write starts with `prepareForNewContents(with: .currentHostOnly)` (macOS 10.12+; the
+  package targets 13), so Universal Clipboard does not offer the token to the human's other devices, where the
+  60 s clear could not reach it.
+- *Auto-cleared, never someone else's copy.* `prepareForNewContents` returns the new `changeCount`; writing to
+  contents we prepared leaves it unchanged. If it differs right after the write, another app wrote in between, so
+  the app cannot tell that app's contents from ours: it reports "Board token copied, but another app changed the
+  clipboard at the same moment, so it will not be cleared automatically" and schedules no clear. Otherwise, after
+  60 seconds, or when the app quits first (synchronously in the `willTerminate` observer), it clears the pasteboard
+  only if `changeCount` still equals that value. If the human copied anything since, it is left alone. A second
+  copy takes over the clear, so the first copy's timer does nothing.
+- *A failed write.* The prepare has already emptied the clipboard, so the human's previous contents are lost.
+  Snapshotting and restoring arbitrary pasteboard items (lazy providers, many types) is not worth it for a write
+  that should not fail. The app clears anything half-written and says "Could not copy the board token: the
+  clipboard refused the write, and its previous contents were cleared", never claiming success.
+- *Never shown.* The token is read through the existing loader at click time and held nowhere in the copier;
+  `BearerToken` now also has an empty mirror, so `dump` cannot reveal it. The menu shows only "Board token copied
+  — clears from the clipboard in 60 s", or why nothing was copied. No notification and no new permission.
+- *Tests.* The logic is `TokenCopier` in AgentCommsKit behind a `TokenPasteboard` protocol, tested with a fake
+  pasteboard and a manual scheduler (markers written; current-host-only requested; clear only when unchanged; no
+  clear scheduled after an interleaved write; an honest failure after a refused write; nothing written or
+  scheduled when the token cannot be loaded; the token in no description, reflection or dump), and the real
+  `SystemPasteboard` adapter against a private named pasteboard, never the general one. BoardModel's two hooks go
+  through Kit seams that are tested too: `TokenCopier.isOffered(signedIn:tokenLoaded:)` behind `canCopyToken`,
+  and `clearWhenPosted(_:center:)` behind the `willTerminate` clear (tested with a private `NotificationCenter`).
+
+What the paste does on the other side: the dashboard swaps a pasted human token for a cookie session at once
+(`POST /api/login-links`, then it follows the one-time `/login/<code>` link; "Dashboard sign-in" below) and never
+stores the token, in `localStorage` or anywhere else. The pasted value lives in the password field only until the
+redirect. Residual risk: while the token is on the clipboard (at most 60 s), any process running as the user can
+read it, and clipboard tools that ignore the markers may record it. Such a process could read the token file
+anyway (objection 1). Universal Clipboard is addressed by `.currentHostOnly` (above). `board dashboard` and the menu's Open Dashboard one-time links remain the preferred sign-in,
+because the token never leaves a request header; Copy board token is the fallback for a browser neither can open.
+
 ## Dashboard sign-in (2026-10-07)
 
 The human had to find and paste the human token whenever the dashboard asked. `board dashboard` put the token in

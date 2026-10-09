@@ -29,6 +29,8 @@ final class BoardModel: ObservableObject {
     private var refreshing = false
     private var pollTask: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
+    private let tokenCopier = TokenCopier(pasteboard: SystemPasteboard())
+    private var tokenCopiedMessage: String?             // the message "Copy board token" set, until its clear runs
 
     static let pollSeconds: UInt64 = 10
 
@@ -39,6 +41,8 @@ final class BoardModel: ObservableObject {
         tokenPath = TokenFile.path()
         launchAtLogin = loginItemAvailable && SMAppService.mainApp.status == .enabled
         observeMenu()
+        // Quitting before the 60 s clear: clear now, if the clipboard still holds the copied token.
+        observers.append(tokenCopier.clearWhenPosted(NSApplication.willTerminateNotification))
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let model = self else { return }
@@ -144,6 +148,31 @@ final class BoardModel: ObservableObject {
     func openDashboard() { open(.home) }
 
     func openSettings() { open(.settings) }
+
+    /// "Copy board token" is offered only in the signed-in menu: the token file passed the safe loader and the
+    /// board accepted the token.
+    var canCopyToken: Bool {
+        var signedIn = false
+        if case .online = phase { signedIn = true }
+        return TokenCopier.isOffered(signedIn: signedIn, tokenLoaded: token != nil)
+    }
+
+    /// Copies the human token for the dashboard's "Or paste a token" sign-in: concealed and transient, cleared
+    /// after 60 s if the clipboard still holds it. Only the non-secret result is shown.
+    func copyToken() {
+        let result = tokenCopier.copy(load: { try self.loadToken() }) { [weak self] _ in
+            guard let self, let shown = self.tokenCopiedMessage else { return }
+            // Whether it was cleared or the human copied something else since, "clears in 60 s" is now stale.
+            if self.message == shown, !self.tokenCopier.hasPendingClear {
+                self.message = nil
+                self.tokenCopiedMessage = nil
+            }
+        }
+        message = result.description
+        if case .copied = result {
+            tokenCopiedMessage = message
+        }
+    }
 
     /// Opens a dashboard page signed in, through a one-time login link the server mints (POST /api/login-links,
     /// token in the header). The link, not the token, goes in the URL. A server without login links (404) gets
