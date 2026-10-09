@@ -3,6 +3,7 @@ import json
 import pytest
 from agent_comms import requests
 from agent_comms.core import Conflict, Forbidden, Invalid
+from conftest import ASK
 
 
 def setup(e):
@@ -169,7 +170,7 @@ def test_later_unrelated_answer_completion_does_not_complete_superseded_work(env
     from agent_comms import issues,pickup
     tid=env.thread(); source=env.post('human',tid,'Original work','request',to=['codex'])
     reply(env,tid,source,disposition='superseded')
-    question=env.post('codex',tid,'Approve separate work?',type='question',needs_response=True,to=['human'])
+    question=env.post('codex',tid,'Approve separate work?',type='question',needs_response=True,to=['human'],decision_question=ASK)
     answer=env.post('human',tid,'Approved separate work',answer_to=[question['id']],to=['codex'])
     evidence=env.post('codex',tid,'Separate work verified')
     requests.progress(env.board,env.p['codex'],env.sid['codex'],answer['id'],'codex','finished',

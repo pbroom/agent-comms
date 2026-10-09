@@ -3,6 +3,16 @@ import pytest
 from agent_comms import issues, db
 from agent_comms.core import Forbidden, Invalid, LimitExceeded, Paused
 
+from conftest import ASK, legacy_plain
+
+
+def plain_ask(env, who, thread_id):
+    """A plain needs-response status to the human, as stored before every asking post had to carry a
+    decision_question (live boards still hold them; an issue covers such a post)."""
+    post = env.post(who, thread_id, "hi", "question", needs_response=True, decision_question=ASK)
+    legacy_plain(env, post["id"], "status")
+    return env.board.get_post(env.p[who], post["id"])
+
 
 def create(env, **kw):
     return issues.create_issue(
@@ -18,11 +28,11 @@ def create(env, **kw):
 
 def test_collaborative_issue_and_scoped_decision(env):
     first = env.thread()
-    post = env.post("codex", first, needs_response=True)
+    post = plain_ask(env, "codex", first)
     issue = create(env, thread_id=first, post_id=post["id"])
     iid = issue["id"]
     second = env.thread("other")
-    second_post = env.post("claude", second, needs_response=True)
+    second_post = plain_ask(env, "claude", second)
     issues.link_issue(env.board, env.p["claude"], env.sid["claude"], iid, second, second_post["id"])
     issues.comment_issue(
         env.board, env.p["claude"], env.sid["claude"], iid, "Observed same permission failure", "evidence"
@@ -93,7 +103,7 @@ def test_caps_shared_with_posts_and_issue_discussion(env):
 
 def test_additive_migration_keeps_posts_and_link_idempotence(env):
     tid = env.thread()
-    post = env.post("codex", tid, needs_response=True)
+    post = plain_ask(env, "codex", tid)
     env.board.conn.execute("PRAGMA user_version=3")
     db.init_schema(env.board.conn)
     assert env.board.conn.execute("SELECT body FROM posts WHERE id=?", (post["id"],)).fetchone()[0] == "hi"
@@ -106,12 +116,12 @@ def test_additive_migration_keeps_posts_and_link_idempotence(env):
 
 def test_linking_preserves_attention_and_updates_include_decision(env):
     first = env.thread()
-    post = env.post("codex", first, needs_response=True)
+    post = plain_ask(env, "codex", first)
     issue = create(env, thread_id=first, post_id=post["id"], needs_human=False)
     assert issue["needs_human"]
     issues.decide_issue(env.board, env.p["human"], env.sid["human"], issue["id"], "Answer", [first])
     second = env.thread()
-    post2 = env.post("claude", second, needs_response=True)
+    post2 = plain_ask(env, "claude", second)
     issue = issues.link_issue(env.board, env.p["claude"], env.sid["claude"], issue["id"], second, post2["id"])
     assert issue["needs_human"]
     assert issue["decisions"][0]["thread_ids"] == [first]
@@ -156,7 +166,7 @@ def test_source_attention_uses_exact_existing_rules(env):
     issue = create(env, thread_id=thread, post_id=decision["id"], needs_human=False)
     assert issue["needs_human"]
     thread = env.thread()
-    post = env.post("codex", thread, needs_response=True)
+    post = plain_ask(env, "codex", thread)
     env.post("human", thread, "Answered", answer_to=[post['id']])
     issue = create(env, thread_id=thread, post_id=post["id"], needs_human=False)
     assert not issue["needs_human"]

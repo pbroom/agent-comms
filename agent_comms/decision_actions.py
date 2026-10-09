@@ -3,18 +3,47 @@ from __future__ import annotations
 
 import json
 from . import requests, workstreams
+from .config import NAME_RE
 from .core import Conflict, Forbidden, Invalid
+
+
+# Task and thread actions: exact fields, no request version (the task's or thread's current state is checked instead).
+TASK_ACTION_FIELDS = {'unstick': {'type', 'thread_id', 'agents'},
+                      'decline_task': {'type', 'task_id', 'expected_status'},
+                      'release_task': {'type', 'task_id', 'expected_owner_session'}}
+DECLINABLE = ('proposed', 'accepted', 'working', 'blocked')
+ACTION_TYPES = 'close, route, repost, unstick, decline_task or release_task'
+
+
+def _validate_task_action(value):
+    kind = value['type']
+    if set(value) != TASK_ACTION_FIELDS[kind]:
+        raise Invalid(f'action must be {ACTION_TYPES} with its exact fields')
+    for field in ('thread_id', 'task_id', 'expected_owner_session'):
+        if field in value and (type(value[field]) is not int or value[field] <= 0):
+            raise Invalid(f'{field} must be a positive integer')
+    if kind == 'unstick':
+        agents = value['agents']
+        if (not isinstance(agents, list) or not 1 <= len(agents) <= 20
+                or any(not isinstance(a, str) or not NAME_RE.match(a) for a in agents)
+                or len(set(agents)) != len(agents)):
+            raise Invalid('unstick requires 1 to 20 distinct agent names')
+    if kind == 'decline_task' and value['expected_status'] not in DECLINABLE:
+        raise Invalid(f"expected_status must be one of {', '.join(DECLINABLE)}")
+    return dict(value)
 
 
 def validate(value):
     if not isinstance(value, dict):
         raise Invalid('option action must be an object')
     kind = value.get('type')
+    if kind in TASK_ACTION_FIELDS:
+        return _validate_task_action(value)
     fields = {'type', 'post_id', 'recipient', 'expected_version'}
     extras = {'close': {'evidence_post_ids'}, 'route': {'target_session_id', 'required_capabilities'},
               'repost': {'target_thread_id'}}
     if kind not in extras or set(value) != fields | extras[kind]:
-        raise Invalid('action must be close, route, or repost with its exact fields')
+        raise Invalid(f'action must be {ACTION_TYPES} with its exact fields')
     for field in ('post_id', 'target_session_id', 'target_thread_id'):
         if field in value and (type(value[field]) is not int or value[field] <= 0):
             raise Invalid(f'{field} must be a positive integer')
@@ -42,6 +71,10 @@ def execute(board, p, session_id, question, action, *, _authorization_decision_i
     if board.is_paused():
         raise Conflict('board is paused')
     action = validate(action)
+    if action['type'] in TASK_ACTION_FIELDS:
+        if _authorization_decision_id is not None:
+            raise Forbidden('only the human can select a task or thread action')
+        return _execute_task_action(board, p, session_id, question, action)
     source, row = requests._context(board, p, session_id, action['post_id'], action['recipient'])
     if source['thread_id'] != question['thread_id']:
         raise Forbidden('action source must belong to the question thread')
@@ -95,6 +128,53 @@ def execute(board, p, session_id, question, action, *, _authorization_decision_i
     board.conn.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
         ('request.successor.' + str(target_post['id']), json.dumps(link), p.name, board.now()))
     return {'reposted_post_id': target_post['id'], 'target_thread_id': target['id']}
+
+
+def _execute_task_action(board, p, session_id, question, action):
+    """unstick / decline_task / release_task, chosen by the human, inside the answer's transaction. The target must be
+    in the question's own thread and still be in the state the question was asked about (Conflict otherwise)."""
+    board._require_human(p, 'execute a decision action')
+    thread_id = question['thread_id']
+    if board._thread_row(thread_id)['status'] != 'open':
+        raise Conflict('the question thread is closed')
+    if action['type'] == 'unstick':
+        from . import unstick
+        if action['thread_id'] != thread_id:
+            raise Forbidden('unstick must target the question thread')
+        # The dashboard's Unstick (same guardrails, cooldown and one-shot rule), only while one of the agents the
+        # question named is still among those the thread waits on.
+        result = unstick.unstick(board, p, thread_id, None, require_agents=action['agents'], _in_transaction=True)
+        return {'unstick_post_id': result['post_id'], 'agents': result['agents'], 'rule_id': result['rule_id']}
+    from . import workstreams
+    task = board.conn.execute('SELECT * FROM tasks WHERE id=?', (action['task_id'],)).fetchone()
+    if task is None or task['thread_id'] != thread_id:
+        raise Forbidden('the task must belong to the question thread')
+    if workstreams.get_for_task(board, task['id']) is not None:
+        raise Forbidden('managed continuation tasks need their dedicated workflow')
+    now = board.now()
+    live = task['owner_agent'] is not None and task['lease_expires_at'] is not None and task['lease_expires_at'] > now
+    if action['type'] == 'decline_task':
+        if task['status'] != action['expected_status']:
+            raise Conflict(f"task {task['id']} is {task['status']} now, not {action['expected_status']}; "
+                           'reload before choosing')
+        if live:
+            raise Conflict(f"task {task['id']} is held under an active lease by {task['owner_agent']} now")
+        board.conn.execute("""UPDATE tasks SET status='declined', owner_agent=NULL, owner_session=NULL,
+                              lease_expires_at=NULL, updated_at=? WHERE id=?""", (now, task['id']))
+        board._event(board.conn, task['id'], 'transition', task['status'], 'declined', p, session_id,
+                     f"declined by the human from decision #{question['id']}")
+        from . import issues
+        issues.reconcile_completed(board, p, session_id, thread_id)
+        return {'task_id': task['id'], 'status': 'declined'}
+    if task['owner_session'] != action['expected_owner_session'] or task['status'] not in ('working', 'blocked'):
+        raise Conflict(f"task {task['id']} changed hands or status since the question; reload before choosing")
+    if live:
+        raise Conflict(f"task {task['id']} is held under an active lease by {task['owner_agent']} again")
+    board.conn.execute("""UPDATE tasks SET status='accepted', owner_agent=NULL, owner_session=NULL,
+                          lease_expires_at=NULL, updated_at=? WHERE id=?""", (now, task['id']))
+    board._event(board.conn, task['id'], 'release', task['status'], 'accepted', p, session_id,
+                 f"released by the human from decision #{question['id']}")
+    return {'task_id': task['id'], 'status': 'accepted'}
 
 
 def repost(board, p, session_id, post_id, recipient, expected_version, target_thread_id):

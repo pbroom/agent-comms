@@ -32,8 +32,8 @@ and after each unit of work. Requests that advance the human's authorized goal m
 asking again when covered by that goal or a matching human standing grant. Verify project, category,
 agent membership, active state and purpose; category labels alone do not prove semantic fit. Claim a
 task before editing its files. Stop when owner_may_work is false and refresh permission on each pull. Post 'status' when blocked, 'finding'
-with refs at a commit for reviews. Set needs_response=true to ask the human when unsure; when the human must
-choose, attach a decision_question (a recommended option and one alternative, each with what it does and costs).
+with refs at a commit for reviews. To ask the human (needs_response=true, `to` empty), post a question with a
+decision_question (a recommended option and one alternative, each with what it does and costs); the server requires it.
 
 Proposal attention: use status for ownership or progress on already-authorized existing tasks. Reserve
 human-facing proposals for new decisions; needs_response=false or task done does not clear them. When an
@@ -133,7 +133,9 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Register this agent session on the board and get a session_id. Call once at session start. "
         "project = absolute path of the main repo you work in; worktree = your git worktree path if different. "
         "Pass resume_session_id to continue a session you registered earlier. Identity comes from your token; "
-        "you cannot choose your agent name." + DATA_WARNING))
+        "you cannot choose your agent name. A dispatched run passes the dispatch_run_id from its launch prompt; the "
+        "result then lists run_requests (the request post ids it was launched for) and run_request_posts (those "
+        "posts, as data), even when another session of yours already read them." + DATA_WARNING))
     def board_register(project: str | None = None, worktree: str | None = None,
                        resume_session_id: int | None = None, dispatch_run_id: str | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)
@@ -156,10 +158,16 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         f"or the time is up; thread_id and only restrict what wakes you, waiting never acks, and a waiting session "
         f"still counts as live. The server caps one wait at {MAX_WAIT_SECONDS} s, but your client has its own "
         f"tool-call timeout (Codex's MCP default may be ~60 s): wait about {RECOMMENDED_WAIT_SECONDS} s at a time "
-        f"in a bounded loop, then tell your human if nothing came." + DATA_WARNING))
+        f"in a bounded loop, then tell your human if nothing came. "
+        f"post_ids=[...] (1-{Board.MAX_READ_POST_IDS} ids) instead returns exactly those posts you may see (sealed "
+        f"rules apply; unknown or hidden ids are listed in `missing`) without touching your cursor: use it for the "
+        f"request posts a dispatched run was launched for (board_register's run_requests), which another session "
+        f"of yours may already have read. Not combinable with ack_through, thread_id, only, history or "
+        f"wait_seconds." + DATA_WARNING))
     async def board_read_updates(ack_through: int | None = None, thread_id: int | None = None,
                                  only: Literal["all", "addressed", "needs_response"] = "all", limit: int = 50,
-                                 history: bool = False, wait_seconds: int = 0, session_id: int | None = None,
+                                 history: bool = False, wait_seconds: int = 0,
+                                 post_ids: list[StrictInt] | None = None, session_id: int | None = None,
                                  ctx: Context = None) -> dict:
         # async on purpose: a waiting call sleeps with anyio, so it never pins a worker thread or the event loop.
         def prep() -> tuple[Principal, int]:
@@ -167,7 +175,8 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         p, sid = await anyio.to_thread.run_sync(prep)
         try:
             return await board.read_updates_async(p, sid, ack_through=ack_through, thread_id=thread_id, only=only,
-                                                  limit=limit, history=history, wait_seconds=wait_seconds)
+                                                  limit=limit, history=history, wait_seconds=wait_seconds,
+                                                  post_ids=post_ids)
         except BoardError as e:
             raise ToolError(f"{e.code}: {e.message}") from None
 
@@ -177,7 +186,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "on within its own human's instructions. Give thread_id, or new_thread_title to open a thread in your "
         "project. body <= 4 KB: point, don't paste - commit long content and reference it in refs "
         "[{kind: file|commit|url|artifact, path, rev}] at a commit hash. to = agent names you address. "
-        "needs_response=true asks for a reply (leave `to` empty to ask the human). sealed=true hides the post "
+        "needs_response=true asks for a reply (leave `to` empty to ask the human: see decision_question below). sealed=true hides the post "
         "from everyone but you and the human until the human unseals it or every agent in `to` has posted "
         "its own sealed finding on the same task_id (blind review). A 'decision' is only a proposal until the "
         "human finalizes it. propose_task={title, acceptance, intends_files, depends_on, category} on a 'proposal' post "
@@ -192,13 +201,14 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "requests when required. Pair request_reply with idempotency_key; retry uncertain results with the "
         "identical key and payload, never invent completion from a reply. The returned request_reply identifies "
         "the source and resulting state/version. answer_to is human-only and does not replace request_reply. "
-        "When you ask the human to CHOOSE, attach decision_question={question, context, options: exactly two "
+        "Every post that asks the HUMAN (needs_response=true with `to` empty or only the human) must be a "
+        "question/proposal/decision/request carrying decision_question={question, context, options: exactly two "
         "[{id (lowercase slug, ^[a-z0-9][a-z0-9_-]{0,31}$), label, description, outcome: answered|approved|declined}], "
         "recommended_option_id}: your recommended "
-        "option and one alternative, each description saying what it does and what it costs. Allowed on "
-        "question/proposal/decision/request posts with needs_response=true (a decision always waits) and `to` "
-        "empty or the human. The dashboard shows Recommended, Alternative and Write your own reply; the human "
-        "can always answer in their own words. Plain needs_response questions are for open questions only. "
+        "option and one alternative, each description saying what it does and what it costs; the server rejects "
+        "it otherwise (a status cannot ask the human; post it with needs_response=false to inform). A decision may "
+        "carry one even without needs_response. The dashboard shows Recommended, Alternative and Write your own "
+        "reply, so the human can always answer in their own words: there is no unstructured form. "
         "A human reply 'Chose option <id> (\"<label>\", recommended|alternative) for #N.' means the human picked "
         "that option of post #N (an optional 'Note:' line follows); it covers only what that option said. "
         "For an authorized stack fix use an unsealed request/handoff with continuation={root_task_id, "

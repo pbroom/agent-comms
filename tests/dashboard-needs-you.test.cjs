@@ -439,6 +439,43 @@ test('mechanical close exposes exact target, version and evidence before executi
   } finally { dom.window.close(); }
 });
 
+test('an automatic-recovery escalation renders as a question with one-click task actions', async () => {
+  const q = { question: 'Task 44 is accepted but nobody claimed it, and automatic recovery did not take. Decline it, or ask codex to claim it?',
+    context: 'Thread #1, task 44 (accepted), created by codex.',
+    options: [{ id: 'decline', label: 'Decline task 44', description: 'Marks task 44 declined.', outcome: 'approved',
+                action: { type: 'decline_task', task_id: 44, expected_status: 'accepted' } },
+              { id: 'ask-creator', label: 'Ask codex to claim it (Unstick)', description: 'Runs Unstick.', outcome: 'approved',
+                action: { type: 'unstick', thread_id: 1, agents: ['codex'] } }],
+    recommended_option_id: 'decline' };
+  const p = post(110, 1, { agent: 'human', type: 'question', needs_response: true, automatic: true,
+    body: 'Automatic recovery did not take ' + INJECTION, decision_question: q });
+  const release = post(111, 1, { agent: 'human', type: 'question', needs_response: true, automatic: true,
+    decision_question: { ...q, options: [q.options[1], { id: 'release', label: 'Release task 45', description: 'Clears it.',
+      outcome: 'approved', action: { type: 'release_task', task_id: 45, expected_owner_session: 70 } }],
+      recommended_option_id: 'ask-creator' } });
+  const { dom, document, calls, win, prompts } = await setup({ threads: [thread(1, [p, release])], needsYou: [release, p] });
+  try {
+    await pick(document, 1);
+    const node = document.querySelector('#needs-you [data-post="110"]');
+    assert.match(node.querySelector('.where').textContent, /post #110 by the dispatcher \(automatic, not your click\)/);
+    assert.ok([...node.querySelectorAll('.chip')].some(c => c.textContent === 'automatic'));
+    assert.deepEqual(cards(document, 110), ['Decline task 44', 'Ask codex to claim it (Unstick)', 'Write your own reply']);
+    assert.deepEqual(badges(document, 110), ['Recommended', 'Alternative', '']);
+    assert.match(node.textContent, /Declines task 44 if it is still accepted/);
+    assert.match(node.textContent, /Runs Unstick on thread #1 \(asks codex\)/);
+    assert.match(document.querySelector('#needs-you [data-post="111"]').textContent, /Releases task 45 from session #70/);
+    card(document, 110, 'option:ask-creator').click();
+    assert.equal(primary(document, 110).textContent, 'Choose and unstick');
+    card(document, 110, 'option:decline').click();
+    assert.equal(primary(document, 110).textContent, 'Choose and decline');
+    assert.equal(node.querySelector('.ny-assign').hidden, true, 'a task action assigns no agent');
+    primary(document, 110).click(); await settle();
+    assert.deepEqual(calls.find(c => c.u.endsWith('/110/resolve')).body, { action: 'choose', option_id: 'decline' });
+    assert.equal(win.pwned, undefined);
+    assert.deepEqual(prompts, []);
+  } finally { dom.window.close(); }
+});
+
 test('assign approved work sends explicit selected implementer, never parses notes', async () => {
   const p = post(11,1,{type:'question',needs_response:true,decision_question:QUESTION()});
   const { dom, win, document, calls } = await setup({threads:[thread(1,[p])],needsYou:[p]});

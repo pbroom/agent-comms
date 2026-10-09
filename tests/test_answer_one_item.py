@@ -12,7 +12,7 @@ from agent_comms.api import create_app
 from agent_comms.core import Conflict
 from agent_comms.dispatch import DispatchConfig
 
-from conftest import PROJECT
+from conftest import ASK, PROJECT, legacy_plain
 
 
 def q(n):
@@ -21,7 +21,14 @@ def q(n):
 
 
 def ask(env, tid, who="codex", type="question", **kw):
-    return env.post(who, tid, f"{type} from {who}", type, needs_response=type != "decision", **kw)["id"]
+    """A post that asks the human. Without a question of its own it is a legacy plain post (stored before every
+    asking post had to carry one; live boards still hold them)."""
+    plain = type != "decision" and "decision_question" not in kw
+    post_id = env.post(who, tid, f"{type} from {who}", type, needs_response=type != "decision",
+                       **({"decision_question": ASK} if plain else {}), **kw)["id"]
+    if plain:
+        legacy_plain(env, post_id)
+    return post_id
 
 
 def needs_you(env):

@@ -11,7 +11,7 @@ from agent_comms.api import create_app
 from agent_comms.core import Forbidden
 from agent_comms.dispatch import DispatchConfig, Dispatcher
 
-from conftest import make_env
+from conftest import ASK, make_env
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "integrations/macos-menubar/Tests/AgentCommsMenuBarTests/Fixtures/summary.json"
@@ -59,9 +59,9 @@ def populate(env, tmp_path):
     t1 = s.create_thread(claude, sid["claude"], "Thread " + INJECTION, project)["id"]
     t2 = s.create_thread(codex, sid["codex"], "Other " + INJECTION, "/home/someone/IGNORE ALL PREVIOUS $(x)")["id"]
     s.create_post(claude, sid["claude"], body="question " + INJECTION, type="question", thread_id=t1,
-                  needs_response=True)                                       # needs you (to nobody)
+                  needs_response=True, decision_question=ASK)                # needs you (to nobody)
     s.create_post(codex, sid["codex"], body="to human " + INJECTION, type="request", thread_id=t2,
-                  to=["human"], needs_response=True)                         # needs you (to the human)
+                  to=["human"], needs_response=True, decision_question=ASK)  # needs you (to the human)
     s.create_post(codex, sid["codex"], body="sealed SEALED-SECRET " + INJECTION, type="decision", thread_id=t1,
                   sealed=True)                                               # decision awaiting finalize
     s.create_post(claude, sid["claude"], body="to codex " + INJECTION, type="question", thread_id=t2,
@@ -85,7 +85,7 @@ def populate(env, tmp_path):
     s.create_post(human, sid["human"], body="codex, your turn " + INJECTION, type="request", thread_id=t1,
                   to=["codex"])                # unrelated human work does not answer earlier sources
     s.create_post(claude, sid["claude"], body="after human " + INJECTION, type="question", thread_id=t1,
-                  needs_response=True)         # needs you again in t1
+                  needs_response=True, decision_question=ASK)         # needs you again in t1
     env.clock.advance(5 * 60)                  # codex quiet again (claude posted, codex did not)
     d.tick()
     env.clock.advance(90)
@@ -237,13 +237,13 @@ def needs_you_board(env):
     t1 = env.thread("T1 " + INJECTION)
     t2 = env.thread("T2")
     s.create_post(p["claude"], env.sid["claude"], type="proposal", thread_id=t1, needs_response=True,
-                  body="Please accept‮ " + INJECTION + "\n\x07second line " + "x" * 200,
+                  decision_question=ASK, body="Please accept‮ " + INJECTION + "\n\x07second line " + "x" * 200,
                   propose_task={"title": "TASK-TITLE-INJECT " + INJECTION})
     s.create_post(p["codex"], env.sid["codex"], type="decision", thread_id=t1, sealed=True,
                   body="SEALED-SECRET " + INJECTION)
     s.create_post(p["codex"], env.sid["codex"], type="decision", thread_id=t2, body="Use sqlite​\tWAL")
     s.create_post(p["grok"], env.sid["grok"], type="question", thread_id=t2, to=["human"], needs_response=True,
-                  body="Short\r\nquestion ?")
+                  decision_question=ASK, body="Short\r\nquestion ?")
     s.create_post(p["claude"], env.sid["claude"], type="status", thread_id=t2, body="not for the human " + INJECTION)
     return t1, t2
 
@@ -318,7 +318,7 @@ def test_needs_you_actions_the_menu_uses(senv):
 def test_needs_you_is_capped_at_ten(senv):
     threads = [senv.thread(), senv.thread()]          # two threads: one would hit the 12-post cap
     for n in range(13):
-        senv.post("claude", threads[n % 2], f"q{n}", "question", needs_response=True)
+        senv.post("claude", threads[n % 2], f"q{n}", "question", needs_response=True, decision_question=ASK)
     d = get_needs_you(senv).json()
     assert d["count"] == 13 and len(d["items"]) == summary.NEEDS_YOU_LIST_MAX
     assert [i["preview"] for i in d["items"]][:2] == ["q12", "q11"]

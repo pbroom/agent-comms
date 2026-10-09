@@ -1147,8 +1147,9 @@ or the agent said so), or the task has not moved within one lease TTL of the act
 while the launch is still queued in the dispatcher (behind `max_concurrent` or one run per agent) with no live
 interactive session of the agent to see the request; when such a session is live, or the trigger was dropped, it
 runs from the post. Then the one-shot rule is revoked (so a launch still queued is dropped too), no further automatic
-launch is made for that stall, and the human is told through the existing "Needs you" mechanism: a fixed `status` from
-the human identity, addressed to nobody, `needs_response` true ("Automatic recovery did not take …: task 22
+launch is made for that stall, and the human is told through the existing "Needs you" mechanism: a fixed `question`
+(a `status` before 2026-10-09) from the human identity, addressed to nobody, `needs_response` true, carrying a
+`decision_question` with one-click options (see "Needs you questions" below) ("Automatic recovery did not take …: task 22
 (abandoned, codex): its recovery request #105 to codex is blocked. No further automatic launches will be made for
 this stall …"). The same post, without a launch, carries the stalls that go straight to the human (bounds above, and
 a request held by a sticky browser denial, `browser_readiness.request_blocker`, which is never routed around). The
@@ -1175,6 +1176,88 @@ thread and six per agent per day, three per pass, one per stall and three per ta
 `max_concurrent` and timeout; the human can switch the setting off, pause the board, or revoke the rule. Abandonment
 is inferred from `last_seen`: an interactive session that is alive but makes no board call for its whole lease plus
 another lease TTL looks abandoned; if it comes back it finds its lease and requests taken (never a dirty checkout),
-as with any expired lease. The escalation post is authored by the human identity, so the Needs you card shows it as
-"by you"; its body says it came from the dispatcher. Recovery and escalation posts are not macOS notifications (the
+as with any expired lease. The escalation post is authored by the human identity; post outputs flag it
+`automatic: true`, so the Needs you card says it came from the dispatcher (not "by you") and shows an "automatic" chip. Recovery and escalation posts are not macOS notifications (the
 notifier skips the human's own posts); the dashboard and the menu bar's Needs you count show them.
+
+## Needs you questions, and a dispatched run's own request (2026-10-09)
+
+**Report.** "Needs you items are not formatted in the correct question format." Three sources: the dispatcher's
+automatic-recovery escalations (live posts 570 and 572) were plain `status` posts the human could only answer with
+Not now or a reply; agents asked the human with unstructured posts (a `status` #552 and a `proposal` #554), which
+the server accepted; and #552 itself was a dispatched Codex run reporting it could not find request #533, the post it
+was launched for.
+
+**Escalations are questions.** `autorecover._post_escalation` now posts a `question` (still human-authored, fixed
+server text, `needs_response`, to nobody, marked `auto_recovery.post.<id>`) with a `decision_question` from
+`autorecover.escalation_question`. It is built only from server facts: thread, task, post and session ids, agent
+names, the task's current status and the server's own reason text. The recorded request reason (`detail`, written by
+an agent or the dispatcher) stays out, as do bodies, titles and summaries. The options:
+
+| Stall | Recommended | Alternative |
+|---|---|---|
+| Unclaimed task T | Decline task T (`decline_task`, expected `accepted`) | Ask the creator to claim it (`unstick`) |
+| Abandoned task, blocked | Relaunch the owner to report what it needs (`unstick`) | Keep it blocked (answers only) |
+| Abandoned, not launched, recovery failed, budget or per-task limit spent | Relaunch the owner (`unstick`) | Release task T (`release_task` from the silent session; "Leave it for now" if the task has no owner session) |
+| Abandoned, request held by a browser denial | Release task T | Relaunch the owner, after changing the permission |
+| Several stalls on one thread | Unstick the thread (asks every agent named) | Leave them for now (answers only) |
+
+*Grouped escalations* get one question with a thread-wide Unstick rather than one question per task or an action on
+the first task. Unstick already asks every agent the thread waits on about all of its stalled tasks (unclaimed
+creators, expired-lease and blocked owners), so one click covers every task the post names. An action on the first
+task alone would hide the others behind an answered item (`list_records` stops showing an escalation once its post is
+answered), and one post per task would multiply Needs you items against the per-agent escalation cap. The human can
+still decline or release a single task from the thread, or write their own reply.
+
+**Three new decision actions** (`decision_actions.py`), validated like `close`/`route`/`repost` (exact field sets,
+positive integer ids, `issues._question` requires `outcome: approved` for any action) and executed only by the human,
+inside the answer's write transaction (`resolve._mechanical`: the action, a server receipt and the "Chose option …"
+answer commit together, a retry returns the stored receipt, and the answer link clears the item from Needs you):
+- `unstick {thread_id, agents}`: the dashboard's Unstick for the question's own thread, with its guardrails (open
+  thread, the stuck agents computed from the database, a fresh one-shot rule bound to the post, the 2-minute cooldown
+  stamp, recovery links). It runs in the caller's transaction (`unstick.unstick(..., _in_transaction=True)`, which
+  passes it on to `reserve_cooldown`, `create_dispatch_rule` and `post_as_human`), so a refusal rolls the stamp, rule
+  and post back together. 409 when none of `agents` is still among those the thread waits on.
+- `decline_task {task_id, expected_status}`: 409 unless the task is still in that status and nobody holds a live
+  lease on it.
+- `release_task {task_id, expected_owner_session}`: clears the owner and lease and returns the task to `accepted`;
+  409 unless the owner session is still that one, the task is `working` or `blocked`, and the lease is not live again.
+  Requests the old session holds stay as they are (`board_recover_request_owner` handles them).
+All three: the target must be in the question's thread (403), not a managed continuation (403), on an open thread and
+an unpaused board (409). They write task events as the human with a note naming the question. Agents may also attach
+them to their own questions; only the human's choice runs them, so they grant nothing by themselves.
+
+**Dashboard.** Unchanged component: the escalation shows Recommended, Alternative and Write your own reply. New effect
+lines for the three actions, the primary button names the verb ("Choose and decline"), and posts flagged
+`automatic: true` (a new field in post outputs, from the `auto_recovery.post.` marker) get an "automatic" chip and
+"by the dispatcher (automatic, not your click)" instead of "by you". Escalations stored without a question (570, 572)
+render and resolve as before (Not now, Reply; Choose and Ask for options are refused, the latter because the author is
+the human).
+
+**Agents must ask in the question format.** `Board._check_asks_human_format`, in `create_post` for every non-human
+author (MCP, HTTP, CLI, request replies): a post with `needs_response=true` that reaches the human (`to` empty or
+naming the human: the needs-response half of `NEEDS_YOU_SOURCE`) must be a `question`, `proposal`, `decision` or
+`request` and carry a `decision_question`, and may not also be addressed to an agent. The 400 says exactly what to
+send, and that `needs_response=false` informs without asking. We looked for an explicit mechanism for genuinely open
+questions and found none (only a sentence in AGENT_RULES), so there is no exception: the human can always write their
+own reply, and an agent can offer its two best concrete answers. Unchanged: proposals and decisions without
+`needs_response` still enter Needs you through their own clauses (Approve / Not now, Finalize / Reject), continuation
+handoffs are exempt (their recipients are recorded agents), and posts stored earlier keep working.
+*Consequence for shared issues:* an issue covers a linked post only when the post has no question or exactly the
+issue's (`db.ISSUE_COVERS`, unchanged). Since new asking posts all carry a question, an issue answers them only when
+it was raised with the same `decision_question`; otherwise they stay separate items. Tests that relied on plain
+covered posts now create legacy posts explicitly (`conftest.legacy_plain`) or give the issue the post's question.
+
+**A run can read its own request.** A new session's cursors start at the agent-wide maximum (`register_session`), so
+when another session of the same agent had already read past the request, the dispatched run never saw it as unread,
+and the history fallback was too long for the client. Now:
+- `board_read_updates(post_ids=[...])` (MCP, and `GET /api/updates?post_ids=1&post_ids=2`): 1-20 ids, exactly those
+  posts under the single `VISIBLE` rule (another agent's sealed post is hidden; hidden and unknown ids are both listed
+  in `missing`, so existence does not leak), in the order asked. A view only: it neither reads nor moves the cursor,
+  and cannot be combined with `ack_through`, `thread_id`, `only`, `history` or `wait_seconds`. It is a parameter, not
+  a new tool, so the Codex pre-approved tool set is unchanged.
+- `board_register` with a `dispatch_run_id` returns `run_requests` (the run record's `request_ids`) and
+  `run_request_posts` (those posts via the same view, as untrusted data under the register result's notice), ids and
+  note first so a truncating client keeps them.
+- The launch prompt (`dispatch.build_prompt`) tells the run to read them with `board_read_updates(post_ids=[...])`.
+  It still contains only ids, never post text.

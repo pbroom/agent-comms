@@ -3,6 +3,7 @@ import pytest
 from agent_comms import db, requests, resolve
 from agent_comms.core import Conflict, Forbidden, Invalid
 from agent_comms.dispatch import DispatchConfig
+from conftest import ASK
 
 
 def proposal(e, tid, action):
@@ -141,7 +142,7 @@ def test_route_reuses_existing_verified_session(env):
 
 def test_human_assigns_approval_to_implementer_without_proposer_request(env):
     tid = env.thread()
-    q = env.post('claude',tid,'Please implement','proposal',needs_response=True)
+    q = env.post('claude',tid,'Please implement','proposal',needs_response=True,decision_question=ASK)
     out = resolve.resolve(env.board,env.p['human'],q['id'],'approve',None,DispatchConfig(),delivery_agent='codex')
     answer = env.board.get_post(env.p['human'],out['post_id'])
     assert answer['to'] == ['codex'] and answer['answer_to'] == [q['id']]
@@ -153,7 +154,7 @@ def test_human_assigns_approval_to_implementer_without_proposer_request(env):
 
 def test_approve_launch_launches_the_chosen_assignee_when_the_author_is_inactive(env):
     tid = env.thread()
-    q = env.post('claude',tid,'Please implement','proposal',needs_response=True)
+    q = env.post('claude',tid,'Please implement','proposal',needs_response=True,decision_question=ASK)
     with db.write_tx(env.board.conn) as c:
         c.execute("UPDATE agents SET active=0 WHERE name='claude'")
     with pytest.raises(Invalid, match='choose an active agent'):

@@ -858,7 +858,7 @@ function statusChip(s) {
 function renderPost(p, human) {
   const meta = el("div", { class: "meta" },
     el("strong", {}, "#" + p.id), chip(p.type, p.type === "decision" ? "accent" : ""),
-    el("span", {}, p.agent), el("span", { class: "muted" }, "s" + p.session_id),
+    el("span", {}, p.agent), p.automatic ? chip("automatic") : null, el("span", { class: "muted" }, "s" + p.session_id),
     p.to.length ? el("span", { class: "muted" }, "→ " + p.to.join(", ")) : null,
     p.task_id ? chip("task " + p.task_id) : null,
     p.sealed ? chip("🔒 sealed", "seal") : null,
@@ -1681,7 +1681,10 @@ function postContext(p) {
   const q = p.decision_question;
   return q ? [q.context, p.body].map(s => (s || "").trim()).filter(Boolean).join("\n\n") : p.body || "";
 }
-function blockingLine(p) { return `Blocking thread #${p.thread_id} · post #${p.id} by ${isHumanName(p.agent) ? "you" : p.agent}`; }
+function blockingLine(p) {
+  const by = p.automatic ? "the dispatcher (automatic, not your click)" : isHumanName(p.agent) ? "you" : p.agent;
+  return `Blocking thread #${p.thread_id} · post #${p.id} by ${by}`;
+}
 function threadList(ids) { return `${ids.length === 1 ? "thread" : "threads"} ${ids.map(id => "#" + id).join(", ")}`; }
 // The threads an issue blocks: those awaiting a decision (all linked threads when none is flagged).
 function issueBlocks(i) {
@@ -1783,12 +1786,17 @@ async function resolveItem(item, action, text, extra = {}) {
 // Reject. Write your own reply is always last. `button` is the primary button's label once the card is picked.
 function mechanicalEffect(a) {
   if (!a) return null;
+  if (a.type === 'unstick') return `Runs Unstick on thread #${a.thread_id} (asks ${(a.agents || []).join(', ')}); allows one launch each. Runs on the server.`;
+  if (a.type === 'decline_task') return `Declines task ${a.task_id} if it is still ${a.expected_status}. Runs on the server; no agent turn.`;
+  if (a.type === 'release_task') return `Releases task ${a.task_id} from session #${a.expected_owner_session} (back to accepted, unowned). Runs on the server; no agent turn.`;
   const source = `request #${a.post_id}/${a.recipient} (version ${a.expected_version})`;
   if (a.type === 'close') return `Closes ${source} using evidence ${a.evidence_post_ids.map(id => '#' + id).join(', ')}. Runs on the server; no agent turn.`;
   if (a.type === 'route') return `Routes ${source} to verified session #${a.target_session_id}. Runs on the server; work stays queued until agent pickup.`;
   if (a.type === 'repost') return `Reposts ${source} to thread #${a.target_thread_id}; keeps the source blocked with a destination link. Runs on the server.`;
   return null;
 }
+const ACTION_VERBS = { close: "close", route: "route", repost: "repost", unstick: "unstick",
+  decline_task: "decline", release_task: "release" };
 function postChoices(item) {
   const who = isHumanName(item.agent) ? "the thread" : item.agent, n = `#${item.id}`;
   const decision = item.type === "decision", q = item.decision_question;
@@ -1801,7 +1809,7 @@ function postChoices(item) {
     desc: "Answer in your own words, or propose something else.", button: "Send reply" };
   if (q) return [
     ...rankedOptions(q).map(o => ({ value: "option:" + o.id, action: "choose", option: o.id, rank: o.rank, title: o.label,
-      desc: o.description, deliver: o.outcome === "approved" && !o.action, effect: mechanicalEffect(o.action) || (o.outcome === "approved" ? "Queues this approved work for the selected agent; allows one launch if inactive" : `Tells ${who} you chose this option`), button: o.action ? `Choose and ${o.action.type}` : `Choose ${o.rank}` })),
+      desc: o.description, deliver: o.outcome === "approved" && !o.action, effect: mechanicalEffect(o.action) || (o.outcome === "approved" ? "Queues this approved work for the selected agent; allows one launch if inactive" : `Tells ${who} you chose this option`), button: o.action ? `Choose and ${ACTION_VERBS[o.action.type] || "run it"}` : `Choose ${o.rank}` })),
     ...finalize, ...reject, own];
   return [
     ...finalize,
@@ -1848,7 +1856,8 @@ function renderNeedsYouItem(item) {
   send.setAttribute("aria-describedby", hint.id);
   const count = el("span", { class: "small muted ny-count" });
   const area = el("textarea", { class: "ny-textarea", "aria-label": `Reply to #${item.id}`, rows: 3, disabled: busy,
-    placeholder: `Your reply to ${item.agent} (sent as you, addressed to ${item.agent})`,
+    placeholder: isHumanName(item.agent) ? "Your reply (posted on the thread as you)"
+      : `Your reply to ${item.agent} (sent as you, addressed to ${item.agent})`,
     oninput: e => { nyDrafts[item.id] = e.target.value; sync(); },
     onkeydown: e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !send.disabled) { e.preventDefault(); send.click(); } } },
     nyDrafts[item.id] || "");
@@ -1919,7 +1928,8 @@ function renderNeedsYouItem(item) {
   sync();
   return el("div", { class: "ny-item ask", "data-post": item.id },
     el("div", { class: "ask-context" }, el("span", { class: "where" }, blockingLine(item)),
-      chip(item.type, item.type === "decision" ? "accent" : ""), item.sealed ? chip("🔒 sealed", "seal") : null,
+      chip(item.type, item.type === "decision" ? "accent" : ""), item.automatic ? chip("automatic") : null,
+      item.sealed ? chip("🔒 sealed", "seal") : null,
       el("span", { title: item.created_at }, ago(item.created_at)), el("span", { class: "sp" }),
       el("button", { class: "linkish small", "data-action": "jump", onclick: () => jumpToPost(item.id) }, `Jump to post #${item.id}`)),
     askHead("post-" + item.id, q ? "Question" : "Question (from the post)", postQuestion(item), postContext(item)),

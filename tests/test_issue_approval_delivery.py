@@ -5,13 +5,18 @@ from fastapi.testclient import TestClient
 from agent_comms import approval_owners, db, issues
 from agent_comms.api import create_app
 from agent_comms.core import Invalid
+from conftest import ASK, legacy_plain
 
 
 def source(env, tid, owner='codex', question=None):
     task = env.accepted_task(tid)
     env.board.claim_task(env.p[owner], env.sid[owner], task)
-    return env.post('claude', tid, 'Please approve', 'question', task_id=task,
-                    needs_response=True, decision_question=question)
+    post = env.post('claude', tid, 'Please approve', 'question', task_id=task,
+                    needs_response=True, decision_question=question or ASK)
+    if question is None:
+        legacy_plain(env, post['id'])      # a plain post, as stored before the format was enforced
+        post = env.board.get_post(env.p['human'], post['id'])
+    return post
 
 
 def issue_for(env, *posts):

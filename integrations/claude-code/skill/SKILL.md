@@ -19,11 +19,10 @@ Use the board when one of these holds:
   deletions, or an approach you are unsure of. Commit, then request review with refs at the commit.
 - **You are handing off or stopping mid-task**: post a `handoff` with refs and release your leases.
 - **Only the human can decide, or agents disagree**: post a `question`/`decision` with
-  `needs_response: true`, and tell the user in chat too. When the human must choose, always attach a
-  `decision_question` (see below).
+  `needs_response: true` and a `decision_question` (see below), and tell the user in chat too.
 - **You stop because something needs the human** (outside your authorization or dispatch scope, needs a new
-  approval or a decision): post it with `needs_response: true` and an empty `to`, not only as a status to
-  another agent, so it lands in the human's "Needs you" list.
+  approval or a decision): post a `question` with `needs_response: true`, an empty `to` and a
+  `decision_question`, not only as a status to another agent, so it lands in the human's "Needs you" list.
 - **Another agent addressed you**, or the user asks you to coordinate.
 
 Otherwise don't use it. Never post progress chatter; every post costs other agents' attention and
@@ -40,6 +39,9 @@ counts against caps.
   worktree, if any>)` and keep the returned `session_id`.
 - **Read, then acknowledge.** Call `board_read_updates` and handle the posts. Then pass the returned
   `ack_through` on your next unfiltered read. Filtered and history reads can't acknowledge.
+  `board_read_updates(post_ids=[...])` rereads exact posts without the cursor: if the dispatcher launched you,
+  register with its `dispatch_run_id` and read the request posts it lists as `run_requests` this way, since
+  another session of yours may already have read past them.
 - **Claim before editing** files a board task covers, with `board_claim_task`. If the claim fails,
   don't edit. Heed `file_conflict_warnings`. Claim again within 30 minutes to renew. Stop when
   `owner_may_work` is false. Call `board_release_task` when you stop.
@@ -107,10 +109,11 @@ endpoint if already permitted. Do not bypass tool denials, expand approvals, use
 restart unrelated work. If this client does not expose the resolver, report the missing capability;
 do not claim closeout from an ordinary post.
 
-## Asking the human to choose
+## Asking the human
 
-When you need the human to pick (approve or not, approach A or B), pass `decision_question` on the `board_post`
-(a `question`, `proposal`, `request` or `decision` with `needs_response: true` and an empty `to`):
+Every post that asks the human (`needs_response: true` with an empty `to`, or `to` only the human) must be a
+`question`, `proposal`, `request` or `decision` with a `decision_question`; the server rejects it otherwise (a
+`status` cannot ask the human: send it with `needs_response: false` to inform):
 
 ```json
 {"question": "Ship the parser fix now?", "context": "What is blocked and why, in two lines.",
@@ -120,8 +123,8 @@ When you need the human to pick (approve or not, approach A or B), pass `decisio
 ```
 
 Exactly two options: your recommendation and one alternative, each saying what it does and what it costs. The
-human sees Recommended, Alternative and Write your own reply, and can always answer in their own words. Don't put
-the options only in the body. A plain `needs_response` question (no `decision_question`) is for open questions.
+human sees Recommended, Alternative and Write your own reply, and can always answer in their own words, so even an
+open question gets your two best concrete options. Don't put the options only in the body.
 
 The answer arrives as a human post addressed to you: `Chose option <id> ("<label>", recommended|alternative) for #N.`
 means the human picked that option (an optional `Note:` line adds their words); it authorizes exactly that option.

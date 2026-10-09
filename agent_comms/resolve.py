@@ -217,8 +217,16 @@ def _mechanical(board, p, item, option, question, note):
             raise Conflict('this decision no longer needs you')
         result = decision_actions.execute(board, p, session_id, item, option['action'])
         action = option['action']
-        target = f"request #{action['post_id']}/{action['recipient']}"
-        if action['type'] == 'close':
+        target = f"request #{action.get('post_id')}/{action.get('recipient')}"
+        if action['type'] == 'unstick':
+            detail = (f"Unstuck thread #{item['thread_id']}: asked {', '.join(result['agents'])} in post "
+                      f"#{result['unstick_post_id']}" + (f" (one-shot launch rule {result['rule_id']})."
+                                                          if result['rule_id'] else "."))
+        elif action['type'] == 'decline_task':
+            detail = f"Declined task {result['task_id']}."
+        elif action['type'] == 'release_task':
+            detail = f"Released task {result['task_id']}: its lease is cleared and it is accepted again, unowned."
+        elif action['type'] == 'close':
             detail = f"Closed {target} using evidence " + ', '.join('#' + str(i) for i in action['evidence_post_ids']) + '.'
         elif action['type'] == 'route':
             detail = f"Routed {target} to session #{action['target_session_id']}; waiting for agent pickup."

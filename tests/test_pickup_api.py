@@ -3,13 +3,14 @@ from fastapi.testclient import TestClient
 from agent_comms.api import create_app
 from agent_comms import requests, summary
 from agent_comms.dispatch import DispatchConfig
+from conftest import ASK
 from test_issues_api import headers
 
 
 def test_http_answer_link_is_human_only_and_snapshot_ignores_read_cursors(env):
     client = TestClient(create_app(env.board))
     tid = env.thread()
-    source = env.post('codex', tid, 'Choose', type='question', needs_response=True)
+    source = env.post('codex', tid, 'Choose', type='question', needs_response=True, decision_question=ASK)
     payload = dict(thread_id=tid, type='status', body='Proceed', to=['codex'], answer_to=[source['id']])
     assert client.post('/api/posts', headers=headers(env), json=payload).status_code == 403
     response = client.post('/api/posts', headers=headers(env, 'human'), json=payload)

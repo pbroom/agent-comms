@@ -7,9 +7,11 @@ from agent_comms import db, issues, requests, resolve
 from agent_comms.core import Conflict, Forbidden, Invalid
 from agent_comms.dispatch import DispatchConfig
 
+from conftest import ASK
+
 
 def question(env, tid, author='codex', **kw):
-    return env.post(author,tid,type='question',to=['human'],needs_response=True,**kw)
+    return env.post(author,tid,type='question',to=['human'],needs_response=True,**{'decision_question':ASK,**kw})
 
 
 def pending(env):
@@ -89,7 +91,7 @@ def test_issue_answer_fanout_snapshots_exact_links_and_version(env):
     first,second=env.thread(),env.thread()
     one,two=question(env,first),question(env,second,'claude')
     issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Shared choice',body='Choose scope',
-                              thread_id=first,post_id=one['id'])
+                              thread_id=first,post_id=one['id'],decision_question=ASK)
     issues.link_issue(env.board,env.p['claude'],env.sid['claude'],issue['id'],second,two['id'])
     result=issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'First only',[first])
     assert result['needs_human']
@@ -146,7 +148,7 @@ def test_completion_never_closes_uncertain_or_unfinished_thread(env,blocker):
 def test_issue_auto_resolution_requires_every_linked_answer_complete(env):
     first,second=env.thread(),env.thread()
     one,two=question(env,first),question(env,second,'claude')
-    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=first,post_id=one['id'])
+    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=first,post_id=one['id'],decision_question=ASK)
     issues.link_issue(env.board,env.p['claude'],env.sid['claude'],issue['id'],second,two['id'])
     issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Both',[first,second])
     posts=[env.board.get_post(env.p['human'],r[0]) for r in env.board.conn.execute('SELECT DISTINCT answer_post_id FROM issue_answer_links ORDER BY answer_post_id')]
@@ -281,7 +283,7 @@ def test_changed_issue_decision_is_not_mistaken_for_retry(env,change):
 def test_exact_retry_after_completed_thread_does_not_reopen_or_duplicate(env):
     tid=env.thread()
     source=question(env,tid)
-    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=tid,post_id=source['id'])
+    issue=issues.create_issue(env.board,env.p['codex'],env.sid['codex'],title='Choice',body='Choose',thread_id=tid,post_id=source['id'],decision_question=ASK)
     issues.decide_issue(env.board,env.p['human'],env.sid['human'],issue['id'],'Yes',[tid])
     answer_id=env.board.conn.execute('SELECT answer_post_id FROM issue_answer_links').fetchone()[0]
     finish(env,env.board.get_post(env.p['human'],answer_id))

@@ -126,7 +126,12 @@ def build_body(agents: list[str], reasons: list[dict]) -> str:
     return f"Unstick: this thread is stalled on {who} ({'; '.join(parts)}). {BODY_INSTRUCTIONS}"
 
 
-def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig) -> dict[str, Any]:
+def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig | None, *,
+            require_agents: list[str] | None = None, _in_transaction: bool = False) -> dict[str, Any]:
+    """`require_agents` (a decision action, decision_actions.py): refuse (409) unless at least one of these agents is
+    still among those the thread waits on. `_in_transaction`: run inside the caller's write transaction (the human's
+    answer to that question), so the cooldown stamp, the rule and the post commit or roll back with the answer; the
+    result then has no launch outlook (`config` is unused)."""
     board._require_human(p, "unstick a thread")
     thread = board._thread_row(thread_id)
     if thread["status"] != "open":
@@ -135,11 +140,13 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
     if not agents:
         raise Conflict("nothing here is waiting on an agent (no unanswered requests to an agent, blocked tasks, "
                        "expired leases or unclaimed tasks); if the thread is waiting on you, reply to it")
+    if require_agents is not None and not set(require_agents) & set(agents):
+        raise Conflict(f"thread {thread_id} no longer waits on {', '.join(require_agents)}; reload before choosing")
     key = STATE_PREFIX + str(thread_id)
     human_actions.reserve_cooldown(
         board, p, key, UNSTICK_COOLDOWN_SECONDS,
         lambda wait: (f"thread {thread_id} was unstuck less than {UNSTICK_COOLDOWN_SECONDS // 60} minutes ago; "
-                      f"give the agents a moment (try again in {wait} s)"))
+                      f"give the agents a moment (try again in {wait} s)"), _in_transaction=_in_transaction)
     def link_recovery(post):
         # Server-created links only, frozen with the post; never infer lineage from prose.
         from . import recovery, workstreams
@@ -169,10 +176,15 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
     try:
         post, rule = human_actions.post_as_human(board, p, thread_id=thread_id, body=build_body(agents, reasons),
                                                  type="request", to=agents, needs_response=True, launch=agents,
-                                                 purpose=PURPOSE.format(thread=thread_id), post_hook=link_recovery)
+                                                 purpose=PURPOSE.format(thread=thread_id), post_hook=link_recovery,
+                                                 _in_transaction=_in_transaction)
     except Exception:
-        human_actions.release_cooldown(board, key)
+        if not _in_transaction:     # inside the caller's transaction, its rollback undoes the stamp
+            human_actions.release_cooldown(board, key)
         raise
+    if _in_transaction:
+        return {"post_id": post["id"], "thread_id": thread_id, "agents": agents,
+                "rule_id": rule["id"] if rule else None, "reasons": reasons}
     # Where the request will be seen now (`sessions`): the target agents' sessions inside the dispatcher's live
     # window, most recently seen first, and `sessions_detail`: those sessions in the snapshot's session shape (the
     # snapshot lists only the 30 most recently seen). Sessions a launch registers later are found by the page from
