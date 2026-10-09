@@ -1,4 +1,4 @@
-from conftest import PROJECT
+from conftest import ASK, PROJECT
 
 
 def ids(r):
@@ -93,7 +93,7 @@ def test_new_session_starts_at_agents_read_position(env):
 
 def test_finalized_decision_resurfaces(env):
     tid = env.thread()
-    d = env.post("claude", tid, "use sqlite", "decision")
+    d = env.post("claude", tid, "use sqlite", "decision", decision_question=ASK)
     assert d["decision_status"].startswith("proposal")
     c, s = env.p["codex"], env.sid["codex"]
     r = env.board.read_updates(c, s)

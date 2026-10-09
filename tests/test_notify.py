@@ -63,7 +63,7 @@ def test_notifies_on_question_for_human_addressed_and_decision(nenv):
     tid = nenv.thread()
     nenv.post("claude", tid, "Which DB?", "question", needs_response=True, decision_question=ASK)
     nenv.post("codex", tid, "ping human", "status", to=["human"])
-    nenv.post("claude", tid, "Use SQLite", "decision")
+    nenv.post("claude", tid, "Use SQLite", "decision", decision_question=ASK)
     kinds = [n.kind for n in nenv.fake.sent]
     assert kinds == ["needs-response", "to-human", "decision"]
     first = nenv.fake.sent[0]
@@ -101,7 +101,7 @@ def test_event_selection_limits_what_notifies(nenv):
     on(nenv, events=["decision"])
     tid = nenv.thread()
     nenv.post("claude", tid, "q", "question", needs_response=True, decision_question=ASK)
-    nenv.post("claude", tid, "d", "decision")
+    nenv.post("claude", tid, "d", "decision", decision_question=ASK)
     assert [n.kind for n in nenv.fake.sent] == ["decision"]
 
 
@@ -144,7 +144,7 @@ def test_sealed_first_post_does_not_burn_idle_nudge(nenv):
 def test_nothing_without_a_subscription(nenv):
     tid = nenv.thread()
     nenv.post("claude", tid, "q", "question", needs_response=True, decision_question=ASK)
-    nenv.post("claude", tid, "d", "decision", to=["human"])
+    nenv.post("claude", tid, "d", "decision", to=["human"], decision_question=ASK)
     assert nenv.fake.sent == []
 
 
@@ -219,7 +219,7 @@ def test_sealed_text_never_included(nenv):
     tid = nenv.thread()
     task = nenv.accepted_task(tid)
     nenv.post("codex", tid, SECRET, "finding", task_id=task, refs=REF, sealed=True, to=["codex", "human"])
-    nenv.post("claude", tid, SECRET, "decision", sealed=True)
+    nenv.post("claude", tid, SECRET, "decision", sealed=True, decision_question=ASK)
     assert len(nenv.fake.sent) == 2
     assert SECRET not in nenv.fake.text()
     assert all(n.message.endswith(": sealed post") for n in nenv.fake.sent)

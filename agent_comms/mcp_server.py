@@ -206,9 +206,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "[{id (lowercase slug, ^[a-z0-9][a-z0-9_-]{0,31}$), label, description, outcome: answered|approved|declined}], "
         "recommended_option_id}: your recommended "
         "option and one alternative, each description saying what it does and what it costs; the server rejects "
-        "it otherwise (a status cannot ask the human; post it with needs_response=false to inform). A decision may "
-        "carry one even without needs_response. The dashboard shows Recommended, Alternative and Write your own "
-        "reply, so the human can always answer in their own words: there is no unstructured form. "
+        "it otherwise (a status cannot ask the human; post it with needs_response=false to inform). Every decision "
+        "(it waits on the human whoever it is addressed to) and every proposal to nobody or the human (except one "
+        "with propose_task) needs one too, even without needs_response; proposals addressed only to agents do not. "
+        "To have a shared issue answer your post, reuse the issue's decision_question verbatim. The dashboard shows "
+        "Recommended, Alternative and Write your own reply, so the human can always answer in their own words: "
+        "there is no unstructured form. "
         "A human reply 'Chose option <id> (\"<label>\", recommended|alternative) for #N.' means the human picked "
         "that option of post #N (an optional 'Note:' line follows); it covers only what that option said. "
         "For an authorized stack fix use an unsealed request/handoff with continuation={root_task_id, "
@@ -313,6 +316,9 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "first. needs_human requests one human decision for the issue. Do not copy sealed content into issues. "
         "Optional decision_question contains question, context, exactly two options (id as a lowercase slug, label, description, "
         "outcome: answered/approved/declined), and recommended_option_id. Suggestions are not authorization. "
+        "Raised from a post_id without its own decision_question, the issue adopts that post's question (unless "
+        "it has option actions), so the issue's answer answers the post. The result's link.covers_post and "
+        "link.coverage say whether the issue covers the post. "
         "Raising an issue creates no task authorization." + DATA_WARNING))
     def board_create_issue(title: str, body: str, thread_id: int, post_id: int | None = None,
                            needs_human: bool = True, decision_question: dict | None = None, session_id: int | None = None, ctx: Context = None) -> dict:
@@ -323,7 +329,10 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     @mcp.tool(description=(
         "Join an existing shared issue: link an affected thread and optionally an exact source post. "
         "Only join when the same blocker applies. This does not extend any existing decision or authorization "
-        "to the newly linked thread or project." + DATA_WARNING))
+        "to the newly linked thread or project. The issue answers a linked post only when the post carries exactly "
+        "the issue's decision_question (or none): post it with the question copied verbatim from board_get_issue "
+        "before linking. The result's link.covers_post and link.coverage say whether it does, and why not."
+        + DATA_WARNING))
     def board_link_issue(issue_id: int, thread_id: int, post_id: int | None = None,
                          session_id: int | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)

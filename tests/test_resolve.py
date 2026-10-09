@@ -32,7 +32,7 @@ def ask(env, frm="codex", type="question", to=(), **kw):
     """A post that needs the human: needs_response to nobody (or the human), or a decision. An agent's needs-response
     post to the human carries the decision_question every such post must have (ASK)."""
     needs = kw.pop("needs_response", type != "decision")
-    if needs and frm != "human" and all(name == "human" for name in to):
+    if frm != "human" and (type == "decision" or (needs or type == "proposal") and all(name == "human" for name in to)):
         kw.setdefault("decision_question", ASK)
     return env.post(frm, kw.pop("thread_id", env.tid), "please " + INJECTION, type, to=list(to),
                     needs_response=needs, **kw)
@@ -315,8 +315,8 @@ def test_a_dispatcher_tick_after_approve_launch_launches_the_author(tmp_path, mo
 
 def test_agent_proposals_to_nobody_or_the_human_need_the_human(renv):
     e = renv
-    mine = e.post("codex", e.tid, "prevent it: add a check", "proposal")                       # to nobody
-    to_me = e.post("codex", e.tid, "or this", "proposal", to=["human"])
+    mine = e.post("codex", e.tid, "prevent it: add a check", "proposal", decision_question=ASK)                       # to nobody
+    to_me = e.post("codex", e.tid, "or this", "proposal", to=["human"], decision_question=ASK)
     between = e.post("codex", e.tid, "claude, try this", "proposal", to=["claude"])            # between agents
     task = e.post("codex", e.tid, "a task", "proposal", propose_task={"title": "Do it"})        # task flow
     ids = {p["id"] for p in e.board.snapshot(e.p["human"])["needs_you"]}

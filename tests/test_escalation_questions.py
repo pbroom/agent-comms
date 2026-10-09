@@ -134,7 +134,7 @@ def test_decline_declines_the_task_and_clears_needs_you(aenv):
     task, note = unclaimed_escalation(aenv)
     before = post_count(aenv)
     out = choose(aenv, note["id"], "decline")
-    assert out["action_result"] == {"task_id": task, "status": "declined"}
+    assert out["action_result"] == {"task_id": task, "status": "declined", "previous_status": "accepted"}
     assert aenv.board.get_task(aenv.p["human"], task)["status"] == "declined"
     assert note["id"] not in needs_you(aenv)
     receipt = aenv.board.get_post(aenv.p["human"], out["receipt_post_id"])
@@ -171,7 +171,7 @@ def test_release_clears_the_lease_and_returns_the_task_to_accepted(aenv):
     out = choose(aenv, note["id"], "release")
     t = aenv.board.get_task(aenv.p["human"], task)
     assert (t["status"], t["owner_agent"], t["owner_session"]) == ("accepted", None, None)
-    assert out["action_result"] == {"task_id": task, "status": "accepted"}
+    assert out["action_result"] == {"task_id": task, "status": "accepted", "previous_status": "working"}
     assert note["id"] not in needs_you(aenv)
 
 
@@ -326,3 +326,73 @@ def test_a_question_that_cannot_be_built_does_not_block_the_escalation(aenv, mon
     aenv.d.tick()
     [note] = auto_posts(aenv)
     assert note["type"] == "status" and note["decision_question"] is None and note["id"] in needs_you(aenv)
+    assert "pick one of the options" not in note["body"] and "then Unstick, reassign or decline" in note["body"]
+
+
+def test_a_late_failure_inside_the_one_click_unstick_rolls_everything_back_and_a_retry_works(aenv, monkeypatch):
+    task, note = unclaimed_escalation(aenv)
+    stamp_key = unstick.STATE_PREFIX + str(aenv.tid)
+
+    def state():
+        return (post_count(aenv), aenv.board.list_dispatch_rules(aenv.p["human"], include_inactive=True),
+                aenv.board.conn.execute("SELECT COUNT(*) FROM board_state").fetchone()[0])
+    before = state()
+    real = aenv.board.create_post
+
+    def fail_on_receipt(*args, **kwargs):
+        if kwargs.get("body", "").startswith("Server executed"):    # after Unstick posted and approved its rule
+            raise RuntimeError("receipt unavailable")
+        return real(*args, **kwargs)
+    monkeypatch.setattr(aenv.board, "create_post", fail_on_receipt)
+    with pytest.raises(RuntimeError):
+        choose(aenv, note["id"], "ask-creator")
+    assert state() == before, "no Unstick post, rule, rule binding, cooldown stamp or receipt survives"
+    assert aenv.board.conn.execute("SELECT 1 FROM board_state WHERE key = ?", (stamp_key,)).fetchone() is None
+    assert note["id"] in needs_you(aenv)
+    monkeypatch.setattr(aenv.board, "create_post", real)
+    out = choose(aenv, note["id"], "ask-creator")
+    assert out["action_result"]["agents"] == ["codex"] and note["id"] not in needs_you(aenv)
+
+
+def test_one_click_actions_notify_after_the_answer_commits(aenv):
+    task, note = unclaimed_escalation(aenv)
+    aenv.rec.events.clear()
+    out = choose(aenv, note["id"], "decline")
+    events = [(e, p) for e, p in aenv.rec.events if e in ("post.created", "task.transition", "task.released")]
+    assert ("task.transition", {"task_id": task, "from": "accepted", "to": "declined", "agent": "human"}) in events
+    assert [p["post_id"] for e, p in events if e == "post.created"] == [out["receipt_post_id"], out["post_id"]]
+    aenv.rec.events.clear()
+    choose(aenv, note["id"], "decline")                                   # a retry returns the receipt, silently
+    assert [e for e, _ in aenv.rec.events if e in ("post.created", "task.transition")] == []
+
+
+def test_release_and_unstick_notify_too(aenv):
+    sid, task, note = failed_recovery(aenv)
+    aenv.rec.events.clear()
+    choose(aenv, note["id"], "release")
+    assert ("task.released", {"task_id": task, "agent": "human"}) in aenv.rec.events
+    aenv.tid = aenv.thread("other")
+    task2, note2 = unclaimed_escalation(aenv)
+    aenv.rec.events.clear()
+    out = choose(aenv, note2["id"], "ask-creator")
+    created = [p["post_id"] for e, p in aenv.rec.events if e == "post.created"]
+    assert created == [out["action_result"]["unstick_post_id"], out["receipt_post_id"], out["post_id"]]
+
+
+def test_a_one_click_unstick_asks_only_the_named_agents(aenv):
+    """An agent-written question can trigger Unstick for the agents it names only, never every stuck agent."""
+    agent_task(aenv, accepted_by="self")                                   # codex is stuck here ...
+    theirs = aenv.board.create_task(aenv.p["claude"], aenv.sid["claude"], aenv.tid, title="c")["id"]
+    aenv.board.transition_task(aenv.p["claude"], aenv.sid["claude"], theirs, "accepted")   # ... and claude
+    assert unstick.stuck_agents(aenv.board, aenv.tid)[0] == ["codex", "claude"]
+    q = aenv.post("claude", aenv.tid, "unstick codex?", "question", needs_response=True, decision_question={
+        "question": "Ask codex?", "context": "",
+        "options": [{"id": "yes", "label": "Ask codex", "description": "Unstick", "outcome": "approved",
+                     "action": {"type": "unstick", "thread_id": aenv.tid, "agents": ["codex"]}},
+                    {"id": "no", "label": "No", "description": "nothing", "outcome": "answered"}],
+        "recommended_option_id": "yes"})
+    out = choose(aenv, q["id"], "yes")
+    asked = aenv.board.get_post(aenv.p["human"], out["action_result"]["unstick_post_id"])
+    assert asked["to"] == ["codex"] and "claude" not in asked["body"]
+    rules = {r["id"]: r for r in aenv.board.list_dispatch_rules(aenv.p["human"])}
+    assert rules[out["action_result"]["rule_id"]]["agents"] == ["codex"]

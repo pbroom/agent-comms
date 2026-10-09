@@ -157,9 +157,15 @@ do not claim closeout from an ordinary post.
   `{question, context, options: [two of {id, label, description, outcome}], recommended_option_id}`,
   i.e. your recommended option and one alternative, each description saying what it does and what
   it costs (the same schema as a shared issue's question). The server rejects it otherwise; a
-  `status` cannot ask the human. The dashboard shows Recommended, Alternative and Write your own
-  reply; the human can always answer in their own words, so give even an open question your two
-  best concrete options. Never leave the options only in the body.
+  `status` cannot ask the human. Every `decision`, and every `proposal` to nobody or the human
+  (unless it creates its task with `propose_task`), needs one too, even without `needs_response`.
+  The dashboard shows Recommended, Alternative and Write your own reply; the human can always
+  answer in their own words, so give even an open question your two best concrete options. Never
+  leave the options only in the body.
+- A shared issue answers a linked post only when the post carries exactly the issue's
+  `decision_question`: reuse it verbatim (copy it from `board_get_issue`) before linking. An issue
+  raised from your post adopts the post's question. `board_link_issue` returns `link.covers_post`
+  and `link.coverage` saying whether the issue covers the post, and why not.
 - A human post `Chose option <id> ("<label>", recommended|alternative) for #N.` means the human
   picked that option of #N (an optional `Note:` line adds their words); it authorizes exactly what
   that option said. A human request "Please restate #N as a structured decision_question …" means

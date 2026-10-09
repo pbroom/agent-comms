@@ -1170,7 +1170,7 @@ class Board:
             raise Invalid('internal post creation requires an active transaction')
         question = self._post_question(decision_question, type, to, needs_response)
         if continuation is None:    # a continuation's recipients are its recorded owner and fallback agents
-            self._check_asks_human_format(p, type, to, needs_response, question)
+            self._check_asks_human_format(p, type, to, needs_response, question, propose_task)
         if continuation is not None and (thread_id is None or sealed or type not in ('request', 'handoff')
                                          or task_id is not None or propose_task is not None):
             raise Invalid('continuation requires an unsealed request or handoff in an existing thread, without task_id/propose_task')
@@ -1277,44 +1277,61 @@ class Board:
                        "description: what it does and what it costs, outcome: answered|approved|declined}], "
                        "recommended_option_id}")
 
-    def _check_asks_human_format(self, p: Principal, type: str, to: list[str], needs_response: bool,
-                                 decision_question: dict | None) -> None:
-        """An agent's post that asks the human (needs_response=true, addressed to nobody or to the human: the
-        needs-response half of NEEDS_YOU_SOURCE) must be a question the human can answer in one click: a
-        question/proposal/decision/request carrying a decision_question with a recommended option and one
-        alternative. The human can always write their own reply instead, so there is no unstructured form."""
-        if p.is_human or not needs_response:
-            return
+    def _reaches_human(self, to: list[str]) -> bool:
+        """Addressed to nobody, or with the human among the recipients (the addressing half of NEEDS_YOU_SOURCE)."""
+        if not to:
+            return True
         humans = {r[0] for r in self.conn.execute("SELECT name FROM agents WHERE is_human = 1")}
-        if to and not any(name in humans for name in to):
-            return      # asks other agents only: not in the human's Needs you
-        fix = (f"Post it as type question, proposal, decision or request with needs_response=true, to=[] (or only "
-               f"the human), and {self.QUESTION_FORMAT}: your recommended option and one alternative. The human "
-               "can still answer in their own words. To inform without asking, set needs_response=false; to ask "
-               "another agent, address only that agent in `to`.")
+        return any(name in humans for name in to)
+
+    def _check_asks_human_format(self, p: Principal, type: str, to: list[str], needs_response: bool,
+                                 decision_question: dict | None, propose_task: dict | None = None) -> None:
+        """An agent's post that will wait in the human's Needs you must be a question the human can answer in one
+        click: a question/proposal/decision/request carrying a decision_question with a recommended option and one
+        alternative. The human can always write their own reply instead, so there is no unstructured form. These are
+        NEEDS_YOU_SOURCE's clauses as they apply to a new post:
+        - needs_response=true, addressed to nobody or to the human;
+        - a decision (an agent cannot finalize it, so it always waits on the human, whoever it is addressed to);
+        - a proposal addressed to nobody or to the human, unless it creates its task (propose_task: left to the task
+          flow). A proposal addressed only to agents is between agents and unaffected."""
+        if p.is_human:
+            return
+        reaches = self._reaches_human(to)
+        if not ((needs_response and reaches) or type == "decision"
+                or (type == "proposal" and propose_task is None and reaches)):
+            return
+        fix = (f"Post it as type question, proposal, decision or request with to=[] (or only the human), "
+               f"needs_response=true unless it is a proposal or decision, and {self.QUESTION_FORMAT}: your recommended "
+               "option and one alternative. The human can still answer in their own words. To inform without asking, "
+               "post a status with needs_response=false; to ask another agent, address only that agent in `to`.")
         if type not in self.QUESTION_POST_TYPES:
             raise Invalid(f"a needs_response post to the human cannot be a '{type}'. {fix}")
         if decision_question is None:
-            raise Invalid(f"a needs_response post to the human needs a decision_question. {fix}")
-        if any(name not in humans for name in to):
+            what = {"decision": "a decision (it waits on the human to finalize it)",
+                    "proposal": "a proposal to the human"}.get(type, "a needs_response post to the human")
+            raise Invalid(f"{what} needs a decision_question. {fix}")
+        humans = {r[0] for r in self.conn.execute("SELECT name FROM agents WHERE is_human = 1")}
+        if type != "decision" and any(name not in humans for name in to):
             raise Invalid(f"a post that asks the human cannot also be addressed to agents. {fix}")
 
     def _post_question(self, value: dict | None, type: str, to: list[str], needs_response: bool) -> dict | None:
         """A structured question for the human on a post: the same schema and rules as a shared issue's
         (issues._question: question, context, exactly two options, recommended_option_id). Only on a post that asks
-        the human: a question/proposal/decision/request that needs a response (a decision always waits on the
-        human), addressed to nobody or to the human. Its text is agent-written board data, like any body."""
+        the human: a decision (it always waits on the human, whoever it is addressed to), or a question/proposal/
+        request addressed to nobody or to the human that needs a response (a proposal to the human waits on them
+        without one). Its text is agent-written board data, like any body."""
         if value is None:
             return None
         if type not in self.QUESTION_POST_TYPES:
             raise Invalid(f"decision_question is only allowed on {' | '.join(self.QUESTION_POST_TYPES)} posts")
-        if type != "decision" and not needs_response:
+        if type not in ("decision", "proposal") and not needs_response:
             raise Invalid("decision_question asks the human: set needs_response=true")
         humans = {r[0] for r in self.conn.execute("SELECT name FROM agents WHERE is_human = 1")}
-        if any(name not in humans for name in to):
+        if type != "decision" and any(name not in humans for name in to):
             raise Invalid("decision_question asks the human: address the post to nobody (to=[]) or to the human")
         from .issues import _question
         return _question(self, value)
+
 
     def _auto_unseal(self, c: sqlite3.Connection, task_id: int) -> list[int]:
         """Unseal sealed posts on a task once every agent named in their `to` posted a sealed finding on it."""

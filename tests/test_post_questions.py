@@ -87,7 +87,8 @@ def test_allowed_on_posts_that_ask_the_human(qenv, type, needs, to):
 
 @pytest.mark.parametrize("type,needs,to,msg", [
     ("status", True, [], "only allowed on"), ("finding", True, [], "only allowed on"), ("handoff", True, [], "only allowed on"),
-    ("question", False, [], "needs_response=true"), ("proposal", False, [], "needs_response=true"),
+    ("question", False, [], "needs_response=true"), ("request", False, [], "needs_response=true"),
+    ("proposal", False, ["claude"], "address the post"),
     ("question", True, ["claude"], "address the post"), ("request", True, ["human", "claude"], "address the post"),
 ])
 def test_refused_elsewhere(qenv, type, needs, to, msg):
@@ -172,11 +173,30 @@ def test_an_agent_cannot_ask_the_human_without_a_decision_question(qenv, type, t
     assert needs_you(qenv) == before
 
 
+@pytest.mark.parametrize("type,to,kw", [("proposal", [], {}), ("proposal", ["human"], {}),
+                                        ("proposal", [], {"task_id": "existing"}), ("decision", [], {}),
+                                        ("decision", ["claude"], {}), ("decision", [], {"sealed": True})])
+def test_proposals_and_decisions_that_reach_needs_you_need_a_question_too(qenv, type, to, kw):
+    """Live #554 was a proposal: proposals to the human and every agent decision wait in Needs you through their own
+    clauses of NEEDS_YOU_SOURCE, without needs_response, so they need a decision_question as well."""
+    if kw.get("task_id") == "existing":
+        kw = {"task_id": qenv.accepted_task(qenv.tid)}
+    before = needs_you(qenv)
+    with pytest.raises(Invalid, match="needs a decision_question"):
+        qenv.post("codex", qenv.tid, "do this " + INJECTION, type, to=to, **kw)
+    assert needs_you(qenv) == before
+    p = qenv.post("codex", qenv.tid, "do this", type, to=to, decision_question=question(), **kw)
+    assert p["id"] in needs_you(qenv) and p["decision_question"]["recommended_option_id"] == "ship"
+
+
 def test_what_still_posts_without_a_question(qenv):
-    # Asking another agent, informing without asking, a decision awaiting finalize, and the human's own posts.
+    # Asking another agent, proposing to another agent, a proposal that creates its task (left to the task flow),
+    # informing without asking, and the human's own posts.
     qenv.post("codex", qenv.tid, "review?", "request", to=["claude"], needs_response=True)
+    qenv.post("codex", qenv.tid, "split the parser?", "proposal", to=["claude"])
+    qenv.post("codex", qenv.tid, "a task", "proposal", propose_task={"title": "t"})
     qenv.post("codex", qenv.tid, "fyi", "status")
-    qenv.post("codex", qenv.tid, "use sqlite", "decision")
+    qenv.post("human", qenv.tid, "use sqlite", "decision")
     qenv.post("human", qenv.tid, "anyone?", "question", needs_response=True)
     # A question to the human and an agent at once is refused: the human's question must be the human's alone.
     with pytest.raises(Invalid, match="nobody|address"):

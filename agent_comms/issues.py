@@ -255,6 +255,8 @@ def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, 
         _write(board, p, session_id, thread_id=thread_id)
         _link_target(board, p, thread_id, post_id)
         stored = json.dumps(question) if question else None
+        if stored is None and post_id is not None:
+            stored = _adoptable_question(board, post_id)
         covers = _covers(board, stored, post_id)
         # A source's own attention makes the link wait on the human only when this issue's question covers it; a
         # post asking its own question is its own Needs you item, answered on its own.
@@ -269,7 +271,9 @@ def create_issue(board, p, session_id, *, title, body, thread_id, post_id=None, 
         )
         _event(board, p, session_id, issue_id, "created", body)
     board._notify("issue.created", {"issue_id": issue_id})
-    return get_issue(board, p, issue_id)
+    out = get_issue(board, p, issue_id)
+    out["link"] = _link_out(thread_id, post_id, covers)
+    return out
 
 
 def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
@@ -282,7 +286,11 @@ def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
             "SELECT 1 FROM issue_links WHERE issue_id=? AND thread_id=? AND post_id IS ?",
             (issue_id, thread_id, post_id),
         ).fetchone()
-        if not exists:
+        if exists:
+            covers = bool(c.execute(
+                "SELECT covers_post FROM issue_links WHERE issue_id=? AND thread_id=? AND post_id IS ?",
+                (issue_id, thread_id, post_id)).fetchone()[0])
+        else:
             _write(board, p, session_id, issue_id, thread_id)
             covers = _covers(board, row["decision_question"], post_id)
             pending = int(post_id is None or (covers and _source_needs_human(board, post_id)))
@@ -300,7 +308,42 @@ def link_issue(board, p, session_id, issue_id, thread_id, post_id=None):
                 "linked",
                 f"Linked thread #{thread_id}" + (f" post #{post_id}" if post_id else ""),
             )
-    return get_issue(board, p, issue_id)
+    out = get_issue(board, p, issue_id)
+    out["link"] = _link_out(thread_id, post_id, covers)
+    return out
+
+
+def _adoptable_question(board, post_id):
+    """An issue raised from a post without a question of its own adopts the post's stored question (the exact JSON
+    text, so `db.ISSUE_COVERS` matches it): the issue then answers that post, and later asking posts that reuse the
+    question are covered when linked. A question with mechanical option actions is never adopted (issue questions
+    carry none), nor a sealed post's. Read inside the creating transaction, after the post was checked."""
+    row = board.conn.execute("SELECT decision_question, sealed FROM posts WHERE id=?", (post_id,)).fetchone()
+    if row is None or row["sealed"] or not row["decision_question"]:
+        return None
+    try:
+        question = json.loads(row["decision_question"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(question, dict) or any(isinstance(o, dict) and "action" in o
+                                             for o in question.get("options") or []):
+        return None
+    return row["decision_question"]
+
+
+def _link_out(thread_id, post_id, covers):
+    """What a link means for its post: whether this issue's answer answers it, and if not, why."""
+    if post_id is None:
+        return {"thread_id": thread_id, "post_id": None, "covers_post": None,
+                "coverage": "A thread link: the issue asks the human about this thread; it covers no post."}
+    if covers:
+        return {"thread_id": thread_id, "post_id": post_id, "covers_post": True,
+                "coverage": f"This issue's question covers post #{post_id}: the issue's answer answers it."}
+    return {"thread_id": thread_id, "post_id": post_id, "covers_post": False,
+            "coverage": (f"Post #{post_id} asks its own question (its decision_question is not exactly this issue's), "
+                         "so it stays its own Needs you item and the issue's answer does not answer it. To have the "
+                         "issue answer a post, post it with exactly the issue's decision_question (copy it from "
+                         "board_get_issue) before linking it.")}
 
 
 def comment_issue(board, p, session_id, issue_id, body, kind="comment", decision_question=None):

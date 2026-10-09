@@ -141,9 +141,9 @@ def _execute_task_action(board, p, session_id, question, action):
         from . import unstick
         if action['thread_id'] != thread_id:
             raise Forbidden('unstick must target the question thread')
-        # The dashboard's Unstick (same guardrails, cooldown and one-shot rule), only while one of the agents the
-        # question named is still among those the thread waits on.
-        result = unstick.unstick(board, p, thread_id, None, require_agents=action['agents'], _in_transaction=True)
+        # The dashboard's Unstick (same guardrails, cooldown and one-shot rule), limited to the agents the question
+        # names that the thread still waits on: a question can never ask or launch anyone else.
+        result = unstick.unstick(board, p, thread_id, None, only_agents=action["agents"], _in_transaction=True)
         return {'unstick_post_id': result['post_id'], 'agents': result['agents'], 'rule_id': result['rule_id']}
     from . import workstreams
     task = board.conn.execute('SELECT * FROM tasks WHERE id=?', (action['task_id'],)).fetchone()
@@ -165,7 +165,7 @@ def _execute_task_action(board, p, session_id, question, action):
                      f"declined by the human from decision #{question['id']}")
         from . import issues
         issues.reconcile_completed(board, p, session_id, thread_id)
-        return {'task_id': task['id'], 'status': 'declined'}
+        return {'task_id': task['id'], 'status': 'declined', 'previous_status': task['status']}
     if task['owner_session'] != action['expected_owner_session'] or task['status'] not in ('working', 'blocked'):
         raise Conflict(f"task {task['id']} changed hands or status since the question; reload before choosing")
     if live:
@@ -174,7 +174,7 @@ def _execute_task_action(board, p, session_id, question, action):
                           lease_expires_at=NULL, updated_at=? WHERE id=?""", (now, task['id']))
     board._event(board.conn, task['id'], 'release', task['status'], 'accepted', p, session_id,
                  f"released by the human from decision #{question['id']}")
-    return {'task_id': task['id'], 'status': 'accepted'}
+    return {'task_id': task['id'], 'status': 'accepted', 'previous_status': task['status']}
 
 
 def repost(board, p, session_id, post_id, recipient, expected_version, target_thread_id):

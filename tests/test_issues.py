@@ -162,7 +162,7 @@ def test_needs_you_not_hidden_by_newer_resolved_issues(env):
 
 def test_source_attention_uses_exact_existing_rules(env):
     thread = env.thread()
-    decision = env.post("codex", thread, type="decision", to=["claude"])
+    decision = env.post("codex", thread, type="decision", to=["claude"], decision_question=ASK)
     issue = create(env, thread_id=thread, post_id=decision["id"], needs_human=False)
     assert issue["needs_human"]
     thread = env.thread()
@@ -176,7 +176,7 @@ def test_source_attention_uses_exact_existing_rules(env):
     assert not issue["needs_human"]
     thread = env.thread()
     task = env.accepted_task(thread)
-    post = env.post("codex", thread, type="proposal", task_id=task)   # about an existing task: asks the human
+    post = env.post("codex", thread, type="proposal", task_id=task, decision_question=ASK)   # about an existing task: asks the human
     issue = create(env, thread_id=thread, post_id=post["id"], needs_human=False)
     assert issue["needs_human"]
 

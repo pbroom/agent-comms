@@ -462,7 +462,7 @@ test('an automatic-recovery escalation renders as a question with one-click task
     assert.deepEqual(cards(document, 110), ['Decline task 44', 'Ask codex to claim it (Unstick)', 'Write your own reply']);
     assert.deepEqual(badges(document, 110), ['Recommended', 'Alternative', '']);
     assert.match(node.textContent, /Declines task 44 if it is still accepted/);
-    assert.match(node.textContent, /Runs Unstick on thread #1 \(asks codex\)/);
+    assert.match(node.textContent, /Runs Unstick on thread #1 for codex only \(whichever the thread still waits on; nobody else is asked\)/);
     assert.match(document.querySelector('#needs-you [data-post="111"]').textContent, /Releases task 45 from session #70/);
     card(document, 110, 'option:ask-creator').click();
     assert.equal(primary(document, 110).textContent, 'Choose and unstick');

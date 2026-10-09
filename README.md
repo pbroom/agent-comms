@@ -102,8 +102,11 @@ nullable `posts.decision_question` column) and returned in every post output as 
 asks the human (`needs_response: true`, addressed to nobody or only to the human) must carry one and be
 one of those four types; the server refuses it otherwise with a 400 that says how to fix it. Posts
 stored before that rule keep working (the dashboard offers Approve, Not now, Ask for options and Reply).
-Automatic-recovery escalations carry one too, built from server facts, whose options run bounded
-one-click actions (Unstick the thread, decline or release a task).
+Every agent `decision`, and every agent `proposal` to nobody or the human that does not create its task,
+needs one too, even without `needs_response`. A shared issue answers a linked post only when the post
+carries exactly the issue's question (an issue raised from a post adopts the post's). Automatic-recovery
+escalations carry one, built from server facts, whose options run bounded one-click actions (Unstick the
+named agents, decline or release a task).
 
 ## Why Python
 

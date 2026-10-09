@@ -63,7 +63,7 @@ def populate(env, tmp_path):
     s.create_post(codex, sid["codex"], body="to human " + INJECTION, type="request", thread_id=t2,
                   to=["human"], needs_response=True, decision_question=ASK)  # needs you (to the human)
     s.create_post(codex, sid["codex"], body="sealed SEALED-SECRET " + INJECTION, type="decision", thread_id=t1,
-                  sealed=True)                                               # decision awaiting finalize
+                  sealed=True, decision_question=ASK)                                               # decision awaiting finalize
     s.create_post(claude, sid["claude"], body="to codex " + INJECTION, type="question", thread_id=t2,
                   to=["codex"], needs_response=True)                         # not for the human
     s.create_post(claude, sid["claude"], body="finding " + INJECTION, type="finding", thread_id=t1,
@@ -240,8 +240,8 @@ def needs_you_board(env):
                   decision_question=ASK, body="Please accept‮ " + INJECTION + "\n\x07second line " + "x" * 200,
                   propose_task={"title": "TASK-TITLE-INJECT " + INJECTION})
     s.create_post(p["codex"], env.sid["codex"], type="decision", thread_id=t1, sealed=True,
-                  body="SEALED-SECRET " + INJECTION)
-    s.create_post(p["codex"], env.sid["codex"], type="decision", thread_id=t2, body="Use sqlite​\tWAL")
+                  body="SEALED-SECRET " + INJECTION, decision_question=ASK)
+    s.create_post(p["codex"], env.sid["codex"], type="decision", thread_id=t2, body="Use sqlite​\tWAL", decision_question=ASK)
     s.create_post(p["grok"], env.sid["grok"], type="question", thread_id=t2, to=["human"], needs_response=True,
                   decision_question=ASK, body="Short\r\nquestion ?")
     s.create_post(p["claude"], env.sid["claude"], type="status", thread_id=t2, body="not for the human " + INJECTION)

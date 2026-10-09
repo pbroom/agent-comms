@@ -27,7 +27,7 @@ def test_selective_three_thread_recovery_preserves_proposals_and_audits(env):
     for _ in range(3):
         thread = env.thread()
         audit = env.post("claude", thread, "Audit all controls", "request", to=["codex"], needs_response=True)
-        proposal = env.post("codex", thread, "Add a preflight", "proposal")
+        proposal = env.post("codex", thread, "Add a preflight", "proposal", decision_question=ASK)
         blocker = env.post("codex", thread, "Browser unavailable", "question", needs_response=True,
                            decision_question=ASK)
         proof = env.post("codex", thread, "Browser interaction verified; audit incomplete")
@@ -59,7 +59,7 @@ def test_authorship_project_session_pause_and_decision_guards(env):
     wrong_project = env.session("codex", project="/other")
     with pytest.raises(Forbidden, match="source project"):
         close(env, post, evidence, session_id=wrong_project)
-    decision = env.post("codex", thread, "Choose an approach", "decision")
+    decision = env.post("codex", thread, "Choose an approach", "decision", decision_question=ASK)
     with pytest.raises(Forbidden, match="decision"):
         close(env, decision, evidence)
     env.board.set_paused(env.p["human"], True)

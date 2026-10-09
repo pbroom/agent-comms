@@ -317,10 +317,10 @@ def test_proposal_about_an_existing_task_needs_the_human_but_propose_task_does_n
     tid = env.thread()
     created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
     task_id = env.accepted_task(tid, title='Existing task')
-    about = env.post('codex', tid, 'Change the approach on the existing task?', 'proposal', task_id=task_id)
+    about = env.post('codex', tid, 'Change the approach on the existing task?', 'proposal', task_id=task_id, decision_question=ASK)
     to_agents = env.post('codex', tid, 'Between us', 'proposal', task_id=task_id, to=['claude'])
     # The second proposal on the propose_task task is not the one that created it.
-    again = env.post('codex', tid, 'And on the new one too?', 'proposal', task_id=created['task_id'])
+    again = env.post('codex', tid, 'And on the new one too?', 'proposal', task_id=created['task_id'], decision_question=ASK)
     assert pending(env) == {about['id'], again['id']}
     assert created['id'] not in pending(env) and to_agents['id'] not in pending(env)
 
@@ -329,10 +329,10 @@ def test_migration_records_which_proposal_created_its_task(env):
     tid = env.thread()
     created = env.post('codex', tid, 'Let me do this', 'proposal', propose_task={'title': 'New task'})
     env.clock.advance(60)
-    about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'])
+    about = env.post('codex', tid, 'And this?', 'proposal', task_id=created['task_id'], decision_question=ASK)
     c = env.board.conn
     done = env.accepted_task(tid, title='Finished long ago')
-    old_done = env.post('claude', tid, 'Old proposal on a finished task', 'proposal', task_id=done)
+    old_done = env.post('claude', tid, 'Old proposal on a finished task', 'proposal', task_id=done, decision_question=ASK)
     env.board.transition_task(env.p['human'], env.sid['human'], done, 'done')
     c = env.board.conn
     c.execute('ALTER TABLE tasks DROP COLUMN proposed_by_post')
@@ -343,5 +343,5 @@ def test_migration_records_which_proposal_created_its_task(env):
     assert {about['id'], old_done['id']} <= {r[0] for r in c.execute('SELECT source_post_id FROM legacy_attention_answers')}
     db.init_schema(c)                                    # idempotent
     # A proposal about an existing task posted after the upgrade does need the human.
-    fresh = env.post('codex', tid, 'And now this?', 'proposal', task_id=created['task_id'])
+    fresh = env.post('codex', tid, 'And now this?', 'proposal', task_id=created['task_id'], decision_question=ASK)
     assert pending(env) == {fresh['id']}

@@ -8,6 +8,7 @@ from mcp import Client
 from agent_comms import attention
 from agent_comms.core import Forbidden
 from agent_comms.mcp_server import build_mcp
+from conftest import ASK
 
 
 def pending(env):
@@ -18,10 +19,10 @@ def completed_proposal(env):
     thread = env.thread()
     task = env.accepted_task(thread, title='Authorized repair')
     source = env.post('codex', thread, 'Implement the authorized repair', 'proposal',
-                      task_id=task, needs_response=False)
-    neighbor = env.post('codex', thread, 'Also change the release policy?', 'proposal', task_id=task)
-    foreign = env.post('claude', thread, 'Change the deployment target?', 'proposal', task_id=task)
-    decision = env.post('codex', thread, 'Choose the next rollout', 'decision', task_id=task)
+                      task_id=task, needs_response=False, decision_question=ASK)
+    neighbor = env.post('codex', thread, 'Also change the release policy?', 'proposal', task_id=task, decision_question=ASK)
+    foreign = env.post('claude', thread, 'Change the deployment target?', 'proposal', task_id=task, decision_question=ASK)
+    decision = env.post('codex', thread, 'Choose the next rollout', 'decision', task_id=task, decision_question=ASK)
     env.board.claim_task(env.p['codex'], env.sid['codex'], task)
     env.board.transition_task(env.p['codex'], env.sid['codex'], task, 'done')
     proof = env.post('codex', thread, 'Exact authorized repair merged and activated; policy unchanged',

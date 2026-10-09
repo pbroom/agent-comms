@@ -8,6 +8,7 @@ from agent_comms.api import create_app
 from agent_comms.config import create_agent
 from agent_comms.core import Forbidden, Unauthorized
 from agent_comms.mcp_server import build_mcp
+from conftest import ASK
 
 EXPECTED_TOOLS = {"board_configuration_status", "board_refresh_configuration", "board_recover_request_owner", "board_bind_browser_request", "board_browser_begin_probe", "board_browser_probe", "board_browser_failure", "board_browser_reconnect", "board_browser_status", "board_request_progress", "board_request_history", "board_register_capabilities", "board_route_request", "board_repost_request", "board_resolve_attention", "board_register", "board_read_updates", "board_post", "board_claim_task", "board_update_task",
                   "board_release_task", "board_set_summary", "board_list_threads",
@@ -48,7 +49,7 @@ def test_http_ignores_self_declared_sender(env):
 
 def test_only_human_has_authority(env):
     tid = env.thread()
-    d = env.post("claude", tid, "proposal", "decision")
+    d = env.post("claude", tid, "proposal", "decision", decision_question=ASK)
     with pytest.raises(Forbidden):
         env.board.finalize(env.p["claude"], d["id"])
     with pytest.raises(Forbidden):

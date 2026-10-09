@@ -94,8 +94,11 @@ PURPOSE = ("Automatic recovery on thread {thread} (the human's board setting aut
            "the thread's existing request.")
 ESCALATION = ("Automatic recovery did not take (sent by the dispatcher under the human's board setting "
               "auto_recover_stalled_work; not a human click): {items}. No further automatic launches will be made "
-              "for {them}. This needs you: pick one of the options below, or open the thread and check the named "
-              "request and task.")
+              "for {them}. This needs you: {next}")
+ESCALATION_NEXT = "pick one of the options below, or open the thread and check the named request and task."
+# Only when its question could not be built (escalation_question failed): then there are no options to pick.
+ESCALATION_NEXT_PLAIN = ("open the thread and check the named request and task, then Unstick, reassign or decline "
+                         "the task.")
 
 
 def task_key(task_id: int, lease_expires_at: float) -> str:
@@ -615,7 +618,7 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
 # ---------------------------------------------------------------- escalation to the human
 
 
-def _escalation_body(entries: list[tuple[dict, str]]) -> str:
+def _escalation_body(entries: list[tuple[dict, str]], structured: bool = True) -> str:
     parts = []
     for rec, reason in entries[:MAX_ITEMS]:
         what = "abandoned" if rec["kind"] == "abandoned" else "unclaimed"
@@ -623,7 +626,8 @@ def _escalation_body(entries: list[tuple[dict, str]]) -> str:
     if len(entries) > MAX_ITEMS:
         parts.append(f"{len(entries) - MAX_ITEMS} more")
     them = "this stall" if len(entries) == 1 else "these stalls"
-    return ESCALATION.format(items="; ".join(parts), them=them)
+    return ESCALATION.format(items="; ".join(parts), them=them,
+                             next=ESCALATION_NEXT if structured else ESCALATION_NEXT_PLAIN)
 
 
 def _option(id_: str, label: str, description: str, action: dict | None = None) -> dict:
@@ -635,8 +639,8 @@ def _option(id_: str, label: str, description: str, action: dict | None = None) 
 
 def _unstick_option(id_: str, label: str, thread_id: int, agents: list[str], what: str) -> dict:
     return _option(id_, label, (
-        f"Runs Unstick on thread #{thread_id}, as if you clicked it: posts a request as you to the agents the thread "
-        f"waits on ({', '.join(agents)} among them) to {what}, and allows one launch of each. Costs an agent run "
+        f"Runs Unstick on thread #{thread_id}, as if you clicked it, for {', '.join(agents)} only: posts a request as you to "
+        f"whichever of them the thread still waits on to {what}, and allows one launch of each. Costs an agent run "
         "(tokens); the server refuses it if the thread no longer waits on them or was unstuck in the last two minutes."),
         {"type": "unstick", "thread_id": thread_id, "agents": agents})
 
@@ -648,9 +652,9 @@ def escalation_question(board: Board, thread_id: int, entries: list[tuple[dict, 
     reason, `detail`, is left out). Each option either runs a bounded decision action (decision_actions.py: unstick,
     decline_task, release_task, rechecked against the current state when chosen) or only answers.
 
-    One question per post. Several stalls on one thread (a grouped escalation) get one Unstick for the thread, which
-    asks every agent the thread waits on about all of its stalled tasks at once, rather than an action on the first
-    task alone, which would leave the others hidden behind an answered item."""
+    One question per post. Several stalls on one thread (a grouped escalation) get one Unstick for the agents the post
+    names, which asks each of them about all of its stalled tasks on the thread at once, rather than an action on the
+    first task alone, which would leave the others hidden behind an answered item."""
     if len(entries) > 1:
         ids = [rec["task_id"] for rec, _ in entries]
         agents = list(dict.fromkeys(rec["agent"] for rec, _ in entries))
@@ -792,7 +796,8 @@ def _post_escalation(board: Board, human: Principal, fence: tuple[str, str], thr
                       thread_id)
         question = None
     post, _ = human_actions.post_as_human(
-        board, human, thread_id=thread_id, body=_escalation_body(pairs), type="question" if question else "status",
+        board, human, thread_id=thread_id, body=_escalation_body(pairs, question is not None),
+        type="question" if question else "status",
         to=[], needs_response=True, decision_question=question, post_check=check, post_hook=record)
     log.warning("automatic recovery did not take on thread %s (tasks %s); told the human in post %s", thread_id,
                 [rec["task_id"] for _, rec, *_ in entries], post["id"])

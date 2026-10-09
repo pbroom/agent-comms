@@ -1200,11 +1200,11 @@ an agent or the dispatcher) stays out, as do bodies, titles and summaries. The o
 | Abandoned task, blocked | Relaunch the owner to report what it needs (`unstick`) | Keep it blocked (answers only) |
 | Abandoned, not launched, recovery failed, budget or per-task limit spent | Relaunch the owner (`unstick`) | Release task T (`release_task` from the silent session; "Leave it for now" if the task has no owner session) |
 | Abandoned, request held by a browser denial | Release task T | Relaunch the owner, after changing the permission |
-| Several stalls on one thread | Unstick the thread (asks every agent named) | Leave them for now (answers only) |
+| Several stalls on one thread | Unstick the thread for the agents named | Leave them for now (answers only) |
 
-*Grouped escalations* get one question with a thread-wide Unstick rather than one question per task or an action on
-the first task. Unstick already asks every agent the thread waits on about all of its stalled tasks (unclaimed
-creators, expired-lease and blocked owners), so one click covers every task the post names. An action on the first
+*Grouped escalations* get one question with an Unstick for every agent the post names rather than one question per
+task or an action on the first task. Unstick asks each of those agents about all of its stalled tasks on the thread
+(unclaimed creators, expired-lease and blocked owners), so one click covers every task the post names. An action on the first
 task alone would hide the others behind an answered item (`list_records` stops showing an escalation once its post is
 answered), and one post per task would multiply Needs you items against the per-agent escalation cap. The human can
 still decline or release a single task from the thread, or write their own reply.
@@ -1215,9 +1215,12 @@ inside the answer's write transaction (`resolve._mechanical`: the action, a serv
 answer commit together, a retry returns the stored receipt, and the answer link clears the item from Needs you):
 - `unstick {thread_id, agents}`: the dashboard's Unstick for the question's own thread, with its guardrails (open
   thread, the stuck agents computed from the database, a fresh one-shot rule bound to the post, the 2-minute cooldown
-  stamp, recovery links). It runs in the caller's transaction (`unstick.unstick(..., _in_transaction=True)`, which
-  passes it on to `reserve_cooldown`, `create_dispatch_rule` and `post_as_human`), so a refusal rolls the stamp, rule
-  and post back together. 409 when none of `agents` is still among those the thread waits on.
+  stamp, recovery links), limited to the named agents (`only_agents`): it asks and launches only those of them the
+  thread still waits on, with only their reasons, never every stuck agent. That bounds what a question an agent wrote
+  can launch to the agents it names. 409 when none of them is still stuck. It runs in the caller's transaction
+  (`unstick.unstick(..., _in_transaction=True)`, passed on to `reserve_cooldown`, `create_dispatch_rule` and
+  `post_as_human`), so a refusal or any later failure (the receipt, the answer) rolls the stamp, rule, binding and
+  post back together, and a retry works.
 - `decline_task {task_id, expected_status}`: 409 unless the task is still in that status and nobody holds a live
   lease on it.
 - `release_task {task_id, expected_owner_session}`: clears the owner and lease and returns the task to `accepted`;
@@ -1225,7 +1228,13 @@ answer commit together, a retry returns the stored receipt, and the answer link 
   Requests the old session holds stay as they are (`board_recover_request_owner` handles them).
 All three: the target must be in the question's thread (403), not a managed continuation (403), on an open thread and
 an unpaused board (409). They write task events as the human with a note naming the question. Agents may also attach
-them to their own questions; only the human's choice runs them, so they grant nothing by themselves.
+them to their own questions; only the human's choice runs them, so they grant nothing by themselves. Once the answer
+commits, `resolve._notify_committed` sends the events the same changes made one by one would have: `post.created` for
+every post the transaction made (the Unstick request, the receipt, the answer), and `task.transition` or
+`task.released`. A retry that returns the stored receipt sends nothing.
+
+*Fallback.* If the question cannot be built or validated, the escalation still posts, as a plain `status` whose body
+says to open the thread and Unstick, reassign or decline (not "pick one of the options below").
 
 **Dashboard.** Unchanged component: the escalation shows Recommended, Alternative and Write your own reply. New effect
 lines for the three actions, the primary button names the verb ("Choose and decline"), and posts flagged
@@ -1238,15 +1247,36 @@ the human).
 author (MCP, HTTP, CLI, request replies): a post with `needs_response=true` that reaches the human (`to` empty or
 naming the human: the needs-response half of `NEEDS_YOU_SOURCE`) must be a `question`, `proposal`, `decision` or
 `request` and carry a `decision_question`, and may not also be addressed to an agent. The 400 says exactly what to
-send, and that `needs_response=false` informs without asking. We looked for an explicit mechanism for genuinely open
-questions and found none (only a sentence in AGENT_RULES), so there is no exception: the human can always write their
-own reply, and an agent can offer its two best concrete answers. Unchanged: proposals and decisions without
-`needs_response` still enter Needs you through their own clauses (Approve / Not now, Finalize / Reject), continuation
-handoffs are exempt (their recipients are recorded agents), and posts stored earlier keep working.
-*Consequence for shared issues:* an issue covers a linked post only when the post has no question or exactly the
-issue's (`db.ISSUE_COVERS`, unchanged). Since new asking posts all carry a question, an issue answers them only when
-it was raised with the same `decision_question`; otherwise they stay separate items. Tests that relied on plain
-covered posts now create legacy posts explicitly (`conftest.legacy_plain`) or give the issue the post's question.
+send, and that `needs_response=false` informs without asking. The same check covers the posts that wait on the human
+through `NEEDS_YOU_SOURCE`'s other clauses, without `needs_response` (review of #56; live #554 was such a proposal):
+every agent `decision` (only the human finalizes it, so it waits whoever it is addressed to; `_post_question` now
+accepts a question on a decision addressed to agents) and every agent `proposal` addressed to nobody or to the human,
+except one that creates its task (`propose_task`, left to the task flow, exactly as the Needs you rule excludes it).
+A proposal addressed only to agents is between agents and needs nothing. We looked for an explicit mechanism for
+genuinely open questions and found none (only a sentence in AGENT_RULES), so there is no exception: the human can
+always write their own reply, and an agent can offer its two best concrete answers. Continuation handoffs are exempt
+(their recipients are recorded agents), and posts stored earlier keep working.
+
+**Shared issues keep covering the posts they represent** (review of #56). An issue covers a linked post only when the
+post has no question or exactly the issue's (`db.ISSUE_COVERS`, unchanged). Since new asking posts all carry a
+question, an issue raised from a post without a question of its own used to cover nothing: two threads asking the
+same question and linked to one issue showed three Needs you items, and answering the issue left both posts pending.
+Now:
+- `create_issue` with a `post_id` and no `decision_question` adopts the post's stored question text (byte for byte,
+  so it matches), unless the question has mechanical option actions (issue questions carry none) or the post is
+  sealed. The issue then covers and answers that post.
+- Agents linking a post to an existing issue post it with the issue's `decision_question` copied verbatim from
+  `board_get_issue` (AGENT_RULES, both skills, the MCP descriptions, the ChatGPT instructions). Re-normalizing a stored
+  question is idempotent, so the copy matches.
+- `create_issue` and `link_issue` return `link: {thread_id, post_id, covers_post, coverage}`, where `coverage` says
+  whether the issue's answer answers the post and, when it does not, why and how to fix it.
+- *Exact match, not a semantic one.* We considered covering a post whose question has the same text and option ids.
+  We kept byte equality: two questions with the same ids can still differ in what an option does (its description or
+  outcome: `approved` on one, `declined` on the other), and an issue answer would then approve something the post
+  described differently. With adoption and verbatim reuse, exact equality is easy to meet. The NULL/IS semantics are
+  unchanged (a post with a question is never covered by an issue without one).
+Tests that relied on plain covered posts create legacy posts explicitly (`conftest.legacy_plain`), raise the issue from
+the thread when they need a question-less issue, or reuse the question.
 
 **A run can read its own request.** A new session's cursors start at the agent-wide maximum (`register_session`), so
 when another session of the same agent had already read past the request, the dispatched run never saw it as unread,

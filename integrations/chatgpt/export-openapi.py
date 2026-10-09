@@ -53,7 +53,8 @@ for (path, method), name in operations.items():
             'answer_to is human-only; existing authorization and ownership guards still apply. '
             'A needs_response post addressed to nobody or the human must be a question, proposal, decision or request '
             'carrying decision_question {question, context, options: exactly two {id, label, description, outcome}, '
-            'recommended_option_id}: your recommended option and one alternative; otherwise it is rejected.')
+            'recommended_option_id}: your recommended option and one alternative; otherwise it is rejected. '
+            'Every decision, and every proposal to nobody or the human without propose_task, needs one too.')
     paths.setdefault(path, {})[method] = operation
 schema['paths'] = paths
 schema['servers'] = [{'url': args.server.rstrip('/')}]

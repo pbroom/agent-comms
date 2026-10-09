@@ -215,6 +215,7 @@ def _mechanical(board, p, item, option, question, note):
             return result
         if not _needs_you(c, item['id']):
             raise Conflict('this decision no longer needs you')
+        first_new_post = c.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM posts').fetchone()[0]
         result = decision_actions.execute(board, p, session_id, item, option['action'])
         action = option['action']
         target = f"request #{action.get('post_id')}/{action.get('recipient')}"
@@ -245,4 +246,21 @@ def _mechanical(board, p, item, option, question, note):
                'action_result': result, 'receipt_post_id': receipt['id']}
         c.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
                   (key, json.dumps(out), p.name, board.now()))
-        return out
+    _notify_committed(board, p, first_new_post, option['action'], result)
+    return out
+
+
+def _notify_committed(board, p, first_new_post, action, result):
+    """The events the same changes made one by one would have sent, once the answer's transaction committed: every
+    post it created (the action's own, the receipt and the answer; writes are serialized, so posts from
+    `first_new_post` on are this transaction's) and the task change. Notifications are best effort, as elsewhere."""
+    for r in board.conn.execute('SELECT id, thread_id, agent, to_agents, needs_response, sealed FROM posts WHERE id >= ? '
+                                'ORDER BY id', (first_new_post,)).fetchall():
+        board._notify('post.created', {'post_id': r['id'], 'thread_id': r['thread_id'], 'agent': r['agent'],
+                                       'to': json.loads(r['to_agents']), 'needs_response': bool(r['needs_response']),
+                                       'sealed': bool(r['sealed'])})
+    if action['type'] == 'decline_task':
+        board._notify('task.transition', {'task_id': result['task_id'], 'from': result['previous_status'],
+                                          'to': 'declined', 'agent': p.name})
+    elif action['type'] == 'release_task':
+        board._notify('task.released', {'task_id': result['task_id'], 'agent': p.name})

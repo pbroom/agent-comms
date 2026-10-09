@@ -23,7 +23,7 @@ def q(n):
 def ask(env, tid, who="codex", type="question", **kw):
     """A post that asks the human. Without a question of its own it is a legacy plain post (stored before every
     asking post had to carry one; live boards still hold them)."""
-    plain = type != "decision" and "decision_question" not in kw
+    plain = "decision_question" not in kw
     post_id = env.post(who, tid, f"{type} from {who}", type, needs_response=type != "decision",
                        **({"decision_question": ASK} if plain else {}), **kw)["id"]
     if plain:
@@ -57,7 +57,8 @@ def test_one_thread_several_posts_each_answered_alone(env):
     plain = ask(env, tid)
     structured = ask(env, tid, "claude", decision_question=q(1))
     decision = ask(env, tid, "codex", "decision")
-    proposal = env.post("claude", tid, "proposal", "proposal")["id"]
+    proposal = env.post("claude", tid, "proposal", "proposal", decision_question=ASK)["id"]
+    legacy_plain(env, proposal)                         # a plain proposal, as stored before questions were required
     structured_decision = ask(env, tid, "claude", "decision", decision_question=q(2))
     every = sorted([plain, structured, decision, proposal, structured_decision])
     post = client(env)
@@ -156,10 +157,12 @@ def test_post_with_its_own_question_does_not_make_its_issue_wait(env):
     t1, t2 = env.thread("one"), env.thread("two")
     own = ask(env, t1, decision_question=q(1))
     later = ask(env, t2, "claude", decision_question=q(2))
+    # Raised from the thread (raised from the post, it would adopt the post's question and cover it), then linked.
     issue = issues.create_issue(env.board, env.p["codex"], env.sid["codex"], title="Context", body="b",
-                                thread_id=t1, post_id=own, needs_human=False)["id"]
+                                thread_id=t1, needs_human=False)["id"]
+    issues.link_issue(env.board, env.p["codex"], env.sid["codex"], issue, t1, own)
     issues.link_issue(env.board, env.p["claude"], env.sid["claude"], issue, t2, later)
-    assert links(env, issue) == {own: (False, False), later: (False, False)}
+    assert links(env, issue) == {None: (None, False), own: (False, False), later: (False, False)}
     assert waiting_issues(env) == {} and needs_you(env) == sorted([own, later])
     assert client(env)(f"/api/posts/{own}/resolve", {"action": "choose", "option_id": "a"}).status_code == 200
     assert waiting_issues(env) == {} and needs_you(env) == [later]
@@ -242,8 +245,10 @@ def test_upgrade_backfill_does_not_cover_a_post_question_when_the_issue_has_none
     # Review of #42: `p.q = i.q` is NULL when the issue has no question, and COALESCE(NULL, 1) marked the post covered.
     tid = env.thread()
     own = ask(env, tid, decision_question=q(2))
+    # Raised from the thread, not the post (an issue raised from the post adopts its question), then linked to it.
     issue = issues.create_issue(env.board, env.p["codex"], env.sid["codex"], title="No question", body="b",
-                                thread_id=tid, post_id=own, needs_human=False)["id"]
+                                thread_id=tid, needs_human=False)["id"]
+    issues.link_issue(env.board, env.p["codex"], env.sid["codex"], issue, tid, own)
     conn = env.board.conn
     conn.execute("ALTER TABLE issue_links DROP COLUMN covers_post")
     db.init_schema(conn)

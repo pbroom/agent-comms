@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from agent_comms import db
+from conftest import ASK
 
 
 def raw_post(c, env, thread, kind='proposal', task_id=None):
@@ -24,7 +25,7 @@ def test_current_propose_task_links_source_and_removes_permit(env):
     assert human['agent'] == 'human'
     assert not env.board.conn.execute('SELECT * FROM proposal_write_permit').fetchall()
     # Existing-task proposals still ask for a decision; no blanket suppression.
-    another = env.post('codex', thread, type='proposal', task_id=post['task_id'])
+    another = env.post('codex', thread, type='proposal', task_id=post['task_id'], decision_question=ASK)
     assert another['id'] in {p['id'] for p in env.board.snapshot(env.p['human'])['needs_you']}
 
 
@@ -90,7 +91,7 @@ def test_other_connection_cannot_borrow_uncommitted_permit(env):
 
 def test_v11_upgrade_installs_fence_without_reclassifying_sources(env):
     thread = env.thread()
-    post = env.post('codex', thread, type='proposal')
+    post = env.post('codex', thread, type='proposal', decision_question=ASK)
     c = env.board.conn
     c.execute('DROP TRIGGER proposal_writer_fence')
     c.execute('DROP TABLE proposal_write_permit')

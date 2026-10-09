@@ -1786,7 +1786,7 @@ async function resolveItem(item, action, text, extra = {}) {
 // Reject. Write your own reply is always last. `button` is the primary button's label once the card is picked.
 function mechanicalEffect(a) {
   if (!a) return null;
-  if (a.type === 'unstick') return `Runs Unstick on thread #${a.thread_id} (asks ${(a.agents || []).join(', ')}); allows one launch each. Runs on the server.`;
+  if (a.type === 'unstick') return `Runs Unstick on thread #${a.thread_id} for ${(a.agents || []).join(', ')} only (whichever the thread still waits on; nobody else is asked); allows one launch each. Runs on the server.`;
   if (a.type === 'decline_task') return `Declines task ${a.task_id} if it is still ${a.expected_status}. Runs on the server; no agent turn.`;
   if (a.type === 'release_task') return `Releases task ${a.task_id} from session #${a.expected_owner_session} (back to accepted, unowned). Runs on the server; no agent turn.`;
   const source = `request #${a.post_id}/${a.recipient} (version ${a.expected_version})`;

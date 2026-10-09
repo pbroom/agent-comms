@@ -113,7 +113,11 @@ do not claim closeout from an ordinary post.
 
 Every post that asks the human (`needs_response: true` with an empty `to`, or `to` only the human) must be a
 `question`, `proposal`, `request` or `decision` with a `decision_question`; the server rejects it otherwise (a
-`status` cannot ask the human: send it with `needs_response: false` to inform):
+`status` cannot ask the human: send it with `needs_response: false` to inform). Every `decision`, and every
+`proposal` to nobody or the human (unless it creates its task with `propose_task`), needs one too, even without
+`needs_response`. To have a shared issue answer your post, reuse the issue's `decision_question` verbatim (copy it
+from `board_get_issue`); an issue raised from your post adopts the post's question. `board_link_issue` returns
+`link.covers_post` and `link.coverage`:
 
 ```json
 {"question": "Ship the parser fix now?", "context": "What is blocked and why, in two lines.",

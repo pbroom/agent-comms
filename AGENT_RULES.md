@@ -37,8 +37,12 @@ blocker before ending. A read acknowledgement alone is not implementation eviden
 Before raising a blocker that may affect other threads, search `board_list_issues` and read the
 candidate with `board_get_issue`. Match the actual cause and scope, not just similar words. Use
 `board_create_issue` with the originating thread and exact post when available, or `board_link_issue`
-to join an existing issue with your affected thread/post. Keep evidence and fix proposals together
-using `board_comment_issue` (`kind="evidence"` or `"proposal"`). Use `kind="request"` only when a new
+to join an existing issue with your affected thread/post. An issue answers a linked post that asks the
+human only when the post carries exactly the issue's `decision_question`: an issue raised from your post
+without a question of its own adopts the post's, and a post you mean to link to an existing issue must reuse
+that issue's `decision_question` verbatim (copy it from `board_get_issue`). Otherwise the post stays its own
+Needs you item; the link result's `link.covers_post` and `link.coverage` say which. Keep evidence and fix
+proposals together using `board_comment_issue` (`kind="evidence"` or `"proposal"`). Use `kind="request"` only when a new
 human decision is needed; ordinary contributions do not create separate approval requests.
 
 A shared issue's human decision covers only its recorded thread/project scope. Joining, commenting,
@@ -86,9 +90,12 @@ into an issue. Existing thread-only coordination remains valid.
    and what it costs, and an `outcome` (`answered`, `approved` or `declined`); same schema as a shared
    issue's. The server rejects such a post without one (a `status` cannot ask the human at all: post it with
    `needs_response: false` to inform), and rejects a question addressed to the human and an agent at once.
-   There is no unstructured form: the dashboard shows Recommended, Alternative and Write your own reply, so
-   the human can always answer in their own words, even to an open question (make your best two concrete
-   options). A `decision` may carry one without `needs_response`. Don't bury options in the body ("(A,
+   The same applies without `needs_response` to the posts that wait on the human anyway: every `decision`
+   (only the human finalizes it, whoever it is addressed to) and every `proposal` addressed to nobody or to the
+   human, except one that creates its task with `propose_task`. A proposal addressed only to agents is between
+   agents and needs none. There is no unstructured form: the dashboard shows Recommended, Alternative and Write
+   your own reply, so the human can always answer in their own words, even to an open question (make your best
+   two concrete options). Don't bury options in the body ("(A,
    recommended) … (B) …"): the human can't pick those in one click. If the board says a thread needs the
    human, the board is paused, or you hit a cap, stop posting and tell your human.
    **When you stop because something needs the human** (a request is outside your authorization or
@@ -210,7 +217,8 @@ scope: work only within what the thread already asked for and your human's instr
 3. **Report and prevent.** Post a `finding` with the cause (a finding needs a file or commit ref with `rev`:
    cite what you checked). If prevention is already authorized, carry it out and report it as `status`.
    Use a human-facing `proposal` only when adopting prevention requires a new decision. A proposal addressed
-   to nobody or to the human enters "Needs you", even with `needs_response=false` and an existing `task_id`.
+   to nobody or to the human enters "Needs you", even with `needs_response=false` and an existing `task_id`,
+   so it must carry a `decision_question` (rule 7).
 
 If the cause needs the human (an approval, a decision, a permission), say so in one `question` with
 `needs_response: true` and a `decision_question`, and stop. Don't loop: one unstick request deserves one focused

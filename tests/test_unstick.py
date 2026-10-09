@@ -169,8 +169,8 @@ def test_rule_then_post_with_fixed_body(uenv, monkeypatch):
     assert post["body"] == (
         f"Unstick: this thread is stalled on codex, grok (#{a['id']} has had no reply from codex; task {t} is "
         "blocked (owner grok)). Find the root cause of the stall, resolve it now, and post a `finding` with the "
-        "cause plus a `proposal` for preventing it next time, with an empty `to` so it reaches the human. Stay "
-        "within what this thread already asked for.")
+        "cause plus a `proposal` for preventing it next time, with an empty `to` and a `decision_question` so it "
+        "reaches the human. Stay within what this thread already asked for.")
     assert rule["created_at_ts"] <= e.board.conn.execute("SELECT created_at FROM posts WHERE id = ?",
                                                          (post["id"],)).fetchone()[0]
     assert e.board.get_thread(e.p["human"], e.tid)["agent_posts_since_human"] == 0   # resets the cap

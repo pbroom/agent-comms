@@ -33,8 +33,8 @@ MAX_REASONS = 20         # reasons listed in the body (keeps it far below the bo
 PURPOSE = ("Unstick thread {thread}: diagnose why it stalled, resolve it, and propose a prevention; "
            "stay within the thread's existing request.")
 BODY_INSTRUCTIONS = ("Find the root cause of the stall, resolve it now, and post a `finding` with the cause plus a "
-                     "`proposal` for preventing it next time, with an empty `to` so it reaches the human. Stay within what this "
-                     "thread already asked for.")
+                     "`proposal` for preventing it next time, with an empty `to` and a `decision_question` so it "
+                     "reaches the human. Stay within what this thread already asked for.")
 
 
 def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
@@ -127,11 +127,12 @@ def build_body(agents: list[str], reasons: list[dict]) -> str:
 
 
 def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.DispatchConfig | None, *,
-            require_agents: list[str] | None = None, _in_transaction: bool = False) -> dict[str, Any]:
-    """`require_agents` (a decision action, decision_actions.py): refuse (409) unless at least one of these agents is
-    still among those the thread waits on. `_in_transaction`: run inside the caller's write transaction (the human's
-    answer to that question), so the cooldown stamp, the rule and the post commit or roll back with the answer; the
-    result then has no launch outlook (`config` is unused)."""
+            only_agents: list[str] | None = None, _in_transaction: bool = False) -> dict[str, Any]:
+    """`only_agents` (a decision action, decision_actions.py): ask and launch only those of these agents the thread
+    still waits on, with only their reasons; refuse (409) when none of them is. This bounds what a question (an agent
+    may write one) can launch to the agents it names. `_in_transaction`: run inside the caller's write transaction (the
+    human's answer to that question), so the cooldown stamp, the rule and the post commit or roll back with the
+    answer; the result then has no launch outlook (`config` is unused)."""
     board._require_human(p, "unstick a thread")
     thread = board._thread_row(thread_id)
     if thread["status"] != "open":
@@ -140,8 +141,11 @@ def unstick(board: Board, p: Principal, thread_id: int, config: dispatch.Dispatc
     if not agents:
         raise Conflict("nothing here is waiting on an agent (no unanswered requests to an agent, blocked tasks, "
                        "expired leases or unclaimed tasks); if the thread is waiting on you, reply to it")
-    if require_agents is not None and not set(require_agents) & set(agents):
-        raise Conflict(f"thread {thread_id} no longer waits on {', '.join(require_agents)}; reload before choosing")
+    if only_agents is not None:
+        agents = [a for a in agents if a in only_agents]
+        reasons = [r for r in reasons if r["agent"] in agents]
+        if not agents:
+            raise Conflict(f"thread {thread_id} no longer waits on {', '.join(only_agents)}; reload before choosing")
     key = STATE_PREFIX + str(thread_id)
     human_actions.reserve_cooldown(
         board, p, key, UNSTICK_COOLDOWN_SECONDS,
