@@ -1507,8 +1507,10 @@ class Dispatcher:
             template = self._runner(agent)
             if template is None:
                 raise LookupError(f"no runner configured for {agent}")
-            if project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude":
-                from . import runner_preflight
+            from . import runner_preflight
+            # A read-only runner (the triage agent's) keeps its own narrower tools: the scoped override would widen it.
+            if (project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude"
+                    and not runner_preflight.read_only(template)):
                 template = runner_preflight.scoped_template(template)
                 session = str(uuid.uuid4())
                 versions = {r["recipient"]: r["version"] for r in requests.for_post(self.board, post)

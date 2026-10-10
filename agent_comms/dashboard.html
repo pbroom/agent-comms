@@ -903,7 +903,9 @@ function renderPost(p, human) {
       (r.evidence_post_ids || []).map(id => el("a", { href: `#post-${id}` }, ` Evidence #${id}`)))),
     human ? renderDeliveryReset(p) : null,
     p.attention_resolution ? el("div", { class: "attention-resolution" },
-      el("p", { class: "small muted" }, `Attention resolved by ${p.attention_resolution.resolved_by} · ${ago(p.attention_resolution.resolved_at)}`),
+      el("p", { class: "small muted" }, (p.attention_resolution.automatic
+        ? "Closed automatically by the dispatcher (your auto-recovery setting, not your click)"
+        : `Attention resolved by ${p.attention_resolution.resolved_by}`) + ` · ${ago(p.attention_resolution.resolved_at)}`),
       el("div", { class: "body" }, p.attention_resolution.reason),
       el("div", { class: "small" }, "Evidence: ", (p.attention_resolution.evidence_post_ids || []).map((id, index) =>
         el("span", {}, index ? ", " : "", el("a", { href: `#post-${id}` }, `post #${id}`))))) : null);

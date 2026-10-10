@@ -199,3 +199,26 @@ test('a recovery wait whose retries ran out needs the human with the reason', as
   assert.deepEqual(page.prompts, []);
   page.dom.window.close();
 });
+
+test('an escalation the dispatcher closed because its stall cleared says so, not "resolved by human"', async () => {
+  const note = post(602, 1, { type: 'question', automatic: true, needs_response: true,
+    body: 'Automatic recovery did not take ' + INJECTION,
+    attention_resolution: { resolved_by: 'human', session_id: 1, evidence_post_ids: [], resolved_at: MINUTES_AGO(1),
+      automatic: true, reason: 'Closed automatically by the dispatcher under your board setting '
+        + 'auto_recover_stalled_work (not your click): task 23 was claimed or settled (now working) ' + INJECTION } });
+  const manual = post(603, 1, { type: 'proposal', agent: 'codex',
+    attention_resolution: { resolved_by: 'codex', session_id: 3, evidence_post_ids: [604], resolved_at: MINUTES_AGO(1),
+      reason: 'done' } });
+  const t = thread(1, { posts: [note, manual], tasks: [task(23, { owner_session: 9, lease_state: 'active' })] });
+  const page = await setup({ threads: [t] });
+  await pick(page.document, 1);
+  const closed = page.document.querySelector('#post-602 .attention-resolution');
+  assert.ok(closed, 'the closure is shown on the post');
+  assert.match(closed.textContent, /Closed automatically by the dispatcher \(your auto-recovery setting, not your click\)/);
+  assert.doesNotMatch(closed.textContent, /resolved by human/);
+  assert.match(closed.textContent, /task 23 was claimed or settled/);
+  assert.equal(page.win.pwned, undefined, 'the reason is rendered as text');
+  assert.match(page.document.querySelector('#post-603 .attention-resolution').textContent, /Attention resolved by codex/);
+  assert.deepEqual(page.prompts, []);
+  page.dom.window.close();
+});

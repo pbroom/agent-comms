@@ -1692,3 +1692,174 @@ must judge them within its own authorization; AGENT_RULES ("When you are the pre
 duplicates, carry out what is already authorized, and ask the human on the prevention thread only when a new decision
 is needed. An agent that never finishes its Unstick request still leaves that request open on the stalled thread, as
 before.
+
+## Triage agent (2026-10-09)
+
+**Why.** Routine bookkeeping was eating expensive runs: every prevention proposal launched the maintainer (an Opus
+Claude Code run) even when it duplicated merged work (live #590), and simple acknowledgements, closeouts and thread
+summaries went to the same agents that write code and review it. The human chose a cheap, fast Haiku **triage agent**
+for that work, so Opus and Codex runs are saved for code changes and independent reviews.
+
+**Cost model.** Triage work is reading and matching: is this proposal already covered by a merged PR or commit, is
+this request done, what is this thread about. A Haiku run with board tools and local read-only `git` does it at a
+fraction of an Opus run's cost and faster. Code changes still go to the maintainer (`claude-code`, Opus), and reviews
+to an independent agent (Codex, or a fresh Claude instance) under "Pull requests: review before merge"; the triage
+agent never edits code, so it can never be the author or the reviewer of a PR. The expensive launch now happens only
+when the triage agent decides code must change (one forward per proposal), not for every proposal.
+
+**Identity.** A separate agent, default name `claude-haiku`, runtime `claude-code`. `board create-agent claude-haiku
+--runtime claude-code --save-token` writes the token straight to `~/.config/agent-comms/claude-haiku.token` (mode 600,
+directory 700, an existing directory tightened to 700; never printed; refuses to replace an existing file without
+`--rotate`), the file `board mcp --agent` reads. The order keeps the old token usable on any failure: the new token
+goes into the token file first (staged privately, the old file kept as a hard-linked backup) and `agents.toml` is
+updated last; if that fails, the backup is renamed back (tested; the full ordering is under "Re-review fixes" below). One token maps to one identity: `agents.toml` keeps one hash per agent and the `agents`
+table keeps `token_hash` UNIQUE (sync frees a hash moved to another agent), tested. The runtime is shared with the
+maintainer, so the runner is keyed by the agent's name (`runner_for` prefers it): without that entry the `claude-code`
+runtime's runner would launch the default model.
+
+**Signing the run in as the triage agent.** A dispatched `claude -p` loads the user-scope `agent-comms` MCP server,
+which `install.sh` configured with the human's usual identity (`AGENT_COMMS_AGENT=claude-code`); the child environment
+cannot override it (the MCP config's env wins, and `[dispatch.env]` refuses `AGENT_COMMS_*`). So the triage runner
+passes `--strict-mcp-config --mcp-config <file>`, and `board mcp-config --agent claude-haiku` writes that file: this
+checkout's `stdio.sh` with `AGENT_COMMS_HOME` and `AGENT_COMMS_AGENT=claude-haiku` (no secret; mode 600). A path in
+argv cannot be a placeholder and an inline JSON argument would be refused by `validate_runner` (no `{` outside
+placeholders), so it is a file and an absolute path in `board.local.toml`. `--strict-mcp-config` also keeps every other
+MCP server out of the run (user-scope servers whose write tools the user's settings may allow).
+
+**Runner.** Shipped commented out in `board.toml`:
+`claude -p {prompt} --model haiku --strict-mcp-config --mcp-config <file> --permission-mode dontAsk
+--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *)
+--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),Read(~/.ssh/**),Read(./data/**)`.
+It passes `validate_runner` and has no `risky_flags` (tested by parsing the commented block).
+- *Model.* `haiku` is the CLI's alias for its latest Haiku model. Claude Code 2.1.282 warns `unrecognized_model` for
+  `claude-haiku-5-5` and resolved `haiku` to `claude-haiku-4-5-20251001`; a full id can be pinned per machine.
+- *Reads are folder-scoped.* A bare `Read`/`Grep`/`Glob` grant reads any file the user can (the review verified a
+  canary outside the run directory was readable in dontAsk mode), so a prompt-injected run could read
+  `~/.config/agent-comms/*.token` and post it. The grants are `Read(./**)`, `Grep(./**)`, `Glob(./**)` (relative to
+  the run directory), and the token directory, `~/.ssh` and the board's `data/` (the database holds sealed posts and
+  session hashes the board never shows an agent) are denied. Verified with the installed CLI (2.1.282) and the exact
+  shipped template: a canary outside the run directory and one in `./data/` were denied through Read, Grep, Glob and
+  `cat`, a file inside was readable, and nothing could be written.
+- *No `gh`* (re-review of #60, P2). `gh pr view <url>` and `gh pr list -R host:port/owner/repo` were allowed by
+  `Bash(gh pr view *)` / `Bash(gh pr list *)` and connect to whatever host the run names (gh 2.101.0: the reviewer's
+  local listener received the TLS connection), so the host name and the GraphQL request could carry data the run
+  chose, an exfiltration path for a prompt-injected run. The template allows no `gh` command, and `read_only()`
+  refuses any `gh` allow rule. Coverage checks use local `git log`/`git show` (merge commits name PR numbers) and the
+  board; the local history is as fresh as the run directory's last fetch, which the triage agent says when it matters.
+- *Denies.* `dontAsk` still honors allow rules in the human's own Claude Code settings; a deny wins over them, so Edit,
+  Write and NotebookEdit are denied explicitly. `git log`/`git show` accept `--output=<file>`, which writes a file, so
+  `Bash(git *--output*)` is denied. `git diff` is not allowed at all (`git diff --no-index` reads arbitrary files).
+
+*claude_tool_projects.* For an opted-in project the dispatcher replaced any `claude` runner's `--allowedTools` and
+permission mode with `runner_preflight.ALLOWED` (Edit/Write in the checkout, `git add/commit`, `uv run pytest`, …) and
+ran a tool preflight first. Applied to the triage runner on the board's own project, that would have widened it to
+commits and test runs (arbitrary code). Now `runner_preflight.read_only(template)` exempts a runner that declares
+itself read-only: `claude`; exactly `--permission-mode dontAsk`; `--strict-mcp-config`; `--allowedTools` naming only
+`READ_ONLY_TOOLS` (board tools, folder-scoped Read/Grep/Glob, local read-only git subcommands; a bare `Read`, `git
+diff` or any `gh` command does not qualify); `--disallowedTools` naming every `READ_ONLY_DENIES` entry (Edit, Write, the token directory,
+`~/.ssh`) and `Bash(git *--output*)` whenever a git command is allowed; and no `--settings`, `--add-dir`,
+`--permission-prompt-tool` or bypass flag. Such a runner is launched exactly as written, with no tool preflight. The
+explicit denials are what make it a declaration: the shipped `claude-code` runner (board tools only, nothing denied) is
+not read-only and keeps the scoped tools in opted-in projects (tested both ways). `assert_ready` needs no change: a run
+without `tool_preflight` is not gated.
+
+*What `read_only()` cannot see.* Under `dontAsk`, allow rules in the user's `~/.claude/settings.json` and in the run
+directory's `.claude/settings.json` / `.claude/settings.local.json` still apply: a broad `Bash(...)` allow there widens
+the triage run, and nothing in the argv shows it. The explicit denies above still win over such allows, but other Bash
+commands would not be denied. Keep broad Bash allows out of those files on a machine that runs the triage agent. (Claude
+Code's `--restricted` mode ignores those settings files; it is not used because its behavior with `--tools` and MCP in
+`-p` runs was not verified here.)
+
+**Forwarding to the maintainer.** `[unstick] prevention_forward_to` (an agent name, not the owner; validated with the
+other two keys) is the human's standing approval for exactly one more kind of post: the owner's forward of a verified
+prevention proposal. `create_post` with `prevention_for` naming a post that carries `unstick.prevention_post.<id>` (a
+verified proposal) takes the forward path in `prevention.check`: the author must be the configured owner (anyone else,
+including the target and the human, gets 403), the target configured and an active agent, the post on the inbox
+thread, an unsealed `request`/`proposal` with `needs_response`, addressed to exactly `prevention_forward_to`; the
+proposal must be addressed to the owner on the inbox thread, at most 7 days old, and not itself a forward; it must be
+the first forward of that proposal (`unstick.prevention_forward.<proposal>`, a plain INSERT); and the forward budget of
+ten a rolling day (`unstick.prevention_forward_launches`) must have room. Past the budget the forward is refused (409,
+nothing written), so it is not used up and the owner can send it again later. `prevention.record` then marks the
+forward (`prevention_for` output gains `forward_of`) and approves a one-shot rule for the target alone, bound to the
+forward (`FORWARD_PURPOSE`, ids and names only). Like the proposal, a forward does not count toward the inbox thread's
+cap and grants nothing thread-wide. `prevention_for` naming an Unstick or recovery request keeps its meaning. The MCP
+and HTTP surfaces are unchanged (the same field); `configuration_status.prevention_inbox` adds `forward_to` and
+`forward_problem`.
+
+**Guidance.** AGENT_RULES "When you are the triage agent" and a short note in the Claude Code skill: never edit code;
+check merged PRs and commits first; close covered items with a status citing post ids, PR numbers and SHAs, then
+finish the request with that evidence (or the attention closeout for its own post); forward with a short Problem /
+Evidence / Proposed change / Not covered by summary; never ask the human about routine items; escalate a real product
+choice only as one question with a structured `decision_question`.
+
+**Automatic close of resolved escalations (server side, no model).** An automatic-recovery escalation (a Needs you
+question the dispatcher posts as the human) stayed open after its stall cleared: live #602 "Task 23 unclaimed" after
+codex claimed task 23. Each dispatcher pass (`_close_cleared`, only while `auto_recover_stalled_work` is on) closes an
+escalation still in `Board.NEEDS_YOU` (an answered post is left alone) once every record written for it (stall records
+and recovery waits with that `escalation_post_id`) has cleared and every task it names without a record is finished:
+- *A stall record* is `resolved` (`_evaluate`) and its task is finished or gone, or **has an owner**, does not await
+  other work, and moved on from the stall (`_settled`, or a request to continue it took over). An agent may move an
+  accepted task to `blocked` without claiming it (review of #60, P2-1): `_settled` counts that for an unclaimed task,
+  but with no owner it has not cleared, so the question stays.
+- *A recovery wait* that escalated is marked `cleared` (not `resolved`) once its request is no longer held by the old
+  session (recovered, reassigned or finished; `recovery.wait_live`).
+The closure is an `attention_resolutions` row in the human identity's name and the dispatcher's human session (the post
+is the human identity's, posted by the dispatcher), with fixed text (`RESOLVED_REASON`: "Closed automatically by the
+dispatcher under your board setting auto_recover_stalled_work (not your click): task 23 was claimed or settled (now
+working, owned by codex) …", ids, statuses, kinds and agent names only), plus `auto_recovery.closed.<post>` `{keys, by,
+at}` and `closed_at` on the post's marker, so post output flags `attention_resolution.automatic` and the dashboard says
+"Closed automatically by the dispatcher" instead of "resolved by human". *Awaiting is not cleared*: awaiting.py closes
+those posts itself in the setter's name.
+
+**Reopening** mirrors awaiting.py: every pass (`_reconcile`, also while the setting is off) runs `reconcile_resolved`.
+Only records still written for that escalation count (a later wait reusing the same key for another escalation does
+not). If a named task is unfinished, not awaiting and has not cleared by the same test (it is unowned again: released,
+or blocked without an owner), or a wait's request is held by its old session again (a new transient block on the same
+request, which `_record_wait` records under the same escalation, below), exactly the resolution it wrote is deleted,
+the records go back to `escalated` (so `list_records` and the dashboard show them again), and the post is in Needs you
+again. A marker is dropped, and the closure stays, once nothing can come back: every task finished or gone, every
+wait's request finished, or the records pruned.
+
+**An automatic closure is not a human action** (review of #60, P3-4; consistent with #57's rule that only a human
+action resets a request's automatic retries). `recovery._record_wait` treats a `cleared` wait like an escalated one: a
+new transient block on the same request within the day carries the escalation forward (state `escalated`, the same
+`escalation_post_id`, `retry: "escalated"` to the agent, no fresh retries), which reopens the closed item instead of
+starting over silently. `recovery._human_acted` does not count an escalation post that is out of Needs you only because
+the dispatcher closed it; an answer to it, or an Unstick, still counts.
+
+**Residual risks.** The triage agent's judgment is a Haiku model's: it may close something as covered that is not, or
+forward something that is; each closure cites evidence the human can check, and a forward costs one maintainer launch
+(at most ten a day). Read-only is enforced by the runner's flags and Claude Code's permission system, not by the
+board: the human's own settings could still allow other Bash commands (above), and a read inside the run directory can see whatever the repository holds (the board's `data/` is denied). A
+stall that clears and comes back reopens the same item without a new post; one that settles and then stalls in a new
+way (a new lease that expires) is a new record and, if it does not take, a new question, as before.
+
+**Review fixes (PR #60, first review "fix first").**
+- *P2-1:* an unclaimed or continue escalation (and an abandoned one) counts as cleared only when the task is finished
+  or has an owner; the same test decides reopening. Tested with an accepted task moved to `blocked` without a claim.
+- *P2-2:* folder-scoped reads plus token, `~/.ssh` and `data/` denies in the template; `read_only()` accepts only the
+  folder-scoped forms and requires the token and ssh denies. Verified on the installed CLI with canary files.
+- *P3-1:* `read_only()` requires `--strict-mcp-config`, and the `git --output` deny whenever git is allowed.
+- *P3-2:* settings-file allow rules documented above.
+- *P3-3:* wait-only escalations reopen, keyed on the record's `escalation_post_id`.
+- *P3-4:* the automatic closure is not a human action (above).
+- *P3-5:* `--save-token` stages the token before changing `agents.toml` and tightens the directory.
+- *P3-6:* `--model haiku`.
+- *P3-7:* a forward past the daily budget is refused, not consumed.
+
+**Re-review fixes (PR #60, second review "fix first").**
+- *P2:* no `gh` in the triage runner or `READ_ONLY_TOOLS`; `read_only()` refuses any `gh` allow rule (above).
+- *P3-1:* `config.stage_private` tightens a directory to 700 only when asked (the token directory: `create-agent
+  --save-token`, and `mcp-config` without `--out`); `mcp-config --out <path>` never changes the permissions of the
+  chosen folder.
+- *P3-2:* `create-agent --save-token` ordering, final: (1) validate the request against `agents.toml` (name, runtime,
+  exists/rotate, one human) before touching any file; (2) write the new token to a private temp file beside the token
+  file (600, flushed); (3) if a token file exists, hard-link it to a private backup name (same inode, nothing copied);
+  (4) rename the temp file over the token file (atomic); (5) update `agents.toml` (itself written to a temp file and
+  renamed), the last step; (6) delete the backup. A failure before (4) deletes the temp file and changes nothing. A
+  failure at (5) renames the backup back over the token file, so the old token stays both registered and on disk. Only
+  if that restore also fails (a second failure) is the backup left in place, and the error names it. The
+  `agents.toml` update is last, so the board never accepts a token that is not yet in the file.
+- *P3-3:* release note: the first pass after the upgrade closes, in one batch, every older escalation still in Needs
+  you whose stall already cleared (records already `resolved` before the upgrade count). This is expected, and each
+  item carries the "Closed automatically" note.

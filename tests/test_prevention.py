@@ -82,7 +82,8 @@ def test_a_bad_reload_keeps_the_last_good_inbox(tmp_path):
 
 def test_status_reports_what_is_wrong(penv):
     assert prevention.status(penv.board) == {"configured": True, "active": True, "owner": "claude",
-                                             "thread_id": penv.inbox, "problem": None}
+                                             "thread_id": penv.inbox, "problem": None, "forward_to": None,
+                                             "forward_problem": None}
     assert penv.board.configuration_status(penv.p["codex"])["prevention_inbox"]["active"] is True
     other = penv.thread("not the board's project")
     penv.board.s.unstick = {"prevention_owner": "claude", "prevention_thread": other}

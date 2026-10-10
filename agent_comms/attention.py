@@ -61,6 +61,10 @@ def resolution_out(board: Board, post_id: int) -> dict | None:
     row = board.conn.execute("SELECT * FROM attention_resolutions WHERE post_id=?", (post_id,)).fetchone()
     if row is None:
         return None
-    return {"resolved_by": row["resolved_by"], "session_id": row["session_id"],
-            "reason": row["reason"], "evidence_post_ids": json.loads(row["evidence_post_ids"]),
-            "resolved_at": iso(row["resolved_at"])}
+    from .autorecover import closed_automatically
+    out = {"resolved_by": row["resolved_by"], "session_id": row["session_id"],
+           "reason": row["reason"], "evidence_post_ids": json.loads(row["evidence_post_ids"]),
+           "resolved_at": iso(row["resolved_at"])}
+    if closed_automatically(board, post_id, row["resolved_at"]):
+        out["automatic"] = True   # the dispatcher closed it because the stall cleared (autorecover.close_resolved)
+    return out
