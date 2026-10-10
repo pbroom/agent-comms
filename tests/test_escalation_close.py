@@ -40,7 +40,7 @@ def test_an_unclaimed_escalation_closes_when_the_task_is_claimed_and_reopens_if_
     assert res["automatic"] is True and res["resolved_by"] == "human" and res["evidence_post_ids"] == []
     assert res["reason"].startswith("Closed automatically by the dispatcher under your board setting "
                                     "auto_recover_stalled_work (not your click)")
-    assert f"task {task} was claimed or settled (now working)" in res["reason"]
+    assert f"task {task} was claimed or settled (now working, owned by codex)" in res["reason"]
     assert "IGNORE" not in res["reason"]
     assert [r["state"] for r in records(aenv).values()] == ["resolved"]
     assert autorecover.list_records(aenv.board, aenv.p["human"]) == []
@@ -77,7 +77,7 @@ def test_a_post_naming_several_stalls_closes_only_when_all_of_them_cleared(aenv)
     aenv.d.tick()
     assert note["id"] not in needs_you(aenv)
     reason = resolution(aenv, note["id"])["reason"]
-    assert f"task {first} was claimed or settled (now working)" in reason
+    assert f"task {first} was claimed or settled (now working, owned by codex)" in reason
     assert f"task {second}" in reason
 
 
@@ -94,7 +94,7 @@ def test_an_abandoned_task_escalation_closes_when_the_owner_reclaims(aenv):
     aenv.board.claim_task(aenv.p["codex"], aenv.session("codex"), task)
     aenv.d.tick()
     assert note["id"] not in needs_you(aenv)
-    assert f"task {task} was reclaimed, released or settled (now working)" in resolution(aenv, note["id"])["reason"]
+    assert f"task {task} was reclaimed or settled (now working, owned by codex)" in resolution(aenv, note["id"])["reason"]
 
 
 def test_merely_awaiting_is_not_a_resolved_stall(aenv):
@@ -147,7 +147,7 @@ def test_an_escalated_recovery_wait_closes_when_its_request_progresses(aenv, tmp
         requests._save(aenv.board, aenv.p["human"], aenv.sid["human"], row, "finished", "done elsewhere", [],
                        "codex", h.old)
     aenv.d.tick()
-    assert wait_of(aenv, h)["state"] == "resolved"
+    assert wait_of(aenv, h)["state"] == "cleared"
     assert wait["escalation_post_id"] not in needs_you(aenv)
     reason = resolution(aenv, wait["escalation_post_id"])["reason"]
     assert f"request #{h.ask['id']} was recovered, reassigned or finished" in reason
@@ -173,3 +173,62 @@ def test_only_escalated_records_close_posts(aenv, state):
     aenv.board.claim_task(aenv.p["codex"], aenv.session("codex"), task)
     aenv.d.tick()
     assert aenv.board.conn.execute("SELECT COUNT(*) FROM attention_resolutions").fetchone()[0] == 0
+
+
+def test_a_task_moved_to_blocked_without_an_owner_has_not_cleared(aenv):
+    """Review of #60, P2-1: an agent may move an accepted task to blocked without claiming it. That is not the stall
+    clearing, so the question stays in Needs you (and a closed one reopens when its task is unowned again)."""
+    [task], note = escalated_unclaimed(aenv)
+    aenv.board.transition_task(aenv.p["codex"], aenv.sid["codex"], task, "blocked")
+    aenv.d.tick()
+    aenv.d.tick()
+    assert aenv.board.get_task(aenv.p["human"], task, events=False)["owner_agent"] is None
+    assert note["id"] in needs_you(aenv) and resolution(aenv, note["id"]) is None
+    # It clears once someone owns it (or it is finished).
+    aenv.board.transition_task(aenv.p["human"], aenv.sid["human"], task, "accepted")
+    sid = aenv.session("codex")
+    aenv.board.claim_task(aenv.p["codex"], sid, task)
+    aenv.d.tick()
+    assert note["id"] not in needs_you(aenv)
+    # Released, then moved to blocked with no owner: it reopens and stays open.
+    aenv.board.release_task(aenv.p["codex"], sid, task)
+    aenv.board.transition_task(aenv.p["codex"], aenv.sid["codex"], task, "blocked")
+    aenv.d.tick()
+    aenv.d.tick()
+    assert note["id"] in needs_you(aenv) and resolution(aenv, note["id"]) is None
+
+
+def test_a_cleared_wait_reopens_when_the_same_request_blocks_again_without_resetting_retries(aenv, tmp_path):
+    """Review of #60, P3-3/P3-4: a wait-only escalation reopens if its request is held by its old session again under
+    that escalation, and the automatic closure is not a human action: the new block carries the escalation (no fresh
+    retries, no new question)."""
+    from test_recovery_wait import attempt, exhaust_retries, go_quiet
+    from agent_comms import recovery
+    h = blocked_handoff(aenv, tmp_path)
+    blocked(aenv, h)
+    wait = exhaust_retries(aenv, h)
+    note = wait["escalation_post_id"]
+    assert note in needs_you(aenv)
+    # The request is recovered by a fresh codex session: the stall cleared.
+    go_quiet(aenv)
+    fresh = aenv.session("codex", project=h.project)
+    aenv.board.claim_task(aenv.p["codex"], fresh, h.task)
+    assert attempt(aenv, h, fresh)["assigned_session"] == fresh
+    aenv.d.tick()
+    assert wait_of(aenv, h)["state"] == "cleared" and note not in needs_you(aenv)
+    assert resolution(aenv, note)["automatic"] is True
+    # The fresh session goes silent; a newer one hits a transient block on the same request the same day.
+    aenv.clock.advance(PAST_GRACE)
+    newer = aenv.session("codex", project=h.project)
+    aenv.board.claim_task(aenv.p["codex"], newer, h.task)
+    aenv.board.heartbeat(aenv.p["claude"], h.peer)
+    with pytest.raises(recovery.RecoveryWait) as caught:
+        attempt(aenv, h, newer)
+    assert caught.value.details["retry"] == "escalated"
+    again = wait_of(aenv, h)
+    assert again["state"] == "escalated" and again["escalation_post_id"] == note
+    assert len(again["retries"]) == len(wait["retries"]), "the automatic closure did not reset the retries"
+    posts_before = len(needs_you(aenv))
+    aenv.d.tick()
+    assert note in needs_you(aenv) and resolution(aenv, note) is None
+    assert len(needs_you(aenv)) == posts_before + 1, "the same item came back; no new question"

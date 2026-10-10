@@ -18,7 +18,7 @@ import webbrowser
 from pathlib import Path
 
 from .config import (Settings, agent_mcp_config, agent_token_file, create_agent, human_token_file, load_agent_token,
-                     read_agents, write_private)
+                     new_token, read_agents, stage_private, write_private)
 from .core import Board, BoardError, TASK_CATEGORIES
 from .notify import DEFAULT_IDLE_MINUTES, DEFAULT_NOTIFY_EVENTS, NOTIFY_EVENTS
 
@@ -518,14 +518,22 @@ def _run(a, out) -> None:
             if a.human:
                 raise SystemExit("--save-token is for agents; `board init` saves the human token")
             f = agent_token_file(a.name)
-            if (f.exists() or f.is_symlink()) and not a.rotate:
+            if f.is_symlink() or (f.exists() and not a.rotate):
                 raise SystemExit(f"{f} already exists; pass --rotate to replace the agent's token")
-        token = create_agent(settings.agents_path, a.name, a.runtime, a.human, a.rotate)
-        if a.save_token:
-            write_private(f, token + "\n", overwrite=a.rotate)
+            # The new token is on disk (a private temp file) before agents.toml changes, and replaces the token file
+            # only after agents.toml accepted it: if updating agents.toml fails, the old token and its file stay valid.
+            token = new_token()
+            staged = stage_private(f, token + "\n")
+            try:
+                create_agent(settings.agents_path, a.name, a.runtime, a.human, a.rotate, token=token)
+            except BaseException:
+                staged.unlink(missing_ok=True)
+                raise
+            os.replace(staged, f)
             print(f"Agent {a.name!r} ({a.runtime}). Token saved to {f} (mode 600); `board mcp --agent {a.name}` "
                   "reads it.")
             return
+        token = create_agent(settings.agents_path, a.name, a.runtime, a.human, a.rotate)
         print(f"Agent {a.name!r} ({a.runtime}). Token (shown once, store it in that agent's MCP config):\n{token}")
         return
     if a.cmd == "mcp-config":

@@ -209,8 +209,9 @@ def write_agents(path: Path, agents: dict[str, AgentSpec]) -> None:
     tmp.replace(path)
 
 
-def create_agent(path: Path, name: str, runtime: str, is_human: bool = False, rotate: bool = False) -> str:
-    """Add an agent (or rotate its token) and return the plaintext token."""
+def create_agent(path: Path, name: str, runtime: str, is_human: bool = False, rotate: bool = False,
+                 token: str | None = None) -> str:
+    """Add an agent (or rotate its token) and return the plaintext token (`token`: one the caller already stored)."""
     if not NAME_RE.match(name):
         raise ValueError("agent name must match [a-z][a-z0-9_-]{0,31}")
     if not re.match(r"^[A-Za-z0-9._-]{1,40}$", runtime):
@@ -220,7 +221,7 @@ def create_agent(path: Path, name: str, runtime: str, is_human: bool = False, ro
         raise ValueError(f"agent {name!r} already exists (use --rotate to issue a new token)")
     if is_human and any(a.is_human for a in agents.values() if a.name != name):
         raise ValueError("a human agent already exists; v1 supports exactly one human")
-    token = new_token()
+    token = token or new_token()
     agents[name] = AgentSpec(name, runtime, hash_token(token), is_human)
     write_agents(path, agents)
     return token
@@ -237,19 +238,38 @@ def agent_token_file(name: str) -> Path:
     return token_dir() / f"{name}.token"
 
 
-def write_private(path: Path, text: str, overwrite: bool = False) -> None:
-    """Write a file only its owner can read (mode 600, its directory 700). Refuses to replace an existing file unless
-    `overwrite`, and never follows a symlink."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink() or (path.exists() and not overwrite):
-        raise ValueError(f"{path} already exists")
-    tmp = path.with_name(path.name + ".tmp")
-    if tmp.exists() or tmp.is_symlink():
-        tmp.unlink()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def stage_private(path: Path, text: str) -> Path:
+    """Write `text` to a new private temp file beside `path` (mode 600, flushed to disk) and return it; the caller
+    renames it over `path` (os.replace, atomic) or deletes it. The directory is created 700, or tightened to 700 if it
+    already exists; it must be a real directory owned by the user."""
+    import stat
+    d = path.parent
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    meta = d.lstat()
+    if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid():
+        raise ValueError(f"{d} must be a directory owned by you")
+    if stat.S_IMODE(meta.st_mode) & 0o077:
+        os.chmod(d, 0o700)
+    tmp = d / f".{path.name}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
-    tmp.replace(path)
+        f.flush()
+        os.fsync(f.fileno())
+    return tmp
+
+
+def write_private(path: Path, text: str, overwrite: bool = False) -> None:
+    """Write a file only its owner can read (mode 600, its directory 700), atomically. Refuses to replace an existing
+    file unless `overwrite`, and never follows a symlink."""
+    if path.is_symlink() or (path.exists() and not overwrite):
+        raise ValueError(f"{path} already exists")
+    tmp = stage_private(path, text)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def agent_mcp_config(name: str) -> dict:

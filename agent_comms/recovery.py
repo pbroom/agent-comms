@@ -361,7 +361,9 @@ def _record_wait(board, p, session_id, post_id, recipient, expected_version, old
         first = prev.get('first_recorded_at')
         carried = (prev.get('state') not in (None, 'resolved') and type(first) in (int, float)
                    and now - first < WAIT_WINDOW_SECONDS)
-        if carried and prev.get('state') in ESCALATED and _human_acted(board, prev):
+        # An escalated wait the dispatcher marked 'cleared' (its request moved on, and the escalation closed by itself)
+        # is not a human action: a new block the same day carries the escalation forward and reopens it.
+        if carried and prev.get('state') in ESCALATED + ('cleared',) and _human_acted(board, prev):
             carried, prev = False, {}
         wait = {'post_id': post_id, 'recipient': recipient, 'version': row['version'], 'agent': p.name,
                 'thread_id': post['thread_id'], 'old_session': old_id, 'session_id': session_id, 'worktree': path,
@@ -369,8 +371,10 @@ def _record_wait(board, p, session_id, post_id, recipient, expected_version, old
                 'first_recorded_at': first if carried else now,
                 'retries': retries_used(prev, now), 'relaunch_post_ids': (prev.get('relaunch_post_ids') or [])[-10:],
                 'covered_post_ids': held[:20], 'covered_task_ids': tasks[:20]}
-        if carried and prev.get('state') in ESCALATED:
+        if carried and prev.get('state') in ESCALATED + ('cleared',):
             wait.update({k: prev[k] for k in ('state', 'reason', 'escalated_at', 'escalation_post_id') if k in prev})
+            if wait['state'] == 'cleared':
+                wait['state'] = 'escalated'
         _put_state(board, key, wait, p.name)
     return wait
 
@@ -384,9 +388,21 @@ def _human_acted(board, wait: dict) -> bool:
     if type(at) not in (int, float) or unstick.unstuck_since(board.conn, wait.get('thread_id'), wait.get('agent') or '', at):
         return True
     note = wait.get('escalation_post_id')
-    if wait.get('state') == 'escalated':
-        return type(note) is not int or board.conn.execute(
-            f'SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}', (note,)).fetchone() is None
+    if wait.get('state') in ('escalated', 'cleared'):
+        if type(note) is not int:
+            return True
+        if board.conn.execute(f'SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}', (note,)).fetchone():
+            return False
+        # Out of Needs you only because the dispatcher closed it automatically (autorecover.close_resolved) is not
+        # the human acting on it.
+        from .autorecover import closed_automatically
+        row = board.conn.execute('SELECT resolved_at FROM attention_resolutions WHERE post_id = ?', (note,)).fetchone()
+        if row is None or not closed_automatically(board, note, row['resolved_at']):
+            return True
+        return board.conn.execute(
+            '''SELECT 1 FROM answer_links WHERE source_post_id = ?
+               UNION ALL SELECT 1 FROM legacy_attention_answers WHERE source_post_id = ?''', (note, note)).fetchone() \
+            is not None
     return False
 
 

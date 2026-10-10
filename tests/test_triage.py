@@ -45,15 +45,17 @@ def test_the_shipped_triage_runner_is_valid_narrow_and_off_by_default():
     template = shipped_triage_runner()
     assert dispatch.validate_runner(TRIAGE, template) == template
     assert dispatch.risky_flags(template) == []
-    assert template[:5] == ["claude", "-p", "{prompt}", "--model", "claude-haiku-5-5"]
+    # "haiku" is the alias Claude Code 2.1.282 recognizes (it warns unrecognized_model for "claude-haiku-5-5").
+    assert template[:5] == ["claude", "-p", "{prompt}", "--model", "haiku"]
     assert template[template.index("--permission-mode") + 1] == "dontAsk"
     assert "--strict-mcp-config" in template and "--mcp-config" in template
     allowed = next(a for a in template if a.startswith("--allowedTools="))
     assert rp.split_tools(allowed.split("=", 1)[1]) == [
-        "mcp__agent-comms", "Read", "Grep", "Glob", "Bash(git log *)", "Bash(git show *)", "Bash(gh pr view *)",
-        "Bash(gh pr list *)"]
-    denied = next(a for a in template if a.startswith("--disallowedTools="))
-    assert {"Edit", "Write"} <= set(rp.split_tools(denied.split("=", 1)[1]))
+        "mcp__agent-comms", "Read(./**)", "Grep(./**)", "Glob(./**)", "Bash(git log *)", "Bash(git show *)",
+        "Bash(gh pr view *)", "Bash(gh pr list *)"]
+    denied = set(rp.split_tools(next(a for a in template if a.startswith("--disallowedTools=")).split("=", 1)[1]))
+    assert {"Edit", "Write", "NotebookEdit", "Bash(git *--output*)", "Read(~/.config/agent-comms/**)",
+            "Read(~/.ssh/**)", "Read(./data/**)"} <= denied
     assert not any(t in allowed for t in ("Edit", "Write", "Bash(git commit", "Bash(git push", "Bash(gh pr merge"))
     assert rp.read_only(template)
     # Shipped commented out: the committed runners are unchanged.
@@ -81,6 +83,19 @@ def test_it_is_keyed_by_the_agents_own_name_so_the_runtime_default_never_launche
     (lambda t: t + ["--dangerously-skip-permissions"], False),
     (lambda t: ["claude-fake"] + t[1:], False),
     (lambda t: [x for x in t if not x.startswith("--allowedTools")], False),
+    # Review of #60: bare reads reach any file; the token and ssh denies, the git --output deny and
+    # --strict-mcp-config are required.
+    (lambda t: [x.replace("Read(./**)", "Read") if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: [x.replace("Grep(./**)", "Grep") if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: [x.replace("Glob(./**)", "Glob(/**)") if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: [x.replace(",Read(~/.config/agent-comms/**)", "") for x in t], False),
+    (lambda t: [x.replace(",Read(~/.ssh/**)", "") for x in t], False),
+    (lambda t: [x.replace(",Bash(git *--output*)", "") for x in t], False),
+    (lambda t: [x for x in t if x != "--strict-mcp-config"], False),
+    (lambda t: [x.replace(",Bash(git *--output*)", "").replace(",Bash(git log *),Bash(git show *)", "")
+                for x in t], True),       # no git allowed: the --output deny is not needed
+    (lambda t: [x.replace(",Glob(./**)", ",Glob(./**),Bash(git diff *)") if x.startswith("--allowedTools") else x
+                for x in t], False),      # git diff --no-index reads any file
 ])
 def test_read_only_is_an_explicit_narrow_declaration(change, expected):
     assert rp.read_only(change(shipped_triage_runner())) is expected
@@ -166,6 +181,31 @@ def test_create_agent_can_save_the_token_where_board_mcp_reads_it(monkeypatch, t
     assert load_agent_token(TRIAGE) == token
     run_cli(monkeypatch, tmp_path, "create-agent", TRIAGE, "--runtime", "claude-code", "--save-token", "--rotate")
     assert load_agent_token(TRIAGE) != token
+
+
+def test_save_token_keeps_the_old_token_valid_when_agents_toml_cannot_be_updated(monkeypatch, tmp_path, capsys):
+    """Review of #60, P3-5: the new token is staged privately first and replaces the token file only after agents.toml
+    accepted it; an existing token directory is tightened to 700."""
+    from agent_comms import config
+    tokens = tmp_path / "tokens"
+    tokens.mkdir(mode=0o755)
+    os.chmod(tokens, 0o755)
+    run_cli(monkeypatch, tmp_path, "create-agent", TRIAGE, "--runtime", "claude-code", "--save-token")
+    assert stat.S_IMODE(tokens.stat().st_mode) == 0o700
+    old = load_agent_token(TRIAGE)
+    agents_before = (tmp_path / "agents.toml").read_text()
+
+    def broken(path, agents):
+        raise OSError("disk full")
+    monkeypatch.setattr(config, "write_agents", broken)
+    with pytest.raises(OSError, match="disk full"):
+        run_cli(monkeypatch, tmp_path, "create-agent", TRIAGE, "--runtime", "claude-code", "--save-token", "--rotate")
+    assert load_agent_token(TRIAGE) == old
+    assert (tmp_path / "agents.toml").read_text() == agents_before
+    assert sorted(x.name for x in tokens.iterdir()) == [f"{TRIAGE}.token"], "no staged copy left behind"
+    from agent_comms.core import Board
+    board = Board(Settings(db_path=tmp_path / "check.db", agents_path=tmp_path / "agents.toml"))
+    assert board.authenticate(old).name == TRIAGE
 
 
 def test_mcp_config_signs_the_run_in_as_that_agent_without_secrets(monkeypatch, tmp_path, capsys):
@@ -339,14 +379,23 @@ def test_an_old_proposal_is_not_forwarded(tenv):
         send_on(tenv, prop)
 
 
-def test_the_daily_forward_budget_bounds_maintainer_launches(tenv):
+def test_a_spent_forward_budget_refuses_the_forward_so_it_can_be_sent_later(tenv):
+    """Review of #60, P3-7: past the daily budget the forward is refused (nothing posted, nothing consumed)."""
     _, prop = proposal(tenv)
     now = tenv.board.now()
     tenv.board.conn.execute("INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'x', ?)",
                             (prevention.FORWARD_LAUNCHES_KEY, json.dumps([now] * prevention.DAILY_FORWARD_LAUNCHES),
                              now))
+    before = tenv.board.conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+    with pytest.raises(Conflict, match="budget of 10 forward launches is spent"):
+        send_on(tenv, prop)
+    assert tenv.board.conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == before
+    assert tenv.board.conn.execute("SELECT 1 FROM board_state WHERE key = ?",
+                                   (prevention.FORWARD_PREFIX + str(prop["id"]),)).fetchone() is None
+    tenv.clock.advance(prevention.WINDOW_SECONDS + 60)
+    tenv.board.s.unstick = dict(tenv.board.s.unstick)
     fwd = send_on(tenv, prop)
-    assert human_actions.post_rule_id(tenv.board, fwd["id"]) is None, "accepted, but nothing launches"
+    assert human_actions.post_rule_id(tenv.board, fwd["id"]) is not None
     assert fwd["prevention_for"]["forward_of"] == prop["id"]
 
 

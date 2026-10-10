@@ -325,6 +325,7 @@ def tick(board: Board, human: Principal, *, runner_for: Callable[[str], Any], fe
     escalated = _evaluate(board, human, fence, live_seconds, budget)
     sent = _detect_and_send(board, human, runner_for, fence, budget)
     waits = _process_waits(board, human, runner_for, fence, live_seconds, budget)
+    _close_cleared(board, human)
     _reconcile(board)   # the backstop: any closure whose task stopped awaiting is checked every pass
     return {"sent": sent, "escalated": escalated, "retried": waits["retried"], "wait_escalated": waits["escalated"]}
 
@@ -820,17 +821,9 @@ def _evaluate(board: Board, human: Principal, fence: tuple[str, str], live_secon
         except Exception:
             log.exception("could not check automatic recovery %s", key)
     if settled:
-        posts = sorted({rec["escalation_post_id"] for _, rec in settled
-                        if rec["state"] == "resolved" and type(rec.get("escalation_post_id")) is int})
-        human_sid = board.human_session(human) if posts else None
-        closed = []
         with db.write_tx(conn) as c:
             for key, rec in settled:
                 _update(c, key, rec, now)
-            for post_id in posts:
-                if close_resolved(board, c, post_id, human.name, human_sid, now):
-                    closed.append(post_id)
-        _announce_closed(board, closed)
     escalated = []
     for thread_id, items in failing.items():
         if budget["escalations"] <= 0:
@@ -1184,7 +1177,7 @@ def _process_waits(board: Board, human: Principal, runner_for: Callable[[str], A
     for key, wait in recovery.waits(conn):
         if wait.get("state") == "escalated" and not recovery.wait_live(board, wait):
             try:
-                _settle_escalated_wait(board, human, key, wait)
+                _settle_escalated_wait(board, key, wait)
             except Exception:
                 log.exception("could not settle escalated recovery wait %s", key)
             continue
@@ -1329,24 +1322,32 @@ def _escalate_wait(board: Board, human: Principal, fence: tuple[str, str], key: 
 # ---------------------------------------------------------------- escalations whose stalls cleared
 #
 # An escalation (a Needs you question the dispatcher posted as the human) used to stay in Needs you after its stall
-# cleared by itself: live #602 "task 23 unclaimed" stayed open after codex claimed task 23. When every record the post
-# was written for settles because the stall genuinely cleared (the task was claimed, reclaimed, released, continued,
-# finished or declined; the request a wait was about was recovered, reassigned or finished), the pass closes the post
-# with an attention resolution: fixed server text, in the human identity's name and session (the dispatcher acting
-# under the human's auto_recover_stalled_work setting; the post itself is the human identity's), plus a CLOSED_PREFIX
-# marker. An awaiting task is not "cleared": it is skipped before settling (awaiting.py closes those itself). Every
-# pass checks the markers again (reconcile_resolved): if a task's stall came back (an unclaimed task is unclaimed again,
-# say), exactly that resolution is deleted, the records go back to `escalated`, and the post is in Needs you again.
+# cleared by itself: live #602 "task 23 unclaimed" stayed open after codex claimed task 23. Each pass (while the setting
+# is on) closes an escalation still in Needs you once every record it was written for has cleared:
+# - a stall record is `resolved` and its task is finished (done, declined or deleted), or has an owner and has moved on
+#   from the stall (_settled, or taken over by a request to continue it). A task without an owner (moved to `blocked`
+#   without a claim, or released) has not cleared;
+# - a recovery wait is `cleared` (_settle_escalated_wait: its request was recovered, reassigned or finished).
+# The closure is an attention resolution: fixed server text, in the human identity's name and session (the dispatcher
+# acting under the human's auto_recover_stalled_work setting; the post itself is the human identity's), plus a
+# CLOSED_PREFIX marker. An awaiting task has not cleared (awaiting.py closes those itself). Every pass checks the
+# markers again (reconcile_resolved): if a stall came back (an unclaimed task is unowned again; a wait's request is
+# held by its old session again under the same escalation), exactly that resolution is deleted, the records go back to
+# `escalated`, and the post is in Needs you again.
+
+WAIT_CLEARED = "cleared"    # an escalated recovery wait whose request moved on; not a human action (recovery._human_acted)
 
 
 def _resolved_what(conn, key: str, rec: dict) -> str:
     if key.startswith(recovery.WAIT_PREFIX):
         return f"request #{rec.get('post_id')} was recovered, reassigned or finished"
-    task = conn.execute("SELECT status FROM tasks WHERE id = ?", (rec["task_id"],)).fetchone()
-    now = f" (now {task['status']})" if task is not None else " (deleted)"
-    verb = {"abandoned": "was reclaimed, released or settled", "continue": "was continued or settled"}.get(
+    task = conn.execute("SELECT status, owner_agent FROM tasks WHERE id = ?", (rec["task_id"],)).fetchone()
+    if task is None:
+        return f"task {rec['task_id']} was deleted"
+    owner = f", owned by {task['owner_agent']}" if task["owner_agent"] else ""
+    verb = {"abandoned": "was reclaimed or settled", "continue": "was continued or settled"}.get(
         rec.get("kind"), "was claimed or settled")
-    return f"task {rec['task_id']} {verb}{now}"
+    return f"task {rec['task_id']} {verb} (now {task['status']}{owner})"
 
 
 def _post_records(conn, post_id: int) -> list[tuple[str, dict]]:
@@ -1356,16 +1357,44 @@ def _post_records(conn, post_id: int) -> list[tuple[str, dict]]:
     return out
 
 
+def _task_cleared(conn, rec: dict, task) -> bool:
+    """The stall this record was written for has cleared: the task is finished or gone, or it has an owner, does not
+    await other work, and moved on from the stall (or a request to continue it took over)."""
+    if task is None or task["status"] in TERMINAL:
+        return True
+    if task["owner_agent"] is None or awaiting.awaits(conn, task["id"]):
+        return False
+    return _settled(rec, task) or _superseded_by_continue(conn, rec, task)
+
+
+def _request_open(board: Board, wait: dict) -> bool:
+    """The request a wait was about still exists and is unfinished (so a new wait on it could bring the stall back)."""
+    post = board.conn.execute("SELECT * FROM posts WHERE id = ?", (wait.get("post_id"),)).fetchone()
+    if post is None:
+        return False
+    row = next((r for r in requests.for_post(board, post) if r["recipient"] == wait.get("recipient")), None)
+    return row is not None and row["state"] != "finished"
+
+
+def _record_cleared(board: Board, c, key: str, rec: dict) -> bool:
+    if key.startswith(recovery.WAIT_PREFIX):
+        return rec.get("state") == WAIT_CLEARED and not recovery.wait_live(board, rec)
+    if rec.get("state") != "resolved":
+        return False
+    task = c.execute("SELECT * FROM tasks WHERE id = ?", (rec["task_id"],)).fetchone()
+    return _task_cleared(c, rec, task)
+
+
 def close_resolved(board: Board, c, post_id: int, human_name: str, human_sid: int, now: float) -> bool:
-    """Inside a write: close escalation `post_id` when every record it was written for is `resolved` (the stall cleared)
-    and every task it names without a record is finished or gone. Only while it is still in Needs you."""
+    """Inside a write: close escalation `post_id` when every record it was written for has cleared (see above) and
+    every task it names without a record is finished or gone. Only while it is still in Needs you."""
     marker = _get(c, POST_PREFIX + str(post_id))
     if not isinstance(marker, dict) or marker.get("kind") != "escalation":
         return False
     if c.execute(f"SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}", (post_id,)).fetchone() is None:
         return False
     recs = _post_records(c, post_id)
-    if not recs or any(r.get("state") != "resolved" for _, r in recs):
+    if not recs or not all(_record_cleared(board, c, k, r) for k, r in recs):
         return False
     covered = {r["task_id"] for k, r in recs if not k.startswith(recovery.WAIT_PREFIX)}
     for task_id in marker.get("task_ids") or []:
@@ -1384,36 +1413,52 @@ def close_resolved(board: Board, c, post_id: int, human_name: str, human_sid: in
     return True
 
 
-def _announce_closed(board: Board, post_ids: list[int]) -> None:
-    for post_id in post_ids:
-        row = board.conn.execute("SELECT thread_id FROM posts WHERE id = ?", (post_id,)).fetchone()
+def _close_cleared(board: Board, human: Principal) -> list[int]:
+    """Once per pass (the setting is on): close every escalation still in Needs you whose stalls all cleared."""
+    conn = board.conn
+    candidates = {r.get("escalation_post_id") for _, r in _records(conn) if r.get("state") == "resolved"}
+    candidates |= {w.get("escalation_post_id") for _, w in recovery.waits(conn) if w.get("state") == WAIT_CLEARED}
+    posts = sorted(i for i in candidates if type(i) is int and conn.execute(
+        f"SELECT 1 FROM posts p WHERE p.id = ? AND {Board.NEEDS_YOU}", (i,)).fetchone() is not None)
+    if not posts:
+        return []
+    closed = []
+    try:
+        human_sid = board.human_session(human)
+        now = board.now()
+        with db.write_tx(conn) as c:
+            for post_id in posts:
+                if close_resolved(board, c, post_id, human.name, human_sid, now):
+                    closed.append(post_id)
+    except Exception:
+        log.exception("could not close cleared escalations")
+        return []
+    for post_id in closed:
+        row = conn.execute("SELECT thread_id FROM posts WHERE id = ?", (post_id,)).fetchone()
         board._notify("attention.resolved", {"post_id": post_id, "thread_id": row["thread_id"] if row else None})
         log.info("escalation %s closed: the stalls it named cleared", post_id)
+    return closed
 
 
-def _settle_escalated_wait(board: Board, human: Principal, key: str, wait: dict) -> None:
-    """An escalated recovery wait whose request was recovered, reassigned or finished meanwhile: resolved, and its
-    escalation closed when nothing else it names still waits."""
+def _settle_escalated_wait(board: Board, key: str, wait: dict) -> None:
+    """An escalated recovery wait whose request was recovered, reassigned or finished meanwhile: `cleared` (the pass
+    then closes its escalation). Not a human action: a new transient block on the same request within the day carries
+    the escalation forward (recovery._record_wait) and reopens it, rather than starting fresh retries."""
     now = board.now()
-    post_id = wait.get("escalation_post_id")
-    human_sid = board.human_session(human) if type(post_id) is int else None
-    closed = []
     with db.write_tx(board.conn) as c:
         if _get(c, key) != wait:
             return
-        _update(c, key, wait | {"state": "resolved", "settled_at": now,
+        _update(c, key, wait | {"state": WAIT_CLEARED, "settled_at": now,
                                 "settled_reason": "the request was recovered, reassigned or finished"}, now)
-        if type(post_id) is int and close_resolved(board, c, post_id, human.name, human_sid, now):
-            closed.append(post_id)
-    _announce_closed(board, closed)
 
 
 def reconcile_resolved(board: Board, c, now: float) -> list[int]:
-    """Inside a write: reopen every escalation close_resolved closed whose stall came back (a record's task is not
-    finished, not awaiting, and no longer moved on from the stall it was recorded for; or a wait's request is held by
-    the old session again). Reopening deletes exactly the resolution written when it was closed and puts the records
-    back to `escalated`. A marker whose records are all gone, or whose tasks are all finished, is dropped (the closure
-    stays). Returns the reopened post ids."""
+    """Inside a write: reopen every escalation close_resolved closed whose stall came back: a record's task is
+    unfinished, does not await other work and has not cleared (_task_cleared: e.g. it has no owner again), or a wait
+    still written for this escalation is held by its old session again (a new transient block on the same request).
+    Reopening deletes exactly the resolution written when it was closed and puts the records back to `escalated`. A
+    marker is dropped (the closure stays) once nothing can come back: every task finished or gone, every wait's request
+    finished or its record reused by a later, unrelated wait, or the records pruned. Returns the reopened post ids."""
     reopened = []
     for key, value in _keys(c, CLOSED_PREFIX).fetchall():
         try:
@@ -1426,16 +1471,19 @@ def reconcile_resolved(board: Board, c, now: float) -> list[int]:
         final, back = True, False
         for rkey in keys:
             rec = _get(c, rkey)
-            if not isinstance(rec, dict):
-                continue    # pruned: nothing can come back for it
+            if not isinstance(rec, dict) or rec.get("escalation_post_id") != post_id:
+                continue    # pruned, or the key now holds a later record about another escalation
             if rkey.startswith(recovery.WAIT_PREFIX):
-                back = back or recovery.wait_live(board, rec)
+                if recovery.wait_live(board, rec):
+                    back = True
+                elif _request_open(board, rec):
+                    final = False
                 continue
             task = c.execute("SELECT * FROM tasks WHERE id = ?", (rec.get("task_id"),)).fetchone()
             if task is None or task["status"] in TERMINAL:
                 continue
             final = False
-            if awaiting.awaits(c, task["id"]) or _settled(rec, task) or _superseded_by_continue(c, rec, task):
+            if awaiting.awaits(c, task["id"]) or _task_cleared(c, rec, task):
                 continue
             back = True
         if back:
@@ -1448,7 +1496,8 @@ def reconcile_resolved(board: Board, c, now: float) -> list[int]:
                         now)
             for rkey in keys:
                 rec = _get(c, rkey)
-                if isinstance(rec, dict) and rec.get("state") == "resolved" and rec.get("escalation_post_id") == post_id:
+                if (isinstance(rec, dict) and rec.get("state") in ("resolved", WAIT_CLEARED)
+                        and rec.get("escalation_post_id") == post_id):
                     _update(c, rkey, {k: v for k, v in rec.items()
                                       if k not in ("resolved_at", "settled_at", "settled_reason")}
                             | {"state": "escalated"}, now)

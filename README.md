@@ -424,11 +424,11 @@ with `AGENT_COMMS_AGENT=claude-haiku`. Then, in `board.local.toml` (copy the com
 ```toml
 [dispatch.runners]
 "claude-haiku" = [
-  "claude", "-p", "{prompt}", "--model", "claude-haiku-5-5",
+  "claude", "-p", "{prompt}", "--model", "haiku",
   "--strict-mcp-config", "--mcp-config", "/Users/you/.config/agent-comms/claude-haiku.mcp.json",
   "--permission-mode", "dontAsk",
-  "--allowedTools=mcp__agent-comms,Read,Grep,Glob,Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr list *)",
-  "--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*)",
+  "--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr list *)",
+  "--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),Read(~/.ssh/**),Read(./data/**)",
 ]
 
 [unstick]
@@ -443,15 +443,25 @@ Why each part matters:
   the `claude-code` runtime's runner, which signs in as whatever identity your user-scope MCP server uses.
 - **`--strict-mcp-config --mcp-config`.** A dispatched `claude -p` otherwise loads your user-scope `agent-comms`
   server, which signs in as your usual Claude identity. This makes the run sign in as `claude-haiku`.
-- **Narrow tools.** `dontAsk` denies every tool not allowed here or in your own Claude Code settings; Edit and Write are
-  denied explicitly (a deny wins over any allow in your settings), and `git ... --output` (which writes a file) too.
-  Such a runner (dontAsk, only board/Read/Grep/Glob/read-only git and gh tools, Edit and Write denied) is launched
-  exactly as written even when the project is in `[dispatch] claude_tool_projects`: the scoped implementation tools
-  and their tool preflight apply to your other Claude runners only.
+- **`--model haiku`.** The Claude CLI's alias for its latest Haiku model (on Claude Code 2.1.282 it ran
+  `claude-haiku-4-5-20251001`; a full id it does not know, such as `claude-haiku-5-5`, only gets an
+  `unrecognized_model` warning). Pin a full model id here if you want one.
+- **Narrow tools.** `dontAsk` denies every tool not allowed here or in your own Claude Code settings. Reads are scoped to
+  the run directory (`Read(./**)`, `Grep(./**)`, `Glob(./**)`): a bare `Read` reads any file you can, your token files
+  included. The token directory, `~/.ssh` and the board's `data/` (the database holds sealed posts) are denied
+  explicitly, as are Edit and Write (a deny wins over any allow in your settings) and `git ... --output` (which writes
+  a file). Checked with the installed CLI: a canary file outside the run directory, and one in `data/`, were unreadable
+  through Read, Grep, Glob and Bash, and nothing could be written. Allow rules in your user or project Claude Code
+  settings (`.claude/settings*.json`) still apply under `dontAsk`; keep broad Bash allows out of them.
+- **Kept narrow in opted-in projects.** A runner that declares itself read-only (`dontAsk`, `--strict-mcp-config`, only
+  folder-scoped reads and read-only git/gh, and Edit, Write, the token directory and `~/.ssh` denied, plus the
+  `--output` deny when git is allowed) is launched exactly as written even when the project is in `[dispatch]
+  claude_tool_projects`: the scoped implementation tools and their tool preflight apply to your other Claude runners.
 - **`prevention_forward_to`.** When the triage agent decides a proposal needs code, it posts a `request` on the inbox
   thread to that agent with `prevention_for` = the proposal's post id. The server accepts it only from the
   `prevention_owner`, only addressed to exactly `prevention_forward_to`, once per proposal, for a verified proposal
-  made in the last 7 days, and then approves a one-shot launch of that agent for that post alone (at most ten a day).
+  made in the last 7 days, and then approves a one-shot launch of that agent for that post alone (at most ten a day;
+  past that the forward is refused, not used up, so the owner can send it again later).
   Nobody else can forward, and no other post on the thread launches anything. `prevention_forward_to` must be another
   agent than the owner; leave it `""` to turn forwarding off. `board_configuration_status` reports `forward_to` and
   `forward_problem` under `prevention_inbox`.
@@ -462,13 +472,16 @@ after editing runners; runners are read when it starts).
 #### Automatic-recovery items close when the stall clears
 
 An automatic-recovery Needs you question ("Automatic recovery did not take …") now closes by itself once the stall it
-named clears: the task was claimed, reclaimed, released, continued, finished or declined, or the request a recovery
-wait was about was recovered, reassigned or finished. The dispatcher writes an attention resolution with fixed text
-("Closed automatically by the dispatcher under your board setting auto_recover_stalled_work (not your click): task 23
-was claimed or settled (now working) …"), shown on the post as "Closed automatically by the dispatcher". A task that
-merely waits on other work is handled by "Awaiting another thread" instead. If the stall comes back (an unclaimed task
-is released and unclaimed again), the same item reopens; nothing new is posted either way. Only while
-`auto_recover_stalled_work` is on, and never for an item you already answered.
+named clears: each task it names is finished, or has an owner and moved on from the stall (claimed, reclaimed,
+continued), and the request a recovery wait was about was recovered, reassigned or finished. A task moved to `blocked`
+or released without an owner has not cleared. The dispatcher writes an attention resolution with fixed text ("Closed
+automatically by the dispatcher under your board setting auto_recover_stalled_work (not your click): task 23 was
+claimed or settled (now working, owned by codex) …"), shown on the post as "Closed automatically by the dispatcher". A
+task that merely waits on other work is handled by "Awaiting another thread" instead. If the stall comes back (an
+unclaimed task is unowned again, or the same request is blocked in the same way again), the same item reopens;
+nothing new is posted either way. The automatic closure is not your answer: it does not give a request's automatic
+retries a fresh start (only your Unstick or answer does). Only while `auto_recover_stalled_work` is on, and never for
+an item you already answered.
 
 #### Awaiting another thread
 

@@ -26,14 +26,20 @@ PROMPT = (
 )
 
 
-# A read-only Claude runner (the triage agent's): board tools, reading files and read-only git/gh, with Edit and Write
-# explicitly denied. An opted-in project keeps it as configured (no scoped override, no tool preflight): replacing its
-# tools with ALLOWED would widen it to commits and test runs.
+# A read-only Claude runner (the triage agent's): board tools, reading files inside its run directory and read-only
+# git/gh, with Edit and Write explicitly denied. An opted-in project keeps it as configured (no scoped override, no
+# tool preflight): replacing its tools with ALLOWED would widen it to commits and test runs.
+# File reads are folder-scoped: a bare Read/Grep/Glob grant reads any file the user can (verified on Claude Code
+# 2.1.282 in dontAsk mode), e.g. ~/.config/agent-comms/*.token. `git diff` is left out: `git diff --no-index` reads
+# arbitrary files.
 READ_ONLY_TOOLS = frozenset((
-    "mcp__agent-comms", "Read", "Grep", "Glob",
-    "Bash(git log *)", "Bash(git show *)", "Bash(git status *)", "Bash(git diff *)", "Bash(git rev-parse *)",
+    "mcp__agent-comms", "Read(./**)", "Grep(./**)", "Glob(./**)",
+    "Bash(git log *)", "Bash(git show *)", "Bash(git status *)", "Bash(git rev-parse *)",
     "Bash(gh pr view *)", "Bash(gh pr list *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
 ))
+# Denies a read-only runner must carry: no edits, never the board's token files or SSH keys.
+READ_ONLY_DENIES = frozenset(("Edit", "Write", "Read(~/.config/agent-comms/**)", "Read(~/.ssh/**)"))
+GIT_OUTPUT_DENY = "Bash(git *--output*)"   # git log/show --output=<file> writes a file
 _READ_ONLY_FORBIDDEN = {"--settings", "--add-dir", "--permission-prompt-tool", "--allow-dangerously-skip-permissions",
                         "--dangerously-skip-permissions"}
 
@@ -77,12 +83,18 @@ def _flag_values(template: list[str], names: set[str]) -> list[str] | None:
 
 
 def read_only(template: list[str]) -> bool:
-    """A `claude` runner that declares itself read-only: permission mode dontAsk (exactly), --allowedTools naming only
-    READ_ONLY_TOOLS (or single agent-comms tools), --disallowedTools naming both Edit and Write, and no flag that could
-    add grants or bypass permissions. The explicit Edit/Write denial is the declaration: the shipped claude-code runner
-    (board tools only, nothing denied) is not read-only, so an opted-in project still gives it the scoped tools."""
+    """A `claude` runner that declares itself read-only:
+    - exactly `--permission-mode dontAsk`, and `--strict-mcp-config` (so no user- or project-scope MCP server, whose
+      write tools the user's settings may allow, is loaded);
+    - `--allowedTools` naming only READ_ONLY_TOOLS (folder-scoped reads, read-only git/gh) or agent-comms tools;
+    - `--disallowedTools` naming every READ_ONLY_DENIES entry (Edit, Write, the token directory, ~/.ssh), plus
+      GIT_OUTPUT_DENY whenever a `git` command is allowed;
+    - no flag that could add grants or bypass permissions.
+    The explicit denials are the declaration: the shipped claude-code runner (board tools only, nothing denied) is not
+    read-only, so an opted-in project still gives it the scoped tools. Allow rules in the user's or the project's
+    Claude Code settings files still apply under dontAsk and cannot be seen from the argv (DESIGN_NOTES)."""
     import os
-    if not template or os.path.basename(template[0]) != "claude":
+    if not template or os.path.basename(template[0]) != "claude" or "--strict-mcp-config" not in template:
         return False
     if any(a.split("=", 1)[0] in _READ_ONLY_FORBIDDEN or "bypass" in a.lower() or "dangerously" in a.lower()
            for a in template):
@@ -92,9 +104,10 @@ def read_only(template: list[str]) -> bool:
         return False
     denied = {t for v in (_flag_values(template, {"--disallowedTools", "--disallowed-tools"}) or [])
               for t in split_tools(v)}
-    if not {"Edit", "Write"} <= denied:
-        return False
     tools = [t for v in (_flag_values(template, {"--allowedTools", "--allowed-tools"}) or []) for t in split_tools(v)]
+    required = set(READ_ONLY_DENIES) | ({GIT_OUTPUT_DENY} if any(t.startswith("Bash(git ") for t in tools) else set())
+    if not required <= denied:
+        return False
     return bool(tools) and all(t in READ_ONLY_TOOLS or t.startswith("mcp__agent-comms__") for t in tools)
 
 

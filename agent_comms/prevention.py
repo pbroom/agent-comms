@@ -34,7 +34,8 @@ with `prevention_for` naming the *proposal*, checked the same way from server re
   the owner, made in the last REQUEST_MAX_AGE_SECONDS;
 - it is the first forward of that proposal (FORWARD_PREFIX, a plain INSERT).
 Then the server approves a one-shot rule for prevention_forward_to alone, bound to the forward post (FORWARD_PURPOSE,
-ids only), at most DAILY_FORWARD_LAUNCHES a rolling day. A forward does not count toward the thread's agent-post cap
+ids only), at most DAILY_FORWARD_LAUNCHES a rolling day (past that a forward is refused, so it can be sent again
+later). A forward does not count toward the thread's agent-post cap
 (one per proposal, so it is bounded by them).
 """
 
@@ -235,6 +236,10 @@ def _check_forward(board: Board, c, p: Principal, cfg: PreventionConfig, proposa
         raise Conflict(f"prevention proposal #{proposal_id} is more than 7 days old")
     if c.execute("SELECT 1 FROM board_state WHERE key = ?", (FORWARD_PREFIX + str(proposal_id),)).fetchone():
         raise Conflict(f"prevention proposal #{proposal_id} was already forwarded")
+    if _spend(c, FORWARD_LAUNCHES_KEY, DAILY_FORWARD_LAUNCHES, now) is None:
+        # Refused, not accepted without a launch: the forward stays available, so the owner can send it again later.
+        raise Conflict(f"the daily budget of {DAILY_FORWARD_LAUNCHES} forward launches is spent; nothing was posted. "
+                       "Forward this proposal again later (the budget is a rolling day)")
     return {"cfg": cfg, "forward_of": proposal_id, "request_id": proposal["request_post_id"],
             "source_thread_id": proposal.get("source_thread_id")}
 
