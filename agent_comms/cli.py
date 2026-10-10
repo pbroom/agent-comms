@@ -18,7 +18,7 @@ import webbrowser
 from pathlib import Path
 
 from .config import (Settings, agent_mcp_config, agent_token_file, create_agent, human_token_file, load_agent_token,
-                     new_token, read_agents, stage_private, write_private)
+                     read_agents, save_agent_token, write_private)
 from .core import Board, BoardError, TASK_CATEGORIES
 from .notify import DEFAULT_IDLE_MINUTES, DEFAULT_NOTIFY_EVENTS, NOTIFY_EVENTS
 
@@ -517,19 +517,8 @@ def _run(a, out) -> None:
         if a.save_token:
             if a.human:
                 raise SystemExit("--save-token is for agents; `board init` saves the human token")
-            f = agent_token_file(a.name)
-            if f.is_symlink() or (f.exists() and not a.rotate):
-                raise SystemExit(f"{f} already exists; pass --rotate to replace the agent's token")
-            # The new token is on disk (a private temp file) before agents.toml changes, and replaces the token file
-            # only after agents.toml accepted it: if updating agents.toml fails, the old token and its file stay valid.
-            token = new_token()
-            staged = stage_private(f, token + "\n")
-            try:
-                create_agent(settings.agents_path, a.name, a.runtime, a.human, a.rotate, token=token)
-            except BaseException:
-                staged.unlink(missing_ok=True)
-                raise
-            os.replace(staged, f)
+            # The token file is written first and agents.toml last; any failure keeps the old token (config docstring).
+            f = save_agent_token(settings.agents_path, a.name, a.runtime, a.rotate)
             print(f"Agent {a.name!r} ({a.runtime}). Token saved to {f} (mode 600); `board mcp --agent {a.name}` "
                   "reads it.")
             return
@@ -542,7 +531,9 @@ def _run(a, out) -> None:
             raise SystemExit(f"no agent {a.agent!r} in {settings.agents_path}: board create-agent {a.agent} "
                              "--runtime claude-code --save-token")
         f = Path(a.out).expanduser() if a.out else agent_token_file(a.agent).with_name(f"{a.agent}.mcp.json")
-        write_private(f.absolute(), json.dumps(agent_mcp_config(a.agent), indent=2) + "\n", overwrite=a.force)
+        # Only the board's own token directory is tightened to 700; a folder chosen with --out is left as it is.
+        write_private(f.absolute(), json.dumps(agent_mcp_config(a.agent), indent=2) + "\n", overwrite=a.force,
+                      tighten=not a.out)
         print(f"Wrote {f.absolute()} (agent-comms signs in as {a.agent!r}). In a runner: \"--strict-mcp-config\", "
               f"\"--mcp-config\", \"{f.absolute()}\"")
         if not agent_token_file(a.agent).exists():

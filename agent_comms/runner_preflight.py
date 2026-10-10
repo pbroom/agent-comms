@@ -26,16 +26,17 @@ PROMPT = (
 )
 
 
-# A read-only Claude runner (the triage agent's): board tools, reading files inside its run directory and read-only
-# git/gh, with Edit and Write explicitly denied. An opted-in project keeps it as configured (no scoped override, no
+# A read-only Claude runner (the triage agent's): board tools, reading files inside its run directory and local
+# read-only git, with Edit and Write explicitly denied. An opted-in project keeps it as configured (no scoped override, no
 # tool preflight): replacing its tools with ALLOWED would widen it to commits and test runs.
 # File reads are folder-scoped: a bare Read/Grep/Glob grant reads any file the user can (verified on Claude Code
 # 2.1.282 in dontAsk mode), e.g. ~/.config/agent-comms/*.token. `git diff` is left out: `git diff --no-index` reads
-# arbitrary files.
+# arbitrary files. No `gh` command qualifies: `gh pr view <url>` and `gh pr list -R host/owner/repo` connect to any
+# host the run names (review of #60: a local listener received the connection on gh 2.101.0), so the host name and
+# the request can carry data the run chose. Coverage checks use local git history and the board instead.
 READ_ONLY_TOOLS = frozenset((
     "mcp__agent-comms", "Read(./**)", "Grep(./**)", "Glob(./**)",
     "Bash(git log *)", "Bash(git show *)", "Bash(git status *)", "Bash(git rev-parse *)",
-    "Bash(gh pr view *)", "Bash(gh pr list *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
 ))
 # Denies a read-only runner must carry: no edits, never the board's token files or SSH keys.
 READ_ONLY_DENIES = frozenset(("Edit", "Write", "Read(~/.config/agent-comms/**)", "Read(~/.ssh/**)"))
@@ -86,7 +87,8 @@ def read_only(template: list[str]) -> bool:
     """A `claude` runner that declares itself read-only:
     - exactly `--permission-mode dontAsk`, and `--strict-mcp-config` (so no user- or project-scope MCP server, whose
       write tools the user's settings may allow, is loaded);
-    - `--allowedTools` naming only READ_ONLY_TOOLS (folder-scoped reads, read-only git/gh) or agent-comms tools;
+    - `--allowedTools` naming only READ_ONLY_TOOLS (folder-scoped reads, local read-only git) or agent-comms tools,
+      and never a `gh` command (it can reach any host);
     - `--disallowedTools` naming every READ_ONLY_DENIES entry (Edit, Write, the token directory, ~/.ssh), plus
       GIT_OUTPUT_DENY whenever a `git` command is allowed;
     - no flag that could add grants or bypass permissions.
@@ -105,6 +107,9 @@ def read_only(template: list[str]) -> bool:
     denied = {t for v in (_flag_values(template, {"--disallowedTools", "--disallowed-tools"}) or [])
               for t in split_tools(v)}
     tools = [t for v in (_flag_values(template, {"--allowedTools", "--allowed-tools"}) or []) for t in split_tools(v)]
+    if any(t.replace(" ", "").startswith(("Bash(gh", "Bash(*gh")) or t.startswith("Bash(") and "gh " in t
+           for t in tools):
+        return False
     required = set(READ_ONLY_DENIES) | ({GIT_OUTPUT_DENY} if any(t.startswith("Bash(git ") for t in tools) else set())
     if not required <= denied:
         return False

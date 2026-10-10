@@ -1635,7 +1635,7 @@ summaries went to the same agents that write code and review it. The human chose
 for that work, so Opus and Codex runs are saved for code changes and independent reviews.
 
 **Cost model.** Triage work is reading and matching: is this proposal already covered by a merged PR or commit, is
-this request done, what is this thread about. A Haiku run with board tools and read-only `git`/`gh` does it at a
+this request done, what is this thread about. A Haiku run with board tools and local read-only `git` does it at a
 fraction of an Opus run's cost and faster. Code changes still go to the maintainer (`claude-code`, Opus), and reviews
 to an independent agent (Codex, or a fresh Claude instance) under "Pull requests: review before merge"; the triage
 agent never edits code, so it can never be the author or the reviewer of a PR. The expensive launch now happens only
@@ -1644,10 +1644,9 @@ when the triage agent decides code must change (one forward per proposal), not f
 **Identity.** A separate agent, default name `claude-haiku`, runtime `claude-code`. `board create-agent claude-haiku
 --runtime claude-code --save-token` writes the token straight to `~/.config/agent-comms/claude-haiku.token` (mode 600,
 directory 700, an existing directory tightened to 700; never printed; refuses to replace an existing file without
-`--rotate`), the file `board mcp --agent` reads. The order keeps the old token usable on failure: the new token is
-written to a private temp file beside it and flushed first, then `agents.toml` is updated, and only then is the temp
-file renamed over the token file; if `agents.toml` cannot be updated the temp file is deleted and the old token and
-its file stay valid (tested). One token maps to one identity: `agents.toml` keeps one hash per agent and the `agents`
+`--rotate`), the file `board mcp --agent` reads. The order keeps the old token usable on any failure: the new token
+goes into the token file first (staged privately, the old file kept as a hard-linked backup) and `agents.toml` is
+updated last; if that fails, the backup is renamed back (tested; the full ordering is under "Re-review fixes" below). One token maps to one identity: `agents.toml` keeps one hash per agent and the `agents`
 table keeps `token_hash` UNIQUE (sync frees a hash moved to another agent), tested. The runtime is shared with the
 maintainer, so the runner is keyed by the agent's name (`runner_for` prefers it): without that entry the `claude-code`
 runtime's runner would launch the default model.
@@ -1663,7 +1662,7 @@ MCP server out of the run (user-scope servers whose write tools the user's setti
 
 **Runner.** Shipped commented out in `board.toml`:
 `claude -p {prompt} --model haiku --strict-mcp-config --mcp-config <file> --permission-mode dontAsk
---allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr list *)
+--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *)
 --disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),Read(~/.ssh/**),Read(./data/**)`.
 It passes `validate_runner` and has no `risky_flags` (tested by parsing the commented block).
 - *Model.* `haiku` is the CLI's alias for its latest Haiku model. Claude Code 2.1.282 warns `unrecognized_model` for
@@ -1675,6 +1674,12 @@ It passes `validate_runner` and has no `risky_flags` (tested by parsing the comm
   session hashes the board never shows an agent) are denied. Verified with the installed CLI (2.1.282) and the exact
   shipped template: a canary outside the run directory and one in `./data/` were denied through Read, Grep, Glob and
   `cat`, a file inside was readable, and nothing could be written.
+- *No `gh`* (re-review of #60, P2). `gh pr view <url>` and `gh pr list -R host:port/owner/repo` were allowed by
+  `Bash(gh pr view *)` / `Bash(gh pr list *)` and connect to whatever host the run names (gh 2.101.0: the reviewer's
+  local listener received the TLS connection), so the host name and the GraphQL request could carry data the run
+  chose, an exfiltration path for a prompt-injected run. The template allows no `gh` command, and `read_only()`
+  refuses any `gh` allow rule. Coverage checks use local `git log`/`git show` (merge commits name PR numbers) and the
+  board; the local history is as fresh as the run directory's last fetch, which the triage agent says when it matters.
 - *Denies.* `dontAsk` still honors allow rules in the human's own Claude Code settings; a deny wins over them, so Edit,
   Write and NotebookEdit are denied explicitly. `git log`/`git show` accept `--output=<file>`, which writes a file, so
   `Bash(git *--output*)` is denied. `git diff` is not allowed at all (`git diff --no-index` reads arbitrary files).
@@ -1684,8 +1689,8 @@ permission mode with `runner_preflight.ALLOWED` (Edit/Write in the checkout, `gi
 ran a tool preflight first. Applied to the triage runner on the board's own project, that would have widened it to
 commits and test runs (arbitrary code). Now `runner_preflight.read_only(template)` exempts a runner that declares
 itself read-only: `claude`; exactly `--permission-mode dontAsk`; `--strict-mcp-config`; `--allowedTools` naming only
-`READ_ONLY_TOOLS` (board tools, folder-scoped Read/Grep/Glob, read-only git and gh subcommands; a bare `Read` or `git
-diff` does not qualify); `--disallowedTools` naming every `READ_ONLY_DENIES` entry (Edit, Write, the token directory,
+`READ_ONLY_TOOLS` (board tools, folder-scoped Read/Grep/Glob, local read-only git subcommands; a bare `Read`, `git
+diff` or any `gh` command does not qualify); `--disallowedTools` naming every `READ_ONLY_DENIES` entry (Edit, Write, the token directory,
 `~/.ssh`) and `Bash(git *--output*)` whenever a git command is allowed; and no `--settings`, `--add-dir`,
 `--permission-prompt-tool` or bypass flag. Such a runner is launched exactly as written, with no tool preflight. The
 explicit denials are what make it a declaration: the shipped `claude-code` runner (board tools only, nothing denied) is
@@ -1759,8 +1764,7 @@ the dispatcher closed it; an answer to it, or an Unstick, still counts.
 **Residual risks.** The triage agent's judgment is a Haiku model's: it may close something as covered that is not, or
 forward something that is; each closure cites evidence the human can check, and a forward costs one maintainer launch
 (at most ten a day). Read-only is enforced by the runner's flags and Claude Code's permission system, not by the
-board: the human's own settings could still allow other Bash commands (above), `gh`/`git` read commands reach the
-network, and a read inside the run directory can see whatever the repository holds (the board's `data/` is denied). A
+board: the human's own settings could still allow other Bash commands (above), and a read inside the run directory can see whatever the repository holds (the board's `data/` is denied). A
 stall that clears and comes back reopens the same item without a new post; one that settles and then stalls in a new
 way (a new lease that expires) is a new record and, if it does not take, a new question, as before.
 
@@ -1776,3 +1780,20 @@ way (a new lease that expires) is a new record and, if it does not take, a new q
 - *P3-5:* `--save-token` stages the token before changing `agents.toml` and tightens the directory.
 - *P3-6:* `--model haiku`.
 - *P3-7:* a forward past the daily budget is refused, not consumed.
+
+**Re-review fixes (PR #60, second review "fix first").**
+- *P2:* no `gh` in the triage runner or `READ_ONLY_TOOLS`; `read_only()` refuses any `gh` allow rule (above).
+- *P3-1:* `config.stage_private` tightens a directory to 700 only when asked (the token directory: `create-agent
+  --save-token`, and `mcp-config` without `--out`); `mcp-config --out <path>` never changes the permissions of the
+  chosen folder.
+- *P3-2:* `create-agent --save-token` ordering, final: (1) validate the request against `agents.toml` (name, runtime,
+  exists/rotate, one human) before touching any file; (2) write the new token to a private temp file beside the token
+  file (600, flushed); (3) if a token file exists, hard-link it to a private backup name (same inode, nothing copied);
+  (4) rename the temp file over the token file (atomic); (5) update `agents.toml` (itself written to a temp file and
+  renamed), the last step; (6) delete the backup. A failure before (4) deletes the temp file and changes nothing. A
+  failure at (5) renames the backup back over the token file, so the old token stays both registered and on disk. Only
+  if that restore also fails (a second failure) is the backup left in place, and the error names it. The
+  `agents.toml` update is last, so the board never accepts a token that is not yet in the file.
+- *P3-3:* release note: the first pass after the upgrade closes, in one batch, every older escalation still in Needs
+  you whose stall already cleared (records already `resolved` before the upgrade count). This is expected, and each
+  item carries the "Closed automatically" note.

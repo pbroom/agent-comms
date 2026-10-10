@@ -51,12 +51,11 @@ def test_the_shipped_triage_runner_is_valid_narrow_and_off_by_default():
     assert "--strict-mcp-config" in template and "--mcp-config" in template
     allowed = next(a for a in template if a.startswith("--allowedTools="))
     assert rp.split_tools(allowed.split("=", 1)[1]) == [
-        "mcp__agent-comms", "Read(./**)", "Grep(./**)", "Glob(./**)", "Bash(git log *)", "Bash(git show *)",
-        "Bash(gh pr view *)", "Bash(gh pr list *)"]
+        "mcp__agent-comms", "Read(./**)", "Grep(./**)", "Glob(./**)", "Bash(git log *)", "Bash(git show *)"]
     denied = set(rp.split_tools(next(a for a in template if a.startswith("--disallowedTools=")).split("=", 1)[1]))
     assert {"Edit", "Write", "NotebookEdit", "Bash(git *--output*)", "Read(~/.config/agent-comms/**)",
             "Read(~/.ssh/**)", "Read(./data/**)"} <= denied
-    assert not any(t in allowed for t in ("Edit", "Write", "Bash(git commit", "Bash(git push", "Bash(gh pr merge"))
+    assert not any(t in allowed for t in ("Edit", "Write", "Bash(git commit", "Bash(git push", "gh "))
     assert rp.read_only(template)
     # Shipped commented out: the committed runners are unchanged.
     shipped = Settings.load(REPO_ROOT / "board.toml", local=False).dispatch["runners"]
@@ -96,9 +95,19 @@ def test_it_is_keyed_by_the_agents_own_name_so_the_runtime_default_never_launche
                 for x in t], True),       # no git allowed: the --output deny is not needed
     (lambda t: [x.replace(",Glob(./**)", ",Glob(./**),Bash(git diff *)") if x.startswith("--allowedTools") else x
                 for x in t], False),      # git diff --no-index reads any file
+    # Re-review of #60, P2: gh can reach any host (gh pr view <url>, gh pr list -R host/owner/repo).
+    (lambda t: [x + ",Bash(gh pr view *)" if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: [x + ",Bash(gh pr list *)" if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: [x + ",Bash(gh api *)" if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: [x + ",Bash( gh pr view *)" if x.startswith("--allowedTools") else x for x in t], False),
+    (lambda t: t + ["--allowedTools", "Bash(gh pr view *)"], False),
 ])
 def test_read_only_is_an_explicit_narrow_declaration(change, expected):
     assert rp.read_only(change(shipped_triage_runner())) is expected
+
+
+def test_no_gh_rule_is_read_only():
+    assert not [t for t in rp.READ_ONLY_TOOLS if t.startswith("Bash(gh")]
 
 
 def test_the_shipped_claude_code_runner_is_not_read_only():
@@ -184,8 +193,9 @@ def test_create_agent_can_save_the_token_where_board_mcp_reads_it(monkeypatch, t
 
 
 def test_save_token_keeps_the_old_token_valid_when_agents_toml_cannot_be_updated(monkeypatch, tmp_path, capsys):
-    """Review of #60, P3-5: the new token is staged privately first and replaces the token file only after agents.toml
-    accepted it; an existing token directory is tightened to 700."""
+    """Reviews of #60 (P3-5, then P3-2): the token file is written first and agents.toml last; when agents.toml cannot
+    be updated the old token file is restored from its hard-linked backup, so the old token stays registered and on
+    disk. An existing token directory is tightened to 700."""
     from agent_comms import config
     tokens = tmp_path / "tokens"
     tokens.mkdir(mode=0o755)
@@ -206,6 +216,39 @@ def test_save_token_keeps_the_old_token_valid_when_agents_toml_cannot_be_updated
     from agent_comms.core import Board
     board = Board(Settings(db_path=tmp_path / "check.db", agents_path=tmp_path / "agents.toml"))
     assert board.authenticate(old).name == TRIAGE
+    # A new agent whose registration fails leaves no token file behind.
+    with pytest.raises(OSError, match="disk full"):
+        run_cli(monkeypatch, tmp_path, "create-agent", "triage-two", "--runtime", "claude-code", "--save-token")
+    assert sorted(x.name for x in tokens.iterdir()) == [f"{TRIAGE}.token"]
+
+
+def test_save_token_writes_the_file_before_registering_the_token(monkeypatch, tmp_path):
+    """agents.toml is the last step: when it is written, the token file already holds the new token."""
+    from agent_comms import config
+    run_cli(monkeypatch, tmp_path, "create-agent", TRIAGE, "--runtime", "claude-code", "--save-token")
+    real, seen = config.write_agents, []
+
+    def spy(path, agents):
+        seen.append((tmp_path / "tokens" / f"{TRIAGE}.token").read_text().strip())
+        real(path, agents)
+    monkeypatch.setattr(config, "write_agents", spy)
+    run_cli(monkeypatch, tmp_path, "create-agent", TRIAGE, "--runtime", "claude-code", "--save-token", "--rotate")
+    assert seen == [load_agent_token(TRIAGE)]
+    assert sorted(x.name for x in (tmp_path / "tokens").iterdir()) == [f"{TRIAGE}.token"], "backup removed"
+
+
+def test_mcp_config_out_never_changes_the_chosen_folders_permissions(monkeypatch, tmp_path, capsys):
+    """Re-review of #60, P3-1: only the board's own token directory is tightened to 700."""
+    run_cli(monkeypatch, tmp_path, "create-agent", TRIAGE, "--runtime", "claude-code", "--save-token")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o755)
+    run_cli(monkeypatch, tmp_path, "mcp-config", "--agent", TRIAGE, "--out", str(shared / "haiku.json"))
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+    assert stat.S_IMODE((shared / "haiku.json").stat().st_mode) == 0o600
+    os.chmod(tmp_path / "tokens", 0o755)
+    run_cli(monkeypatch, tmp_path, "mcp-config", "--agent", TRIAGE)
+    assert stat.S_IMODE((tmp_path / "tokens").stat().st_mode) == 0o700
 
 
 def test_mcp_config_signs_the_run_in_as_that_agent_without_secrets(monkeypatch, tmp_path, capsys):

@@ -406,8 +406,8 @@ another project), the requests fall back to today's wording; `board_configuratio
 #### Triage agent (optional)
 
 A cheap Haiku identity can own the prevention inbox and other routine bookkeeping, so Opus and Codex runs are spent on
-code and independent reviews. It checks whether a proposal is already covered by merged work (`gh pr list/view`,
-`git log/show`) and closes it with evidence, forwards it to the maintainer when code must change, acknowledges and
+code and independent reviews. It checks whether a proposal is already covered by merged work (local
+`git log/show` and the board; no `gh` or network) and closes it with evidence, forwards it to the maintainer when code must change, acknowledges and
 closes simple bookkeeping requests addressed to it, and writes thread summaries. It never edits code (AGENT_RULES
 "When you are the triage agent"). To turn it on, from this checkout:
 
@@ -427,7 +427,7 @@ with `AGENT_COMMS_AGENT=claude-haiku`. Then, in `board.local.toml` (copy the com
   "claude", "-p", "{prompt}", "--model", "haiku",
   "--strict-mcp-config", "--mcp-config", "/Users/you/.config/agent-comms/claude-haiku.mcp.json",
   "--permission-mode", "dontAsk",
-  "--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr list *)",
+  "--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *)",
   "--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),Read(~/.ssh/**),Read(./data/**)",
 ]
 
@@ -451,10 +451,13 @@ Why each part matters:
   included. The token directory, `~/.ssh` and the board's `data/` (the database holds sealed posts) are denied
   explicitly, as are Edit and Write (a deny wins over any allow in your settings) and `git ... --output` (which writes
   a file). Checked with the installed CLI: a canary file outside the run directory, and one in `data/`, were unreadable
-  through Read, Grep, Glob and Bash, and nothing could be written. Allow rules in your user or project Claude Code
+  through Read, Grep, Glob and Bash, and nothing could be written. There is no `gh`: `gh pr view <url>` and
+  `gh pr list -R <host>/...` connect to any host the run names, so a prompt-injected run could send data out in the
+  host name or the request. Coverage checks use the local history (as fresh as the checkout's last fetch) and the
+  board. Allow rules in your user or project Claude Code
   settings (`.claude/settings*.json`) still apply under `dontAsk`; keep broad Bash allows out of them.
 - **Kept narrow in opted-in projects.** A runner that declares itself read-only (`dontAsk`, `--strict-mcp-config`, only
-  folder-scoped reads and read-only git/gh, and Edit, Write, the token directory and `~/.ssh` denied, plus the
+  folder-scoped reads and local read-only git, no `gh` at all, and Edit, Write, the token directory and `~/.ssh` denied, plus the
   `--output` deny when git is allowed) is launched exactly as written even when the project is in `[dispatch]
   claude_tool_projects`: the scoped implementation tools and their tool preflight apply to your other Claude runners.
 - **`prevention_forward_to`.** When the triage agent decides a proposal needs code, it posts a `request` on the inbox
@@ -482,6 +485,10 @@ unclaimed task is unowned again, or the same request is blocked in the same way 
 nothing new is posted either way. The automatic closure is not your answer: it does not give a request's automatic
 retries a fresh start (only your Unstick or answer does). Only while `auto_recover_stalled_work` is on, and never for
 an item you already answered.
+
+*Upgrading:* the first dispatcher pass after this change closes, in one batch, every older automatic-recovery item
+that is still in Needs you although its stall already cleared (records that were already `resolved` before the
+upgrade count). Expect several items to leave Needs you at once, each with the "Closed automatically" note.
 
 #### Awaiting another thread
 
