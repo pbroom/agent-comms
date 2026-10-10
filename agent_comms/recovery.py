@@ -462,7 +462,7 @@ def transfer_ended_owner(board, p, session_id, post_id, recipient, expected_vers
 
 def _transfer(board, p, session_id, post_id, recipient, expected_version):
     import os
-    from . import db, requests, decision_actions, browser_readiness
+    from . import db, requests, decision_actions, browser_readiness, runner_preflight
     with db.write_tx(board.conn):
         post, row = requests._context(board, p, session_id, post_id, recipient)
         if p.is_human or p.name != row['assigned_agent']:
@@ -501,7 +501,7 @@ def _transfer(board, p, session_id, post_id, recipient, expected_version):
             raise _TransientBlock(transient, os.path.realpath(old['worktree'] or old['project']), old['id'])
         how = 'abandoned' if abandoned else 'ended'
         requests._save(board, p, session_id, row, 'queued',
-                       f'Bookkeeping ownership recovered from {how} session {old["id"]}; execution preflight still required',
+                       f'{runner_preflight.RECOVERED_REASON}{how} session {old["id"]}; execution preflight still required',
                        row['evidence_post_ids'], row['assigned_agent'], session_id)
         after_route(board, p, post, row)
         _settle_wait(board, post_id, recipient, 'resolved', p.name, f'recovered by session {session_id}')

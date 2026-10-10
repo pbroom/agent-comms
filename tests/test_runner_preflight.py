@@ -146,6 +146,45 @@ def test_registered_session_cannot_skip_the_gate_by_finishing_unstarted_work(den
                           evidence_post_ids=[proof['id']])
 
 
+def _own(e, post_id, sid, reason):
+    """What recovery._transfer (or any other owner change) writes for this request."""
+    with e.board.conn:
+        _, row = requests._context(e.board, e.p['claude'], sid, post_id, 'claude')
+        requests._save(e.board, e.p['claude'], sid, row, 'queued', reason, [], 'claude', sid)
+
+
+@pytest.mark.parametrize('how', ['recovered', 'not_recovered', 'recovered_elsewhere'])
+def test_verified_run_may_finish_a_request_it_recovered(denv, how):
+    e = denv
+    post, run, rec = configure(e)
+    complete_probe(e, run, rec)
+    sid = e.board.register_session(e.p['claude'], PROJECT, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    other = human_post(e, ['claude'], body='older request this run did not launch for')
+    assert other['id'] not in rec['request_ids']
+    if how == 'recovered':
+        _own(e, other['id'], sid, rp.RECOVERED_REASON + 'ended session 1; execution preflight still required')
+    elif how == 'not_recovered':
+        _own(e, other['id'], sid, 'Assigned some other way')
+    else:
+        _own(e, other['id'], e.sid['claude'], rp.RECOVERED_REASON + 'ended session 1; execution preflight still required')
+    proof = e.board.create_post(e.p['claude'], sid, thread_id=post['thread_id'], type='status', body='Verified on main')
+    finish = lambda: requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'finished',
+                                       reason='Done', evidence_post_ids=[proof['id']])
+    if how == 'recovered':
+        finish()
+        assert e.board.get_post(e.p['human'], other['id'])['requests'][0]['state'] == 'finished'
+    else:
+        with pytest.raises(Conflict, match='preflight has not passed|owned by another session'):
+            finish()
+
+
+def test_scoped_runner_can_check_merges():
+    for tool in ('Bash(git fetch)', 'Bash(gh pr view *)', 'Bash(gh pr list *)', 'Bash(gh pr list)'):
+        assert tool in rp.ALLOWED
+    assert not any(t.startswith(('Bash(gh pr merge', 'Bash(gh api', 'Bash(git push')) for t in rp.ALLOWED)
+
+
 @pytest.mark.parametrize('mismatch', ['conversation', 'directory'])
 def test_wrong_execution_context_cannot_use_verified_receipts(denv, mismatch):
     e = denv
