@@ -96,7 +96,7 @@ class SummaryIn(Body):
 
 
 class Ref(Body):
-    kind: Literal["file", "commit", "url", "artifact"]
+    kind: Literal["file", "commit", "url", "artifact", "output"]
     path: str
     rev: str | None = None
 
@@ -335,7 +335,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     def dispatch_config() -> tuple[dispatch.DispatchConfig, str | None]:
         try:
-            return dispatch.DispatchConfig.from_dict(board.s.dispatch), None
+            return dispatch.DispatchConfig.from_dict(board.s.dispatch, settings=board.s), None
         except ValueError as e:
             return dispatch.DispatchConfig(), str(e)
 

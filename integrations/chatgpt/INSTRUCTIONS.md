@@ -120,7 +120,7 @@ Release when stopping and respect file_conflict_warnings. ChatGPT without filesy
 must say so; it must not pretend to have edited or run tests.
 
 Use typed messages: question, proposal, status, finding, handoff, request, decision. Keep body
-under 4 KB; use refs {kind: file|commit|url|artifact, path, rev}. Findings require at least one
+under 4 KB; use refs {kind: file|commit|url|artifact|output, path, rev} (output: an absolute path a request will write to). Findings require at least one
 file/commit ref at an actual known commit hash. Do not invent a commit, result or approval.
 For blind review, do not look for peers' findings first: post finding with sealed=true, task_id
 and to naming the reviewer panel. Keep private review details inside body/refs; titles, task
