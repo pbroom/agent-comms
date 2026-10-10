@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db, requests, workstreams, pickup
+from . import db, requests, requeue, workstreams, pickup
 from .config import NAME_RE, RUNTIME_RE, Settings, home, human_token_file
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -1245,8 +1245,9 @@ class Dispatcher:
             except ValueError:
                 continue
             # A run the human reset (workstreams.reset_delivery) no longer counts: the human allowed one new attempt.
+            # Nor does a run the dispatcher stopped whose request it requeued (requeue.py): one relaunch is allowed.
             if (isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", [])
-                    and not record.get("reset_by_human")):
+                    and not record.get("reset_by_human") and not requeue.requeued_post(record, post_id)):
                 return True
         return False
 
@@ -1261,7 +1262,10 @@ class Dispatcher:
         return bool(row and row["state"] == "queued" and row["assigned_agent"] == agent
                     and row["assigned_session"] is None)
 
-    def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None) -> None:
+    def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None,
+                         stopped: bool = False) -> None:
+        """Block the requests a failed or ended run left unsettled. `stopped`: the dispatcher itself stopped the run;
+        its generic requests go back to the queue instead, once a day per request (requeue.py)."""
         if post_id is None:
             return
         with db.write_tx(self.board.conn) as c:
@@ -1271,9 +1275,13 @@ class Dispatcher:
             managed = workstreams.get_for_post(self.board, post_id)
             record = self._get(self.RUN_PREFIX + run_id) if run_id else None
             recipients = record.get('request_recipients') if isinstance(record, dict) else None
+            handed_back = requeue.requeued_pairs(record) if isinstance(record, dict) else set()
+            requeued = False
             for row in requests.for_post(self.board, post):
                 if recipients is not None and row['recipient'] not in recipients:
                     continue
+                if (post_id, row['recipient']) in handed_back:
+                    continue    # this run's stop already requeued it; a later state is someone else's to settle
                 if row["state"] in ("finished", "blocked") or row["assigned_agent"] != agent:
                     continue
                 # Never overwrite work explicitly routed to another existing environment.
@@ -1287,18 +1295,34 @@ class Dispatcher:
                     elif run_id is None or session is None or session["dispatch_run_id"] != run_id:
                         continue
                 recipient = row['recipient']
+                row_reason = reason
+                if stopped and managed is None and run_id is not None and isinstance(record, dict):
+                    decision = requeue.decide(self.board, c, self._fence(), post_id, recipient)
+                    if decision == "requeue":
+                        requeue.apply(self.board, c, row, agent, run_id, record)
+                        requeued = True
+                        continue
+                    if decision == "used":
+                        row_reason = reason + requeue.USED
                 now, version = self.board.now(), row["version"] + 1
                 c.execute("""INSERT INTO request_progress
                     (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
                     VALUES (?,?,'blocked',?,NULL,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
                     state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
-                    (post_id,recipient,agent,reason,version,now))
+                    (post_id,recipient,agent,row_reason,version,now))
                 c.execute("""INSERT INTO request_events
                     (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
                     VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
-                    (post_id,recipient,agent,row["assigned_session"],reason,version,now))
+                    (post_id,recipient,agent,row["assigned_session"],row_reason,version,now))
                 seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
                 c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
+            if requeued:
+                seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
+                c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,self.board.now(),post_id))
+                if not record.get("launch_refunded") and type(record.get("rule_id")) is int:
+                    self.board.refund_dispatch_launch(self.human, record["rule_id"], _in_transaction=True)
+                    record["launch_refunded"] = True
+                self._put(c, self.RUN_PREFIX + run_id, record)
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
@@ -1598,7 +1622,8 @@ class Dispatcher:
         remove_browser_output(rec)
         for post_id in rec.get("request_ids", []):
             self._request_failure(post_id, run.agent, "Runner ended without explicit request completion: "
-                                  + status + " (exit " + str(code) + ")" + (": " + rec["error"] if rec.get("error") else ""), run.run_id)
+                                  + status + " (exit " + str(code) + ")" + (": " + rec["error"] if rec.get("error") else ""), run.run_id,
+                                  stopped=status == "stopped")
         log.info("%s run %s ended: %s (exit %s)", run.agent, run.run_id, status, code)
 
     def _reap(self, now: float) -> None:
@@ -1640,7 +1665,7 @@ class Dispatcher:
             for post_id in record.get("request_ids", []):
                 self._request_failure(post_id, record["agent"],
                     "Runner ended without explicit request completion: " + record.get("status", "unknown"),
-                    record["run_id"])
+                    record["run_id"], stopped=record.get("status") == "stopped")
 
     def _reap_orphans(self, now: float) -> list[dict]:
         """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when

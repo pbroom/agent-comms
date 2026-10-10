@@ -54,19 +54,23 @@ def instructions(board: Board, thread_id: int) -> tuple[str, str]:
 
 
 def stuck_agents(board: Board, thread_id: int) -> tuple[list[str], list[dict]]:
-    """The active non-human agents this thread is waiting on, and why: unanswered requests, blocked tasks and expired
-    leases (their owner), and accepted tasks nobody claimed (their creator). Reads metadata only (ids, agents, flags,
+    """The active non-human agents this thread is waiting on, and why: unanswered requests (not ones pickup treats as
+    in progress), blocked tasks and expired leases (their owner), and accepted tasks nobody claimed (their creator). Reads metadata only (ids, agents, flags,
     statuses, times), never bodies, titles or summaries. No age threshold: the human chose to ask."""
     c, now = board.conn, board.now()
     reasons: list[dict] = []
-    # Completion belongs to each original request/recipient, never a later arbitrary reply.
-    from . import requests
+    # Completion belongs to each original request/recipient, never a later arbitrary reply. A request pickup treats as
+    # in progress (its assigned session acknowledged the start and was seen recently, or holds a live lease on the
+    # linked task: pickup.classify, the one rule) is not silent, so its owner is not asked. Read-only: nothing here
+    # finishes a request or renews a lease.
+    from . import pickup, requests
     asks: dict[str, list[int]] = {}
     active = {r["name"] for r in c.execute("SELECT name FROM agents WHERE active=1 AND is_human=0")}
     for post in c.execute("SELECT * FROM posts WHERE thread_id=? AND sealed=0 ORDER BY id", (thread_id,)):
         for request in requests.for_post(board, post):
             agent = request["assigned_agent"] or request["recipient"]
-            if request["state"] != "finished" and agent in active:
+            if (request["state"] != "finished" and agent in active
+                    and not pickup.in_progress(board, post, request)):
                 asks.setdefault(agent, []).append(post["id"])
     for agent, ids in asks.items():
         reasons.append({"kind": "unanswered", "agent": agent, "post_ids": ids})

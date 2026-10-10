@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_comms import dispatch, unstick, requests
+from agent_comms import dispatch, pickup, unstick, requests
 from agent_comms.api import create_app
 from agent_comms.core import Conflict, Forbidden
 from agent_comms.dispatch import DispatchConfig, build_prompt
@@ -497,3 +497,51 @@ def test_human_approval_status_still_waits_on_recipient(uenv):
     p = uenv.post("human", uenv.tid, "Approved: go ahead", "status", to=["codex"])
     assert unstick.stuck_agents(uenv.board, uenv.tid) == (
         ["codex"], [{"kind": "unanswered", "agent": "codex", "post_ids": [p["id"]]}])
+
+
+# ---------------------------------------------------------------- a live owner is never called silent (pickup's rule)
+
+
+def _snapshot(env, post_id):
+    return ([tuple(r) for r in env.board.conn.execute("SELECT * FROM request_progress WHERE post_id=?", (post_id,))],
+            [tuple(r) for r in env.board.conn.execute("SELECT id, owner_session, lease_expires_at FROM tasks")])
+
+
+def _row(env, post_id):
+    post = env.board.conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+    return post, requests.for_post(env.board, post)[0]
+
+
+def test_a_request_its_live_owner_started_is_not_called_silent(uenv):
+    original = ask(uenv, "claude", ["codex"])
+    requests.progress(uenv.board, uenv.p["codex"], uenv.sid["codex"], original["id"], "codex", "started")
+    before = _snapshot(uenv, original["id"])
+    assert pickup.in_progress(uenv.board, *_row(uenv, original["id"]))
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])
+    assert call(uenv).status_code == 409                    # nothing to unstick while codex works on it
+    assert _snapshot(uenv, original["id"]) == before        # read-only: no finish, no lease renewal
+    # Past pickup's window with no lease, the same rule calls it stale: then codex is asked.
+    uenv.clock.advance(pickup.PICKUP_WAIT_SECONDS + 1)
+    assert not pickup.in_progress(uenv.board, *_row(uenv, original["id"]))
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == (
+        ["codex"], [{"kind": "unanswered", "agent": "codex", "post_ids": [original["id"]]}])
+
+
+def test_a_live_task_lease_keeps_a_quiet_owner_in_progress(uenv):
+    task = claimed_task(uenv, "codex")
+    original = ask(uenv, "claude", ["codex"], task_id=task)
+    requests.progress(uenv.board, uenv.p["codex"], uenv.sid["codex"], original["id"], "codex", "started")
+    uenv.clock.advance(pickup.PICKUP_WAIT_SECONDS + 1)       # the session went quiet ...
+    uenv.board.conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (uenv.clock.t + 600, task))
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])   # ... but still holds a live lease
+    uenv.clock.advance(601)                                  # the lease expired too: stalled
+    agents, reasons = unstick.stuck_agents(uenv.board, uenv.tid)
+    assert agents == ["codex"] and {"kind": "unanswered", "agent": "codex", "post_ids": [original["id"]]} in reasons
+
+
+def test_a_start_not_made_by_the_assigned_session_is_not_in_progress_for_unstick(uenv):
+    original = ask(uenv, "claude", ["codex"])
+    requests.progress(uenv.board, uenv.p["codex"], uenv.sid["codex"], original["id"], "codex", "started")
+    # The recorded start was not made by the assigned session itself: pickup does not trust it, nor does Unstick.
+    uenv.board.conn.execute("UPDATE request_events SET actor='human' WHERE post_id=?", (original["id"],))
+    assert unstick.stuck_agents(uenv.board, uenv.tid)[0] == ["codex"]

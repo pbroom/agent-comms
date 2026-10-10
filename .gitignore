@@ -24,3 +24,8 @@ dist/
 
 # Per-machine settings overlay (see board.toml)
 board.local.toml
+
+# Local helper state that must never make a checkout look dirty to the recovery gates (`git status --porcelain`,
+# DESIGN_NOTES "dirty-worktree"): Claude Code helper worktrees and board.local.toml backups
+.claude/worktrees/
+board.local.toml.bak*

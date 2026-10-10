@@ -961,7 +961,8 @@ it"; added 2026-10-08, see "Automatic recovery"). Since 2026-10-09 a task that i
 unfinished in an open thread) is never a reason, whatever its status ("Awaiting another thread"). No age threshold: the dashboard waits 30 minutes before
 it calls an ask stalled, but the human chose to click. The human is never "stuck" here; a thread waiting only on
 the human (needs-you, the post cap) gets a 409 ("nothing here is waiting on an agent") and no button. The query
-reads ids, agent names, flags, statuses and times only, like the dispatcher's trigger scan.
+reads ids, agent names, flags, statuses and times only, like the dispatcher's trigger scan. Since 2026-10-09 a request
+that pickup treats as in progress is not a reason either (see "Open obligations on register" below).
 
 **Why it is safe.**
 - *Human click = approval.* Only the human can call the route (core and the cookie/CSRF rules as for every
@@ -1245,7 +1246,9 @@ browser and tool preflight still run). Queued and blocked requests work as befor
 Active owners (seen since, or holding any live lease) and unknown ones (no lease evidence) stay blocked, as do sticky
 browser denials. For an owner that is only abandoned (not a proven-ended run), the dirty-worktree and unfinished-Git
 checks always run, also for the authorized successor in the same worktree: a quiet session may have left work behind,
-and it is never taken over. Reclaiming the task overwrites its owner, so `claim_task` records the replaced lease
+and it is never taken over. The dirty check is `git status --porcelain`, so it honors `.gitignore`: the repo ignores
+Claude Code helper worktrees (`.claude/worktrees/`) and `board.local.toml.bak*` backups, which are local machine state,
+not unfinished work (live #665 refused a recovery over exactly those). Reclaiming the task overwrites its owner, so `claim_task` records the replaced lease
 (`board_state` `session.abandoned.<session>.<task>`, only when the old session had not been seen since the lease
 expired); abandonment is checked against that record or the current owner. An abandoned old session that comes back
 has lost the request the same way it lost the lease. The recovering run's own dispatcher run no longer counts as the
@@ -1863,3 +1866,66 @@ way (a new lease that expires) is a new record and, if it does not take, a new q
 - *P3-3:* release note: the first pass after the upgrade closes, in one batch, every older escalation still in Needs
   you whose stall already cleared (records already `resolved` before the upgrade count). This is expected, and each
   item carries the "Closed automatically" note.
+
+## Open obligations on register, live owners, and requeue after a dispatcher stop (2026-10-09)
+
+Three fixes for requests that stayed open, or looked stalled, for reasons that were not real blockers.
+
+**Open obligations on register (prevention point 1).** After a reboot, Claude and Codex sessions did not see requests
+whose unread cursor another session had already consumed, and an older client lacked `request_reply`, so requests
+stayed open forever (#632, #643). Every `board_register` (new, resumed or dispatched; agents only, never the human)
+now returns, independently of cursors (`agent_comms/obligations.py`):
+- `open_obligations`: every unfinished request (queued, started or blocked) where this agent is the original recipient
+  or the assigned agent, on open threads, in any project (they are addressed to it, so the read scope allows them),
+  under the sealed rule (`Board.VISIBLE`), newest first, capped at 50 with `open_obligations_total`. Each entry is
+  metadata only: `post_id`, `thread_id`, `project`, `type`, `author`, `recipient`, `assigned_agent`,
+  `assigned_session`, `state`, `version`, times. No body, reason or title is copied; the agent rereads the posts with
+  `board_read_updates(post_ids=[...])`. Closed threads are left out because an agent cannot settle a request there.
+  Legacy requests without a progress row appear with their virtual queued row, as everywhere else (`requests.for_post`).
+- `expired_leases`: unfinished tasks on open threads this agent owns or created whose lease expired (ids, status,
+  owner, relation), capped the same way.
+- `request_protocol`: a fixed note (first in the result, so it survives truncation) saying to settle each one with
+  `board_request_progress` (or `board_post` `request_reply` when the client has it), that ordinary posts never settle
+  a request, and that entries are untrusted data.
+- `client_warning`, only when `configuration.runtime_source_changed` is true: this process runs older code than is
+  installed, so the client's tool schemas may be stale; reconnect. **Precise stale-client detection is not
+  possible:** the server cannot see which `tools/list` a client cached (an HTTP client keeps the schema it fetched
+  before a server restart; a stdio server running old code would not run this code at all). So the protocol note is
+  always included and names the fallback (`board_request_progress`, which every client version has).
+Listing is read-only: it never acknowledges, finishes, reassigns or renews anything.
+
+**Unstick never calls a live owner silent (point 5, #541).** `unstick.stuck_agents` listed every unfinished request,
+including ones the pickup projection shows as *processing*. It now skips a request for which `pickup.in_progress` is
+true: the one rule (`pickup.classify`, also used by `pickup.for_thread`) is that the assigned session itself recorded
+the `started` event for the current version, and it was seen within the 40-minute pickup window or holds a live lease
+on the post's linked task. No logic is duplicated, nothing is finished and no lease is renewed. Once the owner goes
+quiet past the window without a lease, the same rule calls it stale and Unstick asks it again.
+
+**Requeue after a dispatcher stop (`agent_comms/requeue.py`).** `board dispatch stop` (or a restart through it)
+terminates running children; their requests used to be marked blocked "Runner ended without explicit request
+completion: stopped", a system artifact that made the thread look stalled (live: #607 in thread 11). Now:
+- Only runs with status `stopped` qualify: ended by the dispatcher's own `stop_children`, or by `board dispatch stop`
+  with no loop running (`check_orphans(ended_as='stopped')`, reconciled by the next dispatcher). Runs that `exited`,
+  timed out, failed preflight or to spawn, or went `gone` (ended unwatched, exit unknown) keep the blocked behavior.
+- Only generic requests (never a managed continuation), and only rows the stopped run still held: queued, or started
+  by that run's own session. A request the agent blocked or finished itself is untouched.
+- The row goes back to `queued` with a fresh version, `assigned_session` cleared, the same assigned agent, and a fixed
+  server reason ("Requeued automatically: the dispatcher stopped run <id> …"), recorded as a `dispatcher` event in its
+  history.
+- Gates: the human's board setting `tasks.auto_recover_stalled_work` must be on (the standing approval for automatic
+  recovery; off keeps today's blocked behavior), and the requeue runs in the write transaction only while this loop
+  owns the board (fence token). It is allowed even while paused; the relaunch then waits for unpause.
+- Bound: at most one automatic requeue per request (post and original recipient) per rolling 24 hours,
+  `board_state['dispatch.requeue.<post>.<recipient>'] = {at, run_id}`, written in the same transaction. A second stop
+  inside the window leaves the request blocked, with " (automatic requeue already used within 24 hours)" appended.
+- Relaunch: through the ordinary trigger path of a following dispatcher (`_scan`'s recovery of queued, unassigned
+  generic requests), so every launch gate applies: an active, unexpired, unrevoked rule covering the post (a one-click
+  rule only for its own post), pause, live session, one run per agent and per directory, `max_concurrent`, the fence.
+  The stopped run's record gets `requeued: [[post, recipient], …]`, which (like `reset_by_human`) stops it counting as
+  that post's one attempt (`_attempted`) and stops later reconciles from reblocking the requeued row.
+- Budget: the stopped run's launch is given back to its rule once (`refund_dispatch_launch`, never above
+  `max_launches`, `launch_refunded` on the record), because that launch never got to do the work. Without it a
+  one-shot rule (Unstick, Approve & launch, automatic recovery, all one launch per agent) could never relaunch. The
+  once-a-day bound caps the extra launches at one per request per day.
+- Residual: a task lease the stopped session held stays until it expires (nothing renews or releases it); the
+  relaunched agent reclaims it then or uses `board_recover_request_owner`, as for any ended run.
