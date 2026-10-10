@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db, requests, workstreams, pickup
+from . import db, requests, requeue, workstreams, pickup
 from .config import NAME_RE, RUNTIME_RE, Settings, home, human_token_file
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -816,10 +816,12 @@ def _active_records(board: Board) -> list[dict]:
 
 
 def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), note: str = "",
-                  ended_as: dict[str, str] | None = None, respect_owner: bool = True) -> list[dict]:
+                  ended_as: dict[str, str] | None = None, respect_owner: bool = True,
+                  stop_mode: str | None = None) -> list[dict]:
     """Active run records that no live dispatcher is watching: not in `exclude` (runs the caller owns) and, with
     `respect_owner`, not started by the loop that currently owns the board. Dead ones are closed ('gone', or the
-    status given in `ended_as`); live ones are marked 'orphaned' and returned with '_state' ('ours'/'unknown')."""
+    status given in `ended_as`, with `stop_mode` recorded on those: requeue.py); live ones are marked 'orphaned' and
+    returned with '_state' ('ours'/'unknown')."""
     owner = board.conn.execute("SELECT value FROM board_state WHERE key = ?", (Dispatcher.OWNER_KEY,)).fetchone()
     owner_token = json.loads(owner[0]) if owner and respect_owner else None
     alive, updates = [], []
@@ -829,8 +831,11 @@ def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), n
         state = probe(d.get("pid"), d.get("proc_start"))
         if state == "dead":
             status = (ended_as or {}).get(d["run_id"], "gone")
-            updates.append(d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
-                                "note": "ended while no dispatcher was watching it (exit code unknown)"})
+            ended = d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
+                         "note": "ended while no dispatcher was watching it (exit code unknown)"}
+            if stop_mode is not None and d["run_id"] in (ended_as or {}):
+                ended["stop_mode"] = stop_mode
+            updates.append(ended)
             remove_browser_output(d)
             continue
         if d["status"] != "orphaned":
@@ -1245,8 +1250,9 @@ class Dispatcher:
             except ValueError:
                 continue
             # A run the human reset (workstreams.reset_delivery) no longer counts: the human allowed one new attempt.
+            # Nor does a run the dispatcher stopped whose request it requeued (requeue.py): one relaunch is allowed.
             if (isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", [])
-                    and not record.get("reset_by_human")):
+                    and not record.get("reset_by_human") and not requeue.requeued_post(record, post_id)):
                 return True
         return False
 
@@ -1261,19 +1267,30 @@ class Dispatcher:
         return bool(row and row["state"] == "queued" and row["assigned_agent"] == agent
                     and row["assigned_session"] is None)
 
-    def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None) -> None:
+    def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None,
+                         stopped: bool = False) -> None:
+        """Block the requests a failed or ended run left unsettled. `stopped`: a maintenance stop (`board dispatch stop
+        --requeue`) ended the run; its generic requests go back to the queue instead, once a day per request
+        (requeue.py). The decision for this post is recorded on the run in the same transaction."""
         if post_id is None:
             return
         with db.write_tx(self.board.conn) as c:
+            record = self._get(self.RUN_PREFIX + run_id) if run_id else None
             post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
             if post is None:
+                if stopped and isinstance(record, dict):
+                    requeue.mark_decided(record, post_id)
+                    self._put(c, self.RUN_PREFIX + run_id, record)
                 return
             managed = workstreams.get_for_post(self.board, post_id)
-            record = self._get(self.RUN_PREFIX + run_id) if run_id else None
             recipients = record.get('request_recipients') if isinstance(record, dict) else None
+            handed_back = requeue.requeued_pairs(record) if isinstance(record, dict) else set()
+            requeued = False
             for row in requests.for_post(self.board, post):
                 if recipients is not None and row['recipient'] not in recipients:
                     continue
+                if (post_id, row['recipient']) in handed_back:
+                    continue    # this run's stop already requeued it; a later state is someone else's to settle
                 if row["state"] in ("finished", "blocked") or row["assigned_agent"] != agent:
                     continue
                 # Never overwrite work explicitly routed to another existing environment.
@@ -1287,18 +1304,39 @@ class Dispatcher:
                     elif run_id is None or session is None or session["dispatch_run_id"] != run_id:
                         continue
                 recipient = row['recipient']
+                row_reason = reason
+                if stopped and managed is None and run_id is not None and isinstance(record, dict):
+                    decision = requeue.decide(self.board, c, self._fence(), post_id, recipient)
+                    if decision == "requeue":
+                        requeue.apply(self.board, c, row, agent, run_id, record)
+                        requeued = True
+                        continue
+                    if decision == "used":
+                        row_reason = reason + requeue.USED
                 now, version = self.board.now(), row["version"] + 1
                 c.execute("""INSERT INTO request_progress
                     (post_id,recipient,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,updated_at)
                     VALUES (?,?,'blocked',?,NULL,?,'[]',?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET
                     state='blocked',reason=excluded.reason,version=excluded.version,updated_at=excluded.updated_at""",
-                    (post_id,recipient,agent,reason,version,now))
+                    (post_id,recipient,agent,row_reason,version,now))
                 c.execute("""INSERT INTO request_events
                     (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,version,created_at,event_source)
                     VALUES (?,?,NULL,NULL,'blocked',?,?,?,'[]',?,?,'dispatcher')""",
-                    (post_id,recipient,agent,row["assigned_session"],reason,version,now))
+                    (post_id,recipient,agent,row["assigned_session"],row_reason,version,now))
                 seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
                 c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,now,post_id))
+            if requeued:
+                seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
+                c.execute("UPDATE posts SET seq=?,revised_at=? WHERE id=?", (seq,self.board.now(),post_id))
+                # Give the launch back only to the rule that may launch this very post again (checked here, in the
+                # refund's transaction): a one-click rule still bound to it, or a rule that was never one-click. A
+                # one-click rule whose binding is gone would otherwise revive as a thread-wide rule.
+                if not record.get("launch_refunded") and requeue.refundable(self.board, record, post_id):
+                    self.board.refund_dispatch_launch(self.human, record["rule_id"], _in_transaction=True)
+                    record["launch_refunded"] = True
+            if stopped and isinstance(record, dict):
+                requeue.mark_decided(record, post_id)
+                self._put(c, self.RUN_PREFIX + run_id, record)
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
@@ -1464,6 +1502,8 @@ class Dispatcher:
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
                   "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
+        from . import human_actions     # whether the rule is a one-click rule (requeue.refundable)
+        record["one_click"] = rule["id"] in human_actions.one_click_rule_ids(self.board)
         if item.get('post_id'):
             post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (item['post_id'],)).fetchone()
             record['request_recipients'] = [row['recipient'] for row in requests.for_post(self.board, post)
@@ -1589,16 +1629,19 @@ class Dispatcher:
         rec.update(pid=child.pid, proc_start=started)
         self._record(rec)
 
-    def _finish(self, run: _Run, status: str, code: int | None) -> None:
+    def _finish(self, run: _Run, status: str, code: int | None, stop_mode: str | None = None) -> None:
         self.running.pop(run.agent, None)
         self.ended[run.agent] = self.board.now()
         rec = self._get(self.RUN_PREFIX + run.run_id) or {}
         rec |= {"status": status, "exit_code": code, "ended_at": self.board.now()}
+        if stop_mode is not None:
+            rec["stop_mode"] = stop_mode
         self._record(rec)
         remove_browser_output(rec)
         for post_id in rec.get("request_ids", []):
             self._request_failure(post_id, run.agent, "Runner ended without explicit request completion: "
-                                  + status + " (exit " + str(code) + ")" + (": " + rec["error"] if rec.get("error") else ""), run.run_id)
+                                  + status + " (exit " + str(code) + ")" + (": " + rec["error"] if rec.get("error") else ""), run.run_id,
+                                  stopped=requeue.requeue_stop(rec))
         log.info("%s run %s ended: %s (exit %s)", run.agent, run.run_id, status, code)
 
     def _reap(self, now: float) -> None:
@@ -1640,7 +1683,7 @@ class Dispatcher:
             for post_id in record.get("request_ids", []):
                 self._request_failure(post_id, record["agent"],
                     "Runner ended without explicit request completion: " + record.get("status", "unknown"),
-                    record["run_id"])
+                    record["run_id"], stopped=requeue.requeue_stop(record))
 
     def _reap_orphans(self, now: float) -> list[dict]:
         """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when
@@ -1668,9 +1711,17 @@ class Dispatcher:
                 _signal_group(d["pid"], signal.SIGKILL)
         return alive
 
-    def stop_children(self, sleep: Callable[[float], None] = time.sleep) -> None:
+    def stop_children(self, sleep: Callable[[float], None] = time.sleep, requeue_requests: bool = False) -> None:
         """Terminate every running child (process group), wait the grace period, then kill what remains. Verified
-        runs left by an earlier dispatcher are terminated the same way."""
+        runs left by an earlier dispatcher are terminated the same way. Halting is the default: the stopped runs'
+        requests stay blocked. `requeue_requests` (`board dispatch stop --requeue`, a maintenance restart) records
+        the runs for requeue instead (requeue.py), never while the board is paused. A run whose own exit is already
+        known before the stop is recorded as it ended (exited, timeout), never as stopped."""
+        mode = requeue.REQUEUE if requeue_requests and not self.board.is_paused() else requeue.HALT
+        for run in list(self.running.values()):
+            code = run.child.poll()
+            if code is not None:
+                self._finish(run, self._ended_status(run, code), code)
         try:
             orphans = [d for d in check_orphans(self.board, self.probe, self._own_ids()) if d["_state"] == "ours"]
         except Exception:
@@ -1684,7 +1735,7 @@ class Dispatcher:
         while self.running and time.monotonic() < deadline:
             for run in list(self.running.values()):
                 if run.child.poll() is not None:
-                    self._finish(run, "stopped", run.child.poll())
+                    self._finish(run, "timeout" if run.timed_out else "stopped", run.child.poll(), mode)
             if self.running:
                 sleep(0.2)
         if self.running:
@@ -1692,12 +1743,21 @@ class Dispatcher:
                 run.child.kill()
             sleep(0.2)
         for run in list(self.running.values()):
-            self._finish(run, "stopped", run.child.poll())
+            self._finish(run, "timeout" if run.timed_out else "stopped", run.child.poll(), mode)
         for d in orphans:
             if self.probe(d["pid"], d.get("proc_start")) == "ours":
                 _signal_group(d["pid"], signal.SIGKILL)
         if orphans:
-            check_orphans(self.board, self.probe, self._own_ids(), ended_as={d["run_id"]: "stopped" for d in orphans})
+            check_orphans(self.board, self.probe, self._own_ids(), ended_as={d["run_id"]: "stopped" for d in orphans},
+                          stop_mode=mode)
+
+    def _ended_status(self, run: _Run, code: int) -> str:
+        """How a run that already exited by itself ended: 'timeout' when the dispatcher was timing it out, 'stopped'
+        for a tool preflight that passed (its work never began), else 'exited'."""
+        if run.timed_out:
+            return "timeout"
+        rec = self._get(self.RUN_PREFIX + run.run_id) or {}
+        return "stopped" if rec.get("phase") == "tool_preflight" and code == 0 else "exited"
 
     # ------------------------------------------------------------ the loop
 
@@ -1761,7 +1821,11 @@ class Dispatcher:
                 if self.stop_requested():
                     break
         finally:
-            self.stop_children(sleep)
+            # Halt unless the human asked for a maintenance restart (`board dispatch stop --requeue`): a signal
+            # (Ctrl-C, SIGTERM), a plain stop or a takeover never requeues anything.
+            stop = self._get(self.STOP_KEY)
+            self.stop_children(sleep, requeue_requests=isinstance(stop, dict) and stop.get("requeue") is True
+                               and self.owns_loop())
             self.release_loop()
 
 
@@ -1795,20 +1859,31 @@ def loop_status(board: Board, config: DispatchConfig) -> dict:
             "heartbeat_seconds_ago": round(age, 1), "started_at": iso(cur.get("started_at"))}
 
 
-def set_stop_flag(board: Board, p: Principal) -> None:
-    """The flag a running loop checks every pass; it then terminates its children and exits."""
+def set_stop_flag(board: Board, p: Principal, requeue_requests: bool = False) -> None:
+    """The flag a running loop checks every pass; it then terminates its children and exits. A plain stop halts them
+    (their requests stay blocked); `requeue_requests` asks for a maintenance restart instead (requeue.py)."""
     board._require_human(p, "stop the dispatcher")
+    value = {"requeue": True} if requeue_requests else True
     with db.write_tx(board.conn) as c:
         c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, ?, ?)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by,
-                     updated_at = excluded.updated_at""", (Dispatcher.STOP_KEY, json.dumps(True), p.name, board.now()))
+                     updated_at = excluded.updated_at""", (Dispatcher.STOP_KEY, json.dumps(value), p.name, board.now()))
 
 
 def request_stop(board: Board, p: Principal, config: DispatchConfig, wait_seconds: float | None = None,
-                 sleep: Callable[[float], None] = time.sleep, probe: Probe = probe_process) -> dict:
+                 sleep: Callable[[float], None] = time.sleep, probe: Probe = probe_process,
+                 requeue_requests: bool = False) -> dict:
     """Ask the running loop to stop; it terminates its children and exits. Waits for it to go. With no loop
-    running, terminates verified runs an earlier dispatcher left and reports any it cannot verify."""
+    running, terminates verified runs an earlier dispatcher left and reports any it cannot verify. Halting is the
+    default. `requeue_requests` (a maintenance restart) requeues the stopped runs' requests once (requeue.py), never
+    while the board is paused: with a loop running it reports the requests it requeued (`requeued_requests`); with
+    none, the next dispatcher requeues them (`requeue_pending`)."""
     board._require_human(p, "stop the dispatcher")
+    paused = board.is_paused()
+    mode = requeue.REQUEUE if requeue_requests and not paused else requeue.HALT
+    extra = {"requeue": mode == requeue.REQUEUE}
+    if requeue_requests and paused:
+        extra["requeue_refused"] = "the board is paused, so nothing is requeued"
     status = loop_status(board, config)
     if not status["running"]:
         alive = check_orphans(board, probe, note="dispatcher not running at stop", respect_owner=False)
@@ -1820,15 +1895,21 @@ def request_stop(board: Board, p: Principal, config: DispatchConfig, wait_second
             for d in ours:
                 if probe(d["pid"], d.get("proc_start")) == "ours":
                     _signal_group(d["pid"], signal.SIGKILL)
-            check_orphans(board, probe, ended_as={d["run_id"]: "stopped" for d in ours}, respect_owner=False)
+            check_orphans(board, probe, ended_as={d["run_id"]: "stopped" for d in ours}, respect_owner=False,
+                          stop_mode=mode)
+        if mode == requeue.REQUEUE:
+            extra["requeue_pending"] = sorted({i for d in ours for i in d.get("request_ids", []) if type(i) is int})
         return {"stopped": False, "was_running": False, "terminated_runs": [d["run_id"] for d in ours],
-                "unverified_runs": [d for d in alive if d["_state"] != "ours"]}
-    set_stop_flag(board, p)
+                "unverified_runs": [d for d in alive if d["_state"] != "ours"], **extra}
+    asked_at = board.now()
+    set_stop_flag(board, p, requeue_requests=mode == requeue.REQUEUE)
     wait = wait_seconds if wait_seconds is not None else 2 * config.poll_seconds + config.kill_grace_seconds + 5
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if board.conn.execute("SELECT 1 FROM board_state WHERE key = ?", (Dispatcher.LOOP_KEY,)).fetchone() is None:
-            return {"stopped": True, "was_running": True}
+            if mode == requeue.REQUEUE:
+                extra["requeued_requests"] = requeue.requeued_since(board, asked_at)
+            return {"stopped": True, "was_running": True, **extra}
         sleep(0.5)
     return {"stopped": False, "was_running": True, "pid": status.get("pid"),
-            "message": "stop requested; the dispatcher has not exited yet"}
+            "message": "stop requested; the dispatcher has not exited yet", **extra}

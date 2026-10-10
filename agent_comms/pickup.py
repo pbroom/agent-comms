@@ -22,6 +22,53 @@ def waiting_since(board, post, row):
     return since
 
 
+def started_max_age(board):
+    """How long a started request may go without a progress event (a new started/blocked/finished report) before it
+    counts as stalled, however live its owner looks: twice the task lease TTL."""
+    return 2 * board.s.lease_ttl_minutes * 60
+
+
+def classify(board, post, row):
+    """(bucket, reason) for one request row: bucket is 'waiting', 'processing' or 'blocked', or None for a finished
+    request with matching lifecycle evidence. 'processing' is the in-progress rule: the assigned session itself
+    acknowledged the start, it was seen within PICKUP_WAIT_SECONDS or still holds a live lease on the linked task, and
+    its latest progress event is no older than started_max_age (a chatty session that never reports progress is
+    stalled). Unstick uses this same rule, so a live owner is never called silent (unstick.stuck_agents)."""
+    event = board.conn.execute('''SELECT * FROM request_events
+        WHERE post_id=? AND recipient=? AND version=?''',
+        (post['id'], row['recipient'], row['version'])).fetchone()
+    matches = bool(event and event['state'] == row['state']
+                   and event['assigned_agent'] == row['assigned_agent']
+                   and event['assigned_session'] == row['assigned_session'])
+    if row['state'] == 'finished' and matches:
+        return None, row['reason']
+    if row['state'] == 'blocked':
+        return 'blocked', row['reason']
+    if (row['state'] == 'started' and matches and row['assigned_session'] is not None
+            and event['actor'] == row['assigned_agent']
+            and event['session_id'] == row['assigned_session']):
+        owner = board.conn.execute('SELECT last_seen FROM sessions WHERE id=?',
+                                   (row['assigned_session'],)).fetchone()
+        lease = board.conn.execute('''SELECT 1 FROM tasks WHERE id=? AND owner_session=?
+            AND owner_agent=? AND status IN ('working','blocked') AND lease_expires_at>?''',
+            (post['task_id'], row['assigned_session'], row['assigned_agent'], board.now())).fetchone()
+        if (owner is None or owner['last_seen'] < board.now() - PICKUP_WAIT_SECONDS) and not lease:
+            return 'blocked', 'Owner acknowledgement is stale; no current task lease confirms continued work'
+        # A chatty owner (seen, or renewing its lease) that reports no progress is stalled too, past a cap.
+        if board.now() - event['created_at'] > started_max_age(board):
+            return 'blocked', ('No request progress reported for over '
+                               + str(int(started_max_age(board) // 60)) + ' minutes')
+        return 'processing', row['reason']
+    if row['state'] in ('started', 'finished'):
+        return 'waiting', 'Current assignment lacks explicit '+row['state']+' lifecycle evidence'
+    return 'waiting', row['reason']
+
+
+def in_progress(board, post, row):
+    """Pickup treats this request as being worked on right now (classify's 'processing')."""
+    return classify(board, post, row)[0] == 'processing'
+
+
 def for_thread(board, p, thread_id):
     """Project every visible request, independently of cursors and display limits."""
     result = {'waiting': [], 'processing': [], 'blocked': [], 'complete': False}
@@ -32,33 +79,9 @@ def for_thread(board, p, thread_id):
     for post in posts:
         for row in requests.for_post(board, post):
             sources += 1
-            event = board.conn.execute('''SELECT * FROM request_events
-                WHERE post_id=? AND recipient=? AND version=?''',
-                (post['id'], row['recipient'], row['version'])).fetchone()
-            matches = bool(event and event['state'] == row['state']
-                           and event['assigned_agent'] == row['assigned_agent']
-                           and event['assigned_session'] == row['assigned_session'])
-            if row['state'] == 'finished' and matches:
+            bucket, reason = classify(board, post, row)
+            if bucket is None:
                 continue
-            bucket = 'waiting'
-            reason = row['reason']
-            if row['state'] == 'blocked':
-                bucket = 'blocked'
-            elif (row['state'] == 'started' and matches and row['assigned_session'] is not None
-                  and event['actor'] == row['assigned_agent']
-                  and event['session_id'] == row['assigned_session']):
-                owner = board.conn.execute('SELECT last_seen FROM sessions WHERE id=?',
-                                           (row['assigned_session'],)).fetchone()
-                lease = board.conn.execute('''SELECT 1 FROM tasks WHERE id=? AND owner_session=?
-                    AND owner_agent=? AND status IN ('working','blocked') AND lease_expires_at>?''',
-                    (post['task_id'], row['assigned_session'], row['assigned_agent'], board.now())).fetchone()
-                if (owner is None or owner['last_seen'] < board.now() - PICKUP_WAIT_SECONDS) and not lease:
-                    bucket = 'blocked'
-                    reason = 'Owner acknowledgement is stale; no current task lease confirms continued work'
-                else:
-                    bucket = 'processing'
-            elif row['state'] in ('started', 'finished'):
-                reason = 'Current assignment lacks explicit '+row['state']+' lifecycle evidence'
             deadline = None
             if bucket == 'waiting':
                 managed = board.conn.execute('SELECT deadline FROM continuations WHERE post_id=?',

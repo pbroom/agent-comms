@@ -207,7 +207,11 @@ def main(argv: list[str] | None = None) -> None:
     d = dsub.add_parser("revoke", help="revoke a workstream approval (running agents are not stopped)")
     d.add_argument("rule_id", type=int)
     dsub.add_parser("run", help="run the dispatcher in the foreground until `board dispatch stop` or Ctrl-C")
-    dsub.add_parser("stop", help="stop the dispatcher and terminate the agents it started")
+    d = dsub.add_parser("stop", help="stop the dispatcher and terminate the agents it started; their requests stay "
+                                     "blocked (a halt) unless you pass --requeue")
+    d.add_argument("--requeue", action="store_true",
+                   help="maintenance restart: requeue the stopped runs' unsettled requests once (not while paused; "
+                        "needs tasks.auto_recover_stalled_work) so the next dispatcher relaunches them; prints their ids")
 
     a = ap.parse_args(argv)
 
@@ -441,7 +445,7 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
         r = board.revoke_dispatch_rule(p, a.rule_id)
         out(r, f"revoked {_fmt_rule(r)}\n(agents already running are not stopped; `board dispatch stop` stops them)")
     elif a.dispatch_cmd == "stop":
-        r = dispatch.request_stop(board, p, dispatch.DispatchConfig.load())
+        r = dispatch.request_stop(board, p, dispatch.DispatchConfig.load(), requeue_requests=a.requeue)
         if r["stopped"]:
             text = "dispatcher stopped (any agents it had running were terminated)"
         elif not r["was_running"]:
@@ -453,6 +457,16 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
                         "not be verified as the process the dispatcher started; check it yourself"
         else:
             text = f"stop requested, but the dispatcher (pid {r.get('pid')}) has not exited yet"
+        if r.get("requeue_refused"):
+            text += f"\nnot requeued: {r['requeue_refused']}"
+        elif "requeued_requests" in r:
+            ids = [f"#{x['post_id']} ({x['recipient']})" for x in r["requeued_requests"]]
+            text += "\nrequeued requests: " + (", ".join(ids) if ids else "none")
+        elif r.get("requeue_pending"):
+            text += ("\nthe next dispatcher requeues the unsettled requests of "
+                     + ", ".join(f"#{i}" for i in r["requeue_pending"]))
+        elif not a.requeue and (r["stopped"] or r.get("terminated_runs")):
+            text += "\nthe stopped runs' requests stay blocked (use --requeue for a maintenance restart)"
         out(r, text)
     elif a.dispatch_cmd == "run":
         import logging

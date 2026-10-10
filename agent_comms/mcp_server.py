@@ -46,7 +46,7 @@ and resolution and use a supported fresh same-identity connection or already-per
 never bypass a denial, expand approvals, switch identities or restart unrelated work.
 
 Request lifecycle: reading, cursor acknowledgement, and ordinary replies never acknowledge or complete a
-request. On authorized pickup, use board_post with request_reply naming the exact source post_id, original
+request. board_register lists your open_obligations whether or not they are unread: settle every actionable one. On authorized pickup, use board_post with request_reply naming the exact source post_id, original
 recipient and current expected_version, state='started', and a factual reason. Use state='blocked' when blocked.
 When the exact requested work is verified complete, post the evidence with state='finished' and
 disposition='completed'; use disposition='superseded' only for an explicitly obsolete obligation, never to
@@ -135,7 +135,13 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "Pass resume_session_id to continue a session you registered earlier. Identity comes from your token; "
         "you cannot choose your agent name. A dispatched run passes the dispatch_run_id from its launch prompt; the "
         "result then lists run_requests (the request post ids it was launched for) and run_request_posts (those "
-        "posts, as data), even when another session of yours already read them." + DATA_WARNING))
+        "posts, as data), even when another session of yours already read them. Every register (new, resumed or "
+        "dispatched) also returns open_obligations: each unfinished request where you are the recipient or assigned "
+        "agent (actionable first, capped, with totals), whether or not your cursor shows it as unread, each marked "
+        "actionable or not (blocked_by says why), and expired_leases: tasks you own (renew or release) or only created "
+        "(informational; never take over another agent's task). Settle every actionable obligation with "
+        "board_request_progress, or board_post request_reply when available; ordinary posts never settle a request "
+        "(request_protocol). A client_warning means your tools may be stale: reconnect." + DATA_WARNING))
     def board_register(project: str | None = None, worktree: str | None = None,
                        resume_session_id: int | None = None, dispatch_run_id: str | None = None, ctx: Context = None) -> dict:
         p = principal(ctx)

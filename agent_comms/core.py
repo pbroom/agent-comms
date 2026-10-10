@@ -725,10 +725,14 @@ class Board:
         r = self.reserve_dispatch_launch(p, rule_id, agent)
         return r["launches_left"] if r["ok"] else None
 
-    def refund_dispatch_launch(self, p: Principal, rule_id: int) -> None:
-        """Give back a launch that never started (the spawn failed). Never exceeds max_launches."""
+    def refund_dispatch_launch(self, p: Principal, rule_id: int, _in_transaction: bool = False) -> None:
+        """Give back a launch that never started (the spawn failed), or whose run the dispatcher itself stopped before
+        it settled its request (requeue.py). Never exceeds max_launches. `_in_transaction`: inside the caller's open
+        write transaction."""
         self._require_human(p, "run the dispatcher")
-        with db.write_tx(self.conn) as c:
+        if _in_transaction and not self.conn.in_transaction:
+            raise Invalid("internal launch refund requires an active transaction")
+        with (nullcontext(self.conn) if _in_transaction else db.write_tx(self.conn)) as c:
             rows = self._dispatch_rows(rule_id)
             t = self._dispatch_target(rows[0]) if rows else None
             if t is not None and t["launches_left"] < t["max_launches"]:
@@ -934,6 +938,10 @@ class Board:
                "project": project, "worktree": worktree, "paused": self.is_paused(), "limits": self.limits(),
                "configuration": self.configuration_status(p),
                "notice": UNTRUSTED_NOTICE, "authorization_grants": self.list_grants(p, project)}
+        # Every register (new, resumed or dispatched) lists what is still open in this agent's name, independently of
+        # read cursors, so a restarted session settles requests another session already read past (obligations.py).
+        from . import obligations
+        out.update(obligations.for_register(self, p, out["configuration"], sid, project))
         if run_requests is not None:
             # Ids and the note first: they survive a client that truncates a long result.
             out["run_requests"] = run_requests

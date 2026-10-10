@@ -32,6 +32,10 @@ def test_exact_recovery_retires_original_stays_unfinished(env):
     assert row(env, unrelated)['state'] == 'queued'
     assert row(env, obligation)['evidence_post_ids']
     assert env.board.get_post(env.p['human'],obligation['id'])['body'] == 'recover stalled work'
+    # The original stays unfinished, but its live owner just started it: pickup treats it as in progress, so Unstick
+    # does not call codex silent about it (pickup.classify). The unrelated request is still unanswered.
+    assert unstick.stuck_agents(env.board, tid)[1][0]['post_ids'] == [unrelated['id']]
+    env.clock.advance(41 * 60)      # the owner went quiet past the pickup window, with no lease: stalled again
     assert unstick.stuck_agents(env.board, tid)[1][0]['post_ids'] == [originals[0]['id'],unrelated['id']]
 
 
