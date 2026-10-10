@@ -1,44 +1,102 @@
-"""Requests of a run the dispatcher itself stopped go back to the queue, once (DESIGN_NOTES "Requeue after a
+"""Requests of a run stopped for a maintenance restart go back to the queue, once (DESIGN_NOTES "Requeue after a
 dispatcher stop").
 
-`board dispatch stop` (or a restart through it) terminates running children; their runs end with status 'stopped'.
-Their unsettled requests used to be marked blocked ("Runner ended without explicit request completion: stopped"),
-which is a system artifact, not a real blocker, and the thread then showed as stalled until the human clicked
-Unstick. Now such a request goes back to `queued` (a fresh version; the reason is in its history), and a following
-dispatcher relaunches it through the ordinary trigger path.
+Stopping the dispatcher terminates running children; their runs end with status 'stopped'. Their unsettled requests
+used to be marked blocked ("Runner ended without explicit request completion: stopped"). For a restart that is a
+system artifact, not a real blocker, and the thread then showed as stalled (live #607). But a stop is also how the
+human halts a runaway agent, so halting stays the default and requeueing is explicit.
 
-Guardrails:
-- Only runs the dispatcher stopped (status 'stopped': stop_children, or `board dispatch stop` with no loop running).
-  A run that exited on its own, timed out, failed to start, or ended unwatched ('gone': its exit is unknown) keeps
-  today's behavior: its requests are blocked.
+Stop modes, recorded on each stopped run as `stop_mode`:
+- HALT (the default): `board dispatch stop`, the Settings page's stop, Ctrl-C or SIGTERM to the loop, a takeover by
+  another loop, and any stop while the board is paused. Requests stay blocked as before; nothing is refunded.
+- REQUEUE: only `board dispatch stop --requeue` (a maintenance restart), and never while the board is paused at stop
+  time. A run recorded before stop modes existed counts as halted.
+
+Guardrails for REQUEUE:
+- Only runs the dispatcher stopped (status 'stopped'). A run whose own exit was already known at the stop, that timed
+  out, failed to start, or ended unwatched ('gone': its exit is unknown) keeps the blocked behavior.
 - Only generic requests (never a managed continuation, which has its own delivery contract), and only rows the stopped
   run still held unsettled (queued, or started by that run's own session). A request the agent blocked or finished
   itself is never touched.
-- Only while the human's board setting `tasks.auto_recover_stalled_work` is on (the standing approval for automatic
-  recovery), and only by the dispatcher loop that owns the board (its fence token is checked in the transaction).
+- Only while the human's board setting `tasks.auto_recover_stalled_work` is on, and only by the dispatcher loop that
+  owns the board (its fence token is checked in the transaction).
 - At most one automatic requeue per request (post and original recipient) per rolling WINDOW_SECONDS, recorded durably
   in board_state (KEY_PREFIX) in the same transaction as the requeue. A second stop within the window leaves the
-  request blocked, as before.
+  request blocked. With a standing rule and a daily maintenance restart, a request can therefore be relaunched about
+  once a day; a run that keeps being stopped is relaunched at most once per 24 hours.
 - The relaunch needs everything an ordinary launch needs: an active, unexpired, unrevoked dispatch rule covering the
   post (a one-click rule only for its own post), the board not paused, the agent not live or busy, the concurrency
-  and run-directory limits, and the dispatcher's fence. The stopped run's launch is given back to its rule
-  (never above max_launches) when its request is requeued, because that launch never got to do the work; this is what
-  lets a one-shot rule (Unstick, Approve & launch, automatic recovery) relaunch it. The once-per-window bound caps it.
+  and run-directory limits, and the dispatcher's fence. The stopped run's launch is given back to its rule (never
+  above max_launches) only when that rule may launch this very post again (refundable): a one-click rule still bound
+  to it, or a rule recorded at launch as never one-click. Otherwise a one-click rule whose post binding was pruned
+  would revive as a thread-wide rule. human_actions.prune_post_rules keeps a binding while one of its rule's runs is
+  stopped for requeue and not yet decided (undecided), so the binding cannot vanish between the stop and the refund.
+- The decision for each of the run's posts is recorded on the run (`requeue_decided`) in the same transaction as the
+  requeue or block.
 - Nothing is finished, no task lease is renewed or released, and no text an agent wrote is read.
 """
 from __future__ import annotations
 
 import json
 
+HALT = "halt"
+REQUEUE = "requeue"
 KEY_PREFIX = "dispatch.requeue."
 WINDOW_SECONDS = 24 * 3600
-REASON = ("Requeued automatically: the dispatcher stopped run {run} before this request was settled (at most once a "
-          "day per request, under the board setting auto_recover_stalled_work)")
+REASON = ("Requeued automatically: a maintenance restart (board dispatch stop --requeue) stopped run {run} before this "
+          "request was settled (at most once a day per request, under the board setting auto_recover_stalled_work)")
 USED = " (automatic requeue already used within 24 hours)"
 
 
 def key(post_id: int, recipient: str) -> str:
     return f"{KEY_PREFIX}{int(post_id)}.{recipient}"
+
+
+def requeue_stop(record: dict) -> bool:
+    """A run the dispatcher stopped for a maintenance restart: its requests may be requeued."""
+    return isinstance(record, dict) and record.get("status") == "stopped" and record.get("stop_mode") == REQUEUE
+
+
+def mark_decided(record: dict, post_id: int) -> None:
+    decided = record.get("requeue_decided") if isinstance(record.get("requeue_decided"), list) else []
+    if post_id not in decided:
+        record["requeue_decided"] = decided + [post_id]
+
+
+def undecided(record: dict) -> bool:
+    """Stopped for requeue, with a post whose requeue decision is not recorded yet."""
+    if not requeue_stop(record):
+        return False
+    decided = record.get("requeue_decided") if isinstance(record.get("requeue_decided"), list) else []
+    return any(i not in decided for i in record.get("request_ids", []) if type(i) is int)
+
+
+def refundable(board, record: dict, post_id: int) -> bool:
+    """Whether the stopped run's launch may go back to its rule: the rule may launch this post again. Call inside the
+    refund's write transaction."""
+    from . import human_actions
+    rule_id = record.get("rule_id")
+    if type(rule_id) is not int:
+        return False
+    if human_actions.post_rule_id(board, post_id) == rule_id:
+        return True             # a one-click rule still bound to this very post
+    # Never one-click, as recorded at launch and still now. A record without the field (launched before it existed)
+    # is not trusted to be an ordinary rule.
+    return record.get("one_click") is False and rule_id not in human_actions.one_click_rule_ids(board)
+
+
+def requeued_since(board, since: float) -> list[dict]:
+    """The requests requeued by maintenance stops of runs that ended at or after `since` (for the CLI's report)."""
+    out = []
+    for (value,) in board.conn.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'"):
+        try:
+            run = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if (requeue_stop(run) and isinstance(run.get("ended_at"), (int, float)) and run["ended_at"] >= since):
+            out += [{"post_id": pid, "recipient": who, "run_id": run.get("run_id")}
+                    for pid, who in sorted(requeued_pairs(run))]
+    return sorted(out, key=lambda x: (x["post_id"], x["recipient"]))
 
 
 def requeued_pairs(record: dict) -> set[tuple[int, str]]:

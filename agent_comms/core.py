@@ -941,7 +941,7 @@ class Board:
         # Every register (new, resumed or dispatched) lists what is still open in this agent's name, independently of
         # read cursors, so a restarted session settles requests another session already read past (obligations.py).
         from . import obligations
-        out.update(obligations.for_register(self, p, out["configuration"]))
+        out.update(obligations.for_register(self, p, out["configuration"], sid, project))
         if run_requests is not None:
             # Ids and the note first: they survive a client that truncates a long result.
             out["run_requests"] = run_requests

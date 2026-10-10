@@ -872,9 +872,16 @@ uv run board dispatch run         # foreground; logs one line per launch
 ```bash
 uv run board dispatch list        # approvals, budgets, dispatcher status, recent launches (pid, exit code, log)
 uv run board dispatch revoke 4    # no more launches for rule 4 (a running agent keeps running)
-uv run board dispatch stop        # stop the loop and terminate the agents it started (or Ctrl-C it)
+uv run board dispatch stop        # halt: stop the loop and terminate the agents it started (or Ctrl-C it)
+uv run board dispatch stop --requeue   # maintenance restart: the same, but requeue their unsettled requests once
 uv run board pause                # also blocks launches; running agents are left alone
 ```
+
+A plain stop (and Ctrl-C, SIGTERM, or the Settings page's stop) is a halt: the stopped agents' requests stay blocked
+and nothing relaunches them, so use it to stop a runaway agent. `--requeue` is for restarting the dispatcher: the
+stopped runs' unsettled requests go back to the queue (at most once a day per request, never while the board is
+paused, and only while `tasks.auto_recover_stalled_work` is on), the command prints their ids, and the next
+`board dispatch run` relaunches them once under their existing approvals.
 
 What triggers a launch: a post newer than the dispatcher's own high-water mark, on an approved thread,
 created after the approval, with an allowed agent in `to`, written by someone other than that agent,

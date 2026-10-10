@@ -22,11 +22,18 @@ def waiting_since(board, post, row):
     return since
 
 
+def started_max_age(board):
+    """How long a started request may go without a progress event (a new started/blocked/finished report) before it
+    counts as stalled, however live its owner looks: twice the task lease TTL."""
+    return 2 * board.s.lease_ttl_minutes * 60
+
+
 def classify(board, post, row):
     """(bucket, reason) for one request row: bucket is 'waiting', 'processing' or 'blocked', or None for a finished
     request with matching lifecycle evidence. 'processing' is the in-progress rule: the assigned session itself
-    acknowledged the start, and it was seen within PICKUP_WAIT_SECONDS or still holds a live lease on the linked task.
-    Unstick uses this same rule, so a live owner is never called silent (unstick.stuck_agents)."""
+    acknowledged the start, it was seen within PICKUP_WAIT_SECONDS or still holds a live lease on the linked task, and
+    its latest progress event is no older than started_max_age (a chatty session that never reports progress is
+    stalled). Unstick uses this same rule, so a live owner is never called silent (unstick.stuck_agents)."""
     event = board.conn.execute('''SELECT * FROM request_events
         WHERE post_id=? AND recipient=? AND version=?''',
         (post['id'], row['recipient'], row['version'])).fetchone()
@@ -47,6 +54,10 @@ def classify(board, post, row):
             (post['task_id'], row['assigned_session'], row['assigned_agent'], board.now())).fetchone()
         if (owner is None or owner['last_seen'] < board.now() - PICKUP_WAIT_SECONDS) and not lease:
             return 'blocked', 'Owner acknowledgement is stale; no current task lease confirms continued work'
+        # A chatty owner (seen, or renewing its lease) that reports no progress is stalled too, past a cap.
+        if board.now() - event['created_at'] > started_max_age(board):
+            return 'blocked', ('No request progress reported for over '
+                               + str(int(started_max_age(board) // 60)) + ' minutes')
         return 'processing', row['reason']
     if row['state'] in ('started', 'finished'):
         return 'waiting', 'Current assignment lacks explicit '+row['state']+' lifecycle evidence'

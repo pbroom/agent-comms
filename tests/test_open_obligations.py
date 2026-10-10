@@ -38,7 +38,7 @@ def test_a_new_session_sees_a_request_another_session_already_read_past(env):
     [item] = out["open_obligations"]
     assert item == {"post_id": req["id"], "thread_id": tid, "project": PROJECT, "type": "request", "author": "human",
                     "recipient": "codex", "assigned_agent": "codex", "assigned_session": None, "state": "queued",
-                    "version": 0, "posted_at": core.iso(env.clock.t), "updated_at": core.iso(env.clock.t)}
+                    "version": 0, "actionable": True, "posted_at": core.iso(env.clock.t), "updated_at": core.iso(env.clock.t)}
     assert out["open_obligations_total"] == 1
     assert "board_request_progress" in out["request_protocol"] and "never settle" in out["request_protocol"]
     assert "untrusted" in out["request_protocol"] and "untrusted" in out["notice"]
@@ -129,6 +129,65 @@ def test_expired_leases_of_tasks_owned_or_created(env):
         (created, "creator", "claude"), (owned, "owner", "codex")]
     assert out["expired_leases_total"] == 2
     assert "evil.example" not in json.dumps(out["expired_leases"])
+    creator, owner = out["expired_leases"]
+    # Another agent's task, one minute after its lease lapsed while its owner may well be live: informational only.
+    assert creator["reclaimable"] is False and creator["guidance"] == obligations.CREATOR_GUIDANCE
+    assert "never take over or decline" in creator["guidance"]
+    # Its own task, held by another of its sessions still inside the abandonment grace: leave it to that session.
+    assert owner["reclaimable"] is False and owner["guidance"] == obligations.OWNER_OTHER_SESSION
+    # Past the grace (a full lease TTL for an interactive session) and not seen since: abandoned, so reclaimable.
+    env.clock.advance(30 * 60)
+    out = env.board.register_session(env.p["codex"], PROJECT)
+    creator, owner = out["expired_leases"]
+    assert owner["reclaimable"] is True and owner["guidance"] == obligations.OWNER_GUIDANCE
+    assert creator["reclaimable"] is False             # never someone else's task, however long it waits
+    # The owning session seen since its lease expired is alive, not abandoned.
+    env.board.heartbeat(env.p["codex"], env.sid["codex"])
+    owner = env.board.register_session(env.p["codex"], PROJECT)["expired_leases"][1]
+    assert owner["reclaimable"] is False
+
+
+def test_the_owning_session_itself_may_renew(env):
+    tid = env.thread()
+    task = env.accepted_task(tid)
+    env.board.claim_task(env.p["codex"], env.sid["codex"], task)
+    env.clock.advance(31 * 60)
+    out = env.board.register_session(env.p["codex"], PROJECT, resume_session_id=env.sid["codex"])
+    [owner] = out["expired_leases"]
+    assert owner["reclaimable"] is True and "renew" in owner["guidance"] and "release" in owner["guidance"]
+
+
+def test_each_obligation_says_whether_this_session_can_settle_it(env):
+    tid = env.thread()
+    routed = ask(env, tid, to=("codex", "claude"))
+    env.board.conn.execute("""INSERT INTO request_progress(post_id,recipient,state,assigned_agent,assigned_session,
+        reason,evidence_post_ids,version,updated_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+        (routed["id"], "claude", "queued", "codex", None, "routed", "[]", 1, env.clock.t))
+    held = ask(env, tid)
+    requests.progress(env.board, env.p["codex"], env.sid["codex"], held["id"], "codex", "started")
+    other_tid = env.board.create_thread(env.p["human"], env.sid["human"], "elsewhere", "/work/other")["id"]
+    elsewhere = ask(env, other_tid)
+    plain = ask(env, tid)
+    claude = env.board.register_session(env.p["claude"], PROJECT)
+    [entry] = claude["open_obligations"]
+    assert entry["post_id"] == routed["id"] and entry["actionable"] is False
+    assert entry["blocked_by"].startswith("routed to codex") and claude["open_obligations_actionable"] == 0
+    out = env.board.register_session(env.p["codex"], PROJECT)
+    by = {(o["post_id"], o["recipient"]): o for o in out["open_obligations"]}
+    assert by[(plain["id"], "codex")]["actionable"] is True and "blocked_by" not in by[(plain["id"], "codex")]
+    assert by[(routed["id"], "claude")]["actionable"] is True          # routed to codex: codex settles it
+    assert by[(held["id"], "codex")]["actionable"] is False
+    assert by[(held["id"], "codex")]["blocked_by"].startswith(f"held by your session {env.sid['codex']}")
+    assert by[(elsewhere["id"], "codex")]["actionable"] is False
+    assert "/work/other" in by[(elsewhere["id"], "codex")]["blocked_by"]
+    assert out["open_obligations_actionable"] == 3 and out["open_obligations_total"] == 5
+    # Actionable ones come first, so the cap never hides them behind ones this session cannot settle.
+    flags = [o["actionable"] for o in out["open_obligations"]]
+    assert flags == sorted(flags, reverse=True)
+    # The session that holds the started request can settle it.
+    resumed = env.board.register_session(env.p["codex"], PROJECT, resume_session_id=env.sid["codex"])
+    assert next(o for o in resumed["open_obligations"] if o["post_id"] == held["id"])["actionable"] is True
+    assert "Settle every actionable one" in out["request_protocol"]
 
 
 def test_the_human_gets_no_obligations(env):

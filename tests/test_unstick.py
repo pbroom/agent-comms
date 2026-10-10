@@ -539,6 +539,28 @@ def test_a_live_task_lease_keeps_a_quiet_owner_in_progress(uenv):
     assert agents == ["codex"] and {"kind": "unanswered", "agent": "codex", "post_ids": [original["id"]]} in reasons
 
 
+def test_a_chatty_owner_that_reports_no_progress_is_stalled_past_the_cap(uenv):
+    original = ask(uenv, "claude", ["codex"])
+    requests.progress(uenv.board, uenv.p["codex"], uenv.sid["codex"], original["id"], "codex", "started",
+                      reason="working on it")
+    cap = pickup.started_max_age(uenv.board)
+    assert cap == 2 * uenv.board.s.lease_ttl_minutes * 60
+    for _ in range(int(cap // (20 * 60))):            # the session keeps polling, but never reports progress
+        uenv.clock.advance(20 * 60)
+        uenv.board.heartbeat(uenv.p["codex"], uenv.sid["codex"])
+        assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])
+    uenv.clock.advance(60)
+    uenv.board.heartbeat(uenv.p["codex"], uenv.sid["codex"])
+    assert not pickup.in_progress(uenv.board, *_row(uenv, original["id"]))
+    [blocked] = pickup.for_thread(uenv.board, uenv.p["human"], uenv.tid)["blocked"]
+    assert blocked["reason"].startswith("No request progress reported for over")
+    assert unstick.stuck_agents(uenv.board, uenv.tid)[0] == ["codex"]
+    # A progress report (a new reason) makes it in progress again: the same single rule.
+    requests.progress(uenv.board, uenv.p["codex"], uenv.sid["codex"], original["id"], "codex", "started",
+                      reason="tests passing, writing docs")
+    assert unstick.stuck_agents(uenv.board, uenv.tid) == ([], [])
+
+
 def test_a_start_not_made_by_the_assigned_session_is_not_in_progress_for_unstick(uenv):
     original = ask(uenv, "claude", ["codex"])
     requests.progress(uenv.board, uenv.p["codex"], uenv.sid["codex"], original["id"], "codex", "started")

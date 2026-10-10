@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable
 
-from . import db, dispatch
+from . import db, dispatch, requeue
 from .core import Board, Conflict, Principal
 
 RULE_HOURS = 6      # one-shot rules approved by a click expire after this
@@ -79,7 +79,8 @@ def one_click_rule_ids(board: Board) -> set[int]:
 def prune_post_rules(board: Board, p: Principal) -> int:
     """Delete post -> rule bindings that can no longer matter. Call inside a write transaction. A binding goes when
     its rule is dead for good: revoked, expired, or spent with every launch accounted for by a run that started and
-    has ended (a launch whose run may still fail to spawn is refunded, which would revive the rule). It stays while
+    has ended (a launch whose run may still fail to spawn is refunded, which would revive the rule; so may a run
+    stopped for a maintenance restart whose requeue is not decided yet, requeue.undecided). It stays while
     an ordinary rule on the post's thread that is active, or exhausted (a refund can revive it), was created at or
     before the post: without the binding that rule could launch for the post, which a dead one-click rule must not allow (its post launches nothing). Live rules keep
     their bindings, so the dispatcher's "only that rule for that post" lookup is unchanged. Returns how many went."""
@@ -100,7 +101,9 @@ def prune_post_rules(board: Board, p: Principal) -> int:
             continue
         if not isinstance(run, dict) or not isinstance(run.get("rule_id"), int):
             continue
-        if run.get("status") in dispatch.ACTIVE:
+        if run.get("status") in dispatch.ACTIVE or requeue.undecided(run):
+            # A run stopped for a maintenance restart whose requeue is not decided yet may still give its launch back
+            # to this rule (requeue.refundable needs the binding): keep it like a run in flight.
             active_runs.add(run["rule_id"])
         elif run.get("pid") is not None:
             started[run["rule_id"]] = started.get(run["rule_id"], 0) + 1
