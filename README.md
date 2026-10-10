@@ -857,6 +857,39 @@ until they exit, and holds them to the timeout; `stop` terminates them. That app
 is still the process that was started (same process group and start time); a live pid that cannot be
 verified is counted but never signalled, and `stop` prints it for you to check.
 
+### Extra writable folders and declared outputs
+
+A dispatched run may write only inside its run directory (for Codex, its `workspace-write` sandbox, plus Codex's
+own temporary directories). When the runs of one project must also write somewhere else, list that folder per
+project in `board.local.toml` (it is not editable from the dashboard):
+
+```toml
+# board.local.toml
+[dispatch.writable_roots]   # thread project (the same key as [dispatch.worktrees]) -> extra folders
+"/Users/you/some-project" = ["/Users/you/nexus-work"]
+```
+
+Only runs of threads in that project get them, wherever its run directory is. A Codex run gets one
+`-c sandbox_workspace_write.writable_roots=["/Users/you/nexus-work"]` override (Codex adds it to the sandbox next
+to the run directory, keeping `.git`, `.codex` and `.agents` inside it read-only; the override replaces any
+`writable_roots` list in your Codex `config.toml` for that run). An unscoped Claude run gets `--add-dir=<folder>`;
+whether it may then write there still follows its permission mode (`acceptEdits` does, `dontAsk` needs a matching
+allow rule). Scoped Claude runs (`claude_tool_projects`, whose allow list is relative to the run directory) and other
+CLIs get nothing. Each folder must exist and be written as its real path (no symlinks or `..`), at most 10 per
+project, and may not be `/`, your home folder or anything containing it, or overlap `~/.ssh`,
+`~/.config/agent-comms`, `~/.codex`, `~/.claude`, this board's folder or its data directory. A runner that sets
+`--add-dir` or `writable_roots` itself is refused, so the table is the one place to look. The roots are read when
+`board dispatch run` starts; restart it after changing them.
+
+A request that writes outside its repository declares each destination in its refs, as
+`{"kind": "output", "path": "/Users/you/nexus-work/fix/after/screens"}` (an absolute folder or file; `..` is
+refused). Before reserving a launch, the dispatcher checks every declared output of the triggering request: it must
+be inside the run directory or one of that run's extra folders (compared by real path, so a symlink cannot detour),
+and its nearest existing folder must be writable. Otherwise nothing launches, no budget is spent, and the request is
+marked blocked with the reason, for example "output /x is outside this run's writable roots (run dir …; extra roots
+…); ask the human to add it to [dispatch.writable_roots] or retarget the output". Only the structured refs count,
+never paths written in the post text, and a declared output never widens what a run may write.
+
 ### Headless browser for dispatched Codex runs
 
 A request bound to a browser target (`board_bind_browser_request`) needs a browser probe from the context that
@@ -962,7 +995,7 @@ would get the browser is refused with a preflight failure rather than started bl
 | Authorization is the human's | only the human can finalize, post `final`, unseal, pause, or issue/revoke grants; matching category grants allow task acceptance/claim within their project, agents and stated goal |
 | Leases expire | 30 min default, renewed by claiming again; expired leases can be reclaimed by anyone, with the claim done atomically in a single `UPDATE ... WHERE owner IS NULL OR lease_expires_at < now` |
 | Bounded conversation | 12 agent posts per thread without a human post; 200 posts per agent per rolling 24 h; `pause` rejects agent writes |
-| Point, don't paste | 4 KB body limit; `refs: [{kind, path, rev}]` with kind = file / commit / url / artifact; findings must cite a file or commit at a rev |
+| Point, don't paste | 4 KB body limit; `refs: [{kind, path, rev}]` with kind = file / commit / url / artifact / output (a request's declared write destination, checked by the dispatcher before launch); findings must cite a file or commit at a rev |
 
 Limits live in `board.toml`. Put per-machine overrides in `board.local.toml` beside it (gitignored):
 it is loaded after `board.toml` and merged table by table, its keys win, and a list value (such as a

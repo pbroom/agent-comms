@@ -503,6 +503,72 @@ cleared blind. The section says what the click does: records a human permission 
 the next run must probe fresh, and blocked requests are not restarted by it. The reason is agent-written and shown
 as text. The live gate from the incident is left for the human to clear.
 
+### Extra writable roots and declared outputs (2026-10-09)
+
+**What happened.** NEXUS capture requests asked dispatched Codex runs in one project to save screenshots into a
+shared folder outside the repository (`~/nexus-work/fix/after/screens/...`). The run's `workspace-write` sandbox has
+only the run directory (and Codex's temporary directories) as writable roots, so each run launched, spent a launch,
+did its browser work and failed at the copy. Two human decisions followed: allow that one folder for that one
+project's dispatched Codex runs, other projects unchanged; and make the preflight check that a run can write its
+declared output destination, failing before launch with a concrete capability blocker.
+
+**Configuration.** `[dispatch.writable_roots]` maps a thread project (the key `[dispatch.worktrees]` uses; the roots
+follow that project to whatever run directory it maps to) to at most 10 directories. Shipped empty, set per machine
+in `board.local.toml`, and file-only: `board_settings.FILE_ONLY` refuses it from the Settings page like runners and
+worktrees, because it widens what a launched process may write. Validation (errors name the project and the entry's
+position): absolute, normalized (no `.`, `..` or `//`), an existing directory, and its own `realpath` (a symlink
+anywhere in it is refused, so the configured string is exactly what the sandbox gets). Refused: `/`, the home
+directory and anything containing it, and anything that is inside or contains `~/.ssh`, the token directory
+(`AGENT_COMMS_TOKEN_DIR`, default `~/.config/agent-comms`), `CODEX_HOME`/`~/.codex`, `CLAUDE_CONFIG_DIR`/`~/.claude`,
+the board's home (its settings files: a run that could write `board.local.toml` could rewrite its own runner) and its
+configured data directory, or that contains a protected file (the human token file, `agents.toml`, `~/.claude.json`).
+The agent CLIs' own config directories are on the list for the same reason as the settings files: writing there
+would let one run widen the next. Overlap is compared by filesystem identity (device and inode along the ancestor
+chain), not by string, so another spelling of a protected folder (case on macOS) is still caught. The roots are
+read when `board dispatch run` starts, like worktrees. Because the existence check is part of validation, a root
+that is deleted later makes every settings reload fail validation (logged; the previous values stay) until it is
+recreated or its entry removed, and makes launches for that project fail preflight.
+
+**Injection.** Codex: one `-c sandbox_workspace_write.writable_roots=[...]` before `{prompt}`, TOML-encoded like the
+headless browser overrides. Checked against Codex 0.157 with `codex debug prompt-input -c
+sandbox_mode="workspace-write" -c sandbox_workspace_write.writable_roots=[...]` (renders the model-visible context
+locally, no model request): the resolved permission profile gains a write entry for the extra root beside the cwd
+(merged, not replacing it), with `.git`, `.agents` and `.codex` inside it read-only, and lists it as a workspace root.
+`codex sandbox` could not exercise it end to end: it requires a named permission profile (`-P :workspace`), which
+ignores the legacy `sandbox_workspace_write` table, so a direct write probe there showed the extra root denied either
+way. The override replaces a `writable_roots` list in the Codex config file for that run, which keeps it exact.
+Claude: `--add-dir=<root>` per root, appended after everything else; the `=` form takes exactly one value, so the
+variadic option cannot swallow a following argument. `--add-dir` widens which directories Claude's file tools may
+reach; whether a write is allowed still follows the runner's permission mode. Scoped Claude runs
+(`claude_tool_projects`) get nothing: their allow list (`runner_preflight.ALLOWED`) grants `Edit(./**)` and
+`Write(./**)` relative to the run directory, so an extra root would look writable to the preflight while every write
+there is denied; `runner_preflight.scoped_template` still refuses `--add-dir` in a template, and the dispatcher adds
+none. Other CLIs get nothing. Any runner template that sets `--add-dir` or a `sandbox_workspace_write.writable_roots`
+override (dotted, quoted or under a profile; an inline table is already refused by the no-braces rule) is refused,
+so `[dispatch.writable_roots]` is the single place a human has to look. `sandbox_workspace_write.network_access`
+stays allowed.
+
+**Declared outputs.** A request declares a destination as a ref, `{kind: "output", path}`: a new `REF_KINDS` value
+rather than a new post field, because refs are already structured, bounded (`max_refs`, 1024 characters), stored
+(`posts.refs`), shown on the dashboard and accepted by every transport, and a new column would have meant a schema
+change and new plumbing in the MCP, REST and request-reply paths. Validation: an absolute path, no `.` or `..`
+component, no control character, no `rev`. Before reserving a launch, after the browser checks, `_output_blocker`
+reads the refs of the triggering request (the structured field only; paths in post text are never parsed) and checks
+each output: inside the run directory or one of the extra roots this run will actually get, compared by identity
+after `realpath` (a symlink inside the run directory pointing elsewhere is caught), and its nearest existing ancestor
+is a directory the dispatcher's user can write. A configured root that has disappeared or become a symlink since
+start also fails. A failure follows the existing preflight path: a `preflight_failed` run record, the request
+blocked with "Preflight failed: <reason>", no launch reserved, so no budget is spent. The reason names the output,
+the run directory and the extra roots (or why there are none: none configured for the project, or this runner cannot
+take them) and says to ask the human or retarget. The trigger query is unchanged (metadata only); refs are read only
+for this comparison and never reach the prompt or the argv. A declared output never widens anything.
+
+**Limits.** The check models the directory scope the dispatcher grants, not each CLI's permission mode: a Codex
+runner overridden to `--sandbox read-only`, or a Claude runner in `dontAsk` without an edit allow rule, passes the
+check and still cannot write. Writability is checked as the dispatcher's user, which is the user the run runs as.
+An output whose missing components are created later as a symlink out of the root is not foreseeable at preflight.
+Requests that do not declare their outputs get no check, as before.
+
 ## Settings page (2026-10-07)
 
 The human asked to manage board settings from the dashboard instead of editing TOML and running CLI

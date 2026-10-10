@@ -33,7 +33,9 @@ from .notify import CHANNEL as NOTIFY_CHANNEL, DEFAULT_IDLE_MINUTES, DEFAULT_NOT
 POST_TYPES = ("question", "proposal", "status", "finding", "handoff", "request", "decision")
 TASK_CATEGORIES = ("review", "implementation", "tests", "documentation")
 TASK_STATUSES = ("proposed", "accepted", "working", "blocked", "done", "declined")
-REF_KINDS = ("file", "commit", "url", "artifact")
+REF_KINDS = ("file", "commit", "url", "artifact", "output")
+# A request's declared output destination: {kind: "output", path: "/absolute/dir/or/file"}. The dispatcher's preflight
+# checks it against the run's writable roots before launching; it never widens them (dispatch._output_blocker).
 DISPATCH_CHANNEL = "dispatch"   # subscriptions.channel for human workstream approvals (dispatch.py)
 DISPATCH_PURPOSE_MAX = 1000
 DISPATCH_MAX_LAUNCHES = 1000
@@ -274,7 +276,7 @@ def check_reloadable(s: Settings) -> None:
         raise ValueError("[web] session_max_days must be at least session_days")
     if not isinstance(s.dispatch, dict):
         raise ValueError("[dispatch] must be a table")
-    DispatchConfig.from_dict(s.dispatch)
+    DispatchConfig.from_dict(s.dispatch, settings=s)
     conversations.ConversationConfig.from_dict(s.conversations)
 
 
@@ -1128,6 +1130,12 @@ class Board:
                 raise Invalid("commit refs need rev (the commit hash); path is the repo")
             if kind == "url" and not path.startswith(("http://", "https://")):
                 raise Invalid("url refs need an http(s) URL in path")
+            if kind == "output":
+                p = path.strip()
+                if (rev is not None or not p.startswith("/") or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in p)
+                        or any(part in (".", "..") for part in p.split("/"))):
+                    raise Invalid("output refs need an absolute path with no '.' or '..' parts (e.g. "
+                                  "/Users/you/nexus-work/fix/after) and no rev")
             out.append({"kind": kind, "path": path.strip(), "rev": rev.strip() if rev else None})
         return out
 

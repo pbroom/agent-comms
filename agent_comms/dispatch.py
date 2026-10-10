@@ -20,6 +20,8 @@ Guardrails:
   budget, and each launch notifies the human.
 - Browser-bound requests launch only for a Codex runner the human gave a scoped headless browser
   ([dispatch.headless_browser]), never past a sticky policy denial, and the run must probe the target itself.
+- A run writes only inside its run directory plus the extra roots the human listed for its project
+  ([dispatch.writable_roots]); a request's declared outputs (refs of kind "output") outside them fail preflight.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from . import db, requests, workstreams, pickup
-from .config import NAME_RE, RUNTIME_RE, Settings, home
+from .config import NAME_RE, RUNTIME_RE, Settings, home, human_token_file
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
 
@@ -404,6 +406,142 @@ def _forbidden_env(name: str) -> bool:
     return "TOKEN" in u or u.startswith("AGENT_COMMS_") or u == "BOARD_TOKEN"
 
 
+# ---------------------------------------------------------------- extra writable roots
+#
+# `[dispatch.writable_roots]` (file-only, human-written): per thread project, extra directories a dispatched run of
+# that project may write besides its run directory. Codex runs get them as one
+# `-c sandbox_workspace_write.writable_roots=[...]` override (Codex 0.157 adds each to the workspace-write sandbox's
+# write entries next to the run directory, keeping its .git/.codex/.agents read-only carve-outs; the override
+# replaces any list in the Codex config file for that run). Plain Claude runs get one `--add-dir=<root>` per root.
+# Scoped Claude runs ([dispatch] claude_tool_projects) and any other CLI get none: their allow lists are relative to
+# the run directory, so a root would look writable to the preflight while every write there is denied.
+WRITABLE_ROOTS_MAX = 10
+WRITABLE_ROOTS_KEY = "sandbox_workspace_write.writable_roots"
+
+
+def _norm_key(key: str) -> str:
+    return "".join(ch for ch in key if ch not in "\"' \t")
+
+
+def sets_writable_roots(template: list[str]) -> bool:
+    """Whether a runner template grants extra writable directories itself (Codex `--add-dir` or a
+    `sandbox_workspace_write.writable_roots` override in any spelling, Claude `--add-dir`). Refused: the
+    dispatcher owns that choice per project ([dispatch.writable_roots])."""
+    if any(x.split("=", 1)[0] == "--add-dir" for x in template):
+        return True
+    if not uses_codex(template):
+        return False
+    for v in _codex_overrides(template):
+        key = _norm_key(v.partition("=")[0])
+        if (key == "sandbox_workspace_write" or key == WRITABLE_ROOTS_KEY
+                or key.endswith("." + WRITABLE_ROOTS_KEY) or key.endswith(".sandbox_workspace_write")):
+            return True
+    return False
+
+
+def _ident(path: str) -> tuple:
+    """A path's filesystem identity: (device, inode) when it exists, else its spelling. Comparing identities, not
+    strings, catches a different spelling of the same directory (case on macOS, a symlinked parent)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ("missing", os.path.normpath(path))
+    return (st.st_dev, st.st_ino)
+
+
+def _chain(path: str) -> list[tuple]:
+    """Identities of `path` and every ancestor, nearest first."""
+    out, cur = [], os.path.normpath(path)
+    while True:
+        out.append(_ident(cur))
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return out
+        cur = parent
+
+
+def _within(path: str, root: str) -> bool:
+    """Whether `path` is `root` or inside it, by filesystem identity (realpath first: no symlink detours)."""
+    target = _ident(os.path.realpath(root))
+    return target[0] != "missing" and target in _chain(os.path.realpath(path))
+
+
+def protected_paths(settings: Settings | None = None) -> tuple[list[str], list[str]]:
+    """(directories, files) a writable root may neither be inside nor contain: the agents' token files and
+    their directory, SSH keys, the agent CLIs' own config (a run that could write there could widen its own future
+    runs), the board's home (its settings files, agents.toml and default data directory) and, given the settings,
+    the configured data directory and agents file. The user's home itself is refused separately."""
+    user = os.path.expanduser("~")
+    token_dir = os.environ.get("AGENT_COMMS_TOKEN_DIR", "~/.config/agent-comms")
+    dirs = [os.path.join(user, ".ssh"), os.path.expanduser(token_dir), os.path.join(user, ".config", "agent-comms"),
+            os.environ.get("CODEX_HOME") or os.path.join(user, ".codex"),
+            os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(user, ".claude"), str(home())]
+    files = [str(human_token_file()), str(home() / "agents.toml"), os.path.join(user, ".claude.json")]
+    if settings is not None:
+        dirs.append(str(settings.db_path.parent))
+        files.append(str(settings.agents_path))
+    return [os.path.abspath(d) for d in dirs], [os.path.abspath(f) for f in files]
+
+
+def validate_writable_roots(table: Any, settings: Settings | None = None) -> dict[str, list[str]]:
+    """`[dispatch.writable_roots]`: thread project path -> list of extra directories. Each must be an absolute,
+    normalized path to an existing directory that is its own real path (no symlink anywhere in it), and may not be
+    `/`, the home directory or anything containing it, or overlap the protected paths (see protected_paths).
+    Entries are named by project and position in errors."""
+    where = "[dispatch.writable_roots]"
+    if not isinstance(table, dict):
+        raise ValueError(f"{where} must be a table of project path = [directories]")
+    user = os.path.realpath(os.path.expanduser("~"))
+    dirs, files = protected_paths(settings)
+    out: dict[str, list[str]] = {}
+    for proj, roots in table.items():
+        if not isinstance(proj, str) or not os.path.isabs(proj) or _has_control(proj):
+            raise ValueError(f"{where} keys must be absolute project paths")
+        key = proj.rstrip("/") or "/"
+        if key in out:
+            raise ValueError(f"{where} lists project {key} twice")
+        if not isinstance(roots, list) or not all(isinstance(r, str) for r in roots):
+            raise ValueError(f"{where} {key} must be a list of absolute directory paths")
+        if len(roots) > WRITABLE_ROOTS_MAX:
+            raise ValueError(f"{where} {key} lists more than {WRITABLE_ROOTS_MAX} directories")
+        clean: list[str] = []
+        for i, raw in enumerate(roots):
+            bad = f"{where} {key} entry {i}"
+            r = raw.rstrip("/") if raw not in ("", "/") else raw
+            if not r or _has_control(r) or not os.path.isabs(r) or os.path.normpath(r) != r:
+                raise ValueError(f"{bad} must be an absolute, normalized directory path (no '.', '..' or '//')")
+            if not os.path.isdir(r):
+                raise ValueError(f"{bad} is not an existing directory (create it, or remove the entry)")
+            if os.path.realpath(r) != r:
+                raise ValueError(f"{bad} goes through a symlink; write its real path")
+            if r == "/" or _ident(r) in _chain(user):
+                raise ValueError(f"{bad} is / or the home directory or contains it; name a folder inside it")
+            for d in dirs:
+                if _within(r, d) or _within(d, r):
+                    raise ValueError(f"{bad} overlaps a protected location (agent tokens, SSH keys, the agent "
+                                     "CLIs' config or the board's own files); pick a separate folder")
+            for f in files:
+                if _within(f, r):
+                    raise ValueError(f"{bad} contains a protected file (an agent token, agents.toml or a CLI "
+                                     "config); pick a separate folder")
+            if any(_ident(r) == _ident(c) for c in clean):
+                raise ValueError(f"{bad} repeats another entry")
+            clean.append(r)
+        out[key] = clean
+    return out
+
+
+def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
+    """The runner argv with the extra writable roots added the way its CLI takes them (see writable_roots_kind)."""
+    if not roots:
+        return list(template)
+    if uses_codex(template):
+        i = template.index("{prompt}")
+        return template[:i] + ["-c", WRITABLE_ROOTS_KEY + "=" + _toml(list(roots))] + template[i:]
+    # Claude's --add-dir takes several values; the `=` form takes exactly one, so nothing after it is swallowed.
+    return list(template) + [f"--add-dir={r}" for r in roots]
+
+
 # ---------------------------------------------------------------- configuration
 
 
@@ -419,6 +557,7 @@ class DispatchConfig:
     runners: dict[str, list[str]] = field(default_factory=dict)   # agent name or runtime -> argv template
     env: dict[str, list[str]] = field(default_factory=dict)       # agent name or runtime -> extra env var NAMES
     worktrees: dict[str, str] = field(default_factory=dict)       # thread project -> directory to run in
+    writable_roots: dict[str, list[str]] = field(default_factory=dict)   # thread project -> extra writable dirs
     claude_tool_projects: list[str] = field(default_factory=list)
     headless_browser: HeadlessBrowserConfig = field(default_factory=HeadlessBrowserConfig)
     live_minutes: float = 2.0
@@ -429,7 +568,8 @@ class DispatchConfig:
 
     @classmethod
     def load(cls, path: Path | None = None, local: bool = True) -> "DispatchConfig":
-        return cls.from_dict(Settings.load(path, local=local).dispatch)
+        s = Settings.load(path, local=local)
+        return cls.from_dict(s.dispatch, settings=s)
 
     def runner_for(self, agent: str, runtime: str | None) -> list[str] | None:
         """The agent's own entry wins; otherwise the entry for its runtime (e.g. codex-cli, claude-code)."""
@@ -443,7 +583,8 @@ class DispatchConfig:
         return runtime if runtime and runtime in self.runners else None
 
     @classmethod
-    def from_dict(cls, d: dict) -> "DispatchConfig":
+    def from_dict(cls, d: dict, settings: Settings | None = None) -> "DispatchConfig":
+        """`settings` adds its data directory and agents file to the paths a writable root may not touch."""
         c = cls()
         for k, v in d.items():
             if k == "runners":
@@ -467,6 +608,8 @@ class DispatchConfig:
                     if not isinstance(wt, str) or not os.path.isabs(wt) or not os.path.isabs(proj):
                         raise ValueError("[dispatch.worktrees] maps an absolute project path to an absolute directory")
                 c.worktrees = {proj.rstrip("/") or "/": wt for proj, wt in v.items()}
+            elif k == "writable_roots":
+                c.writable_roots = validate_writable_roots(v, settings)
             elif k in ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds"):
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                     raise ValueError(f"[dispatch] {k} must be a positive number")
@@ -481,6 +624,23 @@ class DispatchConfig:
                 raise ValueError(f"unknown setting [dispatch] {k}")
         c.headless_browser.check_runners(c.runners)
         return c
+
+    def writable_roots_kind(self, template: list[str] | None, project: str) -> str | None:
+        """How a run of this runner in this project takes extra writable roots: 'codex' (a `-c` override), 'claude'
+        (`--add-dir`), or None (it cannot: a scoped Claude run, whose allow list is relative to the run directory,
+        or a CLI the dispatcher does not know)."""
+        if not template:
+            return None
+        if uses_codex(template):
+            return "codex"
+        if os.path.basename(template[0]) == "claude" and project not in self.claude_tool_projects:
+            return "claude"
+        return None
+
+    def extra_roots(self, template: list[str] | None, project: str) -> list[str]:
+        """The extra writable roots a run of this runner in this thread project gets (empty: none)."""
+        roots = self.writable_roots.get(project.rstrip("/") or "/", [])
+        return list(roots) if roots and self.writable_roots_kind(template, project) else []
 
     def headless_browser_for(self, agent: str, runtime: str | None) -> bool:
         """Whether this agent's runner (by name, else runtime) is a Codex runner given the headless browser."""
@@ -499,6 +659,9 @@ def validate_runner(agent: str, template: Any) -> list[str]:
                          "or wrapper that re-parses arguments")
     if template.count("{prompt}") != 1:
         raise ValueError(f"[dispatch.runners] {agent} must contain the element \"{{prompt}}\" exactly once")
+    if sets_writable_roots(template):
+        raise ValueError(f"[dispatch.runners] {agent} sets extra writable directories itself (--add-dir or "
+                         f"{WRITABLE_ROOTS_KEY}); list them per project under [dispatch.writable_roots] instead")
     for i, x in enumerate(template):
         if ("{" in x or "}" in x) and x not in PLACEHOLDERS:
             # Name the element by position, never by value: runner argv can carry credentials, and this message
@@ -725,7 +888,7 @@ class Dispatcher:
             return
         self._settings_gen = gen
         try:
-            fresh = DispatchConfig.from_dict(self.board.s.dispatch)
+            fresh = DispatchConfig.from_dict(self.board.s.dispatch, settings=self.board.s)
         except ValueError as e:
             log.warning("ignoring [dispatch] settings that do not validate: %s", e)
             return
@@ -1030,6 +1193,7 @@ class Dispatcher:
             if item.get('post_id'):
                 error = self._browser_blocker(item['post_id'], agent) or error
             error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
+            error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [])
             if delivery is not None:
                 configured_cwd = self.config.worktrees.get(rule['project'], rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
@@ -1148,6 +1312,60 @@ class Dispatcher:
                                                   runtime=self._runtime(agent)).get("PATH")) is None:
             return "required runner executable is unavailable"
         return codex_approval_reminder(template)
+
+    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int]) -> str | None:
+        """Before reserving a launch: every output the triggering request(s) declared (refs of kind "output", the
+        structured field only, never post text) must lie inside this run's directory or one of the extra writable
+        roots it will get, and its nearest existing directory must be writable. A configured root that has gone
+        away (or turned into a symlink) since the dispatcher started fails too. A failure is a capability blocker:
+        recorded on the request, no launch budget spent."""
+        project = rule["project"]
+        cwd = self.config.worktrees.get(project, project)
+        template = self._runner(agent)
+        roots = self.config.extra_roots(template, project)
+        for r in roots:
+            if not os.path.isdir(r) or os.path.realpath(r) != r:
+                return (f"extra writable root {r} for this project no longer exists or is now a symlink; fix "
+                        "[dispatch.writable_roots] in board.local.toml and restart the dispatcher")
+        outputs: list[str] = []
+        for post_id in request_ids:
+            row = self.board.conn.execute("SELECT refs FROM posts WHERE id=?", (post_id,)).fetchone()
+            try:
+                refs = json.loads(row["refs"]) if row and row["refs"] else []
+            except ValueError:
+                refs = []
+            outputs += [r["path"] for r in refs if isinstance(r, dict) and r.get("kind") == "output"
+                        and isinstance(r.get("path"), str)]
+        if not outputs:
+            return None
+        allowed = [cwd] + roots
+        for out in dict.fromkeys(outputs):
+            if (not os.path.isabs(out) or _has_control(out) or len(out) > 1024
+                    or any(part in (".", "..") for part in out.split("/"))):
+                return f"declared output {out[:200]!r} is not a plain absolute path; retarget the output"
+            if not any(_within(out, root) for root in allowed):
+                configured = self.config.writable_roots.get(project.rstrip("/") or "/", [])
+                if roots:
+                    extra = "extra roots " + ", ".join(roots)
+                elif configured:
+                    extra = ("no extra roots: this runner cannot be given [dispatch.writable_roots] (only Codex "
+                             "and unscoped Claude runners can)")
+                else:
+                    extra = "no extra roots configured for this project"
+                return (f"output {out} is outside this run's writable roots (run dir {cwd}; {extra}); ask the "
+                        "human to add it to [dispatch.writable_roots] or retarget the output")
+            real = os.path.realpath(out)
+            probe = real
+            while not os.path.lexists(probe):
+                probe = os.path.dirname(probe)
+            if os.path.isdir(probe):
+                ok = os.access(probe, os.W_OK | os.X_OK)
+            else:
+                ok = probe == real and os.path.isfile(probe) and os.access(probe, os.W_OK)
+            if not ok:
+                return (f"output {out} cannot be written: {probe} is not a directory the dispatcher's user can "
+                        "write; fix its permissions or retarget the output")
+        return None
 
     def _browser_blocker(self, post_id: int, agent: str) -> str | None:
         from . import browser_readiness
@@ -1301,6 +1519,7 @@ class Dispatcher:
                 prompt = runner_preflight.PROMPT
                 template = template + ["--session-id", session, "--output-format", "stream-json",
                                        "--verbose", "--max-turns", "6"]
+            template = with_writable_roots(template, self.config.extra_roots(template, project))
             if browser is not None:
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, browser["origins"], browser["output_dir"]))

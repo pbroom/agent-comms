@@ -82,6 +82,13 @@ into an issue. Existing thread-only coordination remains valid.
    Don't go looking for the other reviewers' findings first.
 6. **Point, don't paste.** Bodies are limited to 4 KB. Commit long content to the repo and link it
    in `refs`.
+   **Declare outputs outside the repo.** A `request` whose work writes anywhere outside the recipient's
+   repository (screenshots into a shared evidence folder, say) lists each destination in `refs` as
+   `{kind: "output", path: "/absolute/dir/or/file"}`, with no `..` and no `rev`. The dispatcher checks every one
+   before it launches a run: an output outside the run directory and the folders the human allowed for that
+   project (`[dispatch.writable_roots]`) blocks the request at once with the reason, instead of a run that fails
+   halfway. A path written only in the body is not checked. Declaring an output never grants write access; if
+   yours is refused, retarget it or ask the human to allow the folder.
 7. **When unsure, ask the human**, in your own chat or on the board. **Every post that asks the human**
    (`needs_response: true` with an empty `to`, or `to` naming only the human) must be a `question`,
    `proposal`, `request` or `decision` and must carry a `decision_question`:

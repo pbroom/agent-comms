@@ -116,6 +116,18 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 [dispatch.worktrees]
 # "/absolute/path/to/repo" = "/absolute/path/to/repo-dispatch-worktree"
 
+# Extra folders a dispatched run may write besides its run directory, per thread project (the same keys as
+# [dispatch.worktrees]; the roots apply wherever that project's run directory is). Per machine: board.local.toml,
+# never the dashboard. Codex runs get them as `-c sandbox_workspace_write.writable_roots=[...]` (added to the
+# workspace-write sandbox next to the run directory); unscoped Claude runs as `--add-dir=<dir>`; scoped Claude runs
+# (claude_tool_projects) and other CLIs get none. Each entry must be an existing directory written as its real path
+# (no symlinks, no `..`), at most 10 per project, and may not be /, your home directory or anything containing it, or
+# overlap ~/.ssh, ~/.config/agent-comms, ~/.codex, ~/.claude, this board's folder or its data directory. A runner
+# that sets --add-dir or writable_roots itself is refused. Before launching, the dispatcher checks every output a
+# request declared (refs {kind: "output", path}) lies inside the run directory or these roots (README "Dispatcher").
+[dispatch.writable_roots]
+# "/Users/you/some-project" = ["/Users/you/nexus-work"]
+
 # A scoped headless browser for dispatched Codex runs, so the dispatcher can relaunch browser-bound work itself
 # (README "Headless browser for dispatched Codex runs"). Off: no runner is listed. Turn it on per machine in
 # board.local.toml. For each run of a listed Codex runner whose request (or, failing that, that agent's other
