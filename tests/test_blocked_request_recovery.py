@@ -1,5 +1,6 @@
 """Explicit terminal recovery never grants execution ownership."""
 import json
+import subprocess
 
 import pytest
 
@@ -154,7 +155,8 @@ def test_invalid_recovery_flag_rejected(env,blocked):
         recover(env,blocked,recover_blocked='true')
 
 
-def test_http_recovery_is_explicit_and_authenticated(env,blocked):
+@pytest.mark.parametrize('disposition', [None, 'completed'])
+def test_http_recovery_is_explicit_and_authenticated(env,blocked,disposition):
     from fastapi.testclient import TestClient
     from agent_comms.api import create_app
     from test_issues_api import headers
@@ -162,13 +164,17 @@ def test_http_recovery_is_explicit_and_authenticated(env,blocked):
     path = f"/api/posts/{blocked['post']['id']}/request-progress"
     payload = dict(recipient='codex',state='finished',reason='Verified actual restack result',
                    evidence_post_ids=[blocked['evidence']['id']],expected_version=2,recover_blocked=True)
+    if disposition is not None:
+        payload['disposition'] = disposition
     assert client.post(path,json=payload).status_code==401
     result = client.post(path,json=payload,headers=headers(env))
     assert result.status_code==200,result.text
     assert result.json()['assigned_session']==blocked['old']
+    assert result.json()['disposition'] == disposition
 
 
-def test_mcp_recovery_option_is_callable(env,blocked,monkeypatch):
+@pytest.mark.parametrize('disposition', [None, 'completed', 'superseded'])
+def test_mcp_recovery_option_is_callable(env,blocked,monkeypatch,disposition):
     import asyncio
     from mcp import Client
     from agent_comms.mcp_server import build_mcp
@@ -177,9 +183,82 @@ def test_mcp_recovery_option_is_callable(env,blocked,monkeypatch):
         async with Client(build_mcp(env.board,'stdio')) as client:
             tools = {tool.name:tool for tool in (await client.list_tools()).tools}
             assert 'recover_blocked' in tools['board_request_progress'].input_schema['properties']
-            result = await client.call_tool('board_request_progress',dict(post_id=blocked['post']['id'],
+            assert 'disposition' in tools['board_request_progress'].input_schema['properties']
+            payload = dict(post_id=blocked['post']['id'],
                 session_id=env.sid['codex'],recipient='codex',state='finished',reason='Verified actual restack',
-                evidence_post_ids=[blocked['evidence']['id']],expected_version=2,recover_blocked=True))
+                evidence_post_ids=[blocked['evidence']['id']],expected_version=2,recover_blocked=True,
+                disposition=disposition)
+            if disposition is None:
+                before = requests.history(env.board, env.p['codex'], blocked['post']['id'], 'codex')
+                rejected = await client.call_tool('board_request_progress', dict(payload, disposition='unknown'))
+                assert rejected.is_error
+                assert requests.history(env.board, env.p['codex'], blocked['post']['id'], 'codex') == before
+            result = await client.call_tool('board_request_progress', payload)
             assert not result.is_error,result
-            assert json.loads(result.content[0].text)['state']=='finished'
+            record = json.loads(result.content[0].text)
+            assert record['state'] == 'finished' and record['disposition'] == disposition
+            assert record['assigned_session'] == blocked['old']
+            assert requests.history(env.board, env.p['codex'], blocked['post']['id'], 'codex')[-1]['disposition'] == disposition
     asyncio.run(go())
+
+
+def test_http_superseded_recovery_preserves_dirty_owner_and_skips_completion(env, blocked, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from agent_comms.api import create_app
+    from agent_comms import issues, decision_actions
+    from test_issues_api import headers
+    project = str(tmp_path / 'original-owner')
+    subprocess.run(['git', 'init', project], check=True, capture_output=True)
+    unfinished = tmp_path / 'original-owner' / 'unfinished.txt'
+    unfinished.write_text('uncommitted work to preserve')
+    env.board.conn.execute('UPDATE threads SET project=? WHERE id=?', (project, blocked['post']['thread_id']))
+    env.board.conn.execute('UPDATE sessions SET project=?,worktree=? WHERE id=?', (project, project, blocked['old']))
+    env.board.register_session(env.p['codex'], project, resume_session_id=env.sid['codex'])
+    evidence = env.post('codex', blocked['post']['thread_id'], body='Verified this exact generic request is obsolete')
+    old_session = dict(env.board.conn.execute('SELECT * FROM sessions WHERE id=?', (blocked['old'],)).fetchone())
+    def no_completion(*args):
+        raise AssertionError('retirement cannot propagate completion')
+    monkeypatch.setattr(issues, 'reconcile_completed', no_completion)
+    monkeypatch.setattr(decision_actions, 'reconcile_successor', no_completion)
+    client = TestClient(create_app(env.board))
+    result = client.post(f"/api/posts/{blocked['post']['id']}/request-progress", headers=headers(env), json=dict(
+        recipient='codex', state='finished', disposition='superseded', recover_blocked=True, expected_version=2,
+        reason='Obsolete after verified replacement', evidence_post_ids=[evidence['id']]))
+    assert result.status_code == 200, result.text
+    assert result.json()['disposition'] == 'superseded'
+    assert result.json()['assigned_session'] == blocked['old']
+    assert dict(env.board.conn.execute('SELECT * FROM sessions WHERE id=?', (blocked['old'],)).fetchone()) == old_session
+    assert unfinished.read_text() == 'uncommitted work to preserve'
+    event = requests.history(env.board, env.p['codex'], blocked['post']['id'], 'codex')[-1]
+    assert event['disposition'] == 'superseded' and event['assigned_session'] == blocked['old']
+    assert event['session_id'] == env.sid['codex'] and event['evidence_post_ids'] == [evidence['id']]
+
+
+@pytest.mark.parametrize('change,status', [({'disposition': 'unknown'}, 422), ({'state': 'started'}, 400),
+    ({'evidence_post_ids': []}, 400), ({'expected_version': 1}, 409), ({'recover_blocked': False}, 409)])
+def test_http_superseded_recovery_rejects_invalid_inputs_without_mutation(env, blocked, change, status):
+    from fastapi.testclient import TestClient
+    from agent_comms.api import create_app
+    from test_issues_api import headers
+    payload = dict(recipient='codex', state='finished', disposition='superseded', recover_blocked=True,
+                   expected_version=2, reason='Explicitly obsolete', evidence_post_ids=[blocked['evidence']['id']])
+    payload.update(change)
+    before = requests.history(env.board, env.p['codex'], blocked['post']['id'], 'codex')
+    result = TestClient(create_app(env.board)).post(f"/api/posts/{blocked['post']['id']}/request-progress",
+                                                   headers=headers(env), json=payload)
+    assert result.status_code == status, result.text
+    assert requests.history(env.board, env.p['codex'], blocked['post']['id'], 'codex') == before
+
+
+@pytest.mark.parametrize('gate', ['old_evidence', 'linked'])
+def test_superseded_terminal_recovery_retains_evidence_and_lineage_guards(env, blocked, gate):
+    if gate == 'old_evidence':
+        env.board.conn.execute('UPDATE posts SET created_at=created_at-20 WHERE id=?', (blocked['evidence']['id'],))
+        error = Invalid
+    else:
+        env.board.conn.execute('INSERT INTO board_state(key,value,updated_at) VALUES (?,?,?)',
+            ('request.successor.999', json.dumps({'source_post_id': blocked['post']['id']}), env.clock()))
+        error = Forbidden
+    with pytest.raises(error):
+        recover(env, blocked, terminal_disposition='superseded')
+    assert env.board.get_post(env.p['codex'], blocked['post']['id'])['requests'][0]['state'] == 'blocked'

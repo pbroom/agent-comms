@@ -9,7 +9,7 @@ from pathlib import Path
 # Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
 # question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
 ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question IS i.decision_question)"
-SCHEMA_VERSION = 12  # v12: fence obsolete proposal writers without task provenance
+SCHEMA_VERSION = 13  # v13: server-controlled request ownership recovery receipts
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
@@ -217,6 +217,23 @@ CREATE TABLE IF NOT EXISTS request_events (
  reason TEXT NOT NULL, evidence_post_ids TEXT NOT NULL, version INTEGER NOT NULL, created_at REAL NOT NULL,
  UNIQUE(post_id,recipient,version)
 );
+CREATE TABLE IF NOT EXISTS request_owner_recoveries (
+ post_id INTEGER NOT NULL, recipient TEXT NOT NULL,
+ assigned_agent TEXT NOT NULL REFERENCES agents(name),
+ assigned_session INTEGER NOT NULL REFERENCES sessions(id),
+ recovered_version INTEGER NOT NULL, previous_session INTEGER NOT NULL REFERENCES sessions(id),
+ created_at REAL NOT NULL, PRIMARY KEY(post_id,recipient),
+ FOREIGN KEY(post_id,recipient) REFERENCES request_progress(post_id,recipient) ON DELETE CASCADE,
+ FOREIGN KEY(post_id,recipient,recovered_version) REFERENCES request_events(post_id,recipient,version)
+);
+-- Any ownership move invalidates the receipt, even if the request later returns to that session.
+-- Keep this in SQLite so dispatcher/requeue writes and older request writers cannot skip it.
+CREATE TRIGGER IF NOT EXISTS invalidate_request_owner_recovery
+AFTER UPDATE OF assigned_agent,assigned_session ON request_progress
+WHEN OLD.assigned_agent IS NOT NEW.assigned_agent OR OLD.assigned_session IS NOT NEW.assigned_session
+BEGIN
+ DELETE FROM request_owner_recoveries WHERE post_id=NEW.post_id AND recipient=NEW.recipient;
+END;
 
 CREATE TABLE IF NOT EXISTS supersession_close_permit (
  kind TEXT NOT NULL CHECK(kind IN ('thread','issue')), entity_id INTEGER NOT NULL,

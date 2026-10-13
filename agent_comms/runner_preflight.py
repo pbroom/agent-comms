@@ -13,7 +13,7 @@ ALLOWED = (
     "mcp__agent-comms", "Edit(./**)", "Write(./**)",
     "Bash(git status *)", "Bash(git diff *)", "Bash(git log *)", "Bash(git show *)",
     "Bash(git rev-parse *)", "Bash(git add *)", "Bash(git commit *)",
-    "Bash(git fetch)", "Bash(git fetch origin)", "Bash(git fetch origin main)",
+    "Bash(git fetch origin)", "Bash(git fetch origin main)",
     "Bash(git worktree add -b codex/*)", "Bash(git switch -c codex/*)",
     "Bash(uv run pytest *)", "Bash(pytest *)", "Bash(gh --version)",
     "Bash(gh pr view)", "Bash(gh pr view *)", "Bash(gh pr list)", "Bash(gh pr list *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)", "Bash(gh run view *)",
@@ -189,23 +189,19 @@ def verify(path: Path, session_id: str) -> dict:
     return {"state": "verified", "session_id": session_id, "commands": list(COMMANDS), "log": str(path)}
 
 
-RECOVERED_REASON = "Bookkeeping ownership recovered from "   # recovery._transfer's reason
-
-
 def _recovered_here(board, session, post_id: int, recipient: str | None) -> bool:
     """This session took the request over with board_recover_request_owner (recovery._transfer: same agent, ended or
     abandoned old owner, execution authorized) and still owns it. Its verified preflight then covers that request
     too: the tools were proven in this conversation and directory, whichever request launched the run."""
     if recipient is None:
         return False
-    row = board.conn.execute("SELECT assigned_agent,assigned_session FROM request_progress WHERE post_id=? AND recipient=?",
-                             (post_id, recipient)).fetchone()
-    if row is None or row["assigned_session"] != session["id"] or row["assigned_agent"] != session["agent"]:
-        return False
-    return board.conn.execute("""SELECT 1 FROM request_events WHERE post_id=? AND recipient=? AND actor=? AND session_id=?
-                                 AND assigned_session=? AND state='queued' AND reason LIKE ?""",
-                              (post_id, recipient, session["agent"], session["id"], session["id"],
-                               RECOVERED_REASON + "%")).fetchone() is not None
+    # Only recovery._transfer creates this receipt, in the ownership transaction. Agent-supplied progress
+    # reasons and legacy reason-only events confer nothing. The schema invalidates it on every ownership move.
+    return board.conn.execute("""SELECT 1 FROM request_owner_recoveries r
+        JOIN request_progress q ON q.post_id=r.post_id AND q.recipient=r.recipient
+        WHERE r.post_id=? AND r.recipient=? AND r.assigned_agent=? AND r.assigned_session=?
+          AND q.assigned_agent=r.assigned_agent AND q.assigned_session=r.assigned_session
+          AND q.version>=r.recovered_version""", (post_id, recipient, session["agent"], session["id"])).fetchone() is not None
 
 
 def assert_ready(board, session_id: int, post_id: int, recipient: str | None = None) -> None:

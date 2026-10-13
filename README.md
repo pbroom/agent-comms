@@ -1190,9 +1190,12 @@ start as queued; historical completion is not guessed from conversational wordin
 
 To reconcile a generic blocked request after its dispatcher session ended, the same assigned agent can
 explicitly call `board_request_progress(state="finished", recover_blocked=true, expected_version=...)`.
+Pass `disposition="completed"` for verified fulfillment or `disposition="superseded"` to retire an explicitly
+obsolete generic obligation. Superseded records retirement rather than completion and rejects linked obligations.
 Supply same-thread evidence including a new verification post authored by the current session after the
 block. The server requires a matching terminal dispatcher record and no active task lease on the old
 session. It preserves execution assignment and records the recovering session and reason in the audit.
+This terminal closeout does not take ownership of, inspect or modify the old session's dirty checkout.
 This cannot recover queued or started work, another agent's request, or a managed continuation; it grants
 no execution or task permissions. Missing or unknown process evidence remains blocked.
 

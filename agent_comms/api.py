@@ -75,6 +75,7 @@ class RequestProgressIn(Body):
     expected_version: StrictInt | None = None
     completion: dict | None = None
     recover_blocked: bool = False
+    disposition: Literal['completed', 'superseded'] | None = None
 
 
 class SessionIn(Body):
@@ -724,8 +725,9 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     @app.post("/api/posts/{post_id}/request-progress")
     def request_progress(post_id: int, body: RequestProgressIn, request: Request, p: Principal = P):
-        values = body.model_dump(exclude={"session_id"})
-        return requests.progress(board, p, sid(p, request, body.session_id), post_id, **values)
+        values = body.model_dump(exclude={"session_id", "disposition"})
+        return requests.progress(board, p, sid(p, request, body.session_id), post_id,
+                                 terminal_disposition=body.disposition, **values)
 
     @app.post("/api/posts/{post_id}/requests/recover-owner")
     def recover_request_owner(post_id: int, body: RequestOwnershipIn, request: Request, p: Principal = P):

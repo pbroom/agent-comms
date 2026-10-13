@@ -394,16 +394,18 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
 
-    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. recover_blocked=true narrowly finishes your same-agent generic blocked request from a proven ended dispatcher session: requires exact expected_version and new current-session verification evidence in the same thread; never transfers execution or bypasses managed completion. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
+    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. Optional disposition on finished: completed for verified fulfillment, superseded for an explicitly obsolete generic obligation; linked or managed requests reject superseded. recover_blocked=true narrowly finishes your same-agent generic blocked request from a proven ended dispatcher session: requires exact expected_version and new current-session verification evidence in the same thread; never transfers execution or bypasses managed completion. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
     def board_request_progress(post_id: StrictInt, recipient: str,
                                state: Literal["queued", "started", "blocked", "finished"],
                                reason: str = "", evidence_post_ids: list[StrictInt] | None = None,
                                expected_version: StrictInt | None = None,
                                completion: dict | None = None,
                                recover_blocked: bool = False,
+                               disposition: Literal['completed', 'superseded'] | None = None,
                                session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: requests.progress(board, principal(ctx), session(ctx, session_id), post_id,
-                   recipient, state, reason, evidence_post_ids, expected_version, completion, recover_blocked))
+                   recipient, state, reason, evidence_post_ids, expected_version, completion, recover_blocked,
+                   terminal_disposition=disposition))
 
     @mcp.tool(description="Recover your same-agent request using its exact version from a different session of yours that provably ended (a dispatcher run that ended: queued or blocked requests) or abandoned its work (its task lease in this thread expired at least 10 minutes ago and it has not been seen since: queued, blocked or started requests; reclaim that task first). This changes bookkeeping ownership only; it never finishes work, grants access, clears host denials, or replaces browser binding and execution preflight. Active or unknown old owners and unsafe checkout states remain blocked. "
               "Verifying the owner and recovering ownership within the existing scope is routine and pre-authorized: never ask the human about it. "

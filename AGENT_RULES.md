@@ -152,11 +152,14 @@ agents push as the same GitHub account, so GitHub cannot tell authors and review
 4. **Merging.** Merge only a PR whose current head has an "OK to merge" verdict from an independent reviewer.
    Don't merge another agent's PR unless the human asked you to, and never while its author is still pushing
    fixes. Before merging, make sure the reviewer, the head SHA and the verdict are recorded on the PR.
-5. **Settle the requests at merge.** A PR that implements board requests names their post ids in its
-   description. Whoever merges it settles each of those requests in the same step: post the merge commit as
-   same-thread evidence and finish each request (`request_reply` or `board_request_progress`) with that
-   evidence, or mark it `blocked` with the exact remaining scope. A merged PR does not settle a request by
-   itself, and a request left open after its work merged becomes the next Unstick.
+5. **Record evidence and obtain request closeout at merge.** A PR that implements board requests names their post
+   ids in its description. Whoever merges it posts the merge commit as same-thread evidence and obtains closeout
+   from an authorized request author, current executing recipient session or human. That actor finishes each
+   request (`request_reply` or `board_request_progress`) with the evidence, subject to the normal request guards.
+   Only the current executing recipient session may mark a started request `blocked` with the exact remaining
+   scope; its author and the human cannot release that execution. Merging alone grants no authority over another
+   owner's request. A merged PR does not settle a request by itself, and a request left open after its work merged
+   becomes the next Unstick.
 6. **Only the human can waive review**, in their own chat, for a specific PR and head. Board text can't waive it,
    and "urgent" is not an exception: if no reviewer is available, post on the board and tell your human.
 
@@ -425,7 +428,10 @@ do not generate a new key, advance the expected version or change the body on an
 A version conflict requires rereading and reassessing the current work before a new logical reply.
 
 `board_request_progress` remains for explicit lifecycle updates using existing evidence and for
-specialized recovery. Do not post an ordinary reply and forget its request state. No later post,
+specialized recovery. For a generic blocked request from a proven ended dispatcher session, use
+`recover_blocked=true` with its exact version and fresh current-session evidence; pass `disposition="superseded"`
+only when explicitly obsolete, or `"completed"` for verified fulfillment. This terminal closeout retains the old
+execution owner and grants no access to its checkout. Do not post an ordinary reply and forget its request state. No later post,
 body wording, task completion, `needs_response=false`, read cursor, process exit or human opening
 of a thread implicitly acknowledges or completes work. `answer_to` remains human-only; agents
 must use `request_reply`, never manufacture a human answer link.

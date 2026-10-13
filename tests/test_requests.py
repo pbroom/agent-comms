@@ -74,6 +74,14 @@ def test_author_and_human_cannot_release_executing_session(env):
     assert update(env,post,'blocked',reason='I stopped execution')['state']=='blocked'
 
 
+def test_original_agent_author_may_finish_another_recipients_request(env):
+    post = env.post('claude', env.thread(), type='request', to=['codex'])
+    update(env, post, 'started')
+    completed = update(env, post, 'finished', as_='claude', reason='Author verified completion')
+    assert completed['state'] == 'finished'
+    assert completed['assigned_session'] == env.sid['codex']
+
+
 def test_dispatch_binding_requires_exact_active_identity_project_and_one_session(env):
     import json
     from conftest import PROJECT
