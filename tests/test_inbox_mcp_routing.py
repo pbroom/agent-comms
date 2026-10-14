@@ -1,5 +1,9 @@
 """Inbox invocations use local board tools, without changing global approvals or access."""
 from pathlib import Path
+import json
+import os
+import shutil
+import subprocess
 import tomllib
 
 import pytest
@@ -103,3 +107,32 @@ def test_missing_local_channel_blocks_before_spending_inbox_budget(denv,tmp_path
     assert e.board.list_inbox_policies(e.p['human'])[0]['launches_left'] == 1
     assert e.board.get_post(e.p['codex'],post['id'])['requests'][0]['state'] == 'blocked'
     assert 'local agent-comms stdio' in runs(e)[0]['error']
+
+
+@pytest.mark.parametrize('server_name',['other','other.with.dots'])
+def test_native_codex_reads_isolated_route_configuration_without_starting_servers(tmp_path,server_name):
+    codex = shutil.which('codex')
+    if codex is None:
+        pytest.skip('Codex CLI is not installed')
+    # If the inventory command accidentally initializes a server this sentinel records it and fails.
+    sentinel = tmp_path / 'server-started'
+    server = tmp_path / 'never-start-server.sh'
+    server.write_text('#!/bin/sh\ntouch "$1"\nexit 97\n')
+    server.chmod(0o700)
+    text = ('cli_auth_credentials_store="file"\nmcp_oauth_credentials_store="file"\n'
+            '[mcp_servers.agent-comms]\ncommand=' + json.dumps(str(server)) + '\nargs=[' + json.dumps(str(sentinel)) + ']\n'
+            '[mcp_servers.' + json.dumps(server_name) + ']\ncommand=' + json.dumps(str(server)) + '\nargs=[' + json.dumps(str(sentinel)) + ']\n')
+    env,path = config(tmp_path,text)
+    narrowed = dispatch.with_codex_inbox_mcp(runner(),env)
+    restrictions = narrowed[narrowed.index('--disable'):-1]
+    native_env = dict(env,PATH=os.environ.get('PATH',''),TMPDIR=str(tmp_path))
+    result = subprocess.run([codex,*restrictions,'mcp','list','--json'],env=native_env,
+                            capture_output=True,text=True,timeout=20)
+    assert result.returncode == 0, result.stderr
+    # Inspect configuration behavior through Codex itself; do not mirror the emitted override strings.
+    inventory = {entry['name']:entry['enabled'] for entry in json.loads(result.stdout)}
+    assert inventory['agent-comms'] is True
+    assert inventory[server_name] is False
+    assert {name for name,enabled in inventory.items() if enabled} == {'agent-comms'}
+    assert not sentinel.exists()
+    assert path.read_text() == text
