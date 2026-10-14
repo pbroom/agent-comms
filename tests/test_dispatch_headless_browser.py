@@ -323,7 +323,7 @@ def _raw_bind(env, post_id, recipient, origin):
     """A requirement written before bind-time validation (or by anything else): bypasses target()."""
     from agent_comms import db
     with db.write_tx(env.board.conn) as c:
-        c.execute("INSERT INTO browser_requirements VALUES (?,?,?,?)", (post_id, recipient, origin + "/", origin))
+        c.execute("INSERT INTO browser_requirements (post_id,recipient,target_url,origin) VALUES (?,?,?,?)", (post_id, recipient, origin + "/", origin))
 
 
 @pytest.mark.parametrize("origin", ["https://*:443", "http://a\x7fb:80", "https://{a,b}:443"])

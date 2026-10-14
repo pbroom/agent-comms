@@ -1289,7 +1289,7 @@ class Board:
                     continuation: dict | None = None, answer_to: list[int] | None = None,
                     _in_transaction: bool = False, _answer_recipient: str | None = None,
                     request_reply: dict | None = None, idempotency_key: str | None = None,
-                    prevention_for: int | None = None) -> dict:
+                    prevention_for: int | None = None, browser_requirement: dict | None = None) -> dict:
         if prevention_for is not None and (request_reply is not None or idempotency_key is not None):
             raise Invalid("send a prevention proposal (prevention_for) as its own post, without request_reply or "
                           "idempotency_key")
@@ -1299,7 +1299,9 @@ class Board:
                 dict(body=body, type=type, thread_id=thread_id, new_thread_title=new_thread_title, to=to,
                      needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, final=final,
                      propose_task=propose_task, decision_question=decision_question, continuation=continuation,
-                     answer_to=answer_to), nested=_in_transaction, answer_recipient=_answer_recipient)
+                     answer_to=answer_to,
+                     **({'browser_requirement': browser_requirement} if browser_requirement is not None else {})),
+                nested=_in_transaction, answer_recipient=_answer_recipient)
         from . import workstreams
         self._check_agent_write(p)
         s = self._session(p, session_id)
@@ -1316,6 +1318,10 @@ class Board:
         if unknown:
             raise Invalid(f"unknown agents in to: {sorted(unknown)}")
         refs = self._validate_refs(refs)
+        from . import browser_readiness
+        browser = browser_readiness.declared_requirement(browser_requirement) if browser_requirement is not None else None
+        if browser is not None and (type != 'request' or browser['recipient'] not in to or continuation is not None):
+            raise Invalid('browser_requirement requires an addressed request and its exact original recipient')
         if type == "finding" and not any(r["rev"] for r in refs if r["kind"] in ("file", "commit")):
             raise Invalid("a finding must reference what was reviewed: include a file or commit ref with rev "
                           "(commit hash)")
@@ -1445,6 +1451,13 @@ class Board:
                 ).lastrowid
             if propose_task is not None:
                 c.execute("UPDATE tasks SET proposed_by_post = ? WHERE id = ?", (post_id, task_id))
+            if browser is not None:
+                # Commit the routing contract before post.created can wake a dispatcher.
+                from . import requests
+                stored_post = c.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+                if not any(row['recipient'] == browser['recipient'] for row in requests.for_post(self, stored_post)):
+                    raise Invalid('browser_requirement needs a nonhuman original request recipient')
+                browser_readiness.store_requirement(self, post_id, browser)
             if continuation is not None:
                 workstreams.create(self, p, session_id, post_id, continuation)
             if prevention_checked is not None:
@@ -1593,6 +1606,8 @@ class Board:
         d['answer_to'] = [a[0] for a in self.conn.execute(f'''SELECT p.id FROM answer_links al
             JOIN posts p ON p.id=al.source_post_id WHERE al.answer_post_id=:answer AND {self.VISIBLE} ORDER BY p.id''',
             {'answer':r['id'],**self._vis(p)})]
+        d['browser_requirements'] = [dict(b) for b in self.conn.execute(
+            'SELECT * FROM browser_requirements WHERE post_id=? ORDER BY recipient', (r['id'],))]
         receipt = self.conn.execute(f'''SELECT rr.result FROM request_reply_operations rr
             JOIN posts p ON p.id=json_extract(rr.result,'$.post_id')
             WHERE rr.reply_post_id=:reply AND {self.VISIBLE}''', {'reply':r['id'],**self._vis(p)}).fetchone()

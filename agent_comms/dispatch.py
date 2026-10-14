@@ -88,6 +88,10 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[i
                    "If a lifecycle tool needs unavailable approval, post a blocker; never bypass the gate. "
                    "Reading a post or exiting is not completion. Check required access before work; "
                    "report capability failures separately from missing authorization. "
+                   "Declare browser requirements before execution dispatch. If browser_missing reports "
+                   "human_action_required=false, diagnose the runner and route to a capable authorized session; "
+                   "do not ask the human to recreate a CLI browser or repeat an existing approval. "
+                   "A newly bound target cannot add tools to this running process: honor reroute_required. "
                    "Existing authorization covers routine work within its scope; host approval gates still apply.")
     if run_id is not None:
         if not isinstance(run_id, str) or not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in run_id):
@@ -443,6 +447,19 @@ def headless_browser_overrides(config: HeadlessBrowserConfig, origins: list[str]
     for tool in HEADLESS_BROWSER_TOOLS:
         out += ["-c", codex_approval_override(tool, HEADLESS_BROWSER_SERVER)]
     return out
+
+
+def git_run_directory_blocker(cwd: str, env: dict[str, str]) -> str | None:
+    """Probe the actual checkout before spending a Codex execution launch; never skip Git trust checks."""
+    try:
+        result = subprocess.run(['git', '-C', cwd, 'rev-parse', '--is-inside-work-tree'],
+                                env=env, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 'Cannot verify the actual Codex execution directory as a Git worktree; repair its project mapping'
+    if result.returncode != 0 or result.stdout.strip() != 'true':
+        return ('Actual Codex execution directory is not a Git worktree; configure '
+                '[dispatch.worktrees] to an existing checkout before dispatch')
+    return None
 
 
 def codex_config_conflict(env: dict[str, str]) -> str | None:
@@ -1473,6 +1490,10 @@ class Dispatcher:
                 with_codex_inbox_mcp(template,child_env(agent,self.config,runtime=self._runtime(agent)))
             except ValueError as e:
                 return str(e)
+        elif uses_codex(template):
+            blocker = git_run_directory_blocker(cwd, child_env(agent, self.config, runtime=self._runtime(agent)))
+            if blocker:
+                return blocker
         return codex_approval_reminder(template)
 
     def _inbox_busy(self, thread_id: int, now: float) -> bool:
@@ -1560,6 +1581,9 @@ class Dispatcher:
                     return reason
                 req = browser_readiness.requirement(self.board, post_id, row['recipient'])
                 if req:
+                    if req['execution_context'] == 'desktop':
+                        return ('Browser work requires an authenticated desktop execution context; generic CLI '
+                                'dispatch cannot inherit its browser. Route to a capable authorized desktop session.')
                     if not headless:
                         return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
                                 'inherit its probe (a Codex runner can be given a scoped headless browser with '
@@ -1570,7 +1594,20 @@ class Dispatcher:
 
     def _headless_blocker(self, agent: str, thread_id: int, request_ids: list[int]) -> str | None:
         """Before reserving a launch: a run that will get the browser server needs its command on the run's PATH."""
+        from . import browser_readiness
+        # Recovery/Unstick wrappers inherit the source's execution requirement, not just its origin.
+        required = self._execution_browser_requirements(agent, thread_id, request_ids, include_thread_fallback=False)
+        for req in required:
+            blocker = browser_readiness.request_blocker(self.board, req['post_id'], req['recipient'])
+            if blocker:
+                return blocker
+            if req['execution_context'] == 'desktop':
+                return ('Browser work requires a desktop execution context; isolated headless dispatch cannot '
+                        'provide authenticated desktop or file-upload access. Route to a capable authorized session.')
         if not self.config.headless_browser_for(agent, self._runtime(agent)):
+            if required:
+                return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
+                        'inherit its probe. Route to a capable authorized session.')
             return None
         if not self._headless_origins(agent, thread_id, request_ids):
             return None   # no browser server will be attached
@@ -1579,17 +1616,17 @@ class Dispatcher:
             return 'required headless browser command is unavailable'
         return codex_config_conflict(env)
 
-    def _headless_origins(self, agent: str, thread_id: int, request_ids: list[int]) -> list[str]:
-        """The origins a headless browser for this run may request: those bound for the triggering request(s)'
-        recipients assigned to this agent or, when they bind none, those bound for this agent's other unfinished
-        requests in the thread (so an Unstick or recovery run in a browser-bound thread can still reach them).
-        A denied origin, a sealed post and anything but a plain http(s) origin are never included (dropped, not
-        raised: see plain_origins). Empty: no browser server is attached."""
-        from . import browser_readiness
-        project = self.board.conn.execute('SELECT project FROM threads WHERE id=?', (thread_id,)).fetchone()
+    def _execution_browser_requirements(self, agent: str, thread_id: int, request_ids: list[int],
+                                        *, include_thread_fallback: bool = True) -> list[dict]:
+        """Exact triggering/recovery requirements, else compatible headless origins in the thread.
 
-        def bound(post_ids: list[int]) -> list[str]:
-            origins: set[str] = set()
+        Recovery wrappers inherit the original context constraints. Origin filtering happens separately;
+        a desktop requirement must not disappear merely because no headless origin can satisfy it.
+        """
+        from . import browser_readiness
+
+        def bound(post_ids: list[int]) -> list[dict]:
+            requirements = []
             for post_id in post_ids:
                 post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
                 if post is None or post['thread_id'] != thread_id or post['sealed']:
@@ -1598,18 +1635,35 @@ class Dispatcher:
                     if row['state'] == 'finished' or row['assigned_agent'] != agent:
                         continue
                     req = browser_readiness.requirement(self.board, post_id, row['recipient'])
-                    if req and project and not browser_readiness._gate(self.board, project['project'],
-                                                                        req['origin'])['denied']:
-                        origins.add(req['origin'])
-            return plain_origins(list(origins))
+                    if req:
+                        requirements.append(dict(req))
+            return requirements
 
+        # Desktop restrictions propagate only through server-created recovery lineage. An unrelated code
+        # request in this thread must not be blocked by another obligation's desktop requirement.
+        from . import recovery
+        linked = set()
+        for post_id in request_ids:
+            for record in self.board.conn.execute('SELECT value FROM board_state WHERE key LIKE ?',
+                                                  (recovery.PREFIX + str(post_id) + '.%',)):
+                for source in json.loads(record['value'])['sources']:
+                    linked.add((source['post_id'], source['recipient']))
         found = bound(request_ids)
-        if not found:
+        found += [req for req in bound(sorted({post_id for post_id, _ in linked}))
+                  if (req['post_id'], req['recipient']) in linked]
+        if not found and include_thread_fallback:
             thread_posts = [r[0] for r in self.board.conn.execute(
                 'SELECT DISTINCT b.post_id FROM browser_requirements b JOIN posts p ON p.id=b.post_id '
                 'WHERE p.thread_id=? ORDER BY b.post_id', (thread_id,))]
-            found = bound(thread_posts)
+            found = [req for req in bound(thread_posts) if req['execution_context'] != 'desktop']
         return found
+
+    def _headless_origins(self, agent: str, thread_id: int, request_ids: list[int]) -> list[str]:
+        from . import browser_readiness
+        project = self.board._thread_row(thread_id)['project']
+        return plain_origins([req['origin'] for req in self._execution_browser_requirements(agent, thread_id, request_ids)
+            if req['execution_context'] != 'desktop'
+            and not browser_readiness._gate(self.board, project, req['origin'])['denied']])
 
     @staticmethod
     def _dir_key(path: Any) -> str | None:
@@ -1670,6 +1724,10 @@ class Dispatcher:
         try:
             if item.get('post_id') and not inbox:
                 browser_blocker = self._browser_blocker(item['post_id'], agent)
+                if browser_blocker:
+                    raise Conflict(browser_blocker)
+            if not inbox:
+                browser_blocker = self._headless_blocker(agent, thread_id, record['request_ids'])
                 if browser_blocker:
                     raise Conflict(browser_blocker)
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1772,6 +1830,12 @@ class Dispatcher:
                    or current[name]["version"] != version
                    for name, version in rec.get("request_versions", {}).items()):
                 raise Conflict("request assignment changed during tool preflight")
+            blocker = self._browser_blocker(pid, run.agent)
+            if blocker:
+                raise Conflict(blocker)
+        blocker = self._headless_blocker(run.agent, run.thread_id, rec.get('request_ids', []))
+        if blocker:
+            raise Conflict(blocker)
         cwd = rec["cwd"]
         template = rec["work_template"] + ["--resume", proof["session_id"]]
         argv = render_argv(template, prompt=rec["work_prompt"], project=cwd, thread_id=run.thread_id)

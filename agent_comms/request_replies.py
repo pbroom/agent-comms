@@ -58,6 +58,8 @@ def create(board, p, session_id, request_reply, idempotency_key, post_fields, *,
             or post_fields['answer_to'] is not None or post_fields['continuation'] is not None
             or post_fields['propose_task'] is not None):
         raise Invalid('request reply requires an unsealed post in an existing thread without another lifecycle action')
+    if post_fields.get('browser_requirement') is not None:
+        raise Invalid('declare browser requirements on their own request, not a request reply')
     # Normalize API defaults, not content: a retry must describe the very same post.
     fields = dict(post_fields, to=post_fields['to'] or [], refs=post_fields['refs'] or [])
     try:

@@ -107,6 +107,7 @@ class Recorder:
 @pytest.fixture
 def denv(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
+    monkeypatch.setattr(dispatch, 'git_run_directory_blocker', lambda cwd, env: None)
     env = make_env(tmp_path)
     workdir = tmp_path / "repo"
     workdir.mkdir()
