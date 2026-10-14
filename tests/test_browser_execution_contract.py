@@ -173,6 +173,40 @@ def test_unrelated_code_request_does_not_inherit_a_desktop_restriction_from_thre
     assert record['request_ids'] == [follow_up['id']] and 'headless_browser' not in record
 
 
+@pytest.mark.parametrize('kind', ['headless', 'either'])
+def test_recovery_source_requires_a_browser_even_when_no_headless_runner_is_configured(benv, kind):
+    from agent_comms import recovery
+    original = human_post(benv, ['codex'], browser_requirement=requirement(kind))
+    benv.clock.advance(1)
+    allow(benv, agents=['codex'], max_launches=3)
+    wrapper = human_post(benv, ['codex'])
+    with db.write_tx(benv.board.conn):
+        recovery.record(benv.board, benv.p['human'], wrapper['id'], 'codex',
+                        [{'post_id': original['id'], 'recipient': 'codex', 'version': 0}])
+    benv.config.headless_browser.runners = []
+    benv.d.tick()
+    assert not benv.spawner.calls
+    assert 'generic CLI' in runs(benv)[0]['error']
+    assert benv.board.list_dispatch_rules(benv.p['human'])[0]['launches_left'] == 3
+
+
+def test_recovery_wrapper_cannot_erase_an_exact_source_policy_denial(benv):
+    from agent_comms import recovery
+    original = human_post(benv, ['codex'], browser_requirement=requirement('headless'))
+    benv.clock.advance(1)
+    allow(benv, agents=['codex'], max_launches=3)
+    wrapper = human_post(benv, ['codex'])
+    with db.write_tx(benv.board.conn):
+        recovery.record(benv.board, benv.p['human'], wrapper['id'], 'codex',
+                        [{'post_id': original['id'], 'recipient': 'codex', 'version': 0}])
+    br.report_failure(benv.board, benv.p['claude'], benv.sid['claude'], URL, DESKTOP,
+                      'policy_denied', 'Browser host explicitly denied this origin')
+    benv.d.tick()
+    assert not benv.spawner.calls
+    assert 'policy denied' in runs(benv)[0]['error']
+    assert benv.board.list_dispatch_rules(benv.p['human'])[0]['launches_left'] == 3
+
+
 @pytest.mark.parametrize('inherited', [False, True])
 def test_context_bound_during_tool_preflight_prevents_the_work_spawn(denv, inherited):
     from test_runner_preflight import configure, complete_probe

@@ -1594,12 +1594,20 @@ class Dispatcher:
 
     def _headless_blocker(self, agent: str, thread_id: int, request_ids: list[int]) -> str | None:
         """Before reserving a launch: a run that will get the browser server needs its command on the run's PATH."""
+        from . import browser_readiness
         # Recovery/Unstick wrappers inherit the source's execution requirement, not just its origin.
-        for req in self._execution_browser_requirements(agent, thread_id, request_ids):
+        required = self._execution_browser_requirements(agent, thread_id, request_ids, include_thread_fallback=False)
+        for req in required:
+            blocker = browser_readiness.request_blocker(self.board, req['post_id'], req['recipient'])
+            if blocker:
+                return blocker
             if req['execution_context'] == 'desktop':
                 return ('Browser work requires a desktop execution context; isolated headless dispatch cannot '
                         'provide authenticated desktop or file-upload access. Route to a capable authorized session.')
         if not self.config.headless_browser_for(agent, self._runtime(agent)):
+            if required:
+                return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
+                        'inherit its probe. Route to a capable authorized session.')
             return None
         if not self._headless_origins(agent, thread_id, request_ids):
             return None   # no browser server will be attached
@@ -1608,7 +1616,8 @@ class Dispatcher:
             return 'required headless browser command is unavailable'
         return codex_config_conflict(env)
 
-    def _execution_browser_requirements(self, agent: str, thread_id: int, request_ids: list[int]) -> list[dict]:
+    def _execution_browser_requirements(self, agent: str, thread_id: int, request_ids: list[int],
+                                        *, include_thread_fallback: bool = True) -> list[dict]:
         """Exact triggering/recovery requirements, else compatible headless origins in the thread.
 
         Recovery wrappers inherit the original context constraints. Origin filtering happens separately;
@@ -1642,7 +1651,7 @@ class Dispatcher:
         found = bound(request_ids)
         found += [req for req in bound(sorted({post_id for post_id, _ in linked}))
                   if (req['post_id'], req['recipient']) in linked]
-        if not found:
+        if not found and include_thread_fallback:
             thread_posts = [r[0] for r in self.board.conn.execute(
                 'SELECT DISTINCT b.post_id FROM browser_requirements b JOIN posts p ON p.id=b.post_id '
                 'WHERE p.thread_id=? ORDER BY b.post_id', (thread_id,))]
