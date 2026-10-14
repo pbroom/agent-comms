@@ -271,11 +271,12 @@ PEER_ACTIVITY = 'Another live session in the owner worktree has active or unknow
 OWNER_RUN_ACTIVE = 'Owner dispatcher run is active or unresolved'
 
 
-def _inactive(board, session, managed, abandoned=False, own_run_id=None, successor=None):
+def _inactive(board, session, managed, abandoned=False, own_run_id=None, successor=None, project_common_dir=None):
     """Why `session` cannot be treated as inactive, or None. `abandoned` (recovery.abandonment proved the session has
     been silent since its task lease expired) counts like an ended dispatcher run; `own_run_id` is the successor's own
     dispatcher run, which is not the old owner's; `successor` is the session taking over (recovery), whose own leases
-    and activity in the checkout are not someone else's work there. The checkout's Git state is still inspected."""
+    and activity in the checkout are not someone else's work there. The checkout's Git state is still inspected.
+    Recovery alone may supply a server-validated configured repository identity for a non-Git project folder."""
     now = board.now()
     path = os.path.realpath(session['worktree'] or session['project'])
     active = board.conn.execute("""SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session
@@ -328,7 +329,8 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     try:
         project = board._thread_row(managed['thread_id'])['project']
         common = _git(path,'rev-parse','--path-format=absolute','--git-common-dir')
-        if os.path.realpath(common) != os.path.realpath(_git(project,'rev-parse','--path-format=absolute','--git-common-dir')):
+        expected = project_common_dir or _git(project,'rev-parse','--path-format=absolute','--git-common-dir')
+        if os.path.realpath(common) != os.path.realpath(expected):
             return 'Owner worktree belongs to another repository'
         if _git(path,'status','--porcelain=v1','--untracked-files=all'):
             return 'Owner worktree contains unfinished changes; preserve it before takeover'
