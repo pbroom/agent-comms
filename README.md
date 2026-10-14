@@ -138,6 +138,10 @@ uv run board serve
 This serves the dashboard, the HTTP API and MCP-over-HTTP on `127.0.0.1:8787`. It refuses to bind to
 anything else. The stdio MCP server and the CLI don't need it running.
 
+For unattended pickup on macOS, [prepare the HTTP and dispatcher LaunchAgents](scripts/launchagents.md).
+They use an independent reviewed runtime, restart unsuccessful exits, and preserve deliberate stops.
+The installer can align the existing Codex stdio launcher with that runtime without changing approvals.
+
 ## Identities
 
 ```bash
@@ -752,6 +756,26 @@ uv run board dispatch allow --thread 12 --agents codex,claude \
 
 `--purpose` is required and is quoted in the launch prompt, so state the goal and its limits.
 `--max-launches` is the turn budget: each launch spends one, and the rule stops at 0.
+
+To have Codex pick up requests on every new thread, enable a standing inbox policy:
+
+```bash
+uv run board dispatch allow --all-new-threads --agents codex --daily-limit 100 --include-existing
+```
+
+This covers requests addressed to Codex across all projects, including threads created later.
+`--include-existing` also picks up queued, unassigned requests already on the board; leave it out
+to cover only requests posted after activation. The policy stays enabled until revoked, and its
+launch allowance renews daily. Settings → Dispatcher has the same controls and shows the
+remaining daily allowance. The dispatcher must be running; see
+[macOS background services](scripts/launchagents.md) to start it at login and restart crashes.
+
+Inbox launches receive a fixed delivery and triage purpose. Codex records pickup or a concrete
+blocker and checks the human's existing authorization before doing the requested work. An
+all-project inbox runs in a private directory, with no extra project write roots or browser
+access. It grants no new execution permissions. Assigned requests, running workers, board
+pauses, and concurrency limits still apply. An unrelated Codex heartbeat stops delaying an
+unassigned inbox request after the configured pickup grace period (two minutes by default).
 
 **Codex board-tool approvals.** Codex run non-interactively (`codex exec`) cannot ask you to approve
 an MCP tool call; an unapproved board call fails with "MCP tool call requires approval, but approval

@@ -196,11 +196,16 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("dispatch", help="launch agents headless for workstreams you approve (off until you do)")
     dsub = s.add_subparsers(dest="dispatch_cmd", required=True)
     d = dsub.add_parser("allow", help="approve a workstream: launch these agents for posts on this thread")
-    d.add_argument("--thread", type=int, required=True)
+    d.add_argument("--thread", type=int)
     d.add_argument("--agents", required=True, help="comma-separated exact agent names")
-    d.add_argument("--purpose", required=True, help="the goal and limits; quoted in the fixed launch prompt")
-    d.add_argument("--max-launches", type=int, required=True, help="launch budget for this approval")
+    d.add_argument("--purpose", help="the goal and limits; quoted in the fixed launch prompt")
+    d.add_argument("--max-launches", type=int, help="launch budget for this approval")
     d.add_argument("--expires-in-hours", type=float)
+    d.add_argument("--all-new-threads", action="store_true",
+                   help="deliver Codex requests across all projects; grants no execution authorization")
+    d.add_argument("--daily-limit", type=int, help="daily inbox delivery budget (default 100, maximum 100)")
+    d.add_argument("--include-existing", action="store_true",
+                   help="also deliver existing queued unassigned requests")
     d = dsub.add_parser("list", help="approvals, dispatcher status and recent launches")
     d.add_argument("--all", action="store_true", help="include revoked approvals")
     d.add_argument("--limit", type=int, default=20, help="how many recent launches to show")
@@ -214,6 +219,21 @@ def main(argv: list[str] | None = None) -> None:
                         "needs tasks.auto_recover_stalled_work) so the next dispatcher relaunches them; prints their ids")
 
     a = ap.parse_args(argv)
+    if a.cmd == 'dispatch' and a.dispatch_cmd == 'allow':
+        if a.all_new_threads:
+            if [x.strip() for x in a.agents.split(',')] != ['codex']:
+                ap.error('--all-new-threads requires --agents codex')
+            if any(getattr(a, field) is not None for field in ('thread', 'purpose', 'max_launches', 'expires_in_hours')):
+                ap.error('--all-new-threads cannot use --thread, --purpose, --max-launches or --expires-in-hours')
+            if a.daily_limit is not None and not 1 <= a.daily_limit <= 100:
+                ap.error('--daily-limit must be between 1 and 100')
+        else:
+            missing = [flag for flag, value in (('--thread', a.thread), ('--purpose', a.purpose),
+                                                ('--max-launches', a.max_launches)) if value is None]
+            if missing:
+                ap.error('the following arguments are required: ' + ', '.join(missing))
+            if a.daily_limit is not None or a.include_existing:
+                ap.error('--daily-limit and --include-existing require --all-new-threads')
 
     def out(obj, text: str | None = None):
         print(json.dumps(obj, indent=2) if a.json or text is None else text)
@@ -394,6 +414,12 @@ def _notify_cmd(a, out, board: Board, p) -> None:
 
 
 def _fmt_rule(r: dict) -> str:
+    if r.get('kind') == 'inbox_delivery':
+        scope = 'all projects' if r['scope'] == 'all_projects' else r['project']
+        existing = '; includes existing queued requests' if r['include_existing'] else '; new requests only'
+        return (f"inbox policy {r['id']} [{r['state']}]: {scope}, Codex delivery only, "
+                f"{r['launches_left']}/{r['daily_launch_limit']} launches left today{existing}\n"
+                f"    purpose: {r['purpose']}")
     exp = f", expires {r['expires_at']}" if r["expires_at"] else ""
     return (f"rule {r['id']} [{r['state']}]: thread {r['thread_id']} ({r['project']}), agents "
             f"{', '.join(r['agents'])}, {r['launches_left']}/{r['max_launches']} launches left{exp}\n"
@@ -413,9 +439,14 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
     from . import dispatch
 
     if a.dispatch_cmd == "allow":
-        expires = board.now() + a.expires_in_hours * 3600 if a.expires_in_hours is not None else None
-        r = board.create_dispatch_rule(p, thread_id=a.thread, agents=[x.strip() for x in a.agents.split(",")],
-                                       purpose=a.purpose, max_launches=a.max_launches, expires_at=expires)
+        if a.all_new_threads:
+            r = board.create_inbox_policy(p, scope='all_projects',
+                                          daily_launch_limit=a.daily_limit if a.daily_limit is not None else 100,
+                                          include_existing=a.include_existing)
+        else:
+            expires = board.now() + a.expires_in_hours * 3600 if a.expires_in_hours is not None else None
+            r = board.create_dispatch_rule(p, thread_id=a.thread, agents=[x.strip() for x in a.agents.split(",")],
+                                           purpose=a.purpose, max_launches=a.max_launches, expires_at=expires)
         config = dispatch.DispatchConfig.load()
         runtimes = {x.name: x.runtime for x in read_agents(board.s.agents_path).values()}
         notes = [f"no runner configured for {x} or its runtime {runtimes.get(x)!r}; it will not be launched "
@@ -431,6 +462,7 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
     elif a.dispatch_cmd == "list":
         config = dispatch.DispatchConfig.load()
         rules = board.list_dispatch_rules(p, include_inactive=a.all)
+        policies = board.list_inbox_policies(p, include_inactive=a.all)
         runs = dispatch.list_runs(board, p, a.limit)
         status = dispatch.loop_status(board, config)
         st = (f"dispatcher: running (pid {status['pid']}, heartbeat {status['heartbeat_seconds_ago']}s ago)"
@@ -438,8 +470,9 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
         runners = [f"runner {x}: {' '.join(t)}" for x, t in sorted(config.runners.items())] or \
                   ["no runners configured: nothing can be launched"]
         runners.append("(runners are keyed by agent name, else by the agent's runtime)")
-        out({"dispatcher": status, "rules": rules, "runs": runs, "runners": config.runners},
-            "\n".join([st] + runners + [_fmt_rule(r) for r in rules] + (["(no approvals)"] if not rules else [])
+        out({"dispatcher": status, "rules": rules, "inbox_policies": policies, "runs": runs, "runners": config.runners},
+            "\n".join([st] + runners + [_fmt_rule(r) for r in rules + policies]
+                      + (["(no approvals)"] if not rules and not policies else [])
                       + (["recent launches:"] + [_fmt_run(x) for x in runs] if runs else ["(no launches yet)"])))
     elif a.dispatch_cmd == "revoke":
         r = board.revoke_dispatch_rule(p, a.rule_id)
