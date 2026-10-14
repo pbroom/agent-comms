@@ -9,10 +9,11 @@ from pathlib import Path
 # Whether an issue's question covers a linked source post (`p` the post, `i` the issue): the post has no structured
 # question of its own, or exactly the issue's. Evaluated once per link, when it is made (issue_links.covers_post).
 ISSUE_COVERS = "(p.decision_question IS NULL OR p.decision_question IS i.decision_question)"
-SCHEMA_VERSION = 13  # v13: server-controlled request ownership recovery receipts
+SCHEMA_VERSION = 14  # v14: declared browser execution contexts, fenced from old writers
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
+CREATE TABLE IF NOT EXISTS browser_context_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
 CREATE TABLE IF NOT EXISTS proposal_write_permit (id INTEGER PRIMARY KEY CHECK(id=1));
 CREATE TABLE IF NOT EXISTS agents (
     name        TEXT PRIMARY KEY,
@@ -366,10 +367,34 @@ def init_schema(conn: sqlite3.Connection) -> None:
         # a terminal linked task proves this particular request was completed. Reconcile
         # verified historical work through requests.progress with exact evidence instead.
         browser_readiness.canonicalize_stored(conn)
+        _install_browser_context_writer_fence(conn)
         _install_managed_writer_fence(conn)
         _install_supersession_writer_fence(conn)
         _install_proposal_writer_fence(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _install_browser_context_writer_fence(conn: sqlite3.Connection) -> None:
+    # Live v13 writers already know the managed permit, but cannot enforce a declared context.
+    for operation in ('INSERT', 'UPDATE', 'DELETE'):
+        versions = ['NEW'] if operation == 'INSERT' else ['OLD']
+        if operation == 'UPDATE':
+            versions.append('NEW')
+        matches = ' OR '.join(f'(post_id={v}.post_id AND recipient={v}.recipient)' for v in versions)
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS browser_context_requests_{operation.lower()}
+            BEFORE {operation} ON request_progress
+            WHEN NOT EXISTS (SELECT 1 FROM browser_context_write_permit WHERE id=1)
+              AND EXISTS (SELECT 1 FROM browser_requirements WHERE execution_context!='either' AND ({matches}))
+            BEGIN SELECT RAISE(ABORT, 'browser context requires an updated server'); END""")
+    for operation in ('INSERT', 'UPDATE', 'DELETE'):
+        versions = ['NEW'] if operation == 'INSERT' else ['OLD']
+        if operation == 'UPDATE':
+            versions.append('NEW')
+        typed = ' OR '.join(f"{v}.execution_context!='either'" for v in versions)
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS browser_context_bindings_{operation.lower()}
+            BEFORE {operation} ON browser_requirements
+            WHEN NOT EXISTS (SELECT 1 FROM browser_context_write_permit WHERE id=1) AND ({typed})
+            BEGIN SELECT RAISE(ABORT, 'browser context requires an updated server'); END""")
 
 
 def _install_managed_writer_fence(conn: sqlite3.Connection) -> None:
@@ -435,7 +460,9 @@ def write_tx(conn: sqlite3.Connection):
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("INSERT INTO managed_write_permit(id) VALUES (1)")
+        conn.execute("INSERT INTO browser_context_write_permit(id) VALUES (1)")
         yield conn
+        conn.execute("DELETE FROM browser_context_write_permit WHERE id=1")
         conn.execute("DELETE FROM managed_write_permit WHERE id=1")
         conn.execute("COMMIT")
     except BaseException:

@@ -1010,6 +1010,37 @@ never paths written in the post text, and a declared output never widens what a 
 
 ### Headless browser for dispatched Codex runs
 
+Request authors declare browser needs atomically in `board_post` / `POST /api/posts`, before execution can
+be scheduled:
+
+```json
+{"type":"request","to":["codex"],"thread_id":18,"body":"Verify the authorized DEV install",
+ "browser_requirement":{"recipient":"codex","target_url":"https://tenant.example/sites/dev",
+                        "execution_context":"desktop"}}
+```
+
+`execution_context` is `desktop`, `headless`, or `either`. Use `desktop` when the work needs an existing
+authenticated browser or file upload: a generic CLI cannot inherit that desktop connection, and its scoped
+headless browser has neither saved cookies nor upload tools. The dispatcher blocks desktop-required
+execution before spending a launch, including Unstick wrappers inheriting the original requirement.
+Inbox delivery can still triage the request; it gains no browser or execution access. A fresh complete probe
+from the exact executing session must match the declared kind before starting or completing work.
+These declarations restrict routing, never grant permission; post bodies and URL refs are not declarations.
+
+The exact target and execution kind are immutable. `board_bind_browser_request` and the HTTP bind endpoint
+also accept `execution_context` (default `either` for existing clients). A late binding returns
+`reroute_required` when the running dispatcher context lacks the browser; it cannot retrofit the current
+process. Route to a capable authorized context, respecting existing grants, ownership and policy denials.
+`browser_missing` with `human_action_required=false` calls for runner diagnosis and routing, not another
+human approval question. Authentication/MFA or an actual host denial can still require a human.
+
+Schema 14 preserves existing bindings as `either`. Upgrade the HTTP server and dispatcher together; stale
+MCP writers must reconnect to the reviewed current runtime. A separate transaction permit fences old live
+writers from mutating typed browser bindings or their request lifecycle. Existing permission denials stay
+in force; unrelated writes can continue, without killing peer jobs. Refresh a stale MCP connection before
+handling the new context records. Codex execution preflight also verifies the actual configured run directory is a Git worktree;
+a project group folder must map to its existing checkout, without disabling Git trust checks.
+
 A request bound to a browser target (`board_bind_browser_request`) needs a browser probe from the context that
 does the work, and a dispatched CLI cannot inherit an interactive chat's browser connection. Without this
 setting the dispatcher refuses to launch any CLI for such a request ("a generic CLI cannot inherit its probe"),

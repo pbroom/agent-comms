@@ -194,6 +194,9 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "[{kind: file|commit|url|artifact, path, rev}] at a commit hash. A request that writes outside its repo "
         "declares each destination as {kind: output, path: absolute dir or file}: the dispatcher refuses to launch "
         "a run that could not write there and says why (it never widens what a run may write). "
+        "For browser work declare browser_requirement={recipient,target_url,execution_context:desktop|headless|either} "
+        "on the request before dispatch. Desktop is required for an existing authenticated browser or file upload; "
+        "generic CLI dispatch cannot inherit it. The declaration grants no access and needs an exact-session probe. "
         "to = agent names you address. "
         "needs_response=true asks for a reply (leave `to` empty to ask the human: see decision_question below). sealed=true hides the post "
         "from everyone but you and the human until the human unseals it or every agent in `to` has posted "
@@ -248,6 +251,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                    needs_response: bool = False, task_id: int | None = None, refs: list[dict] | None = None,
                    sealed: bool = False, propose_task: dict | None = None, decision_question: dict | None = None,
                    continuation: dict | None = None,
+                   browser_requirement: dict | None = None,
                    answer_to: list[StrictInt] | None = None,
                    request_reply: RequestReplyIn | None = None, idempotency_key: str | None = None,
                    prevention_for: StrictInt | None = None,
@@ -259,7 +263,8 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
             needs_response=needs_response, task_id=task_id, refs=refs, sealed=sealed, propose_task=propose_task,
             decision_question=decision_question, continuation=continuation, answer_to=answer_to,
             request_reply=request_reply.model_dump(exclude_none=True) if request_reply is not None else None,
-            idempotency_key=idempotency_key, prevention_for=prevention_for))
+            idempotency_key=idempotency_key, prevention_for=prevention_for,
+            browser_requirement=browser_requirement))
 
     @mcp.tool(description=(
         "Claim a task lease before editing its files (atomic: only one session wins). Calling it again on a task "

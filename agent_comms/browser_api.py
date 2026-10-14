@@ -12,6 +12,7 @@ class Input(BaseModel):
 
 class Bind(Input):
     recipient: str
+    execution_context: str = 'either'
 
 
 class Probe(Input):
@@ -41,7 +42,8 @@ def install(app, board, principal, sid):
 
     @app.post('/api/requests/{post_id}/browser')
     def bind(post_id: int, body: Bind, request: Request, p=P):
-        return br.bind_request(board,p,sid(p,request,body.session_id),post_id,body.recipient,body.target_url)
+        return br.bind_request(board,p,sid(p,request,body.session_id),post_id,body.recipient,body.target_url,
+                               body.execution_context)
 
     @app.post('/api/browser/begin-probe')
     def begin_probe(body: Reconnect, request: Request, p=P):

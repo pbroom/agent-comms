@@ -336,7 +336,7 @@ def test_upgrade_rekeys_gates_and_requirements_stored_under_other_spellings(env)
     with db.write_tx(c):
         c.execute('ALTER TABLE browser_permission_gates DROP COLUMN created_by')   # an older database
         c.execute("INSERT INTO browser_permission_gates VALUES (?,?,1,3,'old deny')", (PROJECT, 'http://localhost.:5185'))
-        c.execute('INSERT INTO browser_requirements VALUES (?,?,?,?)',
+        c.execute('INSERT INTO browser_requirements (post_id,recipient,target_url,origin) VALUES (?,?,?,?)',
                   (post['id'], 'codex', 'http://LOCALHOST.:5185/about', 'http://localhost.:5185'))
     db.init_schema(c)
     assert [tuple(r) for r in c.execute('SELECT origin, denied, epoch FROM browser_permission_gates')] == \

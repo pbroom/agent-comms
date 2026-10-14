@@ -5,10 +5,12 @@ from . import browser_readiness as br
 
 
 def install(mcp, board, principal, session, run, warning=""):
-    @mcp.tool(description='Bind the exact browser target before routing or starting a browser request. This is immutable and grants no access.' + warning)
+    @mcp.tool(description='Bind the exact browser target and execution_context desktop|headless|either before routing or starting a browser request. Prefer atomic browser_requirement on board_post. Both are immutable and grant no access. A late binding returns reroute_required when this running process lacks the required browser; diagnose and route within existing authorization, without asking to repeat approval.' + warning)
     def board_bind_browser_request(post_id: StrictInt, recipient: str, target_url: str,
+                                   execution_context: str = 'either',
                                    session_id: int | None = None, ctx: Context = None) -> dict:
-        return run(lambda: br.bind_request(board,principal(ctx),session(ctx,session_id),post_id,recipient,target_url))
+        return run(lambda: br.bind_request(board,principal(ctx),session(ctx,session_id),post_id,recipient,target_url,
+                                          execution_context))
 
     @mcp.tool(description='Begin a short-lived probe attempt in this exact context before an authorized browser observation. Does not grant permission or run a browser. Denied origins cannot begin probes.' + warning)
     def board_browser_begin_probe(target_url: str, context: dict,
@@ -20,7 +22,7 @@ def install(mcp, board, principal, session, run, warning=""):
                             session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: br.report_probe(board,principal(ctx),session(ctx,session_id),target_url,context,evidence,attempt_id))
 
-    @mcp.tool(description='Record browser failure immediately. policy_denied/host_permission mean only that the browser or its host refused the bound origin itself (a site permission declined, a host policy blocking that origin); they write a sticky gate that blocks every launch to that origin in this project, across identities and contexts, until the human records a permission change. Never reroute or retry denied access. A browser tool refusing a local file path ("outside allowed roots") is not a browser failure: save with a bare file name and copy the file from the path the tool reports; such evidence is refused for those two kinds. Other failures invalidate readiness. This reports evidence, not authority.' + warning)
+    @mcp.tool(description='Record browser failure immediately. browser_missing with human_action_required=false is a runner/capability issue: diagnose and route to a capable authorized context, without asking the human to create a CLI browser or repeat approval. policy_denied/host_permission mean only that the browser or its host refused the bound origin itself (a site permission declined, a host policy blocking that origin); they write a sticky gate that blocks every launch to that origin in this project, across identities and contexts, until the human records a permission change. Never reroute or retry denied access. A browser tool refusing a local file path ("outside allowed roots") is not a browser failure: save with a bare file name and copy the file from the path the tool reports; such evidence is refused for those two kinds. Other failures invalidate readiness. This reports evidence, not authority.' + warning)
     def board_browser_failure(target_url: str, context: dict, failure: str, evidence: str,
                               session_id: int | None = None, ctx: Context = None) -> dict:
         return run(lambda: br.report_failure(board,principal(ctx),session(ctx,session_id),target_url,context,failure,evidence))
