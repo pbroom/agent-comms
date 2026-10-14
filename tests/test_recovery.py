@@ -115,6 +115,19 @@ def test_ended_transfer_keeps_original_unfinished_and_requires_new_pickup(env,tm
     with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
 
 
+def test_owner_transfer_receipt_and_ownership_roll_back_together(env, tmp_path, monkeypatch):
+    post, old, new, _ = ended_owner(env, tmp_path)
+    before = requests.history(env.board, env.p['human'], post['id'], 'codex')
+    def fail(*args):
+        raise RuntimeError('routing failed after receipt')
+    monkeypatch.setattr(recovery, 'after_route', fail)
+    with pytest.raises(RuntimeError, match='routing failed'):
+        recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert row(env, post)['assigned_session'] == old and row(env, post)['version'] == 1
+    assert requests.history(env.board, env.p['human'], post['id'], 'codex') == before
+    assert not env.board.conn.execute('SELECT 1 FROM request_owner_recoveries').fetchone()
+
+
 @pytest.mark.parametrize('gate',['dirty','active','stale','unknown','denial'])
 def test_ended_transfer_preserves_ownership_on_gates(env,tmp_path,monkeypatch,gate):
     import pathlib

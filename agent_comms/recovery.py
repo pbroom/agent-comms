@@ -503,6 +503,10 @@ def _transfer(board, p, session_id, post_id, recipient, expected_version):
         requests._save(board, p, session_id, row, 'queued',
                        f'Bookkeeping ownership recovered from {how} session {old["id"]}; execution preflight still required',
                        row['evidence_post_ids'], row['assigned_agent'], session_id)
+        board.conn.execute('''INSERT INTO request_owner_recoveries
+            (post_id,recipient,assigned_agent,assigned_session,recovered_version,previous_session,created_at)
+            VALUES (?,?,?,?,?,?,?)''',
+            (post_id, recipient, row['assigned_agent'], session_id, row['version'] + 1, old['id'], board.now()))
         after_route(board, p, post, row)
         _settle_wait(board, post_id, recipient, 'resolved', p.name, f'recovered by session {session_id}')
     return next(r for r in board.get_post(p, post_id)['requests'] if r['recipient'] == recipient)

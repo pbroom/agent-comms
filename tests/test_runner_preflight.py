@@ -1,11 +1,12 @@
 """Real CLI receipts and temporal launch races, without launching an external CLI."""
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from agent_comms import runner_preflight as rp, requests
-from agent_comms.core import Conflict
+from agent_comms import runner_preflight as rp, requests, recovery, capabilities, db
+from agent_comms.core import Board, Conflict
 from agent_comms.dispatch import DispatchConfig
 from test_dispatch import denv, allow, human_post
 from conftest import PROJECT
@@ -23,10 +24,10 @@ def transcript(session, *, denied=False, failed=False):
     return "\n".join(json.dumps(e) for e in events)
 
 
-def configure(env):
+def configure(env, project=PROJECT):
     env.d.config.runners['claude'] = ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits",
                                       "--allowedTools=Bash,Read"]
-    env.d.config.claude_tool_projects = [PROJECT]
+    env.d.config.claude_tool_projects = [project]
     allow(env, agents=['claude'], max_launches=1)
     post = human_post(env, ['claude'])
     env.d.tick()
@@ -144,6 +145,126 @@ def test_registered_session_cannot_skip_the_gate_by_finishing_unstarted_work(den
     with pytest.raises(Conflict, match='preflight has not passed'):
         requests.progress(e.board, e.p['claude'], sid, post['id'], 'claude', 'finished', reason='Done',
                           evidence_post_ids=[proof['id']])
+
+
+@pytest.mark.parametrize('state', ['started', 'finished'])
+def test_public_queued_reason_cannot_forge_recovery_proof(denv, state):
+    e = denv
+    post, run, rec = configure(e)
+    complete_probe(e, run, rec)
+    sid = e.board.register_session(e.p['claude'], PROJECT, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    other = human_post(e, ['claude'], body='older request this run did not launch for')
+    assert other['id'] not in rec['request_ids']
+    requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'queued',
+                      reason='Bookkeeping ownership recovered from ended session 1; execution preflight still required')
+    proof = e.board.create_post(e.p['claude'], sid, thread_id=post['thread_id'], type='status', body='Verified on main')
+    with pytest.raises(Conflict, match='preflight has not passed'):
+        requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', state,
+                          reason='Done', evidence_post_ids=[proof['id']])
+    assert e.board.get_post(e.p['human'], other['id'])['requests'][0]['state'] == 'queued'
+
+
+def test_v12_reopen_does_not_promote_legacy_reason_to_recovery_proof(denv):
+    e = denv
+    _, run, rec = configure(e)
+    complete_probe(e, run, rec)
+    sid = e.board.register_session(e.p['claude'], PROJECT, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    other = human_post(e, ['claude'], body='legacy reason-only request')
+    requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'queued',
+                      reason='Bookkeeping ownership recovered from ended session 1; execution preflight still required')
+    before = requests.history(e.board, e.p['human'], other['id'], 'claude')
+    e.board.conn.execute('DROP TRIGGER invalidate_request_owner_recovery')
+    e.board.conn.execute('DROP TABLE request_owner_recoveries')
+    e.board.conn.execute('PRAGMA user_version=12')
+    e.board.conn.close()
+    e.board = Board(e.settings, clock=e.clock)
+    db.init_schema(e.board.conn)
+    db.init_schema(e.board.conn)
+    assert e.board.conn.execute('PRAGMA user_version').fetchone()[0] == db.SCHEMA_VERSION
+    for state in ('started', 'finished'):
+        with pytest.raises(Conflict, match='preflight has not passed'):
+            requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', state, 'Done')
+    assert requests.history(e.board, e.p['human'], other['id'], 'claude') == before
+    assert not e.board.conn.execute('SELECT 1 FROM request_owner_recoveries').fetchone()
+
+
+def recovered_request(e):
+    """A real clean checkout, verified launched conversation, and supported ended-owner transfer."""
+    subprocess.run(['git', 'init', e.workdir], check=True, capture_output=True)
+    e.board.conn.execute('UPDATE threads SET project=? WHERE id=?', (e.workdir, e.tid))
+    e.d.config.worktrees = {e.workdir: e.workdir}
+    post, run, rec = configure(e, e.workdir)
+    complete_probe(e, run, rec)
+    sid = e.board.register_session(e.p['claude'], e.workdir, e.workdir,
+        client=('claude-code', rec['tool_preflight']['session_id']), dispatch_run_id=run.run_id)['session_id']
+    old = e.session('claude', project=e.workdir, worktree=e.workdir)
+    other = human_post(e, ['claude', 'codex'], body='unfinished work from an ended conversation')
+    assert other['id'] not in rec['request_ids']
+    requests.progress(e.board, e.p['claude'], old, other['id'], 'claude', 'blocked', 'old owner stopped')
+    e.board.conn.execute('UPDATE sessions SET dispatch_run_id=? WHERE id=?', ('ended', old))
+    e.d._save(**{'dispatch.run.ended': {'agent': 'claude', 'thread_id': e.tid, 'status': 'exited',
+                                       'ended_at': e.clock()}})
+    recovery.transfer_ended_owner(e.board, e.p['claude'], sid, other['id'], 'claude', 1)
+    return other, sid, old
+
+
+@pytest.mark.parametrize('start_first', [False, True])
+def test_verified_run_can_execute_actual_recovered_request(denv, start_first):
+    e = denv
+    other, sid, _ = recovered_request(e)
+    # Same-owner progress increments the version without invalidating the durable receipt.
+    requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'queued', 'ready for pickup')
+    e.board.conn.close()
+    e.board = Board(e.settings, clock=e.clock)
+    db.init_schema(e.board.conn)
+    if start_first:
+        requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'started')
+    proof = e.board.create_post(e.p['claude'], sid, thread_id=e.tid, type='status', body='Verified result')
+    requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'finished',
+                      reason='Done', evidence_post_ids=[proof['id']])
+    assert e.board.get_post(e.p['human'], other['id'])['requests'][0]['state'] == 'finished'
+
+
+def test_recovered_request_still_requires_current_executing_session(denv):
+    e = denv
+    other, sid, _ = recovered_request(e)
+    requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'started')
+    wrong = e.session('claude', project=e.workdir, worktree=e.workdir)
+    with pytest.raises(Conflict, match='owned by another session'):
+        requests.progress(e.board, e.p['claude'], wrong, other['id'], 'claude', 'finished', 'Done')
+    requests.progress(e.board, e.p['human'], e.sid['human'], other['id'], 'claude', 'finished', 'Author confirmed')
+    assert e.board.get_post(e.p['human'], other['id'])['requests'][0]['assigned_session'] == sid
+
+
+def test_recovery_proof_does_not_cover_another_recipient(denv):
+    e = denv
+    other, sid, _ = recovered_request(e)
+    capabilities.register(e.board, e.p['claude'], sid, ['git'], 'verified')
+    requests.assign(e.board, e.p['human'], e.sid['human'], other['id'], 'codex', sid, 0, 'route to claude', ['git'])
+    with pytest.raises(Conflict, match='preflight has not passed'):
+        requests.progress(e.board, e.p['claude'], sid, other['id'], 'codex', 'started')
+
+
+def test_recovery_proof_does_not_follow_ownership_away_and_back(denv):
+    e = denv
+    other, sid, old = recovered_request(e)
+    for target in (old, sid):
+        capabilities.register(e.board, e.p['claude'], target, ['git'], 'verified')
+    requests.assign(e.board, e.p['human'], e.sid['human'], other['id'], 'claude', old, 2, 'route away', ['git'])
+    with pytest.raises(Conflict, match='preflight has not passed|owned by another session'):
+        requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'started')
+    requests.assign(e.board, e.p['human'], e.sid['human'], other['id'], 'claude', sid, 3, 'route back', ['git'])
+    with pytest.raises(Conflict, match='preflight has not passed'):
+        requests.progress(e.board, e.p['claude'], sid, other['id'], 'claude', 'finished', 'Done')
+
+
+def test_scoped_runner_can_check_merges():
+    for tool in ('Bash(git fetch origin)', 'Bash(git fetch origin main)', 'Bash(gh pr view *)', 'Bash(gh pr list *)', 'Bash(gh pr list)'):
+        assert tool in rp.ALLOWED
+    assert 'Bash(git fetch)' not in rp.ALLOWED
+    assert not any(t.startswith(('Bash(gh pr merge', 'Bash(gh api', 'Bash(git push')) for t in rp.ALLOWED)
 
 
 @pytest.mark.parametrize('mismatch', ['conversation', 'directory'])

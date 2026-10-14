@@ -14,9 +14,12 @@ launch-scoped permission profile, **not an operating-system sandbox**.
 
 For an opted-in project the runner uses `dontAsk` and a fixed list in
 `runner_preflight.ALLOWED` in place of broad runner-argv permissions. It permits
-repository edits, Git status/diff/log/show/rev-parse/add/commit, fetch from origin,
+repository edits, Git status/diff/log/show/rev-parse/add/commit, fetch from origin
+(`git fetch origin`, `git fetch origin main`; the remote must be explicit),
 new `codex/*` branches and worktrees, pytest through uv or
-directly, and GitHub CLI version/read-only PR/check/run inspection. It does not
+directly, and GitHub CLI version/read-only PR/check/run inspection (`gh pr view`,
+`gh pr list`, `gh pr diff`, `gh pr checks`, `gh run view`), so a run can confirm a
+PR merged before it settles the request. It does not
 pre-approve arbitrary Bash, git reset/clean/push, GitHub merge/API/delete, or new
 machine privileges. Force/discard flags are explicitly denied. The native Claude permission engine checks compound commands;
 these patterns are not our own shell parser. Tests and Git hooks execute repository
@@ -41,6 +44,13 @@ expiry, thread openness, and exact request assignment/version. The request's
 `started` transition also requires verified server-owned proof, matching captured
 Claude conversation ID and working directory. Clients without trusted conversation
 capture must report the concrete blocker; an HTTP caller cannot supply that ID.
+The same proof also covers a request the run took over with
+`board_recover_request_owner` and still owns: recovery already checked the agent,
+the ended or abandoned old owner and execution authorization, and the tools were
+proven in this conversation and directory. Recovery writes a server-controlled receipt
+for the exact post, original recipient, agent, session and recovery version in the
+ownership transaction. Every ownership move invalidates it, including a move away
+and back. Progress reasons and legacy reason-only recovery events confer no proof.
 CLI exit/spawn errors, denied tools, changed authority or incomplete receipts leave
 an explicit blocked request. A dispatcher restart during preflight fails closed
 through ordinary orphan reconciliation rather than repeating work.
