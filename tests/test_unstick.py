@@ -232,7 +232,7 @@ def _run(e, run_id, rule_id, status, pid=123):
                                                          "status": status, "pid": pid}), e.board.now()))
 
 
-def test_bindings_of_dead_one_click_rules_are_pruned_when_a_new_binding_is_made(uenv):
+def test_bindings_of_finished_dead_one_click_rules_are_pruned_when_a_new_binding_is_made(uenv):
     from agent_comms import human_actions
     e, human = uenv, uenv.p["human"]
     other = e.thread("other")
@@ -243,6 +243,8 @@ def test_bindings_of_dead_one_click_rules_are_pruned_when_a_new_binding_is_made(
     _run(e, "r-ended", ended[1], "exited")
     _run(e, "r-refunded", ended[1], "spawn_failed", pid=None)               # a refunded attempt is not a launch
     _run(e, "r-running", running[1], "running")
+    for post_id in (revoked[0],ended[0]):
+        requests.progress(e.board,human,e.sid['human'],post_id,'codex','finished','Human closed this obligation')
     newest = _one_click(e, other)
     bound = {p: human_actions.post_rule_id(e.board, p) for p, _ in (revoked, ended, running, unrecorded, live, newest)}
     assert bound == {revoked[0]: None, ended[0]: None,                      # dead for good: pruned
@@ -253,6 +255,8 @@ def test_bindings_of_dead_one_click_rules_are_pruned_when_a_new_binding_is_made(
     assert {running[1], unrecorded[1], live[1], newest[1]} <= human_actions.one_click_rule_ids(e.board)
     _run(e, "r-running", running[1], "exited")
     e.clock.advance(human_actions.RULE_HOURS * 3600 + 1)                     # every earlier rule expires
+    for post_id in (running[0],unrecorded[0],live[0],newest[0]):
+        requests.progress(e.board,human,e.sid['human'],post_id,'codex','finished','Human closed this obligation')
     latest = _one_click(e, other)
     assert [p for p in bound if human_actions.post_rule_id(e.board, p) is not None] == []
     assert human_actions.post_rule_id(e.board, latest[0]) == latest[1]
@@ -277,6 +281,9 @@ def test_a_dead_binding_stays_while_an_older_approval_could_still_launch_its_pos
     assert Dispatcher._rule_for(SimpleNamespace(board=e.board), rs, item) is None   # never borrows `older`
     e.board.revoke_dispatch_rule(human, older["id"])
     _one_click(e, e.thread("elsewhere again"))
+    assert human_actions.post_rule_id(e.board, post_id) == rule_id  # future inbox policies cannot override it
+    requests.progress(e.board,human,e.sid['human'],post_id,'codex','finished','Human closed this obligation')
+    _one_click(e, e.thread('after closeout'))
     assert human_actions.post_rule_id(e.board, post_id) is None
 
 
