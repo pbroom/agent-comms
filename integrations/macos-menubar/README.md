@@ -154,7 +154,7 @@ open -n --env AGENT_COMMS_HOME=/tmp/test-board --env AGENT_COMMS_TOKEN_FILE=/tmp
 
 ## Start Board Server
 
-**Start Board Server** runs `uv run --project <repoPath> board serve --port <port>` with an explicit argument list
+**Start Board Server** runs `uv run --no-dev --project <repoPath> board serve --port <port>` with an explicit argument list
 and no shell. It is detached from the app and keeps running after you quit it. Its output is appended to
 `<homePath>/data/menubar-server.log` (mode 600), and the server gets `AGENT_COMMS_HOME=<homePath>`. Apps opened from Finder or at login get a minimal `PATH`, so the
 app looks for `uv` in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`, then searches a standard `PATH`.

@@ -67,7 +67,7 @@ public enum ServerLaunchError: Error, CustomStringConvertible, Equatable {
     }
 }
 
-/// Starts `uv run --project <repo> board serve --port <port>` detached from the app: explicit argv, no shell,
+/// Starts `uv run --no-dev --project <repo> board serve --port <port>` detached from the app: explicit argv, no shell,
 /// stdin from /dev/null, stdout and stderr appended to `<home>/data/menubar-server.log` (mode 600). With a
 /// `homePath`, the server gets AGENT_COMMS_HOME=<home>, so the code (repoPath) and the board's data can live apart.
 public struct ServerLauncher {
@@ -87,7 +87,7 @@ public struct ServerLauncher {
     public var logPath: String { "\(dataHome)/data/menubar-server.log" }
 
     public func arguments() -> [String] {
-        ["run", "--project", repoPath, "board", "serve", "--port", String(port)]
+        ["run", "--no-dev", "--project", repoPath, "board", "serve", "--port", String(port)]
     }
 
     /// The app's environment with a sane PATH and without anything that looks like a credential: the server

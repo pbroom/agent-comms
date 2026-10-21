@@ -287,7 +287,7 @@ final class ServerLauncherTests: XCTestCase {
     func testArgvAndEnvironment() {
         let l = ServerLauncher(repoPath: "/Users/me/agent-comms", port: 8799,
                                locator: UVLocator(home: "/Users/me", environmentPath: nil, isExecutable: { _ in false }))
-        XCTAssertEqual(l.arguments(), ["run", "--project", "/Users/me/agent-comms", "board", "serve", "--port", "8799"])
+        XCTAssertEqual(l.arguments(), ["run", "--no-dev", "--project", "/Users/me/agent-comms", "board", "serve", "--port", "8799"])
         XCTAssertEqual(l.logPath, "/Users/me/agent-comms/data/menubar-server.log")
         let env = l.environment(["HOME": "/Users/me", "PATH": "/usr/bin", "BOARD_TOKEN": "x",
                                  "AGENT_COMMS_TOKEN": "y", "OPENAI_API_KEY": "z", "AGENT_COMMS_HOME": "/tmp/b"])
@@ -298,7 +298,7 @@ final class ServerLauncherTests: XCTestCase {
         XCTAssertTrue(env["PATH"]!.hasPrefix("/opt/homebrew/bin:"))
         let split = ServerLauncher(repoPath: "/Users/me/agent-comms-live", port: 8799, homePath: "/Users/me/agent-comms",
                                    locator: UVLocator(home: "/Users/me", environmentPath: nil, isExecutable: { _ in false }))
-        XCTAssertEqual(split.arguments(), ["run", "--project", "/Users/me/agent-comms-live", "board", "serve", "--port", "8799"])
+        XCTAssertEqual(split.arguments(), ["run", "--no-dev", "--project", "/Users/me/agent-comms-live", "board", "serve", "--port", "8799"])
         XCTAssertEqual(split.logPath, "/Users/me/agent-comms/data/menubar-server.log")
         XCTAssertEqual(split.environment(["AGENT_COMMS_HOME": "/tmp/b"])["AGENT_COMMS_HOME"], "/Users/me/agent-comms")
         XCTAssertThrowsError(try l.launch()) { e in
