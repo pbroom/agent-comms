@@ -28,7 +28,9 @@ PROBE_RETENTION_SECONDS = 7 * 86400
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS browser_requirements (
  post_id INTEGER NOT NULL REFERENCES posts(id), recipient TEXT NOT NULL,
- target_url TEXT NOT NULL, origin TEXT NOT NULL, PRIMARY KEY(post_id,recipient)
+ target_url TEXT NOT NULL, origin TEXT NOT NULL,
+ execution_context TEXT NOT NULL DEFAULT 'either' CHECK(execution_context IN ('desktop','headless','either')),
+ PRIMARY KEY(post_id,recipient)
 );
 CREATE TABLE IF NOT EXISTS browser_probes (
  session_id INTEGER NOT NULL REFERENCES sessions(id), target_url TEXT NOT NULL,
@@ -188,6 +190,9 @@ def canonicalize_stored(conn):
     recorded under one spelling (`EXAMPLE.com.`) still applies to the host. Merged gates keep the strictest state
     (denied if either was) and the newest epoch. Also adds the gates' created_by column (older gates have no
     recorded creator and count against no agent's quota). Runs inside init_schema's write transaction; idempotent."""
+    if 'execution_context' not in {r[1] for r in conn.execute('PRAGMA table_info(browser_requirements)')}:
+        conn.execute("ALTER TABLE browser_requirements ADD COLUMN execution_context TEXT NOT NULL DEFAULT 'either' "
+                     "CHECK(execution_context IN ('desktop','headless','either'))")
     if 'created_by' not in {r[1] for r in conn.execute('PRAGMA table_info(browser_permission_gates)')}:
         conn.execute('ALTER TABLE browser_permission_gates ADD COLUMN created_by TEXT')
     for row in conn.execute('SELECT * FROM browser_permission_gates').fetchall():
@@ -261,18 +266,57 @@ def _request(board, p, sid, post_id, recipient):
     return post, row
 
 
-def bind_request(board, p, session_id, post_id, recipient, target_url):
+def declared_requirement(value):
+    """A routing requirement, never an access or authorization grant."""
+    if not isinstance(value, dict) or set(value) != {'recipient', 'target_url', 'execution_context'}:
+        raise Invalid('browser_requirement needs recipient, target_url and execution_context')
+    if not isinstance(value['recipient'], str) or not value['recipient']:
+        raise Invalid('browser_requirement needs an original recipient')
+    if value['execution_context'] not in ('desktop', 'headless', 'either'):
+        raise Invalid('execution_context must be desktop, headless or either')
+    url, origin = target(value['target_url'])
+    return dict(recipient=value['recipient'], target_url=url, origin=origin,
+                execution_context=value['execution_context'])
+
+
+def store_requirement(board, post_id, declaration):
+    board.conn.execute('INSERT INTO browser_requirements '
+        '(post_id,recipient,target_url,origin,execution_context) VALUES (?,?,?,?,?)',
+        (post_id, declaration['recipient'], declaration['target_url'], declaration['origin'],
+         declaration['execution_context']))
+
+
+def bind_request(board, p, session_id, post_id, recipient, target_url, execution_context='either'):
+    declaration = declared_requirement(dict(recipient=recipient, target_url=target_url,
+                                           execution_context=execution_context))
     url, origin = target(target_url)
     with db.write_tx(board.conn):
         post, row = _request(board, p, session_id, post_id, recipient)
         old = requirement(board, post_id, recipient)
-        if old and old['target_url'] != url:
-            raise Conflict('browser target is immutable; create a new request for another target')
+        if old and (old['target_url'] != url or old['execution_context'] != execution_context):
+            raise Conflict('browser target and execution context are immutable; create a new request')
         if row['state'] == 'started':
             raise Conflict('block running work before binding browser requirements')
-        board.conn.execute('INSERT OR IGNORE INTO browser_requirements VALUES (?,?,?,?)',
-                           (post_id, recipient, url, origin))
-    return dict(requirement(board, post_id, recipient))
+        if not old:
+            store_requirement(board, post_id, declaration)
+        # A creator can bind after another session registered; diagnose that actual owner's environment too.
+        s = board.conn.execute('SELECT * FROM sessions WHERE id=?',
+                               (row['assigned_session'] or session_id,)).fetchone()
+        reroute = False
+        if s['dispatch_run_id']:
+            run = board.conn.execute('SELECT value FROM board_state WHERE key=?',
+                                    ('dispatch.run.' + s['dispatch_run_id'],)).fetchone()
+            attached = json.loads(run[0]).get('headless_browser', {}) if run else {}
+            reroute = execution_context == 'desktop' or origin not in attached.get('origins', [])
+        project = board._thread_row(post['thread_id'])['project']
+        denied = bool(_gate(board, project, origin)['denied'])
+    return {**dict(requirement(board, post_id, recipient)), 'reroute_required': reroute and not denied,
+            'human_action_required': denied,
+            'routing_reason': ('Browser policy denied; supported human permission change is required. '
+                               'Do not reroute or retry denied access.') if denied else
+                              ('Browser requirement was bound after launch or needs a desktop context; '
+                               'route to a capable authorized session before execution. Do not infer a '
+                               'permission denial or ask for execution approval again.') if reroute else None}
 
 
 def requirement(board, post_id, recipient):
@@ -471,13 +515,22 @@ def eligible(board, session_id, post_id, recipient):
         return True
     project = board.conn.execute('SELECT t.project FROM posts p JOIN threads t ON t.id=p.thread_id WHERE p.id=?',(post_id,)).fetchone()[0]
     s = board.conn.execute('SELECT project FROM sessions WHERE id=?',(session_id,)).fetchone()
-    return bool(s and s['project'] == project and readiness(board,session_id,req['target_url']) == 'ready')
+    return bool(s and s['project'] == project and request_readiness(board, session_id, req) == 'ready')
+
+
+def request_readiness(board, session_id, req):
+    status = readiness(board, session_id, req['target_url'])
+    if status != 'ready' or req['execution_context'] == 'either':
+        return status
+    probe = board.conn.execute('SELECT context FROM browser_probes WHERE session_id=? AND target_url=?',
+                               (session_id, req['target_url'])).fetchone()
+    return 'ready' if json.loads(probe['context'])['kind'] == req['execution_context'] else 'execution_context_mismatch'
 
 
 def assert_request_ready(board, post_id, recipient, session_id):
     req = requirement(board,post_id,recipient)
     if req:
-        status = readiness(board,session_id,req['target_url'])
+        status = request_readiness(board,session_id,req)
         if status != 'ready':
             raise Conflict(f'browser preflight blocked: {status}; exact executing context needs a fresh complete probe')
 

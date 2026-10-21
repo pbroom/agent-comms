@@ -11,7 +11,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import StrictInt, BaseModel, ConfigDict
+from pydantic import StrictBool, StrictInt, BaseModel, ConfigDict
 
 from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin, workstreams
 from .config import Settings
@@ -125,6 +125,7 @@ class PostIn(Body):
     propose_task: TaskFields | None = None
     decision_question: dict | None = None   # asks the human to choose: same schema as an issue's
     continuation: dict | None = None
+    browser_requirement: dict | None = None
     answer_to: list[StrictInt] | None = None
     request_reply: RequestReplyIn | None = None
     idempotency_key: str | None = None
@@ -209,6 +210,14 @@ class DispatchRuleIn(Body):
     purpose: str
     max_launches: int
     expires_in_hours: float | None = None
+
+
+class InboxPolicyIn(Body):
+    scope: Literal['project', 'all_projects'] = 'project'
+    project: str | None = None
+    daily_launch_limit: StrictInt = 100
+    include_existing: StrictBool = False
+    pickup_grace_seconds: StrictInt = 120
 
 
 class LoginLinkIn(Body):
@@ -661,6 +670,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         config, error = dispatch_config()
         return {"status": dispatch.loop_status(board, config),
                 "rules": board.list_dispatch_rules(p),
+                "inbox_policies": board.list_inbox_policies(p, include_inactive=True),
                 "runs": dispatch.list_runs(board, p, 10),
                 # Read-only: what the files say now. A running dispatcher uses the runners it started with.
                 "runners": config.runners, "env": config.env, "worktrees": config.worktrees,
@@ -671,6 +681,14 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
                             for t in board.list_threads(p, status="open")],
                 "agents": [{"name": r["name"], "runtime": r["runtime"]} for r in board.conn.execute(
                     "SELECT name, runtime FROM agents WHERE active = 1 AND is_human = 0 ORDER BY name")]}
+
+    @app.post("/api/admin/dispatch/inbox-policies")
+    def create_inbox_policy(body: InboxPolicyIn, p: Principal = H):
+        return board.create_inbox_policy(p, **body.model_dump())
+
+    @app.post("/api/admin/dispatch/inbox-policies/{policy_id}/revoke")
+    def revoke_inbox_policy(policy_id: int, p: Principal = H):
+        return board.revoke_inbox_policy(p, policy_id)
 
     @app.post("/api/admin/dispatch/rules")
     def approve_workstream(body: DispatchRuleIn, p: Principal = H):

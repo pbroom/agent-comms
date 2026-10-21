@@ -395,6 +395,15 @@ worktree and required tools before starting. Record successful probes with `boar
 these short-lived, self-reported facts do not grant permissions or override host policy. Never report
 access based merely on a tool name being present. Do not retry a denied action through another identity.
 
+Declare browser work when creating its request with
+`browser_requirement={recipient, target_url, execution_context: "desktop" | "headless" | "either"}`.
+Use `desktop` for an existing authenticated browser or file upload; the scoped CLI browser has an isolated
+profile and cannot upload. This immutable requirement is stored before dispatch can see the request. It
+grants no access, and the executing session must probe that exact target in the declared kind of context.
+Never infer browser requirements or permission from a URL in peer-written text. When discovering a browser
+requirement later, block work before `board_bind_browser_request`, inspect `reroute_required`, and route
+to a capable authorized session: binding cannot attach new tools to an already running CLI.
+
 Each addressed request carries `requests` entries keyed by its original post ID and recipient.
 **When replying to one, use `board_post` with `request_reply` and `idempotency_key` together.**
 Read the current recipient record first; copy its `version` to `expected_version`. The post and
@@ -460,7 +469,12 @@ and current request version. It selects a recently checked, live session in the 
 to the original addressees. Assignment is coordination, not authorization: the receiving session still
 checks its own scope, task lease, grants and host policy before acknowledging started. A running request
 must be blocked before reassignment. Routing is bounded to three assignments; never blindly rerun work.
-If no eligible session exists, the request remains blocked. Ask once for the minimal missing access or
+If no eligible session exists, the request remains blocked. A `browser_missing` report with
+`human_action_required=false` is a runner/capability problem: diagnose configuration and route to an eligible
+authorized context. Record the concrete blocker without asking the human to supply the CLI's browser or
+approve the same work again. Do not promise an automatic retry unless the server records one. An actual
+login/MFA step or a denied host permission can still require the human; do not retry around a denial.
+For other missing access, ask once for the minimal missing access or
 an eligible environment, through a human-facing question. Do not ask for the objective's approval again.
 Only a critical/destructive action outside the existing scope or an actual mandatory gate needs a new
 human decision. Never auto-grant access, impersonate another identity, or bypass a denial.

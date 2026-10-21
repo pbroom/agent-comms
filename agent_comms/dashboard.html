@@ -496,6 +496,8 @@ const NOTIFY_EVENTS = ["needs-response", "to-human", "decision", "agent-launched
 const NOTIFY_DEFAULT = ["needs-response", "to-human", "decision", "agent-launched"];
 let notifyDraft = { events: [...NOTIFY_DEFAULT], project: "", thread: "", idle: "" };
 let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
+let inboxDraft = { scope: "all_projects", project: "", daily: "100", grace: "120", includeExisting: false };
+let inboxFormOpen = false;
 // What the human typed to record with "Allow again" on a sticky browser gate, keyed by gateKey (project, origin).
 const gateDrafts = {};
 // Deep links: #post-<id>, #thread-<id>, #settings. `focus` is what still needs scrolling to; the highlight stays.
@@ -1216,6 +1218,70 @@ function renderNotifications() {
     el("div", { class: "actions" }, el("button", { disabled: cfgBusy || !n.deliverable, onclick: () => cfgAct("POST", "/api/admin/notifications/test") }, "Send test notification")));
 }
 
+// Standing inbox pickup grants delivery and triage only, not permission for the requested work.
+function renderInboxPickup() {
+  if (!state || !state.me.is_human) return null;
+  const d = inboxDraft, policies = cfg.dispatch.inbox_policies || [];
+  const enabled = p => p.state === "active" || p.state === "exhausted";
+  const form = el("form", { class: "settings-form inbox-policy-form", onsubmit: async e => {
+      e.preventDefault();
+      if (!state.me.is_human || cfgBusy) return;
+      const daily = Number(d.daily), grace = Number(d.grace), project = d.project.trim();
+      if (d.scope === "project" && !project.startsWith("/")) {
+        cfgError = "Enter the project's absolute path."; return render();
+      }
+      if (!Number.isInteger(daily) || daily < 1 || daily > 100) {
+        cfgError = "Daily launches must be a whole number from 1 to 100."; return render();
+      }
+      if (!Number.isInteger(grace) || grace < 30 || grace > 3600) {
+        cfgError = "Pickup grace must be a whole number from 30 to 3600 seconds."; return render();
+      }
+      const body = { scope: d.scope, project: d.scope === "all_projects" ? null : project,
+        daily_launch_limit: daily, include_existing: d.includeExisting, pickup_grace_seconds: grace };
+      if (await cfgAct("POST", "/api/admin/dispatch/inbox-policies", body)) {
+        inboxDraft = { scope: "all_projects", project: "", daily: "100", grace: "120", includeExisting: false };
+        render();
+      }
+    } },
+    el("label", {}, "Scope", el("select", { name: "inbox_scope", disabled: cfgBusy,
+      onchange: e => { d.scope = e.target.value; inboxFormOpen = true; render();
+        document.querySelector('#settings-inbox-pickup [name="inbox_scope"]').focus(); } },
+      el("option", { value: "all_projects", selected: d.scope === "all_projects" }, "All projects"),
+      el("option", { value: "project", selected: d.scope === "project" }, "One project"))),
+    d.scope === "project" ? el("label", {}, "Project (exact absolute path)", el("input", {
+      name: "inbox_project", required: true, value: d.project, disabled: cfgBusy, autocomplete: "off",
+      placeholder: "/Users/you/project", oninput: e => { d.project = e.target.value; } })) : null,
+    el("label", {}, "Daily launch limit", el("input", { type: "number", name: "daily_launch_limit",
+      min: 1, max: 100, step: 1, required: true, value: d.daily, disabled: cfgBusy,
+      oninput: e => { d.daily = e.target.value; } })),
+    el("label", {}, "Pickup grace (seconds)", el("input", { type: "number", name: "pickup_grace_seconds",
+      min: 30, max: 3600, step: 1, required: true, value: d.grace, disabled: cfgBusy,
+      oninput: e => { d.grace = e.target.value; } })),
+    el("label", { class: "agent-option" }, el("input", { type: "checkbox", name: "include_existing",
+      checked: d.includeExisting, disabled: cfgBusy, onchange: e => { d.includeExisting = e.target.checked; } }),
+      "Include existing queued requests"),
+    el("button", { type: "submit", disabled: cfgBusy }, "Enable Codex pickup"));
+  return el("div", { id: "settings-inbox-pickup" },
+    el("h3", {}, "Codex inbox pickup"),
+    el("p", { class: "small muted" }, "Start Codex to acknowledge and triage new addressed requests. Existing work approvals and permissions still apply."),
+    [...policies].sort((a, b) => Number(enabled(b)) - Number(enabled(a))).map(p =>
+      el("div", { class: "post small" + (enabled(p) ? "" : " muted"), "data-inbox-policy": p.id },
+        el("div", {}, el("strong", {}, p.scope === "all_projects" ? "All projects" : p.project), " · Codex · ",
+          chip(p.state, p.state === "active" ? "ok" : p.state === "exhausted" ? "warn" : "")),
+        el("div", {}, `${p.launches_left}/${p.daily_launch_limit} launches left today · resets `,
+          p.reset_at ? new Date(p.reset_at).toLocaleString() : "not available"),
+        el("div", {}, `Pickup after ${p.pickup_grace_seconds} seconds · `,
+          p.include_existing ? "includes existing queued requests" : "new requests only"),
+        p.purpose ? el("div", { class: "body" }, p.purpose) : null,
+        p.revoked_at ? el("div", {}, "Revoked ", new Date(p.revoked_at).toLocaleString(),
+          p.revoked_by ? " by " + p.revoked_by : "") : null,
+        enabled(p) ? el("button", { class: "danger", disabled: cfgBusy,
+          onclick: () => cfgAct("POST", `/api/admin/dispatch/inbox-policies/${p.id}/revoke`) }, "Revoke pickup") : null)),
+    !policies.length ? el("p", { class: "small muted" }, "Automatic inbox pickup is off.") : null,
+    el("details", { open: inboxFormOpen, ontoggle: e => { inboxFormOpen = e.target.open; } },
+      el("summary", {}, "Enable inbox pickup"), form));
+}
+
 function renderDispatch() {
   const x = cfg.dispatch, st = x.status, d = approveDraft;
   const status = st.running
@@ -1266,6 +1332,7 @@ function renderDispatch() {
         Object.entries(x.env).map(([k, names]) => `${k}: ${names.join(", ")}`).join("; ")) : null,
       Object.keys(x.worktrees || {}).length ? el("div", { class: "small" }, el("strong", {}, "Worktrees: "),
         Object.entries(x.worktrees).map(([k, v]) => `${k} → ${v}`).join("; ")) : null),
+    renderInboxPickup(),
     el("h3", {}, `Approvals (${x.rules.length})`),
     x.rules.length ? x.rules.map(r => el("div", { class: "post small" },
       el("div", {}, el("strong", {}, `Rule ${r.id}`), ` thread ${r.thread_id}: `, r.agents.join(", "), " ",

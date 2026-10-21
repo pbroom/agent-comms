@@ -115,6 +115,123 @@ def test_ended_transfer_keeps_original_unfinished_and_requires_new_pickup(env,tm
     with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
 
 
+def mapped_ended_owner(e, tmp_path, authorized=False):
+    from pathlib import Path
+    post, old, new, checkout = ended_owner(e, tmp_path)
+    project = str(tmp_path / 'project-group')
+    Path(project).mkdir()
+    e.board.conn.execute('UPDATE threads SET project=? WHERE id=?', (project, post['thread_id']))
+    e.board.conn.execute('UPDATE sessions SET project=?,worktree=? WHERE id IN (?,?)',
+                         (project, checkout, old, new))
+    e.board.s.dispatch = {'worktrees': {project: checkout}}
+    if authorized:
+        task = e.accepted_task(post['thread_id'])
+        e.board.claim_task(e.p['codex'], new, task)
+    return post, old, new, project, checkout
+
+
+@pytest.mark.parametrize('authorized', [False, True])
+def test_recovery_uses_configured_checkout_for_non_git_project(env, tmp_path, authorized):
+    post, old, new, project, checkout = mapped_ended_owner(env, tmp_path, authorized)
+    result = recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert result['assigned_session'] == new and result['state'] == 'queued' and result['version'] == 2
+    assert env.board.conn.execute('SELECT previous_session FROM request_owner_recoveries').fetchone()[0] == old
+    assert not (tmp_path / 'project-group' / '.git').exists()  # no repository or access changes
+
+
+@pytest.mark.parametrize('change', ['no_mapping', 'wrong_mapping', 'wrong_old', 'wrong_successor',
+                                    'symlink', 'symlink_parent', 'subdirectory', 'relative', 'missing'])
+def test_mapped_recovery_fails_closed_without_exact_repository_identity(env, tmp_path, change):
+    import subprocess
+    from pathlib import Path
+    post, old, new, project, checkout = mapped_ended_owner(env, tmp_path)
+    unrelated = str(tmp_path / 'unrelated')
+    subprocess.run(['git', 'init', unrelated], check=True, capture_output=True)
+    if change == 'no_mapping':
+        env.board.s.dispatch = {}
+    elif change == 'wrong_mapping':
+        env.board.s.dispatch['worktrees'][project] = unrelated
+    elif change in ('wrong_old', 'wrong_successor'):
+        env.board.conn.execute('UPDATE sessions SET worktree=? WHERE id=?',
+                               (unrelated, old if change == 'wrong_old' else new))
+    elif change == 'symlink':
+        alias = tmp_path / 'checkout-alias'
+        alias.symlink_to(checkout, target_is_directory=True)
+        env.board.s.dispatch['worktrees'][project] = str(alias)
+    elif change == 'symlink_parent':
+        alias = tmp_path / 'parent-alias'
+        alias.symlink_to(tmp_path, target_is_directory=True)
+        env.board.s.dispatch['worktrees'][project] = str(alias / Path(checkout).name)
+    elif change == 'subdirectory':
+        nested = Path(checkout) / 'nested'
+        nested.mkdir()
+        env.board.s.dispatch['worktrees'][project] = str(nested)
+    elif change == 'relative':
+        env.board.s.dispatch['worktrees'][project] = 'repo'
+    else:
+        env.board.s.dispatch['worktrees'][project] = str(tmp_path / 'missing')
+    with pytest.raises(Conflict):
+        recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert row(env, post)['assigned_session'] == old and row(env, post)['version'] == 1
+    assert not env.board.conn.execute('SELECT 1 FROM request_owner_recoveries').fetchone()
+
+
+def test_mapping_cannot_override_existing_git_project_identity(env, tmp_path):
+    import subprocess
+    post, old, new, project = ended_owner(env, tmp_path)
+    unrelated = str(tmp_path / 'unrelated')
+    subprocess.run(['git', 'init', unrelated], check=True, capture_output=True)
+    env.board.s.dispatch = {'worktrees': {project: unrelated}}
+    env.board.conn.execute('UPDATE sessions SET worktree=? WHERE id IN (?,?)', (unrelated, old, new))
+    with pytest.raises(Conflict, match='another repository'):
+        recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert row(env, post)['assigned_session'] == old
+
+
+def test_mapping_does_not_hide_uninspectable_canonical_git_metadata(env, tmp_path):
+    from pathlib import Path
+    post, old, new, project, checkout = mapped_ended_owner(env, tmp_path)
+    Path(project, '.git').write_text('gitdir: missing-repository\n')
+    with pytest.raises(Conflict, match='Git inspection failed'):
+        recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert row(env, post)['assigned_session'] == old
+
+
+def test_mapped_authorized_successor_preserves_own_dirty_artifacts(env, tmp_path):
+    from pathlib import Path
+    post, old, new, project, checkout = mapped_ended_owner(env, tmp_path, authorized=True)
+    artifact = Path(checkout, 'audit-evidence.md')
+    artifact.write_text('successor work')
+    result = recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert result['assigned_session'] == new and result['state'] == 'queued'
+    assert artifact.read_text() == 'successor work'
+
+
+@pytest.mark.parametrize('gate', ['active_run', 'live_owner', 'lease', 'peer', 'dirty', 'git_operation'])
+def test_mapped_recovery_preserves_existing_owner_and_checkout_gates(env, tmp_path, gate):
+    import json
+    from pathlib import Path
+    post, old, new, project, checkout = mapped_ended_owner(env, tmp_path)
+    if gate == 'active_run':
+        env.board.conn.execute("UPDATE board_state SET value=? WHERE key='dispatch.run.ended'",
+                               (json.dumps({'agent': 'codex', 'thread_id': post['thread_id'], 'status': 'running'}),))
+    elif gate == 'live_owner':
+        env.clock.advance(1)
+        env.board.conn.execute('UPDATE sessions SET last_seen=? WHERE id=?', (env.clock(), old))
+    elif gate == 'lease':
+        task = env.accepted_task(post['thread_id'])
+        env.board.claim_task(env.p['codex'], old, task)
+    elif gate == 'peer':
+        env.session('claude', project=project, worktree=checkout)
+    elif gate == 'dirty':
+        Path(checkout, 'unfinished.txt').write_text('preserve this')
+    else:
+        Path(checkout, '.git', 'MERGE_HEAD').write_text('pending')
+    with pytest.raises(Conflict):
+        recovery.transfer_ended_owner(env.board, env.p['codex'], new, post['id'], 'codex', 1)
+    assert row(env, post)['assigned_session'] == old and row(env, post)['version'] == 1
+
+
 def test_owner_transfer_receipt_and_ownership_roll_back_together(env, tmp_path, monkeypatch):
     post, old, new, _ = ended_owner(env, tmp_path)
     before = requests.history(env.board, env.p['human'], post['id'], 'codex')

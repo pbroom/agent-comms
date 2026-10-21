@@ -82,7 +82,8 @@ def prune_post_rules(board: Board, p: Principal) -> int:
     has ended (a launch whose run may still fail to spawn is refunded, which would revive the rule; so may a run
     stopped for a maintenance restart whose requeue is not decided yet, requeue.undecided). It stays while
     an ordinary rule on the post's thread that is active, or exhausted (a refund can revive it), was created at or
-    before the post: without the binding that rule could launch for the post, which a dead one-click rule must not allow (its post launches nothing). Live rules keep
+    before the post: without the binding that rule could launch for the post, which a dead one-click rule must not allow (its post launches nothing). An unfinished
+    request also retains its binding: a future standing inbox policy must not override its one-click restriction. Live rules keep
     their bindings, so the dispatcher's "only that rule for that post" lookup is unchanged. Returns how many went."""
     entries = []
     for key, value in board.conn.execute("SELECT key, value FROM board_state WHERE key LIKE ?", (POST_RULE_PREFIX + "%",)):
@@ -127,7 +128,11 @@ def prune_post_rules(board: Board, p: Principal) -> int:
             state == "exhausted" and rule_id not in active_runs and started.get(rule_id, 0) >= target["max_launches"])
         if not dead:
             continue
-        post = board.conn.execute("SELECT thread_id, created_at FROM posts WHERE id = ?", (post_id,)).fetchone()
+        post = board.conn.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
+        if post is not None:
+            from . import requests
+            if any(row['state'] != 'finished' for row in requests.for_post(board,post)):
+                continue
         if post is not None and any(r["thread_id"] == post["thread_id"] and r["created_at_ts"] <= post["created_at"]
                                     for r in live):
             continue

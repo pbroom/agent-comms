@@ -571,6 +571,39 @@ def after_route(board, p, source, previous):
                                (json.dumps(link), p.name, board.now(), record['key']))
 
 
+def _mapped_project_common_dir(board, project):
+    """Fallback identity for a non-Git project folder, anchored only by server configuration.
+
+    Session worktrees and post refs never select the anchor. Existing Git projects retain their own identity;
+    failed inspection of existing Git metadata must not silently switch to a configured different repository.
+    """
+    import os
+    from pathlib import Path
+    from .dispatch import DispatchConfig
+    try:
+        mapping = DispatchConfig.from_dict(board.s.dispatch, settings=board.s).worktrees
+    except (TypeError, ValueError) as exc:
+        raise Conflict('Configured project worktree is invalid') from exc
+    mapped = mapping.get(project)
+    if mapped is None:
+        return None
+    try:
+        workstreams._git(project, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+        return None
+    except Conflict:
+        # A bare repository or a checkout whose Git metadata cannot be inspected is not a group folder.
+        if (not os.path.isdir(project) or any(os.path.lexists(str(p / '.git')) for p in
+                [Path(project), *Path(project).parents]) or os.path.lexists(os.path.join(project, 'HEAD'))):
+            raise
+    normalized = os.path.abspath(mapped)
+    if normalized != os.path.realpath(normalized) or not os.path.isdir(normalized):
+        raise Conflict('Configured project worktree must be an existing directory without symlink redirection')
+    top = workstreams._git(normalized, 'rev-parse', '--show-toplevel')
+    if os.path.realpath(top) != normalized:
+        raise Conflict('Configured project worktree must be the repository checkout root')
+    return workstreams._git(normalized, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+
+
 def _ownership_blocker(board, old, session_id, post, abandoned=False):
     """Allow this authorized successor's work, without treating peers as idle. An abandoned old owner counts as
     ended (it has been silent since its lease expired), and the successor's own dispatcher run is not the owner's."""
@@ -578,6 +611,14 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
     from . import workstreams
     from .dispatch import ACTIVE
     current = board.conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+    project = board._thread_row(post['thread_id'])['project']
+    try:
+        project_common = _mapped_project_common_dir(board, project)
+        if project_common is not None and os.path.realpath(project_common) != os.path.realpath(workstreams._git(
+                current['worktree'] or current['project'], 'rev-parse', '--path-format=absolute', '--git-common-dir')):
+            return 'Successor worktree belongs to another repository'
+    except Conflict as exc:
+        return str(exc)
     path = os.path.realpath(old['worktree'] or old['project'])
     same = path == os.path.realpath(current['worktree'] or current['project'])
     leases = list(board.conn.execute("SELECT * FROM tasks WHERE owner_session=? AND thread_id=? AND status='working' AND lease_expires_at>?",
@@ -587,7 +628,8 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
         # The successor's own session, leases and dispatcher run are never "someone else busy in the checkout": a
         # relaunched run recovering before (or without) a task claim would otherwise block itself.
         return workstreams._inactive(board, old, {'post_id': post['id'], 'thread_id': post['thread_id']},
-                                     abandoned=abandoned, own_run_id=current['dispatch_run_id'], successor=session_id)
+                                     abandoned=abandoned, own_run_id=current['dispatch_run_id'], successor=session_id,
+                                     project_common_dir=project_common)
     for lease in board.conn.execute("SELECT s.id,s.worktree,s.project FROM tasks t JOIN sessions s ON s.id=t.owner_session WHERE t.status IN ('working','blocked') AND t.lease_expires_at>?", (board.now(),)):
         if lease['id'] == old['id'] or (lease['id'] != session_id and os.path.realpath(lease['worktree'] or lease['project']) == path):
             return SHARED_LEASE_ACTIVE
@@ -608,8 +650,8 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
         if run.get('status') in ACTIVE and (run.get('agent') == old['agent'] or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path)):
             return workstreams.OWNER_RUN_ACTIVE
     try:
-        project = board._thread_row(post['thread_id'])['project']
-        if os.path.realpath(workstreams._git(path,'rev-parse','--path-format=absolute','--git-common-dir')) != os.path.realpath(workstreams._git(project,'rev-parse','--path-format=absolute','--git-common-dir')):
+        expected = project_common or workstreams._git(project,'rev-parse','--path-format=absolute','--git-common-dir')
+        if os.path.realpath(workstreams._git(path,'rev-parse','--path-format=absolute','--git-common-dir')) != os.path.realpath(expected):
             return 'Owner worktree belongs to another repository'
         # An owner that only went silent (not a proven-ended run) may have left work behind: never take over a
         # checkout with changes it did not commit, even as the authorized successor in the same worktree.
