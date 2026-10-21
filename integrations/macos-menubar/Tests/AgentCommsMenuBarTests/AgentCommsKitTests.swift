@@ -221,11 +221,18 @@ final class EndpointTests: XCTestCase {
 
     func testPreferencesFromDefaults() {
         let defaults = UserDefaults(suiteName: "acmb-tests-\(UUID().uuidString)")!
-        XCTAssertEqual(Preferences.load(defaults), Preferences(port: 8787, repoPath: "~/agent-comms"))
-        XCTAssertEqual(Preferences.load(defaults).repoPath, NSHomeDirectory() + "/agent-comms")
+        XCTAssertEqual(Preferences.load(defaults, environment: [:]), Preferences(port: 8787, repoPath: "~/agent-comms"))
+        XCTAssertEqual(Preferences.load(defaults, environment: [:]).repoPath, NSHomeDirectory() + "/agent-comms")
         defaults.set(8799, forKey: Preferences.portKey)
         defaults.set("/tmp/board-checkout", forKey: Preferences.repoPathKey)
-        XCTAssertEqual(Preferences.load(defaults), Preferences(port: 8799, repoPath: "/tmp/board-checkout"))
+        XCTAssertEqual(Preferences.load(defaults, environment: [:]),
+                       Preferences(port: 8799, repoPath: "/tmp/board-checkout"))
+        XCTAssertEqual(Preferences.load(defaults, environment: [:]).homePath, "/tmp/board-checkout")
+        XCTAssertEqual(Preferences.load(defaults, environment: ["AGENT_COMMS_HOME": "/tmp/env-home"]).homePath,
+                       "/tmp/env-home")
+        defaults.set("/tmp/board-home", forKey: Preferences.homePathKey)
+        XCTAssertEqual(Preferences.load(defaults, environment: ["AGENT_COMMS_HOME": "/tmp/env-home"]).homePath,
+                       "/tmp/board-home")
     }
 
     func testTheTokenGoesOnlyInAHeaderAndOnlyToTheBoard() throws {
@@ -289,6 +296,11 @@ final class ServerLauncherTests: XCTestCase {
         XCTAssertNil(env["OPENAI_API_KEY"])
         XCTAssertEqual(env["AGENT_COMMS_HOME"], "/tmp/b")
         XCTAssertTrue(env["PATH"]!.hasPrefix("/opt/homebrew/bin:"))
+        let split = ServerLauncher(repoPath: "/Users/me/agent-comms-live", port: 8799, homePath: "/Users/me/agent-comms",
+                                   locator: UVLocator(home: "/Users/me", environmentPath: nil, isExecutable: { _ in false }))
+        XCTAssertEqual(split.arguments(), ["run", "--project", "/Users/me/agent-comms-live", "board", "serve", "--port", "8799"])
+        XCTAssertEqual(split.logPath, "/Users/me/agent-comms/data/menubar-server.log")
+        XCTAssertEqual(split.environment(["AGENT_COMMS_HOME": "/tmp/b"])["AGENT_COMMS_HOME"], "/Users/me/agent-comms")
         XCTAssertThrowsError(try l.launch()) { e in
             XCTAssertEqual(e as? ServerLaunchError, .repoNotFound("/Users/me/agent-comms"))
         }

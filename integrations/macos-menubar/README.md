@@ -135,7 +135,8 @@ Settings live in the app's defaults (`dev.agentcomms.menubar`):
 | Key | Default | Meaning |
 |---|---|---|
 | `port` | `8787` | the board's port on 127.0.0.1 |
-| `repoPath` | `~/agent-comms` | the agent-comms checkout, used by Start Board Server |
+| `repoPath` | `~/agent-comms` | the agent-comms code Start Board Server runs (ideally the pinned runtime) |
+| `homePath` | `$AGENT_COMMS_HOME`, else `repoPath` | the board home (`agents.toml`, `data/`) the server uses |
 | `tokenFile` | `~/.config/agent-comms/human.token` | the human token file |
 
 ```bash
@@ -155,7 +156,7 @@ open -n --env AGENT_COMMS_HOME=/tmp/test-board --env AGENT_COMMS_TOKEN_FILE=/tmp
 
 **Start Board Server** runs `uv run --project <repoPath> board serve --port <port>` with an explicit argument list
 and no shell. It is detached from the app and keeps running after you quit it. Its output is appended to
-`<repoPath>/data/menubar-server.log` (mode 600). Apps opened from Finder or at login get a minimal `PATH`, so the
+`<homePath>/data/menubar-server.log` (mode 600), and the server gets `AGENT_COMMS_HOME=<homePath>`. Apps opened from Finder or at login get a minimal `PATH`, so the
 app looks for `uv` in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`, then searches a standard `PATH`.
 The server gets the app's environment with that `PATH`, minus anything named like a token, secret, password or key.
 To stop a server started this way, run `pkill -f "board serve"` or quit it in Activity Monitor.

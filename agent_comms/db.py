@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -283,14 +285,65 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+NEWER_SCHEMA = ("database schema v{found} is newer than this server (v{ours}); run the board from up-to-date code "
+                "(the installed runtime, scripts/launchagents.md), or give this checkout its own AGENT_COMMS_HOME")
+
+
+def _db_file(conn: sqlite3.Connection) -> Path | None:
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main" and row[2]:
+            return Path(row[2])
+    return None
+
+
+def _checkout_branch(root: Path) -> str | None:
+    """The branch a git checkout is on; None when detached, not a checkout, or git is unavailable."""
+    try:
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    branch = out.stdout.strip()
+    return branch if out.returncode == 0 and branch not in ("", "HEAD") else None
+
+
+def _before_upgrade(conn: sqlite3.Connection, found: int) -> None:
+    """An existing board is about to be migrated from v`found`. A checkout on a development branch that also holds
+    the board's data (the default home) may not do it: every server and MCP launcher on main would then refuse the
+    database. Otherwise the database is copied to data/board-pre-v<SCHEMA_VERSION>.db first, so a bad upgrade is
+    one file copy to undo."""
+    from .config import REPO_ROOT
+    path = _db_file(conn)
+    if path is None:
+        return
+    if os.environ.get("AGENT_COMMS_ALLOW_MIGRATE") != "1" and path.resolve().is_relative_to(REPO_ROOT):
+        branch = _checkout_branch(REPO_ROOT)
+        if branch is not None and branch != "main":
+            raise RuntimeError(
+                f"refusing to migrate {path} from v{found} to v{SCHEMA_VERSION} from branch '{branch}': the live "
+                "board would then be unreadable from main. Run the board from the installed runtime (scripts/launchagents.md), "
+                "give this branch its own AGENT_COMMS_HOME, or set AGENT_COMMS_ALLOW_MIGRATE=1")
+    backup = path.with_name(f"{path.stem}-pre-v{SCHEMA_VERSION}{path.suffix}")
+    if not backup.exists():
+        dest = sqlite3.connect(backup)
+        try:
+            conn.backup(dest)
+        finally:
+            dest.close()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     from . import browser_readiness
-    if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
-        raise RuntimeError("database schema is newer than this server")
+    found = conn.execute("PRAGMA user_version").fetchone()[0]
+    if found > SCHEMA_VERSION:
+        raise RuntimeError(NEWER_SCHEMA.format(found=found, ours=SCHEMA_VERSION))
+    if 0 < found < SCHEMA_VERSION:
+        _before_upgrade(conn, found)
     conn.executescript(SCHEMA + browser_readiness.SCHEMA)
     with write_tx(conn):
-        if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
-            raise RuntimeError("database schema is newer than this server")
+        found = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            raise RuntimeError(NEWER_SCHEMA.format(found=found, ours=SCHEMA_VERSION))
         if conn.execute('PRAGMA user_version').fetchone()[0] < 10:
             # Snapshot only sources the old rule had already removed from human attention.
             # This boundary never creates an answer request or marks any work complete.
