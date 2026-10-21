@@ -4,4 +4,4 @@
 set -euo pipefail
 board_code="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export AGENT_COMMS_HOME="${AGENT_COMMS_HOME:-$board_code}"
-exec uv run --quiet --frozen --project "$board_code" board "$@"
+exec uv run --quiet --frozen --no-dev --project "$board_code" board "$@"

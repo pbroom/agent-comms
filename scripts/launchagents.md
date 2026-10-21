@@ -47,6 +47,30 @@ finish, and a surviving worker remains under the dispatcher's orphan reconciliat
 launchd does not kill its process group on exit. Existing approval, pause, ownership,
 budget, browser and permission gates still govern every launch.
 
+## Claude Code and the menu bar app
+
+Every process that opens the board database should run the same code: a server or MCP launcher from an older
+checkout refuses a database a newer one migrated ("database schema vN is newer than this server"). After
+installing, move Claude Code's MCP server onto the same `current` pointer Codex uses, and point the menu bar app
+at the runtime and the board home separately:
+
+```sh
+rt="$HOME/Library/Application Support/Agent Comms/runtimes/current"
+home="$HOME/agent-comms"   # the board home: agents.toml and data/
+diff -q "$rt/integrations/claude-code/skill/SKILL.md" ~/.claude/skills/agent-comms/SKILL.md \
+  || cp "$rt/integrations/claude-code/skill/SKILL.md" ~/.claude/skills/agent-comms/SKILL.md
+claude mcp remove -s user agent-comms
+bash "$rt/integrations/claude-code/install.sh" --home "$home"
+defaults write dev.agentcomms.menubar repoPath "$rt"
+defaults write dev.agentcomms.menubar homePath "$home"
+```
+
+The skill is synced first because `install.sh` refuses to replace a different one, and it would refuse only after
+the old MCP server is already removed. Point the Claude Code hooks in `~/.claude/settings.json` at `$rt/integrations/claude-code/` too. Develop in the
+canonical checkout as usual: code that is not on `main` (a branch or detached commit with unmerged work, in any
+checkout or worktree) refuses to migrate an existing board (set `AGENT_COMMS_ALLOW_MIGRATE=1` to override), and every
+migration first copies the database to `data/board-pre-v<N>.db`.
+
 ## First activation
 
 First read the existing signed-in Settings dispatcher status and current runs. The

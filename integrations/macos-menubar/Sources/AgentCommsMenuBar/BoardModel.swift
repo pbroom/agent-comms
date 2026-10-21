@@ -283,7 +283,7 @@ final class BoardModel: ObservableObject {
 
     func startServer() {
         guard !startingServer else { return }
-        let launcher = ServerLauncher(repoPath: prefs.repoPath, port: prefs.port)
+        let launcher = ServerLauncher(repoPath: prefs.repoPath, port: prefs.port, homePath: prefs.homePath)
         do {
             try launcher.launch()
             startingServer = true

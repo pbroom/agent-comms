@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -283,14 +286,85 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+NEWER_SCHEMA = ("database schema v{found} is newer than this server (v{ours}); run the board from up-to-date code "
+                "(the installed runtime, scripts/launchagents.md), or give this checkout its own AGENT_COMMS_HOME")
+
+
+def _db_file(conn: sqlite3.Connection) -> Path | None:
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main" and row[2]:
+            return Path(row[2])
+    return None
+
+
+def _on_main(root: Path) -> bool:
+    """Whether the code in `root` may migrate a board: not a git checkout (an installed runtime snapshot), or a checkout
+    whose HEAD is already on main (an ancestor of main or origin/main). Anything else, including a git error, is not."""
+    if not (root / ".git").exists():
+        return True
+    for base in ("main", "origin/main"):
+        try:
+            out = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", "HEAD", base],
+                                 capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if out.returncode == 0:
+            return True
+    return False
+
+
+def _under_tmp(path: Path) -> bool:
+    return path.is_relative_to(Path(tempfile.gettempdir()).resolve())
+
+
+def _before_upgrade(conn: sqlite3.Connection, found: int) -> None:
+    """An existing board is about to be migrated from v`found`. Code that is not on main (a development branch or a
+    detached commit of one, in any checkout or worktree) may not do it: every server and MCP launcher on main would
+    then refuse the database. Boards under the temp directory (tests) are exempt. Otherwise the database is first
+    copied to data/board-pre-v<SCHEMA_VERSION>.db, so a bad upgrade is one file copy to undo."""
+    from .config import REPO_ROOT
+    path = _db_file(conn)
+    if path is None:
+        return
+    path = path.resolve()
+    if os.environ.get("AGENT_COMMS_ALLOW_MIGRATE") != "1" and not _under_tmp(path) and not _on_main(REPO_ROOT):
+        raise RuntimeError(
+            f"refusing to migrate {path} from v{found} to v{SCHEMA_VERSION}: this code ({REPO_ROOT}) is not on main, "
+            "and the board would then be unreadable from main. Run the board from the installed runtime "
+            "(scripts/launchagents.md), give this checkout its own AGENT_COMMS_HOME, or set AGENT_COMMS_ALLOW_MIGRATE=1")
+    backup = path.with_name(f"{path.stem}-pre-v{SCHEMA_VERSION}{path.suffix}")
+    if backup.exists():
+        return
+    # Copy to a private temporary name, then link it into place: a backup interrupted midway never leaves a partial
+    # file under the final name, and concurrent starts never write the same file.
+    fd, tmp = tempfile.mkstemp(prefix=f".{backup.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    try:
+        dest = sqlite3.connect(tmp)
+        try:
+            conn.backup(dest)
+        finally:
+            dest.close()
+        try:
+            os.link(tmp, backup)
+        except FileExistsError:
+            pass    # another process finished its backup first
+    finally:
+        os.unlink(tmp)
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     from . import browser_readiness
-    if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
-        raise RuntimeError("database schema is newer than this server")
+    found = conn.execute("PRAGMA user_version").fetchone()[0]
+    if found > SCHEMA_VERSION:
+        raise RuntimeError(NEWER_SCHEMA.format(found=found, ours=SCHEMA_VERSION))
+    if 0 < found < SCHEMA_VERSION:
+        _before_upgrade(conn, found)
     conn.executescript(SCHEMA + browser_readiness.SCHEMA)
     with write_tx(conn):
-        if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
-            raise RuntimeError("database schema is newer than this server")
+        found = conn.execute("PRAGMA user_version").fetchone()[0]
+        if found > SCHEMA_VERSION:
+            raise RuntimeError(NEWER_SCHEMA.format(found=found, ours=SCHEMA_VERSION))
         if conn.execute('PRAGMA user_version').fetchone()[0] < 10:
             # Snapshot only sources the old rule had already removed from human attention.
             # This boundary never creates an answer request or marks any work complete.
