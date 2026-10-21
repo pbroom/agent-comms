@@ -1210,12 +1210,13 @@ this under the human's board setting auto_recover_stalled_work; it is not a huma
   instead. Together with the next rule this stops an agent from getting itself launched over and over (claim and go
   silent; create, accept, leave and decline its own tasks; or do either on a fresh thread each time).
 - *Who decides.* Only work the human authorized launches anyone. Abandoned work launches its owner only when the task
-  is human- or grant-authorized, or the human identity asked that agent for work on the thread before the task's
-  current claim: a `request` or `handoff` addressed to the agent, not an automatic one, at or before the claim. An
-  agent cannot write such a post, so it cannot open a thread, claim a task it proposed itself, go silent and be
-  launched; a human status, or a request to another agent, does not count. (The live threads that prompted this have
-  human requests to codex hours before codex's claims, so they still qualify.) (a review probed six such cycles against the first version: six
-  launches, nothing in Needs you). An unclaimed task launches its creator only when the human accepted the task or an
+  is human- or grant-authorized, or the human asked for work on the thread: the human created the thread, or posted
+  a non-automatic `request` or `handoff` there, to any agent (`autorecover._human_in_thread`). This used to require a
+  request addressed to that agent before its claim; it is per thread now, because a human who asked for work on a
+  thread wants it finished by whichever agent claimed it. The human's answers and receipts (Reject, Not now, a reply,
+  a decline or release) are `status`/`question` posts and never count, so a refusal is not an approval. An agent
+  cannot write such a post, so it still cannot open a thread, claim a task it proposed itself, go silent and be
+  launched (a review probed six such cycles against the first version: six launches, nothing in Needs you). An unclaimed task launches its creator only when the human accepted the task or an
   active standing grant covers it. One its own creator accepted (`require_human_accept` is off by default) goes to the human, who
   keeps Unstick. A `blocked` task, and any stall on a thread that already waits on the human (a `Board.NEEDS_YOU`
   post, or a shared issue awaiting the human's decision), also goes to the human, never to a launch. So while one
@@ -1242,7 +1243,7 @@ owner that *abandoned* its work (`recovery.abandonment`): a different session of
 lease, whose lease on a task in the request's thread expired at least its grace ago (`recovery.abandon_grace`, as
 above), and which has not been seen since that expiry. Only then may a
 `started` request be taken over (it is queued again for the new session, which must mark it `started` itself, so
-browser and tool preflight still run). Queued and blocked requests work as before, from an ended dispatcher run too.
+browser readiness is checked again). Queued and blocked requests work as before, from an ended dispatcher run too.
 Active owners (seen since, or holding any live lease) and unknown ones (no lease evidence) stay blocked, as do sticky
 browser denials. For an owner that is only abandoned (not a proven-ended run), the dirty-worktree and unfinished-Git
 checks always run, also for the authorized successor in the same worktree: a quiet session may have left work behind,
@@ -1754,17 +1755,17 @@ It passes `validate_runner` and has no `risky_flags` (tested by parsing the comm
   `Bash(git *--output*)` is denied. `git diff` is not allowed at all (`git diff --no-index` reads arbitrary files).
 
 *claude_tool_projects.* For an opted-in project the dispatcher replaced any `claude` runner's `--allowedTools` and
-permission mode with `runner_preflight.ALLOWED` (Edit/Write in the checkout, `git add/commit`, `uv run pytest`, …) and
-ran a tool preflight first. Applied to the triage runner on the board's own project, that would have widened it to
+permission mode with `runner_preflight.ALLOWED` (Edit/Write in the checkout, `git add/commit`, `uv run pytest`, …).
+(It used to run a tool preflight first; that probe and its `assert_ready` start gate are gone: a run whose tool is
+denied marks its request blocked naming the tool, `runner_preflight.DENIED_TOOL_INSTRUCTION`.) Applied to the triage runner on the board's own project, that would have widened it to
 commits and test runs (arbitrary code). Now `runner_preflight.read_only(template)` exempts a runner that declares
 itself read-only: `claude`; exactly `--permission-mode dontAsk`; `--strict-mcp-config`; `--allowedTools` naming only
 `READ_ONLY_TOOLS` (board tools, folder-scoped Read/Grep/Glob, local read-only git subcommands; a bare `Read`, `git
 diff` or any `gh` command does not qualify); `--disallowedTools` naming every `READ_ONLY_DENIES` entry (Edit, Write, the token directory,
 `~/.ssh`) and `Bash(git *--output*)` whenever a git command is allowed; and no `--settings`, `--add-dir`,
-`--permission-prompt-tool` or bypass flag. Such a runner is launched exactly as written, with no tool preflight. The
+`--permission-prompt-tool` or bypass flag. Such a runner is launched exactly as written. The
 explicit denials are what make it a declaration: the shipped `claude-code` runner (board tools only, nothing denied) is
-not read-only and keeps the scoped tools in opted-in projects (tested both ways). `assert_ready` needs no change: a run
-without `tool_preflight` is not gated.
+not read-only and keeps the scoped tools in opted-in projects (tested both ways).
 
 *What `read_only()` cannot see.* Under `dontAsk`, allow rules in the user's `~/.claude/settings.json` and in the run
 directory's `.claude/settings.json` / `.claude/settings.local.json` still apply: a broad `Bash(...)` allow there widens
@@ -1929,8 +1930,7 @@ halts a runaway agent, so **halting is the default** and requeueing is an explic
   with no loop running it terminates the left-over runs and reports the request ids the next dispatcher will requeue
   (`requeue_pending`). A run recorded before stop modes existed counts as halted.
 - Only runs with status `stopped`. A run whose own exit was already known when the stop began is recorded as it ended
-  (`exited`, or `timeout` when the dispatcher was timing it out), never as `stopped`; a tool preflight that passed
-  just before the stop counts as stopped (its work never began). Runs that timed out, failed preflight or to spawn,
+  (`exited`, or `timeout` when the dispatcher was timing it out), never as `stopped`. Runs that timed out, failed preflight or to spawn,
   or went `gone` (ended unwatched, exit unknown) keep the blocked behavior.
 - Only generic requests (never a managed continuation), and only rows the stopped run still held: queued, or started
   by that run's own session. A request the agent blocked or finished itself is untouched.

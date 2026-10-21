@@ -472,7 +472,7 @@ def test_a_new_session_takes_over_a_started_request_after_reclaiming_the_abandon
     env.board.claim_task(env.p["codex"], new, task)                       # reclaim first (same worktree)
     out = recovery.transfer_ended_owner(env.board, env.p["codex"], new, ask["id"], "codex", version(env, ask))
     assert out["assigned_session"] == new and out["state"] == "queued"
-    assert f"abandoned session {old}" in out["reason"] and "preflight still required" in out["reason"]
+    assert f"abandoned session {old}" in out["reason"] and "resume it with board_request_progress" in out["reason"]
     # Normal lease semantics if the old session comes back: it lost the request as it lost the lease.
     with pytest.raises(Conflict, match="owned by another session"):
         requests.progress(env.board, env.p["codex"], old, ask["id"], "codex", "finished", "done")

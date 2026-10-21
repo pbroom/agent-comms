@@ -19,9 +19,10 @@ is the standing approval that a click on Unstick would otherwise give, and only 
 - Only recent stalls (MAX_STALL_AGE_SECONDS), at most MAX_SENDS_PER_PASS launches per pass, and durable launch
   budgets per rolling day across both kinds: AGENT_BUDGET per (agent, thread) and AGENT_DAILY_BUDGET per agent over
   all threads, so an agent cannot get itself launched over and over.
-- Only work the human authorized launches. Abandoned work: the task is human- or grant-authorized, or the human
-  sent that agent a request or handoff on the thread (not an automatic one) before the task was claimed; otherwise an agent could open a thread,
-  claim its own task, go silent and be launched, again and again. An unclaimed task: the human accepted it or an
+- Only work the human authorized launches. Abandoned work (and a claimed task whose dependencies finished): the
+  task is human- or grant-authorized, or the human asked for work on the thread (_human_in_thread: started it, or
+  sent any agent a non-automatic request or handoff there); otherwise an agent could open a thread, claim its own
+  task, go silent and be launched, again and again. The human's answers and receipts never count. An unclaimed task: the human accepted it or an
   active standing grant covers it. Anything else goes to the human instead. A `blocked` task, and any stall on a
   thread that already waits on the human (a Needs you post, or a shared issue awaiting the human), also goes to the
   human, never to a launch. Posts to the human are capped at ESCALATION_DAILY_CAP a day per responsible agent;
@@ -272,16 +273,19 @@ def _waits_on_human(board: Board, thread_id: int) -> str | None:
 
 
 def _human_in_thread(board: Board, thread_id: int) -> bool:
-    """The human started this thread or takes part in it: the thread's creator is the human identity, or it holds a
-    post by the human that is not an automatic one (Board.NOT_AUTOMATIC). Authorization is per thread: once the human
-    started or joined a thread, an agent that went silent on work it had claimed there may be relaunched to recover it
-    (an unclaimed task its creator accepted for itself still needs the human or a grant). An agent cannot write
-    such a post, so it cannot open a thread of its own, claim, go silent and get launched."""
+    """The human asked for work on this thread: the thread's creator is the human identity, or it holds a `request`
+    or `handoff` by the human (to any agent) that is not an automatic one (Board.NOT_AUTOMATIC). Authorization is per
+    thread: once the human asked for work there, an agent that went silent on work it had claimed may be relaunched to
+    recover it (an unclaimed task its creator accepted for itself still needs the human or a grant). The human's
+    answers and receipts (Reject, Not now, a reply, a decline) are `status` or `question` posts and do not count, so
+    a refusal never authorizes a launch; and an agent cannot write such a post, so it cannot open a thread of its own,
+    claim, go silent and get launched."""
     return board.conn.execute(
         f"""SELECT 1 FROM threads t JOIN agents a ON a.name = t.created_by AND a.is_human = 1 WHERE t.id = ?
             UNION ALL
             SELECT 1 FROM posts p JOIN agents a ON a.name = p.agent AND a.is_human = 1
-            WHERE p.thread_id = ? AND {Board.NOT_AUTOMATIC.format(post='p')} LIMIT 1""",
+            WHERE p.thread_id = ? AND p.type IN ('request', 'handoff') AND {Board.NOT_AUTOMATIC.format(post='p')}
+            LIMIT 1""",
         (thread_id, thread_id)).fetchone() is not None
 
 
@@ -386,8 +390,8 @@ def _abandoned_item(board: Board, r, runner_for, now: float, at_cap) -> tuple[di
     if _attempts(conn, r["id"]) >= MAX_PER_TASK:
         return item, f"the limit of {MAX_PER_TASK} automatic recoveries for this task is reached"
     if not (_human_authorized(board, r["id"], r["owner_agent"]) or _human_in_thread(board, r["thread_id"])):
-        return item, ("neither you nor a standing grant authorized this work (you have not started or posted on this thread), "
-                      "so nothing was launched")
+        return item, ("neither you nor a standing grant authorized this work (you have not started this thread or asked for work "
+                      "on it), so nothing was launched")
     return item, _waits_on_human(board, r["thread_id"])
 
 
@@ -494,8 +498,8 @@ def _continue_item(board: Board, key: str, value: str, runner_for, now: float,
         return item, f"the limit of {MAX_PER_TASK} automatic recoveries for this task is reached"
     claimed = agent == task["owner_agent"]    # its own claimed work; an unclaimed task needs the human or a grant
     if not (_human_authorized(board, task_id, agent) or (claimed and _human_in_thread(board, task["thread_id"]))):
-        return item, ("neither you nor a standing grant authorized this work (you have not started or posted on this "
-                      "thread, or the task was never claimed), so nothing was launched")
+        return item, ("neither you nor a standing grant authorized this work (you have not started this thread or asked "
+                      "for work on it, or the task was never claimed), so nothing was launched")
     return item, _waits_on_human(board, task["thread_id"])
 
 

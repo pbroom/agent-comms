@@ -14,9 +14,10 @@ Stop modes, recorded on each stopped run as `stop_mode`:
 - REQUEUE: `board dispatch stop --requeue` (a maintenance restart), never while the board is paused at stop time.
 
 Guardrails:
-- Only runs that ended by themselves ('exited', 'timeout', 'gone') or were stopped for requeue, after their tool
-  preflight. A run that failed to start, ended during its tool preflight, or was halted keeps the blocked behavior:
-  relaunching cannot fix those.
+- Only runs that ended by themselves ('exited', 'timeout', 'gone') or were stopped for requeue. A run that failed
+  to start or was halted keeps the blocked behavior: relaunching cannot fix those. A run whose tool was denied
+  should block its own request (runner_preflight.DENIED_TOOL_INSTRUCTION); one that exits without doing so is
+  retried like any other crash, so a denied tool costs at most MAX_RETRIES extra runs.
 - Only generic requests (never a managed continuation, which has its own delivery contract), and only rows the run
   still held unsettled (queued, or started by that run's own session). A request the agent blocked or finished
   itself is never touched.
@@ -60,7 +61,7 @@ def requeue_stop(record: dict) -> bool:
     """A run that ended by itself, or that the dispatcher stopped for a maintenance restart: its unsettled requests
     may be requeued."""
     if not isinstance(record, dict) or record.get("phase") == "tool_preflight":
-        return False    # a run that never got past its tool preflight: relaunching cannot fix its access
+        return False    # recorded before the tool preflight was removed: a run that never got past it stays blocked
     return record.get("status") in ENDED or (record.get("status") == "stopped" and record.get("stop_mode") == REQUEUE)
 
 

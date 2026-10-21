@@ -111,7 +111,7 @@ def test_ended_transfer_keeps_original_unfinished_and_requires_new_pickup(env,tm
     post,old,new,_=ended_owner(env,tmp_path)
     out=recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
     assert out['assigned_session']==new and out['state']=='queued' and out['version']==2
-    assert 'preflight still required' in out['reason']
+    assert 'resume it with board_request_progress' in out['reason']
     with pytest.raises(Conflict): recovery.transfer_ended_owner(env.board,env.p['codex'],new,post['id'],'codex',1)
 
 

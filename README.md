@@ -906,7 +906,9 @@ the queue, and the dispatcher launches it again under the same approval: at most
 while `tasks.auto_recover_stalled_work` is on and the board is not paused. Only after that is the request marked
 blocked, which is when it reaches you. Retries do not use up the approval's `max_launches` (it counts distinct
 launches), and task leases the ended run held on the thread are expired so the retry can reclaim them. A run that
-failed to start blocks at once (relaunching cannot fix it). To stop a runaway
+failed to start blocks at once (relaunching cannot fix it). A run whose tool is denied should block its request
+itself; if it exits without doing so it is retried like a crash, so a denied tool can cost up to two extra runs
+before the request blocks. To stop a runaway
 agent, use `board dispatch stop` (a halt); killing its process by hand counts as a crash and is retried.
 
 A plain stop (and Ctrl-C, SIGTERM, or the Settings page's stop) is a halt: the stopped agents' requests stay blocked
