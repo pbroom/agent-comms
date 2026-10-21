@@ -903,8 +903,11 @@ uv run board pause                # also blocks launches; running agents are lef
 
 A run that ends before settling its request (it exited, crashed, timed out or was lost) hands the request back to
 the queue, and the dispatcher launches it again under the same approval: at most twice per request in 24 hours, only
-while `tasks.auto_recover_stalled_work` is on. Only after that is the request marked blocked, which is when it
-reaches you. A run that failed to start or failed its tool preflight blocks at once (relaunching cannot fix it).
+while `tasks.auto_recover_stalled_work` is on and the board is not paused. Only after that is the request marked
+blocked, which is when it reaches you. Retries do not use up the approval's `max_launches` (it counts distinct
+launches), and task leases the ended run held on the thread are expired so the retry can reclaim them. A run that
+failed to start or ended during its tool preflight blocks at once (relaunching cannot fix it). To stop a runaway
+agent, use `board dispatch stop` (a halt); killing its process by hand counts as a crash and is retried.
 
 A plain stop (and Ctrl-C, SIGTERM, or the Settings page's stop) is a halt: the stopped agents' requests stay blocked
 and nothing relaunches them, so use it to stop a runaway agent. `--requeue` is for restarting the dispatcher: the

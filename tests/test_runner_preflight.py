@@ -8,7 +8,7 @@ import pytest
 from agent_comms import runner_preflight as rp, requests, recovery, capabilities, db
 from agent_comms.core import Board, Conflict
 from agent_comms.dispatch import DispatchConfig
-from test_dispatch import denv, allow, human_post
+from test_dispatch import denv, allow, human_post, runs
 from conftest import PROJECT
 
 
@@ -124,7 +124,8 @@ def test_preflight_timeout_is_bounded(denv):
     assert run.child.terminated == 1
     e.d.tick()
     assert len(e.spawner.calls) == 1
-    assert e.board.get_post(e.p['human'], post['id'])['requests'][0]['state'] == 'queued'   # retried (requeue.py)
+    assert e.board.get_post(e.p['human'], post['id'])['requests'][0]['state'] == 'blocked'
+    assert runs(e)[0]['status'] == 'preflight_failed'
 
 
 def test_registered_session_cannot_start_before_verified_receipts(denv):

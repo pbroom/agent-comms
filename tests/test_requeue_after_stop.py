@@ -404,3 +404,59 @@ def test_a_prune_between_recording_the_stop_and_the_requeue_keeps_the_binding(de
     monkeypatch.setattr(Dispatcher, "_request_failure", original)
     next_dispatcher(denv)
     assert len(codex_runs_for(denv, p_post["id"])) == 2
+
+
+# ---------------------------------------------------------------- review fixes: budget, pause, leases, quiet ticks
+
+
+def test_max_launches_counts_distinct_launches_and_retries_are_bounded_per_request(denv):
+    rule, ask = launched(denv)                       # max_launches=1, setting on (the default)
+    for _ in range(requeue.MAX_RETRIES + 1):
+        denv.spawner.children[-1].code = 1
+        denv.d.tick()
+        denv.clock.advance(5 * 60)
+        denv.d.tick()
+    assert len(denv.spawner.calls) == requeue.MAX_RETRIES + 1
+    assert request_row(denv, ask)["state"] == "blocked" and launches_left(denv, rule) == 0
+    other = human_post(denv, ["codex"])              # a different request: the rule is spent
+    denv.clock.advance(5 * 60)
+    denv.d.tick()
+    assert len(denv.spawner.calls) == requeue.MAX_RETRIES + 1 and request_row(denv, other)["state"] == "queued"
+
+
+def test_nothing_is_requeued_while_the_board_is_paused(denv):
+    rule, ask = launched(denv)
+    denv.board.set_paused(denv.p["human"], True)
+    denv.spawner.children[0].code = 0
+    denv.d.tick()
+    assert request_row(denv, ask)["state"] == "blocked"
+
+
+def test_the_ended_runs_task_lease_is_expired_so_the_retry_can_reclaim_it(denv):
+    rule, ask = launched(denv)
+    [record] = runs(denv)
+    sid = denv.board.register_session(denv.p["codex"], PROJECT, dispatch_run_id=record["run_id"])["session_id"]
+    task = denv.board.create_task(denv.p["codex"], sid, ask["thread_id"], title="t")["id"]
+    denv.board.transition_task(denv.p["human"], denv.sid["human"], task, "accepted")
+    denv.board.claim_task(denv.p["codex"], sid, task)
+    denv.spawner.children[0].code = 0
+    denv.d.tick()
+    lease = denv.board.conn.execute("SELECT lease_expires_at FROM tasks WHERE id=?", (task,)).fetchone()[0]
+    assert lease <= denv.clock.t
+    retry = denv.board.register_session(denv.p["codex"], PROJECT)["session_id"]
+    denv.board.claim_task(denv.p["codex"], retry, task)        # no "leased until" conflict
+
+
+def test_an_ended_run_record_is_not_rewritten_on_later_ticks(denv):
+    rule, ask = launched(denv)
+    denv.spawner.children[0].code = 0
+    denv.d.tick()
+    key = Dispatcher.RUN_PREFIX + runs(denv)[0]["run_id"]
+    def stamp():
+        return denv.board.conn.execute("SELECT updated_at FROM board_state WHERE key=?", (key,)).fetchone()[0]
+    before = stamp()
+    denv.clock.advance(20)
+    denv.d.tick()
+    denv.clock.advance(20)
+    denv.d.tick()
+    assert stamp() == before

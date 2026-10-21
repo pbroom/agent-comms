@@ -1430,8 +1430,7 @@ class Dispatcher:
             record = self._get(self.RUN_PREFIX + run_id) if run_id else None
             post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
             if post is None:
-                if stopped and isinstance(record, dict):
-                    requeue.mark_decided(record, post_id)
+                if stopped and isinstance(record, dict) and requeue.mark_decided(record, post_id):
                     self._put(c, self.RUN_PREFIX + run_id, record)
                 return
             managed = workstreams.get_for_post(self.board, post_id)
@@ -1487,8 +1486,7 @@ class Dispatcher:
                     self.board.refund_dispatch_launch(self.human, record["rule_id"], _in_transaction=True,
                                                      budget_day=record.get('budget_day'))
                     record["launch_refunded"] = True
-            if stopped and isinstance(record, dict):
-                requeue.mark_decided(record, post_id)
+            if stopped and isinstance(record, dict) and (requeue.mark_decided(record, post_id) or requeued):
                 self._put(c, self.RUN_PREFIX + run_id, record)
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
@@ -1905,6 +1903,10 @@ class Dispatcher:
                             rec.update(error="Tool preflight failed: " + str(exc)[:300])
                             self._record(rec)
                             self._finish(run, "preflight_failed", code)
+                    elif probing:
+                        rec.update(error="Tool preflight " + ("timed out" if run.timed_out else f"exited {code}"))
+                        self._record(rec)
+                        self._finish(run, "preflight_failed", code)
                     else:
                         self._finish(run, "timeout" if run.timed_out else "exited", code)
                 elif run.terminated_at is None and now - run.started_at >= run_timeout:
@@ -1925,10 +1927,13 @@ class Dispatcher:
             record = json.loads(value)
             if record.get("status") in ACTIVE:
                 continue
+            stopped = requeue.requeue_stop(record)
             for post_id in record.get("request_ids", []):
+                if stopped and requeue.decided(record, post_id):
+                    continue    # settled when the run ended; never rewrite an old run record on every tick
                 self._request_failure(post_id, record["agent"],
                     "Runner ended without explicit request completion: " + record.get("status", "unknown"),
-                    record["run_id"], stopped=requeue.requeue_stop(record))
+                    record["run_id"], stopped=stopped)
 
     def _reap_orphans(self, now: float) -> list[dict]:
         """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when
