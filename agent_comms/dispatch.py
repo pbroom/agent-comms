@@ -221,6 +221,11 @@ def with_codex_inbox_mcp(template: list[str], env: dict[str, str]) -> list[str]:
     if names - {CODEX_SERVER}:
         entries = ','.join(f'{json.dumps(name)}={{enabled=false}}' for name in sorted(names - {CODEX_SERVER}))
         overrides += ['-c','mcp_servers={' + entries + '}']
+        # Codex applies -c in order, and a whole-table override drops dotted mcp_servers.* keys set before it
+        # (the runner's per-tool approvals among them). Re-apply those after it; inline tables stay overridden.
+        for override in _codex_overrides(template):
+            if override.partition('=')[0].strip().startswith('mcp_servers.'):
+                overrides += ['-c',override]
     overrides += ['-c',f'mcp_servers.{CODEX_SERVER}.required=true']
     i = template.index('{prompt}')
     return template[:i] + overrides + template[i:]
@@ -1084,6 +1089,8 @@ class Dispatcher:
         """
         if not rules:
             return []
+        from . import human_actions
+        one_click = human_actions.one_click_rule_ids(self.board)  # once per pass, not per request row
         result = []
         for post in self.board.conn.execute("""SELECT p.* FROM posts p JOIN threads t ON t.id=p.thread_id
                 WHERE p.sealed=0 AND t.status='open'
@@ -1092,7 +1099,7 @@ class Dispatcher:
             for row in requests.for_post(self.board, post):
                 item = {'thread_id':post['thread_id'], 'agent':row['assigned_agent'],
                         'post_id':post['id'], 'post_created_at':post['created_at']}
-                rule = self._rule_for(rules, item)
+                rule = self._rule_for(rules, item, one_click)
                 if row['state'] == 'queued' and rule is not None and (
                         rule.get('kind') != 'inbox_delivery' or row['assigned_session'] is None):
                     result.append((post, row))
@@ -1240,7 +1247,7 @@ class Dispatcher:
                                         (agent, thread_id)).fetchone()[0]
         return acked is not None and acked >= seq
 
-    def _rule_for(self, rules: list[dict], item: dict) -> dict | None:
+    def _rule_for(self, rules: list[dict], item: dict, one_click: set[int] | None = None) -> dict | None:
         # A one-click action (Unstick, Approve & launch) records the rule it approved for its post: that post launches
         # only under that rule (its purpose belongs in the prompt; none other, even when that rule is spent or
         # revoked). Any other post: the newest approval at or before it that is not such a one-click rule (those
@@ -1250,7 +1257,8 @@ class Dispatcher:
         if mapped is not None:
             return next((r for r in rules if r["id"] == mapped and r["thread_id"] == item["thread_id"]
                          and item["agent"] in r["agents"]), None)
-        one_click = human_actions.one_click_rule_ids(self.board)
+        if one_click is None:
+            one_click = human_actions.one_click_rule_ids(self.board)
         ordinary = max((r for r in rules if r["thread_id"] == item["thread_id"] and item["agent"] in r["agents"]
                     and r["id"] not in one_click
                     and r["created_at_ts"] <= item["post_created_at"]),
@@ -1508,8 +1516,10 @@ class Dispatcher:
                 FROM sessions s LEFT JOIN session_activity a ON a.session_id=s.id''',(now,)):
             if self._dir_key(row['worktree'] or row['project']) != source:
                 continue
-            if (row['leased'] or row['executing'] or (row['activity'] == 'active'
-                    and row['recorded_at'] >= now - self.config.live_minutes * 60)):
+            recent = now - self.config.live_minutes * 60
+            # A 'started' request left by a session that has gone quiet is not work in progress.
+            if (row['leased'] or (row['executing'] and row['last_seen'] >= recent)
+                    or (row['activity'] == 'active' and row['recorded_at'] >= recent)):
                 return True
         return False
 

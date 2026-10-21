@@ -196,6 +196,17 @@ def test_same_project_separate_worktree_does_not_starve_but_same_checkout_lease_
     assert len(e.spawner.calls) == 1
 
 
+def test_started_request_of_a_quiet_session_in_the_checkout_stops_holding_pickup(denv):
+    e = denv
+    old = human_post(e,['codex'])
+    sid = e.session('codex',PROJECT,e.workdir)
+    requests.progress(e.board,e.p['codex'],sid,old['id'],'codex','started')
+    policy(e); human_post(e,['codex']); e.clock.advance(60); e.d.tick()
+    assert not e.spawner.calls  # live session executing in the source checkout
+    e.clock.advance(e.d.config.live_minutes * 60); e.d.tick()
+    assert len(e.spawner.calls) == 1  # the session went quiet; its 'started' row is not work
+
+
 @pytest.mark.parametrize('state',['queued','started','blocked','finished'])
 def test_existing_request_ownership_is_preserved(denv,state):
     e = denv

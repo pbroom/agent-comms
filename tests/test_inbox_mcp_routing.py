@@ -47,7 +47,11 @@ url = "https://example.invalid/mcp"
     assert any(tomllib.loads(x).get('mcp_servers',{}).get('another.server',{}).get('enabled') is False for x in overrides)
     assert 'mcp_servers.agent-comms.required=true' in overrides
     assert not any('agent-comms' in x and '.enabled=false' in x for x in overrides)
-    assert [x for x in overrides if 'approval_mode=' in x] == dispatch._codex_overrides(template)
+    approvals = dispatch._codex_overrides(template)
+    assert set(x for x in overrides if 'approval_mode=' in x) == set(approvals)
+    # Each approval is (re)applied after the whole-table override, which would otherwise drop it.
+    table = max(i for i,x in enumerate(overrides) if x.startswith('mcp_servers={'))
+    assert set(approvals) <= set(overrides[table+1:])
     assert dispatch.codex_unapproved_tools(narrowed) == []
     assert '--sandbox' in narrowed and narrowed[narrowed.index('--sandbox')+1] == 'workspace-write'
 
@@ -136,3 +140,26 @@ def test_native_codex_reads_isolated_route_configuration_without_starting_server
     assert {name for name,enabled in inventory.items() if enabled} == {'agent-comms'}
     assert not sentinel.exists()
     assert path.read_text() == text
+
+
+def test_native_codex_keeps_runner_server_overrides_after_disabling_other_servers(tmp_path):
+    codex = shutil.which('codex')
+    if codex is None:
+        pytest.skip('Codex CLI is not installed')
+    text = ('cli_auth_credentials_store="file"\nmcp_oauth_credentials_store="file"\n'
+            '[mcp_servers.agent-comms]\ncommand="/bin/false"\n[mcp_servers.other]\ncommand="/bin/false"\n')
+    env,_ = config(tmp_path,text)
+    template = runner()
+    # Stands in for the runner's per-tool approvals: dotted keys set before the inbox overrides.
+    template = template[:-1] + ['-c','mcp_servers.agent-comms.tool_timeout_sec=77',template[-1]]
+    narrowed = dispatch.with_codex_inbox_mcp(template,env)
+    flags = []
+    for i,x in enumerate(narrowed[:-1]):
+        if x in ('-c','--disable'):
+            flags += [x,narrowed[i+1]]
+    native_env = dict(env,PATH=os.environ.get('PATH',''),TMPDIR=str(tmp_path))
+    result = subprocess.run([codex,*flags,'mcp','get','agent-comms','--json'],env=native_env,
+                            capture_output=True,text=True,timeout=20)
+    assert result.returncode == 0, result.stderr
+    server = json.loads(result.stdout)
+    assert server['enabled'] is True and server['tool_timeout_sec'] == 77
