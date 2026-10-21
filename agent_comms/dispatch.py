@@ -222,9 +222,16 @@ def with_codex_inbox_mcp(template: list[str], env: dict[str, str]) -> list[str]:
         entries = ','.join(f'{json.dumps(name)}={{enabled=false}}' for name in sorted(names - {CODEX_SERVER}))
         overrides += ['-c','mcp_servers={' + entries + '}']
         # Codex applies -c in order, and a whole-table override drops dotted mcp_servers.* keys set before it
-        # (the runner's per-tool approvals among them). Re-apply those after it; inline tables stay overridden.
+        # (the runner's per-tool approvals among them). Re-apply only the local server's keys after it: another
+        # server's keys could set it enabled again.
         for override in _codex_overrides(template):
-            if override.partition('=')[0].strip().startswith('mcp_servers.'):
+            if not override.partition('=')[0].strip().startswith('mcp_servers.'):
+                continue
+            try:
+                servers = tomllib.loads(override).get('mcp_servers')
+            except tomllib.TOMLDecodeError:
+                continue
+            if isinstance(servers,dict) and set(servers) == {CODEX_SERVER}:
                 overrides += ['-c',override]
     overrides += ['-c',f'mcp_servers.{CODEX_SERVER}.required=true']
     i = template.index('{prompt}')
