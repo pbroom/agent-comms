@@ -7,7 +7,7 @@ import pathlib
 
 import pytest
 
-from agent_comms import autorecover, recovery, unstick
+from agent_comms import autorecover, recovery, resolve, unstick
 from agent_comms.core import Conflict
 
 from conftest import ASK, PROJECT
@@ -373,7 +373,7 @@ def test_the_escalation_cap_is_rechecked_inside_the_transaction(aenv, monkeypatc
     assert aenv.board.snapshot(aenv.p["human"])["needs_you"] == []
 
 
-def test_only_a_human_request_to_the_agent_before_the_claim_authorizes_a_launch(aenv):
+def test_a_human_request_on_the_thread_authorizes_a_launch_and_an_answer_does_not(aenv):
     def thread_with(post_kw):
         sid = aenv.session("codex")
         tid = aenv.board.create_thread(aenv.p["codex"], sid, "t", PROJECT)["id"]
@@ -383,14 +383,29 @@ def test_only_a_human_request_to_the_agent_before_the_claim_authorizes_a_launch(
         task = aenv.board.create_task(aenv.p["codex"], sid, tid, title="t")["id"]
         aenv.board.claim_task(aenv.p["codex"], sid, task)
         return tid
-    status = thread_with({"type": "status"})
+    alone = thread_with(None)
+    status = thread_with({"type": "status"})        # e.g. a Reject / Not now answer or a receipt
     other = thread_with({"type": "request", "to": ["claude"]})
-    asked = thread_with({"type": "handoff", "to": ["codex"]})
     aenv.clock.advance(PAST_GRACE)
     aenv.d.tick()
     by_thread = {r["thread_id"]: r["state"] for r in records(aenv).values()}
-    assert by_thread == {status: "escalated", other: "escalated", asked: "sent"}
-    assert len(aenv.spawner.calls) == 1
+    assert by_thread[alone] == by_thread[status] == "escalated"
+    assert by_thread[other] == "sent"
+
+
+def test_the_humans_one_click_refusal_does_not_authorize_a_launch(aenv):
+    sid = aenv.session("codex")
+    tid = aenv.board.create_thread(aenv.p["codex"], sid, "asks the human", PROJECT)["id"]
+    q = aenv.post("codex", tid, "may I?", "question", needs_response=True, decision_question=ASK)
+    resolve.resolve(aenv.board, aenv.p["human"], q["id"], "not_now", None, aenv.config)
+    assert aenv.board.conn.execute("SELECT 1 FROM posts p JOIN agents a ON a.name = p.agent AND a.is_human = 1 "
+                                   "WHERE p.thread_id = ?", (tid,)).fetchone()     # the refusal is a human post
+    aenv.clock.advance(1)
+    task = aenv.board.create_task(aenv.p["codex"], sid, tid, title="t")["id"]
+    aenv.board.claim_task(aenv.p["codex"], sid, task)
+    aenv.clock.advance(PAST_GRACE)
+    aenv.d.tick()
+    assert aenv.spawner.calls == []
 
 
 def test_a_human_post_before_the_claim_authorizes_the_abandoned_launch(aenv):

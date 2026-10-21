@@ -501,7 +501,7 @@ def _transfer(board, p, session_id, post_id, recipient, expected_version):
             raise _TransientBlock(transient, os.path.realpath(old['worktree'] or old['project']), old['id'])
         how = 'abandoned' if abandoned else 'ended'
         requests._save(board, p, session_id, row, 'queued',
-                       f'Bookkeeping ownership recovered from {how} session {old["id"]}; execution preflight still required',
+                       f'Bookkeeping ownership recovered from {how} session {old["id"]}; resume it with board_request_progress (browser binding and host denials still apply)',
                        row['evidence_post_ids'], row['assigned_agent'], session_id)
         board.conn.execute('''INSERT INTO request_owner_recoveries
             (post_id,recipient,assigned_agent,assigned_session,recovered_version,previous_session,created_at)
