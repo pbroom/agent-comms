@@ -15,6 +15,13 @@ from test_autorecover import (LEASE, PAST_GRACE, abandon, abandoned_request, aen
                               records, version)
 
 
+@pytest.fixture(autouse=True)
+def _retries_used_up(monkeypatch):
+    """These tests start where automatic retries end: an ended run's request blocks at once (requeue.py)."""
+    from agent_comms import requeue
+    monkeypatch.setattr(requeue, "MAX_RETRIES", 0)
+
+
 def test_a_dispatched_session_is_abandoned_after_ten_minutes_an_interactive_one_after_a_lease(aenv):
     sid, task, _ = abandon(aenv, started=False)
     aenv.board.conn.execute("UPDATE sessions SET dispatch_run_id='gone-run' WHERE id=?", (sid,))

@@ -1,7 +1,8 @@
-"""Stopping the dispatcher halts by default: the stopped runs' requests stay blocked. Only a maintenance restart
-(`board dispatch stop --requeue`) requeues them and lets a following dispatcher relaunch them once (requeue.py). A run
-that exited on its own keeps today's behavior; a second stop within a day stays blocked; the human's pause and the
-auto_recover_stalled_work setting are respected; a one-click rule never revives for another post."""
+"""A run that ends before settling its request hands it back to the queue, up to requeue.MAX_RETRIES times a day
+(requeue.py): it exited or timed out on its own, or a maintenance restart (`board dispatch stop --requeue`) stopped it.
+Stopping the dispatcher otherwise halts: the stopped runs' requests stay blocked. Retries past the bound block; the
+human's pause and the auto_recover_stalled_work setting are respected; a one-click rule never revives for another
+post."""
 
 import json
 
@@ -68,14 +69,14 @@ def test_a_restart_requeues_its_request_and_a_following_dispatcher_relaunches_it
     assert record["status"] == "stopped" and record["stop_mode"] == "requeue"
     row = request_row(denv, ask)
     assert row["state"] == "queued" and row["assigned_session"] is None and row["version"] == before["version"] + 1
-    assert row["reason"].startswith("Requeued automatically: a maintenance restart")
+    assert row["reason"].startswith("Requeued automatically: run ") and "retry 1 of 2" in row["reason"]
     [event] = requests.history(denv.board, denv.p["human"], ask["id"], "codex")
     assert event["state"] == "queued" and event["actor"] is None and "Requeued automatically" in event["reason"]
     assert record["requeued"] == [[ask["id"], "codex"]] and record["launch_refunded"] is True
     assert record["requeue_decided"] == [ask["id"]] and record["one_click"] is False
     stored = json.loads(denv.board.conn.execute("SELECT value FROM board_state WHERE key=?",
                                                 (requeue.key(ask["id"], "codex"),)).fetchone()[0])
-    assert stored == {"at": denv.clock.t, "run_id": record["run_id"]}
+    assert stored == {"at": denv.clock.t, "times": [denv.clock.t], "run_id": record["run_id"]}
     assert launches_left(denv, rule) == 1        # the stopped launch went back to the rule that launched this post
     next_dispatcher(denv)
     assert len(denv.spawner.calls) == 2
@@ -88,11 +89,13 @@ def test_a_restart_requeues_its_request_and_a_following_dispatcher_relaunches_it
     assert request_row(denv, ask)["state"] == "queued"   # the stopped run's record never reblocks it
 
 
-def test_a_second_restart_within_a_day_leaves_the_request_blocked(denv):
+def test_restarts_past_the_retry_bound_leave_the_request_blocked(denv):
     rule, ask = launched(denv)
-    restart_stop(denv)
-    next_dispatcher(denv)
-    assert len(denv.spawner.calls) == 2
+    for n in range(requeue.MAX_RETRIES):
+        restart_stop(denv)
+        assert f"retry {n + 1} of" in request_row(denv, ask)["reason"]
+        next_dispatcher(denv)
+        assert len(denv.spawner.calls) == n + 2
     restart_stop(denv)
     row = request_row(denv, ask)
     assert row["state"] == "blocked"
@@ -102,7 +105,7 @@ def test_a_second_restart_within_a_day_leaves_the_request_blocked(denv):
     next_dispatcher(denv)
     denv.clock.advance(60 * 60)
     denv.d.tick()
-    assert len(denv.spawner.calls) == 2 and request_row(denv, ask)["state"] == "blocked"
+    assert len(denv.spawner.calls) == requeue.MAX_RETRIES + 1 and request_row(denv, ask)["state"] == "blocked"
 
 
 def test_the_requeued_ids_are_reported_to_the_cli(denv):
@@ -212,17 +215,39 @@ def test_cli_stop_help_and_output(denv, monkeypatch, capsys, tmp_path):
 # ---------------------------------------------------------------- what is never requeued
 
 
-def test_a_run_that_exits_on_its_own_stays_blocked(denv):
+def test_a_run_that_exits_on_its_own_is_retried_then_blocked(denv):
     rule, ask = launched(denv)
-    denv.spawner.children[0].code = 0
+    for n in range(requeue.MAX_RETRIES):
+        denv.spawner.children[-1].code = 0
+        denv.d.tick()
+        assert runs(denv)[-1]["status"] == "exited"
+        row = request_row(denv, ask)
+        assert row["state"] == "queued" and row["assigned_session"] is None
+        assert "ended (exited)" in row["reason"] and f"retry {n + 1} of" in row["reason"]
+        denv.clock.advance(5 * 60)
+        denv.d.tick()
+        assert len(denv.spawner.calls) == n + 2      # the same dispatcher launches it again
+    denv.spawner.children[-1].code = 1
     denv.d.tick()
-    assert runs(denv)[0]["status"] == "exited"
     row = request_row(denv, ask)
     assert row["state"] == "blocked" and row["reason"].startswith("Runner ended without explicit request completion: exited")
-    assert denv.board.conn.execute("SELECT 1 FROM board_state WHERE key LIKE 'dispatch.requeue.%'").fetchone() is None
-    restart_stop(denv)
-    next_dispatcher(denv)
-    assert len(denv.spawner.calls) == 1 and launches_left(denv, rule) == 0
+    assert row["reason"].endswith(requeue.USED)
+    denv.clock.advance(60 * 60)
+    denv.d.tick()
+    assert len(denv.spawner.calls) == requeue.MAX_RETRIES + 1
+
+
+def test_retries_come_back_after_a_day(denv):
+    rule, ask = launched(denv)
+    for _ in range(requeue.MAX_RETRIES):
+        denv.spawner.children[-1].code = 0
+        denv.d.tick()
+        denv.clock.advance(5 * 60)
+        denv.d.tick()
+    denv.clock.advance(requeue.WINDOW_SECONDS)
+    denv.spawner.children[-1].code = 0
+    denv.d.tick()
+    assert request_row(denv, ask)["state"] == "queued"
 
 
 def test_a_clean_exit_already_known_at_stop_time_is_recorded_as_exited(denv):
@@ -231,16 +256,17 @@ def test_a_clean_exit_already_known_at_stop_time_is_recorded_as_exited(denv):
     restart_stop(denv)
     [record] = runs(denv)
     assert record["status"] == "exited" and "stop_mode" not in record
-    assert request_row(denv, ask)["state"] == "blocked" and launches_left(denv, rule) == 0
+    assert request_row(denv, ask)["state"] == "queued" and launches_left(denv, rule) == 1
 
 
-def test_a_timed_out_run_stays_blocked(denv):
+def test_a_timed_out_run_is_retried(denv):
     rule, ask = launched(denv)
     denv.clock.advance(31 * 60)
     denv.d.tick()                              # terminates the child at the timeout
     denv.d.tick()
     assert runs(denv)[0]["status"] == "timeout"
-    assert request_row(denv, ask)["state"] == "blocked"
+    row = request_row(denv, ask)
+    assert row["state"] == "queued" and "ended (timeout)" in row["reason"]
 
 
 def test_setting_off_keeps_todays_blocked_behavior(denv):

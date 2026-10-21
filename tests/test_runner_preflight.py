@@ -124,7 +124,7 @@ def test_preflight_timeout_is_bounded(denv):
     assert run.child.terminated == 1
     e.d.tick()
     assert len(e.spawner.calls) == 1
-    assert e.board.get_post(e.p['human'], post['id'])['requests'][0]['state'] == 'blocked'
+    assert e.board.get_post(e.p['human'], post['id'])['requests'][0]['state'] == 'queued'   # retried (requeue.py)
 
 
 def test_registered_session_cannot_start_before_verified_receipts(denv):

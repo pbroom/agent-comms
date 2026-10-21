@@ -1400,7 +1400,7 @@ class Dispatcher:
             except ValueError:
                 continue
             # A run the human reset (workstreams.reset_delivery) no longer counts: the human allowed one new attempt.
-            # Nor does a run the dispatcher stopped whose request it requeued (requeue.py): one relaunch is allowed.
+            # Nor does an ended run whose request the dispatcher requeued (requeue.py): it may be launched again.
             if (isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", [])
                     and not record.get("reset_by_human") and not requeue.requeued_post(record, post_id)):
                 return True
@@ -1419,9 +1419,11 @@ class Dispatcher:
 
     def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None,
                          stopped: bool = False) -> None:
-        """Block the requests a failed or ended run left unsettled. `stopped`: a maintenance stop (`board dispatch stop
-        --requeue`) ended the run; its generic requests go back to the queue instead, once a day per request
-        (requeue.py). The decision for this post is recorded on the run in the same transaction."""
+        """Settle the requests a failed or ended run left unsettled. `stopped`: the run ended by itself or was stopped
+        for a maintenance restart (requeue.requeue_stop); its generic requests go back to the queue, up to
+        requeue.MAX_RETRIES times a day per request, and are blocked only after that. Otherwise (a halt, a failed
+        start or preflight) they are blocked. The decision for this post is recorded on the run in the same
+        transaction."""
         if post_id is None:
             return
         with db.write_tx(self.board.conn) as c:

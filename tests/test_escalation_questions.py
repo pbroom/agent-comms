@@ -14,6 +14,14 @@ from conftest import legacy_plain
 from test_autorecover import (INJECTION, LEASE, PAST_GRACE, abandon, aenv, agent_task, auto_posts,  # noqa: F401
                               records)
 
+
+@pytest.fixture(autouse=True)
+def _retries_used_up(monkeypatch):
+    """These tests start where automatic retries end: an ended run's request blocks at once (requeue.py)."""
+    from agent_comms import requeue
+    monkeypatch.setattr(requeue, "MAX_RETRIES", 0)
+
+
 MARKERS = ("IGNORE", "evil.example", "TASK ", "TITLE", "please do it", "Runner ended")
 
 

@@ -9,6 +9,13 @@ from test_autorecover import LEASE, PAST_GRACE, abandon, aenv, agent_task, auto_
 from test_recovery_wait import blocked, blocked_handoff, wait_of
 
 
+@pytest.fixture(autouse=True)
+def _retries_used_up(monkeypatch):
+    """These tests start where automatic retries end: an ended run's request blocks at once (requeue.py)."""
+    from agent_comms import requeue
+    monkeypatch.setattr(requeue, "MAX_RETRIES", 0)
+
+
 def escalated_unclaimed(env, n=1):
     """n unclaimed tasks codex created (the human accepted them), escalated to the human in one question."""
     tasks = [agent_task(env) for _ in range(n)]

@@ -131,11 +131,11 @@ def test_matching_live_child_uses_process_timeout_not_pickup_deadline(denv):
     assert len(env.spawner.calls) == 1
     env.spawner.children[0].code = 0
     env.d.tick()
-    assert progress(env, post)['state'] == 'blocked'
+    assert progress(env, post)['state'] == 'queued'     # the run ended unsettled: retried (requeue.py)
     env.d._save(**{env.d.PENDING_KEY: {}})
     env.clock.advance(5000)
     env.d.tick()
-    assert len(env.spawner.calls) == 1
+    assert len(env.spawner.calls) == 2
 
 
 @pytest.mark.parametrize('gate', ['none', 'revoked', 'paused', 'wrong_agent'])
@@ -176,7 +176,8 @@ def test_recovery_uses_assigned_agent_and_preserves_original_recipient(denv):
     assert progress(env, post)['state'] == 'queued'
     env.spawner.children[0].code = 0
     env.d.tick()
-    assert progress(env, post)['state'] == 'blocked'
+    assert progress(env, post)['state'] == 'queued'     # retried, still for its original recipient
+    assert progress(env, post)['recipient'] == 'codex'
     rows = env.board.get_post(env.p['human'], post['id'])['requests']
     assert next(row for row in rows if row['recipient'] == 'claude')['state'] == 'finished'
 
@@ -234,9 +235,12 @@ def test_coalesced_delivery_keeps_both_original_obligations(denv):
     env.d.tick()
     rows = env.board.get_post(env.p['human'], post['id'])['requests']
     assert {row['recipient'] for row in rows} == {'codex', 'claude'}
-    assert all(row['state'] == 'blocked' for row in rows)
+    assert all(row['state'] == 'queued' for row in rows)     # both retried together
+    env.clock.advance(5 * 60)
     env.d.tick()
-    assert len(env.spawner.calls) == 1
+    assert len(env.spawner.calls) == 2
+    record = env.d._get(env.d.RUN_PREFIX + env.d.running['claude'].run_id)
+    assert set(record['request_recipients']) == {'codex', 'claude'}
 
 
 def test_pickup_deadline_ignores_malformed_historical_run_record(denv):
