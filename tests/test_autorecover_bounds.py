@@ -373,7 +373,7 @@ def test_the_escalation_cap_is_rechecked_inside_the_transaction(aenv, monkeypatc
     assert aenv.board.snapshot(aenv.p["human"])["needs_you"] == []
 
 
-def test_only_a_human_request_to_the_agent_before_the_claim_authorizes_a_launch(aenv):
+def test_any_human_post_on_the_thread_authorizes_a_launch(aenv):
     def thread_with(post_kw):
         sid = aenv.session("codex")
         tid = aenv.board.create_thread(aenv.p["codex"], sid, "t", PROJECT)["id"]
@@ -383,14 +383,14 @@ def test_only_a_human_request_to_the_agent_before_the_claim_authorizes_a_launch(
         task = aenv.board.create_task(aenv.p["codex"], sid, tid, title="t")["id"]
         aenv.board.claim_task(aenv.p["codex"], sid, task)
         return tid
+    alone = thread_with(None)
     status = thread_with({"type": "status"})
     other = thread_with({"type": "request", "to": ["claude"]})
-    asked = thread_with({"type": "handoff", "to": ["codex"]})
     aenv.clock.advance(PAST_GRACE)
     aenv.d.tick()
     by_thread = {r["thread_id"]: r["state"] for r in records(aenv).values()}
-    assert by_thread == {status: "escalated", other: "escalated", asked: "sent"}
-    assert len(aenv.spawner.calls) == 1
+    assert by_thread[alone] == "escalated"
+    assert by_thread[status] == by_thread[other] == "sent"
 
 
 def test_a_human_post_before_the_claim_authorizes_the_abandoned_launch(aenv):

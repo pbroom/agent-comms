@@ -129,8 +129,8 @@ def test_split_tools_keeps_parenthesized_rules_whole():
 
 
 def test_an_opted_in_project_keeps_the_triage_runners_narrow_tools(denv):
-    """claude_tool_projects replaces a Claude runner's tools with the scoped implementation set and runs a tool
-    preflight first. A read-only runner is launched exactly as written instead: no Edit/Write, no commits."""
+    """claude_tool_projects replaces a Claude runner's tools with the scoped implementation set. A read-only runner is
+    launched exactly as written instead: no Edit/Write, no commits."""
     template = shipped_triage_runner()
     denv.d.config.runners["claude"] = template
     denv.d.config.claude_tool_projects = [PROJECT]
@@ -154,7 +154,8 @@ def test_an_opted_in_project_still_scopes_an_ordinary_claude_runner(denv):
     allow(denv, agents=["claude"], max_launches=1)
     human_post(denv, ["claude"])
     denv.d.tick()
-    assert "--session-id" in denv.spawner.calls[0]["argv"]
+    argv = denv.spawner.calls[0]["argv"]
+    assert any(a.startswith("--allowedTools=") and "Edit(./**)" in a for a in argv)   # scoped implementation tools
 
 
 # ---------------------------------------------------------------- identity and token

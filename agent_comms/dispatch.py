@@ -35,7 +35,6 @@ import signal
 import subprocess
 import time
 import tomllib
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -1782,19 +1781,13 @@ class Dispatcher:
             if template is None:
                 raise LookupError(f"no runner configured for {agent}")
             from . import runner_preflight
-            # A read-only runner (the triage agent's) keeps its own narrower tools: the scoped override would widen it.
+            # An opted-in project runs Claude with scoped implementation tools (runner_preflight.ALLOWED); a denied
+            # tool is the agent's to report as a blocker. A read-only runner (the triage agent's) keeps its own
+            # narrower tools: the scoped override would widen it.
             if (not inbox and project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude"
                     and not runner_preflight.read_only(template)):
                 template = runner_preflight.scoped_template(template)
-                session = str(uuid.uuid4())
-                versions = {r["recipient"]: r["version"] for r in requests.for_post(self.board, post)
-                            if r["recipient"] in record.get("request_recipients", [])} if item.get("post_id") else {}
-                record.update(request_versions=versions, tool_preflight={"state": "pending", "session_id": session},
-                              work_prompt=prompt, work_template=template, phase="tool_preflight")
-                self._record(record)
-                prompt = runner_preflight.PROMPT
-                template = template + ["--session-id", session, "--output-format", "stream-json",
-                                       "--verbose", "--max-turns", "6"]
+                prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
             if not inbox:
                 template = with_writable_roots(template, self.config.extra_roots(template, project))
             else:
@@ -1826,52 +1819,6 @@ class Dispatcher:
         self.board._notify("dispatch.launched", {"run_id": run_id, "agent": agent, "thread_id": thread_id,
                                                  "rule_id": rule["id"], "launches_left": left})
 
-    def _resume_after_preflight(self, run: _Run, rec: dict) -> None:
-        """Continue the same reserved launch only while its original authority remains valid."""
-        from . import runner_preflight
-        proof = runner_preflight.verify(Path(run.log), rec["tool_preflight"]["session_id"])
-        rules = self.board.list_dispatch_rules(self.human, include_inactive=True)
-        rule = next((r for r in rules if r["id"] == run.rule_id), None)
-        # Exhausted is allowed: this run already reserved its one launch before probing.
-        if (self.stopping or not self.owns_loop() or self.board.is_paused() or rule is None
-                or rule["state"] not in ("active", "exhausted") or run.agent not in rule["agents"]
-                or self.board._thread_row(run.thread_id)["status"] != "open"):
-            raise Conflict("launch authorization changed during tool preflight")
-        if rec.get("request_ids") and not rec.get("request_versions"):
-            raise Conflict("request ownership was missing before tool preflight")
-        for pid in rec.get("request_ids", []):
-            post = self.board.conn.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
-            current = {r["recipient"]: r for r in requests.for_post(self.board, post)} if post else {}
-            if any(name not in current or current[name]["state"] != "queued"
-                   or current[name]["assigned_agent"] != run.agent
-                   or current[name]["version"] != version
-                   for name, version in rec.get("request_versions", {}).items()):
-                raise Conflict("request assignment changed during tool preflight")
-            blocker = self._browser_blocker(pid, run.agent)
-            if blocker:
-                raise Conflict(blocker)
-        blocker = self._headless_blocker(run.agent, run.thread_id, rec.get('request_ids', []))
-        if blocker:
-            raise Conflict(blocker)
-        cwd = rec["cwd"]
-        template = rec["work_template"] + ["--resume", proof["session_id"]]
-        argv = render_argv(template, prompt=rec["work_prompt"], project=cwd, thread_id=run.thread_id)
-        log_path = self.log_dir / (run.run_id + "-work.log")
-        # Persist verified proof before registration can race the newly spawned process.
-        rec.update(tool_preflight=proof, phase="work", log=str(log_path))
-        rec.pop("work_prompt", None)
-        rec.pop("work_template", None)
-        self._record(rec)
-        child = self.spawner(argv, cwd=cwd, env=child_env(run.agent, self.config,
-                             runtime=self._runtime(run.agent)), log_path=log_path)
-        run.child, run.log = child, str(log_path)
-        try:
-            started = self.process_start(child.pid)
-        except Exception:
-            started = None
-        rec.update(pid=child.pid, proc_start=started)
-        self._record(rec)
-
     def _finish(self, run: _Run, status: str, code: int | None, stop_mode: str | None = None) -> None:
         self.running.pop(run.agent, None)
         self.ended[run.agent] = self.board.now()
@@ -1892,26 +1839,10 @@ class Dispatcher:
         for run in list(self.running.values()):
             try:
                 code = run.child.poll()
-                rec = self._get(self.RUN_PREFIX + run.run_id) or {}
-                probing = rec.get("phase") == "tool_preflight"
-                run_timeout = min(timeout, 120) if probing else timeout
                 if code is not None:
-                    if probing and code == 0 and not run.timed_out and run.terminated_at is None:
-                        try:
-                            self._resume_after_preflight(run, rec)
-                        except Exception as exc:
-                            rec.update(error="Tool preflight failed: " + str(exc)[:300])
-                            self._record(rec)
-                            self._finish(run, "preflight_failed", code)
-                    elif probing:
-                        rec.update(error="Tool preflight " + ("timed out" if run.timed_out else f"exited {code}"))
-                        self._record(rec)
-                        self._finish(run, "preflight_failed", code)
-                    else:
-                        self._finish(run, "timeout" if run.timed_out else "exited", code)
-                elif run.terminated_at is None and now - run.started_at >= run_timeout:
-                    log.warning("%s run %s exceeded %s seconds; terminating", run.agent, run.run_id,
-                                run_timeout)
+                    self._finish(run, "timeout" if run.timed_out else "exited", code)
+                elif run.terminated_at is None and now - run.started_at >= timeout:
+                    log.warning("%s run %s exceeded %s seconds; terminating", run.agent, run.run_id, timeout)
                     run.timed_out, run.terminated_at = True, now
                     run.child.terminate()
                 elif (run.terminated_at is not None and not run.killed
@@ -1949,7 +1880,7 @@ class Dispatcher:
             rid, started = d["run_id"], d.get("started_at")
             if d["_state"] != "ours" or not isinstance(started, (int, float)):
                 continue  # unverified: counted, never signalled
-            run_timeout = min(timeout, 120) if d.get("phase") == "tool_preflight" else timeout
+            run_timeout = timeout
             if rid not in self.orphan_terms and now - started >= run_timeout:
                 log.warning("orphaned %s run %s exceeded %s min; terminating", d["agent"], rid,
                             self.config.timeout_minutes)
@@ -2002,12 +1933,9 @@ class Dispatcher:
                           stop_mode=mode)
 
     def _ended_status(self, run: _Run, code: int) -> str:
-        """How a run that already exited by itself ended: 'timeout' when the dispatcher was timing it out, 'stopped'
-        for a tool preflight that passed (its work never began), else 'exited'."""
-        if run.timed_out:
-            return "timeout"
-        rec = self._get(self.RUN_PREFIX + run.run_id) or {}
-        return "stopped" if rec.get("phase") == "tool_preflight" and code == 0 else "exited"
+        """How a run that already exited by itself ended: 'timeout' when the dispatcher was timing it out, else
+        'exited'."""
+        return "timeout" if run.timed_out else "exited"
 
     # ------------------------------------------------------------ the loop
 

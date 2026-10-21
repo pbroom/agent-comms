@@ -139,7 +139,7 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             from . import request_replies
             request_replies.guard_superseded(board, post_id)
         # The assigned agent finishing work it never started (queued or blocked -> finished) executed it all the
-        # same, so it passes the same browser and tool-preflight gates as a start; otherwise self-posted evidence
+        # same, so it passes the same browser gate as a start; otherwise self-posted evidence
         # could skip them. A finish after a start was gated at the start (its probe may have expired since).
         unstarted_finish = (state == 'finished' and not recover_blocked and not p.is_human
                             and p.name == row['assigned_agent'] and row['state'] not in ('started', 'finished'))
@@ -149,8 +149,6 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         if state == 'started' or unstarted_finish:
             from . import browser_readiness
             browser_readiness.assert_request_ready(board,post_id,recipient,session_id)
-            from . import runner_preflight
-            runner_preflight.assert_ready(board, session_id, post_id, recipient)
         managed = workstreams.get_for_post(board, post_id)
         if recover_blocked:
             _recover_blocked(board,p,session_id,post,row,state,evidence,expected_version,managed)

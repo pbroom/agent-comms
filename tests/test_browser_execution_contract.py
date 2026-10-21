@@ -207,27 +207,6 @@ def test_recovery_wrapper_cannot_erase_an_exact_source_policy_denial(benv):
     assert benv.board.list_dispatch_rules(benv.p['human'])[0]['launches_left'] == 3
 
 
-@pytest.mark.parametrize('inherited', [False, True])
-def test_context_bound_during_tool_preflight_prevents_the_work_spawn(denv, inherited):
-    from test_runner_preflight import configure, complete_probe
-    from agent_comms import recovery
-    original = None
-    if inherited:
-        original = human_post(denv, ['claude'])
-        denv.clock.advance(1)
-    post, run, record = configure(denv)
-    if inherited:
-        with db.write_tx(denv.board.conn):
-            recovery.record(denv.board, denv.p['human'], post['id'], 'claude',
-                            [{'post_id': original['id'], 'recipient': 'claude', 'version': 0}])
-    target = original or post
-    br.bind_request(denv.board, denv.p['human'], denv.sid['human'], target['id'],
-                    'claude', URL, 'desktop')
-    complete_probe(denv, run, record)
-    assert len(denv.spawner.calls) == 1
-    assert denv.board.get_post(denv.p['human'], post['id'])['requests'][0]['state'] == 'blocked'
-
-
 @pytest.mark.parametrize("kind", ["headless", "either"])
 def test_compatible_contract_injects_only_its_bound_origin(benv, kind):
     allow(benv, agents=["codex"], max_launches=3)
