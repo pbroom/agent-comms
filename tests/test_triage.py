@@ -21,6 +21,14 @@ from test_autorecover import INJECTION, aenv  # noqa: F401
 from test_dispatch import allow, denv, human_post  # noqa: F401
 from test_prevention import forward, penv, stalled_unstick  # noqa: F401
 
+
+@pytest.fixture(autouse=True)
+def _retries_used_up(monkeypatch):
+    """These tests start where automatic retries end: an ended run's request blocks at once (requeue.py)."""
+    from agent_comms import requeue
+    monkeypatch.setattr(requeue, "MAX_RETRIES", 0)
+
+
 TRIAGE = "claude-haiku"
 
 

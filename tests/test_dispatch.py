@@ -292,6 +292,7 @@ def test_agent_without_runner_is_never_launched(denv):
 
 
 def test_budget_decrements_and_exhausts(denv):
+    denv.board.s.auto_recover_stalled_work = False   # unsettled exits are retried (test_requeue_after_stop)
     rule = allow(denv, agents=["codex"], max_launches=2)
     for n in range(3):
         human_post(denv, ["codex"], f"turn {n}")
@@ -783,6 +784,7 @@ def test_verified_orphan_is_held_to_the_timeout(denv, monkeypatch):
     human_post(denv, ["codex"])
     denv.d.tick()
     [old] = denv.spawner.children
+    [first] = runs(denv)
     restart(denv)                                   # 2 minutes into the run
     denv.clock.advance(27 * 60)
     denv.d.tick()
@@ -795,7 +797,7 @@ def test_verified_orphan_is_held_to_the_timeout(denv, monkeypatch):
     assert signals[-1] == (old.pid, dispatch.signal.SIGKILL)
     old.code = -9
     denv.d.tick()
-    assert runs(denv)[0]["status"] == "timeout"
+    assert next(r for r in runs(denv) if r["run_id"] == first["run_id"])["status"] == "timeout"
 
 
 def test_reused_pid_is_not_mistaken_for_an_orphan(denv):
@@ -1128,6 +1130,7 @@ def test_informational_status_never_launches(denv):
 
 
 def test_distinct_requests_survive_and_revisions_do_not_duplicate(denv):
+    denv.board.s.auto_recover_stalled_work = False   # unsettled exits are retried (test_requeue_after_stop)
     allow(denv, agents=['codex'])
     first = human_post(denv, ['codex'])
     second = human_post(denv, ['codex'])
@@ -1176,7 +1179,7 @@ def test_explicit_completion_before_dispatch_prevents_launch(denv):
 
 
 @pytest.mark.parametrize('bind', [True, False])
-def test_exit_blocks_only_session_bound_to_that_run(denv, bind):
+def test_exit_settles_only_session_bound_to_that_run(denv, bind):
     from agent_comms import requests
     allow(denv, agents=['codex'])
     post = human_post(denv, ['codex'])
@@ -1188,12 +1191,12 @@ def test_exit_blocks_only_session_bound_to_that_run(denv, bind):
     denv.spawner.children[0].code = 1
     denv.d.tick()
     row = denv.board.get_post(denv.p['human'], post['id'])['requests'][0]
-    assert row['state'] == ('blocked' if bind else 'started')
-    assert row['assigned_session'] == session
+    assert row['state'] == ('queued' if bind else 'started')   # the bound run ended: retried (requeue.py)
+    assert row['assigned_session'] == (None if bind else session)
     assert 'dispatch_run_id=' + record['run_id'] in denv.spawner.calls[0]['argv'][-1]
 
 
-def test_restarted_dispatcher_blocks_request_when_bound_orphan_is_gone(denv):
+def test_restarted_dispatcher_retries_request_when_bound_orphan_is_gone(denv):
     from agent_comms import requests
     allow(denv, agents=['codex'])
     post = human_post(denv, ['codex'])
@@ -1206,5 +1209,6 @@ def test_restarted_dispatcher_blocks_request_when_bound_orphan_is_gone(denv):
     denv.d.release_loop()
     replacement = new_dispatcher(denv)
     replacement.tick()
-    assert denv.board.get_post(denv.p['human'], post['id'])['requests'][0]['state'] == 'blocked'
-    assert len(denv.spawner.calls) == 1
+    row = denv.board.get_post(denv.p['human'], post['id'])['requests'][0]
+    assert row['state'] in ('queued', 'started') and 'retry 1 of' in requests.history(
+        denv.board, denv.p['human'], post['id'], 'codex')[-1]['reason']
