@@ -5,22 +5,32 @@ import Foundation
 public struct Preferences: Equatable, Sendable {
     public static let portKey = "port"
     public static let repoPathKey = "repoPath"
+    public static let homePathKey = "homePath"
     public static let tokenFileKey = "tokenFile"
     public static let defaultPort = 8787
     public static let defaultRepoPath = "~/agent-comms"
 
     public var port: Int
-    public var repoPath: String   // tilde-expanded
+    public var repoPath: String   // tilde-expanded: the code the server runs
+    public var homePath: String   // tilde-expanded: the board home (agents.toml, data/); defaults to repoPath
 
-    public init(port: Int = Preferences.defaultPort, repoPath: String = Preferences.defaultRepoPath) {
+    public init(port: Int = Preferences.defaultPort, repoPath: String = Preferences.defaultRepoPath,
+                homePath: String? = nil) {
         self.port = Endpoint.validPort(port) ?? Preferences.defaultPort
         self.repoPath = (repoPath as NSString).expandingTildeInPath
+        self.homePath = ((homePath ?? repoPath) as NSString).expandingTildeInPath
     }
 
-    public static func load(_ defaults: UserDefaults = .standard) -> Preferences {
+    /// `homePath` comes from the defaults, else $AGENT_COMMS_HOME, else the checkout itself. Point `repoPath` at a
+    /// pinned runtime (scripts/launchagents.md) and `homePath` at the board home, so a branch checked out for
+    /// development never runs against, or migrates, the live database.
+    public static func load(_ defaults: UserDefaults = .standard,
+                            environment: [String: String] = ProcessInfo.processInfo.environment) -> Preferences {
         let port = defaults.object(forKey: portKey) != nil ? defaults.integer(forKey: portKey) : defaultPort
         let repo = defaults.string(forKey: repoPathKey).flatMap { $0.isEmpty ? nil : $0 } ?? defaultRepoPath
-        return Preferences(port: port, repoPath: repo)
+        let home = defaults.string(forKey: homePathKey).flatMap { $0.isEmpty ? nil : $0 }
+            ?? environment["AGENT_COMMS_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+        return Preferences(port: port, repoPath: repo, homePath: home)
     }
 }
 

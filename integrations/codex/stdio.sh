@@ -4,4 +4,4 @@ set -euo pipefail
 export AGENT_COMMS_HOME="${AGENT_COMMS_HOME:-$HOME/agent-comms}"
 integration_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 board_code="$(cd -- "$integration_dir/../.." && pwd)"
-exec uv run --project "$board_code" python "$integration_dir/stdio.py"
+exec uv run --no-dev --project "$board_code" python "$integration_dir/stdio.py"

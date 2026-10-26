@@ -67,23 +67,27 @@ public enum ServerLaunchError: Error, CustomStringConvertible, Equatable {
     }
 }
 
-/// Starts `uv run --project <repo> board serve --port <port>` detached from the app: explicit argv, no shell,
-/// stdin from /dev/null, stdout and stderr appended to `<repo>/data/menubar-server.log` (mode 600).
+/// Starts `uv run --no-dev --project <repo> board serve --port <port>` detached from the app: explicit argv, no shell,
+/// stdin from /dev/null, stdout and stderr appended to `<home>/data/menubar-server.log` (mode 600). With a
+/// `homePath`, the server gets AGENT_COMMS_HOME=<home>, so the code (repoPath) and the board's data can live apart.
 public struct ServerLauncher {
     public var repoPath: String
+    public var homePath: String?
     public var port: Int
     public var locator: UVLocator
 
-    public init(repoPath: String, port: Int, locator: UVLocator = UVLocator()) {
+    public init(repoPath: String, port: Int, homePath: String? = nil, locator: UVLocator = UVLocator()) {
         self.repoPath = repoPath
+        self.homePath = homePath
         self.port = port
         self.locator = locator
     }
 
-    public var logPath: String { "\(repoPath)/data/menubar-server.log" }
+    var dataHome: String { homePath ?? repoPath }
+    public var logPath: String { "\(dataHome)/data/menubar-server.log" }
 
     public func arguments() -> [String] {
-        ["run", "--project", repoPath, "board", "serve", "--port", String(port)]
+        ["run", "--no-dev", "--project", repoPath, "board", "serve", "--port", String(port)]
     }
 
     /// The app's environment with a sane PATH and without anything that looks like a credential: the server
@@ -95,6 +99,7 @@ public struct ServerLauncher {
         }
         env["PATH"] = locator.sanePath
         env["HOME"] = env["HOME"] ?? locator.home
+        if let homePath { env["AGENT_COMMS_HOME"] = homePath }
         return env
     }
 
@@ -107,7 +112,7 @@ public struct ServerLauncher {
 
     /// Opens (creating if needed) the log file with mode 600, refusing a symlink.
     func openLog() throws -> FileHandle {
-        let dataDir = "\(repoPath)/data"
+        let dataDir = "\(dataHome)/data"
         if !FileManager.default.fileExists(atPath: dataDir) {
             do {
                 try FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: false,

@@ -141,6 +141,10 @@ anything else. The stdio MCP server and the CLI don't need it running.
 For unattended pickup on macOS, [prepare the HTTP and dispatcher LaunchAgents](scripts/launchagents.md).
 They use an independent reviewed runtime, restart unsuccessful exits, and preserve deliberate stops.
 The installer can align the existing Codex stdio launcher with that runtime without changing approvals.
+Point Claude Code's MCP server and the menu bar app at the same runtime
+([steps](scripts/launchagents.md#claude-code-and-the-menu-bar-app)), so that checking out a branch in your
+development checkout never changes the code the live board runs. Schema migrations back up the database first, and
+code that is not on `main` refuses to migrate an existing board.
 
 ## Identities
 
