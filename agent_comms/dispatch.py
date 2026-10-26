@@ -1400,7 +1400,7 @@ class Dispatcher:
             except ValueError:
                 continue
             # A run the human reset (workstreams.reset_delivery) no longer counts: the human allowed one new attempt.
-            # Nor does a run the dispatcher stopped whose request it requeued (requeue.py): one relaunch is allowed.
+            # Nor does an ended run whose request the dispatcher requeued (requeue.py): it may be launched again.
             if (isinstance(record, dict) and record.get("agent") == agent and post_id in record.get("request_ids", [])
                     and not record.get("reset_by_human") and not requeue.requeued_post(record, post_id)):
                 return True
@@ -1419,17 +1419,18 @@ class Dispatcher:
 
     def _request_failure(self, post_id: int | None, agent: str, reason: str, run_id: str | None = None,
                          stopped: bool = False) -> None:
-        """Block the requests a failed or ended run left unsettled. `stopped`: a maintenance stop (`board dispatch stop
-        --requeue`) ended the run; its generic requests go back to the queue instead, once a day per request
-        (requeue.py). The decision for this post is recorded on the run in the same transaction."""
+        """Settle the requests a failed or ended run left unsettled. `stopped`: the run ended by itself or was stopped
+        for a maintenance restart (requeue.requeue_stop); its generic requests go back to the queue, up to
+        requeue.MAX_RETRIES times a day per request, and are blocked only after that. Otherwise (a halt, a failed
+        start or preflight) they are blocked. The decision for this post is recorded on the run in the same
+        transaction."""
         if post_id is None:
             return
         with db.write_tx(self.board.conn) as c:
             record = self._get(self.RUN_PREFIX + run_id) if run_id else None
             post = c.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
             if post is None:
-                if stopped and isinstance(record, dict):
-                    requeue.mark_decided(record, post_id)
+                if stopped and isinstance(record, dict) and requeue.mark_decided(record, post_id):
                     self._put(c, self.RUN_PREFIX + run_id, record)
                 return
             managed = workstreams.get_for_post(self.board, post_id)
@@ -1485,8 +1486,7 @@ class Dispatcher:
                     self.board.refund_dispatch_launch(self.human, record["rule_id"], _in_transaction=True,
                                                      budget_day=record.get('budget_day'))
                     record["launch_refunded"] = True
-            if stopped and isinstance(record, dict):
-                requeue.mark_decided(record, post_id)
+            if stopped and isinstance(record, dict) and (requeue.mark_decided(record, post_id) or requeued):
                 self._put(c, self.RUN_PREFIX + run_id, record)
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
@@ -1903,6 +1903,10 @@ class Dispatcher:
                             rec.update(error="Tool preflight failed: " + str(exc)[:300])
                             self._record(rec)
                             self._finish(run, "preflight_failed", code)
+                    elif probing:
+                        rec.update(error="Tool preflight " + ("timed out" if run.timed_out else f"exited {code}"))
+                        self._record(rec)
+                        self._finish(run, "preflight_failed", code)
                     else:
                         self._finish(run, "timeout" if run.timed_out else "exited", code)
                 elif run.terminated_at is None and now - run.started_at >= run_timeout:
@@ -1923,10 +1927,13 @@ class Dispatcher:
             record = json.loads(value)
             if record.get("status") in ACTIVE:
                 continue
+            stopped = requeue.requeue_stop(record)
             for post_id in record.get("request_ids", []):
+                if stopped and requeue.decided(record, post_id):
+                    continue    # settled when the run ended; never rewrite an old run record on every tick
                 self._request_failure(post_id, record["agent"],
                     "Runner ended without explicit request completion: " + record.get("status", "unknown"),
-                    record["run_id"], stopped=requeue.requeue_stop(record))
+                    record["run_id"], stopped=stopped)
 
     def _reap_orphans(self, now: float) -> list[dict]:
         """Runs an earlier dispatcher left: closed when gone, counted while alive, and held to the timeout when

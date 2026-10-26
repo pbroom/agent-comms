@@ -17,6 +17,13 @@ from conftest import ASK
 from test_autorecover import PAST_GRACE, aenv, git_project, needs_you  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _retries_used_up(monkeypatch):
+    """These tests start where automatic retries end: an ended run's request blocks at once (requeue.py)."""
+    from agent_comms import requeue
+    monkeypatch.setattr(requeue, "MAX_RETRIES", 0)
+
+
 class Handoff:
     """Request #ask on thread tid, started by codex's interactive session `old`, which abandoned it. Codex's new
     session `new` reclaimed the task in the same checkout, while claude's session `peer` is busy there."""
