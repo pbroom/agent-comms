@@ -73,6 +73,8 @@ EDITABLE: dict[str, Spec] = {s.key: s for s in (
     Spec("dispatch", "timeout_minutes", float, 1, 1440, 30.0, "Wall-clock limit per run (minutes)"),
     Spec("dispatch", "kill_grace_seconds", float, 1, 300, 10.0, "SIGTERM to SIGKILL grace (seconds)"),
     Spec("dispatch", "max_concurrent", int, 1, 20, 2, "Runs at once across all agents"),
+    Spec("dispatch", "undelivered_alert_minutes", float, 0, 1440, 10.0,
+         "Tell me about a request nobody can read after this long (minutes; 0 = off)"),
 )}
 del _d
 

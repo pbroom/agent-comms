@@ -1964,3 +1964,26 @@ halts a runaway agent, so **halting is the default** and requeueing is an explic
   `_finish` recording the stop and `_request_failure` deciding; and the refund needs the binding anyway.
 - Residual: a task lease the stopped session held stays until it expires (nothing renews or releases it); the
   relaunched agent reclaims it then or uses `board_recover_request_owner`, as for any ended run.
+
+## Delivery receipts (2026-10-26)
+
+Live case: thread 27, a Codex handoff to `claude-code` for a project no Claude session had opened. The Claude the human
+was talking to ran in a cloud container that cannot reach this board, and nothing on the board noticed that the
+request had no possible reader. `delivery.py`:
+
+- A *receipt* is recorded the first time a session of a request's recipient is handed the post by an unfiltered
+  `board_read_updates` or by the `post_ids` view (a dispatched run reading its launch request). Filtered and history
+  views do not count. Each request row carries `delivered_at` and `delivered_session`. A receipt is evidence of
+  delivery only; it never starts, acknowledges or finishes a request. Receipts live in `board_state`
+  (`delivery.receipt.<post>.<recipient>`), so no schema change.
+- The *undelivered alert*: each dispatcher pass, a request still queued and unassigned with no receipt after
+  `[dispatch] undelivered_alert_minutes` (board.toml ships 10; 0 or absent = off), not covered by an active dispatch
+  rule (the pickup path owns those), whose recipient has no session in the thread's project seen within that window,
+  goes to the human once as an automatic needs-response question. It recommends one Unstick launch of that agent when
+  it has a runner, otherwise opening a session by hand. It closes on its own when every request it names is delivered,
+  moves on, or is gone.
+- Guardrails follow automatic recovery: fenced to the dispatcher that owns the board, never while paused, fixed text
+  naming only ids and agent names (no bodies, titles or project paths), only posts after the first enabled pass and
+  younger than a day, once per (post, recipient), at most 5 alert posts per pass and 5 per recipient per rolling day.
+- Not a recovery: the alert itself launches nothing. A thread an agent started is not human-authorized work
+  (autorecover `_human_in_thread`), so launching for it needs the human's click.

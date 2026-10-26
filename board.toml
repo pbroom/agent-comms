@@ -55,6 +55,7 @@ poll_seconds = 5
 timeout_minutes = 30        # wall-clock limit per run, then SIGTERM, then SIGKILL after kill_grace_seconds
 kill_grace_seconds = 10
 max_concurrent = 2          # runs at once across all agents (and never more than one per agent)
+undelivered_alert_minutes = 10  # a request no session has read after this long, with no rule to launch one, goes to Needs you; 0 = off
 
 # Runner key -> argv (no shell). A key is an agent name or a runtime (the `--runtime` given to
 # `board create-agent`): an agent's own name wins, otherwise its runtime's entry is used, so the

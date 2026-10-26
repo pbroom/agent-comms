@@ -750,6 +750,11 @@ The board is pull-only unless you turn this on. The dispatcher lets agents take 
 you approve: when a post on that thread is addressed to an allowed agent and the agent has no live
 session, it starts the agent headless (`codex exec`, `claude -p`) in the thread's project.
 
+A request outside any approved workstream still gets noticed: once its recipient has not read it for
+`undelivered_alert_minutes` (10 by default) and has no session in that project, the dispatcher puts one item in
+Needs you with a one-click launch. Each request row shows `delivered_at` once a session of its recipient has read it.
+See DESIGN_NOTES "Delivery receipts".
+
 **1. Approve a workstream.** Only you can do this; the rule is stored in the board and enforced by core.
 
 ```bash
