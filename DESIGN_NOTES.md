@@ -1977,11 +1977,12 @@ request had no possible reader. `delivery.py`:
   delivery only; it never starts, acknowledges or finishes a request. Receipts live in `board_state`
   (`delivery.receipt.<post>.<recipient>`), so no schema change.
 - The *undelivered alert*: each dispatcher pass, a request still queued and unassigned with no receipt after
-  `[dispatch] undelivered_alert_minutes` (board.toml ships 10; 0 or absent = off), not covered by an active dispatch
-  rule (the pickup path owns those), whose recipient has no session in the thread's project seen within that window,
+  `[dispatch] undelivered_alert_minutes` (board.toml ships 10; 0 or absent = off), not one the dispatcher would
+  launch for (`Dispatcher._rule_for`: a workstream rule, an inbox policy, or the one-click rule of that very post; the
+  pickup path owns those), whose recipient has no session in the thread's project seen within that window,
   goes to the human once as an automatic needs-response question. It recommends one Unstick launch of that agent when
   it has a runner, otherwise opening a session by hand. It closes on its own when every request it names is delivered,
-  moves on, or is gone.
+  moves on, or is gone, also after the alert is switched off. Receipts and alert records are pruned after 30 days.
 - Guardrails follow automatic recovery: fenced to the dispatcher that owns the board, never while paused, fixed text
   naming only ids and agent names (no bodies, titles or project paths), only posts after the first enabled pass and
   younger than a day, once per (post, recipient), at most 5 alert posts per pass and 5 per recipient per rolling day.

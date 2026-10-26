@@ -682,7 +682,7 @@ class DispatchConfig:
     timeout_minutes: float = 30.0
     max_concurrent: int = 2
     kill_grace_seconds: float = 10.0
-    undelivered_alert_minutes: float = 0.0   # 0 = off; board.toml turns it on (delivery.py)
+    undelivered_alert_minutes: float = 0.0   # 0 = off when unset; the shipped board.toml sets 10 (delivery.py)
 
     @classmethod
     def load(cls, path: Path | None = None, local: bool = True) -> "DispatchConfig":
@@ -1003,7 +1003,7 @@ class Dispatcher:
 
     def refresh_config(self) -> None:
         """Apply edited [dispatch] scalars (live_minutes, poll_seconds, timeout_minutes, kill_grace_seconds,
-        max_concurrent) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
+        max_concurrent, undelivered_alert_minutes) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
         and a new generation means new values. A file that does not validate is ignored (the Board logs it) and
         the current values stay. Runners, env and worktrees are not reloaded."""
         try:
@@ -1099,7 +1099,8 @@ class Dispatcher:
         from . import delivery
         try:
             delivery.tick(self.board, self.human, fence=self._fence(),
-                          alert_minutes=self.config.undelivered_alert_minutes, runner_for=self._runner)
+                          alert_minutes=self.config.undelivered_alert_minutes, runner_for=self._runner,
+                          rule_for=self._rule_for)
         except Exception:
             log.exception("undelivered-request pass failed")
 

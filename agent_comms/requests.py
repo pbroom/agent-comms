@@ -19,6 +19,7 @@ def for_post(board, post):
                                      (post['id'], managed['recipient'])).fetchone())
         row['evidence_post_ids'] = json.loads(row['evidence_post_ids'])
         row['updated_at'] = iso(row['updated_at'])
+        delivery.annotate(board.conn, post['id'], row)
         return [row]
     author = board.conn.execute('SELECT is_human FROM agents WHERE name=?', (post['agent'],)).fetchone()
     if post['type'] == 'decision' or not (post['needs_response'] or post['type'] in ('request','handoff','question') or (author and author['is_human'])):

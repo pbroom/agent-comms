@@ -11,11 +11,13 @@ cloud container that cannot reach this board). Two things close that gap:
   reached anyone. A receipt is evidence of delivery only: it never starts, acknowledges or finishes the request.
 - *The alert*. On each dispatcher pass (fenced, not while paused, only when `[dispatch] undelivered_alert_minutes` is
   above zero), a request that is still queued and unassigned, has no receipt for that recipient after that many
-  minutes, is not covered by an active dispatch rule (the dispatcher's own pickup path handles those), and whose
+  minutes, is not one the dispatcher would launch for (Dispatcher._rule_for: a workstream rule, an inbox policy, or
+  the one-click rule of that very post; its pickup path handles those), and whose
   recipient has no session in the thread's project seen within the same window, is reported once to the human with a
   needs-response question in its thread (Needs you). The question recommends launching the agent once (Unstick for
   that agent only) when it has a runner, and otherwise opening a session by hand. The item closes on its own once
-  every request it names is delivered, answered or gone (close_delivered).
+  every request it names is delivered, answered or gone (close_delivered), also after the alert is switched off.
+  Receipts, alert records and daily counters older than KEEP_SECONDS are pruned hourly.
 
 Guardrails, as in autorecover.py: fixed server-side text naming only thread and post ids and agent names; nothing an
 agent wrote (bodies, titles, project paths) reaches the post. Only posts created after the first pass with the alert
@@ -69,8 +71,10 @@ def record(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
         return
     keys = [_key(RECEIPT_PREFIX, d["id"], p.name) for d in posts
             if any(r.get("recipient") == p.name for r in d.get("requests") or [])]
+    keys = [k for k in dict.fromkeys(keys)
+            if board.conn.execute("SELECT 1 FROM board_state WHERE key = ?", (k,)).fetchone() is None]
     if not keys:
-        return
+        return   # a re-read before ack, or a long-poll wake, takes no write lock
     try:
         now = board.now()
         with db.write_tx(board.conn) as c:
@@ -79,7 +83,7 @@ def record(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
                              ON CONFLICT(key) DO NOTHING""",
                           (key, json.dumps({"session_id": session_id, "at": now}), p.name, now))
     except Exception:
-        log.debug("could not record delivery receipts for session %s", session_id, exc_info=True)
+        log.warning("could not record delivery receipts for session %s", session_id, exc_info=True)
 
 
 def receipt(conn, post_id: int, recipient: str) -> dict | None:
@@ -98,10 +102,16 @@ def annotate(conn, post_id: int, row: dict) -> None:
 
 
 def tick(board: Board, human: Principal, *, fence: tuple[str, str], alert_minutes: float,
-         runner_for: Callable[[str], Any]) -> list[int]:
-    """One dispatcher pass: close alerts whose requests were delivered, then alert new undelivered requests.
+         runner_for: Callable[[str], Any], rule_for: Callable[[list[dict], dict], dict | None]) -> list[int]:
+    """One dispatcher pass: close alerts whose requests settled (also with the alert switched off, so an open item
+    never strands), then alert new undelivered requests. `rule_for` is the dispatcher's own rule matching
+    (Dispatcher._rule_for), so "covered by a rule" means exactly "the dispatcher would launch for it".
     Returns the ids of alert posts made."""
-    if alert_minutes <= 0 or board.is_paused() or not _owner_ok(board.conn, fence):
+    if board.is_paused() or not _owner_ok(board.conn, fence):
+        return []
+    close_delivered(board, human)
+    _prune(board)
+    if alert_minutes <= 0:
         return []
     now = board.now()
     if _get(board.conn, WATERMARK_KEY) is None:
@@ -109,9 +119,8 @@ def tick(board: Board, human: Principal, *, fence: tuple[str, str], alert_minute
             c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'dispatcher', ?)
                          ON CONFLICT(key) DO NOTHING""", (WATERMARK_KEY, json.dumps(now), now))
         return []
-    close_delivered(board, human)
     window = alert_minutes * 60
-    by_thread = _undelivered(board, human, now, window)
+    by_thread = _undelivered(board, human, now, window, rule_for)
     made = []
     for thread_id, entries in sorted(by_thread.items()):
         if len(made) >= ALERTS_PER_PASS:
@@ -128,10 +137,12 @@ def tick(board: Board, human: Principal, *, fence: tuple[str, str], alert_minute
     return made
 
 
-def _undelivered(board: Board, human: Principal, now: float, window: float) -> dict[int, list[tuple[int, str]]]:
+def _undelivered(board: Board, human: Principal, now: float, window: float,
+                 rule_for: Callable[[list[dict], dict], dict | None]) -> dict[int, list[tuple[int, str]]]:
     c = board.conn
     watermark = _get(c, WATERMARK_KEY)
     rules = board.active_dispatch_rules(human)
+    from . import workstreams
     out: dict[int, list[tuple[int, str]]] = {}
     for post in c.execute("""SELECT p.*, t.project AS thread_project FROM posts p JOIN threads t ON t.id = p.thread_id
                              WHERE t.status = 'open' AND p.sealed = 0 AND p.created_at >= ? AND p.created_at <= ?
@@ -140,14 +151,17 @@ def _undelivered(board: Board, human: Principal, now: float, window: float) -> d
         for row in requests.for_post(board, post):
             agent = row["recipient"]
             if (row["state"] != "queued" or row["assigned_session"] is not None or row["assigned_agent"] != agent
-                    or row.get("delivered_at") or _get(c, _key(ALERT_PREFIX, post["id"], agent)) is not None):
+                    or receipt(c, post["id"], agent) is not None
+                    or _get(c, _key(ALERT_PREFIX, post["id"], agent)) is not None):
                 continue
             if c.execute("SELECT 1 FROM agents WHERE name = ? AND active = 1 AND is_human = 0", (agent,)).fetchone() \
                     is None:
                 continue
-            if any(r["thread_id"] == post["thread_id"] and agent in r["agents"]
-                   and post["created_at"] >= r["created_at_ts"] for r in rules):
-                continue   # an approved rule covers it: the dispatcher's pickup path launches and reports it
+            item = {"agent": agent, "thread_id": post["thread_id"], "post_id": post["id"],
+                    "post_created_at": post["created_at"],
+                    "managed": workstreams.get_for_post(board, post["id"]) is not None}
+            if rule_for(rules, item) is not None:
+                continue   # the dispatcher would launch for it: its pickup path launches and reports it
             if c.execute("SELECT 1 FROM sessions WHERE agent = ? AND project = ? AND last_seen >= ?",
                          (agent, post["thread_project"], now - window)).fetchone():
                 continue   # a session in the project is live and will read it; it may only be busy
@@ -236,17 +250,33 @@ def _settled(board: Board, c, post_id: int, agent: str) -> bool:
     return row is None or row["state"] != "queued" or row["assigned_session"] is not None
 
 
+PRUNED_KEY = "delivery.pruned_at"
+KEEP_SECONDS = 30 * DAY   # receipts and alert records older than this are dropped (hourly)
+
+
+def _prune(board: Board) -> None:
+    now = board.now()
+    last = _get(board.conn, PRUNED_KEY)
+    if isinstance(last, (int, float)) and now - last < 3600:
+        return
+    try:
+        with db.write_tx(board.conn) as c:
+            for prefix in (RECEIPT_PREFIX, ALERT_PREFIX, DAILY_PREFIX):
+                c.execute("DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ?",
+                          (*_range(prefix), now - KEEP_SECONDS))
+            _upsert(c, PRUNED_KEY, now, now)
+    except Exception:
+        log.exception("could not prune delivery records")
+
+
 def close_delivered(board: Board, human: Principal) -> list[int]:
     """Close every undelivered alert still in Needs you whose requests have all settled."""
     conn, closed = board.conn, []
     candidates = []
-    for r in conn.execute("SELECT key, value FROM board_state WHERE key >= ? AND key < ?", _range(POST_PREFIX)):
-        try:
-            marker = json.loads(r["value"])
-        except (TypeError, ValueError):
-            continue
-        if isinstance(marker, dict) and marker.get("kind") == "undelivered" and "closed_at" not in marker:
-            candidates.append((int(r["key"][len(POST_PREFIX):]), marker))
+    for r in conn.execute("""SELECT key, value FROM board_state WHERE key >= ? AND key < ?
+                             AND json_valid(value) AND json_extract(value, '$.kind') = 'undelivered'
+                             AND json_type(value, '$.closed_at') IS NULL""", _range(POST_PREFIX)):
+        candidates.append((int(r["key"][len(POST_PREFIX):]), json.loads(r["value"])))
     if not candidates:
         return []
     try:

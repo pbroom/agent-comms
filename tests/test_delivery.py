@@ -158,3 +158,48 @@ def test_no_alert_when_someone_can_or_does_read_it(denv, case):
     denv.clock.advance(WINDOW + 1)
     denv.d.tick()
     assert alerts(denv) == []
+
+
+def test_an_inbox_policy_covers_the_request(denv):
+    denv.board.conn.execute("UPDATE sessions SET project = ? WHERE agent = 'codex'", (OTHER,))
+    denv.board.create_inbox_policy(denv.p["human"], project=PROJECT, pickup_grace_seconds=3600)
+    denv.clock.advance(1)
+    denv.post("claude", denv.tid, "BODY", "handoff", to=["codex"])
+    denv.clock.advance(WINDOW + 1)
+    denv.d.tick()
+    assert alerts(denv) == [], "the dispatcher's inbox delivery owns it"
+
+
+def test_a_one_click_rule_covers_only_its_own_post(denv):
+    from agent_comms import unstick
+    handoff(denv)
+    unstick.unstick(denv.board, denv.p["human"], denv.tid, denv.config, only_agents=["claude"])
+    denv.session("claude", OTHER)        # live elsewhere: the one-shot launch is not spent
+    denv.clock.advance(1)
+    later = handoff(denv)
+    denv.clock.advance(WINDOW + 1)
+    denv.board.conn.execute("UPDATE sessions SET last_seen = ? WHERE agent = 'claude'", (denv.clock() - 1,))
+    denv.d.tick()
+    [post] = alerts(denv)
+    assert f"request #{later['id']} to claude" in post["body"]
+
+
+def test_an_open_alert_still_closes_after_the_setting_is_turned_off(denv):
+    handoff(denv)
+    denv.clock.advance(WINDOW + 1)
+    denv.d.tick()
+    [post] = alerts(denv)
+    denv.d.config.undelivered_alert_minutes = 0
+    denv.board.read_updates(denv.p["claude"], denv.session("claude", PROJECT))
+    denv.d.tick()
+    assert post["id"] not in needs_you(denv)
+
+
+def test_rereads_take_no_write_lock_once_the_receipt_exists(denv, monkeypatch):
+    handoff(denv)
+    sid = denv.session("claude", OTHER)
+    denv.board.read_updates(denv.p["claude"], sid)
+    def boom(*a, **kw):
+        raise AssertionError("no write transaction expected")
+    monkeypatch.setattr(delivery.db, "write_tx", boom)
+    denv.board.read_updates(denv.p["claude"], sid)
