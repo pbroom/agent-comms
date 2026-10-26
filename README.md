@@ -467,7 +467,7 @@ Why each part matters:
 - **Kept narrow in opted-in projects.** A runner that declares itself read-only (`dontAsk`, `--strict-mcp-config`, only
   folder-scoped reads and local read-only git, no `gh` at all, and Edit, Write, the token directory and `~/.ssh` denied, plus the
   `--output` deny when git is allowed) is launched exactly as written even when the project is in `[dispatch]
-  claude_tool_projects`: the scoped implementation tools and their tool preflight apply to your other Claude runners.
+  claude_tool_projects`: the scoped implementation tools apply to your other Claude runners.
 - **`prevention_forward_to`.** When the triage agent decides a proposal needs code, it posts a `request` on the inbox
   thread to that agent with `prevention_for` = the proposal's post id. The server accepts it only from the
   `prevention_owner`, only addressed to exactly `prevention_forward_to`, once per proposal, for a verified proposal
@@ -910,7 +910,9 @@ the queue, and the dispatcher launches it again under the same approval: at most
 while `tasks.auto_recover_stalled_work` is on and the board is not paused. Only after that is the request marked
 blocked, which is when it reaches you. Retries do not use up the approval's `max_launches` (it counts distinct
 launches), and task leases the ended run held on the thread are expired so the retry can reclaim them. A run that
-failed to start or ended during its tool preflight blocks at once (relaunching cannot fix it). To stop a runaway
+failed to start blocks at once (relaunching cannot fix it). A run whose tool is denied should block its request
+itself; if it exits without doing so it is retried like a crash, so a denied tool can cost up to two extra runs
+before the request blocks. To stop a runaway
 agent, use `board dispatch stop` (a halt); killing its process by hand counts as a crash and is retried.
 
 A plain stop (and Ctrl-C, SIGTERM, or the Settings page's stop) is a halt: the stopped agents' requests stay blocked
@@ -1201,7 +1203,7 @@ agent_comms/summary.py     menu bar app routes: `GET /api/summary` (counts and i
 agent_comms/unstick.py     the dashboard's Unstick: who a stalled thread waits on, the fixed request and one-shot rule
 agent_comms/awaiting.py    tasks that wait on tasks in other threads: depends_on updates, cycles, closing escalations
 agent_comms/prevention.py  the optional prevention inbox ([unstick]): routing text, the verified owner launch and forward
-agent_comms/runner_preflight.py scoped Claude tools and tool preflight for opted-in projects; read-only runners exempt
+agent_comms/runner_preflight.py scoped Claude tools for opted-in projects; read-only runners exempt
 agent_comms/resolve.py     the Needs you card's one-click actions: approve, approve & launch, reject, not now, reply, choose, ask for options
 agent_comms/human_actions.py shared by both: post as the human, rule-before-post with rollback, cooldown, launch outlook
 agent_comms/weblogin.py    dashboard sign-in: one-time login links and cookie sessions

@@ -115,8 +115,8 @@ max_concurrent = 2          # runs at once across all agents (and never more tha
 # its run directory only (./**: never the token directory, ~/.ssh or the board's data/) and local git log/show, never
 # gh (it can reach any host) and never Edit or Write. "haiku" is the Claude CLI's alias for its latest Haiku model. A
 # runner like this (dontAsk, --strict-mcp-config, folder-scoped reads and local git only, Edit/Write/token/ssh denied)
-# is launched exactly as written, also in a [dispatch] claude_tool_projects project (no scoped implementation tools,
-# no tool preflight).
+# is launched exactly as written, also in a [dispatch] claude_tool_projects project (no scoped implementation
+# tools).
 # "claude-haiku" = [
 #   "claude", "-p", "{prompt}", "--model", "haiku",
 #   "--strict-mcp-config", "--mcp-config", "/Users/you/.config/agent-comms/claude-haiku.mcp.json",

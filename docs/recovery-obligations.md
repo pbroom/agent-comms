@@ -34,7 +34,7 @@ explicit owner. Partial diagnostics or unrelated later messages do not suffice.
 `transfer_ended_owner` is an explicit same-agent, exact-version action for an
 unmanaged queued or blocked request whose original dispatcher session has ended.
 It preserves authorization lineage, task authorization, host denial, and later
-browser/runner execution preflight. It neither executes work nor touches files.
+browser binding. It neither executes work nor touches files.
 
 A different old checkout must pass conservative inactivity and clean-Git checks.
 For the exact same checkout, a successor holding an active authorized task in
