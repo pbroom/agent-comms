@@ -215,6 +215,15 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--daily-limit", type=int, help="daily inbox delivery budget (default 100, maximum 100)")
     d.add_argument("--include-existing", action="store_true",
                    help="also deliver existing queued unassigned requests")
+    d = dsub.add_parser("deliver", help="standing delivery for one agent: launch it in the project's checkout (here "
+                                        "or on a node) for requests addressed to it that nobody picks up")
+    d.add_argument("--agent", required=True, help="exact agent name (any runtime with a runner)")
+    g = d.add_mutually_exclusive_group(required=True)
+    g.add_argument("--project", help="absolute project path")
+    g.add_argument("--all-projects", action="store_true")
+    d.add_argument("--daily-limit", type=int, default=20, help="launches per UTC day (default 20, maximum 100)")
+    d.add_argument("--grace-seconds", type=int, default=120,
+                   help="wait this long for a live session to pick a request up first (30-3600, default 120)")
     d = dsub.add_parser("list", help="approvals, dispatcher status and recent launches")
     d.add_argument("--all", action="store_true", help="include revoked approvals")
     d.add_argument("--limit", type=int, default=20, help="how many recent launches to show")
@@ -423,6 +432,11 @@ def _notify_cmd(a, out, board: Board, p) -> None:
 
 
 def _fmt_rule(r: dict) -> str:
+    if r.get('kind') == 'agent_delivery':
+        scope = 'all projects' if r['scope'] == 'all_projects' else r['project']
+        return (f"delivery policy {r['id']} [{r['state']}]: {r['agent']} in {scope}, full work runs after "
+                f"{r['pickup_grace_seconds']}s unpicked, {r['launches_left']}/{r['daily_launch_limit']} launches "
+                f"left today\n    purpose: {r['purpose']}")
     if r.get('kind') == 'inbox_delivery':
         scope = 'all projects' if r['scope'] == 'all_projects' else r['project']
         existing = '; includes existing queued requests' if r['include_existing'] else '; new requests only'
@@ -468,10 +482,17 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
             notes.append("no notification rule includes agent-launched; run `board notify on` to hear about launches")
         out(r, "\n".join([f"approved {_fmt_rule(r)}", "the dispatcher acts on this only while "
                           "`board dispatch run` is running"] + [f"note: {n}" for n in notes]))
+    elif a.dispatch_cmd == "deliver":
+        r = board.create_delivery_policy(p, agent=a.agent, scope='all_projects' if a.all_projects else 'project',
+                                         project=a.project, daily_launch_limit=a.daily_limit,
+                                         pickup_grace_seconds=a.grace_seconds)
+        out(r, f"enabled {_fmt_rule(r)}\nrevoke with `board dispatch revoke {r['id']}`; the dispatcher acts on this "
+               "only while `board dispatch run` is running")
     elif a.dispatch_cmd == "list":
         config = dispatch.DispatchConfig.load()
         rules = board.list_dispatch_rules(p, include_inactive=a.all)
-        policies = board.list_inbox_policies(p, include_inactive=a.all)
+        policies = board.list_inbox_policies(p, include_inactive=a.all) + \
+            board.list_delivery_policies(p, include_inactive=a.all)
         runs = dispatch.list_runs(board, p, a.limit)
         status = dispatch.loop_status(board, config)
         st = (f"dispatcher: running (pid {status['pid']}, heartbeat {status['heartbeat_seconds_ago']}s ago)"

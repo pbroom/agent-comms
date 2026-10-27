@@ -43,6 +43,11 @@ INBOX_DAILY_MAX = 100
 INBOX_PURPOSE = ("Deliver and triage queued Codex requests in the applicable source project. This is inbox delivery only; "
                  "it grants no execution authorization, tool permissions or access. Work may proceed only within "
                  "existing human-authorized scope and normal task, ownership and host gates.")
+DELIVERY_PURPOSE = ("Standing delivery policy (the human's): handle the request(s) addressed to you in this thread, "
+                    "within what the request and the thread already ask for. Reply to each request with request_reply "
+                    "when it is done or blocked.")
+DELIVERY_DAILY_MAX = 100
+BUDGET_KINDS = ("inbox_delivery", "agent_delivery")   # daily budgets that reset at UTC midnight
 TERMINAL = ("done", "declined")
 
 log = logging.getLogger("agent_comms.core")
@@ -617,6 +622,19 @@ class Board:
                         or type(t.get('pickup_grace_seconds')) is not int
                         or not 30 <= t['pickup_grace_seconds'] <= 3600):
                     return None
+            elif t.get('kind') == 'agent_delivery':
+                scope = t.get('scope')
+                if (r['thread_id'] is not None or scope not in ('project', 'all_projects')
+                        or (scope == 'project' and (not r['project'] or not os.path.isabs(r['project'])))
+                        or (scope == 'all_projects' and r['project'] is not None)
+                        or len(agents) != 1 or t['purpose'] != DELIVERY_PURPOSE or t.get('expires_at') is not None
+                        or not 1 <= t['max_launches'] <= DELIVERY_DAILY_MAX
+                        or not 0 <= t['launches_left'] <= t['max_launches']
+                        or type(t.get('budget_day')) is not int or type(t.get('launches_used')) is not int
+                        or t['launches_used'] < 0 or type(t.get('start_post_id')) is not int
+                        or t['start_post_id'] < 0 or type(t.get('pickup_grace_seconds')) is not int
+                        or not 30 <= t['pickup_grace_seconds'] <= 3600):
+                    return None
             elif r['thread_id'] is None or t.get('kind') is not None:
                 return None
             return t
@@ -636,7 +654,7 @@ class Board:
 
     def _dispatch_launches_left(self, target: dict) -> int:
         # Reads never mutate the budget. The launch reservation resets and spends under one write transaction.
-        if target.get('kind') == 'inbox_delivery' and target['budget_day'] != int(self.now() // 86400):
+        if target.get('kind') in BUDGET_KINDS and target['budget_day'] != int(self.now() // 86400):
             return target['max_launches']
         return target['launches_left']
 
@@ -655,7 +673,67 @@ class Board:
                        scope=t['scope'],
                        reset_at=iso((int(self.now() // 86400) + 1) * 86400), include_existing=t['include_existing'],
                        start_seq=t['start_seq'], start_post_id=t['start_post_id'], pickup_grace_seconds=t['pickup_grace_seconds'])
+        elif t.get('kind') == 'agent_delivery':
+            out.update(kind='agent_delivery', agent=t['agents'][0], daily_launch_limit=t['max_launches'],
+                       scope=t['scope'], reset_at=iso((int(self.now() // 86400) + 1) * 86400),
+                       start_post_id=t['start_post_id'], pickup_grace_seconds=t['pickup_grace_seconds'])
         return out
+
+    def create_delivery_policy(self, p: Principal, *, agent: str, project: str | None = None, scope: str = 'project',
+                               daily_launch_limit: int = 20, pickup_grace_seconds: int = 120) -> dict:
+        """Human-owned standing policy (DESIGN_NOTES "Delivery policies"): when a request addressed to `agent` in an
+        open thread of the project (or any project) is still unread and unassigned after `pickup_grace_seconds`, and
+        no session of that agent in that project is live, the dispatcher launches it with its normal runner in the
+        project's checkout (here or on a node), at most `daily_launch_limit` times a UTC day. Only requests posted
+        after the policy is created."""
+        self._require_human(p, 'enable standing delivery')
+        if scope not in ('project', 'all_projects'):
+            raise Invalid('scope must be project or all_projects')
+        if scope == 'project':
+            if not isinstance(project, str) or not os.path.isabs(project):
+                raise Invalid('project must be an absolute path')
+            project = _norm_path(project)
+        elif project is not None:
+            raise Invalid('all_projects scope must not specify a project')
+        if type(daily_launch_limit) is not int or not 1 <= daily_launch_limit <= DELIVERY_DAILY_MAX:
+            raise Invalid(f'daily_launch_limit must be a whole number between 1 and {DELIVERY_DAILY_MAX}')
+        if type(pickup_grace_seconds) is not int or not 30 <= pickup_grace_seconds <= 3600:
+            raise Invalid('pickup_grace_seconds must be a whole number between 30 and 3600')
+        if not isinstance(agent, str) or not self.conn.execute(
+                "SELECT 1 FROM agents WHERE name=? AND active=1 AND is_human=0", (agent,)).fetchone():
+            raise Invalid('agent must be an active non-human agent')
+        with db.write_tx(self.conn) as c:
+            day, used = int(self.now() // 86400), 0
+            for row in self._dispatch_rows():
+                target = self._dispatch_target(row)
+                if (row['project'] == project and target and target.get('kind') == 'agent_delivery'
+                        and target['agents'] == [agent]):
+                    if self._dispatch_state(row, target) != 'revoked':
+                        raise Conflict(f'{agent} already has a delivery policy for this scope; revoke it first')
+                    if target['budget_day'] == day:
+                        used += target['launches_used']   # revoke and re-enable must not refill today's budget
+            target = dict(kind='agent_delivery', scope=scope, agents=[agent], purpose=DELIVERY_PURPOSE,
+                          max_launches=daily_launch_limit, launches_left=max(0, daily_launch_limit - used),
+                          budget_day=day, launches_used=0, expires_at=None, revoked_at=None, revoked_by=None,
+                          pickup_grace_seconds=pickup_grace_seconds,
+                          start_post_id=c.execute('SELECT COALESCE(MAX(id),0) FROM posts').fetchone()[0])
+            policy_id = c.execute('''INSERT INTO subscriptions
+                (agent,project,thread_id,events,channel,target,active,created_at) VALUES (?,?,NULL,?,?,?,1,?)''',
+                (p.name, project, json.dumps(['post.created']), DISPATCH_CHANNEL, json.dumps(target), self.now())).lastrowid
+        return self._dispatch_rule_out(self._dispatch_rows(policy_id)[0])
+
+    def list_delivery_policies(self, p: Principal, include_inactive: bool = False) -> list[dict]:
+        self._require_human(p, 'view standing delivery policies')
+        policies = [self._dispatch_rule_out(row) for row in self._dispatch_rows() if row['thread_id'] is None]
+        return [r for r in policies if r.get('kind') == 'agent_delivery'
+                and (include_inactive or r['state'] != 'revoked')]
+
+    def revoke_delivery_policy(self, p: Principal, policy_id: int) -> dict:
+        self._require_human(p, 'revoke standing delivery')
+        rows = self._dispatch_rows(policy_id)
+        if not rows or (self._dispatch_target(rows[0]) or {}).get('kind') != 'agent_delivery':
+            raise NotFound(f'delivery policy {policy_id} not found')
+        return self.revoke_dispatch_rule(p, policy_id)
 
     def create_inbox_policy(self, p: Principal, *, project: str | None = None, scope: str = 'project', daily_launch_limit: int = 100,
                             include_existing: bool = False, pickup_grace_seconds: int = 120) -> dict:
@@ -807,14 +885,14 @@ class Board:
                 return {"ok": False, "reason": state}
             if agent not in t["agents"]:
                 return {"ok": False, "reason": "not_allowed"}
-            if t.get('kind') == 'inbox_delivery' and t['budget_day'] != int(self.now() // 86400):
+            if t.get('kind') in BUDGET_KINDS and t['budget_day'] != int(self.now() // 86400):
                 t.update(budget_day=int(self.now() // 86400), launches_left=t['max_launches'], launches_used=0)
             t["launches_left"] -= 1
-            if t.get('kind') == 'inbox_delivery':
+            if t.get('kind') in BUDGET_KINDS:
                 t['launches_used'] += 1
             c.execute("UPDATE subscriptions SET target = ? WHERE id = ?", (json.dumps(t), rule_id))
             return {"ok": True, "launches_left": t["launches_left"],
-                    **({'budget_day': t['budget_day']} if t.get('kind') == 'inbox_delivery' else {})}
+                    **({'budget_day': t['budget_day']} if t.get('kind') in BUDGET_KINDS else {})}
 
     def take_dispatch_launch(self, p: Principal, rule_id: int, agent: str) -> int | None:
         """reserve_dispatch_launch without a fence: the launches left, or None when refused for any reason."""
@@ -832,11 +910,11 @@ class Board:
         with (nullcontext(self.conn) if _in_transaction else db.write_tx(self.conn)) as c:
             rows = self._dispatch_rows(rule_id)
             t = self._dispatch_target(rows[0]) if rows else None
-            if t and t.get('kind') == 'inbox_delivery' and (budget_day is None or budget_day != t['budget_day']):
+            if t and t.get('kind') in BUDGET_KINDS and (budget_day is None or budget_day != t['budget_day']):
                 return  # a refund belongs only to the day its launch was charged
             if t is not None and t["launches_left"] < t["max_launches"]:
                 t["launches_left"] += 1
-                if t.get('kind') == 'inbox_delivery':
+                if t.get('kind') in BUDGET_KINDS:
                     t['launches_used'] = max(0, t['launches_used'] - 1)
                 c.execute("UPDATE subscriptions SET target = ? WHERE id = ?", (json.dumps(t), rule_id))
 

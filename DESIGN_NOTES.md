@@ -1995,9 +1995,12 @@ One hub, many machines. The board and its single dispatcher run on the hub (the 
 machine runs `board node`, which connects out to the hub (through `board gateway` over Tailscale) and starts agents
 there when the hub's dispatcher assigns it a run. `nodes.py` is the hub side; `node.py` the node.
 
-- Identity: a node is an agent identity whose runtime is `node` (`board create-agent laptop --runtime node
-  --save-token` on the hub; copy the token to the node machine). Only such an identity may call `/api/nodes/*`; a
-  node cannot post, claim or read as an agent through those routes, and agents cannot speak the node protocol.
+- Identity: a node is an identity whose runtime is `node` (`board create-agent laptop --runtime node --save-token`
+  on the hub; copy the token to the node machine). Only such an identity may call `/api/nodes/*`, and it may call
+  nothing else but `/api/whoami`: every other API route and every MCP tool refuses it, so a node token cannot post,
+  claim or read. Agents cannot speak the node protocol.
+- Allowlist: the hub decides what each node may take, in its own `[dispatch.nodes.<name>]` (`projects`, `agents`).
+  No entry, nothing; a node's offer outside its entry is ignored.
 - Offer: `hello` (every 10 s) lists the node's projects (its own `[dispatch] worktrees` keys) and runner keys
   (agent names or runtimes), plus max_concurrent. A node unseen for 60 s is offered nothing.
 - Placement: the dispatcher decides every launch exactly as before (rules, budgets, liveness, one run per agent and
@@ -2012,8 +2015,33 @@ there when the hub's dispatcher assigns it a run. `nodes.py` is the hub side; `n
   the hub asks for. It reports `running` (pid) and `ended` (exit code or error); reports are idempotent and only the
   assigned node may make them.
 - Failure: a node silent for 180 s loses its unfinished runs (exit -1, `node_lost`); the dispatcher settles or
-  requeues their requests as for any ended run. A node restarted mid-run reports that run ended rather than
-  guessing about a process it did not start.
+  requeues their requests as for any ended run. So that a lost run never keeps going beside its replacement, the node
+  stops its own runs after 120 s without hub contact and stops any local run the hub no longer lists. It keeps
+  pid and start time of its runs in data/node-logs/node-runs.json: a restarted node terminates (then kills) what
+  its predecessor left before reporting those runs ended, and SIGTERM shuts it down the same way.
+- Stops: a stop requested before the node started the run ends it on the hub at once and the node refuses it. A
+  dispatcher that stops while a node run is still going leaves the run active (holding its agent and directory)
+  with the stop mode recorded; the next dispatcher ends it as stopped in that mode once the node confirms or is lost.
 - Any agent: a runner is any CLI with an argv template (`{prompt}`, `{project}`, `{thread}`), so Grok, Gemini or any
   other agent works the same as Claude and Codex. The launched agent reaches the board with its own client
   configuration on that machine (README "Reaching the board from other machines").
+
+## Delivery policies (2026-10-27)
+
+The human chose full work runs for automatic delivery (2026-10-27). A delivery policy (`board dispatch deliver
+--agent X --project P` or `--all-projects`; human only) is the standing OK to launch agent X with its normal runner,
+in the project's checkout (on the hub, or on a node that has the project), for any request addressed to it:
+
+- Only requests posted after the policy, in open threads of the scope, still queued and unassigned, and not already
+  covered by a workstream approval (an ordinary rule wins; a project policy wins over an all-projects one).
+- After `pickup_grace_seconds` (default 120), and only when no session of X *in that project* is live. A session of
+  X in another project cannot read the request (thread 27), so it no longer holds the launch back, unlike an
+  ordinary rule's agent-wide liveness check.
+- A daily budget per policy (default 20, at most 100, reset at UTC midnight; revoking and re-enabling does not
+  refill it), plus the dispatcher's usual limits: one run per agent and per run directory, max_concurrent,
+  timeouts, preflight and browser checks, requeue of an ended run's unsettled request.
+- The launch prompt is the ordinary one with a fixed purpose (core.DELIVERY_PURPOSE): handle the addressed requests
+  within what they and the thread already ask for. Task leases, host gates and grants apply as for any run.
+- Trade-off the human accepted: any agent that can post a request to X can cause a full run of X in that checkout.
+  The daily budget bounds a request loop between agents. The undelivered alert (delivery.py) stays quiet for
+  requests a policy covers.

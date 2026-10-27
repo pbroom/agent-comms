@@ -12,8 +12,9 @@ What passes (fail closed, as integrations/chatgpt/gateway.py):
 - Bad tokens cost little: a refused token is refused locally for REFUSED_TTL seconds, identity checks share one
   pooled upstream client and at most IDENTITY_CONCURRENCY run at once, and past FAILURE_BUDGET refusals in
   FAILURE_WINDOW seconds only tokens that were already verified get through (others get 429).
-- An MCP session belongs to the agent that opened it: a request carrying another agent's `mcp-session-id` is
-  refused, so one agent cannot read another's event stream or close its session. The human's dashboard,
+- An MCP session belongs to the agent that opened it through this gateway: a request carrying another agent's
+  `mcp-session-id` is refused (403), and one the gateway never saw opened is answered 404, so the client initializes
+  a new session. One agent cannot read another's event stream or close its session. The human's dashboard,
   sign-in links and admin routes are never reachable through the gateway, whoever calls.
 - Only `/mcp` (streamable HTTP, for any MCP client: Claude Code, Codex, Grok, others) and the agent routes of the
   HTTP API listed in API_ROUTES (for clients without MCP). Everything else is 404 before anything is forwarded.
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections import OrderedDict
 import json
 import re
 import time
@@ -85,7 +87,7 @@ def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=ti
     verified: dict[str, tuple[float, str]] = {}   # sha256(bearer) -> (checked at, agent name)
     refused: dict[str, float] = {}                # sha256(bearer) -> refused at
     failures: list[float] = []                    # times of refused identity checks (all callers)
-    sessions: dict[str, str] = {}                 # mcp-session-id -> the agent that opened it
+    sessions: OrderedDict[str, str] = OrderedDict()   # mcp-session-id -> the agent that opened it (oldest first)
     checks = asyncio.Semaphore(IDENTITY_CONCURRENCY)
     shared: dict[str, httpx.AsyncClient] = {}
 
@@ -142,8 +144,13 @@ def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=ti
         if agent is None:
             return JSONResponse({"error": "agent_identity_required"}, 403)
         session = request.headers.get("mcp-session-id")
-        if raw == "/mcp" and session is not None and sessions.get(session, agent) != agent:
-            return JSONResponse({"error": "session_belongs_to_another_agent"}, 403)
+        if raw == "/mcp" and session is not None:
+            owner = sessions.get(session)
+            if owner is None:
+                # Not opened through this gateway (or since evicted): 404 makes an MCP client initialize afresh.
+                return JSONResponse({"error": "unknown_session"}, 404)
+            if owner != agent:
+                return JSONResponse({"error": "session_belongs_to_another_agent"}, 403)
         body = await request.body()
         if raw == "/mcp" and request.method == "POST" and session is None:
             # Some clients probe this before initialize; answer "not found" instead of the SDK's 400 so they
@@ -164,10 +171,10 @@ def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=ti
         except (httpx.HTTPError, ValueError):
             return JSONResponse({"error": "upstream_unavailable"}, 502)
         opened = response.headers.get("mcp-session-id")
-        if raw == "/mcp" and opened:
-            if len(sessions) > MAX_SESSIONS:
-                sessions.clear()
-            sessions.setdefault(opened, agent)
+        if raw == "/mcp" and opened and session is None:
+            sessions[opened] = agent
+            while len(sessions) > MAX_SESSIONS:
+                sessions.popitem(last=False)
         if raw == "/mcp" and session is not None and request.method == "DELETE" and response.status_code < 300:
             sessions.pop(session, None)
 

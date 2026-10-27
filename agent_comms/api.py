@@ -233,6 +233,14 @@ class InboxPolicyIn(Body):
     pickup_grace_seconds: StrictInt = 120
 
 
+class DeliveryPolicyIn(Body):
+    agent: str
+    scope: Literal['project', 'all_projects'] = 'project'
+    project: str | None = None
+    daily_launch_limit: StrictInt = 20
+    pickup_grace_seconds: StrictInt = 120
+
+
 class LoginLinkIn(Body):
     next: str = "/"
 
@@ -329,7 +337,11 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         if auth is not None or not secret:
             request.state.auth = "bearer"
             token = auth[7:].strip() if auth and auth.lower().startswith("bearer ") else None
-            return board.authenticate(token)
+            p = board.authenticate(token)
+            if (p.runtime == "node" and not p.is_human and not request.url.path.startswith("/api/nodes/")
+                    and request.url.path != "/api/whoami"):
+                raise Forbidden("a node identity may only use /api/nodes/* (and /api/whoami)")   # nodes.py
+            return p
         check_csrf(request)
         p, renewed = weblogin.authenticate_session(board, secret)
         request.state.auth = "cookie"
@@ -684,6 +696,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         return {"status": dispatch.loop_status(board, config),
                 "rules": board.list_dispatch_rules(p),
                 "inbox_policies": board.list_inbox_policies(p, include_inactive=True),
+                "delivery_policies": board.list_delivery_policies(p, include_inactive=True),
                 "runs": dispatch.list_runs(board, p, 10),
                 # Read-only: what the files say now. A running dispatcher uses the runners it started with.
                 "runners": config.runners, "env": config.env, "worktrees": config.worktrees,
@@ -702,6 +715,14 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/admin/dispatch/inbox-policies/{policy_id}/revoke")
     def revoke_inbox_policy(policy_id: int, p: Principal = H):
         return board.revoke_inbox_policy(p, policy_id)
+
+    @app.post("/api/admin/dispatch/delivery-policies")
+    def create_delivery_policy(body: DeliveryPolicyIn, p: Principal = H):
+        return board.create_delivery_policy(p, **body.model_dump())
+
+    @app.post("/api/admin/dispatch/delivery-policies/{policy_id}/revoke")
+    def revoke_delivery_policy(policy_id: int, p: Principal = H):
+        return board.revoke_delivery_policy(p, policy_id)
 
     @app.post("/api/admin/dispatch/rules")
     def approve_workstream(body: DispatchRuleIn, p: Principal = H):

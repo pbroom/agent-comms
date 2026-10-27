@@ -31,6 +31,7 @@ def nenv(tmp_path, monkeypatch):
     # The hub has runners but no checkout of PROJECT: work there can only run on a node.
     env.config = DispatchConfig.from_dict({
         "runners": {"codex": ["codex-cli-fake", "exec", "{prompt}"]},
+        "nodes": {"laptop": {"projects": [PROJECT], "agents": ["grok"]}},
         "live_minutes": 2, "timeout_minutes": 30, "kill_grace_seconds": 10, "max_concurrent": 2})
     env.spawner = FakeSpawner()
     env.rec = Recorder()
@@ -171,3 +172,106 @@ def test_only_the_assigned_node_may_report(nenv):
     with pytest.raises(NotFound):
         nodes.report(nenv.board, other, run_id, "ended", exit_code=0)
     assert nodes.assignments(nenv.board, other)["runs"] == []
+
+
+def test_the_hub_decides_which_projects_and_agents_a_node_may_take(nenv):
+    nenv.d.config.nodes = {"laptop": {"projects": ["/work/other"], "agents": ["grok"]}}
+    nenv.node.hello()                        # offers PROJECT, which the hub does not allow it
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    assert all(r.get("node") is None for r in runs(nenv))
+    nenv.d.config.nodes = {}                 # no entry: nothing at all
+    assert nodes.node_for(nenv.board, PROJECT, "grok", "grok", nenv.d.config.nodes) is None
+
+
+def test_a_node_identity_cannot_use_board_tools(nenv):
+    client = nenv.node.client
+    assert client.post("/api/sessions", json={"project": PROJECT}).status_code == 403
+    assert client.get("/api/updates", params={"session_id": 1}).status_code == 403
+
+
+def test_a_stop_before_start_ends_the_run_and_the_node_refuses_it(nenv):
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    run_id = runs(nenv)[0]["run_id"]
+    nodes.RemoteChild(nenv.board, run_id).terminate()
+    assert nodes.run(nenv.board, run_id)["state"] == "ended"
+    nenv.node.tick()
+    assert nenv.node_spawner.calls == [], "a stopped assignment is never started"
+
+
+def test_a_run_the_hub_no_longer_lists_is_stopped_on_the_node(nenv):
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    run_id = runs(nenv)[0]["run_id"]
+    nodes.end_lost(nenv.board, run_id)      # e.g. the hub counted the node lost during a network drop
+    nenv.node.tick()
+    assert nenv.node_spawner.children[0].terminated == 1
+
+
+def test_a_node_out_of_contact_stops_its_own_runs_before_the_hub_counts_them_lost(nenv):
+    import httpx as _httpx
+    from agent_comms import node as node_mod
+    assert node_mod.SELF_STOP_SECONDS < nodes.NODE_LOST_SECONDS
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    child = nenv.node_spawner.children[0]
+
+    def down(*a, **kw):
+        raise _httpx.ConnectError("hub unreachable")
+    nenv.node.client.request = down
+    nenv.clock.advance(node_mod.SELF_STOP_SECONDS + 1)
+    with pytest.raises(_httpx.ConnectError):
+        nenv.node.tick()
+    assert child.terminated == 1, "local runs are stopped even while the hub cannot be reached"
+
+
+def test_a_restarted_node_stops_what_its_predecessor_left_before_reporting(nenv, tmp_path):
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    run_id = runs(nenv)[0]["run_id"]
+    pid = nenv.node_spawner.children[0].pid
+    signals, alive = [], {pid}
+
+    def signal_group(p, sig):
+        signals.append((p, sig))
+        alive.discard(p)
+    fresh = Node(nenv.node.client, nenv.node.config, nenv.node.log_dir, spawner=FakeSpawner(), clock=Clock(nenv),
+                 probe=lambda p, start: "ours" if p in alive else "dead", start_of=lambda p: "s",
+                 signal_group=signal_group, sleep=lambda s: None)
+    assert fresh.recover() == [run_id]
+    import signal as _signal
+    assert signals == [(pid, _signal.SIGTERM)]
+    r = nodes.run(nenv.board, run_id)
+    assert r["state"] == "ended" and "restarted" in r["error"]
+
+
+def test_dispatcher_stop_leaves_an_unconfirmed_remote_run_active_for_the_next_one(nenv):
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    nenv.d.config.kill_grace_seconds = 0
+    nenv.d.stop_children(sleep=lambda s: None)
+    [r] = runs(nenv)
+    assert r["status"] == "running" and r["stop_mode"], "the agent and directory stay held until the node confirms"
+    assert nodes.run(nenv.board, r["run_id"])["stop"] in ("terminate", "kill")
+    nenv.node.tick()                          # the node stops it and reports
+    nenv.node.tick()
+    assert nodes.run(nenv.board, r["run_id"])["state"] == "ended"
+    d2 = new_dispatcher(nenv)
+    d2.tick()
+    assert runs(nenv)[0]["status"] == "stopped"

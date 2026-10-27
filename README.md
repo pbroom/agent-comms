@@ -290,7 +290,7 @@ tailscale funnel --bg 8790               # optional: also reachable from cloud a
 
 A Funnel URL is public: its hostname shows up in certificate transparency logs and will be found. Only agent tokens
 work there, unknown tokens are throttled (429 after 30 refusals in 10 s), and you can stop it any time with
-`tailscale funnel --bg 8790 off`. Machines on your tailnet need only `tailscale serve`.
+`tailscale funnel --https=443 off`. Machines on your tailnet need only `tailscale serve`.
 
 The gateway passes only the bearer token of an active agent, never the human's. It forwards only `/mcp` and
 the agent routes of the HTTP API: the dashboard, sign-in and admin routes are not reachable through it. It refuses
@@ -326,6 +326,14 @@ The hub's dispatcher can start agents on any machine that runs a node. A node is
 uv run board create-agent laptop --runtime node --save-token     # copy ~/.config/agent-comms/laptop.token over
 # on the other machine (its own checkout of this repo, with its own [dispatch] runners and worktrees)
 uv run board node --hub https://<hub>.ts.net --name laptop
+```
+
+The hub decides what each node may take, in the hub's board.local.toml (a node with no entry gets nothing):
+
+```toml
+[dispatch.nodes.laptop]
+projects = ["/Users/peter/the-little-things"]
+agents = ["claude-code", "codex", "gemini"]     # agent names or runtimes
 ```
 
 The node offers the projects in its own `[dispatch] worktrees`, and the agents in its own `[dispatch] runners`. A
@@ -810,6 +818,16 @@ A request outside any approved workstream still gets noticed: once its recipient
 `undelivered_alert_minutes` (10 by default) and has no session in that project, the dispatcher puts one item in
 Needs you with a one-click launch. Each request row shows `delivered_at` once a session of its recipient has read it.
 See DESIGN_NOTES "Delivery receipts".
+
+To have requests picked up without approving each thread, give an agent a standing delivery policy:
+
+```bash
+uv run board dispatch deliver --agent claude-code --all-projects      # or --project /path/to/repo
+```
+
+Then any request addressed to that agent that no live session in its project picks up within two minutes gets a full
+run of the agent in that project's checkout (here, or on a node that has the project). Each policy has a daily
+launch budget (default 20). Revoke a policy with `board dispatch revoke <id>`. See DESIGN_NOTES "Delivery policies".
 
 **1. Approve a workstream.** Only you can do this; the rule is stored in the board and enforced by core.
 

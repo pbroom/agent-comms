@@ -185,3 +185,31 @@ def test_an_mcp_session_belongs_to_the_agent_that_opened_it():
         assert r.status_code == 403, method
     assert app.get("/mcp", headers={**grok, "mcp-session-id": "sess-of-grok"}).status_code == 200
     assert app.delete("/mcp", headers={**grok, "mcp-session-id": "sess-of-grok"}).status_code == 200
+
+
+def test_an_unknown_session_id_is_404_and_a_closed_one_is_forgotten():
+    tokens = {"Bearer grok-token-0000001": "grok"}
+
+    def upstream(request):
+        if request.url.path == "/api/whoami":
+            return httpx.Response(200, json={"name": "grok", "is_human": False})
+        return httpx.Response(200, json={"ok": True}, headers={"mcp-session-id": "s-new"})
+    app = TestClient(gateway.create_app("http://upstream", httpx.MockTransport(upstream), clock=Clock()))
+    grok = {"Authorization": "Bearer grok-token-0000001"}
+    assert app.get("/mcp", headers={**grok, "mcp-session-id": "someone-elses"}).status_code == 404
+    app.post("/mcp", headers=grok)
+    assert app.delete("/mcp", headers={**grok, "mcp-session-id": "s-new"}).status_code == 200
+    assert app.get("/mcp", headers={**grok, "mcp-session-id": "s-new"}).status_code == 404
+    assert tokens
+
+
+def test_a_node_token_reaches_only_the_node_routes(env):
+    from agent_comms.api import create_app as board_app
+    from agent_comms.config import create_agent
+    token = create_agent(env.settings.agents_path, "laptop", "node")
+    app = TestClient(gateway.create_app("http://127.0.0.1:8787", httpx.ASGITransport(app=board_app(env.board))))
+    node = {"Authorization": "Bearer " + token}
+    assert app.post("/api/sessions", headers=node, json={"project": "/work/repo"}).status_code == 403
+    assert app.get("/api/updates", headers=node, params={"session_id": 1}).status_code == 403
+    r = app.post("/api/nodes/hello", headers=node, json={"projects": ["/work/repo"], "runners": ["grok"]})
+    assert r.status_code == 200, r.text

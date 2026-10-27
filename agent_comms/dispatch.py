@@ -682,6 +682,7 @@ class DispatchConfig:
     timeout_minutes: float = 30.0
     max_concurrent: int = 2
     kill_grace_seconds: float = 10.0
+    nodes: dict[str, dict] = field(default_factory=dict)   # node name -> {projects, agents} it may take (nodes.py)
     undelivered_alert_minutes: float = 0.0   # 0 = off when unset; the shipped board.toml sets 10 (delivery.py)
 
     @classmethod
@@ -732,6 +733,20 @@ class DispatchConfig:
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                     raise ValueError(f"[dispatch] {k} must be a positive number")
                 setattr(c, k, float(v))
+            elif k == "nodes":
+                if not isinstance(v, dict):
+                    raise ValueError("[dispatch.nodes] maps a node name to {projects = [...], agents = [...]}")
+                c.nodes = {}
+                for name, grant in v.items():
+                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents"}
+                            or not isinstance(grant.get("projects", []), list)
+                            or not isinstance(grant.get("agents", []), list)
+                            or not all(isinstance(x, str) and os.path.isabs(x) for x in grant.get("projects", []))
+                            or not all(isinstance(x, str) and x for x in grant.get("agents", []))):
+                        raise ValueError(f"[dispatch.nodes.{name}] needs projects (absolute paths) and agents (names "
+                                         "or runtimes)")
+                    c.nodes[name] = {"projects": [x.rstrip("/") or "/" for x in grant.get("projects", [])],
+                                     "agents": list(grant.get("agents", []))}
             elif k == "undelivered_alert_minutes":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                     raise ValueError("[dispatch] undelivered_alert_minutes must be zero (off) or a positive number")
@@ -952,7 +967,8 @@ def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), n
             continue
         state = nodes.probe(board, d["run_id"]) if d.get("node") else probe(d.get("pid"), d.get("proc_start"))
         if state == "dead":
-            status = (ended_as or {}).get(d["run_id"], "gone")
+            # A node run the previous dispatcher stopped (stop_children) ends as stopped, in the mode it chose.
+            status = (ended_as or {}).get(d["run_id"]) or ("stopped" if d.get("stop_mode") else "gone")
             ended = d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
                          "note": "ended while no dispatcher was watching it (exit code unknown)"}
             if stop_mode is not None and d["run_id"] in (ended_as or {}):
@@ -1288,7 +1304,33 @@ class Dispatcher:
                    key=lambda r: (r["created_at_ts"], r["id"]), default=None)
         if ordinary is not None or item.get('managed') or not item.get('post_id'):
             return ordinary
-        return self._inbox_rule_for(rules,item)
+        return self._delivery_rule_for(rules, item) or self._inbox_rule_for(rules,item)
+
+    def _delivery_rule_for(self, rules: list[dict], item: dict) -> dict | None:
+        """A standing delivery policy (core.create_delivery_policy) covering this request: the agent's own policy for
+        the thread's project (preferred) or for all projects, created before the post. Returned with `project` set to
+        the thread's project, so the launch runs in that project's checkout like an ordinary workstream run."""
+        from . import human_actions
+        if (item.get('managed') or not item.get('post_id')
+                or human_actions.post_rule_id(self.board, item['post_id']) is not None):
+            return None
+        thread = self.board.conn.execute('SELECT project FROM threads WHERE id=?', (item['thread_id'],)).fetchone()
+        if thread is None:
+            return None
+        rule = max((r for r in rules if r.get('kind') == 'agent_delivery' and item['agent'] in r['agents']
+                    and (r['scope'] == 'all_projects' or r['project'] == thread['project'])
+                    and item['post_id'] > r['start_post_id']),
+                   key=lambda r: (r['scope'] == 'project', r['created_at_ts'], r['id']), default=None)
+        return rule | {'project': thread['project']} if rule else None
+
+    def _live_in_project(self, agent: str, project: str, now: float) -> bool:
+        """For a delivery policy: a session of the agent in THIS project seen within live_minutes, or a run of it that
+        just ended. A session in another project cannot read this request for it (live case: thread 27)."""
+        window = self.config.live_minutes * 60
+        if now - self.ended.get(agent, float("-inf")) < window:
+            return True
+        return self.board.conn.execute("SELECT 1 FROM sessions WHERE agent = ? AND project = ? AND last_seen >= ?",
+                                       (agent, project, now - window)).fetchone() is not None
 
     def _inbox_rule_for(self, rules: list[dict], item: dict) -> dict | None:
         from . import human_actions
@@ -1344,10 +1386,12 @@ class Dispatcher:
                 foreign = check_orphans(self.board, self.probe, self._own_ids())
             busy = set(self.running) | {r["agent"] for r in foreign}
             inbox = rule.get('kind') == 'inbox_delivery'
-            if inbox and now < max(item['post_created_at'],rule['created_at_ts']) + rule['pickup_grace_seconds']:
+            policy = rule.get('kind') == 'agent_delivery'
+            if ((inbox or policy)
+                    and now < max(item['post_created_at'],rule['created_at_ts']) + rule['pickup_grace_seconds']):
                 continue
-            live = (now - self.ended.get(agent,float('-inf')) < self.config.live_minutes * 60
-                    if inbox else self._live(agent, now))
+            live = (now - self.ended.get(agent,float('-inf')) < self.config.live_minutes * 60 if inbox
+                    else self._live_in_project(agent, rule['project'], now) if policy else self._live(agent, now))
             if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
                     or (not item.get('managed') and live)):
                 continue
@@ -1510,7 +1554,7 @@ class Dispatcher:
         it. A local run directory always wins: this machine never hands away work it can do itself."""
         if cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
             return None
-        return nodes.node_for(self.board, project, agent, self._runtime(agent))
+        return nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes)
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
@@ -1743,6 +1787,8 @@ class Dispatcher:
                   "started_at": now, "ended_at": None, "exit_code": None, "status": "starting"}
         if inbox:
             record.update(inbox_delivery=True, budget_day=item['budget_day'])
+        elif rule.get('kind') == 'agent_delivery':
+            record.update(delivery_policy=True, budget_day=item['budget_day'])
         from . import human_actions     # whether the rule is a one-click rule (requeue.refundable)
         record["one_click"] = rule["id"] in human_actions.one_click_rule_ids(self.board)
         if item.get('post_id'):
@@ -1919,6 +1965,9 @@ class Dispatcher:
         timeout = self.config.timeout_minutes * 60
         for d in alive:
             rid, started = d["run_id"], d.get("started_at")
+            if d.get("node") and isinstance(started, (int, float)) and now - started >= timeout:
+                nodes.request_stop(self.board, rid, "terminate")   # its node enforces the stop and the kill grace
+                continue
             if d["_state"] != "ours" or not isinstance(started, (int, float)):
                 continue  # unverified: counted, never signalled
             run_timeout = timeout
@@ -1951,6 +2000,9 @@ class Dispatcher:
             orphans = []
         for d in orphans:
             _signal_group(d["pid"], signal.SIGTERM)
+        for d in self._remote_orphans():
+            nodes.request_stop(self.board, d["run_id"], "terminate")
+            self._record(d | {"stop_mode": mode, "note": "stop requested; waiting for its node to confirm"})
         for run in self.running.values():
             run.child.terminate()
         deadline = time.monotonic() + self.config.kill_grace_seconds
@@ -1965,6 +2017,13 @@ class Dispatcher:
                 run.child.kill()
             sleep(0.2)
         for run in list(self.running.values()):
+            if isinstance(run.child, nodes.RemoteChild) and run.child.poll() is None:
+                # Its node has not confirmed the stop: keep the run active (it still holds its agent and directory)
+                # for the next dispatcher, which ends it as stopped in this mode once the node reports or is lost.
+                self.running.pop(run.agent, None)
+                rec = self._get(self.RUN_PREFIX + run.run_id) or {}
+                self._record(rec | {"stop_mode": mode, "note": "stop requested; waiting for its node to confirm"})
+                continue
             self._finish(run, "timeout" if run.timed_out else "stopped", run.child.poll(), mode)
         for d in orphans:
             if self.probe(d["pid"], d.get("proc_start")) == "ours":
@@ -1972,6 +2031,11 @@ class Dispatcher:
         if orphans:
             check_orphans(self.board, self.probe, self._own_ids(), ended_as={d["run_id"]: "stopped" for d in orphans},
                           stop_mode=mode)
+
+    def _remote_orphans(self) -> list[dict]:
+        """Node runs left active by an earlier dispatcher (nodes.py): stopped through their node, never signalled."""
+        own = self._own_ids()
+        return [d for d in _active_records(self.board) if d.get("node") and d["run_id"] not in own]
 
     def _ended_status(self, run: _Run, code: int) -> str:
         """How a run that already exited by itself ended: 'timeout' when the dispatcher was timing it out, else

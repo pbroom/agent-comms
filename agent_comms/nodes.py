@@ -9,6 +9,11 @@ process on another machine. A *node* (`board node`, node.py) runs on each other 
 - `hello`: every few seconds the node reports what it can run: the projects it has checked out (the keys of its own
   `[dispatch] worktrees`) and its runner keys (agent names or runtimes, as in `[dispatch] runners`), plus its
   max_concurrent. Stored under NODE_PREFIX with `last_seen`. A node unseen for NODE_STALE_SECONDS offers nothing.
+- The hub decides what each node may take: `[dispatch.nodes.<name>] projects = [...]` and `agents = [...]` in the
+  hub's board.local.toml. A node with no entry gets nothing, and a node offering a project or agent outside its
+  entry is not given it, whatever it claims.
+- A node identity is only a node: core refuses it on every agent route and MCP tool (api.principal,
+  mcp_server.principal); it can call nothing but `/api/nodes/*` and `/api/whoami` (which the gateway needs).
 - When the hub would launch an agent for a project it has no run directory for, and a live node offers that project
   and a runner for the agent (by name, else by its runtime), the dispatcher records an *assignment* (RUN_PREFIX)
   instead of spawning: run id, agent, thread, project, the prompt the hub built, and the timeouts. The dispatcher
@@ -17,8 +22,12 @@ process on another machine. A *node* (`board node`, node.py) runs on each other 
   directory: nothing executable comes from the hub, only the prompt text the hub's dispatcher wrote), and reports
   `running` (pid) and `ended` (exit code). It enforces the timeout and kill grace itself and honours a stop the hub
   requested (terminate / kill).
-- A node that goes silent while its run is unfinished: after NODE_LOST_SECONDS the run counts as ended (exit code
-  None, status `node_lost`), so the dispatcher settles or requeues its requests as for any ended run.
+- A node that goes silent while its run is unfinished: after NODE_LOST_SECONDS the run counts as ended (exit -1,
+  error `node_lost`), so the dispatcher settles or requeues its requests as for any ended run. The node stops its own
+  runs well before that (node.SELF_STOP_SECONDS without hub contact), and kills any local run the hub no longer
+  lists, so a lost run never keeps going beside its replacement.
+- A stop the hub requests for a run the node has not started yet ends it on the hub at once ("stopped before
+  start"), and the node refuses to start an assignment that carries a stop.
 
 Any agent CLI works: the node only needs a runner template for it, exactly as the local dispatcher does. The launched
 agent reaches the board through its own MCP or HTTP client configuration on that machine (README "Reaching the board
@@ -86,6 +95,10 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
             "max_concurrent": max_concurrent, "last_seen": now}
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
+        # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
+        c.execute("""DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ?
+                     AND json_valid(value) AND json_extract(value, '$.state') = 'ended'""",
+                  (RUN_PREFIX, RUN_PREFIX[:-1] + chr(ord(RUN_PREFIX[-1]) + 1), now - 86400))
     return {"node": p.name, "hub_time": now, **info}
 
 
@@ -115,14 +128,19 @@ def _active_runs(conn, node: str) -> int:
     return n
 
 
-def node_for(board: Board, project: str, agent: str, runtime: str | None) -> str | None:
-    """The live node that offers this project and a runner for this agent (its name, else its runtime) and has room,
-    the most recently seen first. None when there is none."""
+def node_for(board: Board, project: str, agent: str, runtime: str | None,
+             allowed: dict[str, dict] | None = None) -> str | None:
+    """The live node that offers this project and a runner for this agent (its name, else its runtime), that the hub
+    allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first."""
     now = board.now()
     project = project.rstrip("/") or "/"
     keys = {agent} | ({runtime} if runtime else set())
     for info in sorted(nodes(board), key=lambda i: -float(i.get("last_seen") or 0)):
         if now - float(info.get("last_seen") or 0) > NODE_STALE_SECONDS:
+            continue
+        grant = (allowed or {}).get(info["node"])
+        if (not grant or project not in grant.get("projects", [])
+                or agent not in grant.get("agents", []) and not (runtime and runtime in grant.get("agents", []))):
             continue
         if project not in info.get("projects", []) or not keys & set(info.get("runners", [])):
             continue
@@ -194,14 +212,18 @@ def report(board: Board, p: Principal, run_id: str, state: str, pid: Any = None,
 
 
 def request_stop(board: Board, run_id: str, how: str) -> None:
+    """Ask the node to stop a run. One it has not started yet ends here and now: the node will refuse it."""
     now = board.now()
     with db.write_tx(board.conn) as c:
         r = _get(c, RUN_PREFIX + run_id)
         if not isinstance(r, dict) or r.get("state") == "ended":
             return
-        if r.get("stop") == "kill":
+        if r.get("state") == "assigned":
+            r |= {"state": "ended", "stop": how, "error": "stopped before start", "updated_at": now}
+        elif r.get("stop") == "kill":
             return
-        r |= {"stop": how, "updated_at": now}
+        else:
+            r |= {"stop": how, "updated_at": now}
         _put(c, RUN_PREFIX + run_id, r, "dispatcher", now)
 
 
@@ -234,7 +256,7 @@ class RemoteChild:
             return -1
         if r.get("state") != "ended" and lost(self.board, r):
             end_lost(self.board, self.run_id)
-            return -1
+            r = run(self.board, self.run_id) or {}   # the node may have reported its real exit just before
         if r.get("state") != "ended":
             return None
         code = r.get("exit_code")
