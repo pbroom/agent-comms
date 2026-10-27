@@ -588,10 +588,6 @@ def _run(a, out) -> None:
         from .mcp_server import run_stdio
         if a.agent and not os.environ.get("AGENT_COMMS_TOKEN"):
             os.environ["AGENT_COMMS_TOKEN"] = load_agent_token(a.agent)
-        from . import remote
-        hub = remote.hub_url(Settings.load())
-        if hub:
-            return remote.bridge(hub, os.environ.get("AGENT_COMMS_TOKEN", ""))
         return run_stdio(channel=True if a.channel else None)
     if a.cmd == "brief":
         return _brief(a, out)
