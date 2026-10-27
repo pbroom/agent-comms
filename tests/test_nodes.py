@@ -313,3 +313,10 @@ def test_the_hub_stopping_a_run_while_the_node_starts_it_stops_it_at_once(nenv):
     nodes.RemoteChild(nenv.board, run_id).terminate()                  # ... then the hub stopped it
     nenv.node._start(r)
     assert nenv.node_spawner.children[0].terminated == 1
+
+
+def test_a_report_the_hub_refuses_is_dropped_and_the_node_keeps_working(nenv):
+    nenv.node.unreported = ["s999-grok"]        # a run the hub no longer knows (pruned after a long outage)
+    nenv.node.tick()
+    assert nenv.node.unreported == []
+    assert nodes.nodes(nenv.board)[0]["node"] == "laptop", "hello still went through"

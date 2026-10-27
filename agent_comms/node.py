@@ -99,9 +99,19 @@ class Node:
         return list(left)
 
     def _flush_unreported(self) -> None:
+        """Report the runs recover() stopped. A report the hub refuses (4xx: it no longer knows the run, e.g. pruned
+        after a long outage) is dropped; network errors and 5xx are retried next pass. Never blocks the rest of tick."""
         for rid in list(self.unreported):
-            self._call("POST", f"/api/nodes/runs/{rid}",
-                       json={"state": "ended", "error": "node restarted while the run was going; its process was stopped"})
+            try:
+                self._call("POST", f"/api/nodes/runs/{rid}", json={
+                    "state": "ended", "error": "node restarted while the run was going; its process was stopped"})
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if isinstance(status, int) and 400 <= status < 500:
+                    log.warning("hub refused the report for run %s (%s); dropping it", rid, status)
+                    self.unreported.remove(rid)
+                    continue
+                return      # hub unreachable or failing: retry next pass (hello below raises and is logged)
             self.unreported.remove(rid)
 
     # ------------------------------------------------------------ hub calls
