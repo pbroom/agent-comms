@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import threading
+import time
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -71,6 +72,14 @@ class Bridge:
         self.initialized: dict | None = None   # ... and its notifications/initialized
         self.lock = threading.Lock()           # opening a session is one at a time
 
+    def close(self) -> None:
+        """End the hub session, best effort (the client closed stdin)."""
+        if self.session:
+            try:
+                self.client.delete(self.hub + "/mcp", headers={"mcp-session-id": self.session}, timeout=2)
+            except httpx.HTTPError:
+                pass
+
     def _post(self, message: dict, session: str | None) -> httpx.Response:
         headers = {"accept": "application/json, text/event-stream", "content-type": "application/json"}
         if session:
@@ -86,8 +95,9 @@ class Bridge:
             return []
         if r.headers.get("content-type", "").startswith("text/event-stream"):
             out = []
-            for event in r.text.split("\n\n"):
-                data = "\n".join(line[5:].lstrip() for line in event.splitlines() if line.startswith("data:"))
+            text = r.text.replace("\r\n", "\n").replace("\r", "\n")
+            for event in text.split("\n\n"):
+                data = "\n".join(line[5:].lstrip() for line in event.split("\n") if line.startswith("data:"))
                 if data:
                     out.append(json.loads(data))
             return out
@@ -106,6 +116,8 @@ class Bridge:
 
     def handle(self, message: dict) -> None:
         msg_id, method = message.get("id"), message.get("method")
+        if method is None:
+            msg_id = None      # the client answering a server request: never send it an error under its own id
         try:
             if method == "initialize":
                 with self.lock:
@@ -129,13 +141,27 @@ class Bridge:
                     if self.session == session:      # nobody reopened it meanwhile
                         self._open()
                 r = self._post(message, self.session)
-            if r.status_code >= 400:
+            if not 200 <= r.status_code < 300:
                 if msg_id is not None:
                     self.write(_error(msg_id, f"agent-comms hub {self.hub} answered {r.status_code}"))
                 return
-            for m in self._messages(r):
+            try:
+                out = self._messages(r)
+            except ValueError:
+                # The hub answered (it may have run the call) but the reply could not be read: say so, so the
+                # agent checks before retrying, rather than calling the hub unreachable.
+                if msg_id is not None:
+                    self.write(_error(msg_id, f"agent-comms hub {self.hub} sent a reply that could not be read; the "
+                                              "call may have run, so check the board before retrying"))
+                return
+            for m in out:
                 self.write(m)
-        except (httpx.HTTPError, ValueError, RuntimeError) as e:
+            if msg_id is not None and not any(isinstance(m, dict) and m.get("id") == msg_id and "method" not in m
+                                              for m in out):
+                # e.g. the board restarted during a long poll and the stream ended cleanly without the answer
+                self.write(_error(msg_id, f"agent-comms hub {self.hub} ended the call without an answer; the call "
+                                          "may have run, so check the board before retrying"))
+        except (httpx.HTTPError, RuntimeError) as e:
             if msg_id is not None:
                 self.write(_error(msg_id, f"agent-comms hub {self.hub} unreachable ({type(e).__name__}); "
                                           "retrying on the next call"))
@@ -161,6 +187,11 @@ def bridge(hub: str, token: str) -> None:
             message = json.loads(line)
         except ValueError:
             continue
+        if isinstance(message, list):        # JSON-RPC batches are not relayed: answer each request in it
+            for m in message:
+                if isinstance(m, dict) and m.get("method") is not None and m.get("id") is not None:
+                    write(_error(m["id"], "agent-comms: JSON-RPC batches are not supported; send messages one by one"))
+            continue
         if not isinstance(message, dict):
             continue
         if message.get("method") in ("initialize", "notifications/initialized"):
@@ -169,8 +200,10 @@ def bridge(hub: str, token: str) -> None:
         t = threading.Thread(target=b.handle, args=(message,), daemon=True)
         t.start()
         workers = [w for w in workers if w.is_alive()] + [t]
+    deadline = time.monotonic() + 5       # stdin closed: give calls in flight one shared grace period
     for t in workers:
-        t.join(5)
+        t.join(max(0.0, deadline - time.monotonic()))
+    b.close()
 
 
 class RemoteBoard:

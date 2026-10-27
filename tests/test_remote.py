@@ -171,3 +171,50 @@ def test_an_unreachable_hub_answers_at_once_and_the_next_call_recovers(env, tmp_
     failed, took, after = run(calls(params, steps))
     assert failed and "unreachable" in failed and took < 10
     assert not after.is_error, after
+
+
+def bridge_with(responses):
+    """A Bridge against a mock hub that answers each POST with the next response."""
+    import httpx
+    out, sent = [], []
+
+    def hub(request):
+        sent.append(request)
+        return responses.pop(0)
+    b = remote.Bridge("http://127.0.0.1:1", "tok-0123456789", out.append,
+                      client=httpx.Client(transport=httpx.MockTransport(hub)))
+    return b, out, sent
+
+
+def test_a_reply_without_the_answer_is_an_error_not_silence():
+    import httpx
+    sse = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\r\n\r\n"
+    b, out, _ = bridge_with([httpx.Response(200, headers={"content-type": "text/event-stream"}, text=sse),
+                             httpx.Response(302)])
+    b.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {}})
+    assert out[-1]["id"] == 7 and "without an answer" in out[-1]["error"]["message"]
+    b.handle({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {}})
+    assert out[-1]["id"] == 8 and "302" in out[-1]["error"]["message"]
+
+
+def test_crlf_event_streams_with_several_events_are_parsed():
+    import httpx
+    sse = ("event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\n"
+           "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"ok\":true}}\r\n\r\n")
+    b, out, _ = bridge_with([httpx.Response(200, headers={"content-type": "text/event-stream"}, text=sse)])
+    b.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {}})
+    assert [m.get("id") for m in out] == [None, 9] and out[1]["result"] == {"ok": True}
+
+
+def test_an_unreadable_reply_is_not_called_unreachable():
+    import httpx
+    b, out, _ = bridge_with([httpx.Response(200, headers={"content-type": "application/json"}, text="{oops")])
+    b.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}})
+    assert "may have run" in out[-1]["error"]["message"]
+
+
+def test_a_client_response_never_gets_an_error_under_its_own_id():
+    import httpx
+    b, out, _ = bridge_with([httpx.Response(500)])
+    b.handle({"jsonrpc": "2.0", "id": 4, "result": {}})
+    assert out == []
