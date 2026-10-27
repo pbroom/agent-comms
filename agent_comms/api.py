@@ -759,6 +759,13 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def unpause(p: Principal = P):
         return board.set_paused(p, False)
 
+    @app.get("/api/brief")
+    def brief(p: Principal = P, project: list[str] = Query(default=[]), after_seq: int | None = None):
+        # The session-start hook's counts (Board.brief) for agents on other machines (remote.py).
+        if not project or len(project) > 20 or not all(isinstance(x, str) and x.startswith("/") for x in project):
+            raise Invalid("give 1 to 20 absolute project paths")
+        return board.brief(p, project, after_seq=after_seq)
+
     @app.post("/api/nodes/hello")
     def node_hello(body: NodeHelloIn, p: Principal = P):
         from . import nodes

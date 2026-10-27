@@ -8,6 +8,7 @@ the token to the agent; tools never accept a sender name.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -460,7 +461,15 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
 
 def run_stdio(channel: bool | None = None) -> None:
     from .config import Settings
-    board = Board(Settings.load())
+    from . import remote
+    settings = Settings.load()
+    hub = remote.hub_url(settings)
+    if hub:   # this machine is not the hub: relay to it (every launcher, Claude Code's and Codex's, comes here)
+        if channel or os.environ.get("AGENT_COMMS_CHANNEL"):
+            print("agent-comms: channel push needs a local board; it is off while using the hub", file=sys.stderr)
+        remote.bridge(hub, os.environ.get("AGENT_COMMS_TOKEN", ""))
+        return
+    board = Board(settings)
     # Import channel.py (which uses SDK internals) only when channels are actually requested, so an SDK
     # change there can never break the default stdio server.
     if channel is False or (channel is None and not os.environ.get("AGENT_COMMS_CHANNEL")):

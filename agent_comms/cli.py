@@ -16,6 +16,7 @@ import textwrap
 import time
 import webbrowser
 from pathlib import Path
+from types import SimpleNamespace
 
 from .config import (Settings, agent_mcp_config, agent_token_file, create_agent, human_token_file, load_agent_token,
                      read_agents, save_agent_token, write_private)
@@ -347,8 +348,17 @@ def _brief(a, out) -> None:
     key = a.state_key or (_stdin_session_id() if a.session_from_stdin else None)
     if not key and not a.seed and (a.state_key is not None or a.session_from_stdin):
         return  # since-state mode without a usable key: stay silent rather than repeat every time
-    board = Board(Settings.load())
-    p = board.authenticate(os.environ.get("AGENT_COMMS_TOKEN") or load_agent_token(a.agent))
+    from . import remote
+    settings = Settings.load()
+    token = os.environ.get("AGENT_COMMS_TOKEN") or load_agent_token(a.agent)
+    hub = remote.hub_url(settings)
+    if hub:
+        far = remote.RemoteBoard(hub, token)
+        p = SimpleNamespace(name=far.whoami()["name"])
+        board = SimpleNamespace(brief=lambda _p, projects, after_seq=None: far.brief(projects, after_seq))
+    else:
+        board = Board(settings)
+        p = board.authenticate(token)
     state = _state_file(p.name, key) if key else None
     projects = a.project or _repo_roots(os.getcwd())
     since = state is not None and not a.seed
