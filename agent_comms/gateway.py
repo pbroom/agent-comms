@@ -62,7 +62,7 @@ API_ROUTES = [(m, re.compile(p)) for m, p in (
     ("GET", r"/api/updates"), ("POST", r"/api/updates/ack"),
     ("GET", r"/api/tasks"), ("POST", r"/api/tasks"), ("GET", rf"/api/tasks/{_ID}"),
     ("POST", rf"/api/tasks/{_ID}/(claim|renew|release|transition)"),
-    ("GET", r"/api/grants"),
+    ("GET", r"/api/grants"), ("GET", r"/api/brief"),
     ("POST", r"/api/nodes/hello"), ("GET", r"/api/nodes/assignments"), ("POST", r"/api/nodes/runs/[A-Za-z0-9_-][A-Za-z0-9_.:-]*"),
 )]
 IDENTITY_TTL = 30.0   # seconds a verified token stays verified before /api/whoami is asked again

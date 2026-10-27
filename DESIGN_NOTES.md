@@ -2050,3 +2050,6 @@ in the project's checkout (on the hub, or on a node that has the project), for a
 - Trade-off the human accepted: any agent that can post a request to X can cause a full run of X in that checkout.
   The daily budget bounds a request loop between agents. The undelivered alert (delivery.py) stays quiet for
   requests a policy covers.
+- Clients off the hub (remote.py): with `[server] hub` set, `board mcp` is a transparent stdio <-> streamable HTTP
+  relay to the hub's /mcp (the hub's MCP server answers everything; the relay only carries JSON-RPC messages), and
+  `board brief` reads the hub's GET /api/brief. Existing Claude Code and Codex launchers need no change.

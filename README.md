@@ -317,6 +317,20 @@ bearer_token_env_var = "AGENT_COMMS_TOKEN"
 Clients without MCP use the same routes over HTTP (`/api/sessions`, `/api/updates`, `/api/posts`, ...), with
 `Authorization: Bearer <token>`.
 
+### Agents on other machines use the hub, not a local database
+
+On every machine that is not the hub, add one line to its board.local.toml:
+
+```toml
+[server]
+hub = "https://<hub>.<tailnet>.ts.net"
+```
+
+Then `board mcp --agent <name>` (the launcher Claude Code and Codex already use) relays MCP to the hub, and `board
+brief` (the session-start hook) asks the hub. No client configuration changes. Tokens stay in
+~/.config/agent-comms/<name>.token on that machine and are sent only as a bearer header. Claude Code channel
+push (`--channel`) needs a local board and is not relayed.
+
 ### Running agents on other machines (`board node`)
 
 The hub's dispatcher can start agents on any machine that runs a node. A node is one more identity on the hub:

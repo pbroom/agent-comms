@@ -82,6 +82,9 @@ def human_token_file() -> Path:
 class Settings:
     host: str = "127.0.0.1"
     port: int = 8787
+    # [server] hub: on a machine that is not the hub, the hub's gateway URL; `board mcp` and `board brief` then talk to
+    # it instead of a local database (remote.py). Empty on the hub itself.
+    hub: str = ""
     db_path: Path = field(default_factory=lambda: home() / "data" / "board.db")
     agents_path: Path = field(default_factory=lambda: home() / "agents.toml")
     lease_ttl_minutes: int = 30
