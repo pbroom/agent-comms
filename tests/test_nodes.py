@@ -251,9 +251,18 @@ def test_a_restarted_node_stops_what_its_predecessor_left_before_reporting(nenv,
     fresh = Node(nenv.node.client, nenv.node.config, nenv.node.log_dir, spawner=FakeSpawner(), clock=Clock(nenv),
                  probe=lambda p, start: "ours" if p in alive else "dead", start_of=lambda p: "s",
                  signal_group=signal_group, sleep=lambda s: None)
-    assert fresh.recover() == [run_id]
+    import httpx as _httpx
+    real = fresh.client.request
+
+    def down(*a, **kw):
+        raise _httpx.ConnectError("hub unreachable")
+    fresh.client.request = down
+    assert fresh.recover() == [run_id], "local cleanup needs no hub"
     import signal as _signal
     assert signals == [(pid, _signal.SIGTERM)]
+    assert nodes.run(nenv.board, run_id)["state"] == "running", "reported once the hub answers"
+    fresh.client.request = real
+    fresh.tick()
     r = nodes.run(nenv.board, run_id)
     assert r["state"] == "ended" and "restarted" in r["error"]
 
@@ -275,3 +284,32 @@ def test_dispatcher_stop_leaves_an_unconfirmed_remote_run_active_for_the_next_on
     d2 = new_dispatcher(nenv)
     d2.tick()
     assert runs(nenv)[0]["status"] == "stopped"
+
+
+def test_a_dead_nodes_orphaned_run_ends_even_while_the_hub_keeps_asking_it_to_stop(nenv):
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    nenv.node.tick()
+    run_id = runs(nenv)[0]["run_id"]
+    d2 = new_dispatcher(nenv)                # the hub restarts; the node then goes away for good
+    nenv.clock.advance(31 * 60)              # past the run's timeout: d2 asks the node to stop it, every pass
+    for _ in range(5):
+        d2.tick()
+        nenv.clock.advance(5)
+    assert nodes.run(nenv.board, run_id)["state"] == "ended"
+    [r] = [x for x in runs(nenv) if x["run_id"] == run_id]
+    assert r["status"] in ("gone", "stopped"), "the record ends, freeing the agent and its directory"
+
+
+def test_the_hub_stopping_a_run_while_the_node_starts_it_stops_it_at_once(nenv):
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"])
+    nenv.d.tick()
+    run_id = runs(nenv)[0]["run_id"]
+    [r] = nenv.node._call("GET", "/api/nodes/assignments")["runs"]    # the node fetched it while still assigned
+    nodes.RemoteChild(nenv.board, run_id).terminate()                  # ... then the hub stopped it
+    nenv.node._start(r)
+    assert nenv.node_spawner.children[0].terminated == 1

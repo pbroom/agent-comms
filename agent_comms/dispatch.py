@@ -1317,6 +1317,11 @@ class Dispatcher:
         thread = self.board.conn.execute('SELECT project FROM threads WHERE id=?', (item['thread_id'],)).fetchone()
         if thread is None:
             return None
+        # A thread's project is whatever path its creator gave. A policy runs only in a checkout the human configured
+        # (a [dispatch] worktrees key here, or a project a [dispatch.nodes] entry allows), never in an arbitrary path.
+        if (thread['project'] not in self.config.worktrees
+                and not any(thread['project'] in g.get('projects', []) for g in self.config.nodes.values())):
+            return None
         rule = max((r for r in rules if r.get('kind') == 'agent_delivery' and item['agent'] in r['agents']
                     and (r['scope'] == 'all_projects' or r['project'] == thread['project'])
                     and item['post_id'] > r['start_post_id']),

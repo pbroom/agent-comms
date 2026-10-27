@@ -2016,9 +2016,11 @@ there when the hub's dispatcher assigns it a run. `nodes.py` is the hub side; `n
   assigned node may make them.
 - Failure: a node silent for 180 s loses its unfinished runs (exit -1, `node_lost`); the dispatcher settles or
   requeues their requests as for any ended run. So that a lost run never keeps going beside its replacement, the node
-  stops its own runs after 120 s without hub contact and stops any local run the hub no longer lists. It keeps
+  stops its own runs after 90 s without hub contact and stops any local run the hub no longer lists. It keeps
   pid and start time of its runs in data/node-logs/node-runs.json: a restarted node terminates (then kills) what
-  its predecessor left before reporting those runs ended, and SIGTERM shuts it down the same way.
+  its predecessor left (before contacting the hub, so an unreachable hub cannot block it) and reports those runs
+  ended once the hub answers; SIGTERM shuts it down the same way. Only times the node caused (its hello, its reports)
+  count toward "lost": the hub's repeated stop requests never keep a dead node's run alive.
 - Stops: a stop requested before the node started the run ends it on the hub at once and the node refuses it. A
   dispatcher that stops while a node run is still going leaves the run active (holding its agent and directory)
   with the stop mode recorded; the next dispatcher ends it as stopped in that mode once the node confirms or is lost.
@@ -2032,6 +2034,9 @@ The human chose full work runs for automatic delivery (2026-10-27). A delivery p
 --agent X --project P` or `--all-projects`; human only) is the standing OK to launch agent X with its normal runner,
 in the project's checkout (on the hub, or on a node that has the project), for any request addressed to it:
 
+- Only in a checkout the human configured: a `[dispatch] worktrees` key on the hub, or a project a
+  `[dispatch.nodes]` entry allows. A thread's project is whatever path its creator gave, so an all-projects policy
+  never runs in a path an agent merely named.
 - Only requests posted after the policy, in open threads of the scope, still queued and unassigned, and not already
   covered by a workstream approval (an ordinary rule wins; a project policy wins over an all-projects one).
 - After `pickup_grace_seconds` (default 120), and only when no session of X *in that project* is live. A session of

@@ -202,7 +202,7 @@ def report(board: Board, p: Principal, run_id: str, state: str, pid: Any = None,
             return r                      # idempotent: a retried report changes nothing
         if state == "running" and r["state"] != "assigned":
             return r
-        r |= {"state": state, "updated_at": now}
+        r |= {"state": state, "updated_at": now, "node_reported_at": now}
         if state == "running":
             r["pid"] = pid
         else:
@@ -220,18 +220,21 @@ def request_stop(board: Board, run_id: str, how: str) -> None:
             return
         if r.get("state") == "assigned":
             r |= {"state": "ended", "stop": how, "error": "stopped before start", "updated_at": now}
-        elif r.get("stop") == "kill":
-            return
+        elif r.get("stop") == "kill" or r.get("stop") == how:
+            return      # already asked: a repeated request changes nothing (and never looks like node activity)
         else:
             r |= {"stop": how, "updated_at": now}
         _put(c, RUN_PREFIX + run_id, r, "dispatcher", now)
 
 
 def lost(board: Board, r: dict) -> bool:
-    """The run's node has been silent long enough that the run counts as ended."""
+    """The run's node has been silent long enough that the run counts as ended. Only times the node itself caused
+    count (its last hello, its last report on this run) and the assignment's creation, never a hub-side update such as
+    a stop request."""
     info = _get(board.conn, NODE_PREFIX + r["node"])
     seen = float(info.get("last_seen") or 0) if isinstance(info, dict) else 0.0
-    return board.now() - max(seen, float(r.get("updated_at") or 0)) > NODE_LOST_SECONDS
+    mark = max(seen, float(r.get("node_reported_at") or 0), float(r.get("created_at") or 0))
+    return board.now() - mark > NODE_LOST_SECONDS
 
 
 def end_lost(board: Board, run_id: str) -> None:

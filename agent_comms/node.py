@@ -30,7 +30,8 @@ log = logging.getLogger("agent_comms.node")
 HELLO_SECONDS = 10.0
 # Without hub contact this long, the node stops its own runs: the hub counts them lost after
 # nodes.NODE_LOST_SECONDS (180 s) and may start a replacement, which must never run beside the original.
-SELF_STOP_SECONDS = 120.0
+SELF_STOP_SECONDS = 90.0     # leaves room for a hung hub call (CALL_TIMEOUT) and the kill grace before 180 s
+CALL_TIMEOUT = httpx.Timeout(20, connect=5)
 STATE_FILE = "node-runs.json"   # run id -> {pid, proc_start}: what a restarted node must clean up
 
 
@@ -55,6 +56,7 @@ class Node:
         self.running: dict[str, _Local] = {}
         self.last_hello = float("-inf")
         self.last_contact = clock()
+        self.unreported: list[str] = []   # runs recover() ended locally, to report once the hub answers
 
     # ------------------------------------------------------------ local state (survives a node restart)
 
@@ -77,8 +79,9 @@ class Node:
         os.replace(tmp, self._state_path())
 
     def recover(self) -> list[str]:
-        """At startup: runs an earlier node process on this machine left. Each still-live process it can verify is
-        terminated, then killed after the grace period; each run is then reported ended. Returns their run ids."""
+        """At startup, before any hub contact: runs an earlier node process on this machine left. Each still-live
+        process it can verify is terminated, then killed after the grace period. Their ends are reported once the hub
+        answers (tick), so an unreachable hub never leaves them running. Returns their run ids."""
         left = self._load_state()
         alive = []
         for rid, d in left.items():
@@ -91,10 +94,15 @@ class Node:
             for pid, start in alive:
                 if self.probe(pid, start) == "ours":
                     self.signal_group(pid, signal.SIGKILL)
-        for rid in left:
-            self._report(rid, "ended", error="node restarted while the run was going; its process was stopped")
+        self.unreported = list(left)
         self._save_state()
         return list(left)
+
+    def _flush_unreported(self) -> None:
+        for rid in list(self.unreported):
+            self._call("POST", f"/api/nodes/runs/{rid}",
+                       json={"state": "ended", "error": "node restarted while the run was going; its process was stopped"})
+            self.unreported.remove(rid)
 
     # ------------------------------------------------------------ hub calls
 
@@ -111,11 +119,12 @@ class Node:
         self.last_hello = self.clock()
         return out
 
-    def _report(self, run_id: str, state: str, **fields) -> None:
+    def _report(self, run_id: str, state: str, **fields) -> dict | None:
         try:
-            self._call("POST", f"/api/nodes/runs/{run_id}", json={"state": state, **fields})
+            return self._call("POST", f"/api/nodes/runs/{run_id}", json={"state": state, **fields})
         except Exception:
             log.exception("could not report run %s as %s", run_id, state)
+            return None
 
     # ------------------------------------------------------------ one pass
 
@@ -123,6 +132,7 @@ class Node:
         """One pass. Local runs are reaped and held to their timeouts whatever the hub does; hub errors propagate
         after that (the caller logs them and retries)."""
         try:
+            self._flush_unreported()
             if self.clock() - self.last_hello >= HELLO_SECONDS:
                 self.hello()
             runs = self._call("GET", "/api/nodes/assignments").get("runs", [])
@@ -187,7 +197,9 @@ class Node:
             local.proc_start = None
         self.running[rid] = local
         self._save_state()
-        self._report(rid, "running", pid=getattr(child, "pid", None))
+        ack = self._report(rid, "running", pid=getattr(child, "pid", None))
+        if isinstance(ack, dict) and ack.get("state") == "ended":
+            self._stop(local, "terminate")    # the hub stopped it while we were starting it
         log.info("started %s for thread %s (run %s)", agent, r.get("thread_id"), rid)
 
     def _stop(self, local: _Local, how: str) -> None:
@@ -238,10 +250,10 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_term)      # launchd and `kill` stop the node cleanly, runs included
     with httpx.Client(base_url=hub.rstrip("/"), headers={"Authorization": "Bearer " + token},
-                      timeout=httpx.Timeout(30), trust_env=False) as client:
+                      timeout=CALL_TIMEOUT, trust_env=False) as client:
         node = Node(client, config, log_dir)
+        node.recover()      # local cleanup first: it must not depend on reaching the hub
         me = node.hello()
-        node.recover()
         print(f"node {me['node']} connected to {hub}: {len(me['projects'])} project(s), runners "
               f"{', '.join(me['runners']) or 'none'}")
         try:

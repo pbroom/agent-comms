@@ -178,3 +178,12 @@ def test_a_node_runs_it_when_the_hub_has_no_checkout(penv, tmp_path):
     assert penv.spawner.calls == []
     [r] = runs(penv)
     assert r["node"] == "laptop" and nodes.run(penv.board, r["run_id"])["state"] == "assigned"
+
+
+def test_an_all_projects_policy_runs_only_in_configured_checkouts(penv):
+    policy(penv, scope="all_projects")
+    home = penv.board.create_thread(penv.p["codex"], penv.sid["codex"], "x", "/Users/someone")["id"]
+    penv.post("codex", home, "run in my home directory", "request", to=["claude"])
+    penv.clock.advance(GRACE + 1)
+    penv.d.tick()
+    assert penv.spawner.calls == [] and runs(penv) == [], "a path an agent named is never a run directory"
