@@ -89,6 +89,9 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("serve", help="run HTTP API + dashboard + MCP (streamable HTTP at /mcp)")
     s.add_argument("--port", type=int)
+    s = sub.add_parser("gateway", help="run the agent gateway on localhost (default port 8790) for other machines and "
+                                       "cloud agents to reach this board through Tailscale; agents only, no dashboard")
+    s.add_argument("--port", type=int)
     s = sub.add_parser("mcp", help="run the MCP server on stdio (token from $AGENT_COMMS_TOKEN or --agent)")
     s.add_argument("--agent", help="load ~/.config/agent-comms/<agent>.token when $AGENT_COMMS_TOKEN is unset")
     s.add_argument("--channel", action="store_true",
@@ -538,6 +541,9 @@ def _run(a, out) -> None:
     if a.cmd == "serve":
         from .api import serve
         return serve(port=a.port)
+    if a.cmd == "gateway":
+        from .gateway import serve as serve_gateway
+        return serve_gateway(port=a.port)
     if a.cmd == "mcp":
         from .mcp_server import run_stdio
         if a.agent and not os.environ.get("AGENT_COMMS_TOKEN"):
