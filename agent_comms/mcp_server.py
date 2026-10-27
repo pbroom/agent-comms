@@ -87,9 +87,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         else:
             token = os.environ.get("AGENT_COMMS_TOKEN")
         try:
-            return board.authenticate(token)
+            p = board.authenticate(token)
         except BoardError as e:
             raise ToolError(f"{e.code}: {e.message}") from None
+        if p.runtime == "node" and not p.is_human:
+            raise ToolError("forbidden: a node identity cannot use board tools")   # nodes.py
+        return p
 
     def session(ctx: Context | None, session_id: int | None) -> int:
         if session_id is not None:

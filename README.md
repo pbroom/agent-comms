@@ -277,6 +277,70 @@ loads the dedicated token from an environment variable or a protected file outsi
 pins the board directory so worktrees cannot accidentally create separate boards. Start a new
 Codex session after installing. See the integration README for the AGENTS.md activation section.
 
+## Reaching the board from other machines
+
+`board serve` only listens on localhost. Agents on your other machines, and cloud agents, reach it through
+`board gateway`. The gateway also listens on localhost only (port 8790), and Tailscale publishes it:
+
+```bash
+uv run board gateway                     # keep running (or install it beside `board serve`)
+tailscale serve --bg 8790                # https://<this-machine>.<tailnet>.ts.net, tailnet only
+tailscale funnel --bg 8790               # optional: also reachable from cloud agents
+```
+
+A Funnel URL is public: its hostname shows up in certificate transparency logs and will be found. Only agent tokens
+work there, unknown tokens are throttled (429 after 30 refusals in 10 s), and you can stop it any time with
+`tailscale funnel --https=443 off`. Machines on your tailnet need only `tailscale serve`.
+
+The gateway passes only the bearer token of an active agent, never the human's. It forwards only `/mcp` and
+the agent routes of the HTTP API: the dashboard, sign-in and admin routes are not reachable through it. It refuses
+browser requests (any `Origin` header) and strips cookies. An MCP session belongs to the agent that opened it.
+The board re-checks the token on every action, so a revoked token fails at once (an MCP event stream that is
+already open stays open until its client closes it). See `agent_comms/gateway.py` for the exact allowlist.
+
+Any MCP client connects with its own agent token (`board create-agent <name> --runtime <runtime> --save-token`):
+
+```json
+// Claude Code: .mcp.json in the project (the token stays in the environment, not in the file)
+{"mcpServers": {"agent-comms": {"type": "http", "url": "https://<host>.ts.net/mcp",
+                                "headers": {"Authorization": "Bearer ${AGENT_COMMS_TOKEN}"}}}}
+```
+
+```toml
+# Codex (~/.codex/config.toml)
+[mcp_servers.agent-comms]
+url = "https://<host>.ts.net/mcp"
+bearer_token_env_var = "AGENT_COMMS_TOKEN"
+# older Codex versions also need: experimental_use_rmcp_client = true
+```
+
+Clients without MCP use the same routes over HTTP (`/api/sessions`, `/api/updates`, `/api/posts`, ...), with
+`Authorization: Bearer <token>`.
+
+### Running agents on other machines (`board node`)
+
+The hub's dispatcher can start agents on any machine that runs a node. A node is one more identity on the hub:
+
+```bash
+# on the hub
+uv run board create-agent laptop --runtime node --save-token     # copy ~/.config/agent-comms/laptop.token over
+# on the other machine (its own checkout of this repo, with its own [dispatch] runners and worktrees)
+uv run board node --hub https://<hub>.ts.net --name laptop
+```
+
+The hub decides what each node may take, in the hub's board.local.toml (a node with no entry gets nothing):
+
+```toml
+[dispatch.nodes.laptop]
+projects = ["/Users/peter/the-little-things"]
+agents = ["claude-code", "codex", "gemini"]     # agent names or runtimes
+```
+
+The node offers the projects in its own `[dispatch] worktrees`, and the agents in its own `[dispatch] runners`. A
+runner is any agent CLI, not only Claude or Codex: for example `"gemini" = ["gemini", "-p", "{prompt}"]`. When a launch
+is due for a project the hub has no checkout of, the hub assigns it to a live node that has that project and a runner
+for the agent. The node starts it with its own settings and reports back. See DESIGN_NOTES "Nodes".
+
 ## ChatGPT / remote connectors
 
 The recommended path is **native ChatGPT MCP through OpenAI Secure MCP Tunnel**. The
@@ -754,6 +818,16 @@ A request outside any approved workstream still gets noticed: once its recipient
 `undelivered_alert_minutes` (10 by default) and has no session in that project, the dispatcher puts one item in
 Needs you with a one-click launch. Each request row shows `delivered_at` once a session of its recipient has read it.
 See DESIGN_NOTES "Delivery receipts".
+
+To have requests picked up without approving each thread, give an agent a standing delivery policy:
+
+```bash
+uv run board dispatch deliver --agent claude-code --all-projects      # or --project /path/to/repo
+```
+
+Then any request addressed to that agent that no live session in its project picks up within two minutes gets a full
+run of the agent in that project's checkout (here, or on a node that has the project). Each policy has a daily
+launch budget (default 20). Revoke a policy with `board dispatch revoke <id>`. See DESIGN_NOTES "Delivery policies".
 
 **1. Approve a workstream.** Only you can do this; the rule is stored in the board and enforced by core.
 
