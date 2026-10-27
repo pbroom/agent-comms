@@ -12,13 +12,14 @@ STATES = ('queued', 'started', 'blocked', 'finished')
 
 def for_post(board, post):
     """Legacy requests have virtual queued rows until their first explicit update."""
-    from . import workstreams
+    from . import delivery, workstreams
     managed = workstreams.get_for_post(board, post['id'])
     if managed is not None:
         row = dict(board.conn.execute('SELECT * FROM request_progress WHERE post_id=? AND recipient=?',
                                      (post['id'], managed['recipient'])).fetchone())
         row['evidence_post_ids'] = json.loads(row['evidence_post_ids'])
         row['updated_at'] = iso(row['updated_at'])
+        delivery.annotate(board.conn, post['id'], row)
         return [row]
     author = board.conn.execute('SELECT is_human FROM agents WHERE name=?', (post['agent'],)).fetchone()
     if post['type'] == 'decision' or not (post['needs_response'] or post['type'] in ('request','handoff','question') or (author and author['is_human'])):
@@ -35,6 +36,7 @@ def for_post(board, post):
             version=0, updated_at=post['created_at'], disposition=None))
         row['evidence_post_ids'] = json.loads(row['evidence_post_ids'])
         row['updated_at'] = iso(row['updated_at'])
+        delivery.annotate(board.conn, post['id'], row)
         result.append(row)
     return result
 

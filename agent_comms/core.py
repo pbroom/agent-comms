@@ -1794,6 +1794,8 @@ class Board:
                 d["thread_title"] = rows[i]["thread_title"]
                 d["project"] = rows[i]["thread_project"]
                 posts.append(d)
+        from . import delivery
+        delivery.record(self, p, session_id, posts)
         return {"notice": UNTRUSTED_NOTICE, "session_id": session_id, "paused": self.is_paused(), "posts": posts,
                 "missing": [i for i in ids if i not in rows], "more": False, "ack_through": None,
                 "how_to_ack": "This is a view only (post_ids): it neither reads nor moves your cursor."}
@@ -1874,6 +1876,9 @@ class Board:
             d["thread_title"] = r["thread_title"]
             d["project"] = r["thread_project"]
             posts.append(d)
+        if not view_only:
+            from . import delivery
+            delivery.record(self, p, session_id, posts)
         from . import issues
         my_tasks = [self._task_out(r) for r in self.conn.execute(
             "SELECT * FROM tasks WHERE owner_agent = ? AND status NOT IN ('done','declined')", (p.name,))]

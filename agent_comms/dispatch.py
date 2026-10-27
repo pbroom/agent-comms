@@ -663,7 +663,8 @@ def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
 
 # The [dispatch] values a running dispatcher re-reads when the settings files change (Dispatcher.refresh_config).
 # Runners, env and worktrees are read once, when `board dispatch run` starts.
-SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent")
+SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent",
+           "undelivered_alert_minutes")
 
 
 @dataclass
@@ -681,6 +682,7 @@ class DispatchConfig:
     timeout_minutes: float = 30.0
     max_concurrent: int = 2
     kill_grace_seconds: float = 10.0
+    undelivered_alert_minutes: float = 0.0   # 0 = off when unset; the shipped board.toml sets 10 (delivery.py)
 
     @classmethod
     def load(cls, path: Path | None = None, local: bool = True) -> "DispatchConfig":
@@ -730,6 +732,10 @@ class DispatchConfig:
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                     raise ValueError(f"[dispatch] {k} must be a positive number")
                 setattr(c, k, float(v))
+            elif k == "undelivered_alert_minutes":
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                    raise ValueError("[dispatch] undelivered_alert_minutes must be zero (off) or a positive number")
+                c.undelivered_alert_minutes = float(v)
             elif k == "max_concurrent":
                 if isinstance(v, bool) or not isinstance(v, int) or v < 1:
                     raise ValueError("[dispatch] max_concurrent must be a positive integer")
@@ -997,7 +1003,7 @@ class Dispatcher:
 
     def refresh_config(self) -> None:
         """Apply edited [dispatch] scalars (live_minutes, poll_seconds, timeout_minutes, kill_grace_seconds,
-        max_concurrent) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
+        max_concurrent, undelivered_alert_minutes) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
         and a new generation means new values. A file that does not validate is ignored (the Board logs it) and
         the current values stay. Runners, env and worktrees are not reloaded."""
         try:
@@ -1074,6 +1080,7 @@ class Dispatcher:
         self._expire_generic_pickups()
         # Before the scan, so a recovery request posted now is a trigger in this same pass.
         self._auto_recover()
+        self._undelivered_alerts()
         pending = self._scan()
         self._launch_due(pending, now, foreign)
 
@@ -1086,6 +1093,16 @@ class Dispatcher:
                              live_seconds=self.config.live_minutes * 60)
         except Exception:
             log.exception("automatic recovery pass failed")
+
+    def _undelivered_alerts(self) -> None:
+        """Tell the human about requests nobody can read (delivery.py), fenced on this loop's ownership token."""
+        from . import delivery
+        try:
+            delivery.tick(self.board, self.human, fence=self._fence(),
+                          alert_minutes=self.config.undelivered_alert_minutes, runner_for=self._runner,
+                          rule_for=self._rule_for)
+        except Exception:
+            log.exception("undelivered-request pass failed")
 
     def _generic_pickups(self, rules):
         """Durable queued requests covered by an existing dispatch approval.
