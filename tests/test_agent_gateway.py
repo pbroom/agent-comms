@@ -138,3 +138,50 @@ def test_mcp_through_the_gateway_lists_board_tools(env):
                         return [t.name for t in (await session.list_tools()).tools]
 
     assert "board_read_updates" in asyncio.run(run())
+
+
+def test_a_flood_of_bad_tokens_costs_at_most_one_upstream_check_each_then_none():
+    app, seen = client({"error": "bad"}, 401)
+    for i in range(gateway.FAILURE_BUDGET):
+        assert app.post("/mcp", headers={"Authorization": f"Bearer junk-token-{i:06d}"}).status_code == 403
+        assert app.post("/mcp", headers={"Authorization": f"Bearer junk-token-{i:06d}"}).status_code == 403
+    assert len(seen) == gateway.FAILURE_BUDGET, "a refused token is refused locally on retry"
+    assert app.post("/mcp", headers={"Authorization": "Bearer junk-token-new"}).status_code == 429
+    assert len(seen) == gateway.FAILURE_BUDGET, "past the budget, unknown tokens never reach the board"
+
+
+def test_known_agents_still_pass_during_a_flood():
+    clock = Clock()
+    calls = {"n": 0}
+
+    def upstream(request):
+        if request.url.path == "/api/whoami":
+            calls["n"] += 1
+            if request.headers["authorization"] == AGENT:
+                return httpx.Response(200, json={"name": "grok", "is_human": False})
+            return httpx.Response(401, json={"error": "bad"})
+        return httpx.Response(200, json={"ok": True})
+    app = TestClient(gateway.create_app("http://upstream", httpx.MockTransport(upstream), clock=clock))
+    assert app.post("/mcp", headers={"Authorization": AGENT}).status_code == 200
+    for i in range(gateway.FAILURE_BUDGET):
+        app.post("/mcp", headers={"Authorization": f"Bearer junk-token-{i:06d}"})
+    clock.t += gateway.IDENTITY_TTL + 1
+    assert app.post("/mcp", headers={"Authorization": AGENT}).status_code == 200
+
+
+def test_an_mcp_session_belongs_to_the_agent_that_opened_it():
+    tokens = {"Bearer grok-token-0000001": "grok", "Bearer codex-token-000001": "codex"}
+
+    def upstream(request):
+        if request.url.path == "/api/whoami":
+            return httpx.Response(200, json={"name": tokens[request.headers["authorization"]], "is_human": False})
+        sid = request.headers.get("mcp-session-id") or "sess-of-" + tokens[request.headers["authorization"]]
+        return httpx.Response(200, json={"ok": True}, headers={"mcp-session-id": sid})
+    app = TestClient(gateway.create_app("http://upstream", httpx.MockTransport(upstream), clock=Clock()))
+    grok, codex = {"Authorization": "Bearer grok-token-0000001"}, {"Authorization": "Bearer codex-token-000001"}
+    assert app.post("/mcp", headers=grok).headers["mcp-session-id"] == "sess-of-grok"
+    for method in ("GET", "POST", "DELETE"):
+        r = app.request(method, "/mcp", headers={**codex, "mcp-session-id": "sess-of-grok"})
+        assert r.status_code == 403, method
+    assert app.get("/mcp", headers={**grok, "mcp-session-id": "sess-of-grok"}).status_code == 200
+    assert app.delete("/mcp", headers={**grok, "mcp-session-id": "sess-of-grok"}).status_code == 200

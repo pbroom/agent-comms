@@ -46,6 +46,19 @@ class CapabilitiesIn(Body):
     activity: Literal['idle', 'active', 'unknown'] = 'unknown'
 
 
+class NodeHelloIn(Body):
+    projects: list[str]
+    runners: list[str]
+    max_concurrent: StrictInt = 1
+
+
+class NodeReportIn(Body):
+    state: Literal['running', 'ended']
+    pid: StrictInt | None = None
+    exit_code: StrictInt | None = None
+    error: str | None = None
+
+
 class RequestRouteIn(Body):
     session_id: int | None = None
     recipient: str
@@ -724,6 +737,21 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/admin/unpause")
     def unpause(p: Principal = P):
         return board.set_paused(p, False)
+
+    @app.post("/api/nodes/hello")
+    def node_hello(body: NodeHelloIn, p: Principal = P):
+        from . import nodes
+        return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent)
+
+    @app.get("/api/nodes/assignments")
+    def node_assignments(p: Principal = P):
+        from . import nodes
+        return nodes.assignments(board, p)
+
+    @app.post("/api/nodes/runs/{run_id}")
+    def node_report(run_id: str, body: NodeReportIn, p: Principal = P):
+        from . import nodes
+        return nodes.report(board, p, run_id, body.state, body.pid, body.exit_code, body.error)
 
     @app.post("/api/sessions/capabilities")
     def register_capabilities(body: CapabilitiesIn, request: Request, p: Principal = P):

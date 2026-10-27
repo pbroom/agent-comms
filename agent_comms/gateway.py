@@ -5,12 +5,20 @@ by Tailscale: `tailscale serve` for machines on the tailnet, and optionally `tai
 (README "Reaching the board from other machines"). Nothing here opens a port on a public interface.
 
 What passes (fail closed, as integrations/chatgpt/gateway.py):
-- Only a bearer token of an active non-human agent: each request's token is checked against `/api/whoami`
-  upstream (re-checked at least every IDENTITY_TTL seconds, so a revoked or rotated token stops working within
-  30 s), and a human token is refused. The human's dashboard,
+- Only a bearer token of an active non-human agent: the token is checked against `/api/whoami` upstream (re-checked
+  at least every IDENTITY_TTL seconds), and a human token is refused. The board itself re-authenticates the
+  forwarded token on every API call and MCP tool call, so a revoked token fails at once on any action; an already
+  open MCP event stream (GET /mcp) stays open until the client closes it.
+- Bad tokens cost little: a refused token is refused locally for REFUSED_TTL seconds, identity checks share one
+  pooled upstream client and at most IDENTITY_CONCURRENCY run at once, and past FAILURE_BUDGET refusals in
+  FAILURE_WINDOW seconds only tokens that were already verified get through (others get 429).
+- An MCP session belongs to the agent that opened it: a request carrying another agent's `mcp-session-id` is
+  refused, so one agent cannot read another's event stream or close its session. The human's dashboard,
   sign-in links and admin routes are never reachable through the gateway, whoever calls.
 - Only `/mcp` (streamable HTTP, for any MCP client: Claude Code, Codex, Grok, others) and the agent routes of the
   HTTP API listed in API_ROUTES (for clients without MCP). Everything else is 404 before anything is forwarded.
+  `/mcp` offers every board tool an agent has locally (browser bookkeeping included); the HTTP list is narrower.
+  The board enforces each tool's permissions either way.
 - No browser: a request carrying an Origin header is refused (server-to-server only). The raw path must equal the
   decoded path, so encoded tricks (`/%6dcp`) cannot reach another route.
 - Only the headers in HEADERS go upstream and only those in RESPONSE_HEADERS come back (no cookies).
@@ -19,7 +27,8 @@ The upstream board still does every authorization check; the gateway only narrow
 """
 from __future__ import annotations
 
-import hmac
+import asyncio
+import hashlib
 import json
 import re
 import time
@@ -47,13 +56,19 @@ API_ROUTES = [(m, re.compile(p)) for m, p in (
     ("POST", rf"/api/issues/{_ID}/(links|comments)"),
     ("POST", r"/api/posts"), ("GET", rf"/api/posts/{_ID}"), ("POST", rf"/api/posts/{_ID}/attention/resolve"),
     ("POST", rf"/api/posts/{_ID}/(request-route|request-repost|request-progress|requests/recover-owner)"),
-    ("GET", rf"/api/posts/{_ID}/requests/[A-Za-z0-9_.-]+/history"),
+    ("GET", rf"/api/posts/{_ID}/requests/[A-Za-z0-9_-][A-Za-z0-9_.-]*/history"),
     ("GET", r"/api/updates"), ("POST", r"/api/updates/ack"),
     ("GET", r"/api/tasks"), ("POST", r"/api/tasks"), ("GET", rf"/api/tasks/{_ID}"),
     ("POST", rf"/api/tasks/{_ID}/(claim|renew|release|transition)"),
     ("GET", r"/api/grants"),
+    ("POST", r"/api/nodes/hello"), ("GET", r"/api/nodes/assignments"), ("POST", r"/api/nodes/runs/[A-Za-z0-9_-][A-Za-z0-9_.:-]*"),
 )]
 IDENTITY_TTL = 30.0   # seconds a verified token stays verified before /api/whoami is asked again
+REFUSED_TTL = 10.0    # seconds a refused token is refused without asking upstream again
+FAILURE_WINDOW = 10.0
+FAILURE_BUDGET = 30   # refused identity checks per window across all callers; past it, unknown tokens get 429
+IDENTITY_CONCURRENCY = 4
+MAX_SESSIONS = 10_000
 
 
 def allowed(method: str, path: str) -> bool:
@@ -62,24 +77,51 @@ def allowed(method: str, path: str) -> bool:
     return any(m == method and rx.fullmatch(path) for m, rx in API_ROUTES)
 
 
-def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=time.monotonic) -> Starlette:
-    verified: dict[str, tuple[float, str]] = {}   # bearer -> (checked at, agent name)
+def _digest(bearer: str) -> str:
+    return hashlib.sha256(bearer.encode()).hexdigest()
 
-    async def identity(client: httpx.AsyncClient, bearer: str) -> str | None:
-        hit = verified.get(bearer)
-        if hit and clock() - hit[0] < IDENTITY_TTL:
+
+def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=time.monotonic) -> Starlette:
+    verified: dict[str, tuple[float, str]] = {}   # sha256(bearer) -> (checked at, agent name)
+    refused: dict[str, float] = {}                # sha256(bearer) -> refused at
+    failures: list[float] = []                    # times of refused identity checks (all callers)
+    sessions: dict[str, str] = {}                 # mcp-session-id -> the agent that opened it
+    checks = asyncio.Semaphore(IDENTITY_CONCURRENCY)
+    shared: dict[str, httpx.AsyncClient] = {}
+
+    def client() -> httpx.AsyncClient:
+        if "c" not in shared:
+            shared["c"] = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(60, read=300), trust_env=False,
+                                            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16))
+        return shared["c"]
+
+    async def identity(bearer: str) -> str | None | bool:
+        """The agent name; None when refused; False when refused without asking (failure budget spent)."""
+        key, now = _digest(bearer), clock()
+        hit = verified.get(key)
+        if hit and now - hit[0] < IDENTITY_TTL:
             return hit[1]
-        r = await client.get(upstream + "/api/whoami", headers={"authorization": bearer})
+        if now - refused.get(key, float("-inf")) < REFUSED_TTL:
+            return None
+        failures[:] = [t for t in failures if now - t < FAILURE_WINDOW]
+        if hit is None and len(failures) >= FAILURE_BUDGET:
+            return False    # under a flood of bad tokens only already-known agents get through
+        async with checks:
+            r = await client().get(upstream + "/api/whoami", headers={"authorization": bearer})
         try:
             body = r.json() if r.status_code == 200 else None
         except ValueError:
             body = None
         if not isinstance(body, dict) or body.get("is_human") is not False or not isinstance(body.get("name"), str):
-            verified.pop(bearer, None)
+            verified.pop(key, None)
+            if len(refused) > 10_000:
+                refused.clear()
+            refused[key] = clock()
+            failures.append(clock())
             return None
         if len(verified) > 1000:
             verified.clear()
-        verified[bearer] = (clock(), body["name"])
+        verified[key] = (clock(), body["name"])
         return body["name"]
 
     async def proxy(request: Request):
@@ -91,39 +133,56 @@ def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=ti
         raw = request.scope.get("raw_path", b"").decode("ascii", "replace")
         if raw != request.url.path or not allowed(request.method, raw):
             return JSONResponse({"error": "route_not_allowed"}, 404)
-        client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(60, read=300), trust_env=False)
         try:
-            if await identity(client, auth[0]) is None:
-                await client.aclose()
-                return JSONResponse({"error": "agent_identity_required"}, 403)
-            body = await request.body()
-            if raw == "/mcp" and request.method == "POST" and "mcp-session-id" not in request.headers:
-                # Some clients probe this before initialize; answer "not found" instead of the SDK's 400 so they
-                # fall back to initialize (as integrations/chatgpt/gateway.py does).
-                try:
-                    message = json.loads(body)
-                except (ValueError, UnicodeDecodeError):
-                    message = None
-                if (isinstance(message, dict) and message.get("jsonrpc") == "2.0"
-                        and message.get("method") == "server/discover" and type(message.get("id")) in (str, int)):
-                    await client.aclose()
-                    return JSONResponse({"jsonrpc": "2.0", "id": message["id"],
-                                         "error": {"code": -32601, "message": "Method not found"}})
-            headers = {k: v for k, v in request.headers.items() if k in HEADERS}
-            url = upstream + raw + ("?" + request.url.query if request.url.query else "")
-            response = await client.send(client.build_request(request.method, url, headers=headers, content=body),
-                                         stream=True)
-        except (httpx.HTTPError, ValueError):
-            await client.aclose()
+            agent = await identity(auth[0])
+        except httpx.HTTPError:
             return JSONResponse({"error": "upstream_unavailable"}, 502)
+        if agent is False:
+            return JSONResponse({"error": "too_many_failed_sign_ins"}, 429)
+        if agent is None:
+            return JSONResponse({"error": "agent_identity_required"}, 403)
+        session = request.headers.get("mcp-session-id")
+        if raw == "/mcp" and session is not None and sessions.get(session, agent) != agent:
+            return JSONResponse({"error": "session_belongs_to_another_agent"}, 403)
+        body = await request.body()
+        if raw == "/mcp" and request.method == "POST" and session is None:
+            # Some clients probe this before initialize; answer "not found" instead of the SDK's 400 so they
+            # fall back to initialize (as integrations/chatgpt/gateway.py does).
+            try:
+                message = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                message = None
+            if (isinstance(message, dict) and message.get("jsonrpc") == "2.0"
+                    and message.get("method") == "server/discover" and type(message.get("id")) in (str, int)):
+                return JSONResponse({"jsonrpc": "2.0", "id": message["id"],
+                                     "error": {"code": -32601, "message": "Method not found"}})
+        headers = {k: v for k, v in request.headers.items() if k in HEADERS}
+        url = upstream + raw + ("?" + request.url.query if request.url.query else "")
+        c = client()
+        try:
+            response = await c.send(c.build_request(request.method, url, headers=headers, content=body), stream=True)
+        except (httpx.HTTPError, ValueError):
+            return JSONResponse({"error": "upstream_unavailable"}, 502)
+        opened = response.headers.get("mcp-session-id")
+        if raw == "/mcp" and opened:
+            if len(sessions) > MAX_SESSIONS:
+                sessions.clear()
+            sessions.setdefault(opened, agent)
+        if raw == "/mcp" and session is not None and request.method == "DELETE" and response.status_code < 300:
+            sessions.pop(session, None)
 
-        async def close():
-            await response.aclose()
-            await client.aclose()
+        async def stream():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            except httpx.HTTPError:
+                return
+            finally:
+                await response.aclose()
 
-        return StreamingResponse(response.aiter_bytes(), status_code=response.status_code,
+        return StreamingResponse(stream(), status_code=response.status_code,
                                  headers={k: v for k, v in response.headers.items() if k in RESPONSE_HEADERS},
-                                 background=BackgroundTask(close))
+                                 background=BackgroundTask(response.aclose))
 
     async def health(request: Request):
         return JSONResponse({"ok": True})
@@ -138,7 +197,7 @@ def serve(port: int | None = None) -> None:
 
     from .config import Settings
     settings = Settings.load()
-    host = "::1" if ":" in settings.host else "127.0.0.1"
     upstream = f"http://[{settings.host}]:{settings.port}" if ":" in settings.host else \
         f"http://{settings.host}:{settings.port}"
-    uvicorn.run(create_app(upstream), host=host, port=port or DEFAULT_PORT, access_log=False)
+    # Always 127.0.0.1: `tailscale serve <port>` proxies to 127.0.0.1, whatever address the board itself uses.
+    uvicorn.run(create_app(upstream), host="127.0.0.1", port=port or DEFAULT_PORT, access_log=False)

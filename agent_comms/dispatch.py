@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db, requests, requeue, workstreams, pickup
+from . import db, nodes, requests, requeue, workstreams, pickup
 from .config import NAME_RE, RUNTIME_RE, Settings, home, human_token_file
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -950,7 +950,7 @@ def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), n
     for d in _active_records(board):
         if d["run_id"] in exclude or (owner_token is not None and d.get("loop") == owner_token):
             continue
-        state = probe(d.get("pid"), d.get("proc_start"))
+        state = nodes.probe(board, d["run_id"]) if d.get("node") else probe(d.get("pid"), d.get("proc_start"))
         if state == "dead":
             status = (ended_as or {}).get(d["run_id"], "gone")
             ended = d | {"status": status, "ended_at": d.get("ended_at") or board.now(),
@@ -1505,9 +1505,18 @@ class Dispatcher:
             if stopped and isinstance(record, dict) and (requeue.mark_decided(record, post_id) or requeued):
                 self._put(c, self.RUN_PREFIX + run_id, record)
 
+    def _remote_node(self, agent: str, project: str, cwd: str | None) -> str | None:
+        """A live node (nodes.py) that runs this agent in this project, when this machine has no run directory for
+        it. A local run directory always wins: this machine never hands away work it can do itself."""
+        if cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
+            return None
+        return nodes.node_for(self.board, project, agent, self._runtime(agent))
+
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
         cwd = self.config.worktrees.get(project, project)
+        if rule.get('kind') != 'inbox_delivery' and self._remote_node(agent, project, cwd) is not None:
+            return None   # the node checks its own runner and run directory when it starts the run
         if rule.get('kind') != 'inbox_delivery' and (not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
             return "required run directory does not exist"
         template = self._runner(agent)
@@ -1763,58 +1772,73 @@ class Dispatcher:
                 browser_blocker = self._headless_blocker(agent, thread_id, record['request_ids'])
                 if browser_blocker:
                     raise Conflict(browser_blocker)
-            self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(self.log_dir, 0o700)
-            if inbox:
-                base = Path(cwd).parent
-                base.mkdir(mode=0o700,exist_ok=True)
-                if os.path.realpath(base) != str(base):
-                    raise Conflict('inbox run directory must not contain symlinks')
-                Path(cwd).mkdir(mode=0o700)  # exclusive, fresh run directory
-                # Reviewed server-owned rules are available without granting access to the source project.
-                rules = Path(__file__).resolve().parent.parent / 'AGENT_RULES.md'
-                if rules.is_file():
-                    shutil.copyfile(rules,Path(cwd) / 'AGENT_RULES.md')
-            if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
-                raise FileNotFoundError(f"run directory {cwd!r} does not exist")
-            browser = None
-            if not inbox and self.config.headless_browser_for(agent, self._runtime(agent)):
-                origins = self._headless_origins(agent, thread_id, record["request_ids"])
-                if origins:   # nothing bound: no browser server at all
-                    out_dir = self.log_dir / f"{run_id}-browser"
-                    out_dir.mkdir(mode=0o700)   # fresh per run; never reused
-                    browser = {"origins": origins, "output_dir": str(out_dir)}
-                    record["headless_browser"] = browser
-            prompt = (build_inbox_prompt(thread_id,rule['id'],record['request_ids'],run_id,cwd) if inbox
-                      else build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
-                                        headless_browser=browser is not None))
-            if item.get('managed'):
-                prompt += (' This is an assigned dependent continuation. Read its current request and continuation '
-                           'contract, register fresh successful capability probes in this exact environment, then '
-                           'claim its dependent task before editing. Report progress using the original recipient '
-                           'key from the request and its current version. Finish only with the required descendant '
-                           'ancestry and check evidence. Stop if the assignment or authorization changes.')
-            template = self._runner(agent)
-            if template is None:
-                raise LookupError(f"no runner configured for {agent}")
-            from . import runner_preflight
-            # An opted-in project runs Claude with scoped implementation tools (runner_preflight.ALLOWED); a denied
-            # tool is the agent's to report as a blocker. A read-only runner (the triage agent's) keeps its own
-            # narrower tools: the scoped override would widen it.
-            if (not inbox and project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude"
-                    and not runner_preflight.read_only(template)):
-                template = runner_preflight.scoped_template(template)
-                prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
-            if not inbox:
-                template = with_writable_roots(template, self.config.extra_roots(template, project))
-            else:
-                template = with_codex_inbox_mcp(template,child_env(agent,self.config,runtime=self._runtime(agent)))
-            if browser is not None:
-                template = with_headless_browser(template, headless_browser_overrides(
-                    self.config.headless_browser, browser["origins"], browser["output_dir"]))
-            argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
-            child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
-                                 log_path=log_path)
+            node = None if inbox or item.get('managed') else self._remote_node(agent, project, cwd)
+            if node is not None:
+                if (self.config.headless_browser_for(agent, self._runtime(agent))
+                        and self._headless_origins(agent, thread_id, record["request_ids"])):
+                    raise Conflict("a run on another machine has no headless browser yet")
+                prompt = build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id)
+                record |= {"node": node, "cwd": project}
+                self._record(record)
+                nodes.assign(self.board, node, {
+                    "run_id": run_id, "agent": agent, "runtime": self._runtime(agent), "thread_id": thread_id,
+                    "project": project, "prompt": prompt, "timeout_seconds": self.config.timeout_minutes * 60,
+                    "kill_grace_seconds": self.config.kill_grace_seconds})
+                child = nodes.RemoteChild(self.board, run_id)
+                cwd = project
+            if node is None:
+                self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(self.log_dir, 0o700)
+                if inbox:
+                    base = Path(cwd).parent
+                    base.mkdir(mode=0o700,exist_ok=True)
+                    if os.path.realpath(base) != str(base):
+                        raise Conflict('inbox run directory must not contain symlinks')
+                    Path(cwd).mkdir(mode=0o700)  # exclusive, fresh run directory
+                    # Reviewed server-owned rules are available without granting access to the source project.
+                    rules = Path(__file__).resolve().parent.parent / 'AGENT_RULES.md'
+                    if rules.is_file():
+                        shutil.copyfile(rules,Path(cwd) / 'AGENT_RULES.md')
+                if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+                    raise FileNotFoundError(f"run directory {cwd!r} does not exist")
+                browser = None
+                if not inbox and self.config.headless_browser_for(agent, self._runtime(agent)):
+                    origins = self._headless_origins(agent, thread_id, record["request_ids"])
+                    if origins:   # nothing bound: no browser server at all
+                        out_dir = self.log_dir / f"{run_id}-browser"
+                        out_dir.mkdir(mode=0o700)   # fresh per run; never reused
+                        browser = {"origins": origins, "output_dir": str(out_dir)}
+                        record["headless_browser"] = browser
+                prompt = (build_inbox_prompt(thread_id,rule['id'],record['request_ids'],run_id,cwd) if inbox
+                          else build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
+                                            headless_browser=browser is not None))
+                if item.get('managed'):
+                    prompt += (' This is an assigned dependent continuation. Read its current request and continuation '
+                               'contract, register fresh successful capability probes in this exact environment, then '
+                               'claim its dependent task before editing. Report progress using the original recipient '
+                               'key from the request and its current version. Finish only with the required descendant '
+                               'ancestry and check evidence. Stop if the assignment or authorization changes.')
+                template = self._runner(agent)
+                if template is None:
+                    raise LookupError(f"no runner configured for {agent}")
+                from . import runner_preflight
+                # An opted-in project runs Claude with scoped implementation tools (runner_preflight.ALLOWED); a denied
+                # tool is the agent's to report as a blocker. A read-only runner (the triage agent's) keeps its own
+                # narrower tools: the scoped override would widen it.
+                if (not inbox and project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude"
+                        and not runner_preflight.read_only(template)):
+                    template = runner_preflight.scoped_template(template)
+                    prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
+                if not inbox:
+                    template = with_writable_roots(template, self.config.extra_roots(template, project))
+                else:
+                    template = with_codex_inbox_mcp(template,child_env(agent,self.config,runtime=self._runtime(agent)))
+                if browser is not None:
+                    template = with_headless_browser(template, headless_browser_overrides(
+                        self.config.headless_browser, browser["origins"], browser["output_dir"]))
+                argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
+                child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
+                                     log_path=log_path)
         except Exception as e:
             self.board.refund_dispatch_launch(self.human, rule['id'], budget_day=item.get('budget_day'))
             record |= {"status": "spawn_failed", "ended_at": now, "error": f"{type(e).__name__}: {e}"[:300]}

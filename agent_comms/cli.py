@@ -92,6 +92,12 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("gateway", help="run the agent gateway on localhost (default port 8790) for other machines and "
                                        "cloud agents to reach this board through Tailscale; agents only, no dashboard")
     s.add_argument("--port", type=int)
+    s = sub.add_parser("node", help="run agents on this machine for the hub's dispatcher (connects out to --hub; "
+                                    "runners and project directories come from this machine's [dispatch] settings)")
+    s.add_argument("--hub", required=True, help="the hub's address, e.g. https://server.tailnet.ts.net (its gateway) "
+                                                "or http://127.0.0.1:8787 on the hub itself")
+    s.add_argument("--name", required=True, help="this node's identity on the hub (board create-agent <name> "
+                                                 "--runtime node there); token from ~/.config/agent-comms/<name>.token")
     s = sub.add_parser("mcp", help="run the MCP server on stdio (token from $AGENT_COMMS_TOKEN or --agent)")
     s.add_argument("--agent", help="load ~/.config/agent-comms/<agent>.token when $AGENT_COMMS_TOKEN is unset")
     s.add_argument("--channel", action="store_true",
@@ -544,6 +550,9 @@ def _run(a, out) -> None:
     if a.cmd == "gateway":
         from .gateway import serve as serve_gateway
         return serve_gateway(port=a.port)
+    if a.cmd == "node":
+        from .node import run as run_node
+        return run_node(a.hub, os.environ.get("AGENT_COMMS_TOKEN") or load_agent_token(a.name))
     if a.cmd == "mcp":
         from .mcp_server import run_stdio
         if a.agent and not os.environ.get("AGENT_COMMS_TOKEN"):
