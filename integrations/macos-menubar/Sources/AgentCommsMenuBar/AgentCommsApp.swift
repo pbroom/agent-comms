@@ -34,11 +34,15 @@ struct MenuContent: View {
         case .loading:
             Text("Checking the board…")
         case .offline:
-            Text("Board server not running")
-            Button(model.startingServer ? "Starting Board Server…" : "Start Board Server") {
-                model.startServer()
+            if let hub = model.prefs.hub {
+                Text(verbatim: "Board on \(hub) not reachable")
+            } else {
+                Text("Board server not running")
+                Button(model.startingServer ? "Starting Board Server…" : "Start Board Server") {
+                    model.startServer()
+                }
+                .disabled(model.startingServer)
             }
-            .disabled(model.startingServer)
         case .problem(let text):
             Text(verbatim: text)
         case .online(let summary):

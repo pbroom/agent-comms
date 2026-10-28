@@ -5,15 +5,18 @@ http://127.0.0.1:8787 on the hub's own machine) with its own token, a node ident
 `board create-agent <name> --runtime node`. Everything it runs comes from THIS machine's own `[dispatch]` settings
 (board.toml + board.local.toml here): `runners` (any agent CLI: an argv template with {prompt}, {project},
 {thread}), `env`, `worktrees` (hub project path -> directory here), `writable_roots`, `claude_tool_projects`,
-`max_concurrent`. From the hub it takes only the assignment: which agent, which project, the thread id and the
-prompt text the hub's dispatcher wrote. A project or runner this machine does not have is reported as a failed
-start, never improvised.
+`max_concurrent`, `headless_browser`. From the hub it takes only the assignment: which agent, which project, the thread
+id, the prompt text the hub's dispatcher wrote and, for browser-bound work, the origins the hub bound. A project or
+runner this machine does not have is reported as a failed start, never improvised. A browser-bound run gets this
+machine's own scoped headless browser (dispatch.headless_browser_overrides), allowed exactly the plain origins in the
+assignment, writing only into a fresh `<run id>-browser` directory that is removed once the run has ended.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import shutil
 import signal
 import time
 from dataclasses import dataclass
@@ -22,8 +25,9 @@ from typing import Any, Callable
 
 import httpx
 
-from .dispatch import (DispatchConfig, _signal_group, child_env, probe_process, process_start, render_argv,
-                       spawn_process, with_writable_roots)
+from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
+                       plain_origins, probe_process, process_start, remove_browser_output, render_argv, spawn_process,
+                       with_headless_browser, with_writable_roots)
 
 log = logging.getLogger("agent_comms.node")
 
@@ -94,6 +98,8 @@ class Node:
             for pid, start in alive:
                 if self.probe(pid, start) == "ours":
                     self.signal_group(pid, signal.SIGKILL)
+        for rid in left:
+            self._remove_browser_output(rid)
         self.unreported = list(left)
         self._save_state()
         return list(left)
@@ -122,10 +128,27 @@ class Node:
         self.last_contact = self.clock()
         return r.json()
 
+    def _headless_blocker(self, agent: str, runtime: str | None) -> str | None:
+        """Why this machine cannot attach the scoped headless browser to this agent's runner, else None."""
+        if not self.config.headless_browser_for(agent, runtime):
+            return "this machine gives that runner no headless browser ([dispatch.headless_browser])"
+        env = child_env(agent, self.config, runtime=runtime)
+        if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
+            return "required headless browser command is unavailable"
+        return codex_config_conflict(env)
+
+    def headless_runners(self) -> list[str]:
+        """The runner keys this machine can give a scoped headless browser now (reported in hello)."""
+        return sorted(k for k in self.config.headless_browser.runners
+                      if k in self.config.runners and self._headless_blocker(k, k) is None)
+
     def hello(self) -> dict:
-        out = self._call("POST", "/api/nodes/hello", json={
-            "projects": sorted(self.config.worktrees), "runners": sorted(self.config.runners),
-            "max_concurrent": self.config.max_concurrent})
+        body = {"projects": sorted(self.config.worktrees), "runners": sorted(self.config.runners),
+                "max_concurrent": self.config.max_concurrent}
+        headless = self.headless_runners()
+        if headless:    # only then: a hub older than this field refuses any hello that carries it
+            body["headless_browser"] = headless
+        out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out
 
@@ -191,12 +214,27 @@ class Node:
                 template = runner_preflight.scoped_template(template)
                 prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
             template = with_writable_roots(template, self.config.extra_roots(template, project))
+            browser = r.get("headless_browser")
+            if browser is not None:
+                origins = plain_origins((browser or {}).get("origins") or []) if isinstance(browser, dict) else []
+                if not origins:
+                    raise ValueError("assignment asks for a headless browser with no plain origin")
+                blocker = self._headless_blocker(agent, r.get("runtime"))
+                if blocker:
+                    raise LookupError(blocker)
+                self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                out_dir = self.log_dir / f"{rid}-browser"
+                self._remove_browser_output(rid)   # left by a node that died before recording this run
+                out_dir.mkdir(mode=0o700)   # fresh per run; never reused
+                template = with_headless_browser(template, headless_browser_overrides(
+                    self.config.headless_browser, origins, str(out_dir)))
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=r.get("runtime")),
                                  log_path=self.log_dir / f"{rid}.log")
         except Exception as e:
             log.warning("could not start run %s: %s", rid, e)
+            self._remove_browser_output(rid)
             self._report(rid, "ended", error=f"{type(e).__name__}: {e}"[:300])
             return
         local = _Local(rid, child, self.clock(), float(r.get("timeout_seconds") or 1800),
@@ -211,6 +249,11 @@ class Node:
         if isinstance(ack, dict) and ack.get("state") == "ended":
             self._stop(local, "terminate")    # the hub stopped it while we were starting it
         log.info("started %s for thread %s (run %s)", agent, r.get("thread_id"), rid)
+
+    def _remove_browser_output(self, run_id: str) -> None:
+        out = self.log_dir / f"{run_id}-browser"
+        remove_browser_output({"run_id": run_id, "log": str(self.log_dir / f"{run_id}.log"),
+                               "headless_browser": {"output_dir": str(out)}})
 
     def _stop(self, local: _Local, how: str) -> None:
         if how == "kill" and not local.killed:
@@ -227,6 +270,7 @@ class Node:
             if code is not None:
                 del self.running[rid]
                 self._save_state()
+                self._remove_browser_output(rid)
                 self._report(rid, "ended", exit_code=code)
             elif local.terminated_at is None and now - local.started >= local.timeout:
                 self._stop(local, "terminate")
@@ -246,6 +290,7 @@ class Node:
                 self._stop(local, "kill")
         for rid, local in list(self.running.items()):
             del self.running[rid]
+            self._remove_browser_output(rid)
             self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down")
         self._save_state()
 

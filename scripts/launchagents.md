@@ -121,3 +121,32 @@ After a deliberate halt, start the already loaded revision with
 workers are active: that bypasses the maintenance requeue path. Retain prior snapshots
 for rollback; repoint plists with the installer at the previous reviewed commit and
 repeat the controlled reload.
+
+## Machines that are not the hub
+
+A machine that only runs agents for the hub (a node) gets neither the HTTP board nor the dispatcher. Prepare its
+jobs with `--node`:
+
+```sh
+python3 scripts/install-launchagents.py --revision <reviewed-commit> --board-home "$HOME/agent-comms" \
+  --node macbook-pro --hub https://peters-macbook-pro-2.tailbecb34.ts.net --hub-ssh peters-macbook-pro-2 --dry-run
+```
+
+- `dev.agentcomms.node` runs `board node --hub <url> --name <name>` from the pinned runtime.
+- `dev.agentcomms.tunnel` (with `--hub-ssh`; nothing else here may listen on 8787, so unload this machine's old
+  `dev.agentcomms.http` job first, or the forward fails and restarts every 10 s) keeps `ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 <host>` running (key
+  authentication only, keepalives every 15 s, restarted by launchd when the link drops). The dashboard
+  (`http://127.0.0.1:8787`, `board dashboard`) and the menu bar app then work on this machine as on the hub. The
+  hub's board is unchanged: requests reach it from its own loopback, and the human token still signs in.
+
+Point the menu bar app at the hub so it never offers to start a local server against this machine's old database:
+
+```sh
+defaults write dev.agentcomms.menubar hub peters-macbook-pro-2.tailbecb34.ts.net
+```
+
+Upgrade the hub before its nodes: a node that can give a browser reports it in a heartbeat field older hubs refuse.
+
+Browser-bound Codex work runs on a node only when that node's own `[dispatch.headless_browser]` gives the runner a
+scoped headless browser (and its command is on the node's PATH); the node reports this in its heartbeat, and the
+hub's dispatcher sends such work only to a node that offers it.

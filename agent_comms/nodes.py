@@ -8,7 +8,9 @@ process on another machine. A *node* (`board node`, node.py) runs on each other 
 
 - `hello`: every few seconds the node reports what it can run: the projects it has checked out (the keys of its own
   `[dispatch] worktrees`) and its runner keys (agent names or runtimes, as in `[dispatch] runners`), plus its
-  max_concurrent. Stored under NODE_PREFIX with `last_seen`. A node unseen for NODE_STALE_SECONDS offers nothing.
+  max_concurrent, and the runner keys it can give a scoped headless browser (its own `[dispatch.headless_browser]`,
+  with the browser command on PATH and a Codex config that leaves the server name alone). Stored under NODE_PREFIX
+  with `last_seen`. A node unseen for NODE_STALE_SECONDS offers nothing.
 - The hub decides what each node may take: `[dispatch.nodes.<name>] projects = [...]` and `agents = [...]` in the
   hub's board.local.toml. A node with no entry gets nothing, and a node offering a project or agent outside its
   entry is not given it, whatever it claims.
@@ -20,7 +22,9 @@ process on another machine. A *node* (`board node`, node.py) runs on each other 
   tracks it through RemoteChild, which has the shape of a local child (poll / terminate / kill).
 - The node picks up its assignments (`assignments`), starts the runner from ITS OWN config (template, env, run
   directory: nothing executable comes from the hub, only the prompt text the hub's dispatcher wrote), and reports
-  `running` (pid) and `ended` (exit code). It enforces the timeout and kill grace itself and honours a stop the hub
+  `running` (pid) and `ended` (exit code). A browser-bound run goes only to a node that offers a headless browser
+  for the runner it would use; the assignment then carries the bound origins (the hub's binding and deny gate decide
+  them) and the node attaches its own browser server with exactly those origins. It enforces the timeout and kill grace itself and honours a stop the hub
   requested (terminate / kill).
 - A node that goes silent while its run is unfinished: after NODE_LOST_SECONDS the run counts as ended (exit -1,
   error `node_lost`), so the dispatcher settles or requeues its requests as for any ended run. The node stops its own
@@ -43,7 +47,7 @@ from . import db
 from .core import Board, Conflict, Forbidden, Invalid, NotFound, Principal
 
 NODE_RUNTIME = "node"
-NODE_PREFIX = "node.info."     # <node name>: {projects, runners, max_concurrent, last_seen}
+NODE_PREFIX = "node.info."     # <node name>: {projects, runners, headless_browser, max_concurrent, last_seen}
 RUN_PREFIX = "node.run."       # <run id>: the assignment and its state
 NODE_STALE_SECONDS = 60        # a node unseen this long is offered no new work
 NODE_LOST_SECONDS = 180        # ... and its unfinished runs count as ended
@@ -83,16 +87,20 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
     return sorted(set(value))
 
 
-def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any) -> dict:
-    """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself."""
+def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
+          headless_browser: Any = None) -> dict:
+    """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
+    `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
+    headless = _strings([] if headless_browser is None else headless_browser, "headless_browser",
+                        lambda v: v in runners)
     if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or not 1 <= max_concurrent <= 50:
         raise Invalid("max_concurrent must be an integer from 1 to 50")
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
-            "max_concurrent": max_concurrent, "last_seen": now}
+            "headless_browser": headless, "max_concurrent": max_concurrent, "last_seen": now}
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
@@ -128,10 +136,19 @@ def _active_runs(conn, node: str) -> int:
     return n
 
 
+def runner_key(info: dict, agent: str, runtime: str | None) -> str | None:
+    """The runner key a node would use for this agent: its name, else its runtime (DispatchConfig.runner_key)."""
+    offered = info.get("runners", [])
+    return agent if agent in offered else runtime if runtime and runtime in offered else None
+
+
 def node_for(board: Board, project: str, agent: str, runtime: str | None,
-             allowed: dict[str, dict] | None = None) -> str | None:
+             allowed: dict[str, dict] | None = None, *, headless_browser: bool = False,
+             room: bool = True) -> str | None:
     """The live node that offers this project and a runner for this agent (its name, else its runtime), that the hub
-    allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first."""
+    allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first. With
+    `headless_browser`, only a node that offers a scoped headless browser for that runner. With `room=False`, a full
+    node counts too."""
     now = board.now()
     project = project.rstrip("/") or "/"
     keys = {agent} | ({runtime} if runtime else set())
@@ -144,7 +161,9 @@ def node_for(board: Board, project: str, agent: str, runtime: str | None,
             continue
         if project not in info.get("projects", []) or not keys & set(info.get("runners", [])):
             continue
-        if _active_runs(board.conn, info["node"]) >= int(info.get("max_concurrent") or 1):
+        if headless_browser and runner_key(info, agent, runtime) not in info.get("headless_browser", []):
+            continue
+        if room and _active_runs(board.conn, info["node"]) >= int(info.get("max_concurrent") or 1):
             continue
         return info["node"]
     return None
@@ -178,7 +197,8 @@ def assignments(board: Board, p: Principal) -> dict:
             continue
         if isinstance(r, dict) and r.get("node") == p.name and r.get("state") != "ended":
             out.append({k: r.get(k) for k in ("run_id", "agent", "runtime", "thread_id", "project", "prompt",
-                                              "timeout_seconds", "kill_grace_seconds", "state", "stop")})
+                                              "timeout_seconds", "kill_grace_seconds", "headless_browser", "state",
+                                              "stop")})
     return {"node": p.name, "runs": out}
 
 

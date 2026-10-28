@@ -138,6 +138,7 @@ Settings live in the app's defaults (`dev.agentcomms.menubar`):
 | `repoPath` | `~/agent-comms` | the agent-comms code Start Board Server runs (ideally the pinned runtime) |
 | `homePath` | `$AGENT_COMMS_HOME`, else `repoPath` | the board home (`agents.toml`, `data/`) the server uses |
 | `tokenFile` | `~/.config/agent-comms/human.token` | the human token file |
+| `hub` | unset | on a machine that is not the hub: the hub's host name. The board is reached through the forwarded `127.0.0.1:<port>` (scripts/launchagents.md "Machines that are not the hub"); when it is unreachable the menu names the hub and never offers Start Board Server |
 
 ```bash
 defaults write dev.agentcomms.menubar port -int 8788

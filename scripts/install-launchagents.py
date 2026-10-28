@@ -41,6 +41,27 @@ def job(label: str, command: list[str], board_home: Path, runtime: Path,
     }
 
 
+def tunnel_job(host: str, port: int, log: Path) -> dict:
+    """On a machine that is not the hub: forward 127.0.0.1:<port> here to the hub's board on its own 127.0.0.1:<port>
+    over SSH (key auth only, no prompt), so the dashboard and the menu bar app work here exactly as on the hub. The
+    hub's board keeps its localhost-only checks: requests arrive there from its own loopback."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host):
+        raise ValueError("--hub-ssh must be a plain SSH host name")
+    return {
+        "Label": "dev.agentcomms.tunnel",
+        "ProgramArguments": ["/usr/bin/ssh", "-N", "-T", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+                             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+                             "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                             "-L", f"127.0.0.1:{port}:127.0.0.1:{port}", "--", host],
+        "RunAtLoad": True,
+        # ssh exits when the link drops (keepalives) or the port is taken; launchd brings it back.
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    }
+
+
 def array_end(source: str, start: int) -> int:
     """Find the end of a TOML array without treating quoted/commented ] as syntax."""
     if source[start:start + 1] != "[":
@@ -168,6 +189,13 @@ def main() -> None:
     parser.add_argument("--codex-config", type=Path,
                         default=Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml")
     parser.add_argument("--dry-run", action="store_true", help="Print planned files; write nothing")
+    parser.add_argument("--node", metavar="NAME",
+                        help="This machine is a node, not the hub: prepare `board node --name NAME` (with --hub) "
+                             "instead of the HTTP board and dispatcher")
+    parser.add_argument("--hub", help="With --node: the hub's gateway URL, e.g. https://server.tailnet.ts.net")
+    parser.add_argument("--hub-ssh", metavar="HOST",
+                        help="With --node: also forward 127.0.0.1:8787 here to the hub's board over SSH to HOST, for "
+                             "the dashboard and the menu bar app")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent.parent
     sha = subprocess.check_output(
@@ -196,12 +224,25 @@ def main() -> None:
         updated_codex_config(codex_config.read_text(), script)
     launchagents = args.launchagents_dir.expanduser().resolve()
     log_dir = Path.home() / "Library/Logs/Agent Comms"
-    jobs = [
-        job("dev.agentcomms.http", ["serve", "--port", "8787"], board_home, runtime, runner_path,
-            log_dir / "http.log"),
-        job("dev.agentcomms.dispatcher", ["dispatch", "run"], board_home, runtime, runner_path,
-            log_dir / "dispatcher.log"),
-    ]
+    if args.node:
+        if not args.hub:
+            parser.error("--node needs --hub")
+        jobs = [job("dev.agentcomms.node", ["node", "--hub", args.hub, "--name", args.node], board_home, runtime,
+                    runner_path, log_dir / "node.log")]
+        if args.hub_ssh:
+            try:
+                jobs.append(tunnel_job(args.hub_ssh, 8787, log_dir / "tunnel.log"))
+            except ValueError as e:
+                parser.error(str(e))
+    elif args.hub or args.hub_ssh:
+        parser.error("--hub and --hub-ssh go with --node")
+    else:
+        jobs = [
+            job("dev.agentcomms.http", ["serve", "--port", "8787"], board_home, runtime, runner_path,
+                log_dir / "http.log"),
+            job("dev.agentcomms.dispatcher", ["dispatch", "run"], board_home, runtime, runner_path,
+                log_dir / "dispatcher.log"),
+        ]
     if args.dry_run:
         print(f"Planned current runtime: {runtime.parent / 'current'} -> {runtime}")
         if args.configure_codex:
