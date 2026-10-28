@@ -179,3 +179,28 @@ def test_prepared_install_never_activates_jobs_and_uses_durable_runtime(tmp_path
     output = capsys.readouterr().out
     assert 'synthetic-fixture-secret' not in output
     assert 'No jobs were activated' in output
+
+
+def test_a_node_machine_gets_the_node_and_tunnel_jobs_never_a_local_board(tmp_path, monkeypatch, capsys):
+    args, *_ = fixture_args(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, 'argv', args + ['--dry-run', '--node', 'laptop', '--hub', 'https://hub.example.ts.net',
+                                             '--hub-ssh', 'hub-host'])
+    installer.main()
+    output = capsys.readouterr().out
+    assert 'dev.agentcomms.node.plist' in output and 'dev.agentcomms.tunnel.plist' in output
+    assert 'dev.agentcomms.http' not in output and 'dev.agentcomms.dispatcher' not in output
+    job = installer.tunnel_job('hub-host', 8787, tmp_path / 'tunnel.log')
+    argv = job['ProgramArguments']
+    assert argv[0] == '/usr/bin/ssh' and 'BatchMode=yes' in argv and 'ExitOnForwardFailure=yes' in argv
+    assert argv[-4:] == ['-L', '127.0.0.1:8787:127.0.0.1:8787', '--', 'hub-host']
+    with pytest.raises(ValueError):
+        installer.tunnel_job('-oProxyCommand=evil', 8787, tmp_path / 'tunnel.log')
+
+
+@pytest.mark.parametrize('extra', [['--node', 'laptop'], ['--hub-ssh', 'hub-host'],
+                                   ['--node', 'laptop', '--hub', 'https://h.ts.net', '--hub-ssh', 'bad host']])
+def test_node_options_are_checked(tmp_path, monkeypatch, extra):
+    args, *_ = fixture_args(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, 'argv', args + ['--dry-run'] + extra)
+    with pytest.raises(SystemExit):
+        installer.main()

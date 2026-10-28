@@ -228,6 +228,11 @@ final class EndpointTests: XCTestCase {
         XCTAssertEqual(Preferences.load(defaults, environment: [:]),
                        Preferences(port: 8799, repoPath: "/tmp/board-checkout"))
         XCTAssertEqual(Preferences.load(defaults, environment: [:]).homePath, "/tmp/board-checkout")
+        XCTAssertNil(Preferences.load(defaults, environment: [:]).hub)
+        defaults.set("peters-macbook-pro-2.tailbecb34.ts.net", forKey: Preferences.hubKey)
+        XCTAssertEqual(Preferences.load(defaults, environment: [:]).hub, "peters-macbook-pro-2.tailbecb34.ts.net")
+        defaults.set("evil host\u{202E}", forKey: Preferences.hubKey)
+        XCTAssertNil(Preferences.load(defaults, environment: [:]).hub)
         XCTAssertEqual(Preferences.load(defaults, environment: ["AGENT_COMMS_HOME": "/tmp/env-home"]).homePath,
                        "/tmp/env-home")
         defaults.set("/tmp/board-home", forKey: Preferences.homePathKey)

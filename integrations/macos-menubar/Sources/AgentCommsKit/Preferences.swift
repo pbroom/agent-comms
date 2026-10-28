@@ -7,18 +7,31 @@ public struct Preferences: Equatable, Sendable {
     public static let repoPathKey = "repoPath"
     public static let homePathKey = "homePath"
     public static let tokenFileKey = "tokenFile"
+    public static let hubKey = "hub"
     public static let defaultPort = 8787
     public static let defaultRepoPath = "~/agent-comms"
 
     public var port: Int
     public var repoPath: String   // tilde-expanded: the code the server runs
     public var homePath: String   // tilde-expanded: the board home (agents.toml, data/); defaults to repoPath
+    /// On a machine that is not the hub: the hub's host name, shown when the board is unreachable. The board is then
+    /// reached through a local forward of 127.0.0.1:<port> (scripts/launchagents.md "Machines that are not the hub"),
+    /// and the menu never offers to start a local server, which would serve this machine's old database.
+    public var hub: String?
 
     public init(port: Int = Preferences.defaultPort, repoPath: String = Preferences.defaultRepoPath,
-                homePath: String? = nil) {
+                homePath: String? = nil, hub: String? = nil) {
         self.port = Endpoint.validPort(port) ?? Preferences.defaultPort
         self.repoPath = (repoPath as NSString).expandingTildeInPath
         self.homePath = ((homePath ?? repoPath) as NSString).expandingTildeInPath
+        self.hub = hub.flatMap(Preferences.validHub)
+    }
+
+    /// A plain host name (letters, digits, dots, hyphens), else nil: it is only ever shown as text.
+    public static func validHub(_ value: String) -> String? {
+        let ok = !value.isEmpty && value.count <= 253
+            && value.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) && $0.isASCII || $0 == "." || $0 == "-" }
+        return ok ? value : nil
     }
 
     /// `homePath` comes from the defaults, else $AGENT_COMMS_HOME, else the checkout itself. Point `repoPath` at a
@@ -30,7 +43,7 @@ public struct Preferences: Equatable, Sendable {
         let repo = defaults.string(forKey: repoPathKey).flatMap { $0.isEmpty ? nil : $0 } ?? defaultRepoPath
         let home = defaults.string(forKey: homePathKey).flatMap { $0.isEmpty ? nil : $0 }
             ?? environment["AGENT_COMMS_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-        return Preferences(port: port, repoPath: repo, homePath: home)
+        return Preferences(port: port, repoPath: repo, homePath: home, hub: defaults.string(forKey: hubKey))
     }
 }
 

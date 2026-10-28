@@ -282,7 +282,7 @@ final class BoardModel: ObservableObject {
     }
 
     func startServer() {
-        guard !startingServer else { return }
+        guard !startingServer, prefs.hub == nil else { return }   // never a local server on a machine that is not the hub
         let launcher = ServerLauncher(repoPath: prefs.repoPath, port: prefs.port, homePath: prefs.homePath)
         do {
             try launcher.launch()

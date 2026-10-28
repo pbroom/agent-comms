@@ -320,3 +320,66 @@ def test_a_report_the_hub_refuses_is_dropped_and_the_node_keeps_working(nenv):
     nenv.node.tick()
     assert nenv.node.unreported == []
     assert nodes.nodes(nenv.board)[0]["node"] == "laptop", "hello still went through"
+
+
+# ---------------------------------------------------------------- browser-bound work on a node
+
+def _browser_node(nenv, tmp_path, monkeypatch, *, headless=True):
+    """The laptop node with a Codex runner, given the scoped headless browser when `headless`."""
+    from test_dispatch_headless_browser import BROWSER, CODEX
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr("agent_comms.node.shutil.which", lambda executable, **kw: "/fake/" + executable)
+    nenv.d.config.nodes = {"laptop": {"projects": [PROJECT], "agents": ["grok", "codex"]}}
+    nenv.node.config = DispatchConfig.from_dict({
+        "runners": {"codex": CODEX}, "worktrees": {PROJECT: nenv.node_dir}, "max_concurrent": 1,
+        **({"headless_browser": BROWSER} if headless else {})})
+
+
+def _bound(nenv):
+    from agent_comms import browser_readiness as br
+    from test_dispatch_headless_browser import URL
+    post = human_post(nenv, ["codex"], body="Browser audit of the About dialog")
+    br.bind_request(nenv.board, nenv.p["human"], nenv.sid["human"], post["id"], "codex", URL)
+    return post
+
+
+def test_a_node_runs_browser_bound_work_with_its_own_scoped_headless_browser(nenv, tmp_path, monkeypatch):
+    from test_dispatch_headless_browser import ORIGIN, browser_args
+    _browser_node(nenv, tmp_path, monkeypatch)
+    assert nenv.node.hello()["headless_browser"] == ["codex"]
+    allow(nenv, agents=["codex"])
+    post = _bound(nenv)
+    nenv.d.tick()
+    assert nenv.spawner.calls == []
+    [r] = runs(nenv)
+    assert r["node"] == "laptop" and r["headless_browser"] == {"origins": [ORIGIN]}, r
+    nenv.node.tick()
+    [call] = nenv.node_spawner.calls
+    run_id = f"s{post['seq']}-codex"
+    out_dir = tmp_path / "node-logs" / f"{run_id}-browser"
+    args = browser_args(call["argv"])
+    assert args[args.index("--allowed-origins") + 1] == ORIGIN
+    assert args[args.index("--output-dir") + 1] == str(out_dir) and out_dir.is_dir()
+    assert "headless_browser" in call["argv"][-1], "the prompt tells the run to use its headless browser"
+    nenv.node_spawner.children[0].code = 0
+    nenv.node.tick()
+    assert not out_dir.exists(), "the browser output goes once the run has ended"
+
+
+def test_browser_bound_work_waits_for_a_node_that_has_a_headless_browser(nenv, tmp_path, monkeypatch):
+    _browser_node(nenv, tmp_path, monkeypatch, headless=False)
+    assert nenv.node.hello()["headless_browser"] == []
+    allow(nenv, agents=["codex"])
+    _bound(nenv)
+    nenv.d.tick()
+    assert all(r.get("node") is None for r in runs(nenv))
+    assert any("verified existing browser session" in (r.get("error") or "") for r in runs(nenv))
+
+
+def test_a_node_may_only_offer_a_headless_browser_for_its_own_runners(nenv):
+    with pytest.raises(Invalid):
+        nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1, ["codex"])
+    assert nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1)["headless_browser"] == []

@@ -1554,12 +1554,21 @@ class Dispatcher:
             if stopped and isinstance(record, dict) and (requeue.mark_decided(record, post_id) or requeued):
                 self._put(c, self.RUN_PREFIX + run_id, record)
 
-    def _remote_node(self, agent: str, project: str, cwd: str | None) -> str | None:
+    def _remote_node(self, agent: str, project: str, cwd: str | None, *, headless_browser: bool = False) -> str | None:
         """A live node (nodes.py) that runs this agent in this project, when this machine has no run directory for
-        it. A local run directory always wins: this machine never hands away work it can do itself."""
+        it. A local run directory always wins: this machine never hands away work it can do itself. With
+        `headless_browser`, only a node that can attach a scoped headless browser to that agent's runner."""
         if cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
             return None
-        return nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes)
+        return nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes,
+                              headless_browser=headless_browser)
+
+    def _node_headless(self, agent: str, project: str) -> bool | None:
+        """None when this agent runs here for this project; else whether a node would run it with a headless browser."""
+        cwd = self.config.worktrees.get(project, project)
+        if self._remote_node(agent, project, cwd) is None:
+            return None
+        return self._remote_node(agent, project, cwd, headless_browser=True) is not None
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
@@ -1663,7 +1672,8 @@ class Dispatcher:
         post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
         if post is None:
             return 'request is unavailable'
-        headless = self.config.headless_browser_for(agent, self._runtime(agent))
+        on_node = self._node_headless(agent, self.board._thread_row(post['thread_id'])['project'])
+        headless = self.config.headless_browser_for(agent, self._runtime(agent)) if on_node is None else on_node
         for row in requests.for_post(self.board, post):
             if row['assigned_agent'] == agent:
                 # The sticky policy-denied gate first, always: a denial is never routed around, headless or not.
@@ -1695,13 +1705,14 @@ class Dispatcher:
             if req['execution_context'] == 'desktop':
                 return ('Browser work requires a desktop execution context; isolated headless dispatch cannot '
                         'provide authenticated desktop or file-upload access. Route to a capable authorized session.')
-        if not self.config.headless_browser_for(agent, self._runtime(agent)):
+        on_node = self._node_headless(agent, self.board._thread_row(thread_id)['project'])
+        if not (self.config.headless_browser_for(agent, self._runtime(agent)) if on_node is None else on_node):
             if required:
                 return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
                         'inherit its probe. Route to a capable authorized session.')
             return None
-        if not self._headless_origins(agent, thread_id, request_ids):
-            return None   # no browser server will be attached
+        if on_node or not self._headless_origins(agent, thread_id, request_ids):
+            return None   # no browser server will be attached here (a node checks its own command and config)
         env = child_env(agent, self.config, runtime=self._runtime(agent))
         if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
             return 'required headless browser command is unavailable'
@@ -1825,16 +1836,22 @@ class Dispatcher:
                     raise Conflict(browser_blocker)
             node = None if inbox or item.get('managed') else self._remote_node(agent, project, cwd)
             if node is not None:
-                if (self.config.headless_browser_for(agent, self._runtime(agent))
-                        and self._headless_origins(agent, thread_id, record["request_ids"])):
-                    raise Conflict("a run on another machine has no headless browser yet")
-                prompt = build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id)
+                # Browser-bound work goes to a node that attaches its own scoped headless browser, limited to the
+                # origins bound and not denied here. With none bound, the run gets no browser server at all.
+                origins = self._headless_origins(agent, thread_id, record["request_ids"])
+                browser = None
+                capable = self._remote_node(agent, project, cwd, headless_browser=True) if origins else None
+                if capable is not None:
+                    node, browser = capable, {"origins": origins}
+                    record["headless_browser"] = browser   # browser_readiness compares a later binding against it
+                prompt = build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
+                                      headless_browser=browser is not None)
                 record |= {"node": node, "cwd": project}
                 self._record(record)
                 nodes.assign(self.board, node, {
                     "run_id": run_id, "agent": agent, "runtime": self._runtime(agent), "thread_id": thread_id,
                     "project": project, "prompt": prompt, "timeout_seconds": self.config.timeout_minutes * 60,
-                    "kill_grace_seconds": self.config.kill_grace_seconds})
+                    "kill_grace_seconds": self.config.kill_grace_seconds, "headless_browser": browser})
                 child = nodes.RemoteChild(self.board, run_id)
                 cwd = project
             if node is None:

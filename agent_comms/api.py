@@ -50,6 +50,7 @@ class NodeHelloIn(Body):
     projects: list[str]
     runners: list[str]
     max_concurrent: StrictInt = 1
+    headless_browser: list[str] = []
 
 
 class NodeReportIn(Body):
@@ -769,7 +770,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/nodes/hello")
     def node_hello(body: NodeHelloIn, p: Principal = P):
         from . import nodes
-        return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent)
+        return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent,
+                           body.headless_browser)
 
     @app.get("/api/nodes/assignments")
     def node_assignments(p: Principal = P):
