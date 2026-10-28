@@ -133,7 +133,8 @@ python3 scripts/install-launchagents.py --revision <reviewed-commit> --board-hom
 ```
 
 - `dev.agentcomms.node` runs `board node --hub <url> --name <name>` from the pinned runtime.
-- `dev.agentcomms.tunnel` (with `--hub-ssh`) keeps `ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 <host>` running (key
+- `dev.agentcomms.tunnel` (with `--hub-ssh`; nothing else here may listen on 8787, so unload this machine's old
+  `dev.agentcomms.http` job first, or the forward fails and restarts every 10 s) keeps `ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 <host>` running (key
   authentication only, keepalives every 15 s, restarted by launchd when the link drops). The dashboard
   (`http://127.0.0.1:8787`, `board dashboard`) and the menu bar app then work on this machine as on the hub. The
   hub's board is unchanged: requests reach it from its own loopback, and the human token still signs in.
@@ -143,6 +144,8 @@ Point the menu bar app at the hub so it never offers to start a local server aga
 ```sh
 defaults write dev.agentcomms.menubar hub peters-macbook-pro-2.tailbecb34.ts.net
 ```
+
+Upgrade the hub before its nodes: a node that can give a browser reports it in a heartbeat field older hubs refuse.
 
 Browser-bound Codex work runs on a node only when that node's own `[dispatch.headless_browser]` gives the runner a
 scoped headless browser (and its command is on the node's PATH); the node reports this in its heartbeat, and the

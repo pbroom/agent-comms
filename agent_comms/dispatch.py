@@ -1407,6 +1407,9 @@ class Dispatcher:
                 continue
             if inbox and self._inbox_busy(item['thread_id'], now):
                 continue
+            if not inbox and not item.get('managed') and self._browser_node_busy(agent, rule['project'], thread_id,
+                                                                                 item):
+                continue   # the node that can attach a browser is full: wait for it, as behind max_concurrent
             error = self._preflight(agent, rule)
             if item.get('post_id') and not inbox:
                 error = self._browser_blocker(item['post_id'], agent) or error
@@ -1563,12 +1566,26 @@ class Dispatcher:
         return nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes,
                               headless_browser=headless_browser)
 
-    def _node_headless(self, agent: str, project: str) -> bool | None:
-        """None when this agent runs here for this project; else whether a node would run it with a headless browser."""
+    def _browser_node_busy(self, agent: str, project: str, thread_id: int, item: dict) -> bool:
+        """Browser-bound work for a node where every node that can attach the browser is full: it waits."""
+        if not self._node_headless(agent, project):
+            return False
         cwd = self.config.worktrees.get(project, project)
-        if self._remote_node(agent, project, cwd) is None:
+        if self._remote_node(agent, project, cwd, headless_browser=True) is not None:
+            return False
+        return bool(self._headless_origins(agent, thread_id, [item['post_id']] if item.get('post_id') else []))
+
+    def _node_headless(self, agent: str, project: str) -> bool | None:
+        """None when this agent runs here for this project (or no node offers it); else whether a node offering it
+        can attach a headless browser, full or not (capacity only makes the work wait)."""
+        cwd = self.config.worktrees.get(project, project)
+        if cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
             return None
-        return self._remote_node(agent, project, cwd, headless_browser=True) is not None
+        find = lambda **kw: nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes,
+                                           room=False, **kw)
+        if find() is None:
+            return None
+        return find(headless_browser=True) is not None
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
@@ -1844,6 +1861,9 @@ class Dispatcher:
                 if capable is not None:
                     node, browser = capable, {"origins": origins}
                     record["headless_browser"] = browser   # browser_readiness compares a later binding against it
+                elif self._execution_browser_requirements(agent, thread_id, record["request_ids"],
+                                                          include_thread_fallback=False):
+                    raise Conflict("no node can attach a headless browser to this browser-bound run")
                 prompt = build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
                                       headless_browser=browser is not None)
                 record |= {"node": node, "cwd": project}

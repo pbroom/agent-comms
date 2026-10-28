@@ -143,10 +143,12 @@ def runner_key(info: dict, agent: str, runtime: str | None) -> str | None:
 
 
 def node_for(board: Board, project: str, agent: str, runtime: str | None,
-             allowed: dict[str, dict] | None = None, *, headless_browser: bool = False) -> str | None:
+             allowed: dict[str, dict] | None = None, *, headless_browser: bool = False,
+             room: bool = True) -> str | None:
     """The live node that offers this project and a runner for this agent (its name, else its runtime), that the hub
     allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first. With
-    `headless_browser`, only a node that offers a scoped headless browser for that runner."""
+    `headless_browser`, only a node that offers a scoped headless browser for that runner. With `room=False`, a full
+    node counts too."""
     now = board.now()
     project = project.rstrip("/") or "/"
     keys = {agent} | ({runtime} if runtime else set())
@@ -161,7 +163,7 @@ def node_for(board: Board, project: str, agent: str, runtime: str | None,
             continue
         if headless_browser and runner_key(info, agent, runtime) not in info.get("headless_browser", []):
             continue
-        if _active_runs(board.conn, info["node"]) >= int(info.get("max_concurrent") or 1):
+        if room and _active_runs(board.conn, info["node"]) >= int(info.get("max_concurrent") or 1):
             continue
         return info["node"]
     return None

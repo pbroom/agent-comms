@@ -369,7 +369,7 @@ def test_a_node_runs_browser_bound_work_with_its_own_scoped_headless_browser(nen
     assert not out_dir.exists(), "the browser output goes once the run has ended"
 
 
-def test_browser_bound_work_waits_for_a_node_that_has_a_headless_browser(nenv, tmp_path, monkeypatch):
+def test_browser_bound_work_is_refused_when_no_node_can_attach_a_browser(nenv, tmp_path, monkeypatch):
     _browser_node(nenv, tmp_path, monkeypatch, headless=False)
     assert nenv.node.hello()["headless_browser"] == []
     allow(nenv, agents=["codex"])
@@ -383,3 +383,41 @@ def test_a_node_may_only_offer_a_headless_browser_for_its_own_runners(nenv):
     with pytest.raises(Invalid):
         nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1, ["codex"])
     assert nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1)["headless_browser"] == []
+
+
+def test_browser_bound_work_waits_while_the_node_with_a_browser_is_full(nenv, tmp_path, monkeypatch):
+    _browser_node(nenv, tmp_path, monkeypatch)
+    nenv.node.hello()
+    nodes.assign(nenv.board, "laptop", {"run_id": "busy", "agent": "grok", "thread_id": nenv.tid,
+                                        "project": PROJECT, "prompt": "x"})
+    allow(nenv, agents=["codex"])
+    post = _bound(nenv)
+    nenv.d.tick()
+    assert runs(nenv) == [], [(r.get("status"), r.get("error"), r.get("node")) for r in runs(nenv)]
+    [req] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
+    assert req["state"] == "queued"
+    nodes.report(nenv.board, nenv.p["laptop"], "busy", "ended", exit_code=0)
+    nenv.d.tick()
+    [r] = runs(nenv)
+    assert r["node"] == "laptop" and r["headless_browser"]
+
+
+def test_a_node_without_its_own_browser_refuses_a_browser_assignment(nenv, tmp_path, monkeypatch):
+    _browser_node(nenv, tmp_path, monkeypatch)
+    nenv.node.hello()
+    allow(nenv, agents=["codex"])
+    post = _bound(nenv)
+    nenv.d.tick()
+    nenv.node.config.headless_browser = DispatchConfig().headless_browser   # its browser went away meanwhile
+    nenv.node.tick()
+    assert nenv.node_spawner.calls == []
+    run = nodes.run(nenv.board, f"s{post['seq']}-codex")
+    assert run["state"] == "ended" and "headless browser" in run["error"]
+
+
+def test_a_node_without_a_browser_sends_the_hello_an_older_hub_accepts(nenv):
+    sent = []
+    real = nenv.node.client.request
+    nenv.node.client.request = lambda method, path, **kw: (sent.append(kw.get("json")), real(method, path, **kw))[1]
+    nenv.node.hello()
+    assert "headless_browser" not in sent[0]

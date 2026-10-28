@@ -143,9 +143,12 @@ class Node:
                       if k in self.config.runners and self._headless_blocker(k, k) is None)
 
     def hello(self) -> dict:
-        out = self._call("POST", "/api/nodes/hello", json={
-            "projects": sorted(self.config.worktrees), "runners": sorted(self.config.runners),
-            "max_concurrent": self.config.max_concurrent, "headless_browser": self.headless_runners()})
+        body = {"projects": sorted(self.config.worktrees), "runners": sorted(self.config.runners),
+                "max_concurrent": self.config.max_concurrent}
+        headless = self.headless_runners()
+        if headless:    # only then: a hub older than this field refuses any hello that carries it
+            body["headless_browser"] = headless
+        out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out
 
@@ -221,6 +224,7 @@ class Node:
                     raise LookupError(blocker)
                 self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 out_dir = self.log_dir / f"{rid}-browser"
+                self._remove_browser_output(rid)   # left by a node that died before recording this run
                 out_dir.mkdir(mode=0o700)   # fresh per run; never reused
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, origins, str(out_dir)))
