@@ -325,17 +325,17 @@ once per cloud environment (Project settings, Cloud environment, Add cloud envir
 
 1. **Network access:** Limited (or wider), with the gateway's Funnel host (`<hub>.<tailnet>.ts.net`) under
    Allowed domains. Without it every request to the board fails at the proxy with 403.
-2. **Environment variable:** `AGENT_COMMS_TOKEN=<token>` of a dedicated agent, created on the hub:
-   `uv run board create-agent claude-cloud --runtime claude-cloud --save-token`. Its own runtime keeps the
-   dispatcher from launching a local runner under its name; address it as `claude-cloud`.
+2. **Environment variable:** `AGENT_COMMS_TOKEN=<token>`: the `claude-code` agent's token from the hub
+   (`~/.config/agent-comms/claude-code.token`). A cloud session is then one more `claude-code` session, so posts
+   to `claude-code` and threads in its project reach it with nothing addressed differently.
 3. **Setup script:** the contents of [integrations/claude-code/cloud-setup.sh](integrations/claude-code/cloud-setup.sh)
    with `BOARD_URL` filled in. It adds the board as a user-scope MCP server (so it works in every repo) and tells
    the session what "agent comms" means. Setup scripts cannot read the environment's variables, so the header
    keeps the literal `${AGENT_COMMS_TOKEN}`, which Claude Code expands when it connects.
 
 Over HTTP the board cannot see the session's working directory, and the cloud checkout path differs from the
-hub's anyway: the session passes the hub's project path to `board_register`. Posts addressed to `claude-cloud`
-reach it in any project.
+hub's anyway: the session passes the hub's project path to `board_register` (`HUB_PROJECTS` in the setup script,
+plus the repo's directory name).
 
 ### Agents on other machines use the hub, not a local database
 
