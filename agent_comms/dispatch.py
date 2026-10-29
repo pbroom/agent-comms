@@ -26,6 +26,7 @@ Guardrails:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -647,6 +648,78 @@ def validate_writable_roots(table: Any, settings: Settings | None = None) -> dic
     return out
 
 
+def validate_checkout_roots(value: Any) -> list[str]:
+    """`[dispatch] checkout_roots`: existing directories, each its own real path and never `/`. Git checkouts inside
+    them run without a [dispatch.worktrees] entry (DispatchConfig.discovered_checkout)."""
+    where = "[dispatch] checkout_roots"
+    if not isinstance(value, list) or not all(isinstance(r, str) for r in value):
+        raise ValueError(f"{where} must be a list of absolute directory paths")
+    out: list[str] = []
+    for raw in value:
+        r = raw.rstrip("/") if raw not in ("", "/") else raw
+        if not r or _has_control(r) or not os.path.isabs(r) or os.path.normpath(r) != r:
+            raise ValueError(f"{where}: {raw!r} must be an absolute, normalized directory path")
+        if r == "/":
+            raise ValueError(f"{where} may not be /")
+        if not os.path.isdir(r) or os.path.realpath(r) != r:
+            raise ValueError(f"{where}: {r} must be an existing directory written as its real path (no symlinks)")
+        if r not in out:
+            out.append(r)
+    return out
+
+
+def _git_common_dir(path: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return os.path.realpath(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def run_worktree_path(root: str, checkout: str, agent: str, thread_id: int) -> str:
+    """The git worktree an (agent, thread) runs in with [dispatch] parallel_worktrees: one per checkout, agent and
+    thread, so a relaunch on the same thread resumes in the same tree and other threads run beside it."""
+    real = os.path.realpath(checkout)
+    tag = hashlib.sha256(real.encode()).hexdigest()[:10]
+    name = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in os.path.basename(real))[:60] or "repo"
+    return os.path.join(root, f"{name}-{tag}", f"{agent}-t{int(thread_id)}")
+
+
+def ensure_run_worktree(checkout: str, path: str) -> str:
+    """Create (detached at the checkout's HEAD) or reuse the run worktree at `path`. A directory there that is not
+    a worktree of this same repository is refused, never reused or overwritten."""
+    expected = _git_common_dir(checkout)
+    if expected is None:
+        raise Conflict("the checkout is not a Git repository, so it cannot get a run worktree")
+    if os.path.lexists(path):
+        if os.path.islink(path) or not os.path.isdir(path) or _git_common_dir(path) != expected:
+            raise Conflict("the run worktree path exists but is not a worktree of this checkout")
+        return path
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    if os.path.realpath(parent) != parent:
+        raise Conflict("the run worktree directory must not contain symlinks")
+    r = subprocess.run(["git", "-C", checkout, "worktree", "add", "--detach", path, "HEAD"],
+                       capture_output=True, text=True, timeout=120, check=False)
+    if r.returncode != 0:
+        raise Conflict("git worktree add failed: " + (r.stderr or r.stdout).strip()[:200])
+    return path
+
+
+def removable_run_worktree(path: str) -> bool:
+    """A run worktree can go once it holds nothing unique: no uncommitted or untracked changes, and its HEAD is on
+    some branch or remote-tracking ref (so no commit is lost)."""
+    def git(*args):
+        return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30, check=False)
+    try:
+        status = git("status", "--porcelain")
+        refs = git("for-each-ref", "--contains", "HEAD", "--count=1", "refs/heads", "refs/remotes")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return status.returncode == 0 and not status.stdout.strip() and refs.returncode == 0 and bool(refs.stdout.strip())
+
+
 def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
     """The runner argv with the extra writable roots added the way its CLI takes them (see writable_roots_kind)."""
     if not roots:
@@ -664,7 +737,8 @@ def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
 # The [dispatch] values a running dispatcher re-reads when the settings files change (Dispatcher.refresh_config).
 # Runners, env and worktrees are read once, when `board dispatch run` starts.
 SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent",
-           "undelivered_alert_minutes")
+           "max_runs_per_agent", "undelivered_alert_minutes")
+WORKTREE_PRUNE_SECONDS = 3600
 
 
 @dataclass
@@ -674,6 +748,8 @@ class DispatchConfig:
     runners: dict[str, list[str]] = field(default_factory=dict)   # agent name or runtime -> argv template
     env: dict[str, list[str]] = field(default_factory=dict)       # agent name or runtime -> extra env var NAMES
     worktrees: dict[str, str] = field(default_factory=dict)       # thread project -> directory to run in
+    checkout_roots: list[str] = field(default_factory=list)      # any Git checkout inside these counts as configured
+    protected_dirs: list[str] = field(default_factory=list)      # never a discovered checkout (protected_paths)
     writable_roots: dict[str, list[str]] = field(default_factory=dict)   # thread project -> extra writable dirs
     claude_tool_projects: list[str] = field(default_factory=list)
     headless_browser: HeadlessBrowserConfig = field(default_factory=HeadlessBrowserConfig)
@@ -681,6 +757,9 @@ class DispatchConfig:
     poll_seconds: float = 5.0
     timeout_minutes: float = 30.0
     max_concurrent: int = 2
+    max_runs_per_agent: int = 1     # runs of one agent at once (in different run directories)
+    parallel_worktrees: bool = False   # each (agent, thread) runs in its own git worktree of the checkout
+    worktree_dir: str | None = None    # where those worktrees go (default ~/agent-comms-worktrees)
     kill_grace_seconds: float = 10.0
     nodes: dict[str, dict] = field(default_factory=dict)   # node name -> {projects, agents} it may take (nodes.py)
     undelivered_alert_minutes: float = 0.0   # 0 = off when unset; the shipped board.toml sets 10 (delivery.py)
@@ -729,6 +808,9 @@ class DispatchConfig:
                 c.worktrees = {proj.rstrip("/") or "/": wt for proj, wt in v.items()}
             elif k == "writable_roots":
                 c.writable_roots = validate_writable_roots(v, settings)
+            elif k == "checkout_roots":
+                c.checkout_roots = validate_checkout_roots(v)
+                c.protected_dirs = protected_paths(settings)[0]
             elif k in ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds"):
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                     raise ValueError(f"[dispatch] {k} must be a positive number")
@@ -738,29 +820,79 @@ class DispatchConfig:
                     raise ValueError("[dispatch.nodes] maps a node name to {projects = [...], agents = [...]}")
                 c.nodes = {}
                 for name, grant in v.items():
-                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents"}
+                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents", "checkout_roots"}
                             or not isinstance(grant.get("projects", []), list)
+                            or not isinstance(grant.get("checkout_roots", []), list)
+                            or not all(isinstance(x, str) and os.path.isabs(x) and x.rstrip("/")
+                                       and os.path.normpath(x) == x.rstrip("/")
+                                       for x in grant.get("checkout_roots", []))
                             or not isinstance(grant.get("agents", []), list)
                             or not all(isinstance(x, str) and os.path.isabs(x) for x in grant.get("projects", []))
                             or not all(isinstance(x, str) and x for x in grant.get("agents", []))):
-                        raise ValueError(f"[dispatch.nodes.{name}] needs projects (absolute paths) and agents (names "
-                                         "or runtimes)")
+                        raise ValueError(f"[dispatch.nodes.{name}] needs projects and/or checkout_roots (absolute "
+                                         "paths, not /) and agents (names or runtimes)")
                     c.nodes[name] = {"projects": [x.rstrip("/") or "/" for x in grant.get("projects", [])],
+                                     "checkout_roots": [x.rstrip("/") for x in grant.get("checkout_roots", [])],
                                      "agents": list(grant.get("agents", []))}
             elif k == "undelivered_alert_minutes":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                     raise ValueError("[dispatch] undelivered_alert_minutes must be zero (off) or a positive number")
                 c.undelivered_alert_minutes = float(v)
-            elif k == "max_concurrent":
+            elif k in ("max_concurrent", "max_runs_per_agent"):
                 if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-                    raise ValueError("[dispatch] max_concurrent must be a positive integer")
-                c.max_concurrent = v
+                    raise ValueError(f"[dispatch] {k} must be a positive integer")
+                setattr(c, k, v)
+            elif k == "parallel_worktrees":
+                if not isinstance(v, bool):
+                    raise ValueError("[dispatch] parallel_worktrees must be true or false")
+                c.parallel_worktrees = v
+            elif k == "worktree_dir":
+                if (not isinstance(v, str) or _has_control(v) or not os.path.isabs(v) or os.path.normpath(v) != v
+                        or v == "/" or os.path.realpath(v) != v):
+                    raise ValueError("[dispatch] worktree_dir must be an absolute, normalized path without symlinks")
+                c.worktree_dir = v
             elif k == "headless_browser":
                 c.headless_browser = HeadlessBrowserConfig.from_dict(v)
             else:
                 raise ValueError(f"unknown setting [dispatch] {k}")
         c.headless_browser.check_runners(c.runners)
+        if c.parallel_worktrees:
+            root, user = c.worktree_root(), os.path.realpath(os.path.expanduser("~"))
+            if root == user or _within(user, root) or any(
+                    _within(root, d) or _within(d, root) for d in protected_paths(settings)[0]):
+                raise ValueError("[dispatch] worktree_dir may not be the home directory, contain it or overlap a "
+                                 "protected location (agent tokens, SSH keys, the agent CLIs' config, the board's files)")
         return c
+
+    def worktree_root(self) -> str:
+        return self.worktree_dir or os.path.join(os.path.realpath(os.path.expanduser("~")), "agent-comms-worktrees")
+
+    def checkout_for(self, project: str | None) -> str | None:
+        """The directory this machine runs `project` in: its [dispatch.worktrees] entry, else the project itself when
+        it is a Git checkout inside one of `checkout_roots` (DESIGN_NOTES "Discovered checkouts"), else None."""
+        if not isinstance(project, str) or not project:
+            return None
+        key = project.rstrip("/") or "/"
+        if key in self.worktrees:
+            return self.worktrees[key]
+        return key if self.discovered_checkout(key) else None
+
+    def discovered_checkout(self, project: str) -> bool:
+        """`project` is an existing Git checkout strictly inside a checkout root, written as its own real path, that
+        neither is nor contains a protected location. A thread's project is whatever path its creator gave, so
+        nothing else (a plain folder, a symlink detour, the root itself, ~/.ssh) ever becomes a run directory."""
+        if (not self.checkout_roots or not os.path.isabs(project) or _has_control(project)
+                or os.path.normpath(project) != project or os.path.realpath(project) != project
+                or not os.path.isdir(project) or not os.path.lexists(os.path.join(project, ".git"))):
+            return False
+        if not any(project != r and _within(project, r) for r in self.checkout_roots):
+            return False
+        return not any(_within(project, d) or _within(d, project) for d in self.protected_dirs)
+
+    def run_dir(self, project: str) -> str:
+        """Where a run for this thread project goes: its configured or discovered checkout, else the project path
+        (an ordinary workstream rule's historical default; preflight refuses a directory that does not exist)."""
+        return self.checkout_for(project) or project
 
     def writable_roots_kind(self, template: list[str] | None, project: str) -> str | None:
         """How a run of this runner in this project takes extra writable roots: 'codex' (a `-c` override), 'claude'
@@ -1010,6 +1142,8 @@ class Dispatcher:
         self.token = secrets.token_hex(16)
         self.running: dict[str, _Run] = {}
         self.ended: dict[str, float] = {}   # agent -> when its last dispatched run ended
+        self.ended_on: dict[tuple[str, int], float] = {}   # (agent, thread) -> when its last run there ended
+        self._worktrees_pruned = float("-inf")
         self.orphan_terms: dict[str, float] = {}   # orphaned run id -> when we sent it SIGTERM (timeout/stop)
         self.orphan_killed: set[str] = set()
         self.stopping = False
@@ -1099,6 +1233,7 @@ class Dispatcher:
         self._undelivered_alerts()
         pending = self._scan()
         self._launch_due(pending, now, foreign)
+        self._prune_worktrees(foreign)
 
     def _auto_recover(self) -> None:
         """Automatic recovery of abandoned and unclaimed work under the human's board setting
@@ -1318,9 +1453,10 @@ class Dispatcher:
         if thread is None:
             return None
         # A thread's project is whatever path its creator gave. A policy runs only in a checkout the human configured
-        # (a [dispatch] worktrees key here, or a project a [dispatch.nodes] entry allows), never in an arbitrary path.
-        if (thread['project'] not in self.config.worktrees
-                and not any(thread['project'] in g.get('projects', []) for g in self.config.nodes.values())):
+        # (a [dispatch] worktrees key or a Git checkout inside a checkout root here, or a project a [dispatch.nodes]
+        # entry allows), never in an arbitrary path.
+        if (self.config.checkout_for(thread['project']) is None
+                and not any(nodes.grant_covers(g, thread['project']) for g in self.config.nodes.values())):
             return None
         rule = max((r for r in rules if r.get('kind') == 'agent_delivery' and item['agent'] in r['agents']
                     and (r['scope'] == 'all_projects' or r['project'] == thread['project'])
@@ -1328,14 +1464,25 @@ class Dispatcher:
                    key=lambda r: (r['scope'] == 'project', r['created_at_ts'], r['id']), default=None)
         return rule | {'project': thread['project']} if rule else None
 
-    def _live_in_project(self, agent: str, project: str, now: float) -> bool:
-        """For a delivery policy: a session of the agent in THIS project seen within live_minutes, or a run of it that
-        just ended. A session in another project cannot read this request for it (live case: thread 27)."""
+    def _policy_held(self, agent: str, project: str, item: dict, now: float) -> bool:
+        """For a delivery policy whose grace has passed: whether to leave the request to a session that has it. Only
+        a live session of the agent in THIS project that was handed this very request (its delivery receipt) holds
+        it back; a live session that never read it (idle in a chat, or in another project: live case thread 27)
+        does not. A run of the agent on this thread that ended within live_minutes holds it back too, so a run that
+        exits at once is not relaunched in a tight loop (DESIGN_NOTES "Delivery policies")."""
+        from . import delivery
         window = self.config.live_minutes * 60
-        if now - self.ended.get(agent, float("-inf")) < window:
+        if now - self.ended_on.get((agent, item["thread_id"]), float("-inf")) < window:
             return True
-        return self.board.conn.execute("SELECT 1 FROM sessions WHERE agent = ? AND project = ? AND last_seen >= ?",
-                                       (agent, project, now - window)).fetchone() is not None
+        if not item.get("post_id"):
+            return False
+        got = delivery.receipt(self.board.conn, item["post_id"], agent)
+        sessions = set(delivery.readers(self.board.conn, item["post_id"], agent))
+        if got and isinstance(got.get("session_id"), int):
+            sessions.add(got["session_id"])   # receipts written before per-session readers were recorded
+        return any(self.board.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ? AND agent = ? AND project = ? AND last_seen >= ?",
+            (sid, agent, project, now - window)).fetchone() is not None for sid in sessions)
 
     def _inbox_rule_for(self, rules: list[dict], item: dict) -> dict | None:
         from . import human_actions
@@ -1381,6 +1528,14 @@ class Dispatcher:
                 continue  # preserve the trigger until fresh safe ownership evidence is available
             # An unrelated heartbeat must not starve a covered inbox obligation merely because a normal
             # workstream also covers it. Fall back to delivery-only authority; leave that execution budget alone.
+            # Likewise a delivery policy: a session of the agent that is merely live somewhere must not hold up a
+            # request on a workstream thread past the policy's grace when no session in its project has read it.
+            if not item.get('managed') and rule.get('kind') is None and self._live(agent, now):
+                fallback = self._delivery_rule_for(rules, item)
+                if (fallback and now >= max(item['post_created_at'], fallback['created_at_ts'])
+                        + fallback['pickup_grace_seconds'] and not self._policy_held(agent, fallback['project'],
+                                                                                    item, now)):
+                    rule = fallback
             if not item.get('managed') and rule.get('kind') != 'inbox_delivery' and self._live(agent,now):
                 fallback = self._inbox_rule_for(rules,item)
                 if fallback and now >= max(item['post_created_at'],fallback['created_at_ts']) + fallback['pickup_grace_seconds']:
@@ -1389,21 +1544,23 @@ class Dispatcher:
             # earlier dispatcher count too, so a restart cannot exceed one-per-agent or max_concurrent.
             if foreign is None:
                 foreign = check_orphans(self.board, self.probe, self._own_ids())
-            busy = set(self.running) | {r["agent"] for r in foreign}
+            runs_of_agent = (sum(r.agent == agent for r in self.running.values())
+                             + sum(r.get("agent") == agent for r in foreign))
             inbox = rule.get('kind') == 'inbox_delivery'
             policy = rule.get('kind') == 'agent_delivery'
             if ((inbox or policy)
                     and now < max(item['post_created_at'],rule['created_at_ts']) + rule['pickup_grace_seconds']):
                 continue
             live = (now - self.ended.get(agent,float('-inf')) < self.config.live_minutes * 60 if inbox
-                    else self._live_in_project(agent, rule['project'], now) if policy else self._live(agent, now))
-            if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
+                    else self._policy_held(agent, rule['project'], item, now) if policy else self._live(agent, now))
+            if (runs_of_agent >= self.config.max_runs_per_agent
+                    or len(self.running) + len(foreign) >= self.config.max_concurrent
                     or (not item.get('managed') and live)):
                 continue
             # One dispatched run per run directory: two runs in one checkout (threads of one project, or two agents)
             # see each other's uncommitted changes and fence each other's recovery (recovery._ownership_blocker).
             # The trigger waits, like it does behind max_concurrent, and launches in seq order once it is free.
-            if self._dir_key(self.config.worktrees.get(rule["project"], rule["project"])) in self._busy_dirs(foreign):
+            if self._dir_key(self._run_dir_for(agent, rule["project"], thread_id, item, inbox)) in self._busy_dirs(foreign):
                 continue
             if inbox and self._inbox_busy(item['thread_id'], now):
                 continue
@@ -1415,9 +1572,10 @@ class Dispatcher:
                 error = self._browser_blocker(item['post_id'], agent) or error
             if not inbox:
                 error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
-                error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [])
+                error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [],
+                                                      self._run_dir_for(agent, rule['project'], thread_id, item, inbox))
             if delivery is not None:
-                configured_cwd = self.config.worktrees.get(rule['project'], rule['project'])
+                configured_cwd = self.config.run_dir(rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
                     error = 'Configured runner directory differs from the verified fallback environment'
                 item['delivery'] = delivery
@@ -1570,7 +1728,7 @@ class Dispatcher:
         """Browser-bound work for a node where every node that can attach the browser is full: it waits."""
         if not self._node_headless(agent, project):
             return False
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         if self._remote_node(agent, project, cwd, headless_browser=True) is not None:
             return False
         return bool(self._headless_origins(agent, thread_id, [item['post_id']] if item.get('post_id') else []))
@@ -1578,7 +1736,7 @@ class Dispatcher:
     def _node_headless(self, agent: str, project: str) -> bool | None:
         """None when this agent runs here for this project (or no node offers it); else whether a node offering it
         can attach a headless browser, full or not (capacity only makes the work wait)."""
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         if cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
             return None
         find = lambda **kw: nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes,
@@ -1589,7 +1747,7 @@ class Dispatcher:
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         if rule.get('kind') != 'inbox_delivery' and self._remote_node(agent, project, cwd) is not None:
             return None   # the node checks its own runner and run directory when it starts the run
         if rule.get('kind') != 'inbox_delivery' and (not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
@@ -1614,7 +1772,7 @@ class Dispatcher:
     def _inbox_busy(self, thread_id: int, now: float) -> bool:
         """A heartbeat alone is not work. Preserve active work in the source checkout."""
         project = self.board._thread_row(thread_id)['project']
-        source = self._dir_key(self.config.worktrees.get(project,project))
+        source = self._dir_key(self.config.run_dir(project))
         for row in self.board.conn.execute('''SELECT s.*, a.state AS activity, a.recorded_at,
                 EXISTS(SELECT 1 FROM tasks t WHERE t.owner_session=s.id
                     AND t.status IN ('working','blocked') AND t.lease_expires_at>?) AS leased,
@@ -1630,20 +1788,7 @@ class Dispatcher:
                 return True
         return False
 
-    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int]) -> str | None:
-        """Before reserving a launch: every output the triggering request(s) declared (refs of kind "output", the
-        structured field only, never post text) must lie inside this run's directory or one of the extra writable
-        roots it will get, and its nearest existing directory must be writable. A configured root that has gone
-        away (or turned into a symlink) since the dispatcher started fails too. A failure is a capability blocker:
-        recorded on the request, no launch budget spent."""
-        project = rule["project"]
-        cwd = self.config.worktrees.get(project, project)
-        template = self._runner(agent)
-        roots = self.config.extra_roots(template, project)
-        for r in roots:
-            if not os.path.isdir(r) or os.path.realpath(r) != r:
-                return (f"extra writable root {r} for this project no longer exists or is now a symlink; fix "
-                        "[dispatch.writable_roots] in board.local.toml and restart the dispatcher")
+    def _declared_outputs(self, request_ids: list[int]) -> list[str]:
         outputs: list[str] = []
         for post_id in request_ids:
             row = self.board.conn.execute("SELECT refs FROM posts WHERE id=?", (post_id,)).fetchone()
@@ -1653,6 +1798,23 @@ class Dispatcher:
                 refs = []
             outputs += [r["path"] for r in refs if isinstance(r, dict) and r.get("kind") == "output"
                         and isinstance(r.get("path"), str)]
+        return outputs
+
+    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int], cwd: str | None = None) -> str | None:
+        """Before reserving a launch: every output the triggering request(s) declared (refs of kind "output", the
+        structured field only, never post text) must lie inside this run's directory or one of the extra writable
+        roots it will get, and its nearest existing directory must be writable. A configured root that has gone
+        away (or turned into a symlink) since the dispatcher started fails too. A failure is a capability blocker:
+        recorded on the request, no launch budget spent."""
+        project = rule["project"]
+        cwd = cwd or self.config.run_dir(project)   # the directory the runner actually gets (_run_dir_for)
+        template = self._runner(agent)
+        roots = self.config.extra_roots(template, project)
+        for r in roots:
+            if not os.path.isdir(r) or os.path.realpath(r) != r:
+                return (f"extra writable root {r} for this project no longer exists or is now a symlink; fix "
+                        "[dispatch.writable_roots] in board.local.toml and restart the dispatcher")
+        outputs = self._declared_outputs(request_ids)
         if not outputs:
             return None
         allowed = [cwd] + roots
@@ -1795,6 +1957,49 @@ class Dispatcher:
         dirs.discard(None)
         return dirs
 
+    def _run_dir_for(self, agent: str, project: str, thread_id: int, item: dict, inbox: bool) -> str:
+        """The directory this launch would run in here: with [dispatch] parallel_worktrees, the (agent, thread) run
+        worktree of the project's local Git checkout; otherwise (and for inbox, managed and node runs) the checkout."""
+        base = self.config.run_dir(project)
+        if (inbox or item.get("managed") or not self.config.parallel_worktrees or not os.path.isabs(base)
+                or not os.path.isdir(base) or not os.path.lexists(os.path.join(base, ".git"))):
+            return base
+        # A request that declared an output inside the checkout itself needs the checkout as its run directory
+        # (a worktree run could not write there): it takes turns there, as without parallel_worktrees.
+        if item.get("post_id") and any(isinstance(o, str) and os.path.isabs(o) and _within(o, base)
+                                       for o in self._declared_outputs([item["post_id"]])):
+            return base
+        return run_worktree_path(self.config.worktree_root(), base, agent, thread_id)
+
+    def _prune_worktrees(self, foreign: list[dict]) -> None:
+        """Hourly: remove run worktrees of closed or deleted threads that hold nothing unique (removable_run_worktree)
+        and no run uses. One with uncommitted work or unpushed commits stays for the human or a later run."""
+        now = self.board.now()
+        if not self.config.parallel_worktrees or now - self._worktrees_pruned < WORKTREE_PRUNE_SECONDS:
+            return
+        self._worktrees_pruned = now
+        root = Path(self.config.worktree_root())
+        if not root.is_dir():
+            return
+        busy = self._busy_dirs(foreign)
+        try:
+            for repo in root.iterdir():
+                for wt in (repo.iterdir() if repo.is_dir() and not repo.is_symlink() else []):
+                    tid = wt.name.rpartition("-t")[2]
+                    if not tid.isdigit() or wt.is_symlink() or self._dir_key(str(wt)) in busy:
+                        continue
+                    row = self.board.conn.execute("SELECT status FROM threads WHERE id=?", (int(tid),)).fetchone()
+                    if row is not None and row["status"] == "open":
+                        continue
+                    if not removable_run_worktree(str(wt)):
+                        continue
+                    r = subprocess.run(["git", "-C", str(wt), "worktree", "remove", str(wt)],
+                                       capture_output=True, text=True, timeout=60, check=False)
+                    if r.returncode == 0:
+                        log.info("removed run worktree %s (thread %s is closed)", wt, tid)
+        except Exception:
+            log.exception("could not prune run worktrees")
+
     def _own_ids(self) -> set[str]:
         return {r.run_id for r in self.running.values()}
 
@@ -1813,7 +2018,7 @@ class Dispatcher:
         inbox = rule.get('kind') == 'inbox_delivery'
         project = self.board._thread_row(thread_id)['project'] if inbox else rule['project']
         cwd = (str(self.log_dir.absolute() / 'codex-inbox' / run_id) if inbox
-               else self.config.worktrees.get(project, project))
+               else self.config.run_dir(project))
         log_path = self.log_dir / f"{run_id}.log"
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
                   "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
@@ -1875,6 +2080,11 @@ class Dispatcher:
                 child = nodes.RemoteChild(self.board, run_id)
                 cwd = project
             if node is None:
+                planned = cwd if inbox else self._run_dir_for(agent, project, thread_id, item, inbox)
+                if planned != cwd:
+                    cwd = ensure_run_worktree(cwd, planned)
+                    record |= {"cwd": cwd, "run_worktree": cwd}
+                    self._record(record)   # the run registers with its worktree as soon as it starts
                 self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 os.chmod(self.log_dir, 0o700)
                 if inbox:
@@ -1935,7 +2145,7 @@ class Dispatcher:
             self._request_failure(item.get("post_id"), agent, "Runner failed to start: " + record["error"], run_id)
             log.warning("could not start %s for thread %s: %s", agent, thread_id, record["error"])
             return
-        self.running[agent] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path),
+        self.running[run_id] = _Run(run_id, agent, thread_id, rule["id"], item["seq"], child, now, str(log_path),
                                    cwd=cwd)
         try:
             started = self.process_start(child.pid)
@@ -1949,8 +2159,8 @@ class Dispatcher:
                                                  "rule_id": rule["id"], "launches_left": left})
 
     def _finish(self, run: _Run, status: str, code: int | None, stop_mode: str | None = None) -> None:
-        self.running.pop(run.agent, None)
-        self.ended[run.agent] = self.board.now()
+        self.running.pop(run.run_id, None)
+        self.ended[run.agent] = self.ended_on[(run.agent, run.thread_id)] = self.board.now()
         rec = self._get(self.RUN_PREFIX + run.run_id) or {}
         rec |= {"status": status, "exit_code": code, "ended_at": self.board.now()}
         if stop_mode is not None:
@@ -2062,7 +2272,7 @@ class Dispatcher:
             if isinstance(run.child, nodes.RemoteChild) and run.child.poll() is None:
                 # Its node has not confirmed the stop: keep the run active (it still holds its agent and directory)
                 # for the next dispatcher, which ends it as stopped in this mode once the node reports or is lost.
-                self.running.pop(run.agent, None)
+                self.running.pop(run.run_id, None)
                 rec = self._get(self.RUN_PREFIX + run.run_id) or {}
                 self._record(rec | {"stop_mode": mode, "note": "stop requested; waiting for its node to confirm"})
                 continue

@@ -143,7 +143,7 @@ def test_an_opted_in_project_keeps_the_triage_runners_narrow_tools(denv):
     assert next(a for a in argv if a.startswith("--allowedTools=")) == next(
         a for a in template if a.startswith("--allowedTools="))
     assert not any("Edit(" in a or "Write(" in a or "git commit" in a for a in argv)
-    rec = denv.d._get(denv.d.RUN_PREFIX + denv.d.running["claude"].run_id)
+    rec = denv.d._get(denv.d.RUN_PREFIX + next(r for r in denv.d.running.values() if r.agent == 'claude').run_id)
     assert "tool_preflight" not in rec
 
 

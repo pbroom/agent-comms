@@ -41,7 +41,7 @@ def delivery_env(stack, tmp_path, monkeypatch, request):
 def bind(stack, worker, **overrides):
     env = stack['env']
     args = dict(project=str(stack['repo']), worktree=str(stack['fallback_path']),
-                dispatch_run_id=worker.running['claude'].run_id)
+                dispatch_run_id=next(r for r in worker.running.values() if r.agent == 'claude').run_id)
     args.update(overrides)
     return env.board.register_session(env.p['claude'], **args)['session_id']
 
@@ -267,7 +267,7 @@ def test_reserved_live_child_can_bind_after_acknowledgement_deadline(delivery_en
     stack, worker, rule, post = delivery_env
     env = stack['env']
     worker.tick()
-    run_id = worker.running['claude'].run_id
+    run_id = next(r for r in worker.running.values() if r.agent == 'claude').run_id
     version = current(stack, post)['version']
     env.clock.advance(stack['spec']['ack_seconds'] + 1)
     workstreams.reconcile(env.board, env.p['human'], None, post['id'], version,

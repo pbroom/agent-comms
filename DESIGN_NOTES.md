@@ -2053,3 +2053,45 @@ in the project's checkout (on the hub, or on a node that has the project), for a
 - Clients off the hub (remote.py): with `[server] hub` set, `board mcp` is a transparent stdio <-> streamable HTTP
   relay to the hub's /mcp (the hub's MCP server answers everything; the relay only carries JSON-RPC messages), and
   `board brief` reads the hub's GET /api/brief. Existing Claude Code and Codex launchers need no change.
+
+## Fast pickup (2026-10-29)
+
+**Report.** The human: Codex and Claude should task each other and have each request picked up quickly, whoever sends
+it and whoever receives it. Delivery policies (above) covered "whoever sends". Three things still delayed pickup:
+a project without a `[dispatch.worktrees]` entry never launched (the 10-minute Needs-you alert was all it got), a live
+but idle session of the recipient held a launch back indefinitely, and one run per agent and per checkout queued every
+second request behind the first.
+
+**1. Discovered checkouts** (`[dispatch] checkout_roots`, `DispatchConfig.checkout_for`). A thread project counts as
+configured when it is its own real path (no symlink, no `..`), an existing directory with a `.git` entry, strictly
+inside a root, and neither is nor contains a protected location (`protected_paths`: tokens, SSH keys, the agent CLIs'
+config, the board's files). It then runs in the project directory itself, exactly as a worktrees entry naming it
+would. A plain folder, the root itself or an arbitrary path an agent names still never becomes a run directory.
+Roots are file-only (board.local.toml). Nodes: a node reports its own `checkout_roots` in hello (only when it has
+some, so an older hub keeps accepting it) and checks the checkout itself before starting; the hub's
+`[dispatch.nodes.<name>]` takes `checkout_roots` too, matched by path (`nodes.grant_covers`, `under_roots`).
+
+**2. Liveness by receipt** (`Dispatcher._policy_held`). After a policy's grace, a session holds the launch back only if
+it is a live session of the recipient in the thread's project that was handed this very request (its delivery
+receipt). A session that never read it, idle in a chat or elsewhere, no longer does. A run of the agent on the same
+thread that ended within `live_minutes` still holds it back, so a run that exits at once is not relaunched in a loop
+(`_attempted` and requeue's retry cap bound it further). A thread with an ordinary workstream rule, whose agent is
+merely live somewhere (the agent-wide `_live` check), falls back to the agent's delivery policy once that policy's
+grace has passed and nobody holds the request, like the existing inbox fallback.
+
+**3. Parallel runs** (`[dispatch] parallel_worktrees`, `max_runs_per_agent`). With `parallel_worktrees`, a local
+non-inbox, non-managed run whose run directory is a Git checkout runs in `<worktree_dir>/<repo>-<hash>/<agent>-t<thread>`
+(`run_worktree_path`), created with `git worktree add --detach <path> HEAD` or reused; a directory there that is not a
+worktree of the same repository is refused. One tree per agent and thread, so a relaunch resumes where the last run
+left off, and the one-run-per-directory rule (above) now serializes only the same agent on the same thread.
+`max_runs_per_agent` (default 1, settings page) replaces the fixed one run per agent; the dispatcher's runs are keyed
+by run id. A run may register its worktree as its project: `register_session` maps a path equal to the run's
+recorded `run_worktree` to the thread's project with that worktree. Hourly, the worktree of a closed or deleted thread
+is removed only when nothing would be lost: a clean status and a HEAD contained in some branch or remote-tracking ref;
+anything else stays. `worktree_dir` (default `~/agent-comms-worktrees`) may not be or contain the home directory or
+overlap a protected location. Inbox runs, managed continuations (their verified environment) and node runs are
+unchanged.
+
+**Residual risks.** A worktree starts from the checkout's HEAD, not its uncommitted changes. An output a request
+declared under the main checkout is still checked against the checkout (`_output_blocker`), not the worktree.
+Worktrees of open threads accumulate until their threads close.

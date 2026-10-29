@@ -1080,6 +1080,12 @@ class Board:
                 live = run.get("status") in dispatch.ACTIVE and (
                     run.get("status") != "orphaned"
                     or dispatch.probe_process(run.get("pid"), run.get("proc_start")) != "dead")
+                # A run in its own git worktree ([dispatch] parallel_worktrees) may name that worktree as its
+                # project; it still belongs to the thread's project, so it registers there with that worktree.
+                if (thread and isinstance(run.get("run_worktree"), str)
+                        and project in (_norm_path(run["run_worktree"]), worktree)
+                        and os.path.realpath(project) == os.path.realpath(run["run_worktree"])):
+                    project, worktree = thread["project"], _norm_path(run["run_worktree"])
                 if run.get("agent") != p.name or not live or not thread or thread["project"] != project:
                     raise Forbidden("dispatch run does not match this active agent and project")
                 if run.get('inbox_delivery'):

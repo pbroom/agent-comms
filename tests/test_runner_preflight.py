@@ -15,7 +15,7 @@ def configure(env, project=PROJECT):
     allow(env, agents=['claude'], max_launches=1)
     post = human_post(env, ['claude'])
     env.d.tick()
-    run = env.d.running['claude']
+    run = next(r for r in env.d.running.values() if r.agent == 'claude')
     record = env.d._get(env.d.RUN_PREFIX + run.run_id)
     return post, run, record
 

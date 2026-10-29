@@ -73,13 +73,39 @@ def test_a_live_session_in_another_project_does_not_hold_it_back(penv):
     assert penv.spawner.agents() == ["claude-fake"]
 
 
-def test_a_live_session_in_the_project_is_left_to_pick_it_up(penv):
+def test_a_live_session_in_the_project_that_read_it_is_left_to_pick_it_up(penv):
+    policy(penv)
+    handoff(penv)
+    sid = penv.session("claude", PROJECT)
+    penv.board.read_updates(penv.p["claude"], sid)      # handed the request: it has a delivery receipt
+    penv.clock.advance(GRACE + 1)
+    penv.board.register_session(penv.p["claude"], PROJECT, resume_session_id=sid)   # still live
+    penv.d.tick()
+    assert penv.spawner.calls == []
+
+
+def test_a_live_session_that_never_read_it_does_not_hold_it_back(penv):
     policy(penv)
     handoff(penv)
     penv.clock.advance(GRACE + 1)
-    penv.session("claude", PROJECT)
+    penv.session("claude", PROJECT)                     # live in the project, idle: never read the request
+    penv.d.tick()
+    assert penv.spawner.agents() == ["claude-fake"]
+
+
+def test_a_workstream_rule_falls_back_to_the_policy_when_the_agent_is_only_live(penv):
+    rule = allow(penv, agents=["claude"])
+    delivery = policy(penv)
+    penv.clock.advance(1)
+    handoff(penv)
+    penv.session("claude", "/work/elsewhere")           # live elsewhere: the workstream rule waits for it
     penv.d.tick()
     assert penv.spawner.calls == []
+    penv.clock.advance(GRACE + 1)
+    penv.session("claude", "/work/elsewhere")
+    penv.d.tick()
+    [r] = runs(penv)
+    assert r["rule_id"] == delivery["id"] != rule["id"]
 
 
 def test_only_requests_after_the_policy_and_in_its_scope(penv):
@@ -205,3 +231,71 @@ def test_an_all_projects_policy_runs_only_in_configured_checkouts(penv):
     penv.clock.advance(GRACE + 1)
     penv.d.tick()
     assert penv.spawner.calls == [] and runs(penv) == [], "a path an agent named is never a run directory"
+
+
+def _checkout(root, name):
+    repo = root / name
+    (repo / ".git").mkdir(parents=True)
+    return str(repo)
+
+
+def test_a_git_checkout_inside_a_checkout_root_needs_no_worktrees_entry(penv, tmp_path):
+    root = tmp_path / "code"
+    repo = _checkout(root, "app")
+    plain = root / "notes"
+    plain.mkdir()
+    penv.d.config.checkout_roots = [str(root)]
+    policy(penv, scope="all_projects")
+    for project in (repo, str(plain), str(root)):
+        tid = penv.board.create_thread(penv.p["codex"], penv.sid["codex"], "x", project)["id"]
+        penv.post("codex", tid, "please do this", "request", to=["claude"])
+    penv.clock.advance(GRACE + 1)
+    penv.d.tick()
+    [call] = penv.spawner.calls
+    assert call["cwd"] == repo, "only a Git checkout strictly inside the root, never a plain folder or the root"
+
+
+def test_discovered_checkouts_refuse_symlinks_and_protected_places(tmp_path, monkeypatch):
+    root = tmp_path / "code"
+    repo = _checkout(root, "app")
+    (root / "link").symlink_to(repo)
+    config = DispatchConfig.from_dict({"checkout_roots": [str(root)]})
+    assert config.checkout_for(repo) == repo
+    assert config.checkout_for(str(root / "link")) is None
+    assert config.checkout_for(repo + "/../app") is None
+    config.protected_dirs = [repo]
+    assert config.checkout_for(repo) is None
+    config.worktrees = {"/work/x": "/work/x-run"}
+    assert config.checkout_for("/work/x/") == "/work/x-run" and config.run_dir("/nowhere") == "/nowhere"
+    for bad in (["/"], ["relative"], [str(root / "missing")], [str(root / "link")], "x"):
+        with pytest.raises(ValueError):
+            DispatchConfig.from_dict({"checkout_roots": bad})
+
+
+def test_a_node_takes_projects_inside_its_checkout_roots(penv):
+    from agent_comms import nodes
+    from agent_comms.config import create_agent
+    node = penv.board.authenticate(create_agent(penv.settings.agents_path, "laptop", "node"))
+    penv.d.config.worktrees = {}
+    penv.d.config.nodes = {"laptop": {"projects": [], "checkout_roots": ["/work"], "agents": ["claude"]}}
+    policy(penv)
+    handoff(penv)
+    penv.clock.advance(GRACE + 1)
+    nodes.hello(penv.board, node, [], ["claude"], 1, checkout_roots=["/work"])
+    penv.d.tick()
+    [r] = runs(penv)
+    assert r["node"] == "laptop"
+    assert not nodes.grant_covers({"checkout_roots": ["/work"]}, "/work/../etc")
+    assert not nodes.grant_covers({"checkout_roots": ["/work"]}, "/work")
+
+
+def test_a_later_live_reader_holds_it_back_after_the_first_reader_went_quiet(penv):
+    policy(penv)
+    post = handoff(penv)
+    first = penv.session("claude", PROJECT)
+    penv.board.read_updates(penv.p["claude"], first)
+    penv.clock.advance(GRACE + 1)                       # the first reader is stale now
+    second = penv.session("claude", PROJECT)
+    penv.board.read_posts(penv.p["claude"], second, [post["id"]])
+    penv.d.tick()
+    assert penv.spawner.calls == [], "the second, live reader has it"
