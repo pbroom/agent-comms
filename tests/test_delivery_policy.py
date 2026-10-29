@@ -123,6 +123,24 @@ def test_the_daily_budget_holds(penv, monkeypatch):
     assert len(penv.spawner.calls) == 2, "the budget resets the next UTC day"
 
 
+def test_no_daily_limit_by_default(penv, monkeypatch):
+    from agent_comms import requeue
+    monkeypatch.setattr(requeue, "MAX_RETRIES", 0)
+    rule = policy(penv)
+    assert rule["daily_launch_limit"] is None and rule["launches_left"] is None
+    for n in range(1, 4):
+        handoff(penv)
+        penv.clock.advance(GRACE + 1)
+        penv.d.tick()
+        assert len(penv.spawner.calls) == n
+        penv.spawner.children[-1].code = 0
+        penv.d.tick()
+        penv.clock.advance(penv.config.live_minutes * 60 + 1)
+    [out] = penv.board.list_delivery_policies(penv.p["human"])
+    assert out["state"] == "active" and out["launches_left"] is None
+    assert policy(penv, agent="grok", daily_launch_limit=500)["daily_launch_limit"] == 500, "no upper bound"
+
+
 def test_a_workstream_approval_still_wins(penv):
     policy(penv)
     rule = allow(penv, agents=["claude"])

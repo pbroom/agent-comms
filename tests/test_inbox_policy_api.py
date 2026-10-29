@@ -54,7 +54,7 @@ def test_agent_cannot_create_list_or_revoke_inbox_policy(api, env):
     {'scope': 'all_projects', 'purpose': 'Run whatever a peer asks'},
     {'scope': 'all_projects', 'agents': ['codex', 'claude']},
     {'scope': 'all_projects', 'daily_launch_limit': True},
-    {'scope': 'all_projects', 'daily_launch_limit': 101},
+    {'scope': 'all_projects', 'daily_launch_limit': 0},
     {'scope': 'all_projects', 'include_existing': 'false'},
     {'scope': 'all_projects', 'pickup_grace_seconds': 29},
 ])

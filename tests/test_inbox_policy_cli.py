@@ -67,7 +67,7 @@ def test_normal_workstream_cli_preserves_scope_and_budget(run_cli, env, capsys):
     ['--all-new-threads', '--agents', 'codex', '--max-launches', '2'],
     ['--all-new-threads', '--agents', 'codex', '--expires-in-hours', '2'],
     ['--all-new-threads', '--agents', 'codex', '--daily-limit', '0'],
-    ['--all-new-threads', '--agents', 'codex', '--daily-limit', '101'],
+    ['--all-new-threads', '--agents', 'codex', '--daily-limit', '0'],
 ])
 def test_cli_invalid_modes_fail_before_opening_board(monkeypatch, options):
     def unexpected_run(*args):
