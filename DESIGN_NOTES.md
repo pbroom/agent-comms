@@ -2042,8 +2042,8 @@ in the project's checkout (on the hub, or on a node that has the project), for a
 - After `pickup_grace_seconds` (default 120), and only when no session of X *in that project* is live. A session of
   X in another project cannot read the request (thread 27), so it no longer holds the launch back, unlike an
   ordinary rule's agent-wide liveness check.
-- A daily budget per policy (default 20, at most 100, reset at UTC midnight; revoking and re-enabling does not
-  refill it), plus the dispatcher's usual limits: one run per agent and per run directory, max_concurrent,
+- No daily launch limit by default (2026-10-29, the human's call: the caps stalled agent-to-agent handoffs). An optional
+  `--daily-limit N` (no upper bound) resets at UTC midnight; revoking and re-enabling does not refill it. Plus the dispatcher's usual limits: one run per agent and per run directory, max_concurrent,
   timeouts, preflight and browser checks, requeue of an ended run's unsettled request.
 - The launch prompt is the ordinary one with a fixed purpose (core.DELIVERY_PURPOSE): handle the addressed requests
   within what they and the thread already ask for. Task leases, host gates and grants apply as for any run.

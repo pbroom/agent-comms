@@ -27,7 +27,7 @@ def test_human_policy_is_bounded_revocable_and_separate_from_execution_grants(de
     before = e.board.list_grants(e.p['human'],PROJECT)
     r = policy(e)
     assert r['thread_id'] is None and r['project'] is None
-    assert r['agents'] == ['codex'] and r['daily_launch_limit'] == 100 and r['expires_at'] is None
+    assert r['agents'] == ['codex'] and r['daily_launch_limit'] is None and r['expires_at'] is None
     assert e.board.list_grants(e.p['human'],PROJECT) == before
     assert e.board.list_dispatch_rules(e.p['human']) == []
     with pytest.raises(Forbidden):
@@ -38,7 +38,7 @@ def test_human_policy_is_bounded_revocable_and_separate_from_execution_grants(de
 
 
 @pytest.mark.parametrize('kw',[
-    {'daily_launch_limit':True},{'daily_launch_limit':0},{'daily_launch_limit':101},
+    {'daily_launch_limit':True},{'daily_launch_limit':0},{'daily_launch_limit':-1},
     {'pickup_grace_seconds':False},{'pickup_grace_seconds':29},{'pickup_grace_seconds':3601},
     {'include_existing':1},{'project':PROJECT},{'scope':'other'},
     {'scope':'project','project':'relative'},

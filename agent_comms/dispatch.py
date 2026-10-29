@@ -1943,7 +1943,7 @@ class Dispatcher:
             started = None
         record |= {"pid": child.pid, "proc_start": started, "status": "running", "launches_left": left}
         self._record(record)
-        log.info("launched %s for thread %s (rule %s, %s launch(es) left), pid %s, log %s",
+        log.info("launched %s for thread %s (rule %s, launches left: %s), pid %s, log %s",
                  agent, thread_id, rule["id"], left, child.pid, log_path)
         self.board._notify("dispatch.launched", {"run_id": run_id, "agent": agent, "thread_id": thread_id,
                                                  "rule_id": rule["id"], "launches_left": left})

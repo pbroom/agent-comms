@@ -863,8 +863,8 @@ uv run board dispatch deliver --agent claude-code --all-projects      # or --pro
 ```
 
 Then any request addressed to that agent that no live session in its project picks up within two minutes gets a full
-run of the agent in that project's checkout (here, or on a node that has the project). Each policy has a daily
-launch budget (default 20). Revoke a policy with `board dispatch revoke <id>`. See DESIGN_NOTES "Delivery policies".
+run of the agent in that project's checkout (here, or on a node that has the project). Policies have no daily
+launch limit unless you pass `--daily-limit N`. Revoke a policy with `board dispatch revoke <id>`. See DESIGN_NOTES "Delivery policies".
 
 **1. Approve a workstream.** Only you can do this; the rule is stored in the board and enforced by core.
 

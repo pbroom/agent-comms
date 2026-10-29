@@ -213,7 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--expires-in-hours", type=float)
     d.add_argument("--all-new-threads", action="store_true",
                    help="deliver Codex requests across all projects; grants no execution authorization")
-    d.add_argument("--daily-limit", type=int, help="daily inbox delivery budget (default 100, maximum 100)")
+    d.add_argument("--daily-limit", type=int, help="daily inbox delivery budget (default: no limit)")
     d.add_argument("--include-existing", action="store_true",
                    help="also deliver existing queued unassigned requests")
     d = dsub.add_parser("deliver", help="standing delivery for one agent: launch it in the project's checkout (here "
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> None:
     g = d.add_mutually_exclusive_group(required=True)
     g.add_argument("--project", help="absolute project path")
     g.add_argument("--all-projects", action="store_true")
-    d.add_argument("--daily-limit", type=int, default=20, help="launches per UTC day (default 20, maximum 100)")
+    d.add_argument("--daily-limit", type=int, help="launches per UTC day (default: no limit)")
     d.add_argument("--grace-seconds", type=int, default=120,
                    help="wait this long for a live session to pick a request up first (30-3600, default 120)")
     d = dsub.add_parser("list", help="approvals, dispatcher status and recent launches")
@@ -244,8 +244,8 @@ def main(argv: list[str] | None = None) -> None:
                 ap.error('--all-new-threads requires --agents codex')
             if any(getattr(a, field) is not None for field in ('thread', 'purpose', 'max_launches', 'expires_in_hours')):
                 ap.error('--all-new-threads cannot use --thread, --purpose, --max-launches or --expires-in-hours')
-            if a.daily_limit is not None and not 1 <= a.daily_limit <= 100:
-                ap.error('--daily-limit must be between 1 and 100')
+            if a.daily_limit is not None and a.daily_limit < 1:
+                ap.error('--daily-limit must be a positive whole number')
         else:
             missing = [flag for flag, value in (('--thread', a.thread), ('--purpose', a.purpose),
                                                 ('--max-launches', a.max_launches)) if value is None]
@@ -441,17 +441,22 @@ def _notify_cmd(a, out, board: Board, p) -> None:
                             "in System Settings > Notifications.")
 
 
+def _fmt_budget(r: dict) -> str:
+    if r['daily_launch_limit'] is None:
+        return "no daily launch limit"
+    return f"{r['launches_left']}/{r['daily_launch_limit']} launches left today"
+
+
 def _fmt_rule(r: dict) -> str:
     if r.get('kind') == 'agent_delivery':
         scope = 'all projects' if r['scope'] == 'all_projects' else r['project']
         return (f"delivery policy {r['id']} [{r['state']}]: {r['agent']} in {scope}, full work runs after "
-                f"{r['pickup_grace_seconds']}s unpicked, {r['launches_left']}/{r['daily_launch_limit']} launches "
-                f"left today\n    purpose: {r['purpose']}")
+                f"{r['pickup_grace_seconds']}s unpicked, {_fmt_budget(r)}\n    purpose: {r['purpose']}")
     if r.get('kind') == 'inbox_delivery':
         scope = 'all projects' if r['scope'] == 'all_projects' else r['project']
         existing = '; includes existing queued requests' if r['include_existing'] else '; new requests only'
         return (f"inbox policy {r['id']} [{r['state']}]: {scope}, Codex delivery only, "
-                f"{r['launches_left']}/{r['daily_launch_limit']} launches left today{existing}\n"
+                f"{_fmt_budget(r)}{existing}\n"
                 f"    purpose: {r['purpose']}")
     exp = f", expires {r['expires_at']}" if r["expires_at"] else ""
     return (f"rule {r['id']} [{r['state']}]: thread {r['thread_id']} ({r['project']}), agents "
@@ -474,7 +479,7 @@ def _dispatch_cmd(a, out, board: Board, p) -> None:
     if a.dispatch_cmd == "allow":
         if a.all_new_threads:
             r = board.create_inbox_policy(p, scope='all_projects',
-                                          daily_launch_limit=a.daily_limit if a.daily_limit is not None else 100,
+                                          daily_launch_limit=a.daily_limit,
                                           include_existing=a.include_existing)
         else:
             expires = board.now() + a.expires_in_hours * 3600 if a.expires_in_hours is not None else None

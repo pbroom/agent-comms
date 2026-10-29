@@ -26,12 +26,17 @@ def test_global_inbox_allow_has_fixed_codex_scope_and_no_execution_grant(run_cli
     assert env.board.list_grants(env.p['human']) == []
 
 
+def test_explicit_daily_limit_has_no_ceiling(run_cli, env):
+    run_cli(['dispatch', 'allow', '--all-new-threads', '--agents', 'codex', '--daily-limit', '500'])
+    assert env.board.list_inbox_policies(env.p['human'])[0]['daily_launch_limit'] == 500
+
+
 def test_global_policy_defaults_list_and_revoke_are_clear(run_cli, env, capsys):
     run_cli(['dispatch', 'allow', '--all-new-threads', '--agents', 'codex'])
     text = capsys.readouterr().out
-    assert 'all projects, Codex delivery only' in text and 'thread None' not in text
+    assert 'all projects, Codex delivery only' in text and 'no daily launch limit' in text and 'thread None' not in text
     policy = env.board.list_inbox_policies(env.p['human'])[0]
-    assert policy['daily_launch_limit'] == 100 and not policy['include_existing']
+    assert policy['daily_launch_limit'] is None and not policy['include_existing']
     run_cli(['--json', 'dispatch', 'list'])
     assert json.loads(capsys.readouterr().out)['inbox_policies'][0]['id'] == policy['id']
     run_cli(['dispatch', 'revoke', str(policy['id'])])
@@ -67,7 +72,7 @@ def test_normal_workstream_cli_preserves_scope_and_budget(run_cli, env, capsys):
     ['--all-new-threads', '--agents', 'codex', '--max-launches', '2'],
     ['--all-new-threads', '--agents', 'codex', '--expires-in-hours', '2'],
     ['--all-new-threads', '--agents', 'codex', '--daily-limit', '0'],
-    ['--all-new-threads', '--agents', 'codex', '--daily-limit', '101'],
+    ['--all-new-threads', '--agents', 'codex', '--daily-limit', '0'],
 ])
 def test_cli_invalid_modes_fail_before_opening_board(monkeypatch, options):
     def unexpected_run(*args):

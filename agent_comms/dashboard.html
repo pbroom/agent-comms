@@ -496,7 +496,7 @@ const NOTIFY_EVENTS = ["needs-response", "to-human", "decision", "agent-launched
 const NOTIFY_DEFAULT = ["needs-response", "to-human", "decision", "agent-launched"];
 let notifyDraft = { events: [...NOTIFY_DEFAULT], project: "", thread: "", idle: "" };
 let approveDraft = { thread: "", agents: [], purpose: "", max: "", hours: "" };
-let inboxDraft = { scope: "all_projects", project: "", daily: "100", grace: "120", includeExisting: false };
+let inboxDraft = { scope: "all_projects", project: "", daily: "", grace: "120", includeExisting: false };
 let inboxFormOpen = false;
 // What the human typed to record with "Allow again" on a sticky browser gate, keyed by gateKey (project, origin).
 const gateDrafts = {};
@@ -1226,12 +1226,12 @@ function renderInboxPickup() {
   const form = el("form", { class: "settings-form inbox-policy-form", onsubmit: async e => {
       e.preventDefault();
       if (!state.me.is_human || cfgBusy) return;
-      const daily = Number(d.daily), grace = Number(d.grace), project = d.project.trim();
+      const daily = d.daily.trim() === "" ? null : Number(d.daily), grace = Number(d.grace), project = d.project.trim();
       if (d.scope === "project" && !project.startsWith("/")) {
         cfgError = "Enter the project's absolute path."; return render();
       }
-      if (!Number.isInteger(daily) || daily < 1 || daily > 100) {
-        cfgError = "Daily launches must be a whole number from 1 to 100."; return render();
+      if (daily !== null && (!Number.isInteger(daily) || daily < 1)) {
+        cfgError = "Daily launches must be a positive whole number, or blank for no limit."; return render();
       }
       if (!Number.isInteger(grace) || grace < 30 || grace > 3600) {
         cfgError = "Pickup grace must be a whole number from 30 to 3600 seconds."; return render();
@@ -1239,7 +1239,7 @@ function renderInboxPickup() {
       const body = { scope: d.scope, project: d.scope === "all_projects" ? null : project,
         daily_launch_limit: daily, include_existing: d.includeExisting, pickup_grace_seconds: grace };
       if (await cfgAct("POST", "/api/admin/dispatch/inbox-policies", body)) {
-        inboxDraft = { scope: "all_projects", project: "", daily: "100", grace: "120", includeExisting: false };
+        inboxDraft = { scope: "all_projects", project: "", daily: "", grace: "120", includeExisting: false };
         render();
       }
     } },
@@ -1251,8 +1251,8 @@ function renderInboxPickup() {
     d.scope === "project" ? el("label", {}, "Project (exact absolute path)", el("input", {
       name: "inbox_project", required: true, value: d.project, disabled: cfgBusy, autocomplete: "off",
       placeholder: "/Users/you/project", oninput: e => { d.project = e.target.value; } })) : null,
-    el("label", {}, "Daily launch limit", el("input", { type: "number", name: "daily_launch_limit",
-      min: 1, max: 100, step: 1, required: true, value: d.daily, disabled: cfgBusy,
+    el("label", {}, "Daily launch limit (blank: no limit)", el("input", { type: "number", name: "daily_launch_limit",
+      min: 1, step: 1, value: d.daily, disabled: cfgBusy,
       oninput: e => { d.daily = e.target.value; } })),
     el("label", {}, "Pickup grace (seconds)", el("input", { type: "number", name: "pickup_grace_seconds",
       min: 30, max: 3600, step: 1, required: true, value: d.grace, disabled: cfgBusy,
@@ -1268,8 +1268,9 @@ function renderInboxPickup() {
       el("div", { class: "post small" + (enabled(p) ? "" : " muted"), "data-inbox-policy": p.id },
         el("div", {}, el("strong", {}, p.scope === "all_projects" ? "All projects" : p.project), " · Codex · ",
           chip(p.state, p.state === "active" ? "ok" : p.state === "exhausted" ? "warn" : "")),
-        el("div", {}, `${p.launches_left}/${p.daily_launch_limit} launches left today · resets `,
-          p.reset_at ? new Date(p.reset_at).toLocaleString() : "not available"),
+        p.daily_launch_limit == null ? el("div", {}, "No daily launch limit")
+          : el("div", {}, `${p.launches_left}/${p.daily_launch_limit} launches left today · resets `,
+            p.reset_at ? new Date(p.reset_at).toLocaleString() : "not available"),
         el("div", {}, `Pickup after ${p.pickup_grace_seconds} seconds · `,
           p.include_existing ? "includes existing queued requests" : "new requests only"),
         p.purpose ? el("div", { class: "body" }, p.purpose) : null,

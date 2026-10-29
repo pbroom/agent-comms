@@ -258,7 +258,7 @@ class HumanNotifier:
             self._seen[run_key] = None
             while len(self._seen) > 2000:
                 self._seen.popitem(last=False)
-        thread_id, rule_id, left = int(payload["thread_id"]), int(payload["rule_id"]), int(payload["launches_left"])
+        thread_id, rule_id, left = int(payload["thread_id"]), int(payload["rule_id"]), payload["launches_left"]
         row = self.board.conn.execute("SELECT project FROM threads WHERE id = ?", (thread_id,)).fetchone()
         project = row["project"] if row else None
         if not any((s["project"] is None or s["project"] == project)
@@ -266,7 +266,8 @@ class HumanNotifier:
             return
         agent = clean(payload["agent"], 32)
         self._submit(Notification(TITLE, f"dispatcher · thread {thread_id}",
-                                  f"Started {agent} (rule {rule_id}, {left} launch(es) left)",
+                                  f"Started {agent} (rule {rule_id}, "
+                                  + ("no launch limit)" if left is None else f"{int(left)} launch(es) left)"),
                                   agents=(agent,), thread_ids=(thread_id,), kind="agent-launched"))
 
     def _human_notification(self, post, kinds: set[str]) -> Notification:

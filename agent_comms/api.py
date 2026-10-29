@@ -229,7 +229,7 @@ class DispatchRuleIn(Body):
 class InboxPolicyIn(Body):
     scope: Literal['project', 'all_projects'] = 'project'
     project: str | None = None
-    daily_launch_limit: StrictInt = 100
+    daily_launch_limit: StrictInt | None = None   # None: no daily limit
     include_existing: StrictBool = False
     pickup_grace_seconds: StrictInt = 120
 
@@ -238,7 +238,7 @@ class DeliveryPolicyIn(Body):
     agent: str
     scope: Literal['project', 'all_projects'] = 'project'
     project: str | None = None
-    daily_launch_limit: StrictInt = 20
+    daily_launch_limit: StrictInt | None = None   # None: no daily limit
     pickup_grace_seconds: StrictInt = 120
 
 
