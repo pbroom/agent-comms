@@ -70,7 +70,7 @@ def test_exact_project_policy_and_defaults(api, env):
     assert response.status_code == 200, response.text
     policy = response.json()
     assert policy['project'] == '/work/repo' and policy['scope'] == 'project'
-    assert policy['daily_launch_limit'] == 100 and not policy['include_existing']
+    assert policy['daily_launch_limit'] is None and not policy['include_existing']
     assert policy['pickup_grace_seconds'] == 120
 
 

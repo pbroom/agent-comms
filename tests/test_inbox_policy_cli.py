@@ -29,9 +29,9 @@ def test_global_inbox_allow_has_fixed_codex_scope_and_no_execution_grant(run_cli
 def test_global_policy_defaults_list_and_revoke_are_clear(run_cli, env, capsys):
     run_cli(['dispatch', 'allow', '--all-new-threads', '--agents', 'codex'])
     text = capsys.readouterr().out
-    assert 'all projects, Codex delivery only' in text and 'thread None' not in text
+    assert 'all projects, Codex delivery only' in text and 'no daily launch limit' in text and 'thread None' not in text
     policy = env.board.list_inbox_policies(env.p['human'])[0]
-    assert policy['daily_launch_limit'] == 100 and not policy['include_existing']
+    assert policy['daily_launch_limit'] is None and not policy['include_existing']
     run_cli(['--json', 'dispatch', 'list'])
     assert json.loads(capsys.readouterr().out)['inbox_policies'][0]['id'] == policy['id']
     run_cli(['dispatch', 'revoke', str(policy['id'])])
