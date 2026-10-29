@@ -40,6 +40,7 @@ from .core import Board, Conflict, Principal, iso
 log = logging.getLogger("agent_comms.delivery")
 
 RECEIPT_PREFIX = "delivery.receipt."   # <post id>.<recipient>: {session_id, at}
+READER_PREFIX = "delivery.reader."     # <post id>.<recipient>.<session id>: {at}, one per session that was handed it
 ALERT_PREFIX = "delivery.alert."       # <post id>.<recipient>: {alert_post_id, at}
 DAILY_PREFIX = "delivery.daily."       # <recipient>: times of alert posts naming it, rolling day
 WATERMARK_KEY = "delivery.watermark"   # posts created before the first pass with the alert on never alert
@@ -69,8 +70,9 @@ def record(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
     a read must not fail because a receipt could not be written."""
     if p.is_human:
         return
-    keys = [_key(RECEIPT_PREFIX, d["id"], p.name) for d in posts
-            if any(r.get("recipient") == p.name for r in d.get("requests") or [])]
+    ids = [d["id"] for d in posts if any(r.get("recipient") == p.name for r in d.get("requests") or [])]
+    keys = [k for i in ids for k in (_key(RECEIPT_PREFIX, i, p.name),
+                                     f"{_key(READER_PREFIX, i, p.name)}.{int(session_id)}")]
     keys = [k for k in dict.fromkeys(keys)
             if board.conn.execute("SELECT 1 FROM board_state WHERE key = ?", (k,)).fetchone() is None]
     if not keys:
@@ -89,6 +91,14 @@ def record(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
 def receipt(conn, post_id: int, recipient: str) -> dict | None:
     value = _get(conn, _key(RECEIPT_PREFIX, post_id, recipient))
     return value if isinstance(value, dict) else None
+
+
+def readers(conn, post_id: int, recipient: str) -> list[int]:
+    """Every session of `recipient` that was handed this request (the receipt keeps only the first)."""
+    prefix = _key(READER_PREFIX, post_id, recipient) + "."
+    return [int(k[len(prefix):]) for (k,) in conn.execute(
+        "SELECT key FROM board_state WHERE key >= ? AND key < ?", (prefix, prefix[:-1] + "/"))
+        if k[len(prefix):].isdigit()]
 
 
 def annotate(conn, post_id: int, row: dict) -> None:
@@ -261,7 +271,7 @@ def _prune(board: Board) -> None:
         return
     try:
         with db.write_tx(board.conn) as c:
-            for prefix in (RECEIPT_PREFIX, ALERT_PREFIX, DAILY_PREFIX):
+            for prefix in (RECEIPT_PREFIX, READER_PREFIX, ALERT_PREFIX, DAILY_PREFIX):
                 c.execute("DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ?",
                           (*_range(prefix), now - KEEP_SECONDS))
             _upsert(c, PRUNED_KEY, now, now)

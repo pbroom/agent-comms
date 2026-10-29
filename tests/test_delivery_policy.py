@@ -287,3 +287,15 @@ def test_a_node_takes_projects_inside_its_checkout_roots(penv):
     assert r["node"] == "laptop"
     assert not nodes.grant_covers({"checkout_roots": ["/work"]}, "/work/../etc")
     assert not nodes.grant_covers({"checkout_roots": ["/work"]}, "/work")
+
+
+def test_a_later_live_reader_holds_it_back_after_the_first_reader_went_quiet(penv):
+    policy(penv)
+    post = handoff(penv)
+    first = penv.session("claude", PROJECT)
+    penv.board.read_updates(penv.p["claude"], first)
+    penv.clock.advance(GRACE + 1)                       # the first reader is stale now
+    second = penv.session("claude", PROJECT)
+    penv.board.read_posts(penv.p["claude"], second, [post["id"]])
+    penv.d.tick()
+    assert penv.spawner.calls == [], "the second, live reader has it"

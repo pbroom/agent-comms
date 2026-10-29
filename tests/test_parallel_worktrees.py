@@ -141,3 +141,14 @@ def test_worktree_dir_may_not_be_home_or_protected(tmp_path):
     assert ok.worktree_root() == str(tmp_path)
     with pytest.raises(ValueError):
         DispatchConfig.from_dict({"parallel_worktrees": "yes"})
+
+
+def test_a_request_with_an_output_in_the_checkout_runs_in_the_checkout(wenv):
+    out = os.path.join(wenv.repo, "report.md")
+    wenv.post("codex", wenv.threads[0], "write the report", "request", to=["claude"],
+              refs=[{"kind": "output", "path": out}])
+    ask(wenv, wenv.threads[1])
+    wenv.clock.advance(GRACE + 1)
+    wenv.d.tick()
+    assert [c["cwd"] for c in wenv.spawner.calls] == [
+        wenv.repo, run_worktree_path(wenv.wt_root, wenv.repo, "claude", wenv.threads[1])]

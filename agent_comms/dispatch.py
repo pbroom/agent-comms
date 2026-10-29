@@ -1474,12 +1474,15 @@ class Dispatcher:
         window = self.config.live_minutes * 60
         if now - self.ended_on.get((agent, item["thread_id"]), float("-inf")) < window:
             return True
-        got = delivery.receipt(self.board.conn, item["post_id"], agent) if item.get("post_id") else None
-        if not got:
+        if not item.get("post_id"):
             return False
-        return self.board.conn.execute(
+        got = delivery.receipt(self.board.conn, item["post_id"], agent)
+        sessions = set(delivery.readers(self.board.conn, item["post_id"], agent))
+        if got and isinstance(got.get("session_id"), int):
+            sessions.add(got["session_id"])   # receipts written before per-session readers were recorded
+        return any(self.board.conn.execute(
             "SELECT 1 FROM sessions WHERE id = ? AND agent = ? AND project = ? AND last_seen >= ?",
-            (got.get("session_id"), agent, project, now - window)).fetchone() is not None
+            (sid, agent, project, now - window)).fetchone() is not None for sid in sessions)
 
     def _inbox_rule_for(self, rules: list[dict], item: dict) -> dict | None:
         from . import human_actions
@@ -1569,7 +1572,8 @@ class Dispatcher:
                 error = self._browser_blocker(item['post_id'], agent) or error
             if not inbox:
                 error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
-                error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [])
+                error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [],
+                                                      self._run_dir_for(agent, rule['project'], thread_id, item, inbox))
             if delivery is not None:
                 configured_cwd = self.config.run_dir(rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
@@ -1784,20 +1788,7 @@ class Dispatcher:
                 return True
         return False
 
-    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int]) -> str | None:
-        """Before reserving a launch: every output the triggering request(s) declared (refs of kind "output", the
-        structured field only, never post text) must lie inside this run's directory or one of the extra writable
-        roots it will get, and its nearest existing directory must be writable. A configured root that has gone
-        away (or turned into a symlink) since the dispatcher started fails too. A failure is a capability blocker:
-        recorded on the request, no launch budget spent."""
-        project = rule["project"]
-        cwd = self.config.run_dir(project)
-        template = self._runner(agent)
-        roots = self.config.extra_roots(template, project)
-        for r in roots:
-            if not os.path.isdir(r) or os.path.realpath(r) != r:
-                return (f"extra writable root {r} for this project no longer exists or is now a symlink; fix "
-                        "[dispatch.writable_roots] in board.local.toml and restart the dispatcher")
+    def _declared_outputs(self, request_ids: list[int]) -> list[str]:
         outputs: list[str] = []
         for post_id in request_ids:
             row = self.board.conn.execute("SELECT refs FROM posts WHERE id=?", (post_id,)).fetchone()
@@ -1807,6 +1798,23 @@ class Dispatcher:
                 refs = []
             outputs += [r["path"] for r in refs if isinstance(r, dict) and r.get("kind") == "output"
                         and isinstance(r.get("path"), str)]
+        return outputs
+
+    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int], cwd: str | None = None) -> str | None:
+        """Before reserving a launch: every output the triggering request(s) declared (refs of kind "output", the
+        structured field only, never post text) must lie inside this run's directory or one of the extra writable
+        roots it will get, and its nearest existing directory must be writable. A configured root that has gone
+        away (or turned into a symlink) since the dispatcher started fails too. A failure is a capability blocker:
+        recorded on the request, no launch budget spent."""
+        project = rule["project"]
+        cwd = cwd or self.config.run_dir(project)   # the directory the runner actually gets (_run_dir_for)
+        template = self._runner(agent)
+        roots = self.config.extra_roots(template, project)
+        for r in roots:
+            if not os.path.isdir(r) or os.path.realpath(r) != r:
+                return (f"extra writable root {r} for this project no longer exists or is now a symlink; fix "
+                        "[dispatch.writable_roots] in board.local.toml and restart the dispatcher")
+        outputs = self._declared_outputs(request_ids)
         if not outputs:
             return None
         allowed = [cwd] + roots
@@ -1955,6 +1963,11 @@ class Dispatcher:
         base = self.config.run_dir(project)
         if (inbox or item.get("managed") or not self.config.parallel_worktrees or not os.path.isabs(base)
                 or not os.path.isdir(base) or not os.path.lexists(os.path.join(base, ".git"))):
+            return base
+        # A request that declared an output inside the checkout itself needs the checkout as its run directory
+        # (a worktree run could not write there): it takes turns there, as without parallel_worktrees.
+        if item.get("post_id") and any(isinstance(o, str) and os.path.isabs(o) and _within(o, base)
+                                       for o in self._declared_outputs([item["post_id"]])):
             return base
         return run_worktree_path(self.config.worktree_root(), base, agent, thread_id)
 
