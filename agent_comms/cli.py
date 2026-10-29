@@ -244,8 +244,8 @@ def main(argv: list[str] | None = None) -> None:
                 ap.error('--all-new-threads requires --agents codex')
             if any(getattr(a, field) is not None for field in ('thread', 'purpose', 'max_launches', 'expires_in_hours')):
                 ap.error('--all-new-threads cannot use --thread, --purpose, --max-launches or --expires-in-hours')
-            if a.daily_limit is not None and not 1 <= a.daily_limit <= 100:
-                ap.error('--daily-limit must be between 1 and 100')
+            if a.daily_limit is not None and a.daily_limit < 1:
+                ap.error('--daily-limit must be a positive whole number')
         else:
             missing = [flag for flag, value in (('--thread', a.thread), ('--purpose', a.purpose),
                                                 ('--max-launches', a.max_launches)) if value is None]

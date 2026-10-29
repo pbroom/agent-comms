@@ -26,6 +26,11 @@ def test_global_inbox_allow_has_fixed_codex_scope_and_no_execution_grant(run_cli
     assert env.board.list_grants(env.p['human']) == []
 
 
+def test_explicit_daily_limit_has_no_ceiling(run_cli, env):
+    run_cli(['dispatch', 'allow', '--all-new-threads', '--agents', 'codex', '--daily-limit', '500'])
+    assert env.board.list_inbox_policies(env.p['human'])[0]['daily_launch_limit'] == 500
+
+
 def test_global_policy_defaults_list_and_revoke_are_clear(run_cli, env, capsys):
     run_cli(['dispatch', 'allow', '--all-new-threads', '--agents', 'codex'])
     text = capsys.readouterr().out
