@@ -73,6 +73,8 @@ EDITABLE: dict[str, Spec] = {s.key: s for s in (
     Spec("dispatch", "timeout_minutes", float, 1, 1440, 30.0, "Wall-clock limit per run (minutes)"),
     Spec("dispatch", "kill_grace_seconds", float, 1, 300, 10.0, "SIGTERM to SIGKILL grace (seconds)"),
     Spec("dispatch", "max_concurrent", int, 1, 20, 2, "Runs at once across all agents"),
+    Spec("dispatch", "max_runs_per_agent", int, 1, 20, 1,
+         "Runs of one agent at once (each needs its own run directory: see parallel_worktrees)"),
     Spec("dispatch", "undelivered_alert_minutes", float, 0, 1440, 10.0,
          "Tell me about a request nobody can read after this long (minutes; 0 = off)"),
 )}
@@ -80,7 +82,7 @@ del _d
 
 # Recognised but deliberately not editable from a browser.
 FILE_ONLY = {"host", "port", "db_path", "agents_path", "runners", "env", "worktrees", "headless_browser",
-             "writable_roots", "checkout_roots"}
+             "writable_roots", "checkout_roots", "parallel_worktrees", "worktree_dir"}
 FILE_ONLY_WHY = ("is not editable from the dashboard. host, port and paths need a restart, and the dispatcher's "
                  "runners, env, worktrees, checkout roots, writable roots and headless browser decide what runs on this machine; edit "
                  "board.local.toml by hand")

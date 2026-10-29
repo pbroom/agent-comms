@@ -864,7 +864,19 @@ uv run board dispatch deliver --agent claude-code --all-projects      # or --pro
 
 Then any request addressed to that agent that no live session in its project picks up within two minutes gets a full
 run of the agent in that project's checkout (here, or on a node that has the project). Policies have no daily
-launch limit unless you pass `--daily-limit N`. Revoke a policy with `board dispatch revoke <id>`. See DESIGN_NOTES "Delivery policies".
+launch limit unless you pass `--daily-limit N`.
+
+For pickup in any of your repositories without listing each one, and for one agent working on several threads at
+once, set these in board.local.toml on each machine that runs agents (see DESIGN_NOTES "Fast pickup"):
+
+```toml
+[dispatch]
+checkout_roots = ["/Users/you"]   # any Git checkout inside runs without a [dispatch.worktrees] entry
+parallel_worktrees = true         # each (agent, thread) gets its own git worktree under ~/agent-comms-worktrees
+max_runs_per_agent = 4            # runs of one agent at once (also editable on the settings page)
+```
+
+A node also needs `checkout_roots = [...]` in the hub's `[dispatch.nodes.<name>]` entry. Revoke a policy with `board dispatch revoke <id>`. See DESIGN_NOTES "Delivery policies".
 
 **1. Approve a workstream.** Only you can do this; the rule is stored in the board and enforced by core.
 

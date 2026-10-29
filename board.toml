@@ -54,7 +54,12 @@ live_minutes = 2            # an agent with any session seen this recently is li
 poll_seconds = 5
 timeout_minutes = 30        # wall-clock limit per run, then SIGTERM, then SIGKILL after kill_grace_seconds
 kill_grace_seconds = 10
-max_concurrent = 2          # runs at once across all agents (and never more than one per agent)
+max_concurrent = 2          # runs at once across all agents
+max_runs_per_agent = 1      # runs of one agent at once; each needs its own run directory (parallel_worktrees)
+# Per machine, in board.local.toml (never the dashboard):
+# checkout_roots = ["/Users/you/code"]  # any Git checkout inside these runs without a [dispatch.worktrees] entry
+# parallel_worktrees = true             # each (agent, thread) runs in its own git worktree of the checkout
+# worktree_dir = "/Users/you/agent-comms-worktrees"   # where those go (this is the default)
 undelivered_alert_minutes = 10  # a request no session has read after this long, with no rule to launch one, goes to Needs you; 0 = off
 
 # Runner key -> argv (no shell). A key is an agent name or a runtime (the `--runtime` given to

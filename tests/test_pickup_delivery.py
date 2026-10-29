@@ -24,7 +24,7 @@ def test_recovers_virtual_human_answer_past_scan_mark(denv):
     env.d.tick()
     assert len(env.spawner.calls) == 1
     assert progress(env, post)['state'] == 'queued'
-    run_id = env.d.running['codex'].run_id
+    run_id = next(r for r in env.d.running.values() if r.agent == 'codex').run_id
     env.board.register_session(env.p['codex'], PROJECT, env.workdir, dispatch_run_id=run_id)
 
     assert progress(env, post)['state'] == 'queued'
@@ -229,7 +229,7 @@ def test_coalesced_delivery_keeps_both_original_obligations(denv):
                    'Route other original request to claude', [], 'claude', None)
     env.d.tick()
     assert len(env.spawner.calls) == 1
-    record = env.d._get(env.d.RUN_PREFIX + env.d.running['claude'].run_id)
+    record = env.d._get(env.d.RUN_PREFIX + next(r for r in env.d.running.values() if r.agent == 'claude').run_id)
     assert set(record['request_recipients']) == {'codex', 'claude'}
     env.spawner.children[0].code = 0
     env.d.tick()
@@ -239,7 +239,7 @@ def test_coalesced_delivery_keeps_both_original_obligations(denv):
     env.clock.advance(5 * 60)
     env.d.tick()
     assert len(env.spawner.calls) == 2
-    record = env.d._get(env.d.RUN_PREFIX + env.d.running['claude'].run_id)
+    record = env.d._get(env.d.RUN_PREFIX + next(r for r in env.d.running.values() if r.agent == 'claude').run_id)
     assert set(record['request_recipients']) == {'codex', 'claude'}
 
 
