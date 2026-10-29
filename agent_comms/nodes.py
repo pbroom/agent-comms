@@ -88,19 +88,23 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
 
 
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
-          headless_browser: Any = None) -> dict:
+          headless_browser: Any = None, checkout_roots: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
-    `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser."""
+    `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
+    `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
     headless = _strings([] if headless_browser is None else headless_browser, "headless_browser",
                         lambda v: v in runners)
+    roots = _strings([] if checkout_roots is None else checkout_roots, "checkout_roots",
+                     lambda v: v.startswith("/") and v != "/")
     if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or not 1 <= max_concurrent <= 50:
         raise Invalid("max_concurrent must be an integer from 1 to 50")
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
-            "headless_browser": headless, "max_concurrent": max_concurrent, "last_seen": now}
+            "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots],
+            "max_concurrent": max_concurrent, "last_seen": now}
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
@@ -136,6 +140,20 @@ def _active_runs(conn, node: str) -> int:
     return n
 
 
+def under_roots(project: str, roots: list[str]) -> bool:
+    """`project` lies strictly inside one of `roots`, by path (the hub cannot see a node's disk; the node checks the
+    checkout itself before it starts, DispatchConfig.discovered_checkout)."""
+    if ".." in project.split("/") or "//" in project:
+        return False
+    return any(project.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def grant_covers(grant: dict, project: str) -> bool:
+    """A hub `[dispatch.nodes.<name>]` entry allows this project: listed, or inside one of its checkout_roots."""
+    project = project.rstrip("/") or "/"
+    return project in grant.get("projects", []) or under_roots(project, grant.get("checkout_roots", []))
+
+
 def runner_key(info: dict, agent: str, runtime: str | None) -> str | None:
     """The runner key a node would use for this agent: its name, else its runtime (DispatchConfig.runner_key)."""
     offered = info.get("runners", [])
@@ -156,10 +174,11 @@ def node_for(board: Board, project: str, agent: str, runtime: str | None,
         if now - float(info.get("last_seen") or 0) > NODE_STALE_SECONDS:
             continue
         grant = (allowed or {}).get(info["node"])
-        if (not grant or project not in grant.get("projects", [])
+        if (not grant or not grant_covers(grant, project)
                 or agent not in grant.get("agents", []) and not (runtime and runtime in grant.get("agents", []))):
             continue
-        if project not in info.get("projects", []) or not keys & set(info.get("runners", [])):
+        if ((project not in info.get("projects", []) and not under_roots(project, info.get("checkout_roots", [])))
+                or not keys & set(info.get("runners", []))):
             continue
         if headless_browser and runner_key(info, agent, runtime) not in info.get("headless_browser", []):
             continue

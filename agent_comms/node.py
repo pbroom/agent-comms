@@ -145,6 +145,8 @@ class Node:
     def hello(self) -> dict:
         body = {"projects": sorted(self.config.worktrees), "runners": sorted(self.config.runners),
                 "max_concurrent": self.config.max_concurrent}
+        if self.config.checkout_roots:   # only then: a hub older than this field refuses any hello that carries it
+            body["checkout_roots"] = list(self.config.checkout_roots)
         headless = self.headless_runners()
         if headless:    # only then: a hub older than this field refuses any hello that carries it
             body["headless_browser"] = headless
@@ -202,7 +204,7 @@ class Node:
             template = self.config.runner_for(agent, r.get("runtime"))
             if template is None:
                 raise LookupError(f"no runner configured on this machine for {agent}")
-            cwd = self.config.worktrees.get((project or "").rstrip("/") or "/")
+            cwd = self.config.checkout_for(project)
             if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
                 raise FileNotFoundError(f"this machine has no run directory for project {project!r}")
             prompt = r.get("prompt")

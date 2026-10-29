@@ -647,6 +647,26 @@ def validate_writable_roots(table: Any, settings: Settings | None = None) -> dic
     return out
 
 
+def validate_checkout_roots(value: Any) -> list[str]:
+    """`[dispatch] checkout_roots`: existing directories, each its own real path and never `/`. Git checkouts inside
+    them run without a [dispatch.worktrees] entry (DispatchConfig.discovered_checkout)."""
+    where = "[dispatch] checkout_roots"
+    if not isinstance(value, list) or not all(isinstance(r, str) for r in value):
+        raise ValueError(f"{where} must be a list of absolute directory paths")
+    out: list[str] = []
+    for raw in value:
+        r = raw.rstrip("/") if raw not in ("", "/") else raw
+        if not r or _has_control(r) or not os.path.isabs(r) or os.path.normpath(r) != r:
+            raise ValueError(f"{where}: {raw!r} must be an absolute, normalized directory path")
+        if r == "/":
+            raise ValueError(f"{where} may not be /")
+        if not os.path.isdir(r) or os.path.realpath(r) != r:
+            raise ValueError(f"{where}: {r} must be an existing directory written as its real path (no symlinks)")
+        if r not in out:
+            out.append(r)
+    return out
+
+
 def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
     """The runner argv with the extra writable roots added the way its CLI takes them (see writable_roots_kind)."""
     if not roots:
@@ -674,6 +694,8 @@ class DispatchConfig:
     runners: dict[str, list[str]] = field(default_factory=dict)   # agent name or runtime -> argv template
     env: dict[str, list[str]] = field(default_factory=dict)       # agent name or runtime -> extra env var NAMES
     worktrees: dict[str, str] = field(default_factory=dict)       # thread project -> directory to run in
+    checkout_roots: list[str] = field(default_factory=list)      # any Git checkout inside these counts as configured
+    protected_dirs: list[str] = field(default_factory=list)      # never a discovered checkout (protected_paths)
     writable_roots: dict[str, list[str]] = field(default_factory=dict)   # thread project -> extra writable dirs
     claude_tool_projects: list[str] = field(default_factory=list)
     headless_browser: HeadlessBrowserConfig = field(default_factory=HeadlessBrowserConfig)
@@ -729,6 +751,9 @@ class DispatchConfig:
                 c.worktrees = {proj.rstrip("/") or "/": wt for proj, wt in v.items()}
             elif k == "writable_roots":
                 c.writable_roots = validate_writable_roots(v, settings)
+            elif k == "checkout_roots":
+                c.checkout_roots = validate_checkout_roots(v)
+                c.protected_dirs = protected_paths(settings)[0]
             elif k in ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds"):
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
                     raise ValueError(f"[dispatch] {k} must be a positive number")
@@ -738,14 +763,19 @@ class DispatchConfig:
                     raise ValueError("[dispatch.nodes] maps a node name to {projects = [...], agents = [...]}")
                 c.nodes = {}
                 for name, grant in v.items():
-                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents"}
+                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents", "checkout_roots"}
                             or not isinstance(grant.get("projects", []), list)
+                            or not isinstance(grant.get("checkout_roots", []), list)
+                            or not all(isinstance(x, str) and os.path.isabs(x) and x.rstrip("/")
+                                       and os.path.normpath(x) == x.rstrip("/")
+                                       for x in grant.get("checkout_roots", []))
                             or not isinstance(grant.get("agents", []), list)
                             or not all(isinstance(x, str) and os.path.isabs(x) for x in grant.get("projects", []))
                             or not all(isinstance(x, str) and x for x in grant.get("agents", []))):
-                        raise ValueError(f"[dispatch.nodes.{name}] needs projects (absolute paths) and agents (names "
-                                         "or runtimes)")
+                        raise ValueError(f"[dispatch.nodes.{name}] needs projects and/or checkout_roots (absolute "
+                                         "paths, not /) and agents (names or runtimes)")
                     c.nodes[name] = {"projects": [x.rstrip("/") or "/" for x in grant.get("projects", [])],
+                                     "checkout_roots": [x.rstrip("/") for x in grant.get("checkout_roots", [])],
                                      "agents": list(grant.get("agents", []))}
             elif k == "undelivered_alert_minutes":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
@@ -761,6 +791,33 @@ class DispatchConfig:
                 raise ValueError(f"unknown setting [dispatch] {k}")
         c.headless_browser.check_runners(c.runners)
         return c
+
+    def checkout_for(self, project: str | None) -> str | None:
+        """The directory this machine runs `project` in: its [dispatch.worktrees] entry, else the project itself when
+        it is a Git checkout inside one of `checkout_roots` (DESIGN_NOTES "Discovered checkouts"), else None."""
+        if not isinstance(project, str) or not project:
+            return None
+        key = project.rstrip("/") or "/"
+        if key in self.worktrees:
+            return self.worktrees[key]
+        return key if self.discovered_checkout(key) else None
+
+    def discovered_checkout(self, project: str) -> bool:
+        """`project` is an existing Git checkout strictly inside a checkout root, written as its own real path, that
+        neither is nor contains a protected location. A thread's project is whatever path its creator gave, so
+        nothing else (a plain folder, a symlink detour, the root itself, ~/.ssh) ever becomes a run directory."""
+        if (not self.checkout_roots or not os.path.isabs(project) or _has_control(project)
+                or os.path.normpath(project) != project or os.path.realpath(project) != project
+                or not os.path.isdir(project) or not os.path.lexists(os.path.join(project, ".git"))):
+            return False
+        if not any(project != r and _within(project, r) for r in self.checkout_roots):
+            return False
+        return not any(_within(project, d) or _within(d, project) for d in self.protected_dirs)
+
+    def run_dir(self, project: str) -> str:
+        """Where a run for this thread project goes: its configured or discovered checkout, else the project path
+        (an ordinary workstream rule's historical default; preflight refuses a directory that does not exist)."""
+        return self.checkout_for(project) or project
 
     def writable_roots_kind(self, template: list[str] | None, project: str) -> str | None:
         """How a run of this runner in this project takes extra writable roots: 'codex' (a `-c` override), 'claude'
@@ -1010,6 +1067,7 @@ class Dispatcher:
         self.token = secrets.token_hex(16)
         self.running: dict[str, _Run] = {}
         self.ended: dict[str, float] = {}   # agent -> when its last dispatched run ended
+        self.ended_on: dict[tuple[str, int], float] = {}   # (agent, thread) -> when its last run there ended
         self.orphan_terms: dict[str, float] = {}   # orphaned run id -> when we sent it SIGTERM (timeout/stop)
         self.orphan_killed: set[str] = set()
         self.stopping = False
@@ -1318,9 +1376,10 @@ class Dispatcher:
         if thread is None:
             return None
         # A thread's project is whatever path its creator gave. A policy runs only in a checkout the human configured
-        # (a [dispatch] worktrees key here, or a project a [dispatch.nodes] entry allows), never in an arbitrary path.
-        if (thread['project'] not in self.config.worktrees
-                and not any(thread['project'] in g.get('projects', []) for g in self.config.nodes.values())):
+        # (a [dispatch] worktrees key or a Git checkout inside a checkout root here, or a project a [dispatch.nodes]
+        # entry allows), never in an arbitrary path.
+        if (self.config.checkout_for(thread['project']) is None
+                and not any(nodes.grant_covers(g, thread['project']) for g in self.config.nodes.values())):
             return None
         rule = max((r for r in rules if r.get('kind') == 'agent_delivery' and item['agent'] in r['agents']
                     and (r['scope'] == 'all_projects' or r['project'] == thread['project'])
@@ -1328,14 +1387,22 @@ class Dispatcher:
                    key=lambda r: (r['scope'] == 'project', r['created_at_ts'], r['id']), default=None)
         return rule | {'project': thread['project']} if rule else None
 
-    def _live_in_project(self, agent: str, project: str, now: float) -> bool:
-        """For a delivery policy: a session of the agent in THIS project seen within live_minutes, or a run of it that
-        just ended. A session in another project cannot read this request for it (live case: thread 27)."""
+    def _policy_held(self, agent: str, project: str, item: dict, now: float) -> bool:
+        """For a delivery policy whose grace has passed: whether to leave the request to a session that has it. Only
+        a live session of the agent in THIS project that was handed this very request (its delivery receipt) holds
+        it back; a live session that never read it (idle in a chat, or in another project: live case thread 27)
+        does not. A run of the agent on this thread that ended within live_minutes holds it back too, so a run that
+        exits at once is not relaunched in a tight loop (DESIGN_NOTES "Delivery policies")."""
+        from . import delivery
         window = self.config.live_minutes * 60
-        if now - self.ended.get(agent, float("-inf")) < window:
+        if now - self.ended_on.get((agent, item["thread_id"]), float("-inf")) < window:
             return True
-        return self.board.conn.execute("SELECT 1 FROM sessions WHERE agent = ? AND project = ? AND last_seen >= ?",
-                                       (agent, project, now - window)).fetchone() is not None
+        got = delivery.receipt(self.board.conn, item["post_id"], agent) if item.get("post_id") else None
+        if not got:
+            return False
+        return self.board.conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ? AND agent = ? AND project = ? AND last_seen >= ?",
+            (got.get("session_id"), agent, project, now - window)).fetchone() is not None
 
     def _inbox_rule_for(self, rules: list[dict], item: dict) -> dict | None:
         from . import human_actions
@@ -1381,6 +1448,14 @@ class Dispatcher:
                 continue  # preserve the trigger until fresh safe ownership evidence is available
             # An unrelated heartbeat must not starve a covered inbox obligation merely because a normal
             # workstream also covers it. Fall back to delivery-only authority; leave that execution budget alone.
+            # Likewise a delivery policy: a session of the agent that is merely live somewhere must not hold up a
+            # request on a workstream thread past the policy's grace when no session in its project has read it.
+            if not item.get('managed') and rule.get('kind') is None and self._live(agent, now):
+                fallback = self._delivery_rule_for(rules, item)
+                if (fallback and now >= max(item['post_created_at'], fallback['created_at_ts'])
+                        + fallback['pickup_grace_seconds'] and not self._policy_held(agent, fallback['project'],
+                                                                                    item, now)):
+                    rule = fallback
             if not item.get('managed') and rule.get('kind') != 'inbox_delivery' and self._live(agent,now):
                 fallback = self._inbox_rule_for(rules,item)
                 if fallback and now >= max(item['post_created_at'],fallback['created_at_ts']) + fallback['pickup_grace_seconds']:
@@ -1396,14 +1471,14 @@ class Dispatcher:
                     and now < max(item['post_created_at'],rule['created_at_ts']) + rule['pickup_grace_seconds']):
                 continue
             live = (now - self.ended.get(agent,float('-inf')) < self.config.live_minutes * 60 if inbox
-                    else self._live_in_project(agent, rule['project'], now) if policy else self._live(agent, now))
+                    else self._policy_held(agent, rule['project'], item, now) if policy else self._live(agent, now))
             if (agent in busy or len(self.running) + len(foreign) >= self.config.max_concurrent
                     or (not item.get('managed') and live)):
                 continue
             # One dispatched run per run directory: two runs in one checkout (threads of one project, or two agents)
             # see each other's uncommitted changes and fence each other's recovery (recovery._ownership_blocker).
             # The trigger waits, like it does behind max_concurrent, and launches in seq order once it is free.
-            if self._dir_key(self.config.worktrees.get(rule["project"], rule["project"])) in self._busy_dirs(foreign):
+            if self._dir_key(self.config.run_dir(rule["project"])) in self._busy_dirs(foreign):
                 continue
             if inbox and self._inbox_busy(item['thread_id'], now):
                 continue
@@ -1417,7 +1492,7 @@ class Dispatcher:
                 error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
                 error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [])
             if delivery is not None:
-                configured_cwd = self.config.worktrees.get(rule['project'], rule['project'])
+                configured_cwd = self.config.run_dir(rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
                     error = 'Configured runner directory differs from the verified fallback environment'
                 item['delivery'] = delivery
@@ -1570,7 +1645,7 @@ class Dispatcher:
         """Browser-bound work for a node where every node that can attach the browser is full: it waits."""
         if not self._node_headless(agent, project):
             return False
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         if self._remote_node(agent, project, cwd, headless_browser=True) is not None:
             return False
         return bool(self._headless_origins(agent, thread_id, [item['post_id']] if item.get('post_id') else []))
@@ -1578,7 +1653,7 @@ class Dispatcher:
     def _node_headless(self, agent: str, project: str) -> bool | None:
         """None when this agent runs here for this project (or no node offers it); else whether a node offering it
         can attach a headless browser, full or not (capacity only makes the work wait)."""
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         if cwd and os.path.isabs(cwd) and os.path.isdir(cwd):
             return None
         find = lambda **kw: nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes,
@@ -1589,7 +1664,7 @@ class Dispatcher:
 
     def _preflight(self, agent: str, rule: dict) -> str | None:
         project = rule["project"]
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         if rule.get('kind') != 'inbox_delivery' and self._remote_node(agent, project, cwd) is not None:
             return None   # the node checks its own runner and run directory when it starts the run
         if rule.get('kind') != 'inbox_delivery' and (not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
@@ -1614,7 +1689,7 @@ class Dispatcher:
     def _inbox_busy(self, thread_id: int, now: float) -> bool:
         """A heartbeat alone is not work. Preserve active work in the source checkout."""
         project = self.board._thread_row(thread_id)['project']
-        source = self._dir_key(self.config.worktrees.get(project,project))
+        source = self._dir_key(self.config.run_dir(project))
         for row in self.board.conn.execute('''SELECT s.*, a.state AS activity, a.recorded_at,
                 EXISTS(SELECT 1 FROM tasks t WHERE t.owner_session=s.id
                     AND t.status IN ('working','blocked') AND t.lease_expires_at>?) AS leased,
@@ -1637,7 +1712,7 @@ class Dispatcher:
         away (or turned into a symlink) since the dispatcher started fails too. A failure is a capability blocker:
         recorded on the request, no launch budget spent."""
         project = rule["project"]
-        cwd = self.config.worktrees.get(project, project)
+        cwd = self.config.run_dir(project)
         template = self._runner(agent)
         roots = self.config.extra_roots(template, project)
         for r in roots:
@@ -1813,7 +1888,7 @@ class Dispatcher:
         inbox = rule.get('kind') == 'inbox_delivery'
         project = self.board._thread_row(thread_id)['project'] if inbox else rule['project']
         cwd = (str(self.log_dir.absolute() / 'codex-inbox' / run_id) if inbox
-               else self.config.worktrees.get(project, project))
+               else self.config.run_dir(project))
         log_path = self.log_dir / f"{run_id}.log"
         record = {"run_id": run_id, "agent": agent, "thread_id": thread_id, "rule_id": rule["id"],
                   "post_seq": item["seq"], "request_ids": [item["post_id"]] if item.get("post_id") else [], "pid": None, "cwd": cwd, "log": str(log_path), "loop": self.token,
@@ -1950,7 +2025,7 @@ class Dispatcher:
 
     def _finish(self, run: _Run, status: str, code: int | None, stop_mode: str | None = None) -> None:
         self.running.pop(run.agent, None)
-        self.ended[run.agent] = self.board.now()
+        self.ended[run.agent] = self.ended_on[(run.agent, run.thread_id)] = self.board.now()
         rec = self._get(self.RUN_PREFIX + run.run_id) or {}
         rec |= {"status": status, "exit_code": code, "ended_at": self.board.now()}
         if stop_mode is not None:
