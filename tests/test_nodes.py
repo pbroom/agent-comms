@@ -421,3 +421,80 @@ def test_a_node_without_a_browser_sends_the_hello_an_older_hub_accepts(nenv):
     nenv.node.client.request = lambda method, path, **kw: (sent.append(kw.get("json")), real(method, path, **kw))[1]
     nenv.node.hello()
     assert "headless_browser" not in sent[0]
+
+
+# ---------------------------------------------------------------- writable roots on the node's own disk
+
+
+def node_writable(nenv, tmp_path, roots_for=PROJECT):
+    out = tmp_path / "node-only-output"   # a directory only the node knows about
+    nenv.node.config.runners["grok"] = ["codex", "exec", "{prompt}"]
+    nenv.node.config.writable_roots = {roots_for: [str(out)]}
+    return str(out)
+
+
+def test_a_node_reports_its_writable_roots_and_the_hub_checks_outputs_against_them(nenv, tmp_path):
+    out = node_writable(nenv, tmp_path)
+    nenv.node.hello()
+    assert nodes.node_writable_roots(nenv.board, "laptop", PROJECT, "grok", None) == [out]
+    allow(nenv, agents=["grok"])
+    post = human_post(nenv, ["grok"], refs=[{"kind": "output", "path": out + "/mods"}])
+    nenv.d.tick()
+    [r] = runs(nenv)
+    assert r["status"] == "running" and r["node"] == "laptop", r.get("error")
+    nenv.node.tick()
+    [call] = nenv.node_spawner.calls
+    assert any(out in a for a in call["argv"]), "the node gives the run its own writable root"
+    assert post
+
+
+def test_an_output_outside_the_nodes_roots_fails_preflight_naming_the_node(nenv, tmp_path):
+    node_writable(nenv, tmp_path, roots_for="/work/other")
+    nenv.node.hello()
+    allow(nenv, agents=["grok"])
+    post = human_post(nenv, ["grok"], refs=[{"kind": "output", "path": str(tmp_path / "elsewhere")}])
+    nenv.d.tick()
+    [r] = runs(nenv)
+    assert r["status"] == "preflight_failed" and "node laptop" in r["error"]
+    [req] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
+    assert req["state"] == "blocked"
+
+
+def test_a_node_applies_an_edited_config_without_a_restart(nenv, tmp_path):
+    out = tmp_path / "added-later"
+    out.mkdir()
+    edited = DispatchConfig.from_dict({
+        "runners": {"grok": ["codex", "exec", "{prompt}"]},
+        "worktrees": {PROJECT: nenv.node_dir}, "writable_roots": {PROJECT: [str(out)]}, "max_concurrent": 1})
+    pending = [edited]
+    nenv.node.reload = lambda: pending.pop() if pending else None
+    nenv.node.tick()
+    assert nenv.node.config is edited
+    assert nodes.node_writable_roots(nenv.board, "laptop", PROJECT, "grok", None) == [str(out)]
+
+
+def test_a_node_keeps_its_config_when_an_edit_does_not_validate(nenv):
+    before = nenv.node.config
+    def bad():
+        raise ValueError("broken")
+    nenv.node.reload = bad
+    nenv.node.tick()
+    assert nenv.node.config is before
+
+
+def test_writable_roots_in_hello_are_plain_paths_for_offered_runners(nenv):
+    with pytest.raises(Invalid):
+        nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1, writable_roots={"nope": {PROJECT: ["/x"]}})
+    with pytest.raises(Invalid):
+        nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1,
+                    writable_roots={"grok": {PROJECT: ["/a/../b"]}})
+    with pytest.raises(Invalid):
+        nodes.hello(nenv.board, nenv.p["laptop"], [PROJECT], ["grok"], 1, writable_roots={"grok": {PROJECT: ["/"]}})
+
+
+def test_a_node_without_writable_roots_sends_the_hello_an_older_hub_accepts(nenv):
+    sent = []
+    real = nenv.node.client.request
+    nenv.node.client.request = lambda method, path, **kw: (sent.append(kw.get("json")), real(method, path, **kw))[1]
+    nenv.node.hello()
+    assert "writable_roots" not in sent[0]

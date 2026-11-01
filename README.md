@@ -1137,8 +1137,12 @@ allow rule). Scoped Claude runs (`claude_tool_projects`, whose allow list is rel
 CLIs get nothing. Each folder must exist and be written as its real path (no symlinks or `..`), at most 10 per
 project, and may not be `/`, your home folder or anything containing it, or overlap `~/.ssh`,
 `~/.config/agent-comms`, `~/.codex`, `~/.claude`, this board's folder or its data directory. A runner that sets
-`--add-dir` or `writable_roots` itself is refused, so the table is the one place to look. The roots are read when
-`board dispatch run` starts; restart it after changing them.
+`--add-dir` or `writable_roots` itself is refused, so the table is the one place to look. A running dispatcher or
+`board node` re-reads the table within a pass of any edit; no restart is needed.
+
+With a hub and nodes, put the table in the config of the machine that runs the work (the node). The node reports its
+effective roots to the hub in every heartbeat, and the hub checks a node-bound request's declared outputs against
+those paths, not its own config or disk.
 
 A request that writes outside its repository declares each destination in its refs, as
 `{"kind": "output", "path": "/Users/you/nexus-work/fix/after/screens"}` (an absolute folder or file; `..` is

@@ -738,6 +738,8 @@ def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
 # Runners, env and worktrees are read once, when `board dispatch run` starts.
 SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent",
            "max_runs_per_agent", "undelivered_alert_minutes")
+# Tables a running dispatcher (and a node, node.py) also re-reads: adding a writable root never needs a restart.
+RELOADED_TABLES = ("writable_roots",)
 WORKTREE_PRUNE_SECONDS = 3600
 
 
@@ -1153,7 +1155,7 @@ class Dispatcher:
 
     def refresh_config(self) -> None:
         """Apply edited [dispatch] scalars (live_minutes, poll_seconds, timeout_minutes, kill_grace_seconds,
-        max_concurrent, undelivered_alert_minutes) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
+        max_concurrent, undelivered_alert_minutes) and [dispatch.writable_roots] without a restart: the Board re-reads board.toml + board.local.toml when either changed,
         and a new generation means new values. A file that does not validate is ignored (the Board logs it) and
         the current values stay. Runners, env and worktrees are not reloaded."""
         try:
@@ -1169,7 +1171,7 @@ class Dispatcher:
         except ValueError as e:
             log.warning("ignoring [dispatch] settings that do not validate: %s", e)
             return
-        for k in SCALARS:
+        for k in SCALARS + RELOADED_TABLES:
             if getattr(self.config, k) != getattr(fresh, k):
                 log.info("dispatch setting %s: %s -> %s", k, getattr(self.config, k), getattr(fresh, k))
                 setattr(self.config, k, getattr(fresh, k))
@@ -1808,6 +1810,11 @@ class Dispatcher:
         recorded on the request, no launch budget spent."""
         project = rule["project"]
         cwd = cwd or self.config.run_dir(project)   # the directory the runner actually gets (_run_dir_for)
+        local = self.config.run_dir(project)
+        node = None if local and os.path.isabs(local) and os.path.isdir(local) else nodes.node_for(
+            self.board, project, agent, self._runtime(agent), self.config.nodes, room=False)
+        if node is not None:
+            return self._node_output_blocker(node, agent, project, request_ids)
         template = self._runner(agent)
         roots = self.config.extra_roots(template, project)
         for r in roots:
@@ -1844,6 +1851,26 @@ class Dispatcher:
             if not ok:
                 return (f"output {out} cannot be written: {probe} is not a directory the dispatcher's user can "
                         "write; fix its permissions or retarget the output")
+        return None
+
+    def _node_output_blocker(self, node: str, agent: str, project: str, request_ids: list[int]) -> str | None:
+        """A run that goes to a node writes on the node's disk, inside its run directory for the project or the
+        extra writable roots the node reported for that runner and project (its own [dispatch.writable_roots]).
+        The hub cannot see that disk, so only the paths are checked here; the node's config vouches for them."""
+        outputs = self._declared_outputs(request_ids)
+        if not outputs:
+            return None
+        roots = nodes.node_writable_roots(self.board, node, project, agent, self._runtime(agent))
+        allowed = [project.rstrip("/") or "/"] + roots
+        for out in dict.fromkeys(outputs):
+            if (not os.path.isabs(out) or _has_control(out) or len(out) > 1024
+                    or any(part in (".", "..") for part in out.split("/"))):
+                return f"declared output {out[:200]!r} is not a plain absolute path; retarget the output"
+            if not any(out.rstrip("/") == root or nodes.under_roots(out, [root]) for root in allowed):
+                extra = ("extra roots " + ", ".join(roots)) if roots else "no extra roots configured there"
+                return (f"output {out} is outside what node {node} lets this run write ({extra}); ask the human to "
+                        f"add it to [dispatch.writable_roots] for {project} in that machine's board.local.toml "
+                        "(it applies within seconds, no restart) or retarget the output")
         return None
 
     def _browser_blocker(self, post_id: int, agent: str) -> str | None:

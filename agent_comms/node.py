@@ -3,7 +3,7 @@
 The node connects out to the hub (`--hub`, e.g. https://server.tailnet.ts.net through `board gateway`, or
 http://127.0.0.1:8787 on the hub's own machine) with its own token, a node identity created on the hub with
 `board create-agent <name> --runtime node`. Everything it runs comes from THIS machine's own `[dispatch]` settings
-(board.toml + board.local.toml here): `runners` (any agent CLI: an argv template with {prompt}, {project},
+(board.toml + board.local.toml here, re-read within a pass of any edit): `runners` (any agent CLI: an argv template with {prompt}, {project},
 {thread}), `env`, `worktrees` (hub project path -> directory here), `writable_roots`, `claude_tool_projects`,
 `max_concurrent`, `headless_browser`. From the hub it takes only the assignment: which agent, which project, the thread
 id, the prompt text the hub's dispatcher wrote and, for browser-bound work, the origins the hub bound. A project or
@@ -54,8 +54,12 @@ class Node:
     def __init__(self, client: httpx.Client, config: DispatchConfig, log_dir: Path,
                  spawner: Callable[..., Any] = spawn_process, clock: Callable[[], float] = time.monotonic,
                  probe: Callable[[Any, Any], str] = probe_process, start_of: Callable[[int], Any] = process_start,
-                 signal_group: Callable[[int, int], None] = _signal_group, sleep: Callable[[float], None] = time.sleep):
+                 signal_group: Callable[[int, int], None] = _signal_group, sleep: Callable[[float], None] = time.sleep,
+                 reload: Callable[[], DispatchConfig | None] | None = None):
         self.client, self.config, self.log_dir, self.spawner, self.clock = client, config, log_dir, spawner, clock
+        # `reload`: the node's settings again when board.toml or board.local.toml changed since the last call, else
+        # None (run() passes one). An edit (a new writable root, project or runner) applies on the next pass.
+        self.reload = reload
         self.probe, self.start_of, self.signal_group, self.sleep = probe, start_of, signal_group, sleep
         self.running: dict[str, _Local] = {}
         self.last_hello = float("-inf")
@@ -142,9 +146,37 @@ class Node:
         return sorted(k for k in self.config.headless_browser.runners
                       if k in self.config.runners and self._headless_blocker(k, k) is None)
 
+    def writable_roots(self) -> dict[str, dict[str, list[str]]]:
+        """Runner key -> project -> the extra writable directories such a run gets here (reported in hello, so the
+        hub checks a request's declared outputs against this machine's config, not its own)."""
+        out: dict[str, dict[str, list[str]]] = {}
+        for key, template in self.config.runners.items():
+            for project in self.config.writable_roots:
+                roots = self.config.extra_roots(template, project)
+                if roots:
+                    out.setdefault(key, {})[project] = roots
+        return out
+
+    def refresh_config(self) -> None:
+        """Pick up edited settings files; a file that does not validate is logged and the current config stays."""
+        if self.reload is None:
+            return
+        try:
+            fresh = self.reload()
+        except Exception as e:
+            log.warning("ignoring settings that do not validate: %s", e)
+            return
+        if fresh is not None and fresh != self.config:
+            log.info("settings changed; applying them")
+            self.config = fresh
+            self.last_hello = float("-inf")   # tell the hub at once
+
     def hello(self) -> dict:
         body = {"projects": sorted(self.config.worktrees), "runners": sorted(self.config.runners),
                 "max_concurrent": self.config.max_concurrent}
+        writable = self.writable_roots()
+        if writable:    # only then: a hub older than this field refuses any hello that carries it
+            body["writable_roots"] = writable
         if self.config.checkout_roots:   # only then: a hub older than this field refuses any hello that carries it
             body["checkout_roots"] = list(self.config.checkout_roots)
         headless = self.headless_runners()
@@ -167,6 +199,7 @@ class Node:
         """One pass. Local runs are reaped and held to their timeouts whatever the hub does; hub errors propagate
         after that (the caller logs them and retries)."""
         try:
+            self.refresh_config()
             self._flush_unreported()
             if self.clock() - self.last_hello >= HELLO_SECONDS:
                 self.hello()
@@ -298,17 +331,30 @@ class Node:
 
 
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
-    from .config import Settings, home
+    from .config import LOCAL_SETTINGS, Settings, home
     settings = Settings.load()
     config = DispatchConfig.from_dict(settings.dispatch, settings=settings)
     log_dir = home() / "data" / "node-logs"
+    files = [settings.config_path, settings.config_path.with_name(LOCAL_SETTINGS)] if settings.config_path else []
+
+    def signature():
+        return tuple(os.stat(f).st_mtime_ns if f.exists() else None for f in files)
+    seen = [signature()]
+
+    def reload() -> DispatchConfig | None:
+        sig = signature()
+        if sig == seen[0]:
+            return None
+        seen[0] = sig     # a bad edit is reported once, not every pass; the next save is read again
+        fresh = Settings.load(settings.config_path)
+        return DispatchConfig.from_dict(fresh.dispatch, settings=fresh)
 
     def on_term(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_term)      # launchd and `kill` stop the node cleanly, runs included
     with httpx.Client(base_url=hub.rstrip("/"), headers={"Authorization": "Bearer " + token},
                       timeout=CALL_TIMEOUT, trust_env=False) as client:
-        node = Node(client, config, log_dir)
+        node = Node(client, config, log_dir, reload=reload)
         node.recover()      # local cleanup first: it must not depend on reaching the hub
         me = node.hello()
         print(f"node {me['node']} connected to {hub}: {len(me['projects'])} project(s), runners "

@@ -653,3 +653,13 @@ def test_redact_secrets(text, leak):
     assert leak not in core.redact_secrets(text)
     assert core.redact_secrets('unknown setting [dispatch] unknown_future_option') == \
         'unknown setting [dispatch] unknown_future_option'
+
+
+def test_dispatcher_applies_an_added_writable_root_without_a_restart(senv, tmp_path):
+    d = Dispatcher(senv.board, senv.p['human'], DispatchConfig.from_dict(senv.board.s.dispatch))
+    project, root = "/work/zark", tmp_path / "extra-root"
+    root.mkdir()
+    senv.local.write_text(senv.local.read_text() + f'\n[dispatch.writable_roots]\n"{project}" = ["{root}"]\n')
+    touch_later(senv.local)
+    d.refresh_config()
+    assert d.config.writable_roots == {project: [str(root)]}
