@@ -738,6 +738,8 @@ def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
 # Runners, env and worktrees are read once, when `board dispatch run` starts.
 SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent",
            "max_runs_per_agent", "undelivered_alert_minutes")
+# Tables a running dispatcher (and a node, node.py) also re-reads: adding a writable root never needs a restart.
+RELOADED_TABLES = ("writable_roots",)
 WORKTREE_PRUNE_SECONDS = 3600
 
 
@@ -1153,7 +1155,7 @@ class Dispatcher:
 
     def refresh_config(self) -> None:
         """Apply edited [dispatch] scalars (live_minutes, poll_seconds, timeout_minutes, kill_grace_seconds,
-        max_concurrent, undelivered_alert_minutes) without a restart: the Board re-reads board.toml + board.local.toml when either changed,
+        max_concurrent, undelivered_alert_minutes) and [dispatch.writable_roots] without a restart: the Board re-reads board.toml + board.local.toml when either changed,
         and a new generation means new values. A file that does not validate is ignored (the Board logs it) and
         the current values stay. Runners, env and worktrees are not reloaded."""
         try:
@@ -1169,7 +1171,7 @@ class Dispatcher:
         except ValueError as e:
             log.warning("ignoring [dispatch] settings that do not validate: %s", e)
             return
-        for k in SCALARS:
+        for k in SCALARS + RELOADED_TABLES:
             if getattr(self.config, k) != getattr(fresh, k):
                 log.info("dispatch setting %s: %s -> %s", k, getattr(self.config, k), getattr(fresh, k))
                 setattr(self.config, k, getattr(fresh, k))
@@ -1573,7 +1575,8 @@ class Dispatcher:
             if not inbox:
                 error = error or self._headless_blocker(agent, thread_id, [item['post_id']] if item.get('post_id') else [])
                 error = error or self._output_blocker(agent, rule, [item['post_id']] if item.get('post_id') else [],
-                                                      self._run_dir_for(agent, rule['project'], thread_id, item, inbox))
+                                                      self._run_dir_for(agent, rule['project'], thread_id, item, inbox),
+                                                      thread_id)
             if delivery is not None:
                 configured_cwd = self.config.run_dir(rule['project'])
                 if not configured_cwd or os.path.realpath(configured_cwd) != os.path.realpath(delivery['cwd']):
@@ -1800,7 +1803,17 @@ class Dispatcher:
                         and isinstance(r.get("path"), str)]
         return outputs
 
-    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int], cwd: str | None = None) -> str | None:
+    def _launch_node(self, agent: str, project: str, cwd: str | None, thread_id: int | None,
+                     request_ids: list[int]) -> str | None:
+        """The node _launch would hand this run to (None: it runs here): a node with room, and for work with bound
+        browser origins, one that can attach the scoped headless browser when there is one."""
+        node = self._remote_node(agent, project, cwd)
+        if node is not None and thread_id is not None and self._headless_origins(agent, thread_id, request_ids):
+            node = self._remote_node(agent, project, cwd, headless_browser=True) or node
+        return node
+
+    def _output_blocker(self, agent: str, rule: dict, request_ids: list[int], cwd: str | None = None,
+                        thread_id: int | None = None) -> str | None:
         """Before reserving a launch: every output the triggering request(s) declared (refs of kind "output", the
         structured field only, never post text) must lie inside this run's directory or one of the extra writable
         roots it will get, and its nearest existing directory must be writable. A configured root that has gone
@@ -1808,6 +1821,9 @@ class Dispatcher:
         recorded on the request, no launch budget spent."""
         project = rule["project"]
         cwd = cwd or self.config.run_dir(project)   # the directory the runner actually gets (_run_dir_for)
+        node = self._launch_node(agent, project, self.config.run_dir(project), thread_id, request_ids)
+        if node is not None:
+            return self._node_output_blocker(node, agent, project, request_ids)
         template = self._runner(agent)
         roots = self.config.extra_roots(template, project)
         for r in roots:
@@ -1844,6 +1860,27 @@ class Dispatcher:
             if not ok:
                 return (f"output {out} cannot be written: {probe} is not a directory the dispatcher's user can "
                         "write; fix its permissions or retarget the output")
+        return None
+
+    def _node_output_blocker(self, node: str, agent: str, project: str, request_ids: list[int]) -> str | None:
+        """A run that goes to a node writes on the node's disk, inside its run directory for the project (its
+        [dispatch.worktrees] entry there, else the project path) or the
+        extra writable roots the node reported for that runner and project (its own [dispatch.writable_roots]).
+        The hub cannot see that disk, so only the paths are checked here; the node's config vouches for them."""
+        outputs = self._declared_outputs(request_ids)
+        if not outputs:
+            return None
+        roots = nodes.node_writable_roots(self.board, node, project, agent, self._runtime(agent))
+        allowed = [nodes.node_run_dir(self.board, node, project)] + roots
+        for out in dict.fromkeys(outputs):
+            if (not os.path.isabs(out) or _has_control(out) or len(out) > 1024
+                    or any(part in (".", "..") for part in out.split("/"))):
+                return f"declared output {out[:200]!r} is not a plain absolute path; retarget the output"
+            if not any(out.rstrip("/") == root or nodes.under_roots(out, [root]) for root in allowed):
+                extra = ("extra roots " + ", ".join(roots)) if roots else "no extra roots configured there"
+                return (f"output {out} is outside what node {node} lets this run write ({extra}); ask the human to "
+                        f"add it to [dispatch.writable_roots] for {project} in that machine's board.local.toml "
+                        "(it applies within seconds, no restart) or retarget the output")
         return None
 
     def _browser_blocker(self, post_id: int, agent: str) -> str | None:
@@ -2060,6 +2097,7 @@ class Dispatcher:
             if node is not None:
                 # Browser-bound work goes to a node that attaches its own scoped headless browser, limited to the
                 # origins bound and not denied here. With none bound, the run gets no browser server at all.
+                # (_launch_node makes the same choice, so preflight checked outputs against this node.)
                 origins = self._headless_origins(agent, thread_id, record["request_ids"])
                 browser = None
                 capable = self._remote_node(agent, project, cwd, headless_browser=True) if origins else None

@@ -548,6 +548,14 @@ override (dotted, quoted or under a profile; an inline table is already refused 
 so `[dispatch.writable_roots]` is the single place a human has to look. `sandbox_workspace_write.network_access`
 stays allowed.
 
+**Nodes and reload.** The table is reloaded like the dispatch scalars (`RELOADED_TABLES`), on the hub and on a node
+(`Node.refresh_config` re-reads board.toml + board.local.toml when either file's mtime changes, and keeps the old
+config when an edit does not validate). A node reports `writable_roots` (runner key -> project -> roots it would give,
+i.e. `extra_roots`) in hello. For a run that goes to a node, `_node_output_blocker` checks declared outputs against the
+project path and those roots by path only: the hub cannot see the node's disk, and the roots come from the node
+machine's own human-written config, validated there. Before this, the hub checked node-bound outputs against its own
+(empty) table, so no node-bound request with an output outside the repo could ever launch.
+
 **Declared outputs.** A request declares a destination as a ref, `{kind: "output", path}`: a new `REF_KINDS` value
 rather than a new post field, because refs are already structured, bounded (`max_refs`, 1024 characters), stored
 (`posts.refs`), shown on the dashboard and accepted by every transport, and a new column would have meant a schema
