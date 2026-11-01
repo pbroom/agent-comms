@@ -498,3 +498,31 @@ def test_a_node_without_writable_roots_sends_the_hello_an_older_hub_accepts(nenv
     nenv.node.client.request = lambda method, path, **kw: (sent.append(kw.get("json")), real(method, path, **kw))[1]
     nenv.node.hello()
     assert "writable_roots" not in sent[0]
+
+
+def test_an_output_in_the_nodes_own_run_directory_passes_even_when_it_differs_from_the_project(nenv, tmp_path):
+    node_writable(nenv, tmp_path)    # nenv's node runs PROJECT in node_dir, not at the PROJECT path
+    nenv.node.hello()
+    assert nodes.node_run_dir(nenv.board, "laptop", PROJECT) == nenv.node_dir
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"], refs=[{"kind": "output", "path": nenv.node_dir + "/result.txt"}])
+    nenv.d.tick()
+    [r] = runs(nenv)
+    assert r["status"] == "running", r.get("error")
+
+
+def test_outputs_are_checked_against_the_node_that_gets_the_run(nenv, tmp_path):
+    # A full node offering the root must not vouch for a run that goes to another node without it.
+    out = node_writable(nenv, tmp_path)
+    nenv.node.hello()
+    nenv.d.config.nodes["desk"] = {"projects": [PROJECT], "agents": ["grok"]}
+    token = create_agent(nenv.settings.agents_path, "desk", "node")
+    desk = nenv.board.authenticate(token)
+    nodes.hello(nenv.board, desk, [PROJECT], ["grok"], 1)
+    nenv.clock.advance(1)
+    nodes.hello(nenv.board, desk, [PROJECT], ["grok"], 1)        # seen last: picked first when it has room
+    allow(nenv, agents=["grok"])
+    human_post(nenv, ["grok"], refs=[{"kind": "output", "path": out}])
+    nenv.d.tick()
+    [r] = runs(nenv)
+    assert r["status"] == "preflight_failed" and "node desk" in r["error"]

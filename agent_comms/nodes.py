@@ -108,13 +108,28 @@ def _writable_roots(value: Any, runners: list[str]) -> dict[str, dict[str, list[
     return out
 
 
+def _run_dirs(value: Any) -> dict[str, str]:
+    """A node's [dispatch.worktrees] entries whose directory differs from the project path: project -> run dir."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 200:
+        raise Invalid("run_dirs must map projects to directories")
+    ok = lambda v: (isinstance(v, str) and v.startswith("/") and v != "/" and len(v) <= 1024
+                    and ".." not in v.split("/") and "//" not in v and v.isprintable())
+    if not all(ok(k) and ok(v) for k, v in value.items()):
+        raise Invalid("run_dirs contains an invalid entry")
+    return {k.rstrip("/"): v.rstrip("/") for k, v in value.items()}
+
+
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
-          headless_browser: Any = None, checkout_roots: Any = None, writable_roots: Any = None) -> dict:
+          headless_browser: Any = None, checkout_roots: Any = None, writable_roots: Any = None,
+          run_dirs: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
     `writable_roots`: the extra writable directories its runs get (_writable_roots); the hub checks a request's
-    declared outputs against these, not its own config, when the run goes to this node."""
+    declared outputs against these, not its own config, when the run goes to this node. `run_dirs`: where the
+    node runs a project when that is not the project path itself (_run_dirs)."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -123,12 +138,13 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
     roots = _strings([] if checkout_roots is None else checkout_roots, "checkout_roots",
                      lambda v: v.startswith("/") and v != "/")
     writable = _writable_roots(writable_roots, runners)
+    dirs = _run_dirs(run_dirs)
     if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or not 1 <= max_concurrent <= 50:
         raise Invalid("max_concurrent must be an integer from 1 to 50")
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots],
-            "writable_roots": writable, "max_concurrent": max_concurrent, "last_seen": now}
+            "writable_roots": writable, "run_dirs": dirs, "max_concurrent": max_concurrent, "last_seen": now}
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
@@ -220,6 +236,15 @@ def node_writable_roots(board: Board, node: str, project: str, agent: str, runti
             table = (info.get("writable_roots") or {}).get(key) or {} if key else {}
             return list(table.get(project.rstrip("/") or "/", []))
     return []
+
+
+def node_run_dir(board: Board, node: str, project: str) -> str:
+    """Where `node` runs this project: its reported run directory for it, else the project path."""
+    project = project.rstrip("/") or "/"
+    for info in nodes(board):
+        if info["node"] == node:
+            return (info.get("run_dirs") or {}).get(project, project)
+    return project
 
 
 def assign(board: Board, node: str, run: dict) -> None:

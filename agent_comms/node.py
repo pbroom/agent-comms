@@ -177,6 +177,10 @@ class Node:
         writable = self.writable_roots()
         if writable:    # only then: a hub older than this field refuses any hello that carries it
             body["writable_roots"] = writable
+            # Outputs inside the run directory need no root; tell the hub where that is when it is not the project.
+            dirs = {p: d for p, d in self.config.worktrees.items() if d.rstrip("/") != p.rstrip("/")}
+            if dirs:
+                body["run_dirs"] = dirs
         if self.config.checkout_roots:   # only then: a hub older than this field refuses any hello that carries it
             body["checkout_roots"] = list(self.config.checkout_roots)
         headless = self.headless_runners()
