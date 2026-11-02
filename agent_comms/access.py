@@ -91,6 +91,11 @@ def route_successor(board, human, post_id: int, recipient: str, to_agent: str, o
         if routed_successor(board, post_id) is not None:
             raise Conflict('a request already routed by access is not routed again')
         decision_actions.assert_execution_authorized(board, post_id, to_agent)
+        if source['task_id'] is not None:   # the successor's start rechecks this task's grant for to_agent
+            task = board.conn.execute('SELECT * FROM tasks WHERE id=?', (source['task_id'],)).fetchone()
+            if (not task or task['status'] in ('done', 'declined')
+                    or not board._task_authorization_active(task, to_agent)):
+                raise Conflict(f'the linked task does not authorize {to_agent}')
         req = browser_readiness.requirement(board, post_id, recipient)
         if req is None or req['execution_context'] != 'desktop':
             raise Conflict('only signed-in browser requests are routed by access')

@@ -250,3 +250,19 @@ def test_a_routed_successor_carries_the_declared_outputs(nenv, tmp_path):
     successor = nenv.board.get_post(nenv.p["human"], routed["successor_post_id"])
     assert [r["path"] for r in successor["refs"] if r["kind"] == "output"] == [out]
     assert nenv.d._declared_outputs([successor["id"]]) == [out]
+
+
+def test_no_hand_off_to_an_agent_the_linked_task_does_not_authorize(nenv, tmp_path, monkeypatch):
+    hub_checkout(nenv, tmp_path)
+    laptop(nenv, runner="grok")
+    allow(nenv, agents=["codex", "grok"])
+    task = nenv.board.create_task(nenv.p["human"], nenv.sid["human"], nenv.tid, title="Install preview")
+    real = nenv.board._task_authorization_active
+    monkeypatch.setattr(nenv.board, "_task_authorization_active",
+                        lambda t, agent=None: agent != "grok" and real(t, agent))
+    post = human_post(nenv, ["codex"], body="Install the preview package", task_id=task["id"],
+                      browser_requirement={"recipient": "codex", "target_url": URL, "execution_context": "desktop"})
+    nenv.d.tick()
+    assert not [r for r in runs(nenv) if r["status"] == "routed"]
+    [row] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
+    assert row["state"] == "blocked" and "Routed by access" not in row["reason"]

@@ -2179,6 +2179,10 @@ class Dispatcher:
                 where = self._signed_in_route(agent, project, signed_in)
                 if where is None:
                     raise Conflict("no runner holding a signed-in browser for " + ", ".join(signed_in) + " has room")
+                if item.get('managed') and where != "local":
+                    # A managed continuation's environment was verified and reserved here; it never moves.
+                    raise Conflict("this continuation's reserved environment holds no signed-in browser for "
+                                   + ", ".join(signed_in))
                 node = None if where == "local" else where
                 record["browser_access"] = signed_in   # browser_readiness lets this run attest a desktop probe for them
             if node is not None:
