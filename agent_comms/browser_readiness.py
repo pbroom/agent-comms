@@ -307,7 +307,10 @@ def bind_request(board, p, session_id, post_id, recipient, target_url, execution
             run = board.conn.execute('SELECT value FROM board_state WHERE key=?',
                                     ('dispatch.run.' + s['dispatch_run_id'],)).fetchone()
             attached = json.loads(run[0]).get('headless_browser', {}) if run else {}
-            reroute = execution_context == 'desktop' or origin not in attached.get('origins', [])
+            if execution_context == 'desktop':
+                reroute = origin not in signed_in_run_origins(board, s)
+            else:
+                reroute = origin not in attached.get('origins', [])
         project = board._thread_row(post['thread_id'])['project']
         denied = bool(_gate(board, project, origin)['denied'])
     return {**dict(requirement(board, post_id, recipient)), 'reroute_required': reroute and not denied,
@@ -324,14 +327,43 @@ def requirement(board, post_id, recipient):
                               (post_id, recipient)).fetchone()
 
 
-def _context(value, session):
+def signed_in_run_origins(board, session):
+    """The origins a dispatched run was launched to use a signed-in browser for (access.py), else []."""
+    if not session['dispatch_run_id']:
+        return []
+    row = board.conn.execute('SELECT value FROM board_state WHERE key=?',
+                             ('dispatch.run.' + session['dispatch_run_id'],)).fetchone()
+    try:
+        run = json.loads(row['value']) if row else None
+    except (TypeError, ValueError):
+        run = None
+    held = run.get('browser_access') if isinstance(run, dict) else None
+    return [o for o in held if isinstance(o, str)] if isinstance(held, list) else []
+
+
+def _context(value, session, board=None, origin=None):
     if not isinstance(value, dict) or set(value) != {'kind', 'transport', 'connection_id'}:
         raise Invalid('context needs kind, transport and connection_id only')
     if value['kind'] not in ('desktop', 'headless'):
         raise Invalid('context kind must be desktop or headless')
-    if session['dispatch_run_id'] and value['kind'] == 'desktop':
+    # A dispatched run attests a desktop (signed-in) context only for the origins it was launched to use a signed-in
+    # browser for: its runner on that machine declares that sign-in ([dispatch.runner_access], access.py).
+    if (session['dispatch_run_id'] and value['kind'] == 'desktop'
+            and (board is None or origin not in signed_in_run_origins(board, session))):
         raise Invalid('dispatched process cannot attest another desktop context')
     return {k: _text(value[k], k, 200) for k in sorted(value)}
+
+
+def rendered_matches(requested, rendered):
+    """Whether a probe's rendered URL shows the requested target: the same URL, or, when the target has no query, a
+    page under the target's own path on the same origin (a site's redirect from a folder to its default view, e.g.
+    SharePoint's /AppCatalog -> /AppCatalog/Forms/AllItems.aspx). A sibling path or another origin never matches."""
+    if rendered == requested:
+        return True
+    want, got = urlsplit(requested), urlsplit(rendered)
+    if want.query or (want.scheme, want.netloc) != (got.scheme, got.netloc):
+        return False
+    return got.path.startswith(want.path.rstrip('/') + '/')
 
 
 def begin_probe(board, p, session_id, target_url, context):
@@ -340,7 +372,7 @@ def begin_probe(board, p, session_id, target_url, context):
     with db.write_tx(board.conn):
         board._check_agent_write(p)
         s = board._session(p,session_id)
-        ctx = _context(context,s)
+        ctx = _context(context, s, board, origin)
         gate = _gate(board,s['project'],origin)
         if gate['denied']:
             raise Conflict('browser permission denied; do not probe or reconnect')
@@ -357,7 +389,7 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
     with db.write_tx(board.conn):
         board._check_agent_write(p)
         s = board._session(p, session_id)
-        ctx = _context(context, s)
+        ctx = _context(context, s, board, origin)
         gate = _gate(board, s['project'], origin)
         if gate['denied']:
             raise Conflict('browser permission denied; supported human permission change must be recorded first')
@@ -374,8 +406,8 @@ def report_probe(board, p, session_id, target_url, context, evidence, attempt_id
             raise Invalid('probe requires HTTP status, rendered URL/identity and harmless interaction/result')
         if type(evidence['http_status']) is not int or not 200 <= evidence['http_status'] < 300:
             raise Invalid('probe must report a successful HTTP response')
-        if target(evidence['rendered_url'])[0] != url:
-            raise Invalid('rendered target must match the requested URL exactly')
+        if not rendered_matches(url, target(evidence['rendered_url'])[0]):
+            raise Invalid('rendered target must be the requested URL, or the page it redirects to under its own path')
         for k in ('rendered_identity', 'interaction', 'interaction_result'):
             _text(evidence[k], k, 1000)
         expires = attempt['started_at'] + PROBE_TTL
@@ -413,7 +445,7 @@ def report_failure(board, p, session_id, target_url, context, failure, evidence)
     with db.write_tx(board.conn):
         board._check_agent_write(p)
         s = board._session(p,session_id)
-        ctx = _context(context,s)
+        ctx = _context(context, s, board, origin)
         gate = _gate(board,s['project'],origin)
         if failure in GATE_FAILURES:
             exists = board.conn.execute('SELECT 1 FROM browser_permission_gates WHERE project=? AND origin=?',
@@ -551,7 +583,7 @@ def claim_reconnect(board, p, session_id, target_url, context):
     with db.write_tx(board.conn):
         board._check_agent_write(p)
         s = board._session(p,session_id)
-        ctx = _context(context,s)
+        ctx = _context(context, s, board, origin)
         status = readiness(board,session_id,url)
         if status not in ('disconnected','stale_probe'):
             raise Conflict(f'reconnect not allowed for {status}')

@@ -1149,6 +1149,51 @@ marked blocked with the reason, for example "output /x is outside this run's wri
 …); ask the human to add it to [dispatch.writable_roots] or retarget the output". Only the structured refs count,
 never paths written in the post text, and a declared output never widens what a run may write.
 
+### Signed-in browser work: routing by access
+
+Some work needs a browser that is already signed in to a site (a SharePoint tenant, an admin console). A request
+says so by binding its target with `execution_context: "desktop"`. The board routes such a request by who holds
+the sign-in, not only by who it was addressed to: each machine declares, in its own `board.local.toml`, which of
+its runners has a browser signed in to which origins.
+
+```toml
+# board.local.toml on the machine that holds the sign-in (here, the laptop node)
+[dispatch.runner_access]
+codex-cli = ["browser:https://tenant.sharepoint.com"]   # runner key -> origins its browser is signed in to
+```
+
+The declaration is a statement, not a setup: the runner's own configuration gives it the browser (for example a
+Codex `mcp_servers` entry for Playwright MCP with a `--user-data-dir` profile you signed in to once, or a
+`claude --chrome` runner that drives your Chrome). The board stores no credential and attaches nothing.
+
+On the hub, a node's declaration counts only when the hub's grant for that node lists the same access, so a node
+cannot widen what the hub sends it:
+
+```toml
+# board.local.toml on the hub
+[dispatch.nodes.macbook-pro]
+checkout_roots = ["/Users/you"]
+agents = ["codex", "claude-code"]
+access = ["browser:https://tenant.sharepoint.com"]
+```
+
+What the dispatcher does with a desktop-bound request:
+
+- **The addressed agent holds the sign-in somewhere.** The run goes there, even when the hub has the checkout
+  itself: on the hub when its own runner declares it, else on a node that declares it (waiting while that node is
+  full). The run gets one more prompt sentence: use the runner's own signed-in browser, probe the bound target with
+  context kind `desktop` first, and if the site asks for a sign-in, report it and block instead of entering
+  credentials. Only a run launched this way may attest a `desktop` probe, and only for those origins.
+- **Another agent holds it.** The dispatcher hands the request over: a successor request in the same thread,
+  addressed to that agent and bound to the same target, pointing at the original. The original is blocked with
+  "Routed by access to <agent> on <machine>", and finishing the successor with evidence finishes the original. The
+  receiving agent needs its own delivery policy or workstream rule to be launched. A routed request is never
+  routed again.
+- **Nobody holds it.** The request is blocked before any launch, with the reason, so it shows up for you.
+
+A node checks its own `[dispatch.runner_access]` again when it starts the run and refuses it if the sign-in is no
+longer declared there.
+
 ### Headless browser for dispatched Codex runs
 
 Request authors declare browser needs atomically in `board_post` / `POST /api/posts`, before execution can
@@ -1163,7 +1208,8 @@ be scheduled:
 `execution_context` is `desktop`, `headless`, or `either`. Use `desktop` when the work needs an existing
 authenticated browser or file upload: a generic CLI cannot inherit that desktop connection, and its scoped
 headless browser has neither saved cookies nor upload tools. The dispatcher blocks desktop-required
-execution before spending a launch, including Unstick wrappers inheriting the original requirement.
+execution before spending a launch, including Unstick wrappers inheriting the original requirement, unless a
+runner on some machine declares that sign-in (see "Signed-in browser work: routing by access" below).
 Inbox delivery can still triage the request; it gains no browser or execution access. A fresh complete probe
 from the exact executing session must match the declared kind before starting or completing work.
 These declarations restrict routing, never grant permission; post bodies and URL refs are not declarations.
