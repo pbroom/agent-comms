@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 import httpx
 
+from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv, spawn_process,
                        with_headless_browser, with_writable_roots)
@@ -150,6 +151,9 @@ class Node:
         headless = self.headless_runners()
         if headless:    # only then: a hub older than this field refuses any hello that carries it
             body["headless_browser"] = headless
+        held = {k: v for k, v in self.config.runner_access.items() if k in self.config.runners}
+        if held:        # only then: a hub older than this field refuses any hello that carries it
+            body["access"] = held
         out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out
@@ -216,6 +220,15 @@ class Node:
                 template = runner_preflight.scoped_template(template)
                 prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
             template = with_writable_roots(template, self.config.extra_roots(template, project))
+            signed_in = r.get("browser_access")
+            if signed_in is not None:
+                # Signed-in browser work: this machine's own [dispatch.runner_access] must still say this runner holds
+                # each origin (the hub may have read an older hello). The runner's own config provides the browser.
+                held = set(self.config.access_for(agent, r.get("runtime")))
+                if (not isinstance(signed_in, list) or not signed_in
+                        or any(access.browser(o) not in held for o in signed_in)):
+                    raise LookupError("this machine's runner does not declare a signed-in browser for the bound "
+                                      "origin ([dispatch.runner_access])")
             browser = r.get("headless_browser")
             if browser is not None:
                 origins = plain_origins((browser or {}).get("origins") or []) if isinstance(browser, dict) else []

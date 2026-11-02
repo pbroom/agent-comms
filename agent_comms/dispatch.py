@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import db, nodes, requests, requeue, workstreams, pickup
+from . import access, db, nodes, requests, requeue, workstreams, pickup
 from .config import NAME_RE, RUNTIME_RE, Settings, home, human_token_file
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -71,7 +71,7 @@ BASE_ENV = ("HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "LANG", "LC_AL
 
 
 def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[int] | None = None, run_id: str | None = None,
-                 headless_browser: bool = False) -> str:
+                 headless_browser: bool = False, signed_in_browser: bool = False) -> str:
     """The fixed launch prompt. Deliberately takes no post: post text can never reach an agent this way (nor a bound
     browser target: its origins go only into the browser server's own argv, see headless_browser_overrides)."""
     for v in (thread_id, rule_id):
@@ -99,6 +99,8 @@ def build_prompt(thread_id: int, rule_id: int, purpose: str, request_ids: list[i
         prompt += " Register your session with dispatch_run_id=" + run_id + "."
     if headless_browser:
         prompt += HEADLESS_PROMPT
+    if signed_in_browser:
+        prompt += SIGNED_IN_PROMPT
     return prompt
 
 
@@ -290,6 +292,14 @@ def codex_approval_reminder(template: list[str] | None) -> str | None:
 # security boundary: it does not apply to redirects, WebSocket connections or service-worker requests. The controls
 # remain the board's binding, the fresh headless probe evidence and the sticky policy-denied gate, plus a tool set
 # with no way to run arbitrary script (see HEADLESS_BROWSER_TOOLS).
+# A run launched for signed-in browser work (access.py): its runner's own configuration gives it a browser the human
+# signed in to the bound target's site. The board attaches nothing; it only lets this run attest a desktop probe.
+SIGNED_IN_PROMPT = (
+    " This run was launched where the human configured a browser already signed in to the bound target's site (the "
+    "runner's own browser tools). Use only that browser for the bound target. Before any browser step, probe it: "
+    "board_browser_begin_probe, then board_browser_probe with context kind \"desktop\" from this run. If the site asks "
+    "you to sign in, do not enter credentials: report it with board_browser_failure and block the request with that "
+    "reason so the human can sign in again.")
 HEADLESS_BROWSER_SERVER = "headless_browser"
 # The only browser tools a dispatched run may call, each approved for that run (and nothing else enabled: Codex's
 # `enabled_tools` is the control; a tool a newer Playwright adds stays hidden until it is added here).
@@ -753,6 +763,7 @@ class DispatchConfig:
     writable_roots: dict[str, list[str]] = field(default_factory=dict)   # thread project -> extra writable dirs
     claude_tool_projects: list[str] = field(default_factory=list)
     headless_browser: HeadlessBrowserConfig = field(default_factory=HeadlessBrowserConfig)
+    runner_access: dict[str, list[str]] = field(default_factory=dict)   # runner key -> access it holds here (access.py)
     live_minutes: float = 2.0
     poll_seconds: float = 5.0
     timeout_minutes: float = 30.0
@@ -820,7 +831,7 @@ class DispatchConfig:
                     raise ValueError("[dispatch.nodes] maps a node name to {projects = [...], agents = [...]}")
                 c.nodes = {}
                 for name, grant in v.items():
-                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents", "checkout_roots"}
+                    if (not isinstance(grant, dict) or set(grant) - {"projects", "agents", "checkout_roots", "access"}
                             or not isinstance(grant.get("projects", []), list)
                             or not isinstance(grant.get("checkout_roots", []), list)
                             or not all(isinstance(x, str) and os.path.isabs(x) and x.rstrip("/")
@@ -834,6 +845,8 @@ class DispatchConfig:
                     c.nodes[name] = {"projects": [x.rstrip("/") or "/" for x in grant.get("projects", [])],
                                      "checkout_roots": [x.rstrip("/") for x in grant.get("checkout_roots", [])],
                                      "agents": list(grant.get("agents", []))}
+                    if "access" in grant:   # the access the hub routes to this node; the node must declare it too
+                        c.nodes[name]["access"] = access.parse(grant["access"], f"[dispatch.nodes.{name}] access")
             elif k == "undelivered_alert_minutes":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
                     raise ValueError("[dispatch] undelivered_alert_minutes must be zero (off) or a positive number")
@@ -853,9 +866,14 @@ class DispatchConfig:
                 c.worktree_dir = v
             elif k == "headless_browser":
                 c.headless_browser = HeadlessBrowserConfig.from_dict(v)
+            elif k == "runner_access":
+                c.runner_access = access.parse_table(v)
             else:
                 raise ValueError(f"unknown setting [dispatch] {k}")
         c.headless_browser.check_runners(c.runners)
+        unknown = sorted(set(c.runner_access) - set(c.runners))
+        if unknown:
+            raise ValueError(f"[dispatch.runner_access] {unknown} are not under [dispatch.runners]")
         if c.parallel_worktrees:
             root, user = c.worktree_root(), os.path.realpath(os.path.expanduser("~"))
             if root == user or _within(user, root) or any(
@@ -910,6 +928,11 @@ class DispatchConfig:
         """The extra writable roots a run of this runner in this thread project gets (empty: none)."""
         roots = self.writable_roots.get(project.rstrip("/") or "/", [])
         return list(roots) if roots and self.writable_roots_kind(template, project) else []
+
+    def access_for(self, agent: str, runtime: str | None) -> list[str]:
+        """The access this agent's runner (by name, else runtime) holds on this machine ([dispatch.runner_access])."""
+        key = self.runner_key(agent, runtime)
+        return list(self.runner_access.get(key, [])) if key is not None else []
 
     def headless_browser_for(self, agent: str, runtime: str | None) -> bool:
         """Whether this agent's runner (by name, else runtime) is a Codex runner given the headless browser."""
@@ -1567,7 +1590,16 @@ class Dispatcher:
             if not inbox and not item.get('managed') and self._browser_node_busy(agent, rule['project'], thread_id,
                                                                                  item):
                 continue   # the node that can attach a browser is full: wait for it, as behind max_concurrent
-            error = self._preflight(agent, rule)
+            if not inbox and self._route_by_access(item, agent, rule, now, rules):
+                del pending[key]
+                changed = True
+                continue
+            if not inbox and not item.get('managed') and item.get('post_id'):
+                origins = self._signed_in_origins(agent, thread_id, [item['post_id']])
+                if (origins and self._signed_in_route(agent, rule['project'], origins) is None
+                        and self._signed_in_route(agent, rule['project'], origins, room=False) not in (None, "local")):
+                    continue   # the node holding that sign-in is full: wait for it, as behind max_concurrent
+            error = self._preflight(agent, rule, item)
             if item.get('post_id') and not inbox:
                 error = self._browser_blocker(item['post_id'], agent) or error
             if not inbox:
@@ -1745,9 +1777,91 @@ class Dispatcher:
             return None
         return find(headless_browser=True) is not None
 
-    def _preflight(self, agent: str, rule: dict) -> str | None:
+    # ------------------------------------------------------------ routing by access (access.py)
+
+    def _signed_in_origins(self, agent: str, thread_id: int, request_ids: list[int]) -> list[str]:
+        """The origins this run's requests bind with execution_context "desktop": they need a signed-in browser."""
+        return sorted({req['origin'] for req in self._execution_browser_requirements(
+            agent, thread_id, request_ids, include_thread_fallback=False) if req['execution_context'] == 'desktop'})
+
+    def _local_access(self, agent: str, project: str, origins: list[str]) -> bool:
+        """This machine runs the agent in this project and its runner declares a signed-in browser for each origin."""
+        cwd = self.config.run_dir(project)
+        if not (cwd and os.path.isabs(cwd) and os.path.isdir(cwd)) or self._runner(agent) is None:
+            return False
+        held = set(self.config.access_for(agent, self._runtime(agent)))
+        return all(access.browser(o) in held for o in origins)
+
+    def _signed_in_route(self, agent: str, project: str, origins: list[str], *, room: bool = True) -> str | None:
+        """Where this agent can run signed-in browser work for these origins: "local", a node's name, or None. Unlike
+        ordinary work a local run directory does not win by itself: the run goes where the access is."""
+        if self._local_access(agent, project, origins):
+            return "local"
+        return nodes.node_for(self.board, project, agent, self._runtime(agent), self.config.nodes,
+                              browser_origins=origins, room=room)
+
+    def _access_agents(self, exclude: str, project: str, origins: list[str]) -> list[tuple[str, str]]:
+        """Other agents whose runner (here or on a node) holds a signed-in browser for these origins, as (agent, where),
+        in name order."""
+        out = []
+        for row in self.board.conn.execute("SELECT name FROM agents WHERE is_human=0 AND active=1 ORDER BY name"):
+            if row['name'] == exclude:
+                continue
+            where = self._signed_in_route(row['name'], project, origins, room=False)
+            if where is not None:
+                out.append((row['name'], "the board's machine" if where == "local" else f"node {where}"))
+        return out
+
+    def _dispatchable(self, rules: list[dict], agent: str, thread_id: int, now: float) -> bool:
+        """Whether a request posted to `agent` in this thread now would be launched: an approval (workstream rule or
+        delivery policy) covers it. Inbox triage does not count: it never executes the work."""
+        next_id = self.board.conn.execute('SELECT COALESCE(MAX(id),0)+1 FROM posts').fetchone()[0]
+        rule = self._rule_for(rules, {'agent': agent, 'thread_id': thread_id, 'post_id': next_id,
+                                      'post_created_at': now})
+        return rule is not None and rule.get('kind') != 'inbox_delivery'
+
+    def _route_by_access(self, item: dict, agent: str, rule: dict, now: float, rules: list[dict]) -> bool:
+        """A signed-in browser request whose addressed agent has no runner holding that sign-in goes to another agent
+        that has one (access.route_successor). True when it was routed: the item is settled for this agent."""
+        post_id, project = item.get('post_id'), rule['project']
+        if not post_id or item.get('managed'):
+            return False
+        origins = self._signed_in_origins(agent, item['thread_id'], [post_id])
+        if not origins or self._signed_in_route(agent, project, origins, room=False) is not None:
+            return False
+        if access.routed_successor(self.board, post_id) is not None:
+            return False   # never routed twice: it blocks with the reason instead
+        post = self.board.conn.execute('SELECT * FROM posts WHERE id=?', (post_id,)).fetchone()
+        rows = [r for r in requests.for_post(self.board, post) if r['assigned_agent'] == agent
+                and r['state'] in ('queued', 'blocked')] if post is not None else []
+        for to_agent, where in self._access_agents(agent, project, origins):
+            if not rows:
+                break
+            if not self._dispatchable(rules, to_agent, item['thread_id'], now):
+                continue   # it would never be launched: try the next holder
+            try:
+                successor = access.route_successor(self.board, self.human, post_id, rows[0]['recipient'], to_agent,
+                                                   origins, where)
+            except Exception as e:
+                log.warning("could not route request %s by access to %s: %s", post_id, to_agent, e)
+                continue
+            self._record({"run_id": self._run_id(item["seq"], agent), "agent": agent,
+                          "thread_id": item['thread_id'], "rule_id": rule["id"], "post_seq": item["seq"],
+                          "request_ids": [post_id], "status": "routed", "routed_to": to_agent, "successor_post_id": successor,
+                          "note": f"routed by access to {to_agent} on {where}",
+                          "started_at": now, "ended_at": now, "pid": None})
+            log.info("routed request %s from %s to %s (%s holds a signed-in browser for %s)",
+                     post_id, agent, to_agent, where, ", ".join(origins))
+            return True
+        return False
+
+    def _preflight(self, agent: str, rule: dict, item: dict | None = None) -> str | None:
         project = rule["project"]
         cwd = self.config.run_dir(project)
+        if item and item.get('post_id') and not item.get('managed') and rule.get('kind') != 'inbox_delivery':
+            origins = self._signed_in_origins(agent, item['thread_id'], [item['post_id']])
+            if origins and self._signed_in_route(agent, project, origins, room=False) not in (None, "local"):
+                return None   # signed-in work for a node: the node checks its own runner and run directory
         if rule.get('kind') != 'inbox_delivery' and self._remote_node(agent, project, cwd) is not None:
             return None   # the node checks its own runner and run directory when it starts the run
         if rule.get('kind') != 'inbox_delivery' and (not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
@@ -1862,8 +1976,12 @@ class Dispatcher:
                 req = browser_readiness.requirement(self.board, post_id, row['recipient'])
                 if req:
                     if req['execution_context'] == 'desktop':
-                        return ('Browser work requires an authenticated desktop execution context; generic CLI '
-                                'dispatch cannot inherit its browser. Route to a capable authorized desktop session.')
+                        project = self.board._thread_row(post['thread_id'])['project']
+                        if self._signed_in_route(agent, project, [req['origin']], room=False) is not None:
+                            continue   # a runner here or on a node holds a signed-in browser for it
+                        return (f'Browser work needs a signed-in desktop browser for {req["origin"]}, and no machine declares '
+                                f'one for {agent} ([dispatch.runner_access]) or for another agent. Configure a '
+                                'runner that holds that sign-in, or hand it to a signed-in desktop session.')
                     if not headless:
                         return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
                                 'inherit its probe (a Codex runner can be given a scoped headless browser with '
@@ -1882,11 +2000,13 @@ class Dispatcher:
             if blocker:
                 return blocker
             if req['execution_context'] == 'desktop':
-                return ('Browser work requires a desktop execution context; isolated headless dispatch cannot '
-                        'provide authenticated desktop or file-upload access. Route to a capable authorized session.')
+                project = self.board._thread_row(thread_id)['project']
+                if self._signed_in_route(agent, project, [req['origin']], room=False) is None:
+                    return (f'Browser work needs a signed-in desktop browser for {req["origin"]}; no runner for '
+                            f'{agent} declares one ([dispatch.runner_access]). Route to a capable authorized session.')
         on_node = self._node_headless(agent, self.board._thread_row(thread_id)['project'])
         if not (self.config.headless_browser_for(agent, self._runtime(agent)) if on_node is None else on_node):
-            if required:
+            if any(req['execution_context'] != 'desktop' for req in required):   # desktop: checked above
                 return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
                         'inherit its probe. Route to a capable authorized session.')
             return None
@@ -1959,7 +2079,12 @@ class Dispatcher:
 
     def _run_dir_for(self, agent: str, project: str, thread_id: int, item: dict, inbox: bool) -> str:
         """The directory this launch would run in here: with [dispatch] parallel_worktrees, the (agent, thread) run
-        worktree of the project's local Git checkout; otherwise (and for inbox, managed and node runs) the checkout."""
+        worktree of the project's local Git checkout; otherwise (and for inbox, managed and node runs) the checkout.
+        Signed-in work that goes to a node (access.py) runs in that node's checkout: the project path, as recorded."""
+        if not inbox and not item.get("managed") and item.get("post_id"):
+            origins = self._signed_in_origins(agent, thread_id, [item["post_id"]])
+            if origins and self._signed_in_route(agent, project, origins, room=False) not in (None, "local"):
+                return project   # runs on that node, recorded with cwd=project like any node run
         base = self.config.run_dir(project)
         if (inbox or item.get("managed") or not self.config.parallel_worktrees or not os.path.isabs(base)
                 or not os.path.isdir(base) or not os.path.lexists(os.path.join(base, ".git"))):
@@ -2057,26 +2182,41 @@ class Dispatcher:
                 if browser_blocker:
                     raise Conflict(browser_blocker)
             node = None if inbox or item.get('managed') else self._remote_node(agent, project, cwd)
+            signed_in = [] if inbox else self._signed_in_origins(agent, thread_id, record["request_ids"])
+            if signed_in:
+                # Signed-in browser work runs where a runner declares that sign-in (access.py), even when this machine
+                # has the checkout: the run goes where the access is.
+                where = self._signed_in_route(agent, project, signed_in)
+                if where is None:
+                    raise Conflict("no runner holding a signed-in browser for " + ", ".join(signed_in) + " has room")
+                if item.get('managed') and where != "local":
+                    # A managed continuation's environment was verified and reserved here; it never moves.
+                    raise Conflict("this continuation's reserved environment holds no signed-in browser for "
+                                   + ", ".join(signed_in))
+                node = None if where == "local" else where
+                record["browser_access"] = signed_in   # browser_readiness lets this run attest a desktop probe for them
             if node is not None:
                 # Browser-bound work goes to a node that attaches its own scoped headless browser, limited to the
                 # origins bound and not denied here. With none bound, the run gets no browser server at all.
                 origins = self._headless_origins(agent, thread_id, record["request_ids"])
                 browser = None
-                capable = self._remote_node(agent, project, cwd, headless_browser=True) if origins else None
+                capable = (self._remote_node(agent, project, cwd, headless_browser=True)
+                           if origins and not signed_in else None)
                 if capable is not None:
                     node, browser = capable, {"origins": origins}
                     record["headless_browser"] = browser   # browser_readiness compares a later binding against it
-                elif self._execution_browser_requirements(agent, thread_id, record["request_ids"],
-                                                          include_thread_fallback=False):
+                elif not signed_in and self._execution_browser_requirements(agent, thread_id, record["request_ids"],
+                                                                            include_thread_fallback=False):
                     raise Conflict("no node can attach a headless browser to this browser-bound run")
                 prompt = build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
-                                      headless_browser=browser is not None)
+                                      headless_browser=browser is not None, signed_in_browser=bool(signed_in))
                 record |= {"node": node, "cwd": project}
                 self._record(record)
                 nodes.assign(self.board, node, {
                     "run_id": run_id, "agent": agent, "runtime": self._runtime(agent), "thread_id": thread_id,
                     "project": project, "prompt": prompt, "timeout_seconds": self.config.timeout_minutes * 60,
-                    "kill_grace_seconds": self.config.kill_grace_seconds, "headless_browser": browser})
+                    "kill_grace_seconds": self.config.kill_grace_seconds, "headless_browser": browser,
+                    **({"browser_access": signed_in} if signed_in else {})})
                 child = nodes.RemoteChild(self.board, run_id)
                 cwd = project
             if node is None:
@@ -2109,7 +2249,7 @@ class Dispatcher:
                         record["headless_browser"] = browser
                 prompt = (build_inbox_prompt(thread_id,rule['id'],record['request_ids'],run_id,cwd) if inbox
                           else build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
-                                            headless_browser=browser is not None))
+                                            headless_browser=browser is not None, signed_in_browser=bool(signed_in)))
                 if item.get('managed'):
                     prompt += (' This is an assigned dependent continuation. Read its current request and continuation '
                                'contract, register fresh successful capability probes in this exact environment, then '

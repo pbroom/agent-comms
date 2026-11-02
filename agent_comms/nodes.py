@@ -43,7 +43,7 @@ import json
 import re
 from typing import Any
 
-from . import db
+from . import access as _access, db
 from .core import Board, Conflict, Forbidden, Invalid, NotFound, Principal
 
 NODE_RUNTIME = "node"
@@ -88,10 +88,11 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
 
 
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
-          headless_browser: Any = None, checkout_roots: Any = None) -> dict:
+          headless_browser: Any = None, checkout_roots: Any = None, access: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
-    `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them."""
+    `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
+    `access`: the node's `[dispatch.runner_access]`, runner key -> access entries (access.py), for runners it offers."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -99,11 +100,19 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
                         lambda v: v in runners)
     roots = _strings([] if checkout_roots is None else checkout_roots, "checkout_roots",
                      lambda v: v.startswith("/") and v != "/")
+    held = {}
+    if access is not None:
+        if not isinstance(access, dict) or len(access) > MAX_ITEMS or any(k not in runners for k in access):
+            raise Invalid("access maps runner keys the node offers to lists of access entries")
+        try:
+            held = {k: _access.parse(v, f"access {k}") for k, v in access.items()}
+        except ValueError as e:
+            raise Invalid(str(e)) from None
     if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or not 1 <= max_concurrent <= 50:
         raise Invalid("max_concurrent must be an integer from 1 to 50")
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
-            "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots],
+            "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,
             "max_concurrent": max_concurrent, "last_seen": now}
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
@@ -162,11 +171,12 @@ def runner_key(info: dict, agent: str, runtime: str | None) -> str | None:
 
 def node_for(board: Board, project: str, agent: str, runtime: str | None,
              allowed: dict[str, dict] | None = None, *, headless_browser: bool = False,
-             room: bool = True) -> str | None:
+             room: bool = True, browser_origins: list[str] | None = None) -> str | None:
     """The live node that offers this project and a runner for this agent (its name, else its runtime), that the hub
     allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first. With
     `headless_browser`, only a node that offers a scoped headless browser for that runner. With `room=False`, a full
-    node counts too."""
+    node counts too. With `browser_origins`, only a node whose runner for this agent declares a signed-in browser for
+    each of them (access.py) and whose hub grant lists that access too."""
     now = board.now()
     project = project.rstrip("/") or "/"
     keys = {agent} | ({runtime} if runtime else set())
@@ -182,6 +192,11 @@ def node_for(board: Board, project: str, agent: str, runtime: str | None,
             continue
         if headless_browser and runner_key(info, agent, runtime) not in info.get("headless_browser", []):
             continue
+        if browser_origins:
+            need = {_access.browser(o) for o in browser_origins}
+            held = set((info.get("access") or {}).get(runner_key(info, agent, runtime) or "", []))
+            if not need <= held or not need <= set(grant.get("access", [])):
+                continue
         if room and _active_runs(board.conn, info["node"]) >= int(info.get("max_concurrent") or 1):
             continue
         return info["node"]
@@ -215,9 +230,12 @@ def assignments(board: Board, p: Principal) -> dict:
         except (TypeError, ValueError):
             continue
         if isinstance(r, dict) and r.get("node") == p.name and r.get("state") != "ended":
-            out.append({k: r.get(k) for k in ("run_id", "agent", "runtime", "thread_id", "project", "prompt",
-                                              "timeout_seconds", "kill_grace_seconds", "headless_browser", "state",
-                                              "stop")})
+            item = {k: r.get(k) for k in ("run_id", "agent", "runtime", "thread_id", "project", "prompt",
+                                          "timeout_seconds", "kill_grace_seconds", "headless_browser", "state",
+                                          "stop")}
+            if r.get("browser_access"):   # only then, so a node older than this field sees nothing new
+                item["browser_access"] = r["browser_access"]
+            out.append(item)
     return {"node": p.name, "runs": out}
 
 

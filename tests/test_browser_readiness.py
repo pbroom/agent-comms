@@ -50,12 +50,30 @@ def test_complete_exact_context_probe_and_missing_context(env):
 
 
 @pytest.mark.parametrize('field,value', [('http_status', 503), ('http_status', True),
-    ('rendered_url', URL + '/other'), ('rendered_identity', ''),
+    ('rendered_url', 'http://localhost:5185/other'), ('rendered_url', 'http://localhost:5186/about'),
+    ('rendered_url', 'http://localhost:5185/aboutx'), ('rendered_identity', ''),
     ('interaction', ''), ('interaction_result', '')])
 def test_incomplete_or_wrong_target_evidence_rejected(env, field, value):
     with pytest.raises(Invalid):
         probe(env, evidence={**EVIDENCE, field: value})
     assert br.readiness(env.board, env.sid['codex'], URL) == 'missing_probe'
+
+
+def test_redirect_under_the_target_path_counts_as_the_target(env):
+    # SharePoint sends /AppCatalog to /AppCatalog/Forms/AllItems.aspx; the probe is still of the bound target.
+    probe(env, evidence={**EVIDENCE, 'rendered_url': URL + '/Forms/AllItems.aspx'})
+    assert br.readiness(env.board, env.sid['codex'], URL) == 'ready'
+
+
+def test_rendered_url_matching():
+    base = 'https://h.example/sites/M-EX/AppCatalog'
+    assert br.rendered_matches(base, base)
+    assert br.rendered_matches(base, base + '/Forms/AllItems.aspx')
+    assert br.rendered_matches(base + '/', base + '/Forms/AllItems.aspx')
+    assert not br.rendered_matches(base, 'https://h.example/sites/M-EX/AppCatalogX')
+    assert not br.rendered_matches(base, 'https://h.example/sites/M-EX/Other')
+    assert not br.rendered_matches(base, 'https://other.example/sites/M-EX/AppCatalog/Forms/AllItems.aspx')
+    assert not br.rendered_matches(base + '?a=1', base + '/Forms/AllItems.aspx')
 
 
 def test_owner_liveness_and_evidence_expiry_are_independent(env):
