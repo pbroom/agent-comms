@@ -101,7 +101,10 @@ def route_successor(board, human, post_id: int, recipient: str, to_agent: str, o
                   f"{where} holds a signed-in browser for {held}, which that request needs. Read #{post_id} with "
                   f"board_read_updates(post_ids=[{post_id}]) and do exactly what it asks; no new scope or access is "
                   f"granted. When done, mark this request finished with evidence posts: that completes #{post_id}."),
-            refs=[{'kind': 'artifact', 'path': f"board:post/{post_id}"}],
+            # The source's declared outputs come along, so output checks and the run directory choice still apply.
+            refs=[{'kind': 'artifact', 'path': f"board:post/{post_id}"}]
+                 + [{'kind': 'output', 'path': r['path']} for r in source.get('refs') or []
+                    if isinstance(r, dict) and r.get('kind') == 'output'],
             browser_requirement={'recipient': to_agent, 'target_url': req['target_url'],
                                  'execution_context': 'desktop'},
             _in_transaction=True)

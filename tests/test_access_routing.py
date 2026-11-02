@@ -236,3 +236,17 @@ def test_two_signed_in_runs_on_one_node_take_turns_in_its_checkout(nenv, tmp_pat
     nenv.d.tick()
     started = [r for r in runs(nenv) if r.get("node") == "laptop"]
     assert len(started) == 1, [(r["agent"], r["status"], r.get("node")) for r in runs(nenv)]
+
+
+def test_a_routed_successor_carries_the_declared_outputs(nenv, tmp_path):
+    hub_checkout(nenv, tmp_path)
+    laptop(nenv, runner="grok")
+    allow(nenv, agents=["codex", "grok"])
+    out = str(tmp_path / "preview-out")
+    human_post(nenv, ["codex"], body="Install and save evidence", refs=[{"kind": "output", "path": out}],
+               browser_requirement={"recipient": "codex", "target_url": URL, "execution_context": "desktop"})
+    nenv.d.tick()
+    [routed] = runs(nenv)
+    successor = nenv.board.get_post(nenv.p["human"], routed["successor_post_id"])
+    assert [r["path"] for r in successor["refs"] if r["kind"] == "output"] == [out]
+    assert nenv.d._declared_outputs([successor["id"]]) == [out]
