@@ -1590,7 +1590,7 @@ class Dispatcher:
             if not inbox and not item.get('managed') and self._browser_node_busy(agent, rule['project'], thread_id,
                                                                                  item):
                 continue   # the node that can attach a browser is full: wait for it, as behind max_concurrent
-            if not inbox and self._route_by_access(item, agent, rule, now):
+            if not inbox and self._route_by_access(item, agent, rule, now, rules):
                 del pending[key]
                 changed = True
                 continue
@@ -1812,7 +1812,15 @@ class Dispatcher:
                 out.append((row['name'], "the board's machine" if where == "local" else f"node {where}"))
         return out
 
-    def _route_by_access(self, item: dict, agent: str, rule: dict, now: float) -> bool:
+    def _dispatchable(self, rules: list[dict], agent: str, thread_id: int, now: float) -> bool:
+        """Whether a request posted to `agent` in this thread now would be launched: an approval (workstream rule or
+        delivery policy) covers it. Inbox triage does not count: it never executes the work."""
+        next_id = self.board.conn.execute('SELECT COALESCE(MAX(id),0)+1 FROM posts').fetchone()[0]
+        rule = self._rule_for(rules, {'agent': agent, 'thread_id': thread_id, 'post_id': next_id,
+                                      'post_created_at': now})
+        return rule is not None and rule.get('kind') != 'inbox_delivery'
+
+    def _route_by_access(self, item: dict, agent: str, rule: dict, now: float, rules: list[dict]) -> bool:
         """A signed-in browser request whose addressed agent has no runner holding that sign-in goes to another agent
         that has one (access.route_successor). True when it was routed: the item is settled for this agent."""
         post_id, project = item.get('post_id'), rule['project']
@@ -1829,6 +1837,8 @@ class Dispatcher:
         for to_agent, where in self._access_agents(agent, project, origins):
             if not rows:
                 break
+            if not self._dispatchable(rules, to_agent, item['thread_id'], now):
+                continue   # it would never be launched: try the next holder
             try:
                 successor = access.route_successor(self.board, self.human, post_id, rows[0]['recipient'], to_agent,
                                                    origins, where)

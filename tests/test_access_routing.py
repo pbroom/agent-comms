@@ -266,3 +266,14 @@ def test_no_hand_off_to_an_agent_the_linked_task_does_not_authorize(nenv, tmp_pa
     assert not [r for r in runs(nenv) if r["status"] == "routed"]
     [row] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
     assert row["state"] == "blocked" and "Routed by access" not in row["reason"]
+
+
+def test_no_hand_off_to_a_holder_no_approval_would_launch(nenv, tmp_path):
+    hub_checkout(nenv, tmp_path)
+    laptop(nenv, runner="grok")
+    allow(nenv, agents=["codex"])          # nothing approves launching grok here
+    post = signed_in_request(nenv, "codex")
+    nenv.d.tick()
+    assert not [r for r in runs(nenv) if r["status"] == "routed"]
+    [row] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
+    assert row["state"] == "blocked" and "Routed by access" not in row["reason"]
