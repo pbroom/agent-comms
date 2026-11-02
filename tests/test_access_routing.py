@@ -215,3 +215,24 @@ def test_no_agent_anywhere_holds_the_sign_in_blocks_with_the_reason(nenv, tmp_pa
     [row] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
     assert row["state"] == "blocked" and "signed-in desktop browser" in row["reason"]
     assert dispatch  # imported for the fixtures' monkeypatching
+
+
+def test_two_signed_in_runs_on_one_node_take_turns_in_its_checkout(nenv, tmp_path):
+    # The hub has its own checkout, but both runs go to the laptop: they share its checkout, so one waits.
+    hub_checkout(nenv, tmp_path)
+    nenv.d.config.nodes = {"laptop": {"projects": [PROJECT], "agents": ["grok", "codex"],
+                                      "access": [access.browser(ORIGIN)]}}
+    nenv.node.config = DispatchConfig.from_dict({
+        "runners": {"codex": ["codex-fake", "{prompt}"], "grok": ["grok-fake", "{prompt}"]},
+        "worktrees": {PROJECT: nenv.node_dir}, "runner_access": {"codex": SIGNED_IN, "grok": SIGNED_IN},
+        "max_concurrent": 2})
+    nenv.node.hello()
+    other = nenv.thread("second")
+    allow(nenv, agents=["codex"])
+    allow(nenv, agents=["grok"], thread_id=other)
+    signed_in_request(nenv, "codex")
+    human_post(nenv, ["grok"], body="Install it too", thread_id=other,
+               browser_requirement={"recipient": "grok", "target_url": URL, "execution_context": "desktop"})
+    nenv.d.tick()
+    started = [r for r in runs(nenv) if r.get("node") == "laptop"]
+    assert len(started) == 1, [(r["agent"], r["status"], r.get("node")) for r in runs(nenv)]

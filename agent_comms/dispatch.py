@@ -2069,7 +2069,12 @@ class Dispatcher:
 
     def _run_dir_for(self, agent: str, project: str, thread_id: int, item: dict, inbox: bool) -> str:
         """The directory this launch would run in here: with [dispatch] parallel_worktrees, the (agent, thread) run
-        worktree of the project's local Git checkout; otherwise (and for inbox, managed and node runs) the checkout."""
+        worktree of the project's local Git checkout; otherwise (and for inbox, managed and node runs) the checkout.
+        Signed-in work that goes to a node (access.py) runs in that node's checkout: the project path, as recorded."""
+        if not inbox and not item.get("managed") and item.get("post_id"):
+            origins = self._signed_in_origins(agent, thread_id, [item["post_id"]])
+            if origins and self._signed_in_route(agent, project, origins, room=False) not in (None, "local"):
+                return project   # runs on that node, recorded with cwd=project like any node run
         base = self.config.run_dir(project)
         if (inbox or item.get("managed") or not self.config.parallel_worktrees or not os.path.isabs(base)
                 or not os.path.isdir(base) or not os.path.lexists(os.path.join(base, ".git"))):
