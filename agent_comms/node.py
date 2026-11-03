@@ -27,8 +27,9 @@ import httpx
 
 from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
-                       plain_origins, probe_process, process_start, remove_browser_output, render_argv, spawn_process,
-                       with_headless_browser, with_writable_roots)
+                       plain_origins, probe_process, process_start, remove_browser_output, render_argv,
+                       signed_in_browser_overrides, signed_in_profile, spawn_process, with_headless_browser,
+                       with_writable_roots)
 
 log = logging.getLogger("agent_comms.node")
 
@@ -219,7 +220,6 @@ class Node:
                     and not runner_preflight.read_only(template)):
                 template = runner_preflight.scoped_template(template)
                 prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
-            template = with_writable_roots(template, self.config.extra_roots(template, project))
             signed_in = r.get("browser_access")
             if signed_in is not None:
                 # Signed-in browser work: this machine's own [dispatch.runner_access] must still say this runner holds
@@ -229,6 +229,20 @@ class Node:
                         or any(access.browser(o) not in held for o in signed_in)):
                     raise LookupError("this machine's runner does not declare a signed-in browser for the bound "
                                       "origin ([dispatch.runner_access])")
+            profile = signed_in_profile(self.config, agent, r.get("runtime"), signed_in) if signed_in else None
+            out_dir = self.log_dir / f"{rid}-browser"
+            # The signed-in browser's output directory is writable too, so a file to upload can be copied in.
+            template = with_writable_roots(template, self.config.extra_roots(template, project)
+                                           + ([str(out_dir)] if profile is not None else []))
+            if profile is not None:
+                conflict = codex_config_conflict(child_env(agent, self.config, runtime=r.get("runtime")))
+                if conflict:
+                    raise LookupError(conflict)
+                self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self._remove_browser_output(rid)
+                out_dir.mkdir(mode=0o700)   # fresh per run; removed when it ends
+                template = with_headless_browser(template, signed_in_browser_overrides(
+                    self.config.headless_browser, profile, str(out_dir)))
             browser = r.get("headless_browser")
             if browser is not None:
                 origins = plain_origins((browser or {}).get("origins") or []) if isinstance(browser, dict) else []
