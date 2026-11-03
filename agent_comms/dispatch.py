@@ -1666,6 +1666,9 @@ class Dispatcher:
                 if (origins and self._signed_in_route(agent, rule['project'], origins) is None
                         and self._signed_in_route(agent, rule['project'], origins, room=False) not in (None, "local")):
                     continue   # the node holding that sign-in is full: wait for it, as behind max_concurrent
+                where = self._signed_in_route(agent, rule['project'], origins, room=False) if origins else None
+                if where is not None and self._signed_in_busy(where):
+                    continue   # one signed-in run per machine: a browser profile opens in one browser at a time
             error = self._preflight(agent, rule, item)
             if item.get('post_id') and not inbox:
                 error = self._browser_blocker(item['post_id'], agent) or error
@@ -2143,6 +2146,12 @@ class Dispatcher:
         return plain_origins([req['origin'] for req in self._execution_browser_requirements(agent, thread_id, request_ids)
             if req['execution_context'] != 'desktop'
             and not browser_readiness._gate(self.board, project, req['origin'])['denied']])
+
+    def _signed_in_busy(self, where: str) -> bool:
+        """A signed-in run may still be going on that machine ("local" or a node's name). Its persistent browser
+        profile can be open in only one browser at a time, so signed-in runs on one machine take turns."""
+        return any(d.get("browser_access") and (d.get("node") or "local") == where
+                   for d in _active_records(self.board))
 
     @staticmethod
     def _dir_key(path: Any) -> str | None:

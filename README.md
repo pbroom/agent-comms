@@ -1185,7 +1185,8 @@ profile, then quit Chrome so the run can open it:
   --user-data-dir="$HOME/Library/Application Support/Agent Comms/browser-profiles/tenant" https://tenant.sharepoint.com
 ```
 
-A Codex config that already defines a server named `signed_in_browser` makes the run refuse to start.
+A Codex config that already defines a server named `signed_in_browser` makes the run refuse to start. A profile
+opens in one browser at a time, so signed-in runs on one machine take turns.
 
 On the hub, a node's declaration counts only when the hub's grant for that node lists the same access, so a node
 cannot widen what the hub sends it:

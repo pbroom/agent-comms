@@ -165,3 +165,22 @@ def test_a_recovery_linking_signed_in_and_headless_work_shares_one_browser_direc
     o = overrides_of(call["argv"])
     assert f"mcp_servers.{SIGNED_IN_BROWSER_SERVER}.args" in o and "mcp_servers.headless_browser.args" in o
     assert r["signed_in_browser"]["output_dir"] == r["headless_browser"]["output_dir"]
+
+
+def test_signed_in_runs_on_one_machine_take_turns_with_the_profile(hub, monkeypatch):
+    """Even in separate run directories (parallel worktrees), a profile opens in one browser at a time."""
+    monkeypatch.setattr(type(hub.d), "_busy_dirs", lambda self, foreign: set())
+    hub.d.config.max_runs_per_agent = 2
+    other = hub.thread("second install")
+    allow(hub, agents=["codex"])
+    allow(hub, agents=["codex"], thread_id=other)
+    signed_in_request(hub)
+    human_post(hub, ["codex"], body="Install the other package", thread_id=other,
+               browser_requirement={"recipient": "codex", "target_url": URL, "execution_context": "desktop"})
+    hub.d.tick()
+    assert len(hub.spawner.calls) == 1, "the second signed-in run waits for the profile"
+    hub.spawner.children[0].code = 0
+    hub.d.tick()
+    hub.clock.advance(600)
+    hub.d.tick()
+    assert len(hub.spawner.calls) == 2
