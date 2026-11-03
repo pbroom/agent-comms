@@ -110,3 +110,58 @@ def test_a_codex_config_that_defines_the_server_name_refuses_the_run(laptop, tmp
     run = nodes.run(laptop.board, f"s{post['seq']}-codex")
     assert run["state"] == "ended" and SIGNED_IN_BROWSER_SERVER in run["error"]
     assert URL
+
+
+def test_a_node_without_the_browser_command_refuses_the_signed_in_run(laptop, monkeypatch):
+    monkeypatch.setattr("agent_comms.node.shutil.which", lambda executable, **kw: None)
+    post = signed_in_request(laptop)
+    laptop.d.tick()
+    laptop.node.tick()
+    assert laptop.node_spawner.calls == []
+    assert "browser command is unavailable" in nodes.run(laptop.board, f"s{post['seq']}-codex")["error"]
+
+
+@pytest.fixture
+def hub(nenv, tmp_path, monkeypatch):
+    """The hub's own Codex runner holds the sign-in and has the profile."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr("agent_comms.dispatch.shutil.which", lambda executable, **kw: "/fake/" + executable)
+    hub_checkout(nenv, tmp_path)
+    c = node_config(nenv)
+    nenv.d.config.runners, nenv.d.config.headless_browser = c.runners, c.headless_browser
+    nenv.d.config.runner_access, nenv.d.config.browser_profiles = c.runner_access, c.browser_profiles
+    return nenv
+
+
+def test_the_hub_does_not_launch_signed_in_work_without_the_browser_command(hub, monkeypatch):
+    monkeypatch.setattr("agent_comms.dispatch.shutil.which",
+                        lambda executable, **kw: None if executable == "npx" else "/fake/" + executable)
+    allow(hub, agents=["codex"], max_launches=2)
+    signed_in_request(hub)
+    hub.d.tick()
+    assert hub.spawner.calls == []
+    assert hub.board.list_dispatch_rules(hub.p["human"])[0]["launches_left"] == 2
+    assert runs(hub)[0]["error"] == "required signed-in browser command is unavailable"
+
+
+def test_a_recovery_linking_signed_in_and_headless_work_shares_one_browser_directory(hub):
+    from agent_comms import browser_readiness as br, recovery
+    desktop = signed_in_request(hub)
+    headless = human_post(hub, ["codex"], body="Check the local preview")
+    br.bind_request(hub.board, hub.p["human"], hub.sid["human"], headless["id"], "codex", "http://127.0.0.1:5185/about")
+    hub.clock.advance(1)
+    allow(hub, agents=["codex"])
+    wrapper = human_post(hub, ["codex"], body="Recover the install")
+    hub.board.conn.execute("INSERT INTO board_state(key, value, updated_at) VALUES (?, ?, 0)", (
+        recovery.PREFIX + f"{wrapper['id']}.codex", '{"sources": [{"post_id": %d, "recipient": "codex"}, '
+        '{"post_id": %d, "recipient": "codex"}]}' % (desktop["id"], headless["id"])))
+    hub.board.conn.commit()
+    hub.d.tick()
+    [call] = hub.spawner.calls
+    [r] = [r for r in runs(hub) if r["status"] == "running"]
+    o = overrides_of(call["argv"])
+    assert f"mcp_servers.{SIGNED_IN_BROWSER_SERVER}.args" in o and "mcp_servers.headless_browser.args" in o
+    assert r["signed_in_browser"]["output_dir"] == r["headless_browser"]["output_dir"]

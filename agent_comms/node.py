@@ -235,7 +235,10 @@ class Node:
             template = with_writable_roots(template, self.config.extra_roots(template, project)
                                            + ([str(out_dir)] if profile is not None else []))
             if profile is not None:
-                conflict = codex_config_conflict(child_env(agent, self.config, runtime=r.get("runtime")))
+                env = child_env(agent, self.config, runtime=r.get("runtime"))
+                if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
+                    raise LookupError("required signed-in browser command is unavailable")
+                conflict = codex_config_conflict(env)
                 if conflict:
                     raise LookupError(conflict)
                 self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -253,8 +256,9 @@ class Node:
                     raise LookupError(blocker)
                 self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 out_dir = self.log_dir / f"{rid}-browser"
-                self._remove_browser_output(rid)   # left by a node that died before recording this run
-                out_dir.mkdir(mode=0o700)   # fresh per run; never reused
+                if profile is None:   # else the signed-in browser's fresh directory, shared by both servers
+                    self._remove_browser_output(rid)   # left by a node that died before recording this run
+                    out_dir.mkdir(mode=0o700)   # fresh per run; never reused
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, origins, str(out_dir)))
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))

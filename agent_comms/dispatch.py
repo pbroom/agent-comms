@@ -2071,6 +2071,17 @@ class Dispatcher:
                 if self._signed_in_route(agent, project, [req['origin']], room=False) is None:
                     return (f'Browser work needs a signed-in desktop browser for {req["origin"]}; no runner for '
                             f'{agent} declares one ([dispatch.runner_access]). Route to a capable authorized session.')
+        desktop = sorted({req['origin'] for req in required if req['execution_context'] == 'desktop'})
+        if desktop and self._signed_in_route(agent, self.board._thread_row(thread_id)['project'], desktop,
+                                             room=False) == "local" \
+                and signed_in_profile(self.config, agent, self._runtime(agent), desktop) is not None:
+            # This machine attaches the signed-in browser server itself: its command must be on the run's PATH.
+            env = child_env(agent, self.config, runtime=self._runtime(agent))
+            if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
+                return 'required signed-in browser command is unavailable'
+            conflict = codex_config_conflict(env)
+            if conflict:
+                return conflict
         on_node = self._node_headless(agent, self.board._thread_row(thread_id)['project'])
         if not (self.config.headless_browser_for(agent, self._runtime(agent)) if on_node is None else on_node):
             if any(req['execution_context'] != 'desktop' for req in required):   # desktop: checked above
@@ -2316,8 +2327,10 @@ class Dispatcher:
                         record["headless_browser"] = browser
                 profile = signed_in_profile(self.config, agent, self._runtime(agent), signed_in) if signed_in else None
                 if profile is not None:
+                    # Shares the headless server's directory when both are attached (a recovery run linking both).
                     out_dir = self.log_dir / f"{run_id}-browser"
-                    out_dir.mkdir(mode=0o700)   # fresh per run; removed when it ends
+                    if browser is None:
+                        out_dir.mkdir(mode=0o700)   # fresh per run; removed when it ends
                     record["signed_in_browser"] = {"output_dir": str(out_dir)}
                 prompt = (build_inbox_prompt(thread_id,rule['id'],record['request_ids'],run_id,cwd) if inbox
                           else build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
