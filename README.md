@@ -1213,6 +1213,14 @@ What the dispatcher does with a desktop-bound request:
   routed again.
 - **Nobody holds it.** The request is blocked before any launch, with the reason, so it shows up for you.
 
+A request the dispatcher blocked at preflight (this one, or any other preflight failure such as a missing runner or
+command) is not yours to unblock by hand. About once a minute the dispatcher re-runs the same checks on such requests,
+as long as nobody else has changed them since. Once the checks pass, because you fixed the configuration or a node
+holding the access came online, it queues the request again itself ("Requeued automatically: the dispatcher's own
+preflight that blocked this request now passes") and launches it as usual. This happens at most three times per
+request in 24 hours, and only while the board setting `auto_recover_stalled_work` is on. A block written by an
+agent or by you is never touched.
+
 A node checks its own `[dispatch.runner_access]` again when it starts the run and refuses it if the sign-in is no
 longer declared there.
 

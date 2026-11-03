@@ -1318,6 +1318,7 @@ class Dispatcher:
         # heartbeats must not indefinitely suppress a managed continuation.
         workstreams.tick(self.board, self.human, fence=self._fence())
         self._expire_generic_pickups()
+        self._retry_preflight_blocks(now)
         # Before the scan, so a recovery request posted now is a trigger in this same pass.
         self._auto_recover()
         self._undelivered_alerts()
@@ -1414,6 +1415,118 @@ class Dispatcher:
                     (post['id'],row['recipient'],state,row['assigned_agent'],row['assigned_session'],reason,version,now))
                 seq = c.execute('SELECT COALESCE(MAX(seq),0)+1 FROM posts').fetchone()[0]
                 c.execute('UPDATE posts SET seq=?,revised_at=? WHERE id=?', (seq,now,post['id']))
+
+    PREFLIGHT_RETRY_PREFIX = "dispatch.preflight_retry."
+    PREFLIGHT_RETRY_SECONDS = 60
+    PREFLIGHT_RETRY_MAX = 3   # automatic requeues per request per rolling 24 hours
+    PREFLIGHT_REQUEUED = ("Requeued automatically: the dispatcher's own preflight that blocked this request now "
+                          "passes (was: {was})")
+
+    def _preflight_blocks(self) -> list[tuple[Any, dict]]:
+        """Generic requests the dispatcher itself blocked at preflight, untouched since: the latest event is that
+        block, written by the dispatcher. Never a sealed post, a closed thread or a managed continuation."""
+        out = []
+        for row in self.board.conn.execute("""SELECT q.post_id, q.recipient, q.version FROM request_progress q
+                JOIN posts p ON p.id = q.post_id JOIN threads t ON t.id = p.thread_id
+                WHERE q.state = 'blocked' AND q.reason LIKE 'Preflight failed:%' AND p.sealed = 0
+                  AND t.status = 'open'
+                  AND NOT EXISTS(SELECT 1 FROM continuations w WHERE w.post_id = p.id)
+                ORDER BY p.seq""").fetchall():
+            last = self.board.conn.execute("""SELECT event_source, state, version FROM request_events
+                    WHERE post_id = ? AND recipient = ? ORDER BY id DESC LIMIT 1""",
+                                           (row["post_id"], row["recipient"])).fetchone()
+            if last is None or last["event_source"] != "dispatcher" or last["state"] != "blocked" \
+                    or last["version"] != row["version"]:
+                continue
+            post = self.board.conn.execute("SELECT * FROM posts WHERE id = ?", (row["post_id"],)).fetchone()
+            req = next((r for r in requests.for_post(self.board, post) if r["recipient"] == row["recipient"]), None)
+            if req is not None and req["state"] == "blocked" and req["assigned_session"] is None:
+                out.append((post, req))
+        return out
+
+    def _retry_preflight_blocks(self, now: float) -> None:
+        """A request the dispatcher blocked at preflight (no runner here, no signed-in browser anywhere, a missing
+        command...) is not the human's to unblock by hand: once the same checks pass (the human fixed the
+        configuration, a node with the access came online), the dispatcher queues it again itself, and the next scan
+        launches it. Signed-in browser work whose addressed agent still has no runner holding the sign-in is handed to
+        an agent that has one (_route_by_access). At most PREFLIGHT_RETRY_MAX requeues per request per 24 hours, so a
+        check that keeps flipping cannot loop; only while the board setting auto_recover_stalled_work is on, only by
+        the loop that owns the board, never while paused."""
+        from . import autorecover
+        if (not autorecover.enabled(self.board)
+                or now - getattr(self, "_preflight_retry_at", float("-inf")) < self.PREFLIGHT_RETRY_SECONDS):
+            return   # off with the human's board setting auto_recover_stalled_work, like crash requeues
+        self._preflight_retry_at = now
+        try:
+            blocks = self._preflight_blocks()
+            if not blocks:
+                return
+            rules = self.board.active_dispatch_rules(self.human)
+            for post, row in blocks:
+                agent = row["assigned_agent"]
+                item = {"agent": agent, "thread_id": post["thread_id"], "seq": post["seq"],
+                        "post_created_at": post["created_at"], "post_id": post["id"], "recipient": row["recipient"]}
+                rule = self._rule_for(rules, item)
+                if rule is None or rule.get("kind") == "inbox_delivery":
+                    continue   # nothing would launch it: it stays blocked for the human
+                if self._route_by_access(item, agent, rule, now, rules):
+                    continue
+                ids = [post["id"]]
+                error = (self._preflight(agent, rule, item) or self._browser_blocker(post["id"], agent)
+                         or self._headless_blocker(agent, post["thread_id"], ids)
+                         or self._output_blocker(agent, rule, ids, self._run_dir_for(agent, rule["project"],
+                                                                                      post["thread_id"], item, False)))
+                if error is None:
+                    self._requeue_preflight_block(row, agent, now)
+        except Exception:
+            log.exception("preflight retry pass failed")
+
+    def _requeue_preflight_block(self, row: dict, agent: str, now: float) -> bool:
+        post_id, recipient = row["post_id"], row["recipient"]
+        key = f"{self.PREFLIGHT_RETRY_PREFIX}{int(post_id)}.{recipient}"
+        with db.write_tx(self.board.conn) as c:
+            owner = c.execute("SELECT value FROM board_state WHERE key = ?", (self.OWNER_KEY,)).fetchone()
+            if owner is None or owner["value"] != self._fence()[1] or self.board.is_paused():
+                return False
+            current = c.execute("SELECT state, version FROM request_progress WHERE post_id = ? AND recipient = ?",
+                                (post_id, recipient)).fetchone()
+            if current is None or current["state"] != "blocked" or current["version"] != row["version"]:
+                return False   # someone changed it since it was read
+            seen = c.execute("SELECT value FROM board_state WHERE key = ?", (key,)).fetchone()
+            try:
+                times = [t for t in json.loads(seen["value"]).get("times", []) if isinstance(t, (int, float))] \
+                    if seen else []
+            except (TypeError, ValueError, AttributeError):
+                return False   # an unreadable record counts as used: never requeue without a bound
+            times = [t for t in times if now - t < requeue.WINDOW_SECONDS]
+            if len(times) >= self.PREFLIGHT_RETRY_MAX:
+                return False
+            was = (row["reason"] or "")[len("Preflight failed: "):][:300]
+            reason, version = self.PREFLIGHT_REQUEUED.format(was=was), row["version"] + 1
+            c.execute("""UPDATE request_progress SET state='queued', assigned_session=NULL, reason=?,
+                         evidence_post_ids='[]', version=?, updated_at=? WHERE post_id=? AND recipient=?""",
+                      (reason, version, now, post_id, recipient))
+            c.execute("""INSERT INTO request_events
+                (post_id,recipient,actor,session_id,state,assigned_agent,assigned_session,reason,evidence_post_ids,
+                 version,created_at,event_source) VALUES (?,?,NULL,NULL,'queued',?,NULL,?,'[]',?,?,'dispatcher')""",
+                      (post_id, recipient, agent, reason, version, now))
+            self._put(c, key, {"times": times + [now]})
+            # The preflight-failed attempt no longer counts as this post's one attempt (_attempted), so it launches.
+            for (value,) in c.execute("SELECT value FROM board_state WHERE key LIKE 'dispatch.run.%'").fetchall():
+                try:
+                    record = json.loads(value)
+                except ValueError:
+                    continue
+                if (isinstance(record, dict) and record.get("status") == "preflight_failed"
+                        and record.get("agent") == agent and post_id in record.get("request_ids", [])
+                        and isinstance(record.get("run_id"), str) and not requeue.requeued_post(record, post_id)):
+                    record["requeued"] = (record.get("requeued") if isinstance(record.get("requeued"), list)
+                                          else []) + [[post_id, recipient]]
+                    self._put(c, self.RUN_PREFIX + record["run_id"], record)
+            seq = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM posts").fetchone()[0]
+            c.execute("UPDATE posts SET seq=?, revised_at=? WHERE id=?", (seq, now, post_id))
+        log.info("requeued request %s for %s: its preflight now passes", post_id, agent)
+        return True
 
     def _scan(self) -> dict[str, dict]:
         """New posts (seq above our mark) on approved threads, addressed to an allowed agent by someone else, that
