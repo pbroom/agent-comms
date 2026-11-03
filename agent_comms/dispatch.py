@@ -296,7 +296,9 @@ def codex_approval_reminder(template: list[str] | None) -> str | None:
 # signed in to the bound target's site. The board attaches nothing; it only lets this run attest a desktop probe.
 SIGNED_IN_PROMPT = (
     " This run was launched where the human configured a browser already signed in to the bound target's site (the "
-    "runner's own browser tools). Use only that browser for the bound target. Before any browser step, probe it: "
+    "signed_in_browser MCP server when this run has it, else the runner's own browser tools). Use only that browser "
+    "for the bound target. To upload a file with it, first copy the file into the directory its tool results report "
+    "for saved files, then pass that copy's absolute path. Before any browser step, probe it: "
     "board_browser_begin_probe, then board_browser_probe with context kind \"desktop\" from this run. If the site asks "
     "you to sign in, do not enter credentials: report it with board_browser_failure and block the request with that "
     "reason so the human can sign in again.")
@@ -497,14 +499,15 @@ def codex_config_conflict(env: dict[str, str]) -> str | None:
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return "cannot read the Codex config.toml to check that it leaves mcp_servers.headless_browser alone"
 
-    def defines(table: Any) -> bool:
-        servers = table.get("mcp_servers") if isinstance(table, dict) else None
-        return isinstance(servers, dict) and HEADLESS_BROWSER_SERVER in servers
+    for name in (HEADLESS_BROWSER_SERVER, SIGNED_IN_BROWSER_SERVER):
+        def defines(table: Any) -> bool:
+            servers = table.get("mcp_servers") if isinstance(table, dict) else None
+            return isinstance(servers, dict) and name in servers
 
-    profiles = data.get("profiles")
-    if defines(data) or (isinstance(profiles, dict) and any(defines(p) for p in profiles.values())):
-        return (f"the Codex config.toml defines mcp_servers.{HEADLESS_BROWSER_SERVER}; remove it (the dispatcher "
-                "owns that name, and settings there would merge into the scoped browser)")
+        profiles = data.get("profiles")
+        if defines(data) or (isinstance(profiles, dict) and any(defines(p) for p in profiles.values())):
+            return (f"the Codex config.toml defines mcp_servers.{name}; remove it (the dispatcher "
+                    "owns that name, and settings there would merge into the browser it attaches)")
     return None
 
 
@@ -512,7 +515,7 @@ def remove_browser_output(record: dict) -> None:
     """Delete a finished run's browser output directory, only when it is exactly `<log dir>/<run id>-browser`.
     Called only once the run's process is gone (exit, spawn failure, or an orphan found dead), never while the agent
     may still be copying evidence out of it."""
-    hb = record.get("headless_browser") if isinstance(record, dict) else None
+    hb = (record.get("headless_browser") or record.get("signed_in_browser")) if isinstance(record, dict) else None
     out, run_id, log = (hb or {}).get("output_dir"), record.get("run_id"), record.get("log")
     if not (isinstance(out, str) and isinstance(run_id, str) and isinstance(log, str)):
         return
@@ -526,6 +529,64 @@ def with_headless_browser(template: list[str], overrides: list[str]) -> list[str
     """The runner argv with the overrides placed just before the {prompt} element (options precede the prompt)."""
     i = template.index("{prompt}")
     return template[:i] + overrides + template[i:]
+
+
+# ---------------------------------------------------------------- signed-in browser profiles (access.py)
+# `[dispatch.browser_profiles."<origin>"] user_data_dir = "..."`: a browser profile on this machine that the human
+# signed in to that site once. A Codex run launched for signed-in work on that origin (its record's browser_access)
+# gets the Playwright MCP server from [dispatch.headless_browser] (same pinned command and args) as the
+# `signed_in_browser` server, headless, on that persistent profile, for that run only. Ordinary runs never get it.
+SIGNED_IN_BROWSER_SERVER = "signed_in_browser"
+# The headless set plus file upload: signed-in work (installing a package in an admin page) needs it. Still never
+# the tools that run code outside Codex's sandbox (browser_run_code_unsafe, browser_evaluate) or drop.
+SIGNED_IN_BROWSER_TOOLS = HEADLESS_BROWSER_TOOLS + ("browser_file_upload",)
+
+
+def validate_browser_profiles(value: Any) -> dict[str, str]:
+    """origin (canonical, as access.py) -> absolute, normalized profile directory."""
+    where = "[dispatch.browser_profiles]"
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} maps an origin to {{ user_data_dir = \"/absolute/dir\" }}")
+    out: dict[str, str] = {}
+    home = os.path.realpath(os.path.expanduser("~"))
+    for origin, entry in value.items():
+        key = access.canonical(access.BROWSER + origin, where)[len(access.BROWSER):]
+        if not isinstance(entry, dict) or set(entry) != {"user_data_dir"}:
+            raise ValueError(f"{where} {origin!r} needs exactly user_data_dir")
+        d = entry["user_data_dir"]
+        if (not isinstance(d, str) or _has_control(d) or not os.path.isabs(d) or os.path.normpath(d) != d
+                or d in ("/", home) or "{" in d or "}" in d):
+            raise ValueError(f"{where} {origin!r} user_data_dir must be an absolute, normalized directory of its own")
+        if key in out:
+            raise ValueError(f"{where} lists {key} twice")
+        out[key] = d
+    return out
+
+
+def signed_in_browser_overrides(config: "HeadlessBrowserConfig", profile_dir: str, output_dir: str) -> list[str]:
+    """The `-c` argv pairs that attach the signed-in browser profile to one Codex run."""
+    args = list(config.args) + ["--headless", "--user-data-dir", profile_dir, "--block-service-workers",
+                                "--browser", config.browser, "--output-dir", output_dir, "--file-paths", "absolute"]
+    pre = f"mcp_servers.{SIGNED_IN_BROWSER_SERVER}."
+    out = ["-c", pre + "command=" + _toml(config.command), "-c", pre + "args=" + _toml(args),
+           "-c", pre + "cwd=" + _toml(output_dir), "-c", pre + "env_vars=[]",
+           "-c", pre + "enabled_tools=" + _toml(list(SIGNED_IN_BROWSER_TOOLS))]
+    for tool in SIGNED_IN_BROWSER_TOOLS:
+        out += ["-c", codex_approval_override(tool, SIGNED_IN_BROWSER_SERVER)]
+    return out
+
+
+def signed_in_profile(config: "DispatchConfig", agent: str, runtime: str | None, origins: list[str]) -> str | None:
+    """The one profile directory this machine has for all of `origins`, when this agent's runner is a Codex runner
+    that can run the browser server ([dispatch.headless_browser] command); else None (the runner's own config must
+    then provide the signed-in browser, e.g. `claude --chrome`)."""
+    template = config.runner_for(agent, runtime)
+    if not origins or not uses_codex(template) or not config.headless_browser.command:
+        return None
+    dirs = {config.browser_profiles.get(o) for o in origins}
+    if len(dirs) != 1 or None in dirs:
+        return None
+    return dirs.pop()
 
 
 def _forbidden_env(name: str) -> bool:
@@ -764,6 +825,7 @@ class DispatchConfig:
     claude_tool_projects: list[str] = field(default_factory=list)
     headless_browser: HeadlessBrowserConfig = field(default_factory=HeadlessBrowserConfig)
     runner_access: dict[str, list[str]] = field(default_factory=dict)   # runner key -> access it holds here (access.py)
+    browser_profiles: dict[str, str] = field(default_factory=dict)      # origin -> signed-in profile dir (Codex runs)
     live_minutes: float = 2.0
     poll_seconds: float = 5.0
     timeout_minutes: float = 30.0
@@ -868,12 +930,17 @@ class DispatchConfig:
                 c.headless_browser = HeadlessBrowserConfig.from_dict(v)
             elif k == "runner_access":
                 c.runner_access = access.parse_table(v)
+            elif k == "browser_profiles":
+                c.browser_profiles = validate_browser_profiles(v)
             else:
                 raise ValueError(f"unknown setting [dispatch] {k}")
         c.headless_browser.check_runners(c.runners)
         unknown = sorted(set(c.runner_access) - set(c.runners))
         if unknown:
             raise ValueError(f"[dispatch.runner_access] {unknown} are not under [dispatch.runners]")
+        if c.browser_profiles and not c.headless_browser.command:
+            raise ValueError("[dispatch.browser_profiles] needs [dispatch.headless_browser] command and args: the "
+                             "signed-in browser runs that same pinned Playwright MCP server")
         if c.parallel_worktrees:
             root, user = c.worktree_root(), os.path.realpath(os.path.expanduser("~"))
             if root == user or _within(user, root) or any(
@@ -1599,6 +1666,9 @@ class Dispatcher:
                 if (origins and self._signed_in_route(agent, rule['project'], origins) is None
                         and self._signed_in_route(agent, rule['project'], origins, room=False) not in (None, "local")):
                     continue   # the node holding that sign-in is full: wait for it, as behind max_concurrent
+                where = self._signed_in_route(agent, rule['project'], origins, room=False) if origins else None
+                if where is not None and self._signed_in_busy(where):
+                    continue   # one signed-in run per machine: a browser profile opens in one browser at a time
             error = self._preflight(agent, rule, item)
             if item.get('post_id') and not inbox:
                 error = self._browser_blocker(item['post_id'], agent) or error
@@ -2004,6 +2074,17 @@ class Dispatcher:
                 if self._signed_in_route(agent, project, [req['origin']], room=False) is None:
                     return (f'Browser work needs a signed-in desktop browser for {req["origin"]}; no runner for '
                             f'{agent} declares one ([dispatch.runner_access]). Route to a capable authorized session.')
+        desktop = sorted({req['origin'] for req in required if req['execution_context'] == 'desktop'})
+        if desktop and self._signed_in_route(agent, self.board._thread_row(thread_id)['project'], desktop,
+                                             room=False) == "local" \
+                and signed_in_profile(self.config, agent, self._runtime(agent), desktop) is not None:
+            # This machine attaches the signed-in browser server itself: its command must be on the run's PATH.
+            env = child_env(agent, self.config, runtime=self._runtime(agent))
+            if shutil.which(self.config.headless_browser.command, path=env.get("PATH")) is None:
+                return 'required signed-in browser command is unavailable'
+            conflict = codex_config_conflict(env)
+            if conflict:
+                return conflict
         on_node = self._node_headless(agent, self.board._thread_row(thread_id)['project'])
         if not (self.config.headless_browser_for(agent, self._runtime(agent)) if on_node is None else on_node):
             if any(req['execution_context'] != 'desktop' for req in required):   # desktop: checked above
@@ -2065,6 +2146,12 @@ class Dispatcher:
         return plain_origins([req['origin'] for req in self._execution_browser_requirements(agent, thread_id, request_ids)
             if req['execution_context'] != 'desktop'
             and not browser_readiness._gate(self.board, project, req['origin'])['denied']])
+
+    def _signed_in_busy(self, where: str) -> bool:
+        """A signed-in run may still be going on that machine ("local" or a node's name). Its persistent browser
+        profile can be open in only one browser at a time, so signed-in runs on one machine take turns."""
+        return any(d.get("browser_access") and (d.get("node") or "local") == where
+                   for d in _active_records(self.board))
 
     @staticmethod
     def _dir_key(path: Any) -> str | None:
@@ -2247,6 +2334,13 @@ class Dispatcher:
                         out_dir.mkdir(mode=0o700)   # fresh per run; never reused
                         browser = {"origins": origins, "output_dir": str(out_dir)}
                         record["headless_browser"] = browser
+                profile = signed_in_profile(self.config, agent, self._runtime(agent), signed_in) if signed_in else None
+                if profile is not None:
+                    # Shares the headless server's directory when both are attached (a recovery run linking both).
+                    out_dir = self.log_dir / f"{run_id}-browser"
+                    if browser is None:
+                        out_dir.mkdir(mode=0o700)   # fresh per run; removed when it ends
+                    record["signed_in_browser"] = {"output_dir": str(out_dir)}
                 prompt = (build_inbox_prompt(thread_id,rule['id'],record['request_ids'],run_id,cwd) if inbox
                           else build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
                                             headless_browser=browser is not None, signed_in_browser=bool(signed_in)))
@@ -2268,12 +2362,20 @@ class Dispatcher:
                     template = runner_preflight.scoped_template(template)
                     prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
                 if not inbox:
-                    template = with_writable_roots(template, self.config.extra_roots(template, project))
+                    # The signed-in browser's output directory is writable too, so a file to upload can be copied in.
+                    template = with_writable_roots(template, self.config.extra_roots(template, project) + (
+                        [record["signed_in_browser"]["output_dir"]] if profile is not None else []))
                 else:
                     template = with_codex_inbox_mcp(template,child_env(agent,self.config,runtime=self._runtime(agent)))
                 if browser is not None:
                     template = with_headless_browser(template, headless_browser_overrides(
                         self.config.headless_browser, browser["origins"], browser["output_dir"]))
+                if profile is not None:
+                    conflict = codex_config_conflict(child_env(agent, self.config, runtime=self._runtime(agent)))
+                    if conflict:
+                        raise Conflict(conflict)
+                    template = with_headless_browser(template, signed_in_browser_overrides(
+                        self.config.headless_browser, profile, record["signed_in_browser"]["output_dir"]))
                 argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
                 child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
                                      log_path=log_path)

@@ -1164,7 +1164,29 @@ codex-cli = ["browser:https://tenant.sharepoint.com"]   # runner key -> origins 
 
 The declaration is a statement, not a setup: the runner's own configuration gives it the browser (for example a
 Codex `mcp_servers` entry for Playwright MCP with a `--user-data-dir` profile you signed in to once, or a
-`claude --chrome` runner that drives your Chrome). The board stores no credential and attaches nothing.
+`claude --chrome` runner that drives your Chrome). The board stores no credential.
+
+For a Codex runner the board can attach that browser itself, only to runs launched for signed-in work on that
+origin, so ordinary Codex runs never see the profile:
+
+```toml
+# board.local.toml on the machine that holds the sign-in
+[dispatch.browser_profiles."https://tenant.sharepoint.com"]
+user_data_dir = "/Users/you/Library/Application Support/Agent Comms/browser-profiles/tenant"
+```
+
+Such a run gets a second Playwright MCP server, `signed_in_browser`, started headless from
+`[dispatch.headless_browser]` (its `command` is required) with `--user-data-dir` set to that profile, plus
+`browser_file_upload` and an output directory it may write, removed with the run. Sign in to the site once in the
+profile, then quit Chrome so the run can open it:
+
+```sh
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --user-data-dir="$HOME/Library/Application Support/Agent Comms/browser-profiles/tenant" https://tenant.sharepoint.com
+```
+
+A Codex config that already defines a server named `signed_in_browser` makes the run refuse to start. A profile
+opens in one browser at a time, so signed-in runs on one machine take turns.
 
 On the hub, a node's declaration counts only when the hub's grant for that node lists the same access, so a node
 cannot widen what the hub sends it:
