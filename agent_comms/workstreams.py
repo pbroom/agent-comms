@@ -327,7 +327,7 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     node_run = _node_run(board, session)
     if node_run is not None:
         # The owner ran on a node: its checkout is on that machine, not here. The node inspected it (checkout_blocker)
-        # when the run ended and reported the result; without that report it cannot be inspected.
+        # when the latest run in it ended and reported the result; without that report it cannot be inspected.
         checkout = node_run.get('checkout')
         if node_run.get('state') != 'ended' or not isinstance(checkout, dict):
             return 'Owner worktree cannot be inspected'
@@ -377,7 +377,22 @@ def _node_run(board, session):
         return None
     from . import nodes
     found = nodes.run(board, session['dispatch_run_id'])
-    return found if isinstance(found, dict) else {}
+    if not isinstance(found, dict):
+        return {}
+    # The node gives every run of a project the same checkout (Node._start, checkout_for), so a run there since the
+    # owner's may have changed it: the latest run's report is the one that describes it now.
+    latest = found
+    for (value,) in board.conn.execute('SELECT value FROM board_state WHERE key >= ? AND key < ?',
+                                       (nodes.RUN_PREFIX, nodes.RUN_PREFIX[:-1]+chr(ord(nodes.RUN_PREFIX[-1])+1))):
+        try:
+            other = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if (isinstance(other, dict) and other.get('run_id') != found.get('run_id')
+                and other.get('node') == found.get('node') and other.get('project') == found.get('project')
+                and (other.get('created_at') or 0) >= (latest.get('created_at') or 0)):
+            latest = other
+    return latest
 
 
 def _descendant_checkouts(board, managed):

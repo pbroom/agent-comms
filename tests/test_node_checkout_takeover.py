@@ -71,3 +71,32 @@ def test_a_checkout_report_is_validated(nenv):
     for bad in ({"clean": "yes"}, {"clean": True, "extra": 1}, {"clean": True, "detail": "x" * 301}):
         with pytest.raises(Invalid):
             nodes.report(nenv.board, nenv.p["laptop"], "s1-grok", "ended", checkout=bad)
+
+
+def later_run(env, run_id, **fields):
+    """Another run of the same project on the same node, after the owner's: it shares the checkout."""
+    r = nodes.run(env.board, run_id) | {"run_id": "s2-grok", "created_at": nodes.run(env.board, run_id)["created_at"] + 5}
+    r.update(fields)
+    with env.board.conn:
+        env.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES(?,?,?,?)",
+                               (nodes.RUN_PREFIX + "s2-grok", __import__("json").dumps(r), "dispatcher", r["created_at"]))
+
+
+def test_a_later_run_that_left_the_shared_checkout_dirty_blocks_the_takeover(nenv):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, checkout={"clean": False, "detail": "Owner worktree has an unfinished Git operation"})
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) == \
+        "Owner worktree has an unfinished Git operation"
+
+
+def test_a_later_run_still_going_in_the_shared_checkout_blocks_the_takeover(nenv):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, state="running", checkout=None)
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) == 'Owner worktree cannot be inspected'
+
+
+def test_a_later_clean_run_still_allows_the_takeover(nenv, monkeypatch):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, checkout={"clean": True, "detail": ""})
+    monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
