@@ -63,7 +63,7 @@ def checkout_state(cwd: str | None) -> dict | None:
         blocker = workstreams.checkout_blocker(cwd)
     except Exception as e:
         blocker = f"checkout could not be inspected: {type(e).__name__}"
-    return {"clean": blocker is None, "detail": (blocker or "")[:300]}
+    return {"clean": blocker is None, "detail": (blocker or "")[:300], "path": os.path.realpath(cwd)[:4096]}
 
 
 class Node:

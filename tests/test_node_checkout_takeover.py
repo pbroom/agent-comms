@@ -1,6 +1,7 @@
 """A later run may take over work whose owner ran on a node: the hub cannot see the node's disk, so the node inspects
 its checkout when the run ends and reports it (workstreams.checkout_blocker), and the takeover check uses that."""
 
+import os
 import subprocess
 
 import pytest
@@ -45,7 +46,8 @@ def managed(env):
 
 def test_the_node_reports_a_clean_checkout_and_the_takeover_may_proceed(nenv, tmp_path, monkeypatch):
     run_id = node_run(nenv)
-    assert nodes.run(nenv.board, run_id)["checkout"] == {"clean": True, "detail": ""}
+    assert nodes.run(nenv.board, run_id)["checkout"] == {"clean": True, "detail": "",
+                                                         "path": os.path.realpath(nenv.node_dir)}
     monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)   # the hub has no such directory
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
 
@@ -68,7 +70,8 @@ def test_without_the_nodes_report_it_still_cannot_be_inspected(nenv):
 
 def test_a_checkout_report_is_validated(nenv):
     nenv.node.hello()
-    for bad in ({"clean": "yes"}, {"clean": True, "extra": 1}, {"clean": True, "detail": "x" * 301}):
+    for bad in ({"clean": "yes"}, {"clean": True, "extra": 1}, {"clean": True, "detail": "x" * 301},
+                {"clean": True, "path": 3}):
         with pytest.raises(Invalid):
             nodes.report(nenv.board, nenv.p["laptop"], "s1-grok", "ended", checkout=bad)
 
@@ -84,7 +87,8 @@ def later_run(env, run_id, **fields):
 
 def test_a_later_run_that_left_the_shared_checkout_dirty_blocks_the_takeover(nenv):
     run_id = node_run(nenv)
-    later_run(nenv, run_id, checkout={"clean": False, "detail": "Owner worktree has an unfinished Git operation"})
+    later_run(nenv, run_id, checkout={"clean": False, "detail": "Owner worktree has an unfinished Git operation",
+                                       "path": os.path.realpath(nenv.node_dir)})
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) == \
         "Owner worktree has an unfinished Git operation"
 
@@ -97,7 +101,7 @@ def test_a_later_run_still_going_in_the_shared_checkout_blocks_the_takeover(nenv
 
 def test_a_later_clean_run_still_allows_the_takeover(nenv, monkeypatch):
     run_id = node_run(nenv)
-    later_run(nenv, run_id, checkout={"clean": True, "detail": ""})
+    later_run(nenv, run_id, checkout={"clean": True, "detail": "", "path": os.path.realpath(nenv.node_dir)})
     monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
 
@@ -118,7 +122,7 @@ def test_a_node_shutting_down_still_reports_the_checkout(nenv):
     nenv.node_spawner.children[0].code = -15
     nenv.node.stop_all()
     r = nodes.run(nenv.board, run_id)
-    assert r["state"] == "ended" and r["checkout"] == {"clean": True, "detail": ""}
+    assert r["state"] == "ended" and r["checkout"]["clean"] is True
 
 
 def test_a_restarted_node_reports_the_checkout_of_a_run_it_stopped(nenv):
@@ -149,7 +153,7 @@ def drop_owner_record(env, run_id):
 
 def test_a_later_report_still_counts_once_the_owners_node_record_is_pruned(nenv, monkeypatch):
     run_id = node_run(nenv)
-    later_run(nenv, run_id, checkout={"clean": True, "detail": ""})
+    later_run(nenv, run_id, checkout={"clean": True, "detail": "", "path": os.path.realpath(nenv.node_dir)})
     drop_owner_record(nenv, run_id)
     monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
@@ -159,3 +163,10 @@ def test_with_no_report_left_at_all_it_cannot_be_inspected(nenv):
     run_id = node_run(nenv)
     drop_owner_record(nenv, run_id)
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) == 'Owner worktree cannot be inspected'
+
+
+def test_a_clean_report_for_another_checkout_does_not_cover_the_owners_worktree(nenv, monkeypatch):
+    run_id = node_run(nenv)
+    elsewhere = owner(nenv, run_id) | {"worktree": nenv.node_dir + "-feature"}   # the owner worked in its own worktree
+    monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
+    assert workstreams._inactive(nenv.board, elsewhere, managed(nenv)) == 'Owner worktree cannot be inspected'

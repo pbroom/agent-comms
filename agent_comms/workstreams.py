@@ -331,6 +331,12 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
         checkout = node_run.get('checkout')
         if node_run.get('state') != 'ended' or not isinstance(checkout, dict):
             return 'Owner worktree cannot be inspected'
+        # The node inspects the checkout it launched the run in; an owner that registered another worktree did its
+        # work somewhere that report does not describe.
+        inspected = checkout.get('path')
+        if not isinstance(inspected, str) or os.path.normpath(inspected) not in (
+                path, os.path.normpath(session['worktree'] or session['project'])):
+            return 'Owner worktree cannot be inspected'
         if checkout.get('clean') is True:
             return None
         detail = checkout.get('detail')

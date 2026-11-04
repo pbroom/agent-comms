@@ -242,7 +242,8 @@ def assignments(board: Board, p: Principal) -> dict:
 def report(board: Board, p: Principal, run_id: str, state: str, pid: Any = None, exit_code: Any = None,
            error: Any = None, checkout: Any = None) -> dict:
     """The node reports a run `running` (with its pid) or `ended` (with its exit code, or an error, and what it found
-    in the run's checkout: {"clean": bool, "detail": str}, workstreams.checkout_blocker)."""
+    in the run's checkout: {"clean": bool, "detail": str, "path": the checkout it inspected},
+    workstreams.checkout_blocker)."""
     _require_node(board, p)
     if state not in ("running", "ended"):
         raise Invalid("state must be running or ended")
@@ -251,11 +252,14 @@ def report(board: Board, p: Principal, run_id: str, state: str, pid: Any = None,
             raise Invalid(f"{name} must be an integer")
     if error is not None and (not isinstance(error, str) or len(error) > 300):
         raise Invalid("error must be a string of at most 300 characters")
-    if checkout is not None and (state != "ended" or not isinstance(checkout, dict) or set(checkout) - {"clean", "detail"}
+    if checkout is not None and (state != "ended" or not isinstance(checkout, dict)
+                                 or set(checkout) - {"clean", "detail", "path"}
                                  or not isinstance(checkout.get("clean"), bool)
                                  or not isinstance(checkout.get("detail", ""), str)
-                                 or len(checkout.get("detail", "")) > 300):
-        raise Invalid('checkout must be {"clean": bool, "detail": str} on an ended report')
+                                 or len(checkout.get("detail", "")) > 300
+                                 or not isinstance(checkout.get("path", ""), str)
+                                 or len(checkout.get("path", "")) > 4096):
+        raise Invalid('checkout must be {"clean": bool, "detail": str, "path": str} on an ended report')
     now = board.now()
     with db.write_tx(board.conn) as c:
         r = _get(c, RUN_PREFIX + run_id)
