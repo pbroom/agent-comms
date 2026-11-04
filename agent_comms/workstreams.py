@@ -324,7 +324,7 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
     if not ended and not idle and not abandoned:
         return UNKNOWN_ACTIVITY
-    node_run = _node_run(board, session)
+    node_run = _node_run(board, session, own_run_id)
     if node_run is not None:
         # The owner ran on a node: its checkout is on that machine, not here. The node inspected it (checkout_blocker)
         # when the latest run in it ended and reported the result; without that report it cannot be inspected.
@@ -363,8 +363,13 @@ def checkout_blocker(path):
     return None
 
 
-def _node_run(board, session):
-    """The node's record of the dispatcher run `session` registered under, when that run went to a node."""
+def _node_run(board, session, own_run_id=None):
+    """The node's latest report on the checkout `session`'s dispatcher run used, when that run went to a node: None
+    when it did not, {} when there is no report. The node gives every run of a project the same checkout
+    (Node._start, checkout_for), so a run there since the owner's may have changed it and its report is the current
+    one. A run still going there (other than `own_run_id`, the successor's own) means nothing describes it now.
+    The owner's own node record may be gone (nodes.hello prunes ended records after a day); the dispatcher's record
+    still names the node and project."""
     if not session['dispatch_run_id']:
         return None
     record = board.conn.execute('SELECT value FROM board_state WHERE key=?',
@@ -376,23 +381,26 @@ def _node_run(board, session):
     if not isinstance(run, dict) or not run.get('node'):
         return None
     from . import nodes
-    found = nodes.run(board, session['dispatch_run_id'])
-    if not isinstance(found, dict):
-        return {}
-    # The node gives every run of a project the same checkout (Node._start, checkout_for), so a run there since the
-    # owner's may have changed it: the latest run's report is the one that describes it now.
-    latest = found
+    owner = nodes.run(board, session['dispatch_run_id'])
+    owner = owner if isinstance(owner, dict) else {}
+    node, project = run['node'], owner.get('project') or run.get('cwd')
+    since = owner.get('created_at') or run.get('started_at') or 0
+    latest = None
     for (value,) in board.conn.execute('SELECT value FROM board_state WHERE key >= ? AND key < ?',
                                        (nodes.RUN_PREFIX, nodes.RUN_PREFIX[:-1]+chr(ord(nodes.RUN_PREFIX[-1])+1))):
         try:
             other = json.loads(value)
         except (TypeError, ValueError):
             continue
-        if (isinstance(other, dict) and other.get('run_id') != found.get('run_id')
-                and other.get('node') == found.get('node') and other.get('project') == found.get('project')
-                and (other.get('created_at') or 0) >= (latest.get('created_at') or 0)):
+        if (not isinstance(other, dict) or other.get('node') != node or other.get('project') != project
+                or (own_run_id and other.get('run_id') == own_run_id)):
+            continue
+        if other.get('state') != 'ended':
+            return other
+        if ((other.get('run_id') == session['dispatch_run_id'] or (other.get('created_at') or 0) >= since)
+                and (latest is None or (other.get('created_at') or 0) >= (latest.get('created_at') or 0))):
             latest = other
-    return latest
+    return latest if latest is not None else {}
 
 
 def _descendant_checkouts(board, managed):

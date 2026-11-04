@@ -133,3 +133,29 @@ def test_a_restarted_node_reports_the_checkout_of_a_run_it_stopped(nenv):
     fresh.tick()
     r = nodes.run(nenv.board, run_id)
     assert r["state"] == "ended" and r["checkout"]["clean"] is False
+
+
+def test_the_successors_own_run_in_the_shared_checkout_does_not_block_its_takeover(nenv, monkeypatch):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, state="running", checkout=None)        # s2-grok: the successor, recovering the work
+    monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv), own_run_id="s2-grok") is None
+
+
+def drop_owner_record(env, run_id):
+    with env.board.conn:
+        env.board.conn.execute("DELETE FROM board_state WHERE key=?", (nodes.RUN_PREFIX + run_id,))
+
+
+def test_a_later_report_still_counts_once_the_owners_node_record_is_pruned(nenv, monkeypatch):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, checkout={"clean": True, "detail": ""})
+    drop_owner_record(nenv, run_id)
+    monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
+
+
+def test_with_no_report_left_at_all_it_cannot_be_inspected(nenv):
+    run_id = node_run(nenv)
+    drop_owner_record(nenv, run_id)
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) == 'Owner worktree cannot be inspected'
