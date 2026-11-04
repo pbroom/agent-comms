@@ -324,23 +324,9 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
     if not ended and not idle and not abandoned:
         return UNKNOWN_ACTIVITY
-    node_run = _node_run(board, session, own_run_id)
-    if node_run is not None:
-        # The owner ran on a node: its checkout is on that machine, not here. The node inspected it (checkout_blocker)
-        # when the latest run in it ended and reported the result; without that report it cannot be inspected.
-        checkout = node_run.get('checkout')
-        if node_run.get('state') != 'ended' or not isinstance(checkout, dict):
-            return 'Owner worktree cannot be inspected'
-        # The node inspects the checkout it launched the run in; an owner that registered another worktree did its
-        # work somewhere that report does not describe.
-        inspected = checkout.get('path')
-        if not isinstance(inspected, str) or os.path.normpath(inspected) not in (
-                path, os.path.normpath(session['worktree'] or session['project'])):
-            return 'Owner worktree cannot be inspected'
-        if checkout.get('clean') is True:
-            return None
-        detail = checkout.get('detail')
-        return detail if isinstance(detail, str) and detail else 'Owner worktree cannot be inspected'
+    on_node, blocker = node_checkout_blocker(board, session, own_run_id)
+    if on_node:
+        return blocker
     if not path or not os.path.isdir(path):
         return 'Owner worktree cannot be inspected'
     try:
@@ -354,16 +340,43 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     return checkout_blocker(path)
 
 
+UNFINISHED_CHANGES = 'Owner worktree contains unfinished changes; preserve it before takeover'
+
+
+def node_checkout_blocker(board, session, own_run_id=None):
+    """(False, None) when `session`'s dispatcher run did not go to a node. Otherwise (True, why its checkout, on that
+    machine and not here, is not safe to take over, or None). The node inspected it (checkout_blocker) when the latest
+    run in it ended and reported the result; without that report it cannot be inspected."""
+    node_run = _node_run(board, session, own_run_id)
+    if node_run is None:
+        return False, None
+    checkout = node_run.get('checkout')
+    if node_run.get('state') != 'ended' or not isinstance(checkout, dict):
+        return True, 'Owner worktree cannot be inspected'
+    # The node inspects the checkout it launched the run in; an owner that registered another worktree did its
+    # work somewhere that report does not describe.
+    inspected = checkout.get('path')
+    owned = session['worktree'] or session['project']
+    if not isinstance(inspected, str) or os.path.normpath(inspected) not in (os.path.realpath(owned),
+                                                                             os.path.normpath(owned)):
+        return True, 'Owner worktree cannot be inspected'
+    if checkout.get('clean') is True:
+        return True, None
+    detail = checkout.get('detail')
+    return True, (detail if isinstance(detail, str) and detail else 'Owner worktree cannot be inspected')
+
+
 def checkout_blocker(path):
-    """Why the checkout at `path` (on this machine) is not safe to take over, or None: unfinished changes or an
-    unfinished Git operation. A node runs this on its own checkout when a run ends (node.py) and reports it."""
+    """Why the checkout at `path` (on this machine) is not safe to take over, or None: an unfinished Git operation
+    (checked first, so UNFINISHED_CHANGES means there is none) or unfinished changes. A node runs this on its own
+    checkout when a run ends (node.py) and reports it."""
     try:
-        if _git(path,'status','--porcelain=v1','--untracked-files=all'):
-            return 'Owner worktree contains unfinished changes; preserve it before takeover'
         gitdir = _git(path,'rev-parse','--absolute-git-dir')
         if any(os.path.exists(os.path.join(gitdir,name)) for name in
                ('MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','index.lock')):
             return 'Owner worktree has an unfinished Git operation'
+        if _git(path,'status','--porcelain=v1','--untracked-files=all'):
+            return UNFINISHED_CHANGES
     except Conflict as exc:
         return str(exc)
     return None

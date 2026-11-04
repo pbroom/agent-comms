@@ -649,6 +649,10 @@ def _ownership_blocker(board, old, session_id, post, abandoned=False):
             continue
         if run.get('status') in ACTIVE and (run.get('agent') == old['agent'] or (isinstance(run.get('cwd'),str) and os.path.realpath(run['cwd']) == path)):
             return workstreams.OWNER_RUN_ACTIVE
+    on_node, blocker = workstreams.node_checkout_blocker(board, old, current['dispatch_run_id'])
+    if on_node:
+        # The checkout is on the node, which reported it; as below, changes block only an owner that went silent.
+        return None if blocker == workstreams.UNFINISHED_CHANGES and not abandoned else blocker
     try:
         expected = project_common or workstreams._git(project,'rev-parse','--path-format=absolute','--git-common-dir')
         if os.path.realpath(workstreams._git(path,'rev-parse','--path-format=absolute','--git-common-dir')) != os.path.realpath(expected):
