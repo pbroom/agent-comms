@@ -77,6 +77,7 @@ class Node:
         self.last_hello = float("-inf")
         self.last_contact = clock()
         self.unreported: list[str] = []   # runs recover() ended locally, to report once the hub answers
+        self.unreported_cwd: dict[str, str] = {}   # their checkouts, from the state file, inspected for that report
 
     # ------------------------------------------------------------ local state (survives a node restart)
 
@@ -93,7 +94,7 @@ class Node:
     def _save_state(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         data = {rid: {"pid": getattr(l.child, "pid", None),
-                      "proc_start": getattr(l, "proc_start", None)} for rid, l in self.running.items()}
+                      "proc_start": getattr(l, "proc_start", None), "cwd": l.cwd} for rid, l in self.running.items()}
         tmp = self._state_path().with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
         os.replace(tmp, self._state_path())
@@ -117,6 +118,8 @@ class Node:
         for rid in left:
             self._remove_browser_output(rid)
         self.unreported = list(left)
+        self.unreported_cwd = {rid: d["cwd"] for rid, d in left.items()
+                               if isinstance(d, dict) and isinstance(d.get("cwd"), str)}
         self._save_state()
         return list(left)
 
@@ -125,8 +128,10 @@ class Node:
         after a long outage) is dropped; network errors and 5xx are retried next pass. Never blocks the rest of tick."""
         for rid in list(self.unreported):
             try:
+                c = checkout_state(self.unreported_cwd.get(rid))
                 self._call("POST", f"/api/nodes/runs/{rid}", json={
-                    "state": "ended", "error": "node restarted while the run was going; its process was stopped"})
+                    "state": "ended", "error": "node restarted while the run was going; its process was stopped",
+                    **({"checkout": c} if c is not None else {})})
             except Exception as e:
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 if isinstance(status, int) and 400 <= status < 500:
@@ -339,7 +344,9 @@ class Node:
         for rid, local in list(self.running.items()):
             del self.running[rid]
             self._remove_browser_output(rid)
-            self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down")
+            c = checkout_state(local.cwd)
+            self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down",
+                         **({"checkout": c} if c is not None else {}))
         self._save_state()
 
 

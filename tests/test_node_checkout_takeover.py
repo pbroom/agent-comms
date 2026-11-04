@@ -100,3 +100,36 @@ def test_a_later_clean_run_still_allows_the_takeover(nenv, monkeypatch):
     later_run(nenv, run_id, checkout={"clean": True, "detail": ""})
     monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
+
+
+def started_run(env):
+    git_checkout(env.node_dir)
+    env.node.hello()
+    allow(env, agents=["grok"])
+    human_post(env, ["grok"])
+    env.d.tick()
+    env.node.tick()
+    [r] = runs(env)
+    return r["run_id"]
+
+
+def test_a_node_shutting_down_still_reports_the_checkout(nenv):
+    run_id = started_run(nenv)
+    nenv.node_spawner.children[0].code = -15
+    nenv.node.stop_all()
+    r = nodes.run(nenv.board, run_id)
+    assert r["state"] == "ended" and r["checkout"] == {"clean": True, "detail": ""}
+
+
+def test_a_restarted_node_reports_the_checkout_of_a_run_it_stopped(nenv):
+    from test_nodes import Clock, FakeSpawner
+    from agent_comms.node import Node
+    run_id = started_run(nenv)
+    open(f"{nenv.node_dir}/half-done.txt", "w").write("x")
+    fresh = Node(nenv.node.client, nenv.node.config, nenv.node.log_dir, spawner=FakeSpawner(), clock=Clock(nenv),
+                 probe=lambda p, start: "dead", start_of=lambda p: "s", signal_group=lambda p, s: None,
+                 sleep=lambda s: None)
+    assert fresh.recover() == [run_id]
+    fresh.tick()
+    r = nodes.run(nenv.board, run_id)
+    assert r["state"] == "ended" and r["checkout"]["clean"] is False
