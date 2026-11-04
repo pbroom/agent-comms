@@ -50,6 +50,20 @@ class _Local:
     grace: float
     terminated_at: float | None = None
     killed: bool = False
+    cwd: str | None = None   # the run's checkout, inspected when the run ends (checkout_state)
+
+
+def checkout_state(cwd: str | None) -> dict | None:
+    """What the hub needs to let a later run take over this run's work (workstreams._inactive): whether the
+    checkout is clean, inspected here because the hub cannot see this machine's disk."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    from . import workstreams
+    try:
+        blocker = workstreams.checkout_blocker(cwd)
+    except Exception as e:
+        blocker = f"checkout could not be inspected: {type(e).__name__}"
+    return {"clean": blocker is None, "detail": (blocker or "")[:300]}
 
 
 class Node:
@@ -271,7 +285,7 @@ class Node:
             self._report(rid, "ended", error=f"{type(e).__name__}: {e}"[:300])
             return
         local = _Local(rid, child, self.clock(), float(r.get("timeout_seconds") or 1800),
-                       float(r.get("kill_grace_seconds") or 10))
+                       float(r.get("kill_grace_seconds") or 10), cwd=cwd)
         try:
             local.proc_start = self.start_of(child.pid)
         except Exception:
@@ -304,7 +318,8 @@ class Node:
                 del self.running[rid]
                 self._save_state()
                 self._remove_browser_output(rid)
-                self._report(rid, "ended", exit_code=code)
+                self._report(rid, "ended", exit_code=code,
+                             **({"checkout": c} if (c := checkout_state(local.cwd)) is not None else {}))
             elif local.terminated_at is None and now - local.started >= local.timeout:
                 self._stop(local, "terminate")
             elif (local.terminated_at is not None and not local.killed

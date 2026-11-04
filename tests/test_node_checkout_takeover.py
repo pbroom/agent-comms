@@ -1,0 +1,73 @@
+"""A later run may take over work whose owner ran on a node: the hub cannot see the node's disk, so the node inspects
+its checkout when the run ends and reports it (workstreams.checkout_blocker), and the takeover check uses that."""
+
+import subprocess
+
+import pytest
+
+from agent_comms import nodes, workstreams
+from agent_comms.core import Invalid
+
+from test_dispatch import allow, human_post, runs
+from test_nodes import nenv  # noqa: F401  (fixture)
+
+
+def git_checkout(path):
+    subprocess.run(["git", "init", "-q", path], check=True)
+    subprocess.run(["git", "-C", path, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q",
+                    "--allow-empty", "-m", "init"], check=True)
+
+
+def node_run(env, dirty=False):
+    git_checkout(env.node_dir)
+    if dirty:
+        open(f"{env.node_dir}/half-done.txt", "w").write("x")
+    env.node.hello()
+    allow(env, agents=["grok"])
+    post = human_post(env, ["grok"])
+    env.d.tick()
+    env.node.tick()
+    env.node_spawner.children[0].code = 0
+    env.node.tick()
+    env.d.tick()
+    [r] = runs(env)
+    return r["run_id"]
+
+
+def owner(env, run_id, last_seen=0):
+    return {"id": 99, "worktree": env.node_dir, "project": env.node_dir, "agent": "grok",
+            "dispatch_run_id": run_id, "last_seen": last_seen}
+
+
+def managed(env):
+    return {"post_id": 1, "thread_id": env.tid}
+
+
+def test_the_node_reports_a_clean_checkout_and_the_takeover_may_proceed(nenv, tmp_path, monkeypatch):
+    run_id = node_run(nenv)
+    assert nodes.run(nenv.board, run_id)["checkout"] == {"clean": True, "detail": ""}
+    monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)   # the hub has no such directory
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
+
+
+def test_unfinished_changes_on_the_node_block_the_takeover_with_the_reason(nenv):
+    run_id = node_run(nenv, dirty=True)
+    assert nodes.run(nenv.board, run_id)["checkout"]["clean"] is False
+    assert "unfinished changes" in workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv))
+
+
+def test_without_the_nodes_report_it_still_cannot_be_inspected(nenv):
+    run_id = node_run(nenv)
+    r = nodes.run(nenv.board, run_id)
+    r.pop("checkout")
+    with nenv.board.conn:
+        nenv.board.conn.execute("UPDATE board_state SET value=? WHERE key=?",
+                                (__import__("json").dumps(r), nodes.RUN_PREFIX + run_id))
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) == 'Owner worktree cannot be inspected'
+
+
+def test_a_checkout_report_is_validated(nenv):
+    nenv.node.hello()
+    for bad in ({"clean": "yes"}, {"clean": True, "extra": 1}, {"clean": True, "detail": "x" * 301}):
+        with pytest.raises(Invalid):
+            nodes.report(nenv.board, nenv.p["laptop"], "s1-grok", "ended", checkout=bad)

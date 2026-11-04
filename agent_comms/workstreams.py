@@ -324,6 +324,17 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
     if not ended and not idle and not abandoned:
         return UNKNOWN_ACTIVITY
+    node_run = _node_run(board, session)
+    if node_run is not None:
+        # The owner ran on a node: its checkout is on that machine, not here. The node inspected it (checkout_blocker)
+        # when the run ended and reported the result; without that report it cannot be inspected.
+        checkout = node_run.get('checkout')
+        if node_run.get('state') != 'ended' or not isinstance(checkout, dict):
+            return 'Owner worktree cannot be inspected'
+        if checkout.get('clean') is True:
+            return None
+        detail = checkout.get('detail')
+        return detail if isinstance(detail, str) and detail else 'Owner worktree cannot be inspected'
     if not path or not os.path.isdir(path):
         return 'Owner worktree cannot be inspected'
     try:
@@ -332,6 +343,15 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
         expected = project_common_dir or _git(project,'rev-parse','--path-format=absolute','--git-common-dir')
         if os.path.realpath(common) != os.path.realpath(expected):
             return 'Owner worktree belongs to another repository'
+    except Conflict as exc:
+        return str(exc)
+    return checkout_blocker(path)
+
+
+def checkout_blocker(path):
+    """Why the checkout at `path` (on this machine) is not safe to take over, or None: unfinished changes or an
+    unfinished Git operation. A node runs this on its own checkout when a run ends (node.py) and reports it."""
+    try:
         if _git(path,'status','--porcelain=v1','--untracked-files=all'):
             return 'Owner worktree contains unfinished changes; preserve it before takeover'
         gitdir = _git(path,'rev-parse','--absolute-git-dir')
@@ -341,6 +361,23 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     except Conflict as exc:
         return str(exc)
     return None
+
+
+def _node_run(board, session):
+    """The node's record of the dispatcher run `session` registered under, when that run went to a node."""
+    if not session['dispatch_run_id']:
+        return None
+    record = board.conn.execute('SELECT value FROM board_state WHERE key=?',
+                                ('dispatch.run.'+session['dispatch_run_id'],)).fetchone()
+    try:
+        run = json.loads(record['value']) if record else None
+    except ValueError:
+        return None
+    if not isinstance(run, dict) or not run.get('node'):
+        return None
+    from . import nodes
+    found = nodes.run(board, session['dispatch_run_id'])
+    return found if isinstance(found, dict) else {}
 
 
 def _descendant_checkouts(board, managed):
