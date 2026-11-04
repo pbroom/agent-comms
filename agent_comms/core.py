@@ -1086,6 +1086,12 @@ class Board:
                         and project in (_norm_path(run["run_worktree"]), worktree)
                         and os.path.realpath(project) == os.path.realpath(run["run_worktree"])):
                     project, worktree = thread["project"], _norm_path(run["run_worktree"])
+                # A run on a node starts in that machine's checkout of the project ([dispatch.worktrees] there),
+                # which the hub cannot see; a worker that names it (or lets its cwd stand in) as its project still
+                # belongs to the thread's project, so it registers there with that checkout as its worktree.
+                elif (thread and run.get("node") and project != thread["project"]
+                        and worktree in (None, project)):
+                    project, worktree = thread["project"], project
                 if run.get("agent") != p.name or not live or not thread or thread["project"] != project:
                     raise Forbidden("dispatch run does not match this active agent and project")
                 if run.get('inbox_delivery'):
