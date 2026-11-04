@@ -442,3 +442,51 @@ def test_a_per_agent_daily_budget_across_threads(aenv):
     [note] = auto_posts(aenv)
     assert "daily automatic launch budget for codex (6 per 24 hours across all threads) is spent" in note["body"]
     assert aenv.spawner.calls == []
+
+
+def ran_on_node(env, session, project, checkout):
+    """`session` was a dispatcher run on node `laptop`: its checkout is on that machine, which reported on it."""
+    from agent_comms import nodes
+    now = env.clock()
+    run = {"run_id": "r-node", "agent": "codex", "status": "exited", "node": "laptop", "cwd": project,
+           "started_at": now - 10, "ended_at": now}
+    node_run = {"run_id": "r-node", "node": "laptop", "project": project, "state": "ended", "created_at": now - 10,
+                "checkout": checkout | {"path": project}}
+    with env.board.conn:
+        env.board.conn.execute("UPDATE sessions SET dispatch_run_id='r-node' WHERE id=?", (session,))
+        for key, value in (("dispatch.run.r-node", run), (nodes.RUN_PREFIX + "r-node", node_run)):
+            env.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)",
+                                   (key, json.dumps(value), "dispatcher", now))
+
+
+def hub_cannot_read(monkeypatch, project):
+    from agent_comms import workstreams
+    real = workstreams._git
+
+    def git(path, *args):
+        if str(path).startswith(project):
+            raise Conflict("not on this machine")
+        return real(path, *args)
+    monkeypatch.setattr(workstreams, "_git", git)
+
+
+def test_the_authorized_successor_on_the_same_node_uses_the_nodes_report(env, tmp_path, monkeypatch):
+    project, old, tid, task, ask = abandoned_request(env, tmp_path)
+    ran_on_node(env, old, project, {"clean": True, "detail": ""})
+    env.clock.advance(PAST_GRACE)
+    new = env.session("codex", project=project)
+    env.board.claim_task(env.p["codex"], new, task)              # the authorized successor in the same worktree
+    hub_cannot_read(monkeypatch, project)
+    out = recovery.transfer_ended_owner(env.board, env.p["codex"], new, ask["id"], "codex", version(env, ask))
+    assert out["assigned_session"] == new
+
+
+def test_the_authorized_successor_still_refuses_what_the_node_found_unfinished(env, tmp_path, monkeypatch):
+    project, old, tid, task, ask = abandoned_request(env, tmp_path)
+    ran_on_node(env, old, project, {"clean": False, "detail": "Owner worktree has an unfinished Git operation"})
+    env.clock.advance(PAST_GRACE)
+    new = env.session("codex", project=project)
+    env.board.claim_task(env.p["codex"], new, task)
+    hub_cannot_read(monkeypatch, project)
+    with pytest.raises(Conflict, match="unfinished Git operation"):
+        recovery.transfer_ended_owner(env.board, env.p["codex"], new, ask["id"], "codex", version(env, ask))

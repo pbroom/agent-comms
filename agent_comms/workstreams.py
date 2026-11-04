@@ -324,6 +324,9 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
     idle = bool(activity and activity['state']=='idle' and max(now-90,minimum) <= activity['recorded_at'] <= now)
     if not ended and not idle and not abandoned:
         return UNKNOWN_ACTIVITY
+    on_node, blocker = node_checkout_blocker(board, session, own_run_id)
+    if on_node:
+        return blocker
     if not path or not os.path.isdir(path):
         return 'Owner worktree cannot be inspected'
     try:
@@ -332,15 +335,106 @@ def _inactive(board, session, managed, abandoned=False, own_run_id=None, success
         expected = project_common_dir or _git(project,'rev-parse','--path-format=absolute','--git-common-dir')
         if os.path.realpath(common) != os.path.realpath(expected):
             return 'Owner worktree belongs to another repository'
-        if _git(path,'status','--porcelain=v1','--untracked-files=all'):
-            return 'Owner worktree contains unfinished changes; preserve it before takeover'
+    except Conflict as exc:
+        return str(exc)
+    return checkout_blocker(path)
+
+
+UNFINISHED_CHANGES = 'Owner worktree contains unfinished changes; preserve it before takeover'
+
+
+def node_checkout_blocker(board, session, own_run_id=None):
+    """(False, None) when `session`'s dispatcher run did not go to a node. Otherwise (True, why its checkout, on that
+    machine and not here, is not safe to take over, or None). The node inspected it (checkout_blocker) when the latest
+    run in it ended and reported the result; without that report it cannot be inspected."""
+    node_run = _node_run(board, session, own_run_id)
+    if node_run is None:
+        return False, None
+    checkout = node_run.get('checkout')
+    if node_run.get('state') != 'ended' or not isinstance(checkout, dict):
+        return True, 'Owner worktree cannot be inspected'
+    # The node inspects the checkout it launched the run in; an owner that registered another worktree did its
+    # work somewhere that report does not describe.
+    inspected = checkout.get('path')
+    owned = session['worktree'] or session['project']
+    if not isinstance(inspected, str) or os.path.normpath(inspected) not in (os.path.realpath(owned),
+                                                                             os.path.normpath(owned)):
+        return True, 'Owner worktree cannot be inspected'
+    if checkout.get('clean') is True:
+        return True, None
+    detail = checkout.get('detail')
+    return True, (detail if isinstance(detail, str) and detail else 'Owner worktree cannot be inspected')
+
+
+def checkout_blocker(path):
+    """Why the checkout at `path` (on this machine) is not safe to take over, or None: an unfinished Git operation
+    (checked first, so UNFINISHED_CHANGES means there is none) or unfinished changes. A node runs this on its own
+    checkout when a run ends (node.py) and reports it."""
+    try:
         gitdir = _git(path,'rev-parse','--absolute-git-dir')
         if any(os.path.exists(os.path.join(gitdir,name)) for name in
                ('MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','index.lock')):
             return 'Owner worktree has an unfinished Git operation'
+        if _git(path,'status','--porcelain=v1','--untracked-files=all'):
+            return UNFINISHED_CHANGES
     except Conflict as exc:
         return str(exc)
     return None
+
+
+def _node_run(board, session, own_run_id=None):
+    """The node's latest report on the checkout `session`'s dispatcher run used, when that run went to a node: None
+    when it did not, {} when there is no report. The node gives every run of a project the same checkout
+    (Node._start, checkout_for), and two projects may map to one checkout ([dispatch.worktrees]), so a run there
+    since the owner's may have changed it and its report is the current one. Runs count as there when they share
+    the project or reported inspecting the owner's worktree. A run still going on that node (other than
+    `own_run_id`, the successor's own) means nothing describes the checkout now; one of another project counts
+    too, as only its end report says which checkout it used.
+    The owner's own node record may be gone (nodes.hello prunes ended records after a day); the dispatcher's record
+    still names the node and project."""
+    if not session['dispatch_run_id']:
+        return None
+    record = board.conn.execute('SELECT value FROM board_state WHERE key=?',
+                                ('dispatch.run.'+session['dispatch_run_id'],)).fetchone()
+    try:
+        run = json.loads(record['value']) if record else None
+    except ValueError:
+        return None
+    if not isinstance(run, dict) or not run.get('node'):
+        return None
+    from . import nodes
+    owner = nodes.run(board, session['dispatch_run_id'])
+    owner = owner if isinstance(owner, dict) else {}
+    node, project = run['node'], owner.get('project') or run.get('cwd')
+    since = owner.get('created_at') or run.get('started_at') or 0
+    owned = session['worktree'] or session['project']
+    paths = {os.path.realpath(owned), os.path.normpath(owned)}
+    latest = None
+    for (value,) in board.conn.execute('SELECT value FROM board_state WHERE key >= ? AND key < ?',
+                                       (nodes.RUN_PREFIX, nodes.RUN_PREFIX[:-1]+chr(ord(nodes.RUN_PREFIX[-1])+1))):
+        try:
+            other = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if (not isinstance(other, dict) or other.get('node') != node
+                or (own_run_id and other.get('run_id') == own_run_id)):
+            continue
+        if other.get('state') != 'ended':
+            return other
+        inspected = other.get('checkout', {}).get('path') if isinstance(other.get('checkout'), dict) else None
+        if other.get('project') != project and not (isinstance(inspected, str)
+                                                    and os.path.normpath(inspected) in paths):
+            continue
+        if ((other.get('run_id') == session['dispatch_run_id'] or _reported(other) >= since)
+                and (latest is None or _reported(other) >= _reported(latest))):
+            latest = other
+    return latest if latest is not None else {}
+
+
+def _reported(node_run):
+    """When the node inspected this ended run's checkout: its end report (runs of aliased projects can overlap, so
+    the one assigned last need not be the one that finished last)."""
+    return node_run.get('node_reported_at') or node_run.get('updated_at') or node_run.get('created_at') or 0
 
 
 def _descendant_checkouts(board, managed):
