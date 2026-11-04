@@ -425,10 +425,16 @@ def _node_run(board, session, own_run_id=None):
         if other.get('project') != project and not (isinstance(inspected, str)
                                                     and os.path.normpath(inspected) in paths):
             continue
-        if ((other.get('run_id') == session['dispatch_run_id'] or (other.get('created_at') or 0) >= since)
-                and (latest is None or (other.get('created_at') or 0) >= (latest.get('created_at') or 0))):
+        if ((other.get('run_id') == session['dispatch_run_id'] or _reported(other) >= since)
+                and (latest is None or _reported(other) >= _reported(latest))):
             latest = other
     return latest if latest is not None else {}
+
+
+def _reported(node_run):
+    """When the node inspected this ended run's checkout: its end report (runs of aliased projects can overlap, so
+    the one assigned last need not be the one that finished last)."""
+    return node_run.get('node_reported_at') or node_run.get('updated_at') or node_run.get('created_at') or 0
 
 
 def _descendant_checkouts(board, managed):

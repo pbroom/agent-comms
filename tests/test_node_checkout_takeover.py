@@ -78,7 +78,9 @@ def test_a_checkout_report_is_validated(nenv):
 
 def later_run(env, run_id, **fields):
     """Another run of the same project on the same node, after the owner's: it shares the checkout."""
-    r = nodes.run(env.board, run_id) | {"run_id": "s2-grok", "created_at": nodes.run(env.board, run_id)["created_at"] + 5}
+    first = nodes.run(env.board, run_id)
+    r = first | {"run_id": "s2-grok", "created_at": first["created_at"] + 5,
+                 "node_reported_at": first["node_reported_at"] + 5}
     r.update(fields)
     with env.board.conn:
         env.board.conn.execute("INSERT INTO board_state(key,value,updated_by,updated_at) VALUES(?,?,?,?)",
@@ -187,3 +189,12 @@ def test_a_later_run_of_another_checkout_does_not_count(nenv, monkeypatch):
         "path": "/elsewhere/other"})
     monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
     assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
+
+
+def test_the_report_made_last_wins_even_from_the_run_assigned_first(nenv):
+    run_id = node_run(nenv)
+    # s2 was assigned before the owner's run (an aliased project, overlapping) but ended after it, leaving changes.
+    later_run(nenv, run_id, project="/elsewhere/alias", created_at=0, checkout={
+        "clean": False, "detail": "Owner worktree contains unfinished changes; preserve it before takeover",
+        "path": os.path.realpath(nenv.node_dir)})
+    assert "unfinished changes" in workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv))
