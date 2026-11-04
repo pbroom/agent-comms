@@ -385,8 +385,11 @@ def checkout_blocker(path):
 def _node_run(board, session, own_run_id=None):
     """The node's latest report on the checkout `session`'s dispatcher run used, when that run went to a node: None
     when it did not, {} when there is no report. The node gives every run of a project the same checkout
-    (Node._start, checkout_for), so a run there since the owner's may have changed it and its report is the current
-    one. A run still going there (other than `own_run_id`, the successor's own) means nothing describes it now.
+    (Node._start, checkout_for), and two projects may map to one checkout ([dispatch.worktrees]), so a run there
+    since the owner's may have changed it and its report is the current one. Runs count as there when they share
+    the project or reported inspecting the owner's worktree. A run still going on that node (other than
+    `own_run_id`, the successor's own) means nothing describes the checkout now; one of another project counts
+    too, as only its end report says which checkout it used.
     The owner's own node record may be gone (nodes.hello prunes ended records after a day); the dispatcher's record
     still names the node and project."""
     if not session['dispatch_run_id']:
@@ -404,6 +407,8 @@ def _node_run(board, session, own_run_id=None):
     owner = owner if isinstance(owner, dict) else {}
     node, project = run['node'], owner.get('project') or run.get('cwd')
     since = owner.get('created_at') or run.get('started_at') or 0
+    owned = session['worktree'] or session['project']
+    paths = {os.path.realpath(owned), os.path.normpath(owned)}
     latest = None
     for (value,) in board.conn.execute('SELECT value FROM board_state WHERE key >= ? AND key < ?',
                                        (nodes.RUN_PREFIX, nodes.RUN_PREFIX[:-1]+chr(ord(nodes.RUN_PREFIX[-1])+1))):
@@ -411,11 +416,15 @@ def _node_run(board, session, own_run_id=None):
             other = json.loads(value)
         except (TypeError, ValueError):
             continue
-        if (not isinstance(other, dict) or other.get('node') != node or other.get('project') != project
+        if (not isinstance(other, dict) or other.get('node') != node
                 or (own_run_id and other.get('run_id') == own_run_id)):
             continue
         if other.get('state') != 'ended':
             return other
+        inspected = other.get('checkout', {}).get('path') if isinstance(other.get('checkout'), dict) else None
+        if other.get('project') != project and not (isinstance(inspected, str)
+                                                    and os.path.normpath(inspected) in paths):
+            continue
         if ((other.get('run_id') == session['dispatch_run_id'] or (other.get('created_at') or 0) >= since)
                 and (latest is None or (other.get('created_at') or 0) >= (latest.get('created_at') or 0))):
             latest = other

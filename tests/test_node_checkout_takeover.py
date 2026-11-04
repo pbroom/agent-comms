@@ -170,3 +170,20 @@ def test_a_clean_report_for_another_checkout_does_not_cover_the_owners_worktree(
     elsewhere = owner(nenv, run_id) | {"worktree": nenv.node_dir + "-feature"}   # the owner worked in its own worktree
     monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
     assert workstreams._inactive(nenv.board, elsewhere, managed(nenv)) == 'Owner worktree cannot be inspected'
+
+
+def test_a_later_run_under_another_project_in_the_same_checkout_counts(nenv):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, project="/elsewhere/alias", checkout={
+        "clean": False, "detail": "Owner worktree contains unfinished changes; preserve it before takeover",
+        "path": os.path.realpath(nenv.node_dir)})
+    assert "unfinished changes" in workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv))
+
+
+def test_a_later_run_of_another_checkout_does_not_count(nenv, monkeypatch):
+    run_id = node_run(nenv)
+    later_run(nenv, run_id, project="/elsewhere/other", checkout={
+        "clean": False, "detail": "Owner worktree contains unfinished changes; preserve it before takeover",
+        "path": "/elsewhere/other"})
+    monkeypatch.setattr(workstreams.os.path, "isdir", lambda p: False)
+    assert workstreams._inactive(nenv.board, owner(nenv, run_id), managed(nenv)) is None
