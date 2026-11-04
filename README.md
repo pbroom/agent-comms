@@ -1178,12 +1178,17 @@ user_data_dir = "/Users/you/Library/Application Support/Agent Comms/browser-prof
 Such a run gets a second Playwright MCP server, `signed_in_browser`, started headless from
 `[dispatch.headless_browser]` (its `command` is required) with `--user-data-dir` set to that profile, plus
 `browser_file_upload` and an output directory it may write, removed with the run. Sign in to the site once in the
-profile, then quit Chrome so the run can open it:
+profile through Playwright itself, then close the window so the run can open it. Use the Playwright version that
+`@playwright/mcp` in `[dispatch.headless_browser]` bundles, and the same `browser` channel:
 
 ```sh
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+npx -y playwright@<that version> open --channel=chrome \
   --user-data-dir="$HOME/Library/Application Support/Agent Comms/browser-profiles/tenant" https://tenant.sharepoint.com
 ```
+
+Answer yes to any "stay signed in" prompt. Signing in with plain Chrome does not work on macOS: Chrome encrypts the
+cookies with the login keychain, and Playwright's Chrome runs with a mock keychain, so the runs cannot read them and
+land on the sign-in page. A run that lands there reports it and blocks; sign in again the same way.
 
 A Codex config that already defines a server named `signed_in_browser` makes the run refuse to start. A profile
 opens in one browser at a time, so signed-in runs on one machine take turns.
