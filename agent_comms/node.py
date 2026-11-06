@@ -171,7 +171,8 @@ class Node:
         headless = self.headless_runners()
         if headless:    # only then: a hub older than this field refuses any hello that carries it
             body["headless_browser"] = headless
-        held = {k: v for k, v in self.config.runner_access.items() if k in self.config.runners}
+        held = {k: v for k in self.config.runner_access if k in self.config.runners
+                and (v := self.config.access_for(k, k))}   # never a headless-profile-only sign-in (access_for)
         if held:        # only then: a hub older than this field refuses any hello that carries it
             body["access"] = held
         out = self._call("POST", "/api/nodes/hello", json=body)
@@ -246,8 +247,9 @@ class Node:
                 held = set(self.config.access_for(agent, r.get("runtime")))
                 if (not isinstance(signed_in, list) or not signed_in
                         or any(access.browser(o) not in held for o in signed_in)):
-                    raise LookupError("this machine's runner does not declare a signed-in browser for the bound "
-                                      "origin ([dispatch.runner_access])")
+                    raise LookupError("needs desktop pickup: this machine's runner holds no signed-in desktop browser "
+                                      "for the bound origin ([dispatch.runner_access]; a headless "
+                                      "[dispatch.browser_profiles] profile does not count)")
             profile = signed_in_profile(self.config, agent, r.get("runtime"), signed_in) if signed_in else None
             out_dir = self.log_dir / f"{rid}-browser"
             # The signed-in browser's output directory is writable too, so a file to upload can be copied in.
