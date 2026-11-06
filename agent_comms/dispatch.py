@@ -589,6 +589,14 @@ def signed_in_profile(config: "DispatchConfig", agent: str, runtime: str | None,
     return dirs.pop()
 
 
+def needs_desktop_pickup(origin: str, agent: str) -> str:
+    """Why a desktop-bound browser request is held at dispatch instead of launched."""
+    return (f'needs desktop pickup: browser work for {origin} binds execution_context "desktop", and no runner for '
+            f'{agent} or another agent holds a signed-in desktop browser for it ([dispatch.runner_access]). A '
+            '[dispatch.browser_profiles] profile does not count: a dispatched run drives it headless, not the '
+            'signed-in desktop browser. Pick it up from a signed-in desktop session (e.g. the Codex desktop app).')
+
+
 def _forbidden_env(name: str) -> bool:
     u = name.upper()
     return "TOKEN" in u or u.startswith("AGENT_COMMS_") or u == "BOARD_TOKEN"
@@ -997,9 +1005,17 @@ class DispatchConfig:
         return list(roots) if roots and self.writable_roots_kind(template, project) else []
 
     def access_for(self, agent: str, runtime: str | None) -> list[str]:
-        """The access this agent's runner (by name, else runtime) holds on this machine ([dispatch.runner_access])."""
+        """The access this agent's runner (by name, else runtime) holds on this machine ([dispatch.runner_access]).
+
+        A signed-in browser that would come only from a [dispatch.browser_profiles] profile does not count: the run
+        would drive that profile through a headless Playwright server, which is not the human's signed-in desktop
+        browser (execution_context "desktop"), so it can only land on a sign-in page. That work needs desktop pickup.
+        """
         key = self.runner_key(agent, runtime)
-        return list(self.runner_access.get(key, [])) if key is not None else []
+        if key is None:
+            return []
+        return [a for a in self.runner_access.get(key, []) if not (
+            a.startswith(access.BROWSER) and signed_in_profile(self, agent, runtime, [a[len(access.BROWSER):]]))]
 
     def headless_browser_for(self, agent: str, runtime: str | None) -> bool:
         """Whether this agent's runner (by name, else runtime) is a Codex runner given the headless browser."""
@@ -2162,9 +2178,7 @@ class Dispatcher:
                         project = self.board._thread_row(post['thread_id'])['project']
                         if self._signed_in_route(agent, project, [req['origin']], room=False) is not None:
                             continue   # a runner here or on a node holds a signed-in browser for it
-                        return (f'Browser work needs a signed-in desktop browser for {req["origin"]}, and no machine declares '
-                                f'one for {agent} ([dispatch.runner_access]) or for another agent. Configure a '
-                                'runner that holds that sign-in, or hand it to a signed-in desktop session.')
+                        return needs_desktop_pickup(req["origin"], agent)
                     if not headless:
                         return ('Browser-bound work needs a verified existing browser session; a generic CLI cannot '
                                 'inherit its probe (a Codex runner can be given a scoped headless browser with '
@@ -2185,8 +2199,7 @@ class Dispatcher:
             if req['execution_context'] == 'desktop':
                 project = self.board._thread_row(thread_id)['project']
                 if self._signed_in_route(agent, project, [req['origin']], room=False) is None:
-                    return (f'Browser work needs a signed-in desktop browser for {req["origin"]}; no runner for '
-                            f'{agent} declares one ([dispatch.runner_access]). Route to a capable authorized session.')
+                    return needs_desktop_pickup(req["origin"], agent)
         desktop = sorted({req['origin'] for req in required if req['execution_context'] == 'desktop'})
         if desktop and self._signed_in_route(agent, self.board._thread_row(thread_id)['project'], desktop,
                                              room=False) == "local" \
