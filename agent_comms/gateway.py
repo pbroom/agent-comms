@@ -47,6 +47,7 @@ HEADERS = {"accept", "content-type", "authorization", "mcp-session-id", "mcp-pro
            "x-board-session"}
 RESPONSE_HEADERS = {"content-type", "mcp-session-id", "mcp-protocol-version"}
 _ID = r"[1-9][0-9]*"
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # (method, path regex) an agent may call over HTTP. Human-only routes (admin, finalize, unseal, resolve, unstick,
 # grants admin, login, dashboard state) are deliberately absent.
 API_ROUTES = [(m, re.compile(p)) for m, p in (
@@ -64,6 +65,8 @@ API_ROUTES = [(m, re.compile(p)) for m, p in (
     ("POST", rf"/api/tasks/{_ID}/(claim|renew|release|transition)"),
     ("GET", r"/api/grants"), ("GET", r"/api/brief"),
     ("POST", r"/api/nodes/hello"), ("GET", r"/api/nodes/assignments"), ("POST", r"/api/nodes/runs/[A-Za-z0-9_-][A-Za-z0-9_.:-]*"),
+    # Hosted sessions, the node's side only (hosted.py). /api/hosted-sessions is the human's and never passes.
+    ("GET", r"/api/nodes/sessions"), ("POST", rf"/api/nodes/sessions/{_UUID}"),
 )]
 IDENTITY_TTL = 30.0   # seconds a verified token stays verified before /api/whoami is asked again
 REFUSED_TTL = 10.0    # seconds a refused token is refused without asking upstream again

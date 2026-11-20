@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import Event, validate_model, validate_session_id
+from . import Event, cap_reply, validate_model, validate_session_id
 
 # Flags a hosted session sets itself, or that would start, fork or hide a conversation other than the hub's.
 OWN_FLAGS = frozenset((
@@ -26,9 +26,29 @@ STREAM_FLAGS = ("--input-format", "stream-json", "--output-format", "stream-json
 NO_PROMPTS = ("--permission-prompts", "none")
 TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 MAX_DENIALS = 50
-# The facts of a `result` the host passes on: small scalars only, never the reply text.
+# The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
+# (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
                "api_error_status")
+
+
+BYPASS_REFUSED = ("a Claude runner that bypasses permission checks (--dangerously-skip-permissions or --permission-mode "
+                  "bypassPermissions) cannot be hosted as a session")
+
+
+def bypasses_permissions(template: list[str]) -> bool:
+    """The runner turns Claude's permission checks off, or lets a session turn them off: a hosted session takes
+    turns from messages for as long as it lives, so it is never started that way. Every other permission mode is the
+    machine owner's choice, as for a dispatched run."""
+    for i, arg in enumerate(template):
+        flag, eq, value = arg.partition("=")
+        if flag in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
+            return True
+        if flag == "--permission-mode":
+            mode = value if eq else (template[i + 1] if i + 1 < len(template) else "")
+            if mode.lower() == "bypasspermissions":
+                return True
+    return False
 
 
 def tool_names(denials) -> tuple[str, ...]:
@@ -69,6 +89,8 @@ class ClaudeSession:
         model = validate_model(model)
         if not template or os.path.basename(template[0]) != "claude":
             raise ValueError("not a Claude runner")
+        if bypasses_permissions(template):
+            raise ValueError(BYPASS_REFUSED)
         out, i = [], 0
         while i < len(template):
             arg = template[i]
@@ -123,7 +145,8 @@ class ClaudeSession:
             return events + [Event("turn_started")], []
         if kind == "result":
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
-            return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")))], []
+            return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),
+                          text=cap_reply(ev.get("result")))], []
         if kind == "control_request":
             request = ev.get("request")
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":

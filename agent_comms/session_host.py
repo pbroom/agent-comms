@@ -69,7 +69,8 @@ class HostEvent:
     - `turn_started`: the provider began the turn.
     - `turn_ended`: the turn is over. `ok` False: the provider reported it failed, or the host gave up on it
       (`detail`: timed out, the process exited, the session ended). `delivered` False: the message never reached the
-      process. `denials`: the tools the provider refused in it, names only.
+      process. `denials`: the tools the provider refused in it, names only. `text`: the reply, capped
+      (providers.cap_reply); for the human who sent the message only.
     - `approval_requested`: the provider is waiting for a tool to be allowed (`denials` names it).
     - `ended`: the session is over (`detail`); `undelivered` lists the queued messages that were never written."""
     session_id: str
@@ -81,6 +82,7 @@ class HostEvent:
     meta: dict[str, Any] = field(default_factory=dict)
     detail: str = ""
     undelivered: tuple[str, ...] = ()
+    text: str = ""
 
 
 @dataclass
@@ -244,7 +246,7 @@ class SessionHost:
         if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
             raise FileNotFoundError(f"this machine has no run directory for project {project!r}")
         if runner_preflight.scoped(template, project, self.config.claude_tool_projects):
-            template = runner_preflight.scoped_template(template)
+            template = runner_preflight.with_denied_tool_instruction(runner_preflight.scoped_template(template))
         template = with_writable_roots(template, self.config.extra_roots(template, project))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
                     thread_id=int(thread_id), resume=bool(resume))
@@ -363,7 +365,7 @@ class SessionHost:
             s.denials, s.waiting = ev.denials, bool(ev.denials)
             out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=bool(ev.ok) and not timed_out,
                                  denials=ev.denials, meta=dict(ev.meta),
-                                 detail=self._timeout_detail() if timed_out else ev.detail))
+                                 detail=self._timeout_detail() if timed_out else ev.detail, text=ev.text))
             self._save_state()
         elif ev.kind == "approval_requested":
             s.denials, s.waiting = ev.denials, True
@@ -512,6 +514,31 @@ class SessionHost:
         if not s.outbuf and s.writing is not None:
             s.in_flight, s.writing = s.writing, None
             out.append(HostEvent(s.session_id, "delivered", s.in_flight.id))
+
+    # ------------------------------------------------------------ stopping a process, keeping the session
+
+    def park(self, session_id: str) -> bool:
+        """Stop an idle session's process (an idle limit, or room for another session). The session stays: its next
+        message starts a process that resumes it. False, and nothing is touched, when it has a turn or a message
+        waiting, no process, or one already going down: nothing running is interrupted."""
+        s = self._session(session_id)
+        if s.child is None or s.ended or s.busy or s.inbox or s.stopping_since is not None:
+            return False
+        self._stop(s, self.clock())
+        return True
+
+    def stop_turns(self, detail: str) -> list[HostEvent]:
+        """Give up on every turn in flight: each is reported failed and its process is stopped (the caller lost the
+        hub, so nobody could see or stop the turn). Idle processes and the sessions themselves stay."""
+        out: list[HostEvent] = []
+        now = self.clock()
+        for s in self.sessions.values():
+            if s.child is not None and s.busy and not s.ended:
+                self._fail(s, detail[:300], out)
+                self._stop(s, now)
+        if out:
+            self._save_state()
+        return out
 
     # ------------------------------------------------------------ shutdown
 

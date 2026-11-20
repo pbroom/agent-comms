@@ -28,13 +28,18 @@ def _board() -> Board:
     return Board(Settings.load())
 
 
-def _human(board: Board):
+def _human_token() -> str:
     token = os.environ.get("BOARD_TOKEN")
     f = human_token_file()
     if not token and f.exists():
         token = f.read_text().strip()
     if not token:
         raise SystemExit(f"no human token: set BOARD_TOKEN or run `board init` (writes {f})")
+    return token
+
+
+def _human(board: Board):
+    token = _human_token()
     p = board.authenticate(token)
     if not p.is_human:
         raise SystemExit(f"token belongs to agent {p.name!r}, not the human")
@@ -236,6 +241,36 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--requeue", action="store_true",
                    help="maintenance restart: requeue the stopped runs' unsettled requests once (not while paused; "
                         "needs tasks.auto_recover_stalled_work) so the next dispatcher relaunches them; prints their ids")
+
+    s = sub.add_parser("session", help="hosted sessions: a long-lived agent conversation on a node that takes your "
+                                       "messages as turns (needs `board serve` running; human only)")
+    ssub = s.add_subparsers(dest="session_cmd", required=True)
+
+    def raw(x):     # `board session list --json` as well as `board --json session list`
+        x.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print raw JSON")
+
+    x = ssub.add_parser("start", help="start a session of an agent in a project, with its first message")
+    x.add_argument("project", help="the project's path as the board knows it (a relative path is made absolute)")
+    x.add_argument("message", help="the first message; - reads it from stdin")
+    x.add_argument("--agent", metavar="NAME", help="default: the one agent with a Claude runtime, if there is only one")
+    x.add_argument("--model", metavar="M", help="model for the session, e.g. haiku (default: the runner's own)")
+    x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
+    raw(x)
+    x = ssub.add_parser("send", help="send a message: the next turn if the session is idle, queued behind the "
+                                     "turns ahead of it otherwise")
+    x.add_argument("session_id")
+    x.add_argument("message", help="the message; - reads it from stdin")
+    x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
+    raw(x)
+    x = ssub.add_parser("show", help="one session: state, queue, last result and last reply")
+    x.add_argument("session_id")
+    raw(x)
+    x = ssub.add_parser("list", help="hosted sessions")
+    x.add_argument("--all", action="store_true", help="include ended sessions")
+    raw(x)
+    x = ssub.add_parser("close", help="end a session: its process is stopped, queued messages are dropped")
+    x.add_argument("session_id")
+    raw(x)
 
     a = ap.parse_args(argv)
     if a.cmd == 'dispatch' and a.dispatch_cmd == 'allow':
@@ -643,6 +678,9 @@ def _run(a, out) -> None:
             print(f"{x.name:16} {x.runtime:14} {'HUMAN' if x.is_human else ''}")
         return
 
+    if a.cmd == "session":
+        return _session_cmd(a, out, settings, _human_token())
+
     board = Board(settings)
     p, token = _human(board)
     if a.cmd == "read":
@@ -712,6 +750,116 @@ def _run(a, out) -> None:
         from . import weblogin
         n = weblogin.revoke_all(board, p)
         out({"revoked": n}, f"signed out {n} browser(s); run `board dashboard` to sign in again")
+
+
+def _api(settings: Settings, token: str, method: str, path: str, body: dict | None = None, timeout: float = 15.0):
+    """One call to the running board server as the human. Always the local port: the gateway refuses human tokens by
+    design. No proxy is ever used for it."""
+    import urllib.error
+    import urllib.request
+
+    host = f"[{settings.host}]" if ":" in settings.host else settings.host
+    base = f"http://{host}:{settings.port}"
+    req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(), method=method,
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        code, msg = e.code, e.reason
+        try:
+            d = json.loads(e.read().decode())
+            code, msg = d.get("error", code), d.get("message") or d.get("detail") or msg
+        except (ValueError, AttributeError):
+            pass
+        raise SystemExit(f"error ({code}): {msg}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise SystemExit(f"the board server is not running at {base} ({getattr(e, 'reason', e)}). Start it with "
+                         "`uv run board serve` in another terminal, then try again.") from None
+    except ValueError:
+        raise SystemExit(f"unexpected reply from {base}{path}; is another program using that port?") from None
+
+
+def _fmt_hosted(s: dict) -> str:
+    where = "" if s["node_live"] or s["state"] == "ended" else " (not connected)"
+    return (f"{s['session_id']} [{s['state']}{', closing' if s.get('stop') and s['state'] != 'ended' else ''}] "
+            f"{s['agent']} in {s['project']} on node {s['node']}{where}, turns {s['turns']}, queued {s['queued']}"
+            + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else ""))
+
+
+def _fmt_hosted_detail(s: dict) -> str:
+    from .core import iso
+
+    lines = ["session " + _fmt_hosted(s),
+             f"  created {iso(s['created_at'])}, updated {iso(s['updated_at'])}"
+             + (f", model {s['model']}" if s.get("model") else "") + (f", pid {s['pid']}" if s.get("pid") else "")]
+    if s.get("error"):
+        lines.append(f"  ended: {s['error']}")
+    last = s.get("last_result")
+    if last:
+        lines.append(f"  last result: message {last['message']} {'ok' if last['ok'] else 'FAILED'}"
+                     + (f": {last['detail']}" if last.get("detail") else "")
+                     + (f" (tools denied: {', '.join(last['denials'])})" if last.get("denials") else ""))
+    for m in s.get("messages", []):
+        lines.append(f"  message {m['n']} [{m['state']}]" + (f" {m['detail']}" if m.get("detail") else ""))
+    lines.append(f"  transcript: {s['transcript']}")
+    if s.get("reply") is not None:
+        lines += [f"reply to message {s['reply_for']}:", s["reply"]]
+    return "\n".join(lines)
+
+
+def _session_cmd(a, out, settings: Settings, token: str) -> None:
+    """`board session ...`: over HTTP to the running board server, so the node's waiting fetch sees a new message at
+    once. --wait blocks until that message's turn is over, prints the reply and exits 1 if the turn failed."""
+    from urllib.parse import quote
+
+    if a.session_cmd == "list":
+        r = _api(settings, token, "GET", "/api/hosted-sessions" + ("?all=true" if a.all else ""))
+        return out(r, "\n".join(_fmt_hosted(s) for s in r["sessions"]) or "(no hosted sessions)")
+    sid = quote(a.session_id, safe="") if a.session_cmd != "start" else ""
+    if a.session_cmd == "show":
+        r = _api(settings, token, "GET", f"/api/hosted-sessions/{sid}")
+        return out(r, _fmt_hosted_detail(r))
+    if a.session_cmd == "close":
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/close")
+        return out(r, f"session {r['session_id']} " + ("ended" if r["state"] == "ended" else
+                                                         f"is closing (node {r['node']} stops it and confirms)"))
+    text = sys.stdin.read() if a.message == "-" else a.message
+    if a.session_cmd == "start":
+        body = {"project": os.path.abspath(os.path.expanduser(a.project)), "message": text}
+        body |= {k: v for k, v in (("agent", a.agent), ("model", a.model)) if v}
+        r = _api(settings, token, "POST", "/api/hosted-sessions", body)
+    else:
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", {"message": text})
+    s, m = r["session"], r["message"]
+    info = f"session {_fmt_hosted(s)}; message {m['n']} queued"
+    if not s["node_live"]:
+        info += f"\nnote: node {s['node']} is not connected; the message waits until it is"
+    if not a.wait:
+        return out(r, info)
+    if not a.json:
+        print(info, file=sys.stderr)
+    path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{m['n']}?wait=25"
+    while True:
+        r = _api(settings, token, "GET", path, timeout=60)
+        if r["message"]["state"] in ("done", "failed"):
+            break
+    s, m = r["session"], r["message"]
+    reply = s["reply"] if s.get("reply_for") == m["n"] else None   # the hub keeps only the last reply
+    failed = m["state"] != "done"
+    if a.json:
+        print(json.dumps({"session": s, "message": m, "reply": reply}, indent=2))
+    else:
+        if failed:
+            print(f"turn failed: {m['detail'] or 'no reason given'}", file=sys.stderr)
+        elif m.get("denials"):
+            print(f"note: tools denied in this turn: {', '.join(m['denials'])}", file=sys.stderr)
+        if reply is not None:
+            print(reply)
+        elif not failed:
+            print(f"(a later turn's reply replaced this one; the transcript has it: {s['transcript']})")
+    if failed:
+        raise SystemExit(1)
 
 
 def _login_link(settings: Settings, token: str) -> str:

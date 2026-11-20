@@ -28,8 +28,9 @@ import httpx
 from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
-                       signed_in_browser_overrides, signed_in_profile, spawn_process, stop_verified,
+                       signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
                        with_headless_browser, with_writable_roots)
+from .node_sessions import SessionRunner
 
 log = logging.getLogger("agent_comms.node")
 
@@ -70,9 +71,18 @@ class Node:
     def __init__(self, client: httpx.Client, config: DispatchConfig, log_dir: Path,
                  spawner: Callable[..., Any] = spawn_process, clock: Callable[[], float] = time.monotonic,
                  probe: Callable[[Any, Any], str] = probe_process, start_of: Callable[[int], Any] = process_start,
-                 signal_group: Callable[[int, int], None] = _signal_group, sleep: Callable[[float], None] = time.sleep):
+                 signal_group: Callable[[int, int], None] = _signal_group, sleep: Callable[[float], None] = time.sleep,
+                 session_spawner: Callable[..., Any] = spawn_piped,
+                 session_group_alive: Callable[[int], bool] | None = None):
         self.client, self.config, self.log_dir, self.spawner, self.clock = client, config, log_dir, spawner, clock
         self.probe, self.start_of, self.signal_group, self.sleep = probe, start_of, signal_group, sleep
+        # Hosted sessions (node_sessions.py), only with [dispatch.sessions] enabled = true. They share this node's log
+        # directory, and have their own loop and thread: tick() below never touches them.
+        self.sessions: SessionRunner | None = SessionRunner(
+            client, config, log_dir, clock=clock, self_stop_seconds=SELF_STOP_SECONDS, spawner=session_spawner,
+            probe=probe, start_of=start_of, signal_group=signal_group, sleep=sleep,
+            **({} if session_group_alive is None else {"group_alive": session_group_alive}),
+        ) if config.sessions.enabled else None
         self.running: dict[str, _Local] = {}
         self.last_hello = float("-inf")
         self.last_contact = clock()
@@ -166,6 +176,8 @@ class Node:
         held = {k: v for k, v in self.config.runner_access.items() if k in self.config.runners}
         if held:        # only then: a hub older than this field refuses any hello that carries it
             body["access"] = held
+        if self.sessions is not None:   # only then: a hub older than this field refuses any hello that carries it
+            body["sessions"] = {"max_live": self.config.sessions.max_live}
         out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out
@@ -354,9 +366,15 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                       timeout=CALL_TIMEOUT, trust_env=False) as client:
         node = Node(client, config, log_dir)
         node.recover()      # local cleanup first: it must not depend on reaching the hub
+        if node.sessions is not None:
+            node.sessions.recover()
         me = node.hello()
         print(f"node {me['node']} connected to {hub}: {len(me['projects'])} project(s), runners "
-              f"{', '.join(me['runners']) or 'none'}")
+              f"{', '.join(me['runners']) or 'none'}"
+              + (f", hosting up to {config.sessions.max_live} session(s)" if node.sessions is not None else ""),
+              flush=True)
+        if node.sessions is not None:
+            node.sessions.start()   # their own loop: a message starts a turn without waiting for poll_seconds
         try:
             while True:
                 try:
@@ -365,4 +383,10 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                     log.warning("hub unreachable: %s", e)
                 time.sleep(poll_seconds or config.poll_seconds)
         except KeyboardInterrupt:
+            if node.sessions is not None:
+                node.sessions.shutdown()
             node.stop_all()
+        except BaseException:
+            if node.sessions is not None:
+                node.sessions.shutdown()    # whatever ends this loop, no session process is left running behind it
+            raise

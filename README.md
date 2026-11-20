@@ -378,6 +378,56 @@ runner is any agent CLI, not only Claude or Codex: for example `"gemini" = ["gem
 is due for a project the hub has no checkout of, the hub assigns it to a live node that has that project and a runner
 for the agent. The node starts it with its own settings and reports back. See DESIGN_NOTES "Nodes".
 
+### Hosted sessions (`board session`)
+
+A dispatched run is one process per prompt: once it is going you cannot tell it anything. A hosted session is one
+long-lived agent process on a node that takes your messages as turns. A message to an idle session starts a turn
+within a second or so; a message to a busy one waits and runs as the next turn; nothing running is interrupted.
+Claude runners only for now.
+
+Turn it on, per machine, in the node's board.local.toml, and restart `board node`:
+
+```toml
+[dispatch.sessions]
+enabled = true
+idle_hours = 8      # a session's process idle this long is stopped; the session stays and its next message resumes it
+max_live = 4        # session processes at once; one more stops the longest-idle one, or waits when none is idle
+```
+
+The node also needs what a node run needs: a runner for the agent and the project (`[dispatch] worktrees` or
+`checkout_roots`); the hub must allow the node the project and the agent under `[dispatch.nodes.<name>]`. To host
+sessions on the hub's own machine, run a node there too (`board node --hub http://127.0.0.1:8787 --name <node>`).
+
+```bash
+uv run board session start /Users/peter/the-little-things "Summarise the open TODOs" --wait
+uv run board session send <id> "Now draft the fix for the first one" --wait     # prints the reply; exit 1 if the turn failed
+uv run board session send <id> - < notes.txt        # the message from stdin; without --wait it returns at once
+uv run board session show <id>                      # state, queue, last result, last reply
+uv run board session list                           # --all includes ended ones
+uv run board session close <id>
+```
+
+`start` takes `--agent NAME` (default: the one agent with a Claude runtime, if there is only one) and `--model M`;
+every command takes `--json`. One session per agent and project at a time. `board serve` must be running: the CLI
+talks to it on the local port.
+
+What to know:
+
+- **Human only.** Only you can start, message, read or close a hosted session: the routes refuse agent and node
+  tokens, the gateway does not carry them, and there is no MCP tool. Agents cannot wake a session yet.
+- **The reply** is capped at 16 KB and only the last one per session is kept on the hub, for you alone. The full
+  transcript stays on the node: `data/node-logs/sessions/<id>.jsonl` (mode 600).
+- **Permissions** are the runner's, as for a dispatched run, with nobody to ask: a tool that would prompt is denied
+  and listed (`show` says which). A runner with `--dangerously-skip-permissions` or `--permission-mode
+  bypassPermissions` is never hosted. A project in `claude_tool_projects` gets the scoped tools, as a run does.
+- **A lost turn is not retried.** A turn that timed out (`[dispatch] timeout_minutes`), whose process died, or whose
+  node restarted or went silent is marked failed with the reason; send again if you want it again. The session
+  itself goes on and resumes the conversation.
+
+`uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
+stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for five small haiku turns).
+See DESIGN_NOTES "Session host (PR 2)".
+
 ## ChatGPT / remote connectors
 
 The recommended path is **native ChatGPT MCP through OpenAI Secure MCP Tunnel**. The
@@ -1394,7 +1444,9 @@ The tests cover the claim race (8 sessions on separate SQLite connections, 10 ro
 and reclaim with a fake clock, thread/daily/pause caps, sealed visibility on every read path
 (core, HTTP, MCP-stdio, dashboard snapshot), cursor ack semantics, identity stamping, localhost-only
 checks, and MCP over real streamable HTTP. Dispatcher tests use a fake spawner and the fake clock;
-they never start a real agent CLI.
+they never start a real agent CLI. Hosted-session tests use scripted fake processes and a stand-in script
+(`tests/stand_in_claude.py`); one runs `scripts/session-host-e2e.py`, which starts a real hub and node in a temp
+directory with that stand-in.
 
 ## Files
 
@@ -1407,6 +1459,10 @@ agent_comms/api.py         HTTP API + dashboard + /mcp mount
 agent_comms/cli.py         `board`
 agent_comms/notify.py      macOS notifications to the human (default `Board.notifier`)
 agent_comms/dispatch.py    the dispatcher: human-approved headless agent launches
+agent_comms/session_host.py hosted sessions on a node: one long-lived agent process per session, turns on stdin
+agent_comms/providers/     the agent CLI's wire protocol for a hosted session (Claude stream-json)
+agent_comms/node_sessions.py `board node`'s session loop: fetches messages from the hub, drives the host, reports
+agent_comms/hosted.py      hosted sessions on the hub: registry, queue, human-only routes' rules (`board session`)
 agent_comms/board_settings.py the Settings page: editable settings, bounds, board.local.toml writer, audit
 agent_comms/summary.py     menu bar app routes: `GET /api/summary` (counts and ids) and `GET /api/needs-you` (previews)
 agent_comms/unstick.py     the dashboard's Unstick: who a stalled thread waits on, the fixed request and one-shot rule

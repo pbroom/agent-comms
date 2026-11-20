@@ -19,6 +19,25 @@ DENIED_TOOL_INSTRUCTION = (
     "state=blocked) naming the denied tool, and stop.")
 
 
+def with_denied_tool_instruction(template: list[str]) -> list[str]:
+    """A scoped Claude runner for a hosted session (session_host.py): DENIED_TOOL_INSTRUCTION through
+    `--append-system-prompt`, since a session has no launch prompt to carry it. A runner that already appends its own
+    system prompt keeps it, with the instruction after it (Claude Code takes the flag once)."""
+    out, i, found = [], 0, False
+    while i < len(template):
+        arg = template[i]
+        i += 1
+        if arg == "--append-system-prompt" and i < len(template) and template[i] != "{prompt}":
+            out += [arg, template[i] + "\n\n" + DENIED_TOOL_INSTRUCTION]
+            i, found = i + 1, True
+        elif arg.startswith("--append-system-prompt="):
+            out.append(arg + "\n\n" + DENIED_TOOL_INSTRUCTION)
+            found = True
+        else:
+            out.append(arg)
+    return out if found else out + ["--append-system-prompt", DENIED_TOOL_INSTRUCTION]
+
+
 # A read-only Claude runner (the triage agent's): board tools, reading files inside its run directory and local
 # read-only git, with Edit and Write explicitly denied. An opted-in project keeps it as configured (no scoped override, no
 # denied-tool instruction): replacing its tools with ALLOWED would widen it to commits and test runs.

@@ -47,7 +47,7 @@ from . import access as _access, db
 from .core import Board, Conflict, Forbidden, Invalid, NotFound, Principal
 
 NODE_RUNTIME = "node"
-NODE_PREFIX = "node.info."     # <node name>: {projects, runners, headless_browser, max_concurrent, last_seen}
+NODE_PREFIX = "node.info."     # <node name>: {projects, runners, headless_browser, max_concurrent, last_seen, sessions}
 RUN_PREFIX = "node.run."       # <run id>: the assignment and its state
 NODE_STALE_SECONDS = 60        # a node unseen this long is offered no new work
 NODE_LOST_SECONDS = 180        # ... and its unfinished runs count as ended
@@ -88,11 +88,13 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
 
 
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
-          headless_browser: Any = None, checkout_roots: Any = None, access: Any = None) -> dict:
+          headless_browser: Any = None, checkout_roots: Any = None, access: Any = None,
+          sessions: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
-    `access`: the node's `[dispatch.runner_access]`, runner key -> access entries (access.py), for runners it offers."""
+    `access`: the node's `[dispatch.runner_access]`, runner key -> access entries (access.py), for runners it offers.
+    `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py)."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -110,10 +112,17 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
             raise Invalid(str(e)) from None
     if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or not 1 <= max_concurrent <= 50:
         raise Invalid("max_concurrent must be an integer from 1 to 50")
+    if sessions is not None:
+        live = sessions.get("max_live") if isinstance(sessions, dict) else None
+        if set(sessions if isinstance(sessions, dict) else ()) != {"max_live"} or isinstance(live, bool) \
+                or not isinstance(live, int) or not 1 <= live <= 50:
+            raise Invalid('sessions must be {"max_live": an integer from 1 to 50}')
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,
             "max_concurrent": max_concurrent, "last_seen": now}
+    if sessions is not None:
+        info["sessions"] = {"max_live": sessions["max_live"]}
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
@@ -171,12 +180,13 @@ def runner_key(info: dict, agent: str, runtime: str | None) -> str | None:
 
 def node_for(board: Board, project: str, agent: str, runtime: str | None,
              allowed: dict[str, dict] | None = None, *, headless_browser: bool = False,
-             room: bool = True, browser_origins: list[str] | None = None) -> str | None:
+             room: bool = True, browser_origins: list[str] | None = None, sessions: bool = False) -> str | None:
     """The live node that offers this project and a runner for this agent (its name, else its runtime), that the hub
     allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first. With
     `headless_browser`, only a node that offers a scoped headless browser for that runner. With `room=False`, a full
     node counts too. With `browser_origins`, only a node whose runner for this agent declares a signed-in browser for
-    each of them (access.py) and whose hub grant lists that access too."""
+    each of them (access.py) and whose hub grant lists that access too. With `sessions`, only a node that hosts
+    sessions (hosted.py)."""
     now = board.now()
     project = project.rstrip("/") or "/"
     keys = {agent} | ({runtime} if runtime else set())
@@ -191,6 +201,8 @@ def node_for(board: Board, project: str, agent: str, runtime: str | None,
                 or not keys & set(info.get("runners", []))):
             continue
         if headless_browser and runner_key(info, agent, runtime) not in info.get("headless_browser", []):
+            continue
+        if sessions and not info.get("sessions"):
             continue
         if browser_origins:
             need = {_access.browser(o) for o in browser_origins}

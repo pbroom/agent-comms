@@ -91,7 +91,9 @@ def test_a_result_ends_the_turn_with_tool_names_only():
     assert (ev.kind, ev.ok, ev.denials) == ("turn_ended", True, ("Write",))
     assert ev.meta == {"subtype": "success", "is_error": False, "num_turns": 2, "duration_ms": 5600,
                        "total_cost_usd": 0.0036, "stop_reason": "end_turn", "terminal_reason": "completed"}
-    assert "note.txt" not in repr(ev) and "DENIED" not in repr(ev), "no tool input and no reply text"
+    assert "note.txt" not in repr(ev), "no tool input"
+    # PR 2: the reply travels in its own field (capped, for the human only); `meta` and `denials` never hold it.
+    assert ev.text == "DENIED" and "DENIED" not in repr(ev.meta) + repr(ev.denials)
 
 
 @pytest.mark.parametrize("change", [{"subtype": "error_during_execution", "is_error": True},

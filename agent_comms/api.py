@@ -53,6 +53,7 @@ class NodeHelloIn(Body):
     headless_browser: list[str] = []
     checkout_roots: list[str] = []
     access: dict[str, list[str]] = {}
+    sessions: dict[str, StrictInt] | None = None    # {"max_live": n}: the node hosts sessions (hosted.py)
 
 
 class NodeReportIn(Body):
@@ -61,6 +62,36 @@ class NodeReportIn(Body):
     exit_code: StrictInt | None = None
     error: str | None = None
     checkout: dict[str, Any] | None = None
+
+
+class HostedEventIn(Body):
+    kind: Literal['delivered', 'turn_started', 'turn_ended', 'approval_requested', 'ended']
+    message: StrictInt | None = None
+    ok: StrictBool | None = None
+    delivered: StrictBool = True
+    denials: list[str] = []
+    meta: dict[str, Any] = {}
+    detail: str = ""
+    text: str = ""
+    undelivered: list[StrictInt] = []
+
+
+class NodeSessionReportIn(Body):
+    events: list[HostedEventIn] = []
+    state: Literal['starting', 'idle', 'running', 'waiting', 'ended'] | None = None
+    pid: StrictInt | None = None
+    resume: StrictBool | None = None
+
+
+class HostedStartIn(Body):
+    project: str
+    message: str
+    agent: str | None = None
+    model: str | None = None
+
+
+class HostedMessageIn(Body):
+    message: str
 
 
 class RequestRouteIn(Body):
@@ -774,7 +805,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def node_hello(body: NodeHelloIn, p: Principal = P):
         from . import nodes
         return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent,
-                           body.headless_browser, body.checkout_roots, body.access)
+                           body.headless_browser, body.checkout_roots, body.access, body.sessions)
 
     @app.get("/api/nodes/assignments")
     def node_assignments(p: Principal = P):
@@ -785,6 +816,65 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def node_report(run_id: str, body: NodeReportIn, p: Principal = P):
         from . import nodes
         return nodes.report(board, p, run_id, body.state, body.pid, body.exit_code, body.error, body.checkout)
+
+    # Hosted sessions, the node's side (hosted.py): inside the node-identity gate with the routes above (`principal`
+    # lets a node identity reach only /api/nodes/*, and hosted.py refuses everyone but a node here).
+    def waiter_gone(request: Request):
+        # A waiting call ends early when its caller hung up or this server is stopping (serve() sets `stopping`):
+        # a node sits in such a wait whenever it has nothing to do, and must not hold up a restart of the hub.
+        async def gone() -> bool:
+            stopping = getattr(app.state, "stopping", None)
+            return bool(stopping and stopping()) or await request.is_disconnected()
+        return gone
+
+    @app.get("/api/nodes/sessions")
+    async def node_sessions(request: Request, wait: float = 0, seen: str | None = None, p: Principal = P):
+        # async: wait > 0 long-polls without holding a worker thread (as /api/updates does)
+        from . import hosted
+        return await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request))
+
+    @app.post("/api/nodes/sessions/{session_id}")
+    def node_session_report(session_id: str, body: NodeSessionReportIn, p: Principal = P):
+        from . import hosted
+        return hosted.report(board, p, session_id, [e.model_dump(exclude={"undelivered"}) for e in body.events],
+                             body.state, body.pid, body.resume)
+
+    # Hosted sessions, the human's side: only the human starts, messages, reads or closes one (hosted.py checks on
+    # every call; a node identity never gets past `principal`). The reply text is returned here and nowhere else.
+    @app.get("/api/hosted-sessions")
+    def hosted_sessions(all: bool = False, p: Principal = P):
+        from . import hosted
+        return hosted.list_sessions(board, p, include_ended=all)
+
+    @app.post("/api/hosted-sessions")
+    def hosted_start(body: HostedStartIn, p: Principal = P):
+        from . import hosted
+        board._require_human(p, "start a hosted session")
+        config, error = dispatch_config()
+        if error:
+            raise Conflict(f"the hub's [dispatch] settings cannot be read: {error}")
+        return hosted.start(board, p, body.project, body.message, agent=body.agent, model=body.model,
+                            allowed=config.nodes)
+
+    @app.get("/api/hosted-sessions/{session_id}")
+    def hosted_show(session_id: str, p: Principal = P):
+        from . import hosted
+        return hosted.show(board, p, session_id)
+
+    @app.post("/api/hosted-sessions/{session_id}/messages")
+    def hosted_send(session_id: str, body: HostedMessageIn, p: Principal = P):
+        from . import hosted
+        return hosted.send(board, p, session_id, body.message)
+
+    @app.get("/api/hosted-sessions/{session_id}/messages/{n}")
+    async def hosted_message(request: Request, session_id: str, n: int, wait: float = 0, p: Principal = P):
+        from . import hosted
+        return await hosted.message_wait(board, p, session_id, n, wait, waiter_gone(request))
+
+    @app.post("/api/hosted-sessions/{session_id}/close")
+    def hosted_close(session_id: str, p: Principal = P):
+        from . import hosted
+        return hosted.close(board, p, session_id)
 
     @app.post("/api/sessions/capabilities")
     def register_capabilities(body: CapabilitiesIn, request: Request, p: Principal = P):
@@ -831,4 +921,13 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     host = host or settings.host
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise SystemExit("agent-comms v1 only binds to localhost")
-    uvicorn.run(create_app(settings=settings), host=host, port=port or settings.port, log_level="info")
+    app = create_app(settings=settings)
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port or settings.port, log_level="info"))
+    app.state.stopping = lambda: server.should_exit     # lets a waiting call (hosted sessions) end when asked to stop
+    # As uvicorn.run does for one worker without reload: Ctrl-C ends quietly, a failed start exits 3.
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    if not server.started:
+        raise SystemExit(3)
