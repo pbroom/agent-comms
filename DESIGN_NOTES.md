@@ -2453,13 +2453,26 @@ the bodies or the thread title. Stand-in and Claude Code 2.1.322 (`--model haiku
 was written 0.18 s and 0.04 s after the post; the two later posts went as one wake 6.00 s and 6.14 s after the first
 (the run's interval is 6 s), after the first wake's turn had ended.
 
+*A woken real session reads the board* (`--claude-bin ... --with-board`, Claude Code 2.1.322, haiku, two turns). The
+session's only MCP server is this checkout's `board mcp` on the temp hub's database, signed in as the temp agent
+from a temp token file (`--setting-sources= --strict-mcp-config --mcp-config <temp file>
+--allowedTools=mcp__agent-comms --disallowedTools=Bash,Edit,Write,...`, `--permission-mode dontAsk`). Its first turn
+called no tool and left no board session. Then the second agent posted a request addressed to it and the session
+was told nothing but the wake: written 0.13 s after the post; the turn called `ToolSearch`, `board_register`,
+`board_read_updates` twice (the second acknowledged the post) and nothing else; the hub recorded the delivery
+receipt 3.75 s after the post (3.62 s after the wake was written); the turn ended after 7.89 s; with
+`wake_grace_seconds` at 5 for that run, `hosted.holds` was true at +8.08 s, on the receipt alone. So the fixed wake
+text is enough for a session that has the board's tools. It registered under the thread's project (its working
+directory, which in this run is the project path). It read the request and left it `queued`: the request said no
+work was needed, and the session said it had not loaded the request-progress tool.
+
 **Residual risks / not verified.**
 - A hosted session that read a request after its wake and then does nothing keeps the dispatcher off that request
   until the session is closed, as a live session with a receipt already did under a delivery policy.
-- Not checked with a real board-connected session: how a hosted Claude registers with the board from its node's
-  checkout. If that path differs from the thread's project, its board reads are scoped to another project; posts
-  addressed to it are returned all the same (`Board._scope_sql`), which is what a wake announces. In the end-to-end
-  run the session has no board tools, so it could not act on the wake; it said so.
+- Checked only where the node's checkout path IS the thread's project (below): how a hosted Claude registers with
+  the board. Where a node maps the project to another directory, the session would register under that directory
+  and its board reads would be scoped to another project; posts addressed to it are returned all the same
+  (`Board._scope_sql`), which is what a wake announces. Not run.
 - A wake counts toward the interval and the hourly maximum when it is queued, also if it is then dropped at
   hand-over.
 - `_busy_dirs` compares directories as the hub sees them (`run_dir(project)`): with a hub checkout of the same

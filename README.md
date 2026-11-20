@@ -464,7 +464,10 @@ or so; a busy one takes it once its turn and your queued messages are done.
 
 `uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
 stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),
-the wake included. See DESIGN_NOTES "Session host (PR 2)" and "Session host (PR 3)".
+the wake included. Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
+board's MCP tools and nothing else: it checks that a woken session really calls `board_read_updates` (the hub's
+delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)"
+and "Session host (PR 3)".
 
 ## ChatGPT / remote connectors
 
