@@ -57,6 +57,7 @@ JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
+SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 LOST = "the node restarted while this turn was in flight; it was not replayed"
 
 
@@ -84,7 +85,8 @@ class SessionRunner:
         self.last_contact = clock()
         self.lock = threading.Lock()                  # the host, between the loop and shutdown()
         self.report_lock = threading.Lock()           # the report queue: one flush at a time, shutdown's last
-        self.seq = 0                                  # the last report's stamp (`_stamp`)
+        self.seq = self._load_seq()                   # the last report's stamp (`_stamp`), an earlier process's included
+        self.seq_unsaved = False                      # the last attempt to put it on disk failed (said once)
         self.hub_seq = 0                              # the highest stamp the hub says it applied, for any session
         self.sent: dict[str, int] = {}                # session id -> stamp of this process's last status the hub took
         self.stopping = threading.Event()
@@ -102,16 +104,27 @@ class SessionRunner:
             return {}
         return {k: v for k, v in data.items() if isinstance(k, str) and type(v) is int} if isinstance(data, dict) else {}
 
-    def _save_handed(self) -> None:
+    def _write_private(self, path: Path, data: Any) -> None:
+        """Atomically, mode 600 (as session_host's state file)."""
         self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = self._handed_path().with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, json.dumps(self.handed).encode())
+            os.write(fd, json.dumps(data).encode())
         finally:
             os.close(fd)
-        os.replace(tmp, self._handed_path())
+        os.replace(tmp, path)
+
+    def _save_handed(self) -> None:
+        self._write_private(self._handed_path(), self.handed)
+
+    def _load_seq(self) -> int:
+        try:
+            seq = json.loads((self.log_dir / SEQ_FILE).read_text()).get("seq")
+        except (OSError, ValueError, AttributeError):
+            return 0
+        return seq if type(seq) is int and seq > 0 else 0
 
     def recover(self) -> None:
         """Once, before any hub contact: stop the session processes an earlier node process left here."""
@@ -172,10 +185,22 @@ class SessionRunner:
     def _stamp(self) -> int:
         """An id for the next report that is above every earlier one of this node: the hub ignores the status of a
         report that is not newer than the last it applied, so one that arrives late (its call timed out here, then it
-        committed there) cannot undo a later one. Above this process's own last stamp, the wall clock, and the highest
-        stamp the hub says it applied (it comes with every fetch): the hub is the source of truth, so a clock that
-        was set back across a node restart can neither let an old report win nor get the new process ignored."""
+        committed there) cannot undo a later one. Above the last stamp issued, the wall clock, and the highest stamp
+        the hub says it applied (it comes with every fetch).
+
+        The last stamp issued is on disk (SEQ_FILE) before the report that carries it is sent, and the next node
+        process starts from it. So whatever the clock did across a restart, the new process never issues a stamp an
+        old one issued, nor one below it: an old report can neither tie with a new one and win by arriving first, nor
+        overwrite the final report of a shutdown after the node has stopped fetching. If the file cannot be written
+        the report goes out all the same (the hub's floor still orders what the hub has applied)."""
         self.seq = max(self.seq + 1, self.wall_ns(), self.hub_seq + 1)
+        try:
+            self._write_private(self.log_dir / SEQ_FILE, {"seq": self.seq})
+            self.seq_unsaved = False
+        except OSError as e:
+            if not self.seq_unsaved:
+                log.warning("could not record the report stamp in %s (%s); reporting goes on", SEQ_FILE, e)
+            self.seq_unsaved = True
         return self.seq
 
     def _post_pending(self) -> bool:

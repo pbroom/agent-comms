@@ -2282,7 +2282,13 @@ message's write.
   enough across a restart (set back, the new process would stamp below what the hub holds and go unheard), so the
   hub is the floor: every fetch carries each session's `status_seq`, the node stamps above the highest it has seen,
   and when a fetch shows a stamp that is not this process's last for that session (an old report that landed late
-  with a stamp from the clock that ran ahead) the node sends its status again.
+  with a stamp from the clock that ran ahead) the node sends its status again. That still left two gaps (a new
+  process issuing the very stamp an old one issued, the old report landing first; and an old stamp the hub had not
+  yet seen overwriting a shutdown's final report after the node stopped fetching), so the node also keeps the
+  highest stamp it has issued in `data/node-logs/node-session-seq.json` (mode 600, written atomically BEFORE the
+  report that carries it is sent) and the next process starts from it:
+  `seq = max(last + 1, wall clock ns, hub status_seq + 1)` with `last` seeded from the file. A stamp that cannot be
+  written is still issued (logged once); reporting never waits on the file.
   After the kills nothing is signalled again: `SessionHost._stop` sends SIGTERM only while the process or its
   group is still there, so the reporting phase cannot signal a process-group id that has since been reused.
   `node.shut_down` is `Node.stop_all()` with the session processes stopped alongside: SIGTERM to every run and

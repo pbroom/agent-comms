@@ -25,7 +25,7 @@ from agent_comms.config import create_agent
 from agent_comms.core import Forbidden
 from agent_comms.dispatch import DispatchConfig
 from agent_comms.node import SELF_STOP_SECONDS, Node, _Local, shut_down
-from agent_comms.node_sessions import HANDED_FILE, LOST, SessionRunner
+from agent_comms.node_sessions import HANDED_FILE, LOST, SEQ_FILE, SessionRunner
 from agent_comms.providers.claude import ClaudeSession
 from agent_comms.session_host import SessionHost
 
@@ -1063,6 +1063,52 @@ def test_after_a_restart_with_the_clock_set_back_the_new_process_is_heard_and_th
     tick(senv, node)
     view = show(senv, sid)
     assert (view["state"], view["pid"]) == ("starting", children(senv, node)[0].pid)
+
+
+def test_the_next_node_process_stamps_above_everything_the_last_one_issued(senv, monkeypatch):
+    """The highest stamp issued is on disk before the report that carries it is sent, and seeds the next process: with
+    the clock set far back, the new process's first stamp is still above the old one's last, before any fetch, so
+    an old report can neither tie with a new one nor outrank it."""
+    sid = start(senv)["session_id"]
+    old, hub, seq_file = senv.node.sessions, senv.node.sessions.client, senv.tmp / "laptop-logs" / SEQ_FILE
+    on_disk_at_send = []
+
+    class Recording:
+        def request(self, method, path, **kw):
+            if method == "POST":
+                on_disk_at_send.append(json.loads(seq_file.read_text())["seq"] >= kw["json"]["seq"])
+            return hub.request(method, path, **kw)
+
+    old.client = Recording()
+    old.wall_ns = lambda: 9_000_000_000_000_000_000        # the old process's clock runs far ahead
+    tick(senv)
+    run_turn(senv, sid)
+    n = old.seq
+    assert on_disk_at_send and all(on_disk_at_send), "persisted before each report is sent"
+    assert json.loads(seq_file.read_text()) == {"seq": n} and (seq_file.stat().st_mode & 0o777) == 0o600
+    # The old process issued one more stamp for a report that is still on its way when it dies.
+    in_flight = {"events": [], "state": "waiting", "pid": 4242, "resume": True, "seq": old._stamp()}
+    n = in_flight["seq"]
+
+    node = make_node(senv, log_dir=senv.tmp / "laptop-logs")       # restarted; the clock has been set far back
+    new = node.sessions
+    new.wall_ns = lambda: 1_000
+    assert new.hub_seq == 0 and new.seq == n, "seeded from the file, before any fetch"
+    new.recover()
+    send(senv, sid, "after the restart")
+    tick(senv, node)
+    assert new.seq > n and show(senv, sid)["state"] == "starting", "its first status is above N and is applied"
+    assert senv.laptop.post(f"/api/nodes/sessions/{sid}", json=in_flight).status_code == 200
+    view = show(senv, sid)
+    assert (view["state"], view["pid"]) == ("starting", children(senv, node)[0].pid), "the late old report is ignored"
+
+    # A stamp that cannot be put on disk is still issued: reporting goes on.
+    def unwritable(path, data):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(new, "_write_private", unwritable)
+    before = new.seq
+    run_turn(senv, sid, "still reported", node=node)
+    assert new.seq > before and show(senv, sid)["reply"] == "still reported"
 
 
 def test_settle_decides_again_inside_its_transaction(senv, monkeypatch):
