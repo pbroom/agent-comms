@@ -540,7 +540,7 @@ enabled = true
         self.check("mcp__agent-comms__board_read_updates" in calls, "the wake turn called board_read_updates")
         self.check(not {"Bash", "Edit", "Write", "NotebookEdit"} & set(calls), "... and no shell or file-writing tool")
 
-        wait = state["woken_at"] + BOARD_GRACE + 0.5 - time.time()
+        wait = state["woken_at"] + BOARD_GRACE + 1.5 - time.time()     # the grace counts from the hand-over
         if wait > 0:
             time.sleep(wait)
         state = self.probe(post["id"], sid)

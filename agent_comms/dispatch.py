@@ -1782,27 +1782,23 @@ class Dispatcher:
             return False
 
     def _hosted_recheck(self, agent: str, item: dict, now: float) -> dict:
-        """The `check` for reserve_dispatch_launch (as keyword arguments; none without a hosted session, so the call
-        is then the one it always was): inside the reservation's own write transaction, the hold is asked again, and
-        a launch that is reserved takes the request away from any wake still waiting or queued for it
-        (hosted_wake.reserve). Managed continuations stay on their own path: no wake is ever for them."""
+        """The `check` for reserve_dispatch_launch, as keyword arguments: inside the reservation's own write
+        transaction, the hold is asked again, and a launch that is reserved takes the request away from any wake
+        still waiting or queued for it (hosted_wake.reserve). Everything is decided inside that transaction, on what
+        is stored then, also whether the agent has a hosted session at all; without one the check reads the session
+        list, refuses nothing and writes nothing. Managed continuations stay on their own path: no wake is ever for
+        them."""
         if not item.get("post_id") or item.get("managed"):
             return {}
-        from . import hosted, hosted_wake
+        from . import hosted_wake
         conn = self.board.conn
-        try:
-            thread = conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
-            if thread is None or not any(r.get("agent") == agent and r.get("state") != "ended"
-                                         for r in hosted._sessions(conn)):
-                return {}
-        except Exception:
-            log.exception("could not read the hosted sessions for request %s", item["post_id"])
-            return {}
 
         def check() -> str | None:
             try:
-                return None if hosted_wake.reserve(conn, agent, thread["project"], item["post_id"], now) \
-                    else HOSTED_HOLDS
+                thread = conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
+                if thread is None or hosted_wake.reserve(conn, agent, thread["project"], item["post_id"], now):
+                    return None
+                return HOSTED_HOLDS
             except Exception:
                 log.exception("could not recheck the hosted hold for request %s", item["post_id"])
                 return None

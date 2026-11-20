@@ -82,20 +82,22 @@ def _new(mark: int, post: int | None = None) -> dict:
     {count, human, stopped, limit, alert, tried, hour_ack}: wakes since the human's last new post there (`human`:
     that post's id), why the thread is stopped ("thread" | "hour"), the Needs-you post that said so, and `hour_ack`:
     the newest wake's time when the human answered an hourly stop (no second item while that is still the newest).
-    woken: post id -> when a wake covering it was last queued or handed. read: post id -> when the board last
-    showed that post, after such a wake, to a board session of the agent in the session's project (`handed`).
+    woken: post id -> when the wake covering it was QUEUED (what read evidence is compared with); handed: post
+    id -> when the node was first shown that wake (the grace period counts from the later of the two). read: post
+    id -> when the board last showed that post, at or after the wake was queued, to a board session of the agent in
+    the session's project (`handed()`).
     claimed: post id -> when the dispatcher reserved a launch for it (no wake for it after that). closing: Needs-you
     posts to close. grace: wake_grace_seconds as of the last write (so `holds` needs no settings)."""
     return {"mark": mark, "post": post, "sealed": [], "pending": {}, "sent": [], "threads": {}, "woken": {},
-            "read": {}, "claimed": {}, "closing": [], "grace": 120.0}
+            "handed": {}, "read": {}, "claimed": {}, "closing": [], "grace": 120.0}
 
 
 def _clean(rec: Any) -> dict | None:
     if not isinstance(rec, dict) or type(rec.get("mark")) is not int:
         return None
     out = _new(rec["mark"], rec["post"] if type(rec.get("post")) is int else None)
-    for key, kind in (("pending", dict), ("threads", dict), ("woken", dict), ("read", dict), ("claimed", dict),
-                      ("sent", list), ("closing", list), ("sealed", list)):
+    for key, kind in (("pending", dict), ("threads", dict), ("woken", dict), ("handed", dict), ("read", dict),
+                      ("claimed", dict), ("sent", list), ("closing", list), ("sealed", list)):
         if isinstance(rec.get(key), kind):
             out[key] = rec[key]
     if isinstance(rec.get("grace"), (int, float)) and not isinstance(rec.get("grace"), bool):
@@ -130,6 +132,7 @@ def _recent(times: dict | list, now: float, keep: float, most: int | None = None
 def _save(c, session_id: str, rec: dict, now: float) -> None:
     rec["sent"] = _recent(rec["sent"], now, HOUR)
     rec["woken"] = _recent(rec["woken"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
+    rec["handed"] = _recent(rec["handed"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["read"] = _recent(rec["read"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["claimed"] = _recent(rec["claimed"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     if len(rec["pending"]) > MAX_PENDING:
@@ -418,7 +421,9 @@ def listing(board: Board, node: str, build: Callable[[], dict]) -> dict:
     try:
         with db.write_tx(conn) as c:
             now = board.now()
-            for sid in todo:
+            # Worked out again here, on what is stored now: a wake queued since the snapshot above (by a dispatcher
+            # pass, for any of this node's sessions) is re-checked too before the answer below can show it.
+            for sid in _unsettled(board, node):
                 _recheck(board, c, sid, now)
             return build()
     except BoardError:
@@ -464,9 +469,9 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
     """Inside the transaction that shows the node its sessions: eligibility at the moment of hand-over. A wake is
     for the posts recorded on it; those that stopped qualifying since it was queued (author revoked, read meanwhile,
     reserved by the dispatcher) are taken off it, and with none left the wake is not sent at all. A wake that was
-    never handed and now has a message of the human's behind it is not sent either: its posts go back to `pending`
-    and it is not counted, so the human's message is the next turn. The first hand-over is also when the grace
-    period starts anew (`holds`)."""
+    never handed and now has a message of the human's behind it is not sent either: its posts go back to `pending`,
+    uncovered, and it is not counted, so the human's message is the next turn. The first hand-over is also when the
+    grace period starts anew (`holds`)."""
     r = _get(c, hosted.SESSION_PREFIX + session_id)
     m, human_waiting = _next_queued(c, session_id)
     if (not isinstance(r, dict) or r.get("state") == "ended" or m is None or m.get("kind") != "wake"
@@ -477,13 +482,17 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
     keep = _qualifying(board, p, r["project"], m["posts"], rec) if p is not None else {}
     defer = bool(keep) and m.get("handed_at") is None and human_waiting
     for k in (str(i) for i in m["posts"]):
-        if k not in keep:
-            rec["woken"].pop(k, None)   # no wake reached anyone for it: the dispatcher is not held back
-            rec["read"].pop(k, None)
-        elif defer:
-            rec["pending"][k] = keep[k]
+        if k not in keep or defer:
+            # No wake reached anyone for it (dropped, or stepping back behind the human's message): its coverage
+            # goes, so the dispatcher is not held back by a wake that was never delivered.
+            for table in ("woken", "handed", "read"):
+                rec[table].pop(k, None)
+            if defer:
+                rec["pending"][k] = keep[k]
         elif m.get("handed_at") is None:
-            rec["woken"][k] = now       # handed now: the grace period counts from here
+            # Shown to the node now: the grace period counts from here. `woken` keeps the time the wake was queued,
+            # so that a read between then and now (a mark or a dated receipt) still counts as after the wake.
+            rec["handed"][k] = now
     if defer:
         if m.get("created_at") in rec["sent"]:
             rec["sent"].remove(m["created_at"])
@@ -533,7 +542,8 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         at = rec["woken"].get(str(post_id)) if rec else None
         if not isinstance(at, (int, float)):
             continue
-        if now - at < rec["grace"]:
+        handed_at = rec["handed"].get(str(post_id))
+        if now - max(at, handed_at if isinstance(handed_at, (int, float)) else at) < rec["grace"]:
             return True
         read = rec["read"].get(str(post_id))
         if isinstance(read, (int, float)) and read >= at:
@@ -589,11 +599,18 @@ def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:
     """Inside the write transaction in which the dispatcher reserves a launch for this request
     (Board.reserve_dispatch_launch): False when a hosted session holds it after all (a wake was queued since the
     dispatcher looked), and the launch is then not reserved. Otherwise the request is the dispatcher's from here on:
-    it leaves every such session's waiting posts, and a wake already queued for it loses it when the node is shown
-    that wake (`_qualifying`). Writes nothing without a hosted session of the agent in the project."""
+    it leaves the waiting posts of every session of the agent in the project that has not ended (also one whose
+    node is not connected), and a wake already queued for it loses it when the node is shown that wake
+    (`_qualifying`). Writes nothing without a hosted session of the agent in the project."""
     if holds(conn, agent, project, post_id, now):
         return False
-    for r in _matching(conn, agent, project, now) if type(post_id) is int else []:
+    project = (project.rstrip("/") or "/") if isinstance(project, str) else None
+    for r in hosted._sessions(conn) if type(post_id) is int else []:
+        # Every session of the agent in the project that has not ended, connected or not: whether a session HOLDS a
+        # request depends on its node being there, but a claim must also reach the wake of a session whose node is
+        # away, or that wake would be handed over beside the run when the node is back.
+        if r.get("agent") != agent or r.get("project") != project or r.get("state") == "ended":
+            continue
         rec = _load(conn, r["session_id"])
         if rec is not None:
             rec["pending"].pop(str(post_id), None)

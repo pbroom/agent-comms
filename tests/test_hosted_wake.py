@@ -758,7 +758,9 @@ def test_a_pause_that_lands_during_the_nodes_fetch_shows_it_no_wake(senv, monkey
     senv.board.set_paused(senv.p["human"], False)
     [listed] = senv.laptop.get("/api/nodes/sessions").json()["sessions"]
     assert listed["messages"][0]["kind"] == "wake" and "text" in listed["messages"][0]
-    assert record(senv, sid)["woken"][str(post["id"])] == senv.clock(), "handed in the transaction that showed it"
+    rec = record(senv, sid)
+    assert rec["handed"][str(post["id"])] == senv.clock(), "handed in the transaction that showed it"
+    assert rec["woken"][str(post["id"])] == queued_at, "the queue time stays what read evidence is compared with"
 
 
 def test_a_session_started_during_a_pass_keeps_its_starting_mark(senv, monkeypatch):
@@ -868,6 +870,115 @@ def test_the_undelivered_alert_is_not_posted_once_a_wake_covers_the_request(denv
     later(denv, GRACE + 1)
     alert = delivery._alert(denv.board, denv.p["human"], denv.d._fence(), denv.tid, entries, 10, denv.d._runner)
     assert f"request #{post['id']} to claude" in denv.board.get_post(denv.p["human"], alert)["body"]
+
+
+# ------------------------------------------------------------ review round 2
+
+
+def test_a_wake_that_stepped_back_no_longer_covers_its_posts(senv):
+    """S3. Nothing was delivered: the dispatcher must not be held by a wake that stepped back behind the human."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    hosted_wake.tick(senv.board)
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
+    send(senv, sid, "mine")
+    tick(senv)
+    assert wakes(senv, sid)[0]["detail"] == hosted_wake.DEFERRED
+    rec = record(senv, sid)
+    assert rec["woken"] == {} and rec["handed"] == {} and rec["read"] == {}
+    assert list(rec["pending"]) == [str(post["id"])]
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
+    run_turn(senv, sid)
+    tick(senv)
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "covered again once really handed"
+
+
+def test_a_wake_queued_after_the_fetchs_snapshot_is_still_checked_before_it_is_shown(senv, monkeypatch):
+    """S4. The write transaction works out for itself which wakes need the re-check; it does not trust the list from
+    the read snapshot before it, which a wake queued in between is missing from."""
+    first, second = ready(senv), ready(senv, project=P2)
+    t2 = senv.board.create_thread(senv.p["human"], senv.sid["human"], "elsewhere", P2)["id"]
+    ask(senv, senv.thread())
+    ask(senv, t2, as_="grok")
+    hosted_wake.tick(senv.board)        # both wakes are queued; neither was shown to the node
+    _revoke(senv, "grok")               # the second one's post no longer qualifies
+    real, calls = hosted_wake._unsettled, []
+
+    def stale(board, node):             # the snapshot was taken before the second wake existed
+        calls.append(1)
+        return [sid for sid in real(board, node) if len(calls) > 1 or sid != second]
+
+    monkeypatch.setattr(hosted_wake, "_unsettled", stale)
+    listed = {s["session_id"]: s["messages"] for s in senv.laptop.get("/api/nodes/sessions").json()["sessions"]}
+    assert [m["kind"] for m in listed[first]] == ["wake"] and "text" in listed[first][0]
+    assert listed[second] == [], "not shown: it was re-checked in the transaction that built the answer"
+    assert wakes(senv, second)[0]["detail"] == hosted_wake.NOT_SENT
+
+
+def test_a_launch_reserved_while_the_sessions_node_is_away_still_takes_the_request_off_its_wake(denv):
+    """S6. The claim is recorded for every session of the agent in the project that has not ended, connected or
+    not: otherwise the queued wake would be handed over beside the cold run when the node is back."""
+    allow(denv)
+    sid = ready(denv)
+    later(denv, 5 * 60)
+    post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
+    denv.d.tick()
+    assert launched(denv) == [] and [m["state"] for m in wakes(denv, sid)] == ["queued"]
+    denv.clock.advance(nodes.NODE_STALE_SECONDS + 1)    # the node went away without fetching: nothing holds now
+    denv.d.tick()
+    assert launched(denv) == ["claude-fake"]
+    assert str(post["id"]) in record(denv, sid)["claimed"], "claimed although its node is not connected"
+    denv.node.hello()                                   # ... and comes back
+    tick(denv, times=2)
+    assert (wakes(denv, sid)[0]["state"], wakes(denv, sid)[0]["detail"]) == ("failed", hosted_wake.NOT_SENT)
+    assert turns(denv) == ["first"], "no wake turn beside the cold run"
+
+
+def test_the_reservation_check_is_installed_and_decided_inside_the_transaction(denv, monkeypatch):
+    """S6. Whether the agent has a hosted session is not decided before the reservation: the check is always
+    passed, and without a hosted session it refuses nothing and writes nothing."""
+    allow(denv)
+    post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
+    real, seen = denv.board.reserve_dispatch_launch, []
+
+    def reserve(*a, check=None, **kw):
+        def inside():
+            seen.append(denv.board.conn.in_transaction)
+            return check()
+        return real(*a, check=inside if check else None, **kw)
+
+    monkeypatch.setattr(denv.board, "reserve_dispatch_launch", reserve)
+    denv.d.tick()
+    assert seen == [True], "asked once, inside the reservation's write transaction, with no hosted session at all"
+    assert launched(denv) == ["claude-fake"] and post["id"] in dispatch.list_runs(
+        denv.board, denv.p["human"], limit=10)[0]["request_ids"]
+    assert denv.board.conn.execute("SELECT key FROM board_state WHERE key LIKE 'host.%'").fetchall() == []
+
+
+def test_a_read_between_queueing_and_hand_over_still_counts_and_the_grace_runs_from_the_hand_over(senv):
+    """S12. Read evidence is compared with the time the wake was queued; the hand-over only extends the grace."""
+    sid = ready(senv)
+    tid = senv.thread()
+    read_early, unread = ask(senv, tid), ask(senv, tid, as_="grok")
+    hosted_wake.tick(senv.board)            # one wake for both, queued now
+    queued = senv.clock()
+    senv.clock.advance(5)
+    reader = senv.session("claude")
+    shown = senv.board.read_updates(senv.p["claude"], reader, post_ids=[read_early["id"]])
+    assert [p["id"] for p in shown["posts"]] == [read_early["id"]]
+    senv.board.read_updates(senv.p["claude"], reader, only="needs_response")    # returns neither: no mark
+    later(senv, 5)
+    tick(senv)                              # handed over 10 s after it was queued
+    rec = record(senv, sid)
+    assert rec["woken"] == {str(read_early["id"]): queued, str(unread["id"]): queued}
+    assert rec["handed"] == {str(read_early["id"]): queued + 10, str(unread["id"]): queued + 10}
+    now = senv.clock
+    later(senv, GRACE - 1)
+    assert hosted.holds(senv.board, "claude", PROJECT, unread["id"], now()), "inside the grace since the hand-over"
+    later(senv, 1)
+    assert not hosted.holds(senv.board, "claude", PROJECT, unread["id"], now()), "never shown: the grace is over"
+    assert hosted.holds(senv.board, "claude", PROJECT, read_early["id"], now()), \
+        "shown after the wake was queued, before it was handed: that read counts"
 
 
 # ------------------------------------------------------------ what a woken session was shown (hosted_wake.handed)
