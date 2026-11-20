@@ -26,7 +26,7 @@ from test_dispatch import FakeChild, FakeProcs, FakeSpawner
 
 ROOT = Path(__file__).resolve().parents[1]
 SID = "5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6c"
-SID2 = "2c33cbfc-3334-4290-b654-b73ccf444afa"
+SID2 = "b66694f5-8c10-476a-ba2f-489c99218ed7"
 OTHER = "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4"
 SHIPPED = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
 SECRET_INPUT = {"file_path": "/Users/someone/secret/notes.txt", "content": "TOOL-INPUT-SECRET"}
