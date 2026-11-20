@@ -82,19 +82,20 @@ def _new(mark: int, post: int | None = None) -> dict:
     {count, human, stopped, limit, alert, tried, hour_ack}: wakes since the human's last new post there (`human`:
     that post's id), why the thread is stopped ("thread" | "hour"), the Needs-you post that said so, and `hour_ack`:
     the newest wake's time when the human answered an hourly stop (no second item while that is still the newest).
-    woken: post id -> when a wake covering it was last queued or handed. claimed: post id -> when the dispatcher
-    reserved a launch for it (no wake for it after that). closing: Needs-you posts to close. grace:
-    wake_grace_seconds as of the last write (so `holds` needs no settings)."""
+    woken: post id -> when a wake covering it was last queued or handed. read: post id -> when the board last
+    showed that post, after such a wake, to a board session of the agent in the session's project (`handed`).
+    claimed: post id -> when the dispatcher reserved a launch for it (no wake for it after that). closing: Needs-you
+    posts to close. grace: wake_grace_seconds as of the last write (so `holds` needs no settings)."""
     return {"mark": mark, "post": post, "sealed": [], "pending": {}, "sent": [], "threads": {}, "woken": {},
-            "claimed": {}, "closing": [], "grace": 120.0}
+            "read": {}, "claimed": {}, "closing": [], "grace": 120.0}
 
 
 def _clean(rec: Any) -> dict | None:
     if not isinstance(rec, dict) or type(rec.get("mark")) is not int:
         return None
     out = _new(rec["mark"], rec["post"] if type(rec.get("post")) is int else None)
-    for key, kind in (("pending", dict), ("threads", dict), ("woken", dict), ("claimed", dict), ("sent", list),
-                      ("closing", list), ("sealed", list)):
+    for key, kind in (("pending", dict), ("threads", dict), ("woken", dict), ("read", dict), ("claimed", dict),
+                      ("sent", list), ("closing", list), ("sealed", list)):
         if isinstance(rec.get(key), kind):
             out[key] = rec[key]
     if isinstance(rec.get("grace"), (int, float)) and not isinstance(rec.get("grace"), bool):
@@ -129,6 +130,7 @@ def _recent(times: dict | list, now: float, keep: float, most: int | None = None
 def _save(c, session_id: str, rec: dict, now: float) -> None:
     rec["sent"] = _recent(rec["sent"], now, HOUR)
     rec["woken"] = _recent(rec["woken"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
+    rec["read"] = _recent(rec["read"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["claimed"] = _recent(rec["claimed"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     if len(rec["pending"]) > MAX_PENDING:
         rec["pending"] = dict(sorted(rec["pending"].items(), key=lambda kv: kv[1][3])[-MAX_PENDING:])
@@ -477,6 +479,7 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
     for k in (str(i) for i in m["posts"]):
         if k not in keep:
             rec["woken"].pop(k, None)   # no wake reached anyone for it: the dispatcher is not held back
+            rec["read"].pop(k, None)
         elif defer:
             rec["pending"][k] = keep[k]
         elif m.get("handed_at") is None:
@@ -518,9 +521,10 @@ def _matching(conn, agent: str, project: Any, now: float) -> list[dict]:
 def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> bool:
     """A hosted session has this request, so nothing else should be started for it: a session of `agent` in `project`
     that has not ended, on a node seen within nodes.NODE_STALE_SECONDS, and either a wake covering the post was
-    queued or handed less than `wake_grace_seconds` ago, or a session of the agent was handed the request (its
-    delivery receipt) at or after such a wake. A session that was never woken for the post, or was woken and did not
-    read it within the grace, holds nothing."""
+    queued or handed less than `wake_grace_seconds` ago, or the board showed the post to a session of the agent at
+    or after such a wake: in any view, to a board session in this project (`handed`, the record's `read`), or as a
+    delivery receipt. A session that was never woken for the post, or was woken and was not shown it, holds nothing
+    once the grace has passed."""
     conn = getattr(board_or_conn, "conn", board_or_conn)
     if type(post_id) is not int:
         return False
@@ -531,10 +535,54 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
             continue
         if now - at < rec["grace"]:
             return True
+        read = rec["read"].get(str(post_id))
+        if isinstance(read, (int, float)) and read >= at:
+            return True
         from . import delivery
         if delivery.read_since(conn, post_id, agent, at):
             return True
     return False
+
+
+def _unmarked(rec: dict, ids: list[int]) -> list[str]:
+    """Of these posts, the ones a wake covered that have no `read` mark at or after that wake."""
+    out = []
+    for k in (str(i) for i in ids):
+        woken, read = rec["woken"].get(k), rec["read"].get(k)
+        if isinstance(woken, (int, float)) and not (isinstance(read, (int, float)) and read >= woken):
+            out.append(k)
+    return out
+
+
+def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> None:
+    """Called where the board returns posts to a reader (Board.read_updates, every view): note, for `holds`, that a
+    board session of a hosted session's agent, registered in that session's project, was really shown a post a wake
+    had covered. This is not a delivery receipt (delivery.py keeps its own rule: an unfiltered read or the post_ids
+    view); it exists because a woken session may read with `only="addressed"`, which the wake's wording invites and
+    which leaves no receipt. Only what is in `posts`, the response itself, is noted. Never raises, and without a
+    hosted session of the reader it reads one key range and writes nothing."""
+    try:
+        ids = [] if p.is_human else [d["id"] for d in posts if p.name in (d.get("to") or [])]
+        mine = [r for r in hosted._sessions(board.conn)
+                if r.get("agent") == p.name and r.get("state") != "ended"] if ids else []
+        if not mine:
+            return
+        row = board.conn.execute("SELECT project FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        project = (row["project"].rstrip("/") or "/") if row else None
+        now = board.now()
+        for r in mine:
+            rec = _load(board.conn, r["session_id"]) if r.get("project") == project else None
+            if rec is None or not _unmarked(rec, ids):
+                continue        # nothing to note: no write (a re-read, or a post no wake covered)
+            with db.write_tx(board.conn) as c:
+                rec = _load(c, r["session_id"])
+                todo = _unmarked(rec, ids) if rec else []
+                for k in todo:
+                    rec["read"][k] = now
+                if todo:
+                    _save(c, r["session_id"], rec, now)
+    except Exception:
+        _complain("hosted sessions: could not note what a session was shown")
 
 
 def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:

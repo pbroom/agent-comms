@@ -644,6 +644,8 @@ def test_without_a_hosted_session_the_pass_writes_nothing_and_nothing_is_held(de
     assert hosted_wake.turn_projects(denv.board, denv.clock()) == set()
     denv.d.tick()
     assert launched(denv) == ["claude-fake"], "launched in the same pass, as before"
+    read = denv.board.read_updates(denv.p["claude"], denv.session("claude"), only="addressed")
+    assert post["id"] in [p["id"] for p in read["posts"]], "a read notes nothing either (hosted_wake.handed)"
     assert denv.board.conn.execute("SELECT key FROM board_state WHERE key LIKE 'host.%'").fetchall() == []
 
 
@@ -866,3 +868,55 @@ def test_the_undelivered_alert_is_not_posted_once_a_wake_covers_the_request(denv
     later(denv, GRACE + 1)
     alert = delivery._alert(denv.board, denv.p["human"], denv.d._fence(), denv.tid, entries, 10, denv.d._runner)
     assert f"request #{post['id']} to claude" in denv.board.get_post(denv.p["human"], alert)["body"]
+
+
+# ------------------------------------------------------------ what a woken session was shown (hosted_wake.handed)
+
+
+def test_a_filtered_read_after_the_wake_holds_without_a_delivery_receipt(senv, monkeypatch):
+    """Seen with a real session: woken, it called board_read_updates(only="addressed"). That view returns the post
+    and leaves no delivery receipt (delivery.py's rule, unchanged). The hold must not depend on how it read."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    reader = senv.session("claude")         # the board session the hosted process registers, in its project
+    tick(senv)
+    later(senv, GRACE)
+    now = senv.clock
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "woken, shown nothing, grace over"
+    out = senv.board.read_updates(senv.p["claude"], reader, only="addressed")
+    assert [p["id"] for p in out["posts"]] == [post["id"]]
+    assert delivery.receipt(senv.board.conn, post["id"], "claude") is None, "a filtered view is still no receipt"
+    assert senv.board.get_post(senv.p["codex"], post["id"])["requests"][0]["delivered_at"] is None
+    assert record(senv, sid)["read"] == {str(post["id"]): now()}
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "it was shown the post after the wake"
+    later(senv, 3600)
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now())
+    real, writes = db.write_tx, []
+    monkeypatch.setattr(db, "write_tx", lambda conn: writes.append(1) or real(conn))
+    hosted_wake.handed(senv.board, senv.p["claude"], reader, out["posts"])
+    assert writes == [], "a re-read notes nothing again"
+
+
+def test_only_the_agents_own_read_in_the_project_that_returned_the_post_counts(senv):
+    sid = ready(senv)
+    tid, other = senv.thread(), senv.thread()
+    post = ask(senv, tid)
+    tick(senv)
+    later(senv, GRACE)
+    now = senv.clock
+    shown = senv.board.read_updates(senv.p["grok"], senv.sid["grok"])           # another agent, same project
+    assert post["id"] in [p["id"] for p in shown["posts"]]
+    elsewhere = senv.board.read_updates(senv.p["claude"], senv.session("claude", P2), only="addressed")
+    assert post["id"] in [p["id"] for p in elsewhere["posts"]], "the agent's session in ANOTHER project is shown it too"
+    reader = senv.session("claude")
+    missed = senv.board.read_updates(senv.p["claude"], reader, thread_id=other, history=True)
+    assert missed["posts"] == [], "a call that did not return the post"
+    assert record(senv, sid)["read"] == {} and not hosted.holds(senv.board, "claude", PROJECT, post["id"], now())
+    later_post = ask(senv, tid, as_="grok")                                     # found, but no wake covers it yet
+    senv.board.read_updates(senv.p["claude"], reader, post_ids=[later_post["id"]])
+    assert record(senv, sid)["read"] == {}, "only a post a wake covered is noted"
+    assert not hosted.holds(senv.board, "claude", PROJECT, later_post["id"], now())
+    senv.board.read_updates(senv.p["claude"], reader, thread_id=tid, history=True)  # any view that returns it counts
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now())
+    assert not hosted.holds(senv.board, "claude", P2, post["id"], now())
+    assert not hosted.holds(senv.board, "grok", PROJECT, post["id"], now())

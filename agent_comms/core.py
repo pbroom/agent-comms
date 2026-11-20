@@ -1907,8 +1907,9 @@ class Board:
                 d["thread_title"] = rows[i]["thread_title"]
                 d["project"] = rows[i]["thread_project"]
                 posts.append(d)
-        from . import delivery
+        from . import delivery, hosted_wake
         delivery.record(self, p, session_id, posts)
+        hosted_wake.handed(self, p, session_id, posts)
         return {"notice": UNTRUSTED_NOTICE, "session_id": session_id, "paused": self.is_paused(), "posts": posts,
                 "missing": [i for i in ids if i not in rows], "more": False, "ack_through": None,
                 "how_to_ack": "This is a view only (post_ids): it neither reads nor moves your cursor."}
@@ -1992,6 +1993,10 @@ class Board:
         if not view_only:
             from . import delivery
             delivery.record(self, p, session_id, posts)
+        # Any view, filtered ones too: what a hosted session of the reader was really shown (hosted_wake.handed). Not
+        # a delivery receipt, and nothing is read or written unless the reader has a hosted session.
+        from . import hosted_wake
+        hosted_wake.handed(self, p, session_id, posts)
         from . import issues
         my_tasks = [self._task_out(r) for r in self.conn.execute(
             "SELECT * FROM tasks WHERE owner_agent = ? AND status NOT IN ('done','declined')", (p.name,))]

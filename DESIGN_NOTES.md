@@ -2454,9 +2454,24 @@ options of the question are answers, so both lift it; the second says to close t
 
 **The dispatcher** (`hosted.holds(board_or_conn, agent, project, post_id, now)`). True when a session of the agent
 in that project has not ended and is not being closed, its node was seen within `NODE_STALE_SECONDS`, and either a
-wake covering the post was queued or handed less than `wake_grace_seconds` ago, or a session of the agent was handed
-the request (a delivery receipt or reader record) at or after that wake. The record keeps when each post was last
-covered (`woken`) and the grace in force, so `holds` needs only a connection. It is asked in `_policy_held`, at the
+wake covering the post was queued or handed less than `wake_grace_seconds` ago, or the board showed the post to a
+session of the agent at or after that wake. "Showed" is either of two records. One is a delivery receipt or reader
+record (an unfiltered read or the `post_ids` view, by any session of the agent). The other is the watcher's own
+`read` mark, written by `hosted_wake.handed` where `Board.read_updates` returns posts, in EVERY view: when the
+reader is the hosted session's agent, its board session is registered in the session's project, and the response
+really contains a post a wake covered, the time is noted. The record also keeps when each post was last covered
+(`woken`) and the grace in force, so `holds` needs only a connection.
+
+*Why the second record* (observed, 2026-11-20). In two of eight real `--with-board` runs the woken session read the
+post and the hub had no delivery receipt. The second time the script printed the calls: `board_register({"project":
+<checkout>})`, whose result did not hold the post's body (open obligations are metadata only), then
+`board_read_updates({"only": "addressed"})`, whose result did. That call was made by the agent's board session 2,
+registered under the thread's project. A filtered view never records a receipt ("Delivery receipts"; that rule and
+the undelivered alert are unchanged), and the wake's own wording ("addressed to ...") invites the filter. So the
+hold must not depend on how the session read. The mark is not a receipt: it says nothing to the sender, the alert
+does not read it, and without a hosted session of the reader nothing is written. A session without board access is
+shown nothing, so it still holds nothing after the grace. After the change, five consecutive real runs passed, one
+of them again with `only="addressed"`: no receipt, `holds` true after the grace. It is asked in `_policy_held`, at the
 launch gate for all three kinds of rule, and by the undelivered alert. After the grace without a read it is False
 and the dispatcher launches as before: an idle hosted session that did not read a request holds nothing ("Fast
 pickup"). The dispatcher's own pass runs the watcher before launching, so a trigger it has just scanned is never
@@ -2468,6 +2483,10 @@ in each such session's record (`claimed`): it leaves `pending`, and a wake alrea
 node is shown that wake. The undelivered alert asks `holds` again in the transaction that posts it. `_busy_dirs` adds the run directory of a
 hosted session's project only while the hub has a message of that session in flight and its node is not lost
 (`hosted._lost`, the test PR 2 uses to fail such a turn).
+
+**Changes to core.py** (not PR 2's, but everybody's): `reserve_dispatch_launch` takes the optional `check`, and
+`read_updates` calls `hosted_wake.handed` at its two return points (the ordinary read, every view, and the
+`post_ids` view). Both do nothing without a hosted session.
 
 **Changes to PR 2's files** are small on purpose: `hosted.py` gains `holds` (a delegate), one call in `start`
 (`hosted_wake.begin`), two comment lines, and `node_sessions` is split in two with its body unchanged: the route's
@@ -2497,14 +2516,6 @@ directory, which in this run is the project path). It read the request and left 
 work was needed, and the session said it had not loaded the request-progress tool.
 
 **Residual risks / not verified.**
-- *A woken session can read a post and leave no receipt.* One of four real `--with-board` runs failed on exactly
-  this: the wake turn called `board_register` and `board_read_updates` once, its reply quoted the post, and the hub
-  held no receipt 90 s later. The arguments of that call were not kept (the script prints them since). An
-  unfiltered read and a `post_ids` read always record a receipt; a filtered or history view never does ("Delivery
-  receipts"), and the wake's own wording ("addressed to ...") invites `only="addressed"`. So the likely cause is a
-  filtered read, by elimination, not by observation. Effect: `holds` turns false after the grace and the dispatcher
-  may start a run beside a session that has the request. Not fixed here: the candidates are the wake text (say
-  "with the default arguments") or what counts as a receipt, and neither is this PR's to decide alone.
 - A hosted session that read a request after its wake and then does nothing keeps the dispatcher off that request
   until the session is closed, as a live session with a receipt already did under a delivery policy.
 - Checked only where the node's checkout path IS the thread's project (below): how a hosted Claude registers with

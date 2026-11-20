@@ -35,7 +35,9 @@ runs another, shorter scenario (two haiku turns) in which the session has ONE MC
 on the temp hub's database, signed in as the temp agent from a token file in the temp directory, with only that
 server's tools allowed. The second agent posts a request addressed to the hosted agent and the session is told
 nothing but the wake. The script reports what the session did (its tool calls, its reply, the board session it
-registered) and checks that the hub recorded a delivery receipt for the post and that `hosted.holds` is true for it
+registered, each board call's arguments and whether its result held the post) and checks that the hub noted the
+session was shown the post (hosted_wake.handed; a delivery receipt too when the read was unfiltered) and that
+`hosted.holds` is true for it
 once the wake's grace has passed.
 """
 from __future__ import annotations
@@ -110,6 +112,7 @@ rows = [dict(r) for r in c.execute("SELECT id, project, worktree, started_at, la
                                    "WHERE agent = ? ORDER BY id", (agent,))]
 print(json.dumps({"now": now, "holds": hosted.holds(board, agent, project, post_id, now),
                   "woken_at": (rec.get("woken") or {}).get(str(post_id)), "grace": rec.get("grace"),
+                  "shown_at": (rec.get("read") or {}).get(str(post_id)),
                   "receipt": delivery.receipt(c, post_id, agent), "readers": delivery.readers(c, post_id, agent),
                   "sessions": rows}))
 """
@@ -453,6 +456,21 @@ enabled = true
                 uses += [b for b in content or [] if isinstance(b, dict) and b.get("type") == "tool_use"]
         return uses
 
+    def tool_results(self, sid: str) -> dict[str, str]:
+        """What each tool call returned to the session (tool_use id -> the result, as text), from its transcript."""
+        out = {}
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                content = (ev.get("message") or {}).get("content") if ev.get("type") == "user" else None
+                for b in content if isinstance(content, list) else []:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        out[b.get("tool_use_id")] = json.dumps(b.get("content"))
+        return out
+
     def tool_calls(self, sid: str) -> list[str]:
         return [b.get("name", "?") for b in self.tool_uses(sid)]
 
@@ -489,7 +507,7 @@ enabled = true
         self.check(MARKER not in self.stdin_log.read_text(), "the stdin line holds no part of the post's body")
 
         deadline, state = time.monotonic() + BOARD_BOUND, self.probe(post["id"], sid)
-        while state["receipt"] is None and time.monotonic() < deadline:
+        while state["shown_at"] is None and time.monotonic() < deadline:
             time.sleep(0.5)
             state = self.probe(post["id"], sid)
         m2 = self.message(sid, 2, lambda m: m["ended_at"] is not None, 180)
@@ -498,21 +516,27 @@ enabled = true
         print(f"  wake turn: {m2['state']}" + (f", ended +{m2['ended_at'] - t1:.2f}s" if m2["ended_at"] else "")
               + (f"; tools denied: {view['denials']}" if view.get("denials") else ""))
         print(f"  tools the session called in the wake turn: {calls or 'none'}")
+        results = self.tool_results(sid)
         for use in self.tool_uses(sid)[len(before):]:
             if use.get("name", "").startswith("mcp__agent-comms__"):   # its own arguments, on the temp board
-                print(f"    {use['name'].removeprefix('mcp__agent-comms__')}({json.dumps(use.get('input'))[:300]})")
+                got = results.get(use.get("id"))
+                print(f"    {use['name'].removeprefix('mcp__agent-comms__')}({json.dumps(use.get('input'))[:300]})"
+                      f" -> the result held the post's body: "
+                      + ("no result seen" if got is None else "yes" if MARKER in got else "no"))
         print(f"  reply: {view['reply']!r}")
         posts = self.api(self.poster_token, "GET", f"/api/threads/{tid}/posts")["posts"]
         for p in posts:
             print(f"  thread {tid}: #{p['id']} by {p['agent']} ({p['type']}): {p['body'][:160]!r}")
         self.check(m2["state"] == "done", "the wake turn ran to its end")
-        self.check(state["receipt"] is not None,
-                   f"the hub recorded a delivery receipt for post #{post['id']} and {AGENT} within {BOARD_BOUND}s")
-        receipt = state["receipt"]
-        print(f"  receipt: board session {receipt['session_id']}, +{receipt['at'] - t1:.2f}s after the post "
-              f"(+{receipt['at'] - m2['delivered_at']:.2f}s after the wake was written)")
-        self.check(receipt["at"] >= m2["delivered_at"], "the receipt is dated after the wake was written: the read "
-                                                        "happened in the wake turn (the session was idle before it)")
+        self.check(state["shown_at"] is not None,
+                   f"the hub noted that a session of {AGENT} was shown post #{post['id']} within {BOARD_BOUND}s")
+        shown, receipt = state["shown_at"], state["receipt"]
+        print(f"  shown: +{shown - t1:.2f}s after the post (+{shown - m2['delivered_at']:.2f}s after the wake was "
+              "written); delivery receipt: "
+              + (f"board session {receipt['session_id']}, +{receipt['at'] - t1:.2f}s" if receipt
+                 else "none (a filtered view leaves none)"))
+        self.check(shown >= m2["delivered_at"], "it was shown after the wake was written: the read happened in the "
+                                                "wake turn (the session was idle before it)")
         self.check("mcp__agent-comms__board_read_updates" in calls, "the wake turn called board_read_updates")
         self.check(not {"Bash", "Edit", "Write", "NotebookEdit"} & set(calls), "... and no shell or file-writing tool")
 
@@ -523,13 +547,13 @@ enabled = true
         print(f"  holds: {state['holds']} at +{state['now'] - t1:.2f}s; wake covered the post at "
               f"+{state['woken_at'] - t1:.2f}s; wake_grace_seconds {state['grace']:g}; readers {state['readers']}")
         self.check(state["now"] - state["woken_at"] > state["grace"] and state["holds"] is True,
-                   "hosted.holds is true for the post after the grace: the receipt, dated after the wake, keeps it")
+                   "hosted.holds is true for the post after the grace: the session was shown it after the wake")
         print("  board sessions of the hosted agent (what it registered with):")
         for row in state["sessions"]:
             print(f"    session {row['id']}: project {row['project']!r}, worktree {row['worktree']!r}")
-        mine = next((row for row in state["sessions"] if row["id"] == receipt["session_id"]), {})
-        print(f"  the thread's project is {str(self.project)!r}: the reading session registered "
-              + ("under the SAME project" if mine.get("project") == str(self.project) else "under ANOTHER project"))
+        same = bool(state["sessions"]) and all(row["project"] == str(self.project) for row in state["sessions"])
+        print(f"  the thread's project is {str(self.project)!r}: the session registered "
+              + ("under the SAME project" if same else "under ANOTHER project"))
         self.open_pid = view["pid"]
         self.check(bool(self.open_pid) and alive(self.open_pid),
                    f"the session's process (pid {self.open_pid}) stays up")

@@ -461,8 +461,8 @@ also one you send just after a wake was queued.
   for good, close the session.
 - **With the dispatcher.** A request the session was just woken for is left to it: for `wake_grace_seconds` the
   dispatcher starts no run for it and the undelivered alert stays quiet. If a session of the agent reads the request
-  in that time, it stays with the session. If not, the dispatcher handles it exactly as it would without a hosted
-  session (workstream approval, delivery policy, limits). An open session holds no checkout: only while one of its
+  in that time (any `board_read_updates` view that returns it counts), it stays with the session. If not, the
+  dispatcher handles it exactly as it would without a hosted session (workstream approval, delivery policy, limits). An open session holds no checkout: only while one of its
   turns is running does a dispatched run for the same project wait, as it would behind another run. With no hosted
   session, nothing about the dispatcher changes.
 
