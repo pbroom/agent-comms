@@ -876,11 +876,14 @@ class Board:
     DISPATCH_TEMPORARY = ("paused", "fenced")
 
     def reserve_dispatch_launch(self, p: Principal, rule_id: int, agent: str,
-                                fence: tuple[str, str] | None = None) -> dict:
+                                fence: tuple[str, str] | None = None,
+                                check: Callable[[], str | None] | None = None) -> dict:
         """Atomically spend one launch from a rule, in one write transaction that also rechecks pause and,
         with `fence=(key, value)`, that board_state[key] still holds `value` (the dispatcher's ownership
         token, so a superseded loop cannot launch). Returns {"ok": True, "launches_left": n} or
-        {"ok": False, "reason": paused | fenced | revoked | expired | exhausted | not_allowed | invalid}."""
+        {"ok": False, "reason": paused | fenced | revoked | expired | exhausted | not_allowed | invalid}.
+        `check` runs last, inside the transaction, and refuses the launch by returning a reason (the dispatcher's
+        recheck that no hosted session took the request meanwhile, hosted_wake.reserve)."""
         self._require_human(p, "run the dispatcher")
         with db.write_tx(self.conn) as c:
             if fence is not None:
@@ -898,6 +901,9 @@ class Board:
                 return {"ok": False, "reason": state}
             if agent not in t["agents"]:
                 return {"ok": False, "reason": "not_allowed"}
+            refused = check() if check is not None else None
+            if refused:
+                return {"ok": False, "reason": refused}
             if t.get('kind') in BUDGET_KINDS and t['budget_day'] != int(self.now() // 86400):
                 t.update(budget_day=int(self.now() // 86400), launches_left=t['max_launches'], launches_used=0)
             if not t.get('unlimited'):

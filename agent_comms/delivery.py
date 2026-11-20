@@ -230,9 +230,13 @@ def _alert(board: Board, human: Principal, fence: tuple[str, str], thread_id: in
             raise Conflict("another dispatcher owns this board now")
         if board.is_paused():
             raise Conflict("the board is paused")
+        from . import hosted
+        thread = board.conn.execute("SELECT project FROM threads WHERE id = ?", (thread_id,)).fetchone()
         for (post_id, agent), key in zip(entries, keys):
             if _get(board.conn, key) is not None or receipt(board.conn, post_id, agent) is not None:
                 raise Conflict(f"{key} changed meanwhile")
+            if thread is not None and hosted.holds(board.conn, agent, thread["project"], post_id, now):
+                raise Conflict(f"a hosted session was woken for request #{post_id} meanwhile")
 
     def hook(post: dict) -> None:
         _insert(board.conn, POST_PREFIX + str(post["id"]),

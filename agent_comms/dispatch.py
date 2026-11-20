@@ -810,6 +810,7 @@ def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
 SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent",
            "max_runs_per_agent", "undelivered_alert_minutes")
 WORKTREE_PRUNE_SECONDS = 3600
+HOSTED_HOLDS = "hosted"     # reserve_dispatch_launch's reason when a hosted session took the request meanwhile
 
 
 @dataclass
@@ -1780,6 +1781,33 @@ class Dispatcher:
             log.exception("could not tell whether a hosted session has request %s", item.get("post_id"))
             return False
 
+    def _hosted_recheck(self, agent: str, item: dict, now: float) -> dict:
+        """The `check` for reserve_dispatch_launch (as keyword arguments; none without a hosted session, so the call
+        is then the one it always was): inside the reservation's own write transaction, the hold is asked again, and
+        a launch that is reserved takes the request away from any wake still waiting or queued for it
+        (hosted_wake.reserve). Managed continuations stay on their own path: no wake is ever for them."""
+        if not item.get("post_id") or item.get("managed"):
+            return {}
+        from . import hosted, hosted_wake
+        conn = self.board.conn
+        try:
+            thread = conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
+            if thread is None or not any(r.get("agent") == agent and r.get("state") != "ended"
+                                         for r in hosted._sessions(conn)):
+                return {}
+        except Exception:
+            log.exception("could not read the hosted sessions for request %s", item["post_id"])
+            return {}
+
+        def check() -> str | None:
+            try:
+                return None if hosted_wake.reserve(conn, agent, thread["project"], item["post_id"], now) \
+                    else HOSTED_HOLDS
+            except Exception:
+                log.exception("could not recheck the hosted hold for request %s", item["post_id"])
+                return None
+        return {"check": check}
+
     def _runtime(self, agent: str) -> str | None:
         row = self.board.conn.execute("SELECT runtime FROM agents WHERE name = ?", (agent,)).fetchone()
         return row["runtime"] if row else None
@@ -1977,7 +2005,8 @@ class Dispatcher:
                 del pending[key]
                 changed = True
                 continue
-            res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence())
+            res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence(),
+                                                     **self._hosted_recheck(agent, item, now))
             if not res["ok"]:
                 if res["reason"] == "fenced":
                     log.warning("another dispatcher owns this board now; this one stops launching")
@@ -1985,6 +2014,8 @@ class Dispatcher:
                     break
                 if res["reason"] == "paused":
                     break  # temporary: everything stays pending until the human unpauses
+                if res["reason"] == HOSTED_HOLDS:
+                    continue  # a hosted session was woken for it since the gate above: wait, as the gate would
                 rules = self.board.active_dispatch_rules(self.human)
                 if self._rule_for(rules, item) is None:  # permanent, and no other approval covers it
                     log.info("not launching %s for thread %s: rule %s is %s", agent, thread_id, rule["id"],

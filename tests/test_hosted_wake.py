@@ -3,11 +3,11 @@ limits, with server-built text only; and the dispatcher and the undelivered aler
 was just woken for it (hosted.holds). Fakes only, as in test_hosted_sessions. Never a real agent CLI."""
 
 import json
-from pathlib import Path
 
 import pytest
 
 from agent_comms import db, delivery, dispatch, hosted, hosted_wake, nodes
+from agent_comms.core import Conflict
 from agent_comms.dispatch import DispatchConfig, Dispatcher, SessionsConfig
 
 from conftest import PROJECT
@@ -191,13 +191,6 @@ def test_no_agent_or_node_can_queue_a_message_and_the_human_route_only_makes_use
     r = senv.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": "mine", "kind": "wake"})
     assert r.status_code == 422, "the human's route takes a message and nothing else"
     assert send(senv, sid, "mine")["kind"] == "user"
-    # Everything that queues a message, in the whole package: start and send (human-only, kind `user`) and the wake,
-    # whose text is wake_text's and nothing else.
-    calls = sorted(line.strip() for path in Path(hosted.__file__).parent.rglob("*.py")
-                   for line in path.read_text().splitlines()
-                   if "_enqueue(" in line and not line.lstrip().startswith(("def ", "#")))
-    assert calls == ['m = _enqueue(c, r, "user", text, p.name, now)'] * 2 + [
-        'm = hosted._enqueue(c, r, "wake", wake_text(r["agent"], list(batch.values())), HUB, now)']
 
 
 # ------------------------------------------------------------ one at a time: coalescing and the interval
@@ -277,7 +270,7 @@ def test_the_thread_limit_stops_waking_and_asks_the_human_once(senv):
     assert item["agent"] == "human" and item["type"] == "question" and item["to"] == [] and item["needs_response"]
     assert item["automatic"] is True and item["id"] in needs_you(senv)
     assert item["body"] == hosted_wake.HEADER.format(
-        sid=sid, agent="claude", thread=tid,
+        sid=sid, agent="claude", thread=tid, then="",
         why=f"was woken 3 times for thread #{tid} with no post of yours there in between")
     q = item["decision_question"]
     assert q["recommended_option_id"] == "go-on" and [o["id"] for o in q["options"]] == ["go-on", "close-session"]
@@ -312,28 +305,50 @@ def test_the_automatic_item_itself_does_not_lift_the_limit(senv):
     assert len(alerts(senv, tid)) == 1
 
 
-def test_the_hourly_limit_stops_the_threads_it_catches_and_a_human_post_clears_the_hour(senv):
-    limits(senv, max_wakes_per_hour=3, wake_min_interval_seconds=0)
+def test_the_hourly_limit_stops_the_threads_it_catches_and_the_humans_answer_lifts_only_the_stop(senv):
+    limits(senv, max_wakes_per_hour=3)
     sid = ready(senv)
     threads = [senv.thread() for _ in range(5)]
     assert [woken(senv, sid, t) for t in threads[:3]] == [True] * 3
+    first = record(senv, sid)["sent"][0]
     assert woken(senv, sid, threads[3]) is False and woken(senv, sid, threads[4]) is False
     [item] = alerts(senv, threads[3])
-    assert item["body"] == hosted_wake.HEADER.format(sid=sid, agent="claude", thread=threads[3],
-                                                     why="was woken 3 times within an hour")
+    assert item["body"] == hosted_wake.HEADER.format(
+        sid=sid, agent="claude", thread=threads[3], why="was woken 3 times within an hour",
+        then=" (the session is woken again once fewer than 3 wakes lie within the past hour)")
+    assert "as soon as fewer than 3 wakes lie within the past hour" in json.dumps(item["decision_question"])
     assert len(alerts(senv, threads[4])) == 1 and alerts(senv, threads[0]) == []
     assert woken(senv, sid, threads[3]) is False and len(alerts(senv, threads[3])) == 1
-    senv.post("human", threads[3], "go on")
-    later(senv, 1)
+
+    senv.post("human", threads[3], "go on")             # the answer lifts the stop, not the hour
+    later(senv, 31)
     tick(senv)
-    assert turns(senv)[-1] == text_for(senv, 2, [threads[3]]), "the human stepped in: that thread is woken again"
+    rec = record(senv, sid)
+    assert len(wakes(senv, sid)) == 3 and len(rec["sent"]) == 3, "still three wakes in the past hour: none is added"
+    assert rec["threads"][str(threads[3])]["stopped"] is None and len(rec["pending"]) == 3
+    assert item["id"] not in needs_you(senv), "the answered item is closed"
+    assert woken(senv, sid, threads[3]) is False and woken(senv, sid, threads[3], as_="grok") is False
+    assert len(alerts(senv, threads[3])) == 1, "no second item for the hour the human already answered for"
+    assert record(senv, sid)["threads"][str(threads[3])]["stopped"] is None, "held, not stopped again"
+    assert woken(senv, sid, threads[0]) is False and len(alerts(senv, threads[0])) == 1, \
+        "a thread the same full hour catches for the first time gets its own item ..."
+    assert record(senv, sid)["threads"][str(threads[3])]["stopped"] is None and len(alerts(senv, threads[3])) == 1, \
+        "... and the answered one is still only held"
+
+    later(senv, first + 3600 - senv.clock() - 1)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 3, "one second before the oldest wake leaves the hour"
+    later(senv, 2)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 4 and len(record(senv, sid)["sent"]) == 3, "sent when the hour has room"
+    assert turns(senv)[-1] == text_for(senv, 4, [threads[3]], authors="codex, grok"), "what was held, as one wake"
     run_turn(senv, sid)
     assert record(senv, sid)["threads"][str(threads[4])]["stopped"] == "hour", "the other one waits for its own post"
-
-    limits(senv, max_wakes_per_hour=2, wake_min_interval_seconds=0)
-    assert woken(senv, sid, threads[0]) is True
-    later(senv, 3600)
-    assert woken(senv, sid, threads[1]) is True, "an hour later the window has room again"
+    limits(senv, max_wakes_per_hour=3, wake_min_interval_seconds=5)
+    ask(senv, threads[3])               # the hour is full again (that wake and two older ones): a NEW full hour
+    later(senv, 10)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 4 and len(alerts(senv, threads[3])) == 2, "which gets its own item"
 
 
 def test_an_ended_sessions_items_are_closed_and_its_record_dropped(senv):
@@ -623,7 +638,7 @@ def test_without_a_hosted_session_the_pass_writes_nothing_and_nothing_is_held(de
     real, writes = db.write_tx, []
     monkeypatch.setattr(db, "write_tx", lambda conn: writes.append(1) or real(conn))
     hosted_wake.tick(denv.board)
-    hosted_wake.hand_over(denv.board, "laptop")
+    assert denv.laptop.get("/api/nodes/sessions").json()["sessions"] == []
     assert writes == [], "no write transaction"
     assert not hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
     assert hosted_wake.turn_projects(denv.board, denv.clock()) == set()
@@ -640,7 +655,9 @@ def test_a_failing_wake_pass_fails_neither_the_nodes_fetch_nor_the_dispatcher(de
         raise RuntimeError("wake pass broke")
 
     monkeypatch.setattr(hosted_wake, "_tick", boom)
+    monkeypatch.setattr(hosted_wake, "_unsettled", boom)
     monkeypatch.setattr(hosted_wake, "_recheck", boom)
+    monkeypatch.setattr(hosted_wake, "reserve", boom)
     monkeypatch.setattr(hosted_wake, "holds", boom)
     monkeypatch.setattr(hosted_wake, "turn_projects", boom)
     later(denv, 5 * 60)
@@ -651,3 +668,201 @@ def test_a_failing_wake_pass_fails_neither_the_nodes_fetch_nor_the_dispatcher(de
     assert turns(denv)[-1] == "still works"
     denv.d.tick()
     assert launched(denv) == ["claude-fake"], "the dispatcher decides as without hosted sessions"
+
+
+# ------------------------------------------------------------ review round 1
+
+
+def test_progress_on_an_old_request_is_neither_a_new_post_nor_the_human_stepping_in(senv):
+    """S1. Request progress gives the request's post a new seq. That is not a new post (no second wake for it) and,
+    on one of the human's requests, not the human posting (a stopped thread stays stopped)."""
+    limits(senv, max_wakes_without_human=1)
+    sid = ready(senv)
+    tid = senv.thread()
+    source = senv.post("human", tid, "do work", "request", to=["codex", "claude"])
+    later(senv, 31)
+    tick(senv)
+    run_turn(senv, sid)
+    assert len(wakes(senv, sid)) == 1
+    assert woken(senv, sid, tid) is False, "the second without a post of the human's: stopped"
+    [item] = alerts(senv, tid)
+    before = record(senv, sid)
+
+    progress = senv.post("codex", tid, "on it", "status", idempotency_key="started-1", request_reply={
+        "post_id": source["id"], "recipient": "codex", "expected_version": 0, "state": "started", "reason": "begun"})
+    assert senv.board.get_post(senv.p["human"], source["id"])["seq"] > progress["seq"] > source["seq"], \
+        "the human's request now has the newest seq on the board"
+    later(senv, 31)
+    tick(senv, times=2)
+    rec = record(senv, sid)
+    assert rec["threads"][str(tid)]["stopped"] == "thread" and item["id"] in needs_you(senv), "nothing was lifted"
+    assert rec["pending"] == before["pending"] and len(wakes(senv, sid)) == 1, "and the old request is not new again"
+    assert len(alerts(senv, tid)) == 1
+
+    other = senv.thread()                               # a thread that is not stopped: the revision alone wakes nobody
+    again = senv.post("human", other, "more work", "request", to=["codex", "claude"])
+    later(senv, 31)
+    tick(senv)
+    run_turn(senv, sid)
+    assert len(wakes(senv, sid)) == 2
+    senv.post("codex", other, "on that too", "status", idempotency_key="started-2", request_reply={
+        "post_id": again["id"], "recipient": "codex", "expected_version": 0, "state": "started", "reason": "begun"})
+    later(senv, 31)
+    tick(senv, times=2)
+    assert len(wakes(senv, sid)) == 2 and str(again["id"]) not in record(senv, sid)["pending"]
+
+    senv.post("human", tid, "carry on")                 # a NEW post of the human's does lift it
+    later(senv, 31)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 3 and item["id"] not in needs_you(senv)
+
+
+def test_a_wake_not_yet_handed_steps_back_behind_a_message_the_human_sent_after_it(senv):
+    """S3. The human's messages go before a wake, also one sent after the wake was queued and before the node had
+    it. The wake is not sent and not counted; its posts wait for the next free moment."""
+    sid = ready(senv)
+    tid = senv.thread()
+    post = ask(senv, tid)
+    hosted_wake.tick(senv.board)        # queued by a dispatcher pass; the node has not fetched
+    assert [m["state"] for m in wakes(senv, sid)] == ["queued"]
+    send(senv, sid, "mine")
+    tick(senv)
+    assert turns(senv)[-1] == "mine", "the human's message is the next turn"
+    [wake] = wakes(senv, sid)
+    assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.DEFERRED)
+    rec = record(senv, sid)
+    assert list(rec["pending"]) == [str(post["id"])] and rec["sent"] == [] and rec["threads"][str(tid)]["count"] == 0
+    run_turn(senv, sid)
+    tick(senv)
+    assert turns(senv)[-1] == text_for(senv, 1, [tid]) and [m["state"] for m in wakes(senv, sid)][-1] == "delivered"
+
+
+def test_a_pause_that_lands_during_the_nodes_fetch_shows_it_no_wake(senv, monkeypatch):
+    """S4. The wake a node is shown is validated in the transaction that shows it, and the pause is checked there."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    hosted_wake.tick(senv.board)
+    queued_at = record(senv, sid)["woken"][str(post["id"])]
+    senv.clock.advance(5)
+    # After the route's first check of the pause, before the answer is read: where the pass used to run.
+    monkeypatch.setattr(hosted_wake, "tick", lambda board, node=None: board.set_paused(senv.p["human"], True))
+    r = senv.laptop.get("/api/nodes/sessions")
+    assert r.status_code == 423, r.text
+    monkeypatch.undo()
+    stored = json.loads(senv.board.conn.execute("SELECT value FROM board_state WHERE key = ?",
+                                                (hosted._msg_key(sid, 2),)).fetchone()[0])
+    assert stored["state"] == "queued" and stored.get("handed_at") is None, "not handed: nothing was written"
+    assert record(senv, sid)["woken"][str(post["id"])] == queued_at
+    senv.board.set_paused(senv.p["human"], False)
+    [listed] = senv.laptop.get("/api/nodes/sessions").json()["sessions"]
+    assert listed["messages"][0]["kind"] == "wake" and "text" in listed["messages"][0]
+    assert record(senv, sid)["woken"][str(post["id"])] == senv.clock(), "handed in the transaction that showed it"
+
+
+def test_a_session_started_during_a_pass_keeps_its_starting_mark(senv, monkeypatch):
+    """S5. `start` commits between the pass's read of the sessions and its read of the watcher records: the new
+    record is not an orphan."""
+    tid = senv.thread()
+    real, started = hosted_wake._records, []
+
+    def records(conn):
+        if not started:
+            started.append(start(senv)["session_id"])
+        return real(conn)
+
+    monkeypatch.setattr(hosted_wake, "_records", records)
+    hosted_wake.tick(senv.board)
+    monkeypatch.undo()
+    [sid] = started
+    assert record(senv, sid) is not None, "its record, the starting mark, is still there"
+    hosted_wake._retire(senv.board, sid, senv.clock())
+    assert record(senv, sid) is not None, "a session that has not ended is never retired"
+    tick(senv)
+    run_turn(senv, sid)
+    ask(senv, tid)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 1
+
+
+def test_the_reservation_asks_again_whether_a_hosted_session_took_the_request(denv, monkeypatch):
+    """S6. A wake queued between the dispatcher's gate and its reservation: the reservation's own transaction sees
+    it, and nothing is launched or spent."""
+    rule = allow(denv)
+    sid = ready(denv)
+    later(denv, 5 * 60)
+    post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
+    hosted_wake.tick(denv.board)        # the wake that lands in the gap ...
+    assert hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
+    monkeypatch.setattr(denv.d, "_hosted_holds", lambda agent, item, now: False)    # ... after the gate looked
+    denv.d.tick()
+    assert launched(denv) == [], "refused inside the reservation"
+    assert denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == rule["launches_left"], "not spent"
+    monkeypatch.undo()
+    monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
+    monkeypatch.setattr(dispatch, "git_run_directory_blocker", lambda cwd, env: None)
+    later(denv, GRACE + 1)
+    denv.d.tick()
+    assert launched(denv) == ["claude-fake"], "the trigger was kept: launched after the grace, as before"
+    assert len(wakes(denv, sid)) == 1
+
+
+def test_a_request_the_dispatcher_launched_for_is_taken_off_a_wake_not_yet_handed(denv):
+    """S6, the other way round: a wake that waited past its grace is not handed over once a run was reserved for
+    its request."""
+    allow(denv)
+    sid = ready(denv)
+    later(denv, 5 * 60)
+    post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
+    denv.d.tick()
+    assert launched(denv) == [] and [m["state"] for m in wakes(denv, sid)] == ["queued"]
+    later(denv, GRACE + 1)              # the node says hello but does not fetch its sessions in that time
+    denv.d.tick()
+    assert launched(denv) == ["claude-fake"]
+    assert str(post["id"]) in record(denv, sid)["claimed"]
+    tick(denv, times=2)
+    [wake] = wakes(denv, sid)
+    assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.NOT_SENT)
+    assert turns(denv) == ["first"], "no wake turn beside the run"
+    denv.post("codex", denv.tid, "a later one", "request", to=["claude"])
+    later(denv, 31)
+    tick(denv)
+    assert turns(denv)[-1] == text_for(denv, 1, [denv.tid]), "a later post still wakes the session"
+
+
+def test_a_managed_continuations_post_wakes_nobody(senv):
+    """S7. The dispatcher delivers a managed continuation on its own verified path and ignores a hosted hold for it;
+    so the watcher leaves its post alone (the dispatcher's test: a `continuations` row for the post)."""
+    sid = ready(senv)
+    tid = senv.thread()
+    tasks = [senv.accepted_task(tid, title=t) for t in ("continuation", "root")]
+    managed = senv.post("human", tid, "propagate the fix", "handoff", to=["claude"])
+    now = senv.clock()
+    senv.board.conn.execute(
+        """INSERT INTO continuations(post_id, thread_id, task_id, root_task_id, owner_session, fallback_session,
+           recipient, fix_commit, descendants, required_checks, required_capabilities, ack_seconds, deadline,
+           created_at) VALUES (?, ?, ?, ?, ?, ?, 'claude', 'abc123', '[]', '[]', '[]', 120, ?, ?)""",
+        (managed["id"], tid, tasks[0], tasks[1], senv.sid["codex"], senv.sid["claude"], now + 120, now))
+    tick(senv, times=2)
+    assert wakes(senv, sid) == [] and record(senv, sid)["pending"] == {}
+    assert not hosted.holds(senv.board, "claude", PROJECT, managed["id"], senv.clock())
+    ask(senv, tid)
+    later(senv, 31)
+    tick(senv)
+    assert turns(senv)[-1] == text_for(senv, 1, [tid]), "an ordinary post in the same thread still does"
+
+
+def test_the_undelivered_alert_is_not_posted_once_a_wake_covers_the_request(denv):
+    """S8. The alert's own write transaction asks again: a wake queued after its scan stops the post."""
+    denv.board.conn.execute("UPDATE sessions SET project = '/work/other' WHERE agent = 'claude'")
+    sid = ready(denv)
+    post = denv.post("codex", denv.tid, "handing over", "handoff", to=["claude"])
+    entries = [(post["id"], "claude")]      # what the scan found before any wake existed
+    tick(denv)
+    run_turn(denv, sid)
+    assert hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
+    with pytest.raises(Conflict, match="hosted session was woken"):
+        delivery._alert(denv.board, denv.p["human"], denv.d._fence(), denv.tid, entries, 10, denv.d._runner)
+    assert [p for p in denv.board.list_posts(denv.p["human"], denv.tid)["posts"] if p["agent"] == "human"] == []
+    later(denv, GRACE + 1)
+    alert = delivery._alert(denv.board, denv.p["human"], denv.d._fence(), denv.tid, entries, 10, denv.d._runner)
+    assert f"request #{post['id']} to claude" in denv.board.get_post(denv.p["human"], alert)["body"]

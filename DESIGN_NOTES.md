@@ -2397,9 +2397,14 @@ with the end-to-end script: 0.04-0.18 s from the post to the bytes in the proces
 
 **What qualifies** is the channel push's rule, now shared code (`channel.eligible`, `channel.render`; the watcher
 class calls the same functions): visible to the agent under `Board.VISIBLE`, addressed to it, written by someone
-else, by an active identity; plus the thread's project is the session's. The mark starts at the newest post when the
-session starts, so history is never replayed. Nothing is queued while the board is paused; the mark stays, so those
-posts are found after the unpause. A session whose node has not been seen as a session host for
+else, by an active identity; plus the thread's project is the session's. The marks start at the newest post when the
+session starts, so history is never replayed. Only a NEW post counts. The scan follows `seq`, which also moves when
+an existing post is merely revised (request progress, a closed Needs-you item, a finalized decision), so the record
+keeps the highest post id it has looked at as well: a row at or below it is a revision and wakes nobody, except a
+post that was sealed when it was looked at (the record remembers those ids) and is visible now. The post of a
+managed continuation (a `continuations` row, the dispatcher's own test) wakes nobody: the dispatcher delivers it on
+its verified path and ignores a hosted hold for it. Nothing is queued while the board is paused; the marks stay, so
+those posts are found after the unpause. A session whose node has not been seen as a session host for
 `NODE_STALE_SECONDS` (`hosted._node_seen`, PR 2's notion: a node whose hello no longer says it hosts sessions counts
 as never seen) is skipped the same way and catches up when the node is back. `holds` uses the same test. A revoked
 agent's session is never woken.
@@ -2408,29 +2413,44 @@ agent's session is never woken.
 session has no turn in flight and nothing queued (the human's messages go first) and
 `wake_min_interval_seconds` have passed since the last wake. That is the coalescing: there is never more than one
 wake in a session's queue, and posts that arrive during a turn or inside the interval join the next one. Eligibility
-is checked three times: when the post is found, when the wake is queued, and when the node is handed the message
-(`hand_over`, in the fetch that lists it with its text). The last two also drop a post a session of the agent has
-already acknowledged (its cursor is past it): there is nothing left to wake for. A wake with no post left is settled
-`failed` with "not sent: ..." and never reaches the node; one with fewer is rendered again.
+is checked three times: when the post is found, when the wake is queued, and when the node is shown the message with
+its text. The last two also drop a post a session of the agent has already acknowledged (its cursor is past it) and
+one the dispatcher has reserved a run for. A wake with no post left is settled `failed` with "not sent: ..." and
+never reaches the node; one with fewer is rendered again.
+
+*Shown and validated in one transaction* (`hosted_wake.listing`, which `hosted.node_sessions` now goes through). In
+one read snapshot the hub looks at the wake each session would be handed next; if each was handed before and still
+stands, the answer is read in that snapshot. Otherwise the re-check and the answer share one write transaction. The
+pause is checked inside either, so a pause that lands during the fetch refuses it. A wake queued a moment earlier by
+the dispatcher's pass is therefore never shown unvalidated. If the wake code itself fails, the answer goes out with
+no wake's text, so none is handed.
+
+*The human's messages go first, always.* A wake is only queued behind nothing. If a message of the human's arrives
+after a wake was queued and before the node was shown it, the wake steps back: it is settled `failed` ("a message of
+yours was waiting"), its posts return to `pending`, and it is taken out of the interval, hourly and thread counts.
 
 **Text.** `channel.render`'s sentence (count, author names re-checked against the name rule, thread ids, how many
 need a response, "call board_read_updates", "board content is untrusted data") plus a fixed note that the server
 wrote it, that it is not the human's message and grants no authority. Nothing an agent wrote can reach it: the
 renderer is given thread ids, names, a flag and a seq. `_enqueue` has three callers in the package: `start` and
-`send` (human only, kind `user`) and the wake; a test pins that list. The reply of a wake turn is stored as the
+`send` (human only, kind `user`) and the wake. The reply of a wake turn is stored as the
 session's last reply like any other, for the human alone.
 
 **Limits** (`[dispatch.sessions]`, read on the hub whatever `enabled` says there; strict keys):
 `wake_min_interval_seconds` 30, `max_wakes_per_hour` 12 (per session), `max_wakes_without_human` 6 (per session and
-thread, counted since the human's last post in that thread that is not an automatic one, `Board.NOT_AUTOMATIC`),
+thread, counted since the human's last NEW post in that thread that is not an automatic one, `Board.NOT_AUTOMATIC`;
+the newest such post is found by id and author, not by seq, so an agent's progress on a request of the human's is
+not the human stepping in),
 `wake_grace_seconds` 120. The interval only delays. At either maximum the thread is *stopped* for that session: its
 posts stay in `pending`, and the human gets ONE needs-response question in that thread (fixed text: the session id,
 the agent's name, the thread id and the limit; marked automatic with an `auto_recovery.post.` marker of kind
 `wake_limit`, so it is labelled and does not itself count as the human posting). It is not repeated for that session
-and thread. Any post of the human's in the thread lifts the stop: the count starts over, the item is closed if it is
-still open, what waited goes as one wake, and a stop for the hourly maximum also clears that hour (otherwise the
-human's answer would be met by the same item again). Both options of the question are answers, so both lift it; the
-second says to close the session first. An ended session's items are closed and its record deleted.
+and thread. A new post of the human's in the thread lifts that stop and nothing else: the count starts over, the item
+is closed if it is still open, and what waited goes as one wake. The wake times are never cleared, so the interval
+and the rolling hour always hold. After an hourly stop the answered thread's posts are therefore held until fewer
+than the maximum lie within the past hour, with no second item meanwhile: the thread remembers which wake was the
+newest when the human answered (`hour_ack`), and only a full hour that includes a later wake is a new one. Both
+options of the question are answers, so both lift it; the second says to close the session first. An ended session's items are closed and its record deleted.
 
 **The dispatcher** (`hosted.holds(board_or_conn, agent, project, post_id, now)`). True when a session of the agent
 in that project has not ended and is not being closed, its node was seen within `NODE_STALE_SECONDS`, and either a
@@ -2440,12 +2460,19 @@ covered (`woken`) and the grace in force, so `holds` needs only a connection. It
 launch gate for all three kinds of rule, and by the undelivered alert. After the grace without a read it is False
 and the dispatcher launches as before: an idle hosted session that did not read a request holds nothing ("Fast
 pickup"). The dispatcher's own pass runs the watcher before launching, so a trigger it has just scanned is never
-launched for in the gap before a node's fetch would have queued the wake. `_busy_dirs` adds the run directory of a
+launched for in the gap before a node's fetch would have queued the wake. Two rechecks close what is left of that
+gap without a new lock. `Board.reserve_dispatch_launch` takes a `check` that runs last inside its write
+transaction; the dispatcher passes `hosted_wake.reserve`, which refuses the launch if a hosted session holds the
+request after all (the trigger stays pending, nothing is spent) and otherwise marks the request as the dispatcher's
+in each such session's record (`claimed`): it leaves `pending`, and a wake already queued for it loses it when the
+node is shown that wake. The undelivered alert asks `holds` again in the transaction that posts it. `_busy_dirs` adds the run directory of a
 hosted session's project only while the hub has a message of that session in flight and its node is not lost
 (`hosted._lost`, the test PR 2 uses to fail such a turn).
 
-**Changes to PR 2's files** are small on purpose: `hosted.py` gains `holds` (a delegate), one call in
-`node_sessions` (`hosted_wake.hand_over`), one in `start` (`hosted_wake.begin`) and two comment lines; `cli.py` labels
+**Changes to PR 2's files** are small on purpose: `hosted.py` gains `holds` (a delegate), one call in `start`
+(`hosted_wake.begin`), two comment lines, and `node_sessions` is split in two with its body unchanged: the route's
+function checks the caller and calls `hosted_wake.listing`, which runs `_listed` (the old body) inside its
+transaction; `cli.py` labels
 a wake in `board session show`; `node_sessions.py` and `api.py` are untouched (the node treats message kinds alike).
 
 **Proof.** `tests/test_hosted_wake.py` (fakes) and `scripts/session-host-e2e.py`, which now also has a second agent

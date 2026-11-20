@@ -371,7 +371,13 @@ def node_sessions(board: Board, p: Principal) -> dict:
     anything the node acts on does, so the node's long-poll can wait on it."""
     nodes._require_node(board, p)
     from . import hosted_wake
-    hosted_wake.hand_over(board, p.name)    # PR 3: queue the wakes that are due, re-check the one about to be handed
+    # PR 3: queue the wakes that are due; a wake is validated in the transaction that shows it (hosted_wake.listing).
+    return hosted_wake.listing(board, p.name, lambda: _listed(board, p))
+
+
+def _listed(board: Board, p: Principal) -> dict:
+    """node_sessions' answer, read inside the transaction hosted_wake.listing opened."""
+    nodes._require_node(board, p)       # again, in that transaction: a pause may have landed since the first check
     out, mark = [], []
     for r in sorted(_sessions(board.conn), key=lambda r: r["session_id"]):
         if r.get("node") != p.name or r.get("state") == "ended":
