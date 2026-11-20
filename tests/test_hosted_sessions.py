@@ -985,7 +985,8 @@ def test_a_session_process_that_ignores_sigterm_is_killed_within_its_grace_befor
 
     node.client = node.sessions.client = Stalling()
     shut_down(node)
-    assert stubborn.terminated >= 1 and run_child.terminated == 1
+    assert run_child.terminated == 1
+    assert stubborn.terminated == 1, "one SIGTERM: once it is killed and gone, the reporting phase signals nothing"
     assert kills and kills[0] == pytest.approx(10, abs=0.5), "killed when ITS grace was over, not 20 s of report later"
     assert [path for path, _ in posts] == ["/api/nodes/runs/run-1", f"/api/nodes/sessions/{sid}"]
     assert all(killed for _, killed in posts), "no report before the kill"
@@ -1029,6 +1030,39 @@ def test_a_late_older_report_cannot_undo_the_final_one(senv):
     senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "idle", "pid": None})
     assert (show(senv, sid)["state"], show(senv, sid)["pid"]) == ("idle", None)
     assert senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "seq": 0}).status_code == 400
+
+
+def test_after_a_restart_with_the_clock_set_back_the_new_process_is_heard_and_the_old_one_is_not(senv):
+    """The stamp that orders reports starts from the wall clock. If that clock ran ahead and is corrected across a
+    node restart, the new process would stamp below what the hub holds: the hub's own stored stamp is the floor."""
+    sid = start(senv)["session_id"]
+    listed = lambda: senv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+    post = lambda **body: senv.laptop.post(f"/api/nodes/sessions/{sid}", json=body)
+    senv.node.sessions.wall_ns = lambda: 9_000_000_000_000_000_000      # the old process's clock runs far ahead
+    tick(senv)
+    run_turn(senv, sid)
+    held = listed()["status_seq"]
+    assert held >= 9_000_000_000_000_000_000 and show(senv, sid)["state"] == "idle"
+
+    node = make_node(senv, log_dir=senv.tmp / "laptop-logs")       # restarted; the clock has been set back
+    node.sessions.wall_ns = lambda: 1_000
+    node.sessions.recover()
+    send(senv, sid, "after the restart")
+    tick(senv, node)
+    assert show(senv, sid)["state"] == "starting", "the new process's first status is applied, not ignored"
+    assert listed()["status_seq"] > held
+    # A report the old process sent before it died arrives now: its status is older than what the hub holds.
+    assert post(events=[], state="waiting", pid=4242, resume=True, seq=held).status_code == 200
+    view = show(senv, sid)
+    assert (view["state"], view["pid"]) == ("starting", children(senv, node)[0].pid)
+
+    # Even one stamped above everything the new process has sent (it was never applied before the restart) only
+    # holds until the node's next fetch: the node sees a stamp that is not its own and says again how things stand.
+    assert post(events=[], state="waiting", pid=4242, seq=listed()["status_seq"] + 10**6).status_code == 200
+    assert show(senv, sid)["pid"] == 4242
+    tick(senv, node)
+    view = show(senv, sid)
+    assert (view["state"], view["pid"]) == ("starting", children(senv, node)[0].pid)
 
 
 def test_settle_decides_again_inside_its_transaction(senv, monkeypatch):

@@ -2278,7 +2278,13 @@ message's write.
   hub later, so every report carries `seq` (wall-clock nanoseconds at send, forced to grow within the process, so
   it also grows across node restarts) and the hub keeps the highest it applied per session (`status_seq`): the
   status part (state, pid, resume) of a report that is not above it is ignored, while its events are applied as
-  ever (a message only moves forward). A report without `seq` is applied as it comes.
+  ever (a message only moves forward). A report without `seq` is applied as it comes. The wall clock alone is not
+  enough across a restart (set back, the new process would stamp below what the hub holds and go unheard), so the
+  hub is the floor: every fetch carries each session's `status_seq`, the node stamps above the highest it has seen,
+  and when a fetch shows a stamp that is not this process's last for that session (an old report that landed late
+  with a stamp from the clock that ran ahead) the node sends its status again.
+  After the kills nothing is signalled again: `SessionHost._stop` sends SIGTERM only while the process or its
+  group is still there, so the reporting phase cannot signal a process-group id that has since been reused.
   `node.shut_down` is `Node.stop_all()` with the session processes stopped alongside: SIGTERM to every run and
   every session process, one `kill_grace_seconds` for all of them from that moment, SIGKILL for what remains
   (`Node.signal_runs`/`runs_alive`/`kill_runs`, `SessionRunner.signal`/`alive`/`kill`), and only then the reports,

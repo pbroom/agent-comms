@@ -85,6 +85,8 @@ class SessionRunner:
         self.lock = threading.Lock()                  # the host, between the loop and shutdown()
         self.report_lock = threading.Lock()           # the report queue: one flush at a time, shutdown's last
         self.seq = 0                                  # the last report's stamp (`_stamp`)
+        self.hub_seq = 0                              # the highest stamp the hub says it applied, for any session
+        self.sent: dict[str, int] = {}                # session id -> stamp of this process's last status the hub took
         self.stopping = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -165,11 +167,15 @@ class SessionRunner:
                 return False
             return self._post_pending()
 
+    wall_ns = staticmethod(time.time_ns)
+
     def _stamp(self) -> int:
-        """An id for the next report that is above every earlier one of this node, this process's and (wall clock) a
-        previous one's: the hub ignores the status of a report that is not newer than the last it applied, so one
-        that arrives late (its call timed out here, then it committed there) cannot undo a later one."""
-        self.seq = max(self.seq + 1, time.time_ns())
+        """An id for the next report that is above every earlier one of this node: the hub ignores the status of a
+        report that is not newer than the last it applied, so one that arrives late (its call timed out here, then it
+        committed there) cannot undo a later one. Above this process's own last stamp, the wall clock, and the highest
+        stamp the hub says it applied (it comes with every fetch): the hub is the source of truth, so a clock that
+        was set back across a node restart can neither let an old report win nor get the new process ignored."""
+        self.seq = max(self.seq + 1, self.wall_ns(), self.hub_seq + 1)
         return self.seq
 
     def _post_pending(self) -> bool:
@@ -194,6 +200,7 @@ class SessionRunner:
                 log.warning("hub refused the report for session %s (%s); dropping it", sid, code)
             if status is not None:
                 self.reported[sid] = status
+                self.sent[sid] = body["seq"]
             taken = len(events)
             kept = []
             for item in self.pending:       # drop exactly the events that were sent, keep their order
@@ -279,6 +286,13 @@ class SessionRunner:
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
         for sid, view in listed.items():
+            applied = view.get("status_seq")
+            if type(applied) is int:
+                self.hub_seq = max(self.hub_seq, applied)
+                if applied > self.sent.get(sid, applied):
+                    # The hub applied a status that is not this process's last one (an earlier node process's
+                    # report arrived late, with a stamp from a clock that ran ahead): say again how it stands.
+                    self.reported.pop(sid, None)
             s = self.host.sessions.get(sid)
             if sid in self.ending:
                 if not any(x == sid and e["kind"] == "ended" for x, e in self.pending):
@@ -382,7 +396,7 @@ class SessionRunner:
                 self.last_busy[sid] = now
             if s.ended and s.child is None:
                 self.host.forget(sid)
-                for d in (self.status, self.reported, self.last_busy, self.queue):
+                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent):
                     d.pop(sid, None)
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:

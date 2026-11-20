@@ -380,7 +380,10 @@ def node_sessions(board: Board, p: Principal) -> dict:
                 item["text"], first = m.get("text"), False
             msgs.append(item)
         out.append({k: r.get(k) for k in ("session_id", "agent", "runtime", "project", "model", "stop")}
-                   | {"resume": r.get("resume") is True, "messages": msgs})
+                   | {"resume": r.get("resume") is True, "messages": msgs,
+                      # The stamp of the last status applied (`report`): the node stamps above it, whatever its
+                      # own clock says. Not part of `version`: it changes with the node's own reports.
+                      "status_seq": int(r.get("status_seq") or 0)})
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] for m in msgs]])
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
     return {"node": p.name, "sessions": out, "version": version}

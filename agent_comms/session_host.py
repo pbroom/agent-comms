@@ -455,7 +455,10 @@ class SessionHost:
     def _stop(self, s: Session, now: float) -> None:
         if s.child is not None and s.stopping_since is None:
             s.stopping_since = now
-            s.child.terminate()     # the whole process group (PopenChild)
+            # The whole process group (PopenChild). Not once all of it is known to be gone (a caller may have
+            # stopped it already, node.shut_down): its id could be another group's by now.
+            if s.child.poll() is None or self.group_alive(s.child.pid):
+                s.child.terminate()
 
     def _end(self, s: Session, detail: str, now: float, out: list[HostEvent]) -> None:
         s.ended, s.error, s.waiting = True, detail[:300], False
