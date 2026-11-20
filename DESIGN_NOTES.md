@@ -2399,8 +2399,10 @@ with the end-to-end script: 0.04-0.18 s from the post to the bytes in the proces
 class calls the same functions): visible to the agent under `Board.VISIBLE`, addressed to it, written by someone
 else, by an active identity; plus the thread's project is the session's. The mark starts at the newest post when the
 session starts, so history is never replayed. Nothing is queued while the board is paused; the mark stays, so those
-posts are found after the unpause. A session whose node has not been seen for `NODE_STALE_SECONDS` is skipped the
-same way and catches up when the node is back. A revoked agent's session is never woken.
+posts are found after the unpause. A session whose node has not been seen as a session host for
+`NODE_STALE_SECONDS` (`hosted._node_seen`, PR 2's notion: a node whose hello no longer says it hosts sessions counts
+as never seen) is skipped the same way and catches up when the node is back. `holds` uses the same test. A revoked
+agent's session is never woken.
 
 **One wake at a time.** Qualifying posts wait in the record (`pending`). They become ONE `wake` message when the
 session has no turn in flight and nothing queued (the human's messages go first) and
@@ -2439,7 +2441,8 @@ launch gate for all three kinds of rule, and by the undelivered alert. After the
 and the dispatcher launches as before: an idle hosted session that did not read a request holds nothing ("Fast
 pickup"). The dispatcher's own pass runs the watcher before launching, so a trigger it has just scanned is never
 launched for in the gap before a node's fetch would have queued the wake. `_busy_dirs` adds the run directory of a
-hosted session's project only while the hub has a message of that session in flight and its node is not lost.
+hosted session's project only while the hub has a message of that session in flight and its node is not lost
+(`hosted._lost`, the test PR 2 uses to fail such a turn).
 
 **Changes to PR 2's files** are small on purpose: `hosted.py` gains `holds` (a delegate), one call in
 `node_sessions` (`hosted_wake.hand_over`), one in `start` (`hosted_wake.begin`) and two comment lines; `cli.py` labels

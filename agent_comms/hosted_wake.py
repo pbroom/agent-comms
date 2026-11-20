@@ -390,12 +390,13 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
 
 def turn_projects(board_or_conn: Any, now: float) -> set[str]:
     """The projects in which a hosted session has a turn running now (Dispatcher._busy_dirs): the hub saw a message
-    reach the session's process and has not seen its turn end, and the node is not lost."""
+    reach the session's process and has not seen its turn end, and the node is not lost (hosted._lost: silent for
+    nodes.NODE_LOST_SECONDS, or no longer hosting sessions; the same test that fails such a turn on the human's
+    next read)."""
     conn = getattr(board_or_conn, "conn", board_or_conn)
     return {r["project"] for r in hosted._sessions(conn)
             if r.get("state") != "ended" and r.get("in_flight") is not None and isinstance(r.get("project"), str)
-            and now - max(hosted._node_seen(conn, r.get("node") or ""), float(r.get("node_reported_at") or 0))
-            <= nodes.NODE_LOST_SECONDS}
+            and not hosted._lost(conn, r, now)}
 
 
 # ---------------------------------------------------------------- telling the human

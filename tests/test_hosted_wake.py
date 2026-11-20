@@ -13,7 +13,8 @@ from agent_comms.dispatch import DispatchConfig, Dispatcher, SessionsConfig
 from conftest import PROJECT
 from test_channel import INJECTION, _revoke
 from test_dispatch import FakeProcs, FakeSpawner
-from test_hosted_sessions import HUB_DISPATCH, P2, children, run_turn, send, senv, show, start, tick  # noqa: F401
+from test_hosted_sessions import (HUB_DISPATCH, P2, children, make_node, node_config, run_turn, send,  # noqa: F401
+                                  senv, show, start, tick)
 
 MARKER = "WAKE-BODY-MARKER-7f3a"
 GRACE = 120
@@ -434,6 +435,31 @@ def test_holds_within_the_grace_then_only_with_a_read_after_the_wake(senv):
     assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now())
     assert senv.human.post(f"/api/hosted-sessions/{sid}/close").status_code == 200
     assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "a session being closed holds nothing"
+
+
+def test_a_node_that_no_longer_hosts_sessions_counts_as_not_connected(senv):
+    """hosted._node_seen: a node restarted with [dispatch.sessions] off keeps saying hello, but reads no session's
+    messages. Its sessions are not woken, hold nothing and keep no directory busy, until it hosts again."""
+    sid = ready(senv)
+    tid = senv.thread()
+    first = ask(senv, tid)
+    tick(senv)                          # woken, and the wake turn is in flight
+    now = senv.clock
+    assert hosted.holds(senv.board, "claude", PROJECT, first["id"], now())
+    assert hosted_wake.turn_projects(senv.board, now()) == {PROJECT}
+    plain = make_node(senv, config=node_config(senv, sessions={"enabled": False}), log_dir=senv.tmp / "plain-logs")
+    plain.hello()                       # the same node identity, now without sessions
+    assert not hosted.holds(senv.board, "claude", PROJECT, first["id"], now())
+    assert hosted_wake.turn_projects(senv.board, now()) == set()
+    mark = record(senv, sid)["mark"]
+    ask(senv, tid, as_="grok")
+    hosted_wake.tick(senv.board)
+    assert record(senv, sid)["mark"] == mark and len(wakes(senv, sid)) == 1, "skipped: its mark stays"
+    senv.node.hello()                   # hosting again
+    run_turn(senv, sid)
+    later(senv, 31)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 2 and turns(senv)[-1] == text_for(senv, 1, [tid], authors="grok")
 
 
 def test_a_receipt_from_before_the_wake_does_not_hold(senv):
