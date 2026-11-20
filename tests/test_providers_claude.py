@@ -91,7 +91,9 @@ def test_a_result_ends_the_turn_with_tool_names_only():
     assert (ev.kind, ev.ok, ev.denials) == ("turn_ended", True, ("Write",))
     assert ev.meta == {"subtype": "success", "is_error": False, "num_turns": 2, "duration_ms": 5600,
                        "total_cost_usd": 0.0036, "stop_reason": "end_turn", "terminal_reason": "completed"}
-    assert "note.txt" not in repr(ev) and "DENIED" not in repr(ev), "no tool input and no reply text"
+    assert "note.txt" not in repr(ev), "no tool input"
+    # PR 2: the reply travels in its own field (capped, for the human only); `meta` and `denials` never hold it.
+    assert ev.text == "DENIED" and "DENIED" not in repr(ev.meta) + repr(ev.denials)
 
 
 @pytest.mark.parametrize("change", [{"subtype": "error_during_execution", "is_error": True},
@@ -153,3 +155,19 @@ def test_the_seam_picks_the_adapter_by_the_runners_cli():
     with pytest.raises(ValueError):
         Event("made_up")
     assert providers.validate_model(None) is None and providers.validate_model("opus[1m]") == "opus[1m]"
+
+
+def test_a_refused_start_says_whether_the_session_exists():
+    """The two refusals as Claude Code 2.1.322 writes them to stderr before any turn (exit 1; DESIGN_NOTES "Session
+    host (PR 2)", checked live). The host flips its start mode on them, so the wording is pinned here."""
+    p, _ = session()
+    assert p.session_exists(f"Error: Session ID {SID} is already in use.\n") is True
+    assert p.session_exists(f"No conversation found with session ID: {SID}\n") is False
+    assert p.session_exists("") is None and p.session_exists("Error: something else went wrong\n") is None
+    assert p.session_exists(f"Error: Session ID {OTHER} is already in use.\n") is None, "another session's is not ours"
+    # The `result` Claude also writes for a refused --resume carries no init: it ends a turn, it confirms nothing.
+    refused = {"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 0,
+               "session_id": SID, "permission_denials": [],
+               "errors": [f"No conversation found with session ID: {SID}"]}
+    [ev], _ = p.feed(line(refused))
+    assert (ev.kind, ev.ok) == ("turn_ended", False)

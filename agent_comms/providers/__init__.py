@@ -16,7 +16,22 @@ from typing import Any, Callable, Protocol
 # names the tools it refused (names only, never their inputs) and `meta` holds small scalar facts about the turn.
 # `approval_requested`: the provider is waiting for someone to allow a tool (`denials` names it). `fatal`: this
 # session cannot go on (`detail` says why); the host ends it and no other session.
+# `text` (turn_ended only): the turn's reply, capped by `cap_reply`. It is for the human who sent the message and for
+# nobody else: the hub keeps the last one per session and never hands it to an agent (hosted.py).
 KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal")
+REPLY_MAX_BYTES = 16 * 1024
+REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
+
+
+def cap_reply(text: Any) -> str:
+    """A turn's reply as it may leave the node: valid UTF-8 and at most REPLY_MAX_BYTES, the marker that says it was
+    cut included. Capping a capped reply changes nothing."""
+    if not isinstance(text, str):
+        return ""
+    data = text.encode("utf-8", "replace")
+    if len(data) <= REPLY_MAX_BYTES:
+        return data.decode("utf-8", "replace")
+    return data[:REPLY_MAX_BYTES - len(REPLY_TRUNCATED.encode())].decode("utf-8", "ignore") + REPLY_TRUNCATED
 
 
 @dataclass(frozen=True)
@@ -27,6 +42,7 @@ class Event:
     meta: dict[str, Any] = field(default_factory=dict)
     denials: tuple[str, ...] = ()
     detail: str = ""
+    text: str = ""
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -59,6 +75,12 @@ class ProviderSession(Protocol):
     def interrupt(self) -> list[bytes] | None:
         """How to stop the turn in flight without ending the process, or None: the host terminates the process and
         starts it again (resuming) for the next message."""
+        ...
+
+    def session_exists(self, stderr: str) -> bool | None:
+        """What a process that went without ever confirming the session said about it on stderr: True, the session it
+        was told to create already exists (the next process must resume it); False, the one it was told to resume does
+        not (the next process must create it); None, neither. Optional: a provider without it never corrects the host."""
         ...
 
 

@@ -28,8 +28,10 @@ import httpx
 from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
-                       signed_in_browser_overrides, signed_in_profile, spawn_process, stop_verified,
+                       signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
                        with_headless_browser, with_writable_roots)
+from .node_sessions import SessionRunner
+from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
 log = logging.getLogger("agent_comms.node")
 
@@ -70,9 +72,19 @@ class Node:
     def __init__(self, client: httpx.Client, config: DispatchConfig, log_dir: Path,
                  spawner: Callable[..., Any] = spawn_process, clock: Callable[[], float] = time.monotonic,
                  probe: Callable[[Any, Any], str] = probe_process, start_of: Callable[[int], Any] = process_start,
-                 signal_group: Callable[[int, int], None] = _signal_group, sleep: Callable[[float], None] = time.sleep):
+                 signal_group: Callable[[int, int], None] = _signal_group, sleep: Callable[[float], None] = time.sleep,
+                 session_spawner: Callable[..., Any] = spawn_piped,
+                 session_group_alive: Callable[[int], bool] | None = None):
         self.client, self.config, self.log_dir, self.spawner, self.clock = client, config, log_dir, spawner, clock
         self.probe, self.start_of, self.signal_group, self.sleep = probe, start_of, signal_group, sleep
+        self.session_group_alive = session_group_alive
+        # Hosted sessions (node_sessions.py), only with [dispatch.sessions] enabled = true. They share this node's log
+        # directory, and have their own loop and thread: tick() below never touches them.
+        self.sessions: SessionRunner | None = SessionRunner(
+            client, config, log_dir, clock=clock, self_stop_seconds=SELF_STOP_SECONDS, spawner=session_spawner,
+            probe=probe, start_of=start_of, signal_group=signal_group, sleep=sleep,
+            **({} if session_group_alive is None else {"group_alive": session_group_alive}),
+        ) if config.sessions.enabled else None
         self.running: dict[str, _Local] = {}
         self.last_hello = float("-inf")
         self.last_contact = clock()
@@ -113,7 +125,25 @@ class Node:
         self.unreported_cwd = {rid: d["cwd"] for rid, d in left.items()
                                if isinstance(d, dict) and isinstance(d.get("cwd"), str)}
         self._save_state()
+        if self.sessions is None:
+            self._stop_left_sessions()      # with hosting on, the session runner's own recover() does this (run)
         return list(left)
+
+    def _stop_left_sessions(self) -> None:
+        """Hosting is off on this machine now, but an earlier node process may have hosted sessions and died with
+        their processes up (node-sessions.json). They are stopped as a hosting node stops them at its start
+        (`SessionHost.recover`: only a pid verified by its start time, its group killed, a bounded wait), which leaves
+        that file with no entries. Nothing is hosted, advertised or started for this, and with no such file nothing
+        is done and nothing is created. A failure here never keeps the node from starting."""
+        if not (self.log_dir / SESSION_STATE_FILE).exists():
+            return
+        try:
+            SessionHost(self.config, self.log_dir, clock=self.clock, probe=self.probe, start_of=self.start_of,
+                        signal_group=self.signal_group, sleep=self.sleep,
+                        **({} if self.session_group_alive is None else {"group_alive": self.session_group_alive}),
+                        ).recover()
+        except Exception:
+            log.exception("could not stop the session processes an earlier node process left")
 
     def _flush_unreported(self) -> None:
         """Report the runs recover() stopped. A report the hub refuses (4xx: it no longer knows the run, e.g. pruned
@@ -166,6 +196,8 @@ class Node:
         held = {k: v for k, v in self.config.runner_access.items() if k in self.config.runners}
         if held:        # only then: a hub older than this field refuses any hello that carries it
             body["access"] = held
+        if self.sessions is not None:   # only then: a hub older than this field refuses any hello that carries it
+            body["sessions"] = {"max_live": self.config.sessions.max_live}
         out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out
@@ -324,14 +356,28 @@ class Node:
 
     def stop_all(self) -> None:
         """Shutdown: terminate every run, wait the grace period, kill what remains, report each ended."""
+        self.signal_runs()
+        deadline = self.clock() + self.config.kill_grace_seconds
+        while self.runs_alive() and self.clock() < deadline:
+            self.sleep(0.2)
+        self.kill_runs()
+        self.report_stopped()
+
+    # stop_all's steps, so that shut_down can stop hosted sessions within the same grace period and before any report.
+
+    def signal_runs(self) -> None:
         for local in self.running.values():
             self._stop(local, "terminate")
-        deadline = self.clock() + self.config.kill_grace_seconds
-        while any(l.child.poll() is None for l in self.running.values()) and self.clock() < deadline:
-            self.sleep(0.2)
+
+    def runs_alive(self) -> bool:
+        return any(l.child.poll() is None for l in self.running.values())
+
+    def kill_runs(self) -> None:
         for local in self.running.values():
             if local.child.poll() is None:
                 self._stop(local, "kill")
+
+    def report_stopped(self) -> None:
         for rid, local in list(self.running.items()):
             del self.running[rid]
             self._remove_browser_output(rid)
@@ -339,6 +385,46 @@ class Node:
             self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down",
                          **({"checkout": c} if c is not None else {}))
         self._save_state()
+
+
+def shut_down(node: Node) -> None:
+    """SIGTERM or Ctrl-C: signal every child, wait one grace period for all of them, kill what remains, and only then
+    report. The ordinary runs get what `stop_all` gives them (the same signals, the same grace from their SIGTERM, the
+    same reports): this is `stop_all` with the hosted sessions' processes signalled, waited for and killed alongside,
+    so a session process that ignores SIGTERM is killed when its grace is over, not after the runs' reports (a report
+    can stall for the length of a hub call). Nothing the sessions do can keep the runs from being stopped and
+    reported: their steps are guarded, and if stopping the runs itself fails, `stop_all` is still attempted."""
+    sessions = node.sessions
+
+    def quietly(step, default=None):
+        try:
+            return step()
+        except Exception:
+            log.exception("hosted sessions: a shutdown step failed")
+            return default
+
+    stopped = False
+    try:
+        node.signal_runs()
+        deadline = node.clock() + node.config.kill_grace_seconds
+        if sessions is not None:
+            quietly(sessions.signal)
+        while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
+                and node.clock() < deadline:
+            node.sleep(0.2)
+        node.kill_runs()
+        if sessions is not None:
+            quietly(sessions.kill)
+        stopped = True
+    finally:
+        try:
+            if stopped:
+                node.report_stopped()
+            else:
+                node.stop_all()
+        finally:
+            if sessions is not None:
+                sessions.shutdown()     # its processes are gone: the bookkeeping, then its reports
 
 
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
@@ -354,9 +440,15 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                       timeout=CALL_TIMEOUT, trust_env=False) as client:
         node = Node(client, config, log_dir)
         node.recover()      # local cleanup first: it must not depend on reaching the hub
+        if node.sessions is not None:
+            node.sessions.recover()
         me = node.hello()
         print(f"node {me['node']} connected to {hub}: {len(me['projects'])} project(s), runners "
-              f"{', '.join(me['runners']) or 'none'}")
+              f"{', '.join(me['runners']) or 'none'}"
+              + (f", hosting up to {config.sessions.max_live} session(s)" if node.sessions is not None else ""),
+              flush=True)
+        if node.sessions is not None:
+            node.sessions.start()   # their own loop: a message starts a turn without waiting for poll_seconds
         try:
             while True:
                 try:
@@ -365,4 +457,8 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                     log.warning("hub unreachable: %s", e)
                 time.sleep(poll_seconds or config.poll_seconds)
         except KeyboardInterrupt:
-            node.stop_all()
+            shut_down(node)
+        except BaseException:
+            if node.sessions is not None:
+                node.sessions.shutdown()    # whatever ends this loop, no session process is left running behind it
+            raise

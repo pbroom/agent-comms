@@ -169,3 +169,13 @@ runners = []                # e.g. ["codex-cli"]: Codex runner keys only
 # command = "npx"           # the Playwright MCP server, run without a shell
 # args = ["--offline", "-y", "@playwright/mcp@0.0.83"]   # pinned; --offline never downloads at launch
 # browser = "chrome"        # chrome (installed Google Chrome), msedge, firefox or webkit
+
+# Hosted sessions (README "Hosted sessions"): `board node` on this machine keeps one long-lived agent process per
+# session and writes your messages to it as turns (`board session start|send|show|list|close`, human only). Off:
+# the node tells the hub nothing about sessions and starts none. Turn it on per machine in board.local.toml, and on
+# the hub allow the node its projects and agents under [dispatch.nodes.<name>] as for a node run. A runner that
+# bypasses permission checks (--dangerously-skip-permissions, --permission-mode bypassPermissions) is never hosted.
+[dispatch.sessions]
+enabled = false
+idle_hours = 8              # a session's process idle this long is stopped; the session stays, its next message resumes it
+max_live = 4                # session processes at once; one more stops the longest-idle one, or waits when none is idle

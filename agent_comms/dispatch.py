@@ -813,6 +813,39 @@ WORKTREE_PRUNE_SECONDS = 3600
 
 
 @dataclass
+class SessionsConfig:
+    """`[dispatch.sessions]`: hosted sessions on this machine's node (session_host.py, node_sessions.py). Off unless
+    `enabled = true`: only then does `board node` tell the hub it hosts sessions, and start any."""
+
+    enabled: bool = False
+    idle_hours: float = 8.0     # a session's process idle this long is stopped; its next message resumes it
+    max_live: int = 4           # session processes at once; one more stops the longest-idle one, or waits
+
+    @classmethod
+    def from_dict(cls, d: Any) -> "SessionsConfig":
+        where = "[dispatch.sessions]"
+        if not isinstance(d, dict):
+            raise ValueError(f"{where} must be a table")
+        c = cls()
+        for k, v in d.items():
+            if k == "enabled":
+                if not isinstance(v, bool):
+                    raise ValueError(f"{where} enabled must be true or false")
+                c.enabled = v
+            elif k == "idle_hours":
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 24 * 366:
+                    raise ValueError(f"{where} idle_hours must be a positive number of hours")
+                c.idle_hours = float(v)
+            elif k == "max_live":
+                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 50:
+                    raise ValueError(f"{where} max_live must be a whole number from 1 to 50")
+                c.max_live = v
+            else:
+                raise ValueError(f"unknown setting {where} {k}")
+        return c
+
+
+@dataclass
 class DispatchConfig:
     """The `[dispatch]` section of board.toml, with board.local.toml merged over it."""
 
@@ -836,6 +869,7 @@ class DispatchConfig:
     kill_grace_seconds: float = 10.0
     nodes: dict[str, dict] = field(default_factory=dict)   # node name -> {projects, agents} it may take (nodes.py)
     undelivered_alert_minutes: float = 0.0   # 0 = off when unset; the shipped board.toml sets 10 (delivery.py)
+    sessions: SessionsConfig = field(default_factory=SessionsConfig)   # hosted sessions on this machine's node
 
     @classmethod
     def load(cls, path: Path | None = None, local: bool = True) -> "DispatchConfig":
@@ -932,6 +966,8 @@ class DispatchConfig:
                 c.runner_access = access.parse_table(v)
             elif k == "browser_profiles":
                 c.browser_profiles = validate_browser_profiles(v)
+            elif k == "sessions":
+                c.sessions = SessionsConfig.from_dict(v)
             else:
                 raise ValueError(f"unknown setting [dispatch] {k}")
         c.headless_browser.check_runners(c.runners)
