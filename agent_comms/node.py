@@ -31,6 +31,7 @@ from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_co
                        signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
                        with_headless_browser, with_writable_roots)
 from .node_sessions import SessionRunner
+from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
 log = logging.getLogger("agent_comms.node")
 
@@ -76,6 +77,7 @@ class Node:
                  session_group_alive: Callable[[int], bool] | None = None):
         self.client, self.config, self.log_dir, self.spawner, self.clock = client, config, log_dir, spawner, clock
         self.probe, self.start_of, self.signal_group, self.sleep = probe, start_of, signal_group, sleep
+        self.session_group_alive = session_group_alive
         # Hosted sessions (node_sessions.py), only with [dispatch.sessions] enabled = true. They share this node's log
         # directory, and have their own loop and thread: tick() below never touches them.
         self.sessions: SessionRunner | None = SessionRunner(
@@ -123,7 +125,25 @@ class Node:
         self.unreported_cwd = {rid: d["cwd"] for rid, d in left.items()
                                if isinstance(d, dict) and isinstance(d.get("cwd"), str)}
         self._save_state()
+        if self.sessions is None:
+            self._stop_left_sessions()      # with hosting on, the session runner's own recover() does this (run)
         return list(left)
+
+    def _stop_left_sessions(self) -> None:
+        """Hosting is off on this machine now, but an earlier node process may have hosted sessions and died with
+        their processes up (node-sessions.json). They are stopped as a hosting node stops them at its start
+        (`SessionHost.recover`: only a pid verified by its start time, its group killed, a bounded wait), which leaves
+        that file with no entries. Nothing is hosted, advertised or started for this, and with no such file nothing
+        is done and nothing is created. A failure here never keeps the node from starting."""
+        if not (self.log_dir / SESSION_STATE_FILE).exists():
+            return
+        try:
+            SessionHost(self.config, self.log_dir, clock=self.clock, probe=self.probe, start_of=self.start_of,
+                        signal_group=self.signal_group, sleep=self.sleep,
+                        **({} if self.session_group_alive is None else {"group_alive": self.session_group_alive}),
+                        ).recover()
+        except Exception:
+            log.exception("could not stop the session processes an earlier node process left")
 
     def _flush_unreported(self) -> None:
         """Report the runs recover() stopped. A report the hub refuses (4xx: it no longer knows the run, e.g. pruned

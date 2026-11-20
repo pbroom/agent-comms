@@ -2358,8 +2358,12 @@ write, the queued turn written 0.00 s after the long one ended, one process for 
 - The start-mode correction reads Claude Code's two refusal messages as 2.1.322 writes them. If a later version
   words them differently a wrong guess no longer heals: every message of that session then fails with the process's
   exit until the session is closed. An adapter test pins the two strings.
-- A node restarted with `[dispatch.sessions]` off does not run `SessionHost.recover()`: session processes left by a
-  node that crashed (a clean stop ends them) stay up until hosting is enabled again or they are stopped by hand.
+- A node restarted with `[dispatch.sessions]` off still stops what a hosting node process left when it crashed:
+  `Node.recover()` runs `SessionHost.recover()` once over `node-sessions.json` (verified pid and start time only,
+  the group killed, a bounded wait; the file is left with no entries). It hosts nothing, sends no `sessions` in
+  hello and starts no thread, and without that file it does nothing and creates nothing. What remains: a process
+  whose pid or start time no longer verifies is never signalled (as for runs), and `node-session-handed.json` and
+  `node-session-seq.json` stay where they are for the next time hosting is on.
 - `--append-system-prompt` together with a runner's own `--append-system-prompt-file` was not tried.
 - `--wait` has no timeout of its own: a message for a node that never comes back stays queued and the CLI keeps
   waiting (it says so once). Ctrl-C stops the wait, not the message.

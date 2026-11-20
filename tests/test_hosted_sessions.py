@@ -1289,6 +1289,47 @@ def test_shutdown_stops_every_process_and_reports_the_turn_in_flight_failed(senv
     assert senv.node.sessions.pass_once() is not None and len(children(senv)) == 2, "a stopped runner starts nothing"
 
 
+def test_a_node_restarted_without_hosting_still_stops_the_session_processes_the_last_one_left(senv):
+    """The node crashed with a hosted turn running and comes back with [dispatch.sessions] off: nobody else would
+    ever stop that process, and the node's hello says it hosts nothing."""
+    sid = start(senv)["session_id"]
+    tick(senv)
+    [left] = children(senv)
+    logs = senv.tmp / "laptop-logs"
+    state = logs / "node-sessions.json"
+    assert json.loads(state.read_text())[sid]["pid"] == left.pid
+    threads = threading.active_count()
+
+    off = make_node(senv, config=node_config(senv, sessions={"enabled": False}), log_dir=logs)
+    off.procs.external[left.pid] = f"start-{left.pid}"      # still alive, and verifiably the recorded process
+    senv.groups.add(left.pid)                               # ... with a tool process that ignores SIGTERM
+    sent = []
+    off._call = lambda method, path, **kw: sent.append(kw.get("json")) or {}
+    off.recover()
+    assert (left.pid, signal.SIGTERM) in senv.signals and (left.pid, signal.SIGKILL) in senv.signals
+    assert json.loads(state.read_text()) == {}, "nothing is left on record"
+    off.hello()
+    assert off.sessions is None and "sessions" not in sent[0] and threading.active_count() == threads, \
+        "cleaning up is not hosting: nothing advertised, nothing started"
+    assert children(senv, off) == []
+
+    # Only a process that is verifiably the recorded one is signalled: a reused pid is left alone.
+    state.write_text(json.dumps({sid: {"pid": 4321, "proc_start": "start-of-the-old-process", "resume": True}}))
+    again = make_node(senv, config=node_config(senv, sessions={"enabled": False}), log_dir=logs)
+    again.procs.external[4321] = "start-of-something-else"
+    del senv.signals[:]
+    again.recover()
+    assert senv.signals == [] and json.loads(state.read_text()) == {}
+
+
+def test_without_a_session_state_file_a_node_that_does_not_host_touches_nothing(senv):
+    logs = senv.tmp / "fresh-logs"
+    off = make_node(senv, config=node_config(senv, sessions={"enabled": False}), log_dir=logs)
+    assert off.recover() == [] and senv.signals == []
+    assert sorted(x.name for x in logs.iterdir()) == ["node-runs.json"], \
+        "only the node's own run record, as before: no session file, no sessions directory"
+
+
 def test_the_nodes_own_loop_never_touches_sessions(senv):
     """Node.tick() is the run loop (poll_seconds); sessions have their own."""
     sid = start(senv)["session_id"]
