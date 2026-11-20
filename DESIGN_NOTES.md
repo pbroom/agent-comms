@@ -2497,6 +2497,14 @@ directory, which in this run is the project path). It read the request and left 
 work was needed, and the session said it had not loaded the request-progress tool.
 
 **Residual risks / not verified.**
+- *A woken session can read a post and leave no receipt.* One of four real `--with-board` runs failed on exactly
+  this: the wake turn called `board_register` and `board_read_updates` once, its reply quoted the post, and the hub
+  held no receipt 90 s later. The arguments of that call were not kept (the script prints them since). An
+  unfiltered read and a `post_ids` read always record a receipt; a filtered or history view never does ("Delivery
+  receipts"), and the wake's own wording ("addressed to ...") invites `only="addressed"`. So the likely cause is a
+  filtered read, by elimination, not by observation. Effect: `holds` turns false after the grace and the dispatcher
+  may start a run beside a session that has the request. Not fixed here: the candidates are the wake text (say
+  "with the default arguments") or what counts as a receipt, and neither is this PR's to decide alone.
 - A hosted session that read a request after its wake and then does nothing keeps the dispatcher off that request
   until the session is closed, as a live session with a receipt already did under a delivery policy.
 - Checked only where the node's checkout path IS the thread's project (below): how a hosted Claude registers with

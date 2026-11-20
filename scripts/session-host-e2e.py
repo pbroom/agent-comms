@@ -440,9 +440,9 @@ enabled = true
             raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
         return json.loads(r.stdout)
 
-    def tool_calls(self, sid: str) -> list[str]:
-        """The tools the session's process called, in order, from its transcript on the node."""
-        names = []
+    def tool_uses(self, sid: str) -> list[dict]:
+        """The tool calls the session's process made, in order, from its transcript on the node."""
+        uses = []
         for path in self.node_home.rglob(f"{sid}.jsonl"):
             for line in path.read_text().splitlines():
                 try:
@@ -450,9 +450,11 @@ enabled = true
                 except ValueError:
                     continue
                 content = (ev.get("message") or {}).get("content") if ev.get("type") == "assistant" else None
-                names += [b.get("name", "?") for b in content or []
-                          if isinstance(b, dict) and b.get("type") == "tool_use"]
-        return names
+                uses += [b for b in content or [] if isinstance(b, dict) and b.get("type") == "tool_use"]
+        return uses
+
+    def tool_calls(self, sid: str) -> list[str]:
+        return [b.get("name", "?") for b in self.tool_uses(sid)]
 
     def board_scenario(self) -> None:
         """A real session with the temp board's tools: is a wake enough for it to read the board? Reports what the
@@ -496,6 +498,9 @@ enabled = true
         print(f"  wake turn: {m2['state']}" + (f", ended +{m2['ended_at'] - t1:.2f}s" if m2["ended_at"] else "")
               + (f"; tools denied: {view['denials']}" if view.get("denials") else ""))
         print(f"  tools the session called in the wake turn: {calls or 'none'}")
+        for use in self.tool_uses(sid)[len(before):]:
+            if use.get("name", "").startswith("mcp__agent-comms__"):   # its own arguments, on the temp board
+                print(f"    {use['name'].removeprefix('mcp__agent-comms__')}({json.dumps(use.get('input'))[:300]})")
         print(f"  reply: {view['reply']!r}")
         posts = self.api(self.poster_token, "GET", f"/api/threads/{tid}/posts")["posts"]
         for p in posts:
