@@ -17,8 +17,9 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   probes are injected. Pipes are non-blocking, so a child that stops reading or writing delays nothing.
 - One turn in flight per session. A message counts as delivered once its bytes are in the child's stdin, not before.
 - A turn that outlives the timeout gets its process group SIGTERMed (SIGKILL after the grace period) and is reported
-  failed. The session is then dormant (no process); the next message starts a process that resumes the provider's
-  session. A turn that was cut short is never written again by the host.
+  failed. Once the whole group is gone (not just its leader: a tool process may outlive it) the session is dormant
+  (no process); the next message starts a process that resumes the provider's session. A turn that was cut short is
+  never written again by the host.
 - Every stdout line is appended to `<log dir>/sessions/<session id>.jsonl` (mode 600). The live processes are listed
   in `<log dir>/node-sessions.json`, so a host that starts after a crash stops what the last one left (`recover`,
   verified by pid and start time like node.py's runs) before it starts anything.
@@ -45,6 +46,18 @@ STATE_FILE = "node-sessions.json"   # session id -> {pid, proc_start, ...}: what
 SESSIONS_DIR = "sessions"           # <session id>.jsonl (stdout) and <session id>.stderr.log
 STATES = ("starting", "idle", "running", "waiting", "ended")
 MESSAGE_ID_MAX = 200
+
+
+def group_alive(pgid: int) -> bool:
+    """Whether any process is left in this process group (signal 0: nothing is sent). A group this user may not
+    signal is not one of ours."""
+    if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -134,10 +147,11 @@ class SessionHost:
                  start_of: Callable[[int], Any] = process_start,
                  signal_group: Callable[[int, int], None] = _signal_group,
                  sleep: Callable[[float], None] = time.sleep,
+                 group_alive: Callable[[int], bool] = group_alive,
                  provider_for: Callable[[list[str]], Callable[[], ProviderSession] | None] = providers.provider_for):
         self.config, self.log_dir, self.spawner, self.clock = config, Path(log_dir), spawner, clock
         self.probe, self.start_of, self.signal_group, self.sleep = probe, start_of, signal_group, sleep
-        self.provider_for = provider_for
+        self.provider_for, self.group_alive = provider_for, group_alive
         self.timeout_minutes = float(config.timeout_minutes if timeout_minutes is None else timeout_minutes)
         if not self.timeout_minutes > 0:
             raise ValueError("timeout_minutes must be positive")
@@ -304,9 +318,16 @@ class SessionHost:
     def _read(self, s: Session, now: float, out: list[HostEvent]) -> None:
         for line in s.child.read_lines():
             self._tee(s, line)
-            if s.stopping_since is not None or s.ended:
-                continue        # kept in the transcript only: this process's turn was already given up
+            if s.ended:
+                continue
             events, replies = s.provider.feed(line)
+            if s.stopping_since is not None:
+                # This process's turn was already given up: its late turn events are dropped. That the provider's
+                # session exists still counts, or the next process would start it anew and be refused.
+                if any(ev.kind == "ready" for ev in events) and not s.resume:
+                    s.resume = True
+                    self._save_state()
+                continue
             for data in replies:
                 s.outbuf += data
             for ev in events:
@@ -343,6 +364,8 @@ class SessionHost:
         code = s.child.poll()
         if code is None:
             return
+        if s.stopping_since is not None and self.group_alive(s.child.pid):
+            return      # the host stopped it and its leader is gone, but not its group: nothing starts beside that
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
@@ -481,19 +504,22 @@ class SessionHost:
     # ------------------------------------------------------------ shutdown
 
     def stop_all(self) -> list[HostEvent]:
-        """Shutdown: terminate every session's process, wait the grace period, kill what remains. A turn in flight is
-        reported failed. Sessions are not ended: a later host may reopen them with resume."""
+        """Shutdown: terminate every session's process group, wait the grace period, kill what remains of each group
+        (its leader may be gone while a member is not). A turn in flight is reported failed. Sessions are not ended:
+        a later host may reopen them with resume."""
         out: list[HostEvent] = []
         now = self.clock()
         live = [s for s in self.sessions.values() if s.child is not None]
         for s in live:
             self._fail(s, "the session host shut down", out)
             self._stop(s, now)
+        def going(s: Session) -> bool:
+            return s.child.poll() is None or self.group_alive(s.child.pid)
         deadline = self.clock() + self.kill_grace
-        while any(s.child.poll() is None for s in live) and self.clock() < deadline:
+        while any(going(s) for s in live) and self.clock() < deadline:
             self.sleep(0.2)
         for s in live:
-            if s.child.poll() is None:
+            if going(s):
                 s.child.kill()
             self._read(s, now, out)     # the transcript keeps what was written until the end
             close = getattr(s.child, "close", None)

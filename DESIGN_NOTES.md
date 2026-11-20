@@ -2132,7 +2132,11 @@ a lower-case UUID (it is an argv element and a file name). The environment is `c
 **Turns.** One in flight per session. `delivered` is emitted once every byte of the line is in the child's stdin; a
 partial write is carried to the next pass. A turn past `timeout_minutes` (constructor argument, default
 `[dispatch] timeout_minutes`) gets SIGTERM for its process group, SIGKILL after `kill_grace_seconds`, and is reported
-`turn_ended ok=False`; queued messages wait until the old process is gone, then a new one resumes the session. Every
+`turn_ended ok=False`; queued messages wait until the old process GROUP is gone, then a new one resumes the session.
+After any stop the host asked for (timeout, close, a failed write, shutdown) the leader's exit is not enough: a tool
+process in its group may ignore SIGTERM and keep writing, so the host probes the group (`killpg` with signal 0,
+injected as `group_alive`), sends the group SIGKILL after the grace period even when the leader is already gone, and
+starts nothing for that session until the group is empty. A process that exits by itself is not held this way. Every
 way a turn can be lost (timeout, the process exits, a write fails, the session ends, the host shuts down) consumes
 that one message and reports it failed, with `delivered=False` when it never reached the process. The host never
 writes a message twice, so nothing can loop without new input. A session resumes (`--resume`) only after the provider
@@ -2166,9 +2170,15 @@ none`, an empty temp directory, six small turns in four processes):
 - *(c) Resume.* `--resume <uuid>` with stream-json reports the same session id in `init` and `result`, and the
   conversation's earlier turns are there. Also checked: SIGTERM mid-turn exits with 143 within 0.3 s and writes no
   `result`; `--resume` afterwards works and the cut turn was not replayed.
+- *Session id already used* (seen in review of PR 1, same version): starting with `--session-id` for a session that
+  already exists fails with "Error: Session ID <uuid> is already in use." So an `init` that arrives while the host is
+  stopping a process still marks the session resumable (its late turn events are dropped); otherwise the session
+  could never start again.
 
-**Residual risks / not verified.** A turn cut before its first `init` restarts with `--session-id`; whether Claude
-then refuses the id as already used was not checked (the turn would fail and say so). Claude's in-band interrupt and
+**Residual risks / not verified.** A turn cut before its process wrote any `init` restarts with `--session-id`; if
+Claude had already created the session, that start is refused as above and the turn fails. After the leader exits,
+the group probe is by process-group id alone: if that id were reused within the grace period by another group of the
+same user, that group would get the SIGKILL. Claude's in-band interrupt and
 `can_use_tool` control requests were not exercised: the adapter interrupts by SIGTERM and leaves such a request
 unanswered (reported as `approval_requested`; the timeout ends the turn). `--resume` finds a session only from the
 directory it was created in. A stdout line over 32 MiB is handed on in pieces and so is not parsed. An older Claude

@@ -81,14 +81,15 @@ def make_host(henv, **kw):
     return SessionHost(henv.config, henv.log_dir, timeout_minutes=kw.pop("timeout_minutes", 30),
                        spawner=kw.pop("spawner", henv.spawner), clock=henv.clock, probe=henv.procs.probe,
                        start_of=henv.procs.start, signal_group=lambda pid, sig: henv.signals.append((pid, sig)),
-                       sleep=lambda s: henv.clock.advance(s), **kw)
+                       sleep=lambda s: henv.clock.advance(s), group_alive=lambda pid: pid in henv.groups, **kw)
 
 
 @pytest.fixture
 def henv(tmp_path):
     work = tmp_path / "checkout"
     work.mkdir()
-    henv = SimpleNamespace(clock=FakeClock(), work=str(work), log_dir=tmp_path / "node-logs", signals=[])
+    henv = SimpleNamespace(clock=FakeClock(), work=str(work), log_dir=tmp_path / "node-logs", signals=[],
+                           groups=set())    # pids whose process group still has a member besides the (fake) leader
     henv.config = DispatchConfig.from_dict({"runners": {"claude-code": SHIPPED}, "worktrees": {PROJECT: str(work)},
                                             "timeout_minutes": 30, "kill_grace_seconds": 10})
     henv.spawner = FakeSpawner(child=FakeSessionChild)
@@ -268,6 +269,76 @@ def test_a_process_that_ignores_sigterm_is_killed_after_the_grace_period_before_
     assert stubborn.turns() == ["first"]
 
 
+def test_a_stopped_group_that_outlives_its_leader_holds_the_next_start_until_it_is_killed(henv):
+    """The leader exits on SIGTERM; a tool process in its group does not and may still be writing files."""
+    s = open_session(henv)
+    first = henv.host.send(SID, "first")
+    queued = henv.host.send(SID, "queued")
+    henv.host.tick()
+    [child] = henv.spawner.children
+    child.emit(init())
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    henv.clock.advance(30 * 60)
+    assert kinds(henv.host.tick()) == [("turn_ended", first)]
+    assert child.terminated == 1 and child.poll() == -15, "the leader is gone"
+    assert not s.dormant and len(henv.spawner.calls) == 1 and s.inbox, "nothing starts beside the rest of its group"
+    henv.clock.advance(9)
+    assert henv.host.tick() == [] and child.killed == 0 and len(henv.spawner.calls) == 1
+    henv.clock.advance(1)
+    assert henv.host.tick() == [] and child.killed == 1, "SIGKILL for the group after the grace period"
+    assert len(henv.spawner.calls) == 1, "still there this pass"
+    henv.groups.clear()
+    assert kinds(henv.host.tick()) == [("delivered", queued)]
+    assert value_after(henv.spawner.calls[1]["argv"], "--resume") == SID
+
+
+def test_a_process_that_exits_by_itself_is_not_held_for_its_group(henv):
+    s = open_session(henv)
+    first = henv.host.send(SID, "first")
+    queued = henv.host.send(SID, "queued")
+    henv.host.tick()
+    [child] = henv.spawner.children
+    henv.groups.add(child.pid)
+    child.code = 1
+    assert kinds(henv.host.tick()) == [("turn_ended", first), ("delivered", queued)]
+    assert child.killed == 0 and len(henv.spawner.calls) == 2 and not s.dormant
+
+
+def test_stop_all_kills_a_group_whose_leader_exited_but_which_still_has_members(henv):
+    open_session(henv)
+    henv.host.send(SID, "first")
+    henv.host.tick()
+    [child] = henv.spawner.children
+    henv.groups.add(child.pid)
+    start = henv.clock()
+    henv.host.stop_all()
+    assert child.terminated == 1, "the leader exited on SIGTERM (FakeChild)"
+    assert henv.clock() - start >= 10, "it waited the grace period for the group"
+    assert child.killed == 1
+
+
+def test_a_session_confirmed_while_its_process_is_being_stopped_resumes(henv):
+    """Claude refuses --session-id for a session that exists ("already in use"), so a late init must still count."""
+    s = open_session(henv)
+    stubborn = FakeSessionChild(2000, exits_on_terminate=False)
+    henv.host.spawner = lambda argv, **kw: stubborn
+    first = henv.host.send(SID, "first")
+    henv.host.tick()
+    henv.clock.advance(30 * 60)
+    assert kinds(henv.host.tick()) == [("turn_ended", first)] and s.resume is False
+    stubborn.emit(init(), result())
+    assert henv.host.tick() == [], "the turn was already given up: its late events are dropped"
+    assert s.resume is True and s.ready is False and s.state == "idle"
+    assert json.loads((henv.log_dir / STATE_FILE).read_text())[SID]["resume"] is True
+    henv.host.spawner = henv.spawner
+    henv.clock.advance(10)
+    second = henv.host.send(SID, "second")
+    assert kinds(henv.host.tick()) == [("delivered", second)]
+    argv = henv.spawner.calls[0]["argv"]
+    assert value_after(argv, "--resume") == SID and "--session-id" not in argv
+
+
 def test_stop_all_fails_the_turn_in_flight_and_clears_the_state_file(henv):
     open_session(henv)
     mid = henv.host.send(SID, "first")
@@ -343,7 +414,7 @@ def test_orphan_cleanup_on_host_start_stops_only_verified_leftovers_before_start
         return henv.spawner(argv, **kw)
     host = SessionHost(henv.config, henv.log_dir, spawner=spawner, clock=henv.clock, probe=henv.procs.probe,
                        start_of=henv.procs.start, signal_group=lambda pid, sig: order.append((pid, sig)),
-                       sleep=lambda s: order.append(("sleep", s)))
+                       sleep=lambda s: order.append(("sleep", s)), group_alive=lambda pid: False)
     host.open(SID, agent="claude", runtime="claude-code", project=PROJECT, resume=True)
     host.send(SID, "after restart")
     host.tick()
@@ -674,18 +745,70 @@ def until(host, want, seconds=20.0):
     raise AssertionError(f"no {want} event within {seconds}s; saw {kinds(seen)}")
 
 
-def test_real_pipes_carry_turns_a_timeout_terminates_the_group_and_the_next_message_resumes(tmp_path, monkeypatch):
+def real_host(tmp_path, monkeypatch, script, timeout_seconds, grace):
+    """A host with real processes: the runner is a stand-in script named `claude` (TMPDIR is where it leaves notes)."""
     work = tmp_path / "checkout"
     work.mkdir()
     exe = tmp_path / "bin" / "claude"
     exe.parent.mkdir()
-    exe.write_text(f"#!{sys.executable}\n{STAND_IN}")
+    exe.write_text(f"#!{sys.executable}\n{script}")
     exe.chmod(0o700)
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     config = DispatchConfig.from_dict({"runners": {"claude-code": [str(exe)] + SHIPPED[1:]},
-                                       "worktrees": {PROJECT: str(work)}, "kill_grace_seconds": 5})
-    host = SessionHost(config, tmp_path / "node-logs", timeout_minutes=3 / 60, spawner=spawn_piped)
-    s = host.open(SID, agent="claude", runtime="claude-code", project=PROJECT)
+                                       "worktrees": {PROJECT: str(work)}, "kill_grace_seconds": grace})
+    host = SessionHost(config, tmp_path / "node-logs", timeout_minutes=timeout_seconds / 60, spawner=spawn_piped)
+    return host, host.open(SID, agent="claude", runtime="claude-code", project=PROJECT)
+
+
+# Its first process starts a tool process in the same group that ignores SIGTERM (set before exec, so there is no
+# race), then hangs. SIGTERM ends the leader only.
+STRAY_STAND_IN = r'''
+import json, os, signal, subprocess, sys, time
+args = sys.argv[1:]
+resumed = "--resume" in args
+sid = args[args.index("--resume" if resumed else "--session-id") + 1]
+for line in sys.stdin:
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": sid}), flush=True)
+    if not resumed:
+        tool = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"],
+                                preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN))
+        with open(os.environ["TMPDIR"] + "/stray.pid", "w") as f:
+            f.write(str(tool.pid))
+        time.sleep(600)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": sid,
+                      "permission_denials": []}), flush=True)
+'''
+
+
+def test_real_group_member_that_ignores_sigterm_is_killed_before_the_session_starts_again(tmp_path, monkeypatch):
+    host, s = real_host(tmp_path, monkeypatch, STRAY_STAND_IN, timeout_seconds=2, grace=1)
+    try:
+        first, second = host.send(SID, "first"), host.send(SID, "second")
+        seen = until(host, "turn_ended")
+        assert (seen[-1].message_id, seen[-1].ok) == (first, False)
+        stopped_at, leader = time.monotonic(), s.child.pid
+        stray = int((tmp_path / "stray.pid").read_text())
+        assert os.getpgid(stray) == leader, "the tool process is in the session's process group"
+        deadline = time.monotonic() + 5
+        while s.child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert s.child.poll() is not None, "SIGTERM ended the leader"
+        os.kill(stray, 0)       # the tool process ignored it
+        assert host.tick() == [] and not s.dormant, "nothing starts while a member of the old group runs"
+
+        seen = until(host, "delivered")
+        assert kinds(seen)[-1] == ("delivered", second)
+        assert time.monotonic() - stopped_at >= 0.9, "it waited out the grace period"
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader, 0)        # the whole old group was gone before the next process started
+        seen = until(host, "turn_ended")
+        assert (seen[-1].message_id, seen[-1].ok) == (second, True) and s.child.pid != leader
+    finally:
+        host.stop_all()
+
+
+def test_real_pipes_carry_turns_a_timeout_terminates_the_group_and_the_next_message_resumes(tmp_path, monkeypatch):
+    host, s = real_host(tmp_path, monkeypatch, STAND_IN, timeout_seconds=3, grace=5)
     try:
         first, second = host.send(SID, "one"), host.send(SID, "two")
         seen = until(host, "turn_ended")
