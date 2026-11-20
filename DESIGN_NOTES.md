@@ -2428,9 +2428,14 @@ with no wake's text, so none is handed. Only a session's first queued message ca
 keep a message of the human's behind it from the node for as long as the failure lasts (seen in review: a step-back
 that raised on a wake holding one post that still qualified and one that did not). A wake that was never handed and
 has a message of the human's behind it is therefore set aside in that case: settled `failed`, not sent, using only
-the session's message records. Its posts stay covered for the grace and are then the dispatcher's. A step-back now
-clears the coverage of every post of the wake, present or not, and returns only the still-qualifying ones to
-`pending`.
+the session's message records. That wake never ran, so its posts lose their coverage at once (`woken`, `handed`,
+`read`: `holds` is false, and a later filtered read cannot make it true) and go back to `pending` as the posts table
+has them, where the ordinary pass re-qualifies them before it queues a wake after the human's turn; the wake is
+taken out of the counts like a step-back. If that bookkeeping fails too, the session's watcher record is dropped:
+nothing stays covered, the next pass starts a new record at the newest post, and those posts are the dispatcher's.
+The set-aside and the answer share one transaction, so a fetch refused there (the pause) sets nothing aside. A
+step-back now clears the coverage of every post of the wake, present or not, and returns only the still-qualifying
+ones to `pending`.
 
 *The human's messages go first, always.* A wake is only queued behind nothing. If a message of the human's arrives
 after a wake was queued and before the node was shown it, the wake steps back: it is settled `failed` ("a message of

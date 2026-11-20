@@ -440,7 +440,10 @@ def _fallback(board: Board, node: str, build: Callable[[], dict]) -> dict:
     wake's text, so no unchecked wake is handed. And a message of the human's never waits behind such a wake: only
     a session's first queued message carries its text, so a wake that was never handed and has a message of the
     human's behind it is set aside here (settled, not sent), with nothing but the session's own message records.
-    Its posts stay covered for the grace and are then the dispatcher's, as after any wake nobody read."""
+    That wake never ran, so its posts must not stay covered: `_set_aside` takes them back into `pending`, where the
+    ordinary pass re-qualifies them after the human's turn; and if even that fails, the session's watcher record is
+    dropped, which leaves nothing covered (the next pass starts a new record, and those posts are the dispatcher's).
+    The answer is built inside the same transaction, so a fetch refused there (the pause) sets nothing aside."""
     try:
         with db.write_tx(board.conn) as c:
             now = board.now()
@@ -455,9 +458,46 @@ def _fallback(board: Board, node: str, build: Callable[[], dict]) -> dict:
                     r |= {"queued": max(0, int(r.get("queued") or 0) - 1), "updated_at": now}
                     _put(c, hosted._msg_key(r["session_id"], m["n"]), m, HUB, now)
                     _put(c, hosted.SESSION_PREFIX + r["session_id"], r, HUB, now)
+                    try:
+                        _set_aside(c, r["session_id"], m, now)
+                    except Exception:
+                        _complain("hosted sessions: could not uncover a wake that was set aside; dropping its record")
+                        c.execute("DELETE FROM board_state WHERE key = ?", (WAKE_PREFIX + r["session_id"],))
+            return _withheld(build())
+    except BoardError:
+        raise
     except Exception:
         _complain("hosted sessions: could not set an unchecked wake aside")
     return _withheld(build())
+
+
+def _uncount(rec: dict, m: dict) -> None:
+    """A wake that was queued and never sent no longer counts toward the interval, the hour or its threads."""
+    if m.get("created_at") in rec["sent"]:
+        rec["sent"].remove(m["created_at"])
+    for tid in m.get("threads") or []:
+        t = rec["threads"].get(str(tid))
+        if isinstance(t, dict) and int(t.get("count") or 0) > 0:
+            t["count"] -= 1
+
+
+def _set_aside(c, session_id: str, m: dict, now: float) -> None:
+    """The record's side of setting a wake aside, kept apart from the code that failed (no eligibility is judged
+    here): the wake's posts lose their coverage and go back to `pending` as the posts table has them now. They are
+    not trusted as they are: the ordinary pass re-qualifies everything in `pending` before it queues a wake."""
+    rec = _load(c, session_id)
+    if rec is None:
+        return
+    ids = [i for i in m.get("posts") or [] if type(i) is int]
+    for k in (str(i) for i in ids):
+        for table in ("woken", "handed", "read"):
+            rec[table].pop(k, None)
+    for row in c.execute("""SELECT id, thread_id, agent, needs_response, seq FROM posts
+                            WHERE id IN (SELECT value FROM json_each(?))""", (json.dumps(ids),)):
+        if str(row["id"]) not in rec["claimed"]:
+            rec["pending"][str(row["id"])] = _entry(row)
+    _uncount(rec, m)
+    _save(c, session_id, rec, now)
 
 
 def _withheld(out: dict) -> dict:
@@ -522,12 +562,7 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
             # so that a read between then and now (a mark or a dated receipt) still counts as after the wake.
             rec["handed"][k] = now
     if defer:
-        if m.get("created_at") in rec["sent"]:
-            rec["sent"].remove(m["created_at"])
-        for tid in m.get("threads") or []:
-            t = rec["threads"].get(str(tid))
-            if isinstance(t, dict) and int(t.get("count") or 0) > 0:
-                t["count"] -= 1
+        _uncount(rec, m)
     if keep and not defer:
         m |= {"posts": sorted(int(k) for k in keep), "text": wake_text(r["agent"], list(keep.values())),
               "handed_at": m.get("handed_at") or now, "updated_at": now}

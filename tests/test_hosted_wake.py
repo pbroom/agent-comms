@@ -1032,11 +1032,103 @@ def test_a_failure_in_the_wake_code_never_keeps_the_humans_message_from_the_node
     [wake] = wakes(senv, sid)
     assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.SET_ASIDE)
     assert show(senv, sid)["queued"] == 0 and str(post["id"]) not in turns(senv)[-1]
+    # S14. That wake never ran: its post is not covered any more, at once, and nothing can cover it again but a wake.
+    rec = record(senv, sid)
+    assert rec["woken"] == {} and rec["handed"] == {} and rec["read"] == {} and rec["sent"] == []
+    assert list(rec["pending"]) == [str(post["id"])], "kept for the ordinary pass to re-qualify"
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "not only after the grace"
+    shown = senv.board.read_updates(senv.p["claude"], senv.session("claude"), only="addressed")
+    assert post["id"] in [p["id"] for p in shown["posts"]]
+    assert record(senv, sid)["read"] == {}
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "a filtered read changes nothing"
     monkeypatch.undo()
     run_turn(senv, sid)
-    later(senv, GRACE)
-    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), \
-        "its post is the dispatcher's again once the grace is over"
+    tick(senv)
+    assert turns(senv)[-1] == text_for(senv, 1, [post["thread_id"]]), "woken for it after the human's turn"
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
+
+
+def test_a_set_aside_wake_re_qualifies_its_posts_instead_of_trusting_them(senv, monkeypatch):
+    """S14. What returns to `pending` is only a list to look at again: a post that stopped qualifying meanwhile is
+    not woken for once the wake code works again."""
+    sid = ready(senv)
+    t1, t2 = senv.thread(), senv.thread()
+    good, gone = ask(senv, t1), ask(senv, t2, as_="grok")
+    hosted_wake.tick(senv.board)
+    _revoke(senv, "grok")
+    send(senv, sid, "mine")
+
+    def boom(*a, **kw):
+        raise RuntimeError("wake code broke")
+
+    monkeypatch.setattr(hosted_wake, "_recheck", boom)
+    tick(senv)
+    assert turns(senv)[-1] == "mine" and wakes(senv, sid)[0]["detail"] == hosted_wake.SET_ASIDE
+    assert sorted(record(senv, sid)["pending"]) == sorted([str(good["id"]), str(gone["id"])])
+    assert not any(hosted.holds(senv.board, "claude", PROJECT, p["id"], senv.clock()) for p in (good, gone))
+    monkeypatch.undo()
+    run_turn(senv, sid)
+    tick(senv)
+    assert turns(senv)[-1] == text_for(senv, 1, [t1]), "only the post that still qualifies"
+    assert record(senv, sid)["pending"] == {}
+    assert not hosted.holds(senv.board, "claude", PROJECT, gone["id"], senv.clock())
+
+
+def test_when_the_watcher_record_cannot_be_updated_either_nothing_stays_covered(senv, monkeypatch):
+    """S14. The bookkeeping of a set-aside fails too: the human's message is still handed, and the session's
+    watcher record is dropped rather than left saying the wake's post is covered."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    hosted_wake.tick(senv.board)
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
+    send(senv, sid, "mine")
+
+    def boom(*a, **kw):
+        raise RuntimeError("wake code broke")
+
+    monkeypatch.setattr(hosted_wake, "_recheck", boom)
+    monkeypatch.setattr(hosted_wake, "_save", boom)
+    r = senv.laptop.get("/api/nodes/sessions")
+    assert r.status_code == 200, r.text
+    assert r.json()["sessions"][0]["messages"] == [{"n": 3, "kind": "user", "state": "queued", "text": "mine"}]
+    tick(senv)
+    assert turns(senv)[-1] == "mine"
+    assert record(senv, sid) is None and wakes(senv, sid)[0]["detail"] == hosted_wake.SET_ASIDE
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
+    senv.board.read_updates(senv.p["claude"], senv.session("claude"), only="addressed")
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
+    monkeypatch.undo()
+    run_turn(senv, sid)
+    tick(senv)
+    assert record(senv, sid)["pending"] == {} and len(wakes(senv, sid)) == 1, "a new record, from the newest post on"
+    later_post = ask(senv, post["thread_id"], as_="grok")
+    later(senv, 31)
+    tick(senv)
+    assert turns(senv)[-1] == text_for(senv, 1, [post["thread_id"]], authors="grok") and later_post["id"]
+
+
+def test_a_fetch_refused_as_paused_sets_no_wake_aside(senv, monkeypatch):
+    """S15. The set-aside and the answer share one transaction: a pause found while the answer is built undoes it."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    hosted_wake.tick(senv.board)
+    send(senv, sid, "mine")
+    before = record(senv, sid)
+
+    def boom(*a, **kw):
+        raise RuntimeError("wake code broke")
+
+    monkeypatch.setattr(hosted_wake, "_recheck", boom)
+    monkeypatch.setattr(hosted_wake, "tick", lambda board, node=None: board.set_paused(senv.p["human"], True))
+    assert senv.laptop.get("/api/nodes/sessions").status_code == 423
+    monkeypatch.undo()
+    assert [m["state"] for m in wakes(senv, sid)] == ["queued"] and show(senv, sid)["queued"] == 2
+    assert record(senv, sid) == before, "nothing of the set-aside was kept"
+    senv.board.set_paused(senv.p["human"], False)
+    later(senv, 5)
+    tick(senv)
+    assert turns(senv)[-1] == "mine" and wakes(senv, sid)[0]["detail"] == hosted_wake.DEFERRED
+    assert list(record(senv, sid)["pending"]) == [str(post["id"])]
 
 
 def test_a_failure_in_the_wake_code_leaves_a_wake_with_no_message_behind_it_queued_and_unhanded(senv, monkeypatch):
