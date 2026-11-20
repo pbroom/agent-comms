@@ -1,0 +1,91 @@
+"""The seam between the session host (session_host.py) and one agent CLI's wire protocol.
+
+A `ProviderSession` is the protocol state of ONE hosted session. It never touches a process, a file or a clock: the
+host hands it the lines the child wrote and gets back what they mean (`Event`s) and what to write in answer (bytes),
+so an adapter is testable from strings alone. It is stateful per session, so a request/response protocol with ids and
+a handshake (Codex's app-server JSON-RPC) fits the same seam as Claude's one-JSON-line-per-turn stream.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable, Protocol
+
+# What a child can tell the host. `ready`: the provider's own session exists (`provider_id` names it there).
+# `turn_started` / `turn_ended`: one turn's bounds; `ok` is False for a turn the provider reports failed, `denials`
+# names the tools it refused (names only, never their inputs) and `meta` holds small scalar facts about the turn.
+# `approval_requested`: the provider is waiting for someone to allow a tool (`denials` names it). `fatal`: this
+# session cannot go on (`detail` says why); the host ends it and no other session.
+KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal")
+
+
+@dataclass(frozen=True)
+class Event:
+    kind: str
+    provider_id: str | None = None
+    ok: bool | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+    denials: tuple[str, ...] = ()
+    detail: str = ""
+
+    def __post_init__(self):
+        if self.kind not in KINDS:
+            raise ValueError(f"unknown provider event kind {self.kind!r}")
+
+
+class ProviderSession(Protocol):
+    # True: no turn may be written until `ready` (a handshake comes first). False: the child takes a turn as soon as
+    # it is started, and `ready` arrives with the first turn (Claude's stream-json mode, DESIGN_NOTES).
+    waits_for_ready: bool
+
+    def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
+        """The command for this session's process, from the machine's runner template. Called once per process start
+        (so again after a restart, with resume=True once the provider's session exists); resets per-process state.
+        ValueError: the template or the model cannot be used for a hosted session."""
+        ...
+
+    def on_open(self) -> list[bytes]:
+        """What to write as soon as the process is up (a handshake), before any turn."""
+        ...
+
+    def turn(self, text: str) -> list[bytes]:
+        """One user turn, as the bytes to write."""
+        ...
+
+    def feed(self, line: bytes) -> tuple[list[Event], list[bytes]]:
+        """One line the child wrote: what it means, and what to write back. Never raises on malformed input."""
+        ...
+
+    def interrupt(self) -> list[bytes] | None:
+        """How to stop the turn in flight without ending the process, or None: the host terminates the process and
+        starts it again (resuming) for the next message."""
+        ...
+
+
+# A model name is one argv element the hub chose. It may never read as an option or carry anything but a name.
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}")
+# A hub-issued session id: a lower-case RFC 4122 UUID as text (it becomes an argv element and a file name).
+SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def validate_model(model: Any) -> str | None:
+    if model is None:
+        return None
+    if not isinstance(model, str) or not MODEL_RE.fullmatch(model):
+        raise ValueError("model override is not a plain model name")
+    return model
+
+
+def validate_session_id(session_id: Any) -> str:
+    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError("session id must be a lower-case UUID")
+    return session_id
+
+
+def provider_for(template: list[str]) -> Callable[[], ProviderSession] | None:
+    """The adapter for the CLI this runner template starts, or None: it cannot be hosted as a session."""
+    import os
+    from .claude import ClaudeSession
+    if template and os.path.basename(template[0]) == "claude":
+        return ClaudeSession
+    return None

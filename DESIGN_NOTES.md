@@ -2095,3 +2095,95 @@ unchanged.
 **Residual risks.** A worktree starts from the checkout's HEAD, not its uncommitted changes. An output a request
 declared under the main checkout is still checked against the checkout (`_output_blocker`), not the worktree.
 Worktrees of open threads accumulate until their threads close.
+
+## Session host (PR 1) (2026-11-20)
+
+**Report.** The human: agent-comms cannot start a turn in a conversation it does not own, so it will own the Claude
+processes and push turns into them. A message to an idle session starts a turn at once; a message to a busy one queues
+and runs as the next turn; nothing running is interrupted. PR 1 is the local host and the Claude adapter only
+(`session_host.py`, `providers/`): no hub registry, node protocol, route, CLI, wake logic or schema change. Nothing
+calls it yet.
+
+**Shape.** `SessionHost.open(session_id, agent=, project=, ...)` registers a session, `send` queues a message (first
+in, first out), and the caller drives `tick()`, which returns what happened as `HostEvent`s (`delivered`,
+`turn_started`, `turn_ended`, `approval_requested`, `ended`). There are no threads: the pipes are non-blocking
+(`dispatch.PipedChild`, started by `spawn_piped`, the sibling of `spawn_process` that keeps stdin and stdout), and the
+clock, spawner and process probes are injected. A process starts only when its session has a message. States:
+`starting` (process up, session not yet confirmed), `idle`, `running`, `waiting`, `ended`; a session with no process
+is `idle` and `dormant`.
+
+**Provider seam** (`providers.ProviderSession`): `argv`, `on_open`, `turn`, `feed`, `interrupt`, stateful per session,
+so a request/response protocol with a handshake (Codex's app-server) fits beside Claude's one line per turn. One
+addition to the planned interface: `waits_for_ready`. Claude writes nothing until it has a turn (below), so the host
+cannot wait for `ready` before the first turn; a provider with a handshake sets it and gets no turn until `ready`.
+The session-id check lives in the adapter (it knows whether the provider's id must equal the hub's): Claude's reports
+`fatal` on any line carrying another `session_id`, and the host ends that one session.
+
+**Argv.** From this machine's runner template for the agent (`runner_for`), in the order a dispatched run uses: the
+scoped template when the project is in `claude_tool_projects` and the runner is not read-only
+(`runner_preflight.scoped`, the condition node.py and dispatch.py already applied, now shared), then
+`with_writable_roots`, then the adapter drops the `{prompt}` element and appends `--input-format stream-json
+--output-format stream-json --verbose --permission-prompts none [--model M]` and `--session-id <uuid>` (or `--resume
+<uuid>` once the session exists). A runner that sets a session or stream flag itself is refused at `open`. A session
+never applies the scoped tools to a project the human did not opt in: that would widen the shipped board-tools-only
+runner to edits and commits. A model override must match `[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}`; a session id must be
+a lower-case UUID (it is an argv element and a file name). The environment is `child_env`, as for a run.
+
+**Turns.** One in flight per session. `delivered` is emitted once every byte of the line is in the child's stdin; a
+partial write is carried to the next pass. A turn past `timeout_minutes` (constructor argument, default
+`[dispatch] timeout_minutes`) gets SIGTERM for its process group, SIGKILL after `kill_grace_seconds`, and is reported
+`turn_ended ok=False`; queued messages wait until the old process GROUP is gone, then a new one resumes the session.
+After any stop the host asked for (timeout, close, a failed write, shutdown) the leader's exit is not enough: a tool
+process in its group may ignore SIGTERM and keep writing, so the host probes the group (`killpg` with signal 0,
+injected as `group_alive`), sends the group SIGKILL after the grace period even when the leader is already gone, and
+starts nothing for that session until the group is empty. A process that exits by itself is not held this way. Every
+way a turn can be lost (timeout, the process exits, a write fails, the session ends, the host shuts down) consumes
+that one message and reports it failed, with `delivered=False` when it never reached the process. The host never
+writes a message twice, so nothing can loop without new input. A session resumes (`--resume`) only after the provider
+confirmed it once (`ready`), or when the caller opens it with `resume=True`.
+
+**Denials.** A `result` with `permission_denials` ends the turn normally and leaves the session `waiting`, with the
+tool names (only) on the event and the session. `waiting` does not hold the queue: the next message starts a turn and
+clears it. The transcript still holds the full denial, tool input included.
+
+**Files.** `data/node-logs/sessions/<uuid>.jsonl` receives every stdout line (append, mode 600, directory 700; a
+pre-existing looser file is tightened); `<uuid>.stderr.log` beside it receives stderr. `data/node-logs/node-sessions.json`
+(mode 600) lists each live process: pid, start time, cwd, whether the session can be resumed, and the id of the message
+whose turn is in flight (recorded before its first byte is written). `recover()` runs once before the host starts
+anything (the first `tick()` calls it if the caller did not): it stops what an earlier host left with
+`dispatch.stop_verified` (extracted from `Node.recover`, which now calls it), so only a pid that still leads its own
+group with the recorded start time is signalled, and returns per session `{stopped, resume, turn}` so the caller can
+report the lost turn. `stop_verified` sends SIGKILL only to a pid that still verifies after the grace period, so a
+group whose verified leader exited on SIGTERM while a member ignored it would survive; `recover()` therefore sends
+the group SIGKILL to each such group (only ones whose leader it verified and signalled) and waits, at most one more
+grace period, until they are gone.
+
+**Live checks** (Claude Code 2.1.322, `--model haiku --setting-sources "" --strict-mcp-config --permission-prompts
+none`, an empty temp directory, six small turns in four processes):
+- *Init.* Nothing is written before the first stdin line (6 s of silence). Each turn begins with its own
+  `system`/`init` and ends with one `result`; both carry the given session id. So `init` is the adapter's
+  `turn_started`, and the first one is `ready`.
+- *(a) Denial shape.* `result.permission_denials` is a list of `{tool_name, tool_use_id, tool_input}`; an earlier
+  `system`/`permission_denied` event carries `tool_name`, `tool_use_id`, `decision_reason_type: "asyncAgent"`. The
+  result is still `subtype: "success"`, `is_error: false`. A `Write` was denied this way and the file was not created.
+  `Bash` running `echo hi` was NOT denied: read-only commands need no prompt in the default mode, so `none` only
+  refuses what would have asked; the permission mode and allow rules decide the rest.
+- *(b) Stdin EOF.* Idle: exit code 0 within 0.3 s, no further event. Mid-turn (EOF right after the line): the turn
+  finishes, its `result` is written, then exit 0. The host stops processes with SIGTERM and does not rely on EOF.
+- *(c) Resume.* `--resume <uuid>` with stream-json reports the same session id in `init` and `result`, and the
+  conversation's earlier turns are there. Also checked: SIGTERM mid-turn exits with 143 within 0.3 s and writes no
+  `result`; `--resume` afterwards works and the cut turn was not replayed.
+- *Session id already used* (seen in review of PR 1, same version): starting with `--session-id` for a session that
+  already exists fails with "Error: Session ID <uuid> is already in use." So an `init` that arrives while the host is
+  stopping a process still marks the session resumable (its late turn events are dropped); otherwise the session
+  could never start again.
+
+**Residual risks / not verified.** A turn cut before its process wrote any `init` restarts with `--session-id`; if
+Claude had already created the session, that start is refused as above and the turn fails. After the leader exits,
+the group probe is by process-group id alone: if that id were reused within the grace period by another group of the
+same user, that group would get the SIGKILL. Claude's in-band interrupt and
+`can_use_tool` control requests were not exercised: the adapter interrupts by SIGTERM and leaves such a request
+unanswered (reported as `approval_requested`; the timeout ends the turn). `--resume` finds a session only from the
+directory it was created in. A stdout line over 32 MiB is handed on in pieces and so is not parsed. An older Claude
+Code without `--permission-prompts` exits at once; the reason is in the stderr log. Idle processes stay up until
+closed: there is no idle limit and no cap on the number of sessions yet.

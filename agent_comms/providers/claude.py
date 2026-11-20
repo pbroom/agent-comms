@@ -1,0 +1,131 @@
+"""Claude Code as a hosted session: `claude -p --input-format stream-json --output-format stream-json --verbose`.
+
+The process stays up and takes one user turn per JSON line on stdin. What the adapter relies on was observed on Claude
+Code 2.1.322 (DESIGN_NOTES "Session host (PR 1)"):
+- Nothing is written before the first turn. Every turn begins with a `system`/`init` event and ends with exactly one
+  `result` event; both carry the `session_id` given as `--session-id` (or `--resume`).
+- A `result` lists the tool calls that were refused as `permission_denials`: objects with `tool_name`, `tool_use_id`
+  and `tool_input`. Only the names leave this module: an input can hold file contents and paths.
+- With `--permission-prompts none` anything that would ask is refused on the spot, so the process never waits for an
+  answer. A `control_request` asking to use a tool should therefore never arrive; if one does it is reported and left
+  unanswered (nothing is approved), and the host's turn timeout ends the turn.
+"""
+from __future__ import annotations
+
+import json
+import re
+
+from . import Event, validate_model, validate_session_id
+
+# Flags a hosted session sets itself, or that would start, fork or hide a conversation other than the hub's.
+OWN_FLAGS = frozenset((
+    "--session-id", "--resume", "-r", "--continue", "-c", "--fork-session", "--from-pr", "--teleport",
+    "--input-format", "--output-format", "--permission-prompts", "--permission-prompt-tool",
+    "--no-session-persistence"))
+STREAM_FLAGS = ("--input-format", "stream-json", "--output-format", "stream-json")
+NO_PROMPTS = ("--permission-prompts", "none")
+TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+MAX_DENIALS = 50
+# The facts of a `result` the host passes on: small scalars only, never the reply text.
+RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
+               "api_error_status")
+
+
+def tool_names(denials) -> tuple[str, ...]:
+    """The distinct tool names in a result's `permission_denials`, in order. Anything that is not a plain name is
+    reported as "unknown" rather than passed on."""
+    out: list[str] = []
+    for d in denials if isinstance(denials, list) else []:
+        name = d.get("tool_name") if isinstance(d, dict) else None
+        name = name if isinstance(name, str) and TOOL_NAME_RE.fullmatch(name) else "unknown"
+        if name not in out:
+            out.append(name)
+    return tuple(out[:MAX_DENIALS])
+
+
+def _meta(ev: dict) -> dict:
+    out = {}
+    for k in RESULT_META:
+        v = ev.get(k)
+        if isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 200):
+            out[k] = v
+    return out
+
+
+class ClaudeSession:
+    waits_for_ready = False     # `init` only arrives once the first turn has been written
+
+    def __init__(self):
+        self.session_id: str | None = None
+        self._ready = False
+        self._dead = False
+
+    def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
+        """The runner template (already scoped where the project asks for it) as a session command: without its
+        {prompt} element, with the stream flags, the session's id and `--permission-prompts none`."""
+        import os
+        self.session_id = validate_session_id(session_id)
+        self._ready = self._dead = False
+        model = validate_model(model)
+        if not template or os.path.basename(template[0]) != "claude":
+            raise ValueError("not a Claude runner")
+        out, i = [], 0
+        while i < len(template):
+            arg = template[i]
+            flag = arg.split("=", 1)[0]
+            i += 1
+            if flag in OWN_FLAGS:
+                raise ValueError("this Claude runner sets session or stream flags a hosted session sets itself")
+            if arg == "{prompt}":
+                continue            # turns arrive on stdin
+            if flag == "--model" and model is not None:
+                if "=" not in arg and i < len(template):
+                    i += 1          # its value
+                continue
+            out.append(arg)
+        if not any(a in ("-p", "--print") for a in out):
+            out.insert(1, "-p")
+        out += STREAM_FLAGS
+        if "--verbose" not in out:
+            out.append("--verbose")     # stream-json output needs it
+        out += NO_PROMPTS
+        if model is not None:
+            out += ["--model", model]
+        return out + ["--resume" if resume else "--session-id", self.session_id]
+
+    def on_open(self) -> list[bytes]:
+        return []
+
+    def turn(self, text: str) -> list[bytes]:
+        # json.dumps escapes every line break inside the text: one turn is exactly one line.
+        return [json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"]
+
+    def interrupt(self) -> list[bytes] | None:
+        return None
+
+    def feed(self, line: bytes) -> tuple[list[Event], list[bytes]]:
+        if self._dead:
+            return [], []
+        try:
+            ev = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            return [], []
+        if not isinstance(ev, dict):
+            return [], []
+        kind, sid = ev.get("type"), ev.get("session_id")
+        init = kind == "system" and ev.get("subtype") == "init"
+        if (isinstance(sid, str) and sid != self.session_id) or (init and not isinstance(sid, str)):
+            self._dead = True
+            return [Event("fatal", detail="the process reported a session id other than the one it was given")], []
+        if init:
+            events = [] if self._ready else [Event("ready", provider_id=sid)]
+            self._ready = True
+            return events + [Event("turn_started")], []
+        if kind == "result":
+            ok = ev.get("subtype") == "success" and ev.get("is_error") is False
+            return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")))], []
+        if kind == "control_request":
+            request = ev.get("request")
+            if isinstance(request, dict) and request.get("subtype") == "can_use_tool":
+                return [Event("approval_requested", denials=tool_names([request]))], []
+        return [], []

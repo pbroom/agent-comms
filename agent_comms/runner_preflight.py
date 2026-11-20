@@ -109,6 +109,15 @@ def read_only(template: list[str]) -> bool:
     return bool(tools) and all(t in READ_ONLY_TOOLS or t.startswith("mcp__agent-comms__") for t in tools)
 
 
+def scoped(template: list[str], project: str | None, claude_tool_projects: list[str]) -> bool:
+    """Whether a run of this runner in this thread project gets the scoped tools (scoped_template): a Claude runner in
+    an opted-in project ([dispatch] claude_tool_projects), unless it declares itself read-only (the scoped set would
+    widen it)."""
+    import os
+    return (project in claude_tool_projects and os.path.basename(template[0]) == "claude"
+            and not read_only(template))
+
+
 def scoped_template(template: list[str]) -> list[str]:
     """Replace additive broad grants for this opted-in launch; keep existing deny rules."""
     replaced = {"--allowedTools", "--allowed-tools", "--permission-mode"}
