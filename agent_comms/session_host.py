@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -50,7 +51,8 @@ MESSAGE_ID_MAX = 200
 
 def group_alive(pgid: int) -> bool:
     """Whether any process is left in this process group (signal 0: nothing is sent). A group this user may not
-    signal is not one of ours."""
+    signal is not one of ours; macOS also answers EPERM for the instant in which a killed group holds only
+    processes that have exited and are not yet reaped."""
     if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
         return False
     try:
@@ -196,9 +198,10 @@ class SessionHost:
     def recover(self) -> dict[str, dict]:
         """Once, before this host starts anything: stop the session processes an earlier host on this machine left.
         Only a process whose pid still leads its own group and whose start time matches the record is signalled
-        (SIGTERM, then SIGKILL after the grace period). Returns what was recorded, per session id: `stopped` (a live
-        process was signalled), `turn` (the message whose turn was in flight: it is lost, never replayed) and
-        `resume` (the provider's session exists, so reopening it should resume)."""
+        (SIGTERM, then SIGKILL after the grace period), and a group one of those led is killed even when its leader
+        went on SIGTERM and a member did not. Returns what was recorded, per session id: `stopped` (a live process
+        was signalled), `turn` (the message whose turn was in flight: it is lost, never replayed) and `resume` (the
+        provider's session exists, so reopening it should resume)."""
         if self._recovered:
             return {}
         self._recovered = True
@@ -206,6 +209,15 @@ class SessionHost:
                 if isinstance(k, str) and providers.SESSION_ID_RE.fullmatch(k) and isinstance(d, dict)}
         stopped = set(stop_verified([(d.get("pid"), d.get("proc_start")) for d in left.values()], probe=self.probe,
                                     signal_group=self.signal_group, sleep=self.sleep, grace=self.kill_grace))
+        # stop_verified kills only a pid that still verifies after the grace period. A leader that exited on SIGTERM
+        # no longer does, yet a tool process in its group may have ignored the signal: a resumed session must not
+        # start beside it. Only groups whose leader was verified and signalled above are touched.
+        lingering = [pid for pid in stopped if self.group_alive(pid)]
+        for pid in lingering:
+            self.signal_group(pid, signal.SIGKILL)
+        deadline = self.clock() + self.kill_grace
+        while any(self.group_alive(pid) for pid in lingering) and self.clock() < deadline:
+            self.sleep(0.2)
         if left or self._state_path().exists():
             self._save_state()
         return {k: {"stopped": d.get("pid") in stopped, "resume": d.get("resume") is True,

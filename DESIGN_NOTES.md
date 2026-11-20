@@ -2153,7 +2153,10 @@ whose turn is in flight (recorded before its first byte is written). `recover()`
 anything (the first `tick()` calls it if the caller did not): it stops what an earlier host left with
 `dispatch.stop_verified` (extracted from `Node.recover`, which now calls it), so only a pid that still leads its own
 group with the recorded start time is signalled, and returns per session `{stopped, resume, turn}` so the caller can
-report the lost turn.
+report the lost turn. `stop_verified` sends SIGKILL only to a pid that still verifies after the grace period, so a
+group whose verified leader exited on SIGTERM while a member ignored it would survive; `recover()` therefore sends
+the group SIGKILL to each such group (only ones whose leader it verified and signalled) and waits, at most one more
+grace period, until they are gone.
 
 **Live checks** (Claude Code 2.1.322, `--model haiku --setting-sources "" --strict-mcp-config --permission-prompts
 none`, an empty temp directory, six small turns in four processes):

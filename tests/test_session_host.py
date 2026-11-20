@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_comms import runner_preflight as rp
+from agent_comms import runner_preflight as rp, session_host
 from agent_comms.dispatch import DispatchConfig, spawn_piped
 from agent_comms.providers import Event
 from agent_comms.session_host import STATE_FILE, SessionHost
@@ -437,6 +437,82 @@ def test_recover_reports_what_the_last_host_left_and_runs_once(henv):
     assert json.loads((henv.log_dir / STATE_FILE).read_text()) == {}
 
 
+def leftovers(henv, groups):
+    """Three recorded sessions: two verified leaders that exit on SIGTERM (4001, 4002) and one live pid whose identity
+    cannot be verified (4003). `groups`: the process groups that still have a member whatever SIGTERM did."""
+    henv.procs.external = {4001: "start-4001", 4002: "start-4002", 4003: None}
+    henv.groups.update(groups)
+    henv.log_dir.mkdir(parents=True)
+    (henv.log_dir / STATE_FILE).write_text(json.dumps({
+        SID: {"pid": 4001, "proc_start": "start-4001", "resume": True, "turn": "m7"},
+        SID2: {"pid": 4002, "proc_start": "start-4002"}, OTHER: {"pid": 4003, "proc_start": "start-4003"}}))
+
+    def signal_group(pid, sig):
+        henv.signals.append((pid, sig))
+        if sig == signal.SIGTERM:
+            henv.procs.external.pop(pid, None)      # the leader goes; whatever ignores SIGTERM stays in its group
+    henv.host.signal_group = signal_group
+
+
+def test_recover_kills_a_leftover_group_whose_leader_exited_on_sigterm(henv):
+    """The leader no longer verifies after the grace period, so stop_verified sends no SIGKILL; a tool process in its
+    group that ignored SIGTERM would otherwise run on beside the resumed session."""
+    leftovers(henv, groups={4001, 4003})
+    kill = henv.host.signal_group
+
+    def signal_group(pid, sig):
+        kill(pid, sig)
+        if sig == signal.SIGKILL:
+            henv.groups.discard(pid)
+    henv.host.signal_group = signal_group
+    start = henv.clock()
+    left = henv.host.recover()
+    assert henv.signals == [(4001, signal.SIGTERM), (4002, signal.SIGTERM), (4001, signal.SIGKILL)], \
+        "only the group that outlived its verified leader; never the unverifiable pid's"
+    assert {k: v["stopped"] for k, v in left.items()} == {SID: True, SID2: True, OTHER: False}
+    assert henv.clock() - start == 10, "the group was gone at once: no further wait"
+    assert 4003 in henv.groups and json.loads((henv.log_dir / STATE_FILE).read_text()) == {}
+
+
+def test_recover_waits_at_most_the_grace_period_for_a_killed_group(henv):
+    leftovers(henv, groups={4001})      # this fake group never goes
+    start = henv.clock()
+    henv.host.recover()
+    assert henv.signals[-1] == (4001, signal.SIGKILL) and henv.signals.count((4001, signal.SIGKILL)) == 1
+    assert 20 <= henv.clock() - start < 21, "one grace period for SIGTERM, at most one more for the killed group"
+
+
+def test_real_recover_kills_a_group_member_that_ignored_sigterm(tmp_path):
+    """Real processes: a leftover leader that exits on SIGTERM and a child in its group that ignores it."""
+    leader = spawn_piped([sys.executable, "-c", (
+        "import signal, subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'],\n"
+        "                 preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN))\n"
+        "print('up', flush=True)\n"
+        "time.sleep(600)\n")], cwd=str(tmp_path), env=dict(os.environ), log_path=tmp_path / "stderr.log")
+    try:
+        deadline = time.monotonic() + 10
+        while not leader.read_lines() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        from agent_comms.dispatch import process_start
+        log_dir = tmp_path / "node-logs"
+        log_dir.mkdir()
+        (log_dir / STATE_FILE).write_text(json.dumps({
+            SID: {"pid": leader.pid, "proc_start": process_start(leader.pid), "resume": True, "turn": None}}))
+
+        def sleep(seconds):
+            time.sleep(seconds)
+            leader.poll()       # the test is this leader's parent: reap it, as a dead host's leftovers already are
+        host = SessionHost(DispatchConfig.from_dict({"kill_grace_seconds": 1}), log_dir, sleep=sleep)
+        assert host.recover() == {SID: {"stopped": True, "resume": True, "turn": None}}
+        assert leader.poll() == -signal.SIGTERM, "the leader went on SIGTERM; only the group SIGKILL reached the rest"
+        assert not session_host.group_alive(leader.pid)
+        assert_group_gone(leader.pid, seconds=1.0)
+    finally:
+        leader.kill()
+        leader.close()
+
+
 def test_a_host_with_no_state_file_recovers_nothing_and_writes_none(henv):
     assert henv.host.recover() == {} and henv.signals == []
     assert not (henv.log_dir / STATE_FILE).exists()
@@ -734,6 +810,21 @@ for line in sys.stdin:
 '''
 
 
+def assert_group_gone(pgid, seconds=5.0):
+    """No process is left in the group. Just after its last member is killed, macOS answers EPERM for an instant
+    (only an exited, not yet reaped process is left) before ESRCH."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        assert time.monotonic() < deadline, f"process group {pgid} still has a member"
+        time.sleep(0.005)
+
+
 def until(host, want, seconds=20.0):
     """Tick until an event of this kind arrives (real processes take real time). Returns every event seen."""
     seen, deadline = [], time.monotonic() + seconds
@@ -799,8 +890,8 @@ def test_real_group_member_that_ignores_sigterm_is_killed_before_the_session_sta
         seen = until(host, "delivered")
         assert kinds(seen)[-1] == ("delivered", second)
         assert time.monotonic() - stopped_at >= 0.9, "it waited out the grace period"
-        with pytest.raises(ProcessLookupError):
-            os.killpg(leader, 0)        # the whole old group was gone before the next process started
+        assert not session_host.group_alive(leader), "the whole old group was gone before the next process started"
+        assert_group_gone(leader, seconds=1.0)
         seen = until(host, "turn_ended")
         assert (seen[-1].message_id, seen[-1].ok) == (second, True) and s.child.pid != leader
     finally:
