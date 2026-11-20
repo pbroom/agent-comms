@@ -1097,6 +1097,88 @@ def spawn_process(argv: list[str], *, cwd: str, env: dict[str, str], log_path: P
 
 Spawner = Callable[..., Child]
 
+
+class PipedChild(PopenChild):
+    """A runner process the caller talks to (session_host.py): stdin and stdout are non-blocking pipes, so a
+    caller-driven loop can write and read without threads and without ever waiting on the child."""
+
+    MAX_LINE = 32 * 1024 * 1024    # a longer unterminated line is handed over in pieces, never buffered whole
+    READ_BUDGET = 4 * 1024 * 1024  # most bytes one read_lines() call takes, so one chatty child cannot hold a pass
+
+    def __init__(self, proc: subprocess.Popen):
+        super().__init__(proc)
+        self._buf = b""
+        self.eof = False
+        for f in (proc.stdin, proc.stdout):
+            os.set_blocking(f.fileno(), False)
+
+    def write(self, data: bytes) -> int:
+        """Bytes the pipe took now (0: full, try again later). OSError: the child no longer reads (e.g. it exited)."""
+        if self.proc.stdin is None or self.proc.stdin.closed:
+            raise BrokenPipeError("stdin is closed")
+        try:
+            return os.write(self.proc.stdin.fileno(), data)
+        except BlockingIOError:
+            return 0
+
+    def read_lines(self) -> list[bytes]:
+        """The complete stdout lines available now, without their newline; at end of output, also the unterminated
+        rest."""
+        out: list[bytes] = []
+        taken = 0
+        while not self.eof and taken < self.READ_BUDGET:
+            try:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self.eof = True
+                break
+            taken += len(chunk)
+            self._buf += chunk
+            if b"\n" in chunk:
+                *lines, self._buf = self._buf.split(b"\n")
+                out.extend(lines)
+            elif len(self._buf) > self.MAX_LINE:
+                out.append(self._buf)
+                self._buf = b""
+        if self.eof and self._buf:
+            out.append(self._buf)
+            self._buf = b""
+        return out
+
+    def close_stdin(self) -> None:
+        try:
+            if self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        """Release both pipes once the process has been reaped."""
+        self.close_stdin()
+        try:
+            if self.proc.stdout is not None:
+                self.proc.stdout.close()
+        except OSError:
+            pass
+
+
+def spawn_piped(argv: list[str], *, cwd: str, env: dict[str, str], log_path: Path) -> PipedChild:
+    """spawn_process's sibling for a process that is talked to: argv, never a shell, in its own session; stdin and
+    stdout stay open as pipes; stderr is appended to a mode-600 log file (a session's processes share one)."""
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        proc = subprocess.Popen(argv, shell=False, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=fd, close_fds=True, start_new_session=True, bufsize=0)
+    finally:
+        os.close(fd)
+    return PipedChild(proc)
+
+
 ACTIVE = ("starting", "running", "orphaned")   # run statuses that may still have a live process
 
 
@@ -1144,6 +1226,24 @@ def _signal_group(pid: int, sig: int) -> None:
 
 
 Probe = Callable[[Any, "str | None"], str]
+
+
+def stop_verified(procs: list[tuple[Any, Any]], *, probe: Probe, signal_group: Callable[[int, int], None],
+                  sleep: Callable[[float], None], grace: float) -> list[int]:
+    """Stop the processes an earlier process of ours left: each (pid, recorded start) that still verifies as 'ours'
+    gets SIGTERM for its process group, then SIGKILL if it is still ours after one grace period. A pid that is dead,
+    reused, or alive but unverifiable is never signalled. Returns the pids that were signalled."""
+    alive = []
+    for pid, start in procs:
+        if isinstance(pid, int) and probe(pid, start) == "ours":
+            signal_group(pid, signal.SIGTERM)
+            alive.append((pid, start))
+    if alive:
+        sleep(grace)
+        for pid, start in alive:
+            if probe(pid, start) == "ours":
+                signal_group(pid, signal.SIGKILL)
+    return [pid for pid, _ in alive]
 
 
 @dataclass
@@ -2470,8 +2570,7 @@ class Dispatcher:
                 # An opted-in project runs Claude with scoped implementation tools (runner_preflight.ALLOWED); a denied
                 # tool is the agent's to report as a blocker. A read-only runner (the triage agent's) keeps its own
                 # narrower tools: the scoped override would widen it.
-                if (not inbox and project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude"
-                        and not runner_preflight.read_only(template)):
+                if not inbox and runner_preflight.scoped(template, project, self.config.claude_tool_projects):
                     template = runner_preflight.scoped_template(template)
                     prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
                 if not inbox:

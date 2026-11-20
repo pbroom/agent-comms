@@ -45,17 +45,18 @@ class FakeChild:
 
 
 class FakeSpawner:
-    def __init__(self, fail_for=()):
+    def __init__(self, fail_for=(), child=FakeChild):
         self.calls = []
         self.children = []
         self.fail_for = set(fail_for)
+        self.child = child      # the fake to hand out (test_session_host: one with scripted stdout, captured stdin)
 
     def __call__(self, argv, *, cwd, env, log_path, **kw):
         assert not kw, "spawner takes only argv, cwd, env and log_path"
         self.calls.append({"argv": argv, "cwd": cwd, "env": env, "log_path": log_path})
         if any(a in self.fail_for for a in argv):
             raise FileNotFoundError(f"[Errno 2] No such file or directory: {argv[0]!r}")
-        child = FakeChild(1000 + len(self.children))
+        child = self.child(1000 + len(self.children))
         self.children.append(child)
         return child
 

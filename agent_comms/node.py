@@ -28,8 +28,8 @@ import httpx
 from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
-                       signed_in_browser_overrides, signed_in_profile, spawn_process, with_headless_browser,
-                       with_writable_roots)
+                       signed_in_browser_overrides, signed_in_profile, spawn_process, stop_verified,
+                       with_headless_browser, with_writable_roots)
 
 log = logging.getLogger("agent_comms.node")
 
@@ -104,17 +104,9 @@ class Node:
         process it can verify is terminated, then killed after the grace period. Their ends are reported once the hub
         answers (tick), so an unreachable hub never leaves them running. Returns their run ids."""
         left = self._load_state()
-        alive = []
-        for rid, d in left.items():
-            pid = d.get("pid") if isinstance(d, dict) else None
-            if isinstance(pid, int) and self.probe(pid, d.get("proc_start")) == "ours":
-                self.signal_group(pid, signal.SIGTERM)
-                alive.append((pid, d.get("proc_start")))
-        if alive:
-            self.sleep(self.config.kill_grace_seconds)
-            for pid, start in alive:
-                if self.probe(pid, start) == "ours":
-                    self.signal_group(pid, signal.SIGKILL)
+        stop_verified([(d.get("pid"), d.get("proc_start")) for d in left.values() if isinstance(d, dict)],
+                      probe=self.probe, signal_group=self.signal_group, sleep=self.sleep,
+                      grace=self.config.kill_grace_seconds)
         for rid in left:
             self._remove_browser_output(rid)
         self.unreported = list(left)
@@ -235,8 +227,7 @@ class Node:
             if not isinstance(prompt, str) or not prompt:
                 raise ValueError("assignment has no prompt")
             from . import runner_preflight
-            if (project in self.config.claude_tool_projects and os.path.basename(template[0]) == "claude"
-                    and not runner_preflight.read_only(template)):
+            if runner_preflight.scoped(template, project, self.config.claude_tool_projects):
                 template = runner_preflight.scoped_template(template)
                 prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
             signed_in = r.get("browser_access")
