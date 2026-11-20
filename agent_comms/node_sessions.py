@@ -17,14 +17,18 @@ Rules the hub relies on:
   processes are up and none is idle), and nothing running is ever stopped to make room: only an idle process is.
 - Never twice. The number of the last message handed to each session is on disk before the host gets it
   (HANDED_FILE). A message at or below that number which the hub still lists and the host no longer holds was lost
-  (the node restarted): it is reported failed, never written again.
+  (the node restarted): it is reported failed, never written again. That number says nothing else: in particular
+  not whether the provider's session exists.
 - Start-up: `SessionHost.recover()` first (stop what an earlier node process left), then the hub's sessions for this
-  node are opened again, with resume once anything was ever handed to them (Claude refuses `--session-id` for a
-  session that exists), and a turn that was in flight is reported failed.
-- No hub for `self_stop_seconds` (node.SELF_STOP_SECONDS): turns in flight are stopped and reported failed once the
-  hub answers; idle processes stay, and nothing new starts until then.
+  node are opened again, resuming exactly those the provider confirmed (the hub's `resume`, or the last host's
+  record), and a turn that was in flight is reported failed. Where that guess is wrong the host corrects itself
+  after one refused start (session_host._correct_start_mode).
+- A hub call failed (unreachable, paused, an error): turns already running go on, but nothing new is handed over
+  until a fetch has succeeded again, because the queue and the stop flags this node holds may be out of date.
+  No hub for `self_stop_seconds` (node.SELF_STOP_SECONDS): turns in flight are stopped and reported failed once the
+  hub answers; idle processes stay.
 - A session the hub no longer lists is closed here. Shutdown stops every process (`stop_all`); the sessions go on
-  at the next start.
+  at the next start. From the moment shutdown begins, shutdown alone reports: the loop posts nothing more.
 - `[dispatch.sessions]`: `idle_hours` (a process idle that long is stopped; its session stays and the next message
   resumes it) and `max_live`.
 """
@@ -50,6 +54,7 @@ SYNC_SECONDS = 1.0          # between fetches of the hub's list while any sessio
 LONG_POLL_SECONDS = 20      # how long one fetch may wait at the hub when nothing has work
 RETRY_SECONDS = 2.0         # after a hub call failed, with nothing else to do
 JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a loop waiting at the hub is not waited for
+REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 LOST = "the node restarted while this turn was in flight; it was not replayed"
@@ -75,8 +80,10 @@ class SessionRunner:
         self.version: str | None = None
         self.last_sync = float("-inf")
         self.retry_at = float("-inf")
+        self.fresh = False                            # the last hub call was a fetch that succeeded: `queue` is current
         self.last_contact = clock()
         self.lock = threading.Lock()                  # the host, between the loop and shutdown()
+        self.report_lock = threading.Lock()           # the report queue: one flush at a time, shutdown's last
         self.stopping = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -146,10 +153,18 @@ class SessionRunner:
                 self.queue.pop(e.session_id, None)
             self._add(e.session_id, self._event(e))
 
-    def _flush(self) -> bool:
+    def _flush(self, final: bool = False) -> bool:
         """Post what the hub has not taken yet, per session and in order. False: the hub could not be reached (the
         rest is kept). A report the hub refuses for good (it does not know the session, or cannot read the report)
-        is dropped, so one bad event never holds the others back."""
+        is dropped, so one bad event never holds the others back. Once shutdown has begun only shutdown's own flush
+        (`final`) posts: the loop's would race it, and an older status sent after shutdown's would bring a dead pid
+        back to life on the hub."""
+        with self.report_lock:
+            if self.stopping.is_set() and not final:
+                return False
+            return self._post_pending()
+
+    def _post_pending(self) -> bool:
         order: list[str] = []
         for sid, _ in self.pending:
             if sid not in order:
@@ -207,35 +222,41 @@ class SessionRunner:
         if wait is None:
             wait = self.long_poll if ok and not self.active() else 0
         data = None
-        if ok and (wait or self.clock() - self.last_sync >= self.sync_seconds):
+        if ok and (wait or not self.fresh or self.clock() - self.last_sync >= self.sync_seconds):
             try:
                 data = self._sync(wait)
                 self.last_sync = self.clock()
             except Exception as e:
                 log.warning("could not fetch hosted sessions: %s", e)
                 ok = False
+        if data is not None:
+            self.fresh = True
+        elif not ok:
+            # The queue and the stop flags held here may be out of date (the human may just have closed a session):
+            # turns already running go on, nothing new is handed over until a fetch has succeeded again.
+            self.fresh = False
         with self.lock:
             if self.stopping.is_set():
                 return ok
             now = self.clock()
             if data is not None:
                 self._reconcile(data)
-            connected = now - self.last_contact < self.self_stop_seconds
-            if connected:
-                self._hand_over(now)
-            else:
+            if now - self.last_contact >= self.self_stop_seconds:
                 self._emit(self.host.stop_turns(
                     f"the node had no hub contact for {self.self_stop_seconds:g} seconds and stopped the turn"))
+            if self.fresh:
+                self._hand_over(now)
             self._park_idle(now)
             events = self.host.tick()
             self._emit(events)
-            if connected and any(e.kind == "turn_ended" for e in events):
+            if self.fresh and any(e.kind == "turn_ended" for e in events):
                 self._hand_over(now)        # the message behind a turn that just ended is written in this same pass
                 self._emit(self.host.tick())
             self._after_tick(now)
         if ok and (self.pending or any(self.reported.get(sid) != st for sid, st in self.status.items())):
             ok = self._flush()
         if reach and not ok:
+            self.fresh = False
             self.retry_at = self.clock() + RETRY_SECONDS
         return ok
 
@@ -264,12 +285,12 @@ class SessionRunner:
                 continue
             if s is None:
                 left = self.recovered.pop(sid, None) or {}
-                # Resume whenever the provider's session may exist: the hub saw a message reach it, the last host
-                # recorded it, or this node handed it a message whose report was lost. Only a session that never
-                # got a message starts anew (`--session-id` for an existing session is refused, and so is
-                # `--resume` for one that does not exist).
-                resume = (view.get("resume") is True or left.get("resume") is True or bool(left.get("turn"))
-                          or self.handed.get(sid, 0) > 0)
+                # Resume only a session the provider confirmed: the hub's record of it (the host's own `resume`,
+                # reported with every status) or the last host's state file. That a message was handed over, or
+                # even written, proves nothing: Claude refuses `--resume` for a conversation that does not exist
+                # just as it refuses `--session-id` for one that does. A wrong guess heals in the host after one
+                # refused start (session_host._correct_start_mode).
+                resume = view.get("resume") is True or left.get("resume") is True
                 try:
                     s = self.host.open(sid, agent=view.get("agent"), project=view.get("project"),
                                        runtime=view.get("runtime"), model=view.get("model"), resume=resume)
@@ -377,15 +398,26 @@ class SessionRunner:
         self.thread = threading.Thread(target=self.run_forever, name="hosted-sessions", daemon=True)
         self.thread.start()
 
+    def signal(self) -> None:
+        """The first step of a shutdown: SIGTERM to every session process, now. No waiting and no reporting, so the
+        node can go on to stop its ordinary runs at once (node.run); `shutdown()` does the rest."""
+        self.stopping.set()
+        with self.lock:
+            for s in self.host.sessions.values():
+                if s.child is not None:
+                    try:
+                        s.child.terminate()
+                    except Exception:
+                        log.exception("could not signal session %s", s.session_id)
+
     def shutdown(self) -> None:
         """Stop the loop and every session process; turns in flight are reported failed. The loop may be waiting at
         the hub: it is given JOIN_SECONDS, then the host is taken from it (it checks `stopping` before touching the
-        host again)."""
+        host again). From `stopping` on the loop posts nothing (`_flush`), so what it had not reported yet and what
+        the shutdown adds go to the hub from here, in order, as one queue."""
         self.stopping.set()
-        joined = True
         if self.thread is not None:
             self.thread.join(JOIN_SECONDS)
-            joined = not self.thread.is_alive()
         with self.lock:
             # stop_all reports the turn in flight and says nothing of a message still in a session's inbox. Such a
             # message never reached a process, so it is given back: the hub still lists it as queued, and with its
@@ -398,16 +430,19 @@ class SessionRunner:
             if back:
                 self._save_handed()
             events = self.host.stop_all()
-            last = {sid: {"events": [], "state": s.state, "pid": None, "resume": bool(s.resume)}
-                    for sid, s in self.host.sessions.items() if not s.ended and sid not in self.dropped}
-        for e in events:
-            if e.session_id in last:
-                last[e.session_id]["events"].append(self._event(e))
+        # A flush the loop began before `stopping` may still be on its way: wait for it (a hub call is bounded by the
+        # client's timeout) rather than post beside it. If it never returns, nothing is reported from here and the
+        # next node process reports the lost turns.
+        if not self.report_lock.acquire(timeout=REPORT_WAIT_SECONDS):
+            log.warning("a report to the hub is still under way; the session shutdown is not reported")
+            return
+        self.report_lock.release()
+        with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
+            self._emit(events)
+            self.status = {sid: (s.state, None, bool(s.resume)) for sid, s in self.host.sessions.items()
+                           if not s.ended and sid not in self.dropped}
         try:
-            if joined:              # else the loop still owns `pending`; the hub fails what it never hears about
-                self.status = {}
-                self._flush()
-            for sid, body in last.items():
-                self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+            if not self._flush(final=True):
+                log.warning("could not report the session shutdown")
         except Exception as e:
             log.warning("could not report the session shutdown: %s", e)

@@ -137,8 +137,11 @@ def _agent(board: Board, name: Any) -> tuple[str, str]:
 
 
 def _node_seen(conn, node: str) -> float:
+    """When the node was last seen AS A SESSION HOST. A node whose latest hello does not say it hosts sessions (it
+    was restarted with [dispatch.sessions] off) keeps its heartbeat fresh through its run loop, but nothing there
+    reads a session's messages or its stop flag any more: for hosted sessions it counts as never seen."""
     info = _get(conn, nodes.NODE_PREFIX + node)
-    return float(info.get("last_seen") or 0) if isinstance(info, dict) else 0.0
+    return float(info.get("last_seen") or 0) if isinstance(info, dict) and info.get("sessions") else 0.0
 
 
 def _place(board: Board, project: str, agent: str, runtime: str, allowed: dict[str, dict] | None) -> str:
@@ -273,8 +276,16 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
 def message(board: Board, p: Principal, session_id: Any, n: Any) -> dict:
     """One message and its session (the reply included): what `--wait` polls."""
     _human(board, p, "read a hosted session")
-    r = _settle(board, _session(board.conn, session_id))
-    m = _get(board.conn, _msg_key(r["session_id"], n)) if type(n) is int and n > 0 else None
+    _settle(board, _session(board.conn, session_id))
+    # One snapshot for both reads: a turn that completes between them would otherwise show its message `done` beside
+    # the session's previous reply, and `--wait` would exit without the reply it waited for.
+    c = board.conn
+    c.execute("BEGIN")
+    try:
+        r = _session(c, session_id)
+        m = _get(c, _msg_key(r["session_id"], n)) if type(n) is int and n > 0 else None
+    finally:
+        c.execute("ROLLBACK")
     if not isinstance(m, dict):
         raise NotFound(f"session {r['session_id']} has no message {n}")
     return {"message": _msg_view(m), "session": _human_view(board, r)}
@@ -289,7 +300,7 @@ def close(board: Board, p: Principal, session_id: Any) -> dict:
     with db.write_tx(board.conn) as c:
         r = _session(c, session_id)
         if r["state"] != "ended":
-            if now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS:
+            if now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS:   # away, or no longer hosting sessions
                 _end(c, r, "closed by the human (its node was not connected)", p.name, now)
             elif not r.get("stop"):
                 r |= {"stop": "close", "updated_at": now}
@@ -309,18 +320,28 @@ def _end(c, r: dict, detail: str, by: str, now: float) -> None:
           "in_flight": None}
 
 
+def _lost(conn, r: dict, now: float) -> bool:
+    """The session has a turn in flight or a close pending, and its node has been gone long enough (or no longer
+    hosts sessions) that neither will be carried out. Only what the node itself did counts: its hellos as a session
+    host and its reports on this session."""
+    if r.get("state") == "ended" or not (r.get("stop") or r.get("in_flight") is not None):
+        return False
+    seen = _node_seen(conn, r["node"])
+    return not seen or now - max(seen, float(r.get("node_reported_at") or 0)) > nodes.NODE_LOST_SECONDS
+
+
 def _settle(board: Board, r: dict) -> dict:
     """On the human's reads: a session whose node went silent (nodes.NODE_LOST_SECONDS, like a node run) no longer
     has a turn in flight, and one being closed is closed. The node stops its own turns well before that
     (node_sessions.py), so the failed turn is not still running somewhere."""
-    if r.get("state") == "ended" or not (r.get("stop") or r.get("in_flight") is not None):
-        return r
     now = board.now()
-    if now - max(_node_seen(board.conn, r["node"]), float(r.get("node_reported_at") or 0)) <= nodes.NODE_LOST_SECONDS:
+    if not _lost(board.conn, r, now):
         return r
     with db.write_tx(board.conn) as c:
+        # Decided again inside the transaction, on what is stored now: a node that reconnected and reported a
+        # freshly delivered turn between the check above and here must not have that turn failed under it.
         r = _session(c, r["session_id"])
-        if r["state"] == "ended":
+        if not _lost(c, r, now):
             return r
         if r.get("stop"):
             _end(c, r, "closed by the human (its node went silent)", "hub", now)
@@ -328,7 +349,8 @@ def _settle(board: Board, r: dict) -> dict:
             for m in _messages(c, r["session_id"]):
                 if m.get("state") == "delivered":
                     m |= {"state": "failed", "ok": False, "text": "", "ended_at": now, "updated_at": now,
-                          "detail": "node_lost: the node went silent while the turn was in flight; it was not replayed"}
+                          "detail": "node_lost: the node went silent (or stopped hosting sessions) while the turn "
+                                    "was in flight; it was not replayed"}
                     _put(c, _msg_key(r["session_id"], m["n"]), m, "hub", now)
                     r["last_result"] = {"message": m["n"], "ok": False, "detail": m["detail"], "denials": [],
                                         "meta": {}, "at": now}
@@ -413,9 +435,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
         if m["state"] == "queued":
             m |= {"state": "delivered", "delivered_at": now, "text": ""}    # the node has it: the hub lets go of it
             r["in_flight"] = n
-        # A message reached the session's process: from here on a new process must resume the provider's session
-        # (Claude refuses `--session-id` for a session that already exists).
-        r["resume"] = True
+        if kind == "turn_started":
+            r["resume"] = True      # the provider began a turn in it, so its session exists (a write proves nothing)
     else:
         ok = ev["ok"] is True
         detail = ev["detail"] or ("" if ok else "the agent reported that the turn failed"
@@ -428,7 +449,6 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
                             "at": now}
         r["denials"] = ev["denials"]
         if ev["delivered"]:
-            r["resume"] = True
             r["turns"] = int(r.get("turns") or 0) + 1
             if ok or ev["text"]:
                 r |= {"reply": ev["text"], "reply_for": n}
@@ -442,8 +462,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
 def report(board: Board, p: Principal, session_id: Any, events: Any = None, state: Any = None, pid: Any = None,
            resume: Any = None) -> dict:
     """The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
-    turn_ended, approval_requested, ended), and how the session stands now (`state`, `pid`, `resume`: the provider's
-    session exists). Only the node the session is assigned to may; a repeated report changes nothing."""
+    turn_ended, approval_requested, ended), and how the session stands now (`state`, `pid`, `resume`: the provider
+    confirmed its session exists). Only the node the session is assigned to may; a repeated report changes nothing."""
     nodes._require_node(board, p)
     events = _events([] if events is None else events)
     if state is not None and state not in SESSION_STATES:
@@ -466,8 +486,10 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         if r["state"] != "ended":
             if state is not None and state != "ended":
                 r |= {"state": state, "pid": pid}
-            if resume:
-                r["resume"] = True
+            if resume is not None:
+                # As the node's host knows it: confirmed by the provider, or corrected when a start was refused
+                # (session_host._correct_start_mode). This is what a restarted node reopens the session with.
+                r["resume"] = resume
         r |= {"updated_at": now, "node_reported_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     return _node_view(r)

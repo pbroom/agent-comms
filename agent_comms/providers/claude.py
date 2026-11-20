@@ -125,6 +125,16 @@ class ClaudeSession:
     def interrupt(self) -> list[bytes] | None:
         return None
 
+    def session_exists(self, stderr: str) -> bool | None:
+        """Claude Code 2.1.322 refuses a start in the wrong mode before any turn and exits 1 (DESIGN_NOTES "Session
+        host (PR 2)"): `--session-id` for a session that exists writes "Error: Session ID <uuid> is already in use.";
+        `--resume` for one that does not writes "No conversation found with session ID: <uuid>"."""
+        if f"Session ID {self.session_id} is already in use" in stderr:
+            return True
+        if f"No conversation found with session ID: {self.session_id}" in stderr:
+            return False
+        return None
+
     def feed(self, line: bytes) -> tuple[list[Event], list[bytes]]:
         if self._dead:
             return [], []

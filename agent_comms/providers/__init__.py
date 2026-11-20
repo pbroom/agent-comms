@@ -24,15 +24,14 @@ REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the sess
 
 
 def cap_reply(text: Any) -> str:
-    """A turn's reply as it may leave the node: valid UTF-8, at most REPLY_MAX_BYTES of it plus a marker saying it was
-    cut. Capping a capped reply changes nothing."""
+    """A turn's reply as it may leave the node: valid UTF-8 and at most REPLY_MAX_BYTES, the marker that says it was
+    cut included. Capping a capped reply changes nothing."""
     if not isinstance(text, str):
         return ""
     data = text.encode("utf-8", "replace")
-    if len(data) <= REPLY_MAX_BYTES or (text.endswith(REPLY_TRUNCATED)
-                                        and len(data) <= REPLY_MAX_BYTES + len(REPLY_TRUNCATED.encode())):
+    if len(data) <= REPLY_MAX_BYTES:
         return data.decode("utf-8", "replace")
-    return data[:REPLY_MAX_BYTES].decode("utf-8", "ignore") + REPLY_TRUNCATED
+    return data[:REPLY_MAX_BYTES - len(REPLY_TRUNCATED.encode())].decode("utf-8", "ignore") + REPLY_TRUNCATED
 
 
 @dataclass(frozen=True)
@@ -76,6 +75,12 @@ class ProviderSession(Protocol):
     def interrupt(self) -> list[bytes] | None:
         """How to stop the turn in flight without ending the process, or None: the host terminates the process and
         starts it again (resuming) for the next message."""
+        ...
+
+    def session_exists(self, stderr: str) -> bool | None:
+        """What a process that went without ever confirming the session said about it on stderr: True, the session it
+        was told to create already exists (the next process must resume it); False, the one it was told to resume does
+        not (the next process must create it); None, neither. Optional: a provider without it never corrects the host."""
         ...
 
 

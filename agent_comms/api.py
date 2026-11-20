@@ -73,7 +73,6 @@ class HostedEventIn(Body):
     meta: dict[str, Any] = {}
     detail: str = ""
     text: str = ""
-    undelivered: list[StrictInt] = []
 
 
 class NodeSessionReportIn(Body):
@@ -836,7 +835,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/nodes/sessions/{session_id}")
     def node_session_report(session_id: str, body: NodeSessionReportIn, p: Principal = P):
         from . import hosted
-        return hosted.report(board, p, session_id, [e.model_dump(exclude={"undelivered"}) for e in body.events],
+        return hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
                              body.state, body.pid, body.resume)
 
     # Hosted sessions, the human's side: only the human starts, messages, reads or closes one (hosted.py checks on

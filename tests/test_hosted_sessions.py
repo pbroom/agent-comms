@@ -11,7 +11,9 @@ import sys
 import threading
 import time
 import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,13 +24,13 @@ from agent_comms.api import create_app
 from agent_comms.config import create_agent
 from agent_comms.core import Forbidden
 from agent_comms.dispatch import DispatchConfig
-from agent_comms.node import SELF_STOP_SECONDS, Node
+from agent_comms.node import SELF_STOP_SECONDS, Node, _Local, shut_down
 from agent_comms.node_sessions import HANDED_FILE, LOST, SessionRunner
 from agent_comms.providers.claude import ClaudeSession
 from agent_comms.session_host import SessionHost
 
 from conftest import PROJECT, make_env
-from test_dispatch import FakeProcs, FakeSpawner
+from test_dispatch import FakeChild, FakeProcs, FakeSpawner
 from test_nodes import Clock
 from test_session_host import SHIPPED, FakeSessionChild, init, result, value_after
 
@@ -77,6 +79,25 @@ def senv(tmp_path):
     env.node = make_node(env)
     env.node.hello()
     return env
+
+
+class NoReports:
+    """The node's client when it can fetch from the hub but every report is lost on the way."""
+
+    def __init__(self, hub):
+        self.hub = hub
+
+    def request(self, method, path, **kw):
+        if method == "POST":
+            raise httpx.ReadTimeout("timed out")
+        return self.hub.request(method, path, **kw)
+
+
+class Down:
+    """The node's client when the hub cannot be reached at all."""
+
+    def request(self, *a, **kw):
+        raise httpx.ConnectError("connection refused")
 
 
 def start(env, text="first", project=PROJECT, **kw) -> dict:
@@ -438,6 +459,7 @@ def test_a_report_the_hub_cannot_read_is_refused_whole(senv):
     assert post(events=[{"kind": "turn_ended", "message": 1, "ok": True, "meta": {"k": {"nested": 1}}}]) == 400
     assert post(events=[{"kind": "ended", "detail": "x" * 301}]) == 400
     assert post(state="sleeping") == 422 and post(events=[], exec="rm") == 422
+    assert post(events=[{"kind": "ended", "detail": "x", "undelivered": [1]}]) == 422, "no field the hub ignores"
     assert msg(senv, sid, 1)["state"] == "queued" and show(senv, sid)["state"] == "idle"
 
 
@@ -450,9 +472,12 @@ def test_the_reply_is_capped_at_16_kb_with_a_marker():
     big = "é" * 20_000      # 40 KB of UTF-8
     [ev], _ = p.feed(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": UNKNOWN,
                                  "result": big}).encode())
-    assert ev.text.endswith(providers.REPLY_TRUNCATED) and ev.text.startswith("é" * 8192)
-    assert len(ev.text.removesuffix(providers.REPLY_TRUNCATED).encode()) == providers.REPLY_MAX_BYTES == 16 * 1024
+    assert ev.text.endswith(providers.REPLY_TRUNCATED) and ev.text.startswith("é" * 8000)
+    assert providers.REPLY_MAX_BYTES == 16 * 1024
+    assert providers.REPLY_MAX_BYTES - 1 <= len(ev.text.encode()) <= providers.REPLY_MAX_BYTES, \
+        "the marker is inside the cap, not on top of it"
     assert providers.cap_reply(ev.text) == ev.text, "capping again changes nothing"
+    assert len(providers.cap_reply("x" * 100_000).encode()) == providers.REPLY_MAX_BYTES
     assert "result" not in ev.meta and big[:100] not in repr(ev.meta)
     [small], _ = p.feed(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": UNKNOWN,
                                     "result": "short"}).encode())
@@ -470,7 +495,7 @@ def test_only_the_last_reply_is_kept_and_only_the_human_can_read_it(senv):
     run_turn(senv, sid, "é" * 20_000)
     view = show(senv, sid)
     assert view["reply_for"] == 2 and view["reply"].endswith(providers.REPLY_TRUNCATED)
-    assert len(view["reply"].encode()) == providers.REPLY_MAX_BYTES + len(providers.REPLY_TRUNCATED.encode())
+    assert len(view["reply"].encode()) <= providers.REPLY_MAX_BYTES
     rows = [(k, v) for k, v in senv.board.conn.execute("SELECT key, value FROM board_state")]
     assert "FIRST-REPLY-TEXT" not in json.dumps(rows), "the earlier reply is gone from the hub"
     assert [k for k, v in rows if "\\u00e9\\u00e9" in v or "éé" in v] == [hosted.SESSION_PREFIX + sid]
@@ -745,15 +770,8 @@ def test_a_restarted_node_resumes_its_sessions_and_fails_the_turn_that_was_in_fl
 def test_a_message_handed_over_before_a_crash_is_never_written_twice(senv):
     """The hub still lists it as queued (the report never arrived), but the node recorded that it handed it over."""
     sid = start(senv)["session_id"]
-    runner, hub = senv.node.sessions, senv.node.sessions.client
-
-    class NoReports:        # the node can fetch, but every report is lost on the way
-        def request(self, method, path, **kw):
-            if method == "POST":
-                raise httpx.ReadTimeout("timed out")
-            return hub.request(method, path, **kw)
-
-    runner.client = NoReports()
+    runner = senv.node.sessions
+    runner.client = NoReports(runner.client)
     runner.pass_once()
     assert children(senv)[0].turns() == ["first"] and msg(senv, sid, 1)["state"] == "queued"
     assert json.loads((senv.tmp / "laptop-logs" / HANDED_FILE).read_text()) == {sid: 1}
@@ -765,12 +783,257 @@ def test_a_message_handed_over_before_a_crash_is_never_written_twice(senv):
     assert m["state"] == "failed" and m["detail"] == LOST
     assert children(senv, node) == [], "not written again"
     assert show(senv, sid)["turns"] == 0
-    # The message did reach a process, so Claude may know the session: the next process resumes it (`--session-id`
-    # for a session that exists is refused).
+    # The provider never confirmed the session, and a hand-over (even a write) is no proof that it exists: the next
+    # process creates it. `--resume` here would fail every later message if Claude never got as far as creating it.
     send(senv, sid, "second")
     tick(senv, node)
     assert children(senv, node)[0].turns() == ["second"]
-    assert value_after(node.session_spawner.calls[0]["argv"], "--resume") == sid
+    argv = node.session_spawner.calls[0]["argv"]
+    assert value_after(argv, "--session-id") == sid and "--resume" not in argv
+
+
+def test_only_the_providers_confirmation_makes_a_session_resumable(senv):
+    sid = start(senv)["session_id"]
+    listed = lambda: senv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+    post = lambda **body: senv.laptop.post(f"/api/nodes/sessions/{sid}", json=body)
+    post(events=[{"kind": "delivered", "message": 1}], state="starting", pid=4242, resume=False)
+    assert listed()["resume"] is False, "bytes in a pipe do not prove the conversation exists"
+    post(events=[{"kind": "turn_ended", "message": 1, "ok": False, "detail": "the process exited (code 1)"}])
+    assert listed()["resume"] is False
+    send(senv, sid, "second")
+    post(events=[{"kind": "delivered", "message": 2}, {"kind": "turn_started", "message": 2}])
+    assert listed()["resume"] is True, "the provider began a turn in it"
+    post(events=[], state="idle", pid=None, resume=False)
+    assert listed()["resume"] is False, "the host's correction after a refused start reaches the hub too"
+
+
+def test_a_refused_start_flips_the_mode_so_the_session_heals_after_one_failed_message(senv):
+    """Claude Code refuses `--session-id` for a session that exists and `--resume` for one that does not, before any
+    turn (stderr and exit 1; DESIGN_NOTES). Whichever way the node guessed wrong, the next process starts the other
+    way: one failed message, never every later one."""
+    sid = start(senv)["session_id"]
+    calls = senv.node.session_spawner.calls
+    listed = lambda: senv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+    tick(senv)
+    assert value_after(calls[0]["argv"], "--session-id") == sid
+    with open(calls[0]["log_path"], "a") as f:     # Claude had created the session before an earlier crash
+        f.write(f"Error: Session ID {sid} is already in use.\n")
+    children(senv)[0].code = 1
+    tick(senv)
+    m = msg(senv, sid, 1)
+    assert m["state"] == "failed" and "exited (code 1)" in m["detail"], "that message is lost, and is not retried"
+    assert listed()["resume"] is True
+    send(senv, sid, "second")
+    tick(senv)
+    assert value_after(calls[1]["argv"], "--resume") == sid and "--session-id" not in calls[1]["argv"]
+
+    # The other way round: told to resume a conversation Claude does not have.
+    with open(calls[1]["log_path"], "a") as f:
+        f.write(f"No conversation found with session ID: {sid}\n")
+    children(senv)[1].emit(result(sid, subtype="error_during_execution", is_error=True, text=""))
+    children(senv)[1].code = 1
+    tick(senv)
+    assert msg(senv, sid, 2)["state"] == "failed" and listed()["resume"] is False
+    send(senv, sid, "third")
+    tick(senv)
+    assert value_after(calls[2]["argv"], "--session-id") == sid and "--resume" not in calls[2]["argv"]
+
+    # A process that did confirm the session and later exits is not second-guessed by what an earlier one wrote.
+    run_turn(senv, sid, "third reply")
+    children(senv)[2].code = 0
+    tick(senv)
+    assert listed()["resume"] is True and show(senv, sid)["reply"] == "third reply"
+    send(senv, sid, "fourth")
+    tick(senv)
+    assert value_after(calls[3]["argv"], "--resume") == sid
+
+
+def test_after_a_failed_hub_call_nothing_new_is_handed_over_until_a_fetch_succeeds(senv):
+    """The queue and the stop flags the node holds may be out of date: the human may just have closed the session."""
+    sid = start(senv)["session_id"]
+    send(senv, sid, "second")
+    tick(senv)
+    [child] = children(senv)
+    child.emit(init(sid))
+    tick(senv)
+    runner, hub = senv.node.sessions, senv.node.sessions.client
+    assert runner.queue[sid][0]["text"] == "second", "the node already holds the next message"
+
+    runner.client = Down()
+    assert senv.human.post(f"/api/hosted-sessions/{sid}/close").json()["stop"] == "close"
+    child.emit(result(sid, text="first reply"))
+    assert runner.pass_once() is False
+    assert child.turns() == ["first"], "the running turn went on to its end; the cached message was not started"
+    senv.clock.advance(1)
+    runner.pass_once()
+    assert child.turns() == ["first"]
+
+    runner.client = hub
+    senv.clock.advance(5)
+    tick(senv, times=2)
+    assert child.turns() == ["first"] and child.terminated == 1
+    view = show(senv, sid)
+    assert (view["state"], view["reply"]) == ("ended", "first reply"), "the turn that did run is not lost"
+    assert [m["state"] for m in view["messages"]] == ["done", "failed"]
+
+
+def test_a_paused_board_also_holds_new_turns_back(senv):
+    sid = start(senv)["session_id"]
+    send(senv, sid, "second")
+    tick(senv)
+    children(senv)[0].emit(init(sid))
+    tick(senv)
+    assert senv.node.sessions.queue[sid][0]["text"] == "second", "the node already holds the next message"
+    senv.board.set_paused(senv.p["human"], True)        # from here the node's calls are refused (423)
+    children(senv)[0].emit(result(sid))
+    tick(senv, times=2)
+    assert children(senv)[0].turns() == ["first"], "the running turn ended; the cached message was not started"
+    senv.board.set_paused(senv.p["human"], False)
+    senv.clock.advance(5)
+    tick(senv)
+    assert children(senv)[0].turns() == ["first", "second"]
+
+
+def test_shutdown_reports_what_the_loop_had_not_and_the_loop_posts_nothing_after(senv):
+    sid = start(senv)["session_id"]
+    tick(senv)
+    runner, hub = senv.node.sessions, senv.node.sessions.client
+    runner.client = NoReports(hub)
+    children(senv)[0].emit(init(sid), result(sid, text="finished just before the stop"))
+    runner.pass_once()
+    assert any(e["kind"] == "turn_ended" for _, e in runner.pending) and msg(senv, sid, 1)["state"] == "delivered"
+    runner.client = hub
+
+    # The loop is still alive when shutdown's join times out (it sits in a hub call). Shutdown reports all the same,
+    # everything in order: the completion the loop had not delivered, then how the session stands now.
+    runner.thread = SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: True)
+    runner.shutdown()
+    view = show(senv, sid)
+    assert (msg(senv, sid, 1)["state"], view["reply"]) == ("done", "finished just before the stop")
+    assert (view["state"], view["pid"], view["turns"]) == ("idle", None, 1)
+
+    # When that loop comes back from its call it posts nothing: its older status would bring the dead pid back.
+    runner.status[sid] = ("running", 4242, True)
+    runner.pending.append((sid, {"kind": "delivered", "message": 1}))
+    assert runner._flush() is False and runner.pass_once() is False
+    view = show(senv, sid)
+    assert (view["state"], view["pid"]) == ("idle", None)
+
+
+def test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up_the_runs(senv):
+    sid = start(senv)["session_id"]
+    tick(senv)
+    node = senv.node
+    [session_child] = children(senv)
+    run_child = FakeChild(5000)
+    node.running["run-1"] = _Local("run-1", run_child, senv.clock(), 1800.0, 10.0)
+    posts, hub = [], node.client
+
+    class Recording:
+        def request(self, method, path, **kw):
+            if method == "POST":
+                posts.append((path, run_child.terminated, session_child.terminated))
+            return hub.request(method, path, **kw)
+
+    node.client = node.sessions.client = Recording()
+    shut_down(node)
+    assert posts and all(run and session for _, run, session in posts), "every child had its SIGTERM before any report"
+    assert [path for path, _, _ in posts] == ["/api/nodes/runs/run-1", f"/api/nodes/sessions/{sid}"], \
+        "the ordinary runs are reported as before; the sessions come after"
+    assert node.running == {} and msg(senv, sid, 1)["state"] == "failed"
+
+    # Whatever the sessions do, the runs are stopped and reported.
+    for broken in ("signal", "shutdown"):
+        again = FakeChild(6000)
+        node.running["run-2"] = _Local("run-2", again, senv.clock(), 1800.0, 10.0)
+
+        def boom():
+            raise RuntimeError("session cleanup failed")
+        fake = SimpleNamespace(signal=lambda: None, shutdown=lambda: None)
+        setattr(fake, broken, boom)
+        node.sessions = fake
+        del posts[:]
+        if broken == "shutdown":
+            with pytest.raises(RuntimeError):
+                shut_down(node)
+        else:
+            shut_down(node)
+        assert again.terminated == 1 and node.running == {} and posts[0][0] == "/api/nodes/runs/run-2", broken
+
+
+def test_settle_decides_again_inside_its_transaction(senv, monkeypatch):
+    """A reader finds the node silent for too long; before it writes, the node is back and has reported. The turn the
+    node holds must not be failed under it."""
+    sid = start(senv)["session_id"]
+    tick(senv)
+    senv.clock.advance(nodes.NODE_LOST_SECONDS + 5)
+    real, raced = hosted.db.write_tx, []
+
+    @contextmanager
+    def racing(conn):
+        if not raced:
+            raced.append(True)      # the node reconnects in the gap between the reader's check and its transaction
+            senv.node.hello()
+            r = senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "running", "pid": 4242})
+            assert r.status_code == 200
+        with real(conn) as c:
+            yield c
+
+    monkeypatch.setattr(hosted.db, "write_tx", racing)
+    view = show(senv, sid)
+    assert raced, "the reader did decide to settle"
+    assert (view["in_flight"], view["state"], view["pid"]) == (1, "running", 4242)
+    assert msg(senv, sid, 1)["state"] == "delivered"
+    run_turn(senv, sid, "its result counts")
+    assert show(senv, sid)["reply"] == "its result counts"
+
+
+def test_a_message_and_its_session_are_read_from_one_snapshot(senv, monkeypatch):
+    """`--wait` reads the message's state and the session's reply together: a turn completing between two separate
+    reads would show `done` beside the previous reply."""
+    sid = start(senv)["session_id"]
+    tick(senv)
+    real, raced = hosted._get, []
+
+    def racing(conn, key):
+        if key.startswith(hosted.MSG_PREFIX) and not raced:
+            raced.append(True)      # the completion commits between the session read and the message read
+            t = threading.Thread(target=lambda: hosted.report(senv.board, senv.p["laptop"], sid, [
+                {"kind": "turn_ended", "message": 1, "ok": True, "text": "THE REPLY"}]))
+            t.start()
+            t.join()
+        return real(conn, key)
+
+    monkeypatch.setattr(hosted, "_get", racing)
+    out = hosted.message(senv.board, senv.p["human"], sid, 1)
+    assert raced
+    assert (out["message"]["state"], out["session"]["reply_for"], out["session"]["reply"]) == ("delivered", None, None), \
+        "both from before the completion: never `done` with the reply still missing"
+    out = hosted.message(senv.board, senv.p["human"], sid, 1)
+    assert (out["message"]["state"], out["session"]["reply_for"], out["session"]["reply"]) == ("done", 1, "THE REPLY")
+
+
+def test_a_node_that_no_longer_hosts_sessions_cannot_hold_a_close(senv):
+    """Restarted with [dispatch.sessions] off, a node keeps its heartbeat fresh through its run loop, but nothing
+    there reads a stop flag any more."""
+    sid = start(senv)["session_id"]
+    tick(senv)
+    run_turn(senv, sid)
+    off = make_node(senv, config=node_config(senv, sessions={"enabled": False}), log_dir=senv.tmp / "off-logs")
+    off.hello()
+    off.tick()
+    r = senv.human.post(f"/api/hosted-sessions/{sid}/close")
+    assert (r.json()["state"], r.json()["node_live"]) == ("ended", False), "ended on the hub at once"
+    refused = senv.human.post("/api/hosted-sessions", json={"project": PROJECT, "message": "x"})
+    assert refused.status_code == 409 and "no connected node hosts sessions" in refused.json()["message"]
+    # A turn that was in flight there is not left in flight for ever either.
+    senv.node.hello()
+    other = start(senv, project=P2)["session_id"]
+    tick(senv)
+    off.hello()
+    assert msg(senv, other, 1)["detail"].startswith("node_lost") and show(senv, other)["in_flight"] is None
+
+
 
 
 def test_a_session_that_never_got_a_message_starts_anew_after_a_restart(senv):
@@ -837,10 +1100,6 @@ def test_without_the_hub_turns_in_flight_are_stopped_and_idle_processes_kept(sen
     by_session = {value_after_any(senv, c): c for c in children(senv)}
     by_session[busy].emit(init(busy))
     tick(senv)
-
-    class Down:
-        def request(self, *a, **kw):
-            raise httpx.ConnectError("connection refused")
 
     runner, hub = senv.node.sessions, senv.node.sessions.client
     runner.client = Down()

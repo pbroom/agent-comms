@@ -121,6 +121,7 @@ class Session:
     error: str = ""
     transcript_fd: int | None = None
     tee_failed: bool = False
+    stderr_from: int = 0            # size of the stderr log when this process started: what it wrote comes after
 
     @property
     def dormant(self) -> bool:
@@ -381,6 +382,8 @@ class SessionHost:
         if s.stopping_since is not None and self.group_alive(s.child.pid):
             return      # the host stopped it and its leader is gone, but not its group: nothing starts beside that
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
+        if not s.ready:
+            self._correct_start_mode(s)
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.outbuf.clear()
@@ -398,6 +401,25 @@ class SessionHost:
                 self._fail(s, f"the process exited (code {code}) before the message was written", out)
             s.busy_since = None
         self._save_state()
+
+    def _correct_start_mode(self, s: Session) -> None:
+        """A process that went without ever confirming the session may have said why (stderr): the session it was told
+        to create exists, or the one it was told to resume does not. The next process then starts the other way, so
+        a wrong guess (a crash between the provider creating the session and anyone recording it) costs one failed
+        message instead of every later one. Nothing is retried here."""
+        said = getattr(s.provider, "session_exists", None)
+        if said is None:
+            return
+        try:
+            with open(self.sessions_dir / f"{s.session_id}.stderr.log", "rb") as f:
+                f.seek(s.stderr_from)
+                exists = said(f.read(65536).decode("utf-8", "replace"))
+        except OSError:
+            return
+        if exists is not None and exists != s.resume:
+            log.warning("session %s: its process said the session %s; the next one %s", s.session_id,
+                        "already exists" if exists else "does not exist", "resumes it" if exists else "creates it")
+            s.resume = exists
 
     def _timeout_detail(self) -> str:
         return f"timed out after {self.timeout_minutes:g} minutes"
@@ -454,6 +476,10 @@ class SessionHost:
             argv = self._argv(s)
             self.sessions_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.sessions_dir.mkdir(exist_ok=True, mode=0o700)
+            try:
+                s.stderr_from = os.path.getsize(self.sessions_dir / f"{s.session_id}.stderr.log")
+            except OSError:
+                s.stderr_from = 0
             child = self.spawner(argv, cwd=s.cwd, env=child_env(s.agent, self.config, runtime=s.runtime),
                                  log_path=self.sessions_dir / f"{s.session_id}.stderr.log")
         except Exception as e:

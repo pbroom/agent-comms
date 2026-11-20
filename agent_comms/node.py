@@ -353,6 +353,24 @@ class Node:
         self._save_state()
 
 
+def shut_down(node: Node) -> None:
+    """SIGTERM or Ctrl-C. The ordinary runs are stopped and reported exactly as before hosted sessions existed
+    (`stop_all`), whatever the sessions do: session processes are only signalled first (no waiting, no reporting, and
+    a failure there changes nothing), so every child has its SIGTERM before anything is reported to the hub; the
+    sessions' own waiting and reporting come last."""
+    try:
+        if node.sessions is not None:
+            node.sessions.signal()
+    except Exception:
+        log.exception("could not signal the hosted sessions")
+    finally:
+        try:
+            node.stop_all()
+        finally:
+            if node.sessions is not None:
+                node.sessions.shutdown()
+
+
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
     from .config import Settings, home
     settings = Settings.load()
@@ -383,9 +401,7 @@ def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
                     log.warning("hub unreachable: %s", e)
                 time.sleep(poll_seconds or config.poll_seconds)
         except KeyboardInterrupt:
-            if node.sessions is not None:
-                node.sessions.shutdown()
-            node.stop_all()
+            shut_down(node)
         except BaseException:
             if node.sessions is not None:
                 node.sessions.shutdown()    # whatever ends this loop, no session process is left running behind it

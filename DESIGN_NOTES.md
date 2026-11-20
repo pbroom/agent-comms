@@ -2240,19 +2240,44 @@ message's write.
   `data/node-logs/node-session-handed.json` (mode 600) before the host gets the message. A listed message at or below
   that number which the host no longer holds, with no report on its way, was lost: it is reported failed, not
   written again. That covers a crash after the write and before the `delivered` report reached the hub.
-- *Restart.* `SessionHost.recover()` runs before any hub contact. Then each listed session is opened again, with
-  `resume` whenever the provider's session may exist (the hub saw a message reach it, the last host recorded it, or a
-  message was handed): PR 1 found that Claude refuses `--session-id` for a session that exists. A turn that was in
-  flight is reported `failed` ("the node restarted while this turn was in flight; it was not replayed").
-- *No hub.* After `node.SELF_STOP_SECONDS` (90 s) without a successful hub call, turns in flight are stopped
-  (`SessionHost.stop_turns`) and reported failed once the hub answers; idle processes stay; nothing is handed over
-  until then. After a failed call the hub is left alone for 2 s. The hub, for its part, fails a turn in flight when
+- *Restart.* `SessionHost.recover()` runs before any hub contact. Then each listed session is opened again, and
+  resumed only when the provider confirmed it (`ready`): the hub's `resume`, which is the host's own flag as the node
+  reports it with every status (plus `turn_started`), or the last host's state file. The handed-over number is for
+  de-duplication only; a hand-over, or even a write to the pipe, proves nothing about the conversation. A turn that
+  was in flight is reported `failed` ("the node restarted while this turn was in flight; it was not replayed").
+- *Start mode* (review round 1). Claude refuses a start in the wrong mode before any turn, and both ways were checked
+  live (Claude Code 2.1.322, the stream-json flags, no turn sent, no model call): `--resume <unknown uuid>` exits 1
+  after about 0.45 s with stderr `No conversation found with session ID: <uuid>` and one stdout `result`
+  (`error_during_execution`, `is_error` true, `num_turns` 0, cost 0, the given session id, `errors` holding that
+  text) and no `init`; `--session-id <existing uuid>` exits 1 after 0.13 s with stderr `Error: Session ID <uuid> is
+  already in use.` and nothing on stdout. The node cannot always know which applies (a crash between Claude creating
+  the session and anyone recording `ready`), so the host corrects itself: when a process is reaped without ever
+  having confirmed the session, it reads what that process wrote to the stderr log (from the offset recorded at its
+  start), asks the adapter (`ClaudeSession.session_exists`) and flips `resume` for the next process
+  (`SessionHost._correct_start_mode`). The message that met the refusal is failed as any lost turn is, not retried;
+  the next one starts correctly, and the corrected flag reaches the hub with the status. Run live through a real
+  `SessionHost` both ways: opened with `resume=True` for a new id, the first message failed (the refusal's
+  `result`, 1.4 s, no model call) and the second ran with `--session-id`; a second host opened the same, now
+  existing, session with `resume=False`, the first message failed ("the process exited (code 1) before the turn
+  ended", 1.2 s) and the next ran with `--resume` and still knew the earlier turn.
+- *No hub.* After any failed hub call (unreachable, an error, a paused board's 423) nothing new is handed over until
+  a fetch has succeeded again: the queue and the stop flags the node holds may be out of date, and a session the
+  human just closed must not start another turn. Turns already running go on. After `node.SELF_STOP_SECONDS` (90 s)
+  without a successful hub call, turns in flight are stopped (`SessionHost.stop_turns`) and reported failed once the
+  hub answers; idle processes stay. After a failed call the hub is left alone for 2 s. The hub, for its part, fails a turn in flight when
   its node has been silent for `nodes.NODE_LOST_SECONDS` (180 s), on the human's next read (`hosted._settle`), as
-  `RemoteChild.poll` does for a run. A paused board refuses node calls (as it does a node's run reports), so a pause
+  `RemoteChild.poll` does for a run; the decision is taken again inside the write transaction, so a node that
+  reconnected and reported in between keeps its turn. A paused board refuses node calls (as it does a node's run reports), so a pause
   longer than 90 s stops hosted turns the same way.
 - *Shutdown* (SIGTERM, Ctrl-C, or the run loop dying): `stop_all`; the turn in flight is reported failed, the
   sessions stay and resume at the next start. The loop may be inside its long-poll then: shutdown waits 1 s for a
-  pass in progress, then takes the host under a lock the loop re-checks before touching the host again. `stop_all` says nothing about
+  pass in progress, then takes the host under a lock the loop re-checks before touching the host again. From that
+  moment shutdown alone reports: the loop's `_flush` posts nothing once `stopping` is set, shutdown waits for a
+  report the loop was in the middle of, then sends what the loop had not delivered and its own events as one queue,
+  in order, with the final status last (an older status arriving after it would show a dead pid as running).
+  `node.shut_down` keeps the ordinary runs as they were before hosted sessions: session processes are only
+  signalled first (`SessionRunner.signal`: SIGTERM, no waiting, no reporting), then `Node.stop_all()` runs in a
+  `finally`, then the sessions wait, kill and report. `stop_all` says nothing about
   a message still in a session's inbox (PR 1 review); such a message never reached a process, so the node gives it
   back (its number is no longer recorded as handed) and the next node process delivers it.
 - *Sessions the hub no longer lists* are closed locally and not reported.
@@ -2264,7 +2289,10 @@ message's write.
 `hosted.py` refuses every caller that is not the human, as core does for other human-only actions; a node identity
 never gets past `api.principal`; the gateway does not carry the routes; there is no MCP tool. `close` sets a stop
 flag that the node carries out and confirms; when the node is not connected the session ends on the hub at once and
-the node closes it when it is back.
+the node closes it when it is back. A node whose latest hello does not say it hosts sessions counts as not connected
+for all of this (`hosted._node_seen`): restarted with `[dispatch.sessions]` off it still says hello from its run
+loop, but nothing there would ever read the stop flag. The message route reads the message and its session in one
+SQLite snapshot, so `--wait` never sees `done` beside the previous turn's reply.
 
 **CLI.** `board session` talks HTTP to the local board port with the human token (as `board dashboard` does for its
 sign-in link), not to the database: the node's waiting fetch then sees the message within one 0.25 s poll, and the
@@ -2272,8 +2300,8 @@ gateway refuses human tokens by design. `--wait` long-polls that message until i
 stdout (the session line goes to stderr) and exits 1 when the turn failed, with the reason on stderr. `-` reads the
 message from stdin. Default agent: the one agent whose runtime starts with `claude`, else `--agent` is required.
 
-**Reply text.** The Claude adapter's `turn_ended` now carries `result` capped at 16 KB of UTF-8 plus a marker
-(`providers.cap_reply`), `HostEvent.text` passes it on, and the hub keeps only the last one per session
+**Reply text.** The Claude adapter's `turn_ended` now carries `result` capped at 16 KB of UTF-8, the truncation
+marker included (`providers.cap_reply`), `HostEvent.text` passes it on, and the hub keeps only the last one per session
 (`reply`, `reply_for`). Only the human routes return it. It is not in any agent view, any node response or
 `/api/state`. The adapter's `meta` still never holds it. The full transcript stays on the node
 (`data/node-logs/sessions/<uuid>.jsonl`, mode 600).
@@ -2307,8 +2335,11 @@ installed as `claude` (the test suite runs the script this way); `--claude-bin` 
 write, the queued turn written 0.00 s after the long one ended, one process for four turns).
 
 **Residual risks / not verified.**
-- A message written to a process that died before Claude created the session leaves the session resuming a
-  conversation that does not exist: every later turn fails with the process's exit. Close it and start another.
+- The start-mode correction reads Claude Code's two refusal messages as 2.1.322 writes them. If a later version
+  words them differently a wrong guess no longer heals: every message of that session then fails with the process's
+  exit until the session is closed. An adapter test pins the two strings.
+- A node restarted with `[dispatch.sessions]` off does not run `SessionHost.recover()`: session processes left by a
+  node that crashed (a clean stop ends them) stay up until hosting is enabled again or they are stopped by hand.
 - `--append-system-prompt` together with a runner's own `--append-system-prompt-file` was not tried.
 - `--wait` has no timeout of its own: a message for a node that never comes back stays queued and the CLI keeps
   waiting (it says so once). Ctrl-C stops the wait, not the message.
