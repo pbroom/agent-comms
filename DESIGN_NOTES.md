@@ -2274,10 +2274,18 @@ message's write.
   pass in progress, then takes the host under a lock the loop re-checks before touching the host again. From that
   moment shutdown alone reports: the loop's `_flush` posts nothing once `stopping` is set, shutdown waits for a
   report the loop was in the middle of, then sends what the loop had not delivered and its own events as one queue,
-  in order, with the final status last (an older status arriving after it would show a dead pid as running).
-  `node.shut_down` keeps the ordinary runs as they were before hosted sessions: session processes are only
-  signalled first (`SessionRunner.signal`: SIGTERM, no waiting, no reporting), then `Node.stop_all()` runs in a
-  `finally`, then the sessions wait, kill and report. `stop_all` says nothing about
+  in order, with the final status last. The node cannot stop a report that timed out here from committing at the
+  hub later, so every report carries `seq` (wall-clock nanoseconds at send, forced to grow within the process, so
+  it also grows across node restarts) and the hub keeps the highest it applied per session (`status_seq`): the
+  status part (state, pid, resume) of a report that is not above it is ignored, while its events are applied as
+  ever (a message only moves forward). A report without `seq` is applied as it comes.
+  `node.shut_down` is `Node.stop_all()` with the session processes stopped alongside: SIGTERM to every run and
+  every session process, one `kill_grace_seconds` for all of them from that moment, SIGKILL for what remains
+  (`Node.signal_runs`/`runs_alive`/`kill_runs`, `SessionRunner.signal`/`alive`/`kill`), and only then the reports,
+  the runs' first (`Node.report_stopped`, the same reports `stop_all` makes), the sessions' last. So a session
+  process that ignores SIGTERM is killed when its grace is over, not after the runs' reports (one stalled report
+  had stretched a 10 s grace to 30 s). The session steps are guarded, and if stopping the runs itself fails,
+  `stop_all` is still attempted in a `finally`. `stop_all` says nothing about
   a message still in a session's inbox (PR 1 review); such a message never reached a process, so the node gives it
   back (its number is no longer recorded as handed) and the next node process delivers it.
 - *Sessions the hub no longer lists* are closed locally and not reported.

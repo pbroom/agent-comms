@@ -460,10 +460,15 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
 
 
 def report(board: Board, p: Principal, session_id: Any, events: Any = None, state: Any = None, pid: Any = None,
-           resume: Any = None) -> dict:
+           resume: Any = None, seq: Any = None) -> dict:
     """The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
     turn_ended, approval_requested, ended), and how the session stands now (`state`, `pid`, `resume`: the provider
-    confirmed its session exists). Only the node the session is assigned to may; a repeated report changes nothing."""
+    confirmed its session exists). Only the node the session is assigned to may; a repeated report changes nothing.
+    `seq` orders a node's reports on one session (it grows with every report the node sends, across its restarts):
+    events only ever move a message forward, so they are applied whatever the order, but the status is a snapshot,
+    and one that is not newer than the last applied is ignored. Otherwise a report whose call timed out on the node
+    and reached the hub late could put a dead pid and `running` back after the node's final report. A report without
+    `seq` is applied as it comes."""
     nodes._require_node(board, p)
     events = _events([] if events is None else events)
     if state is not None and state not in SESSION_STATES:
@@ -472,6 +477,8 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         raise Invalid("pid must be an integer")
     if resume is not None and not isinstance(resume, bool):
         raise Invalid("resume must be true or false")
+    if seq is not None and (isinstance(seq, bool) or not isinstance(seq, int) or seq < 1):
+        raise Invalid("seq must be a positive integer")
     now = board.now()
     with db.write_tx(board.conn) as c:
         r = _get(c, SESSION_PREFIX + _sid(session_id))
@@ -483,7 +490,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
             _apply(c, r, ev, p.name, now)
             if r["state"] == "ended":
                 break
-        if r["state"] != "ended":
+        if r["state"] != "ended" and (seq is None or seq > int(r.get("status_seq") or 0)):
+            if seq is not None:
+                r["status_seq"] = seq
             if state is not None and state != "ended":
                 r |= {"state": state, "pid": pid}
             if resume is not None:

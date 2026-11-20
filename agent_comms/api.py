@@ -80,6 +80,7 @@ class NodeSessionReportIn(Body):
     state: Literal['starting', 'idle', 'running', 'waiting', 'ended'] | None = None
     pid: StrictInt | None = None
     resume: StrictBool | None = None
+    seq: StrictInt | None = None    # orders this node's reports on the session; an older status is ignored
 
 
 class HostedStartIn(Body):
@@ -836,7 +837,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def node_session_report(session_id: str, body: NodeSessionReportIn, p: Principal = P):
         from . import hosted
         return hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
-                             body.state, body.pid, body.resume)
+                             body.state, body.pid, body.resume, body.seq)
 
     # Hosted sessions, the human's side: only the human starts, messages, reads or closes one (hosted.py checks on
     # every call; a node identity never gets past `principal`). The reply text is returned here and nowhere else.

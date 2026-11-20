@@ -943,13 +943,13 @@ def test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up
     assert node.running == {} and msg(senv, sid, 1)["state"] == "failed"
 
     # Whatever the sessions do, the runs are stopped and reported.
-    for broken in ("signal", "shutdown"):
+    for broken in ("signal", "alive", "kill", "shutdown"):
         again = FakeChild(6000)
         node.running["run-2"] = _Local("run-2", again, senv.clock(), 1800.0, 10.0)
 
         def boom():
             raise RuntimeError("session cleanup failed")
-        fake = SimpleNamespace(signal=lambda: None, shutdown=lambda: None)
+        fake = SimpleNamespace(signal=lambda: None, alive=lambda: False, kill=lambda: None, shutdown=lambda: None)
         setattr(fake, broken, boom)
         node.sessions = fake
         del posts[:]
@@ -959,6 +959,76 @@ def test_node_shutdown_signals_every_child_before_reporting_and_always_cleans_up
         else:
             shut_down(node)
         assert again.terminated == 1 and node.running == {} and posts[0][0] == "/api/nodes/runs/run-2", broken
+
+
+def test_a_session_process_that_ignores_sigterm_is_killed_within_its_grace_before_any_report(senv):
+    """One grace period for every child, measured from its SIGTERM, and the kills before the first shutdown report:
+    a report can stall for as long as a hub call takes, and the stubborn process must not wait that out first."""
+    node = senv.node
+    node.session_spawner.child = lambda pid: FakeSessionChild(pid, exits_on_terminate=False)
+    sid = start(senv)["session_id"]
+    tick(senv)
+    [stubborn] = children(senv)
+    run_child = FakeChild(5000)
+    node.running["run-1"] = _Local("run-1", run_child, senv.clock(), 1800.0, 10.0)
+    posts, kills, hub, t0 = [], [], node.client, senv.clock()
+    kill = stubborn.kill
+    stubborn.kill = lambda: (kills.append(senv.clock() - t0), kill())
+
+    class Stalling:
+        def request(self, method, path, **kw):
+            if method == "POST":
+                posts.append((path, stubborn.killed))
+                if "/runs/" in path:
+                    senv.clock.advance(20)      # the hub does not answer until the call times out
+            return hub.request(method, path, **kw)
+
+    node.client = node.sessions.client = Stalling()
+    shut_down(node)
+    assert stubborn.terminated >= 1 and run_child.terminated == 1
+    assert kills and kills[0] == pytest.approx(10, abs=0.5), "killed when ITS grace was over, not 20 s of report later"
+    assert [path for path, _ in posts] == ["/api/nodes/runs/run-1", f"/api/nodes/sessions/{sid}"]
+    assert all(killed for _, killed in posts), "no report before the kill"
+    assert node.running == {} and msg(senv, sid, 1)["state"] == "failed" and show(senv, sid)["pid"] is None
+
+
+def test_a_late_older_report_cannot_undo_the_final_one(senv):
+    """A report whose call timed out on the node can still commit at the hub after the node's final report. Its events
+    are harmless (a message only moves forward); its status is an old snapshot and is ignored."""
+    sid = start(senv)["session_id"]
+    send(senv, sid, "second")
+    sent, hub = [], senv.node.sessions.client
+
+    class Recording:
+        def request(self, method, path, **kw):
+            if method == "POST":
+                sent.append(kw["json"])
+            return hub.request(method, path, **kw)
+
+    senv.node.sessions.client = Recording()
+    tick(senv)
+    senv.node.sessions.shutdown()       # the final report: the turn failed, no process
+    stamps = [body["seq"] for body in sent]
+    assert len(stamps) >= 2 and stamps == sorted(set(stamps)), "every report is stamped above the one before"
+    final = show(senv, sid)
+    assert (final["state"], final["pid"], msg(senv, sid, 1)["state"]) == ("idle", None, "failed")
+
+    late = {"events": [{"kind": "delivered", "message": 1}, {"kind": "delivered", "message": 2}],
+            "state": "running", "pid": 4242, "resume": True, "seq": stamps[0] - 1}
+    assert senv.laptop.post(f"/api/nodes/sessions/{sid}", json=late).status_code == 200
+    view = show(senv, sid)
+    assert (view["state"], view["pid"]) == ("idle", None), "the dead pid does not come back"
+    assert senv.laptop.get("/api/nodes/sessions").json()["sessions"][0]["resume"] is False
+    assert (msg(senv, sid, 1)["state"], msg(senv, sid, 2)["state"]) == ("failed", "delivered"), "events apply as ever"
+    same = dict(late, events=[], seq=stamps[-1])
+    senv.laptop.post(f"/api/nodes/sessions/{sid}", json=same)
+    assert show(senv, sid)["pid"] is None, "nor does a repeat of the last one's stamp"
+    # A newer report, and one without a stamp (nothing sends one, the route stays tolerant), apply as before.
+    senv.laptop.post(f"/api/nodes/sessions/{sid}", json=dict(late, events=[], seq=stamps[-1] + 1))
+    assert (show(senv, sid)["state"], show(senv, sid)["pid"]) == ("running", 4242)
+    senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "idle", "pid": None})
+    assert (show(senv, sid)["state"], show(senv, sid)["pid"]) == ("idle", None)
+    assert senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "seq": 0}).status_code == 400
 
 
 def test_settle_decides_again_inside_its_transaction(senv, monkeypatch):

@@ -84,6 +84,7 @@ class SessionRunner:
         self.last_contact = clock()
         self.lock = threading.Lock()                  # the host, between the loop and shutdown()
         self.report_lock = threading.Lock()           # the report queue: one flush at a time, shutdown's last
+        self.seq = 0                                  # the last report's stamp (`_stamp`)
         self.stopping = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -164,6 +165,13 @@ class SessionRunner:
                 return False
             return self._post_pending()
 
+    def _stamp(self) -> int:
+        """An id for the next report that is above every earlier one of this node, this process's and (wall clock) a
+        previous one's: the hub ignores the status of a report that is not newer than the last it applied, so one
+        that arrives late (its call timed out here, then it committed there) cannot undo a later one."""
+        self.seq = max(self.seq + 1, time.time_ns())
+        return self.seq
+
     def _post_pending(self) -> bool:
         order: list[str] = []
         for sid, _ in self.pending:
@@ -172,7 +180,7 @@ class SessionRunner:
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
         for sid in order:
             events = [e for s, e in self.pending if s == sid][:MAX_BATCH]
-            body: dict[str, Any] = {"events": events}
+            body: dict[str, Any] = {"events": events, "seq": self._stamp()}
             status = self.status.get(sid)
             if status is not None:
                 body |= {"state": status[0], "pid": status[1], "resume": status[2]}
@@ -409,6 +417,22 @@ class SessionRunner:
                         s.child.terminate()
                     except Exception:
                         log.exception("could not signal session %s", s.session_id)
+
+    def _going(self, s) -> bool:
+        return s.child is not None and (s.child.poll() is None or self.host.group_alive(s.child.pid))
+
+    def alive(self) -> bool:
+        """After `signal()`: is any session process, or anything in its process group, still there?"""
+        with self.lock:
+            return any(self._going(s) for s in self.host.sessions.values())
+
+    def kill(self) -> None:
+        """After `signal()` and the grace period: SIGKILL for every session process group that is still there. No
+        reporting; `shutdown()` then finds them gone."""
+        with self.lock:
+            for s in self.host.sessions.values():
+                if self._going(s):
+                    s.child.kill()
 
     def shutdown(self) -> None:
         """Stop the loop and every session process; turns in flight are reported failed. The loop may be waiting at

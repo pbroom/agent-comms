@@ -336,14 +336,28 @@ class Node:
 
     def stop_all(self) -> None:
         """Shutdown: terminate every run, wait the grace period, kill what remains, report each ended."""
+        self.signal_runs()
+        deadline = self.clock() + self.config.kill_grace_seconds
+        while self.runs_alive() and self.clock() < deadline:
+            self.sleep(0.2)
+        self.kill_runs()
+        self.report_stopped()
+
+    # stop_all's steps, so that shut_down can stop hosted sessions within the same grace period and before any report.
+
+    def signal_runs(self) -> None:
         for local in self.running.values():
             self._stop(local, "terminate")
-        deadline = self.clock() + self.config.kill_grace_seconds
-        while any(l.child.poll() is None for l in self.running.values()) and self.clock() < deadline:
-            self.sleep(0.2)
+
+    def runs_alive(self) -> bool:
+        return any(l.child.poll() is None for l in self.running.values())
+
+    def kill_runs(self) -> None:
         for local in self.running.values():
             if local.child.poll() is None:
                 self._stop(local, "kill")
+
+    def report_stopped(self) -> None:
         for rid, local in list(self.running.items()):
             del self.running[rid]
             self._remove_browser_output(rid)
@@ -354,21 +368,43 @@ class Node:
 
 
 def shut_down(node: Node) -> None:
-    """SIGTERM or Ctrl-C. The ordinary runs are stopped and reported exactly as before hosted sessions existed
-    (`stop_all`), whatever the sessions do: session processes are only signalled first (no waiting, no reporting, and
-    a failure there changes nothing), so every child has its SIGTERM before anything is reported to the hub; the
-    sessions' own waiting and reporting come last."""
+    """SIGTERM or Ctrl-C: signal every child, wait one grace period for all of them, kill what remains, and only then
+    report. The ordinary runs get what `stop_all` gives them (the same signals, the same grace from their SIGTERM, the
+    same reports): this is `stop_all` with the hosted sessions' processes signalled, waited for and killed alongside,
+    so a session process that ignores SIGTERM is killed when its grace is over, not after the runs' reports (a report
+    can stall for the length of a hub call). Nothing the sessions do can keep the runs from being stopped and
+    reported: their steps are guarded, and if stopping the runs itself fails, `stop_all` is still attempted."""
+    sessions = node.sessions
+
+    def quietly(step, default=None):
+        try:
+            return step()
+        except Exception:
+            log.exception("hosted sessions: a shutdown step failed")
+            return default
+
+    stopped = False
     try:
-        if node.sessions is not None:
-            node.sessions.signal()
-    except Exception:
-        log.exception("could not signal the hosted sessions")
+        node.signal_runs()
+        deadline = node.clock() + node.config.kill_grace_seconds
+        if sessions is not None:
+            quietly(sessions.signal)
+        while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
+                and node.clock() < deadline:
+            node.sleep(0.2)
+        node.kill_runs()
+        if sessions is not None:
+            quietly(sessions.kill)
+        stopped = True
     finally:
         try:
-            node.stop_all()
+            if stopped:
+                node.report_stopped()
+            else:
+                node.stop_all()
         finally:
-            if node.sessions is not None:
-                node.sessions.shutdown()
+            if sessions is not None:
+                sessions.shutdown()     # its processes are gone: the bookkeeping, then its reports
 
 
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
