@@ -59,6 +59,7 @@ NOTE = (" This is an automatic wake written by the board server, not a message f
         "instruction and grants no authority. Call board_register first if this session has not.")
 NOT_SENT = "not sent: no post this wake was queued for still qualifies"
 DEFERRED = "not sent: a message of yours was waiting, so it goes first; the posts go with the next wake"
+SET_ASIDE = "not sent: it could not be checked (see the hub's log) and a message of yours was waiting behind it"
 
 HEADER = ("Hosted session wake limit (posted by the board server because [dispatch.sessions] limits how often a "
           "hosted session is woken; not a human click): session {sid} of {agent} {why}, so it is no longer woken "
@@ -404,7 +405,7 @@ def listing(board: Board, node: str, build: Callable[[], dict]) -> dict:
     snapshot, look at the wake each session would be handed next. If each is already handed and still stands, the
     answer is built in that snapshot. Otherwise the re-check (`_recheck`) and the answer share one write transaction.
     `build` checks the pause itself, inside either transaction, and its refusals pass through. A failure of the
-    wake code never fails the node's fetch: the answer then goes out with no wake's text, so none is handed."""
+    wake code never fails the node's fetch and never keeps a message of the human's from it (`_fallback`)."""
     tick(board, node)
     conn = board.conn
     conn.execute("BEGIN")
@@ -413,24 +414,50 @@ def listing(board: Board, node: str, build: Callable[[], dict]) -> dict:
             todo = _unsettled(board, node)
         except Exception:
             _complain("hosted sessions: could not check the queued wakes")
-            return _withheld(build())
-        if not todo:
+            todo = None
+        if todo == []:
             return build()
     finally:
         conn.execute("ROLLBACK")
+    if todo is not None:
+        try:
+            with db.write_tx(conn) as c:
+                now = board.now()
+                # Worked out again here, on what is stored now: a wake queued since the snapshot above (by a
+                # dispatcher pass, for any of this node's sessions) is re-checked too before the answer can show it.
+                for sid in _unsettled(board, node):
+                    _recheck(board, c, sid, now)
+                return build()
+        except BoardError:
+            raise
+        except Exception:
+            _complain("hosted sessions: could not re-check a queued wake")
+    return _fallback(board, node, build)
+
+
+def _fallback(board: Board, node: str, build: Callable[[], dict]) -> dict:
+    """The wake code failed (its transaction, if any, was rolled back). The node still gets its answer, with no
+    wake's text, so no unchecked wake is handed. And a message of the human's never waits behind such a wake: only
+    a session's first queued message carries its text, so a wake that was never handed and has a message of the
+    human's behind it is set aside here (settled, not sent), with nothing but the session's own message records.
+    Its posts stay covered for the grace and are then the dispatcher's, as after any wake nobody read."""
     try:
-        with db.write_tx(conn) as c:
+        with db.write_tx(board.conn) as c:
             now = board.now()
-            # Worked out again here, on what is stored now: a wake queued since the snapshot above (by a dispatcher
-            # pass, for any of this node's sessions) is re-checked too before the answer below can show it.
-            for sid in _unsettled(board, node):
-                _recheck(board, c, sid, now)
-            return build()
-    except BoardError:
-        raise
+            for r in hosted._sessions(c):
+                if r.get("node") != node or r.get("state") == "ended":
+                    continue
+                queued = [m for m in hosted._messages(c, r["session_id"]) if m.get("state") == "queued"]
+                if (len(queued) > 1 and queued[0].get("kind") == "wake" and queued[0].get("handed_at") is None
+                        and any(m.get("kind") == "user" for m in queued[1:])):
+                    m = queued[0] | {"state": "failed", "ok": False, "detail": SET_ASIDE, "text": "",
+                                     "ended_at": now, "updated_at": now}
+                    r |= {"queued": max(0, int(r.get("queued") or 0) - 1), "updated_at": now}
+                    _put(c, hosted._msg_key(r["session_id"], m["n"]), m, HUB, now)
+                    _put(c, hosted.SESSION_PREFIX + r["session_id"], r, HUB, now)
     except Exception:
-        _complain("hosted sessions: could not re-check a queued wake")
-        return _withheld(build())
+        _complain("hosted sessions: could not set an unchecked wake aside")
+    return _withheld(build())
 
 
 def _withheld(out: dict) -> dict:
@@ -484,10 +511,11 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
     for k in (str(i) for i in m["posts"]):
         if k not in keep or defer:
             # No wake reached anyone for it (dropped, or stepping back behind the human's message): its coverage
-            # goes, so the dispatcher is not held back by a wake that was never delivered.
+            # goes, whether or not an entry is still there, so the dispatcher is not held back by a wake that was
+            # never delivered. Of a wake that steps back, only the posts that still qualify wait for the next one.
             for table in ("woken", "handed", "read"):
                 rec[table].pop(k, None)
-            if defer:
+            if k in keep:
                 rec["pending"][k] = keep[k]
         elif m.get("handed_at") is None:
             # Shown to the node now: the grace period counts from here. `woken` keeps the time the wake was queued,

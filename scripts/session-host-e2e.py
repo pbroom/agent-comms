@@ -113,6 +113,7 @@ rows = [dict(r) for r in c.execute("SELECT id, project, worktree, started_at, la
 print(json.dumps({"now": now, "holds": hosted.holds(board, agent, project, post_id, now),
                   "woken_at": (rec.get("woken") or {}).get(str(post_id)), "grace": rec.get("grace"),
                   "shown_at": (rec.get("read") or {}).get(str(post_id)),
+                  "handed_at": (rec.get("handed") or {}).get(str(post_id)),
                   "receipt": delivery.receipt(c, post_id, agent), "readers": delivery.readers(c, post_id, agent),
                   "sessions": rows}))
 """
@@ -540,14 +541,19 @@ enabled = true
         self.check("mcp__agent-comms__board_read_updates" in calls, "the wake turn called board_read_updates")
         self.check(not {"Bash", "Edit", "Write", "NotebookEdit"} & set(calls), "... and no shell or file-writing tool")
 
-        wait = state["woken_at"] + BOARD_GRACE + 1.5 - time.time()     # the grace counts from the hand-over
+        # The grace counts from the later of the wake being queued and the node being shown it (the hub's records).
+        def grace_from(st: dict) -> float:
+            return max(st["woken_at"], st["handed_at"] or st["woken_at"])
+        wait = grace_from(state) + BOARD_GRACE + 0.5 - time.time()
         if wait > 0:
             time.sleep(wait)
         state = self.probe(post["id"], sid)
-        print(f"  holds: {state['holds']} at +{state['now'] - t1:.2f}s; wake covered the post at "
-              f"+{state['woken_at'] - t1:.2f}s; wake_grace_seconds {state['grace']:g}; readers {state['readers']}")
-        self.check(state["now"] - state["woken_at"] > state["grace"] and state["holds"] is True,
-                   "hosted.holds is true for the post after the grace: the session was shown it after the wake")
+        print(f"  holds: {state['holds']} at +{state['now'] - t1:.2f}s; wake queued +{state['woken_at'] - t1:.2f}s, "
+              f"handed to the node +{grace_from(state) - t1:.2f}s; wake_grace_seconds {state['grace']:g}; "
+              f"readers {state['readers']}")
+        self.check(state["now"] - grace_from(state) > state["grace"] and state["holds"] is True,
+                   "hosted.holds is true for the post after the grace (counted from the hand-over): the session was "
+                   "shown it after the wake")
         print("  board sessions of the hosted agent (what it registered with):")
         for row in state["sessions"]:
             print(f"    session {row['id']}: project {row['project']!r}, worktree {row['worktree']!r}")

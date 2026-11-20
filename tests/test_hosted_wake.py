@@ -981,6 +981,82 @@ def test_a_read_between_queueing_and_hand_over_still_counts_and_the_grace_runs_f
         "shown after the wake was queued, before it was handed: that read counts"
 
 
+# ------------------------------------------------------------ review round 3
+
+
+def test_a_wake_with_a_post_that_stopped_qualifying_steps_back_cleanly_behind_the_humans_message(senv):
+    """S3. One post of the queued wake still qualifies and one does not: stepping back clears the coverage of both,
+    returns only the first to `pending`, and the human's message is handed in that same fetch."""
+    sid = ready(senv)
+    t1, t2 = senv.thread(), senv.thread()
+    good, gone = ask(senv, t1), ask(senv, t2, as_="grok")
+    hosted_wake.tick(senv.board)        # one wake for both, not yet shown to the node
+    assert all(hosted.holds(senv.board, "claude", PROJECT, p["id"], senv.clock()) for p in (good, gone))
+    _revoke(senv, "grok")
+    send(senv, sid, "mine")
+    for _ in range(3):                  # repeated fetches: each must answer, and nothing may be left half done
+        assert senv.laptop.get("/api/nodes/sessions").status_code == 200
+    [listed] = senv.laptop.get("/api/nodes/sessions").json()["sessions"]
+    assert listed["messages"] == [{"n": 3, "kind": "user", "state": "queued", "text": "mine"}]
+    tick(senv)
+    assert turns(senv)[-1] == "mine", "the human's message is handed"
+    [wake] = wakes(senv, sid)
+    assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.DEFERRED)
+    rec = record(senv, sid)
+    assert list(rec["pending"]) == [str(good["id"])], "the post that still qualifies waits; the other is dropped"
+    assert rec["woken"] == {} and rec["handed"] == {} and rec["read"] == {} and rec["sent"] == []
+    assert not any(hosted.holds(senv.board, "claude", PROJECT, p["id"], senv.clock()) for p in (good, gone))
+    run_turn(senv, sid)
+    tick(senv)
+    assert turns(senv)[-1] == text_for(senv, 1, [t1])
+
+
+@pytest.mark.parametrize("broken", ["_unsettled", "_recheck", "_qualifying"])
+def test_a_failure_in_the_wake_code_never_keeps_the_humans_message_from_the_node(senv, monkeypatch, broken):
+    """Whatever goes wrong while a queued wake is checked, the fetch answers and the human's message behind that
+    wake reaches the node: the wake that could not be checked is set aside, not left in front without its text."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    hosted_wake.tick(senv.board)
+    send(senv, sid, "mine")
+
+    def boom(*a, **kw):
+        raise KeyError("wake code broke")
+
+    monkeypatch.setattr(hosted_wake, broken, boom)
+    r = senv.laptop.get("/api/nodes/sessions")
+    assert r.status_code == 200, r.text
+    assert r.json()["sessions"][0]["messages"] == [{"n": 3, "kind": "user", "state": "queued", "text": "mine"}]
+    tick(senv)
+    assert turns(senv)[-1] == "mine"
+    [wake] = wakes(senv, sid)
+    assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.SET_ASIDE)
+    assert show(senv, sid)["queued"] == 0 and str(post["id"]) not in turns(senv)[-1]
+    monkeypatch.undo()
+    run_turn(senv, sid)
+    later(senv, GRACE)
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), \
+        "its post is the dispatcher's again once the grace is over"
+
+
+def test_a_failure_in_the_wake_code_leaves_a_wake_with_no_message_behind_it_queued_and_unhanded(senv, monkeypatch):
+    sid = ready(senv)
+    ask(senv, senv.thread())
+    hosted_wake.tick(senv.board)
+
+    def boom(*a, **kw):
+        raise KeyError("wake code broke")
+
+    monkeypatch.setattr(hosted_wake, "_recheck", boom)
+    [listed] = senv.laptop.get("/api/nodes/sessions").json()["sessions"]
+    assert listed["messages"] == [{"n": 2, "kind": "wake", "state": "queued"}], "no text: the node cannot hand it"
+    tick(senv)
+    assert turns(senv) == ["first"] and [m["state"] for m in wakes(senv, sid)] == ["queued"]
+    monkeypatch.undo()
+    tick(senv)
+    assert turns(senv)[-1].startswith("agent-comms: 1 new post(s)"), "checked and handed once the code works again"
+
+
 # ------------------------------------------------------------ what a woken session was shown (hosted_wake.handed)
 
 

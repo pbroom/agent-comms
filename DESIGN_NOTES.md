@@ -2423,8 +2423,14 @@ one read snapshot the hub looks at the wake each session would be handed next; i
 stands, the answer is read in that snapshot. Otherwise the re-check and the answer share one write transaction,
 which works out again, on what is stored then, which wakes need it (one may have been queued since the snapshot). The
 pause is checked inside either, so a pause that lands during the fetch refuses it. A wake queued a moment earlier by
-the dispatcher's pass is therefore never shown unvalidated. If the wake code itself fails, the answer goes out with
-no wake's text, so none is handed.
+the dispatcher's pass is therefore never shown unvalidated. If the wake code itself fails (`_fallback`), the answer goes out
+with no wake's text, so none is handed. Only a session's first queued message carries its text, so such a wake would
+keep a message of the human's behind it from the node for as long as the failure lasts (seen in review: a step-back
+that raised on a wake holding one post that still qualified and one that did not). A wake that was never handed and
+has a message of the human's behind it is therefore set aside in that case: settled `failed`, not sent, using only
+the session's message records. Its posts stay covered for the grace and are then the dispatcher's. A step-back now
+clears the coverage of every post of the wake, present or not, and returns only the still-qualifying ones to
+`pending`.
 
 *The human's messages go first, always.* A wake is only queued behind nothing. If a message of the human's arrives
 after a wake was queued and before the node was shown it, the wake steps back: it is settled `failed` ("a message of
