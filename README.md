@@ -1166,32 +1166,12 @@ The declaration is a statement, not a setup: the runner's own configuration give
 Codex `mcp_servers` entry for Playwright MCP with a `--user-data-dir` profile you signed in to once, or a
 `claude --chrome` runner that drives your Chrome). The board stores no credential.
 
-For a Codex runner the board can attach that browser itself, only to runs launched for signed-in work on that
-origin, so ordinary Codex runs never see the profile:
-
-```toml
-# board.local.toml on the machine that holds the sign-in
-[dispatch.browser_profiles."https://tenant.sharepoint.com"]
-user_data_dir = "/Users/you/Library/Application Support/Agent Comms/browser-profiles/tenant"
-```
-
-Such a run gets a second Playwright MCP server, `signed_in_browser`, started headless from
-`[dispatch.headless_browser]` (its `command` is required) with `--user-data-dir` set to that profile, plus
-`browser_file_upload` and an output directory it may write, removed with the run. Sign in to the site once in the
-profile through Playwright itself, then close the window so the run can open it. Use the Playwright version that
-`@playwright/mcp` in `[dispatch.headless_browser]` bundles, and the same `browser` channel:
-
-```sh
-npx -y playwright@<that version> open --channel=chrome \
-  --user-data-dir="$HOME/Library/Application Support/Agent Comms/browser-profiles/tenant" https://tenant.sharepoint.com
-```
-
-Answer yes to any "stay signed in" prompt. Signing in with plain Chrome does not work on macOS: Chrome encrypts the
-cookies with the login keychain, and Playwright's Chrome runs with a mock keychain, so the runs cannot read them and
-land on the sign-in page. A run that lands there reports it and blocks; sign in again the same way.
-
-A Codex config that already defines a server named `signed_in_browser` makes the run refuse to start. A profile
-opens in one browser at a time, so signed-in runs on one machine take turns.
+A `[dispatch.browser_profiles]` profile does not count as that browser. The board would attach it to a dispatched
+Codex run as a headless Playwright server (`signed_in_browser`), which is not your signed-in desktop browser, so the
+run only reaches the sign-in page. A runner whose only sign-in for an origin is such a profile holds no access for it
+(a node leaves it out of its hello). With no other holder, the request is held at dispatch: it is blocked with a reason
+starting "needs desktop pickup", and a signed-in desktop session (for example the Codex desktop app) picks it up.
+Signed-in runs on one machine take turns.
 
 On the hub, a node's declaration counts only when the hub's grant for that node lists the same access, so a node
 cannot widen what the hub sends it:
