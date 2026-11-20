@@ -15,11 +15,19 @@ What it does and checks:
 2. `board session send <id> <message> --wait` to the idle session: written to the process within --max-latency.
 3. A long turn, and right behind it a second `send --wait`: the second message is queued while the first turn is in
    flight, the first turn is not interrupted, and the second is written within --max-latency of the first ending.
-4. One process took every turn; `close` ends the session and its process.
-5. The project takes a new session; stopping the node stops that session's idle process too.
+4. A second agent identity posts a request addressed to the hosted agent, in a thread of the project, over the
+   hub's HTTP API: the idle session takes a wake turn within --max-wake. The line written to the process's stdin
+   names the thread and the counts and holds no part of the post's body.
+5. Two more posts inside the hub's wake interval, one over HTTP and one written straight to the database by another
+   process (what `board mcp` does): no wake until the interval has passed and the turn before is over, then ONE wake
+   for both.
+6. One process took every turn; `close` ends the session and its process; a later post wakes nothing.
+7. The project takes a new session; stopping the node stops that session's idle process too.
 
-With the real CLI the runner is `claude -p {prompt} --permission-mode dontAsk --setting-sources= --strict-mcp-config`
-(no user settings, hooks or MCP servers), run in the empty temp checkout: five small haiku turns.
+The session's process is started through a small wrapper named `claude` that copies every stdin line to
+logs/session-stdin.log before passing it on, so the script can check what was written. With the real CLI the wrapper
+runs `claude -p {prompt} --permission-mode dontAsk --setting-sources= --strict-mcp-config` (no user settings, hooks or
+MCP servers) in the empty temp checkout: seven small haiku turns.
 """
 from __future__ import annotations
 
@@ -43,6 +51,38 @@ from agent_comms.config import create_agent  # noqa: E402
 
 NODE = "e2enode"
 AGENT = "claude"
+POSTER = "codex"                # the second agent identity: it posts the requests that wake the hosted session
+WAKE_INTERVAL = 6               # the hub's [dispatch.sessions] wake_min_interval_seconds for this run
+MARKER = "E2E-BODY-MARKER-4c1e9a"
+BODY_WORDS = ("zebra", "quartz", "lantern")
+
+# The session's process, wrapped: every stdin line is appended to a log before the real program gets it.
+WRAPPER = """#!{python}
+import subprocess, sys
+log = open({log!r}, "ab", buffering=0)
+child = subprocess.Popen([{real!r}, *sys.argv[1:]], stdin=subprocess.PIPE)
+try:
+    for line in sys.stdin.buffer:
+        log.write(line)
+        child.stdin.write(line)
+        child.stdin.flush()
+    child.stdin.close()
+except OSError:
+    pass
+sys.exit(child.wait())
+"""
+
+# A post written straight to the hub's database by another process, as `board mcp` (stdio) does.
+DIRECT_POST = """
+import json, os, sys
+from agent_comms.config import Settings
+from agent_comms.core import Board
+board = Board(Settings.load())
+p = board.authenticate(os.environ["E2E_POSTER_TOKEN"])
+sid = board.register_session(p, sys.argv[1])["session_id"]
+post = board.create_post(p, sid, body=sys.argv[3], type="request", thread_id=int(sys.argv[2]), to=[sys.argv[4]])
+print(json.dumps({"id": post["id"]}))
+"""
 
 
 def free_port() -> int:
@@ -59,6 +99,14 @@ def listening(port: int) -> bool:
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
         return True
     except OSError:
         return False
@@ -102,6 +150,7 @@ class Run:
         agents = self.hub_home / "agents.toml"
         self.human_token = create_agent(agents, "human", "human", is_human=True)
         create_agent(agents, AGENT, "claude-code")
+        self.poster_token = create_agent(agents, POSTER, "codex-cli")
         self.node_token = create_agent(agents, NODE, "node")
         (self.hub_home / "board.toml").write_text(f"""[server]
 host = "127.0.0.1"
@@ -115,16 +164,24 @@ enabled = false
 [dispatch.nodes.{NODE}]
 projects = {toml_list([str(self.project)])}
 agents = {toml_list([AGENT])}
+
+[dispatch.sessions]
+wake_min_interval_seconds = {WAKE_INTERVAL}
 """)
+        real = self.args.claude_bin
+        if not self.real:
+            real = self.tmp / "stand-in" / "claude"
+            real.parent.mkdir()
+            real.write_text(f"#!{sys.executable}\n" + (ROOT / "tests" / "stand_in_claude.py").read_text())
+            real.chmod(0o700)
+        self.stdin_log = self.tmp / "logs" / "session-stdin.log"
+        exe = self.tmp / "bin" / "claude"           # the adapter goes by the executable's name
+        exe.parent.mkdir()
+        exe.write_text(WRAPPER.format(python=sys.executable, log=str(self.stdin_log), real=str(real)))
+        exe.chmod(0o700)
+        runner = [str(exe), "-p", "{prompt}", "--permission-mode", "dontAsk"]
         if self.real:
-            runner = [self.args.claude_bin, "-p", "{prompt}", "--permission-mode", "dontAsk", "--setting-sources=",
-                      "--strict-mcp-config"]
-        else:
-            exe = self.tmp / "bin" / "claude"       # the adapter goes by the executable's name
-            exe.parent.mkdir()
-            exe.write_text(f"#!{sys.executable}\n" + (ROOT / "tests" / "stand_in_claude.py").read_text())
-            exe.chmod(0o700)
-            runner = [str(exe), "-p", "{prompt}", "--permission-mode", "dontAsk"]
+            runner += ["--setting-sources=", "--strict-mcp-config"]
         (self.node_home / "board.toml").write_text(f"""[conversations]
 enabled = false
 
@@ -206,6 +263,27 @@ enabled = true
             self.pids.add(view["pid"])
         return view
 
+    def api(self, token: str, method: str, path: str, body: dict | None = None) -> dict:
+        """One call to the hub's HTTP API as the identity with this token."""
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    def message(self, sid: str, n: int, until, seconds: float) -> dict | None:
+        """The session's message `n` once `until(message)` holds, or as it stands when the time is up."""
+        deadline = time.monotonic() + seconds
+        while True:
+            m = next((m for m in self.show(sid)["messages"] if m["n"] == n), None)
+            if (m is not None and until(m)) or time.monotonic() >= deadline:
+                return m
+            time.sleep(0.1)
+
+    def stdin_lines(self) -> list[str]:
+        """What was written to the session processes' stdin so far: the text of each turn, in order."""
+        return [json.loads(line)["message"]["content"] for line in self.stdin_log.read_text().splitlines()]
+
     def check(self, condition: bool, what: str) -> None:
         if not condition:
             raise SystemExit(f"FAIL: {what}")
@@ -270,8 +348,12 @@ enabled = true
         if not self.real:
             self.check(out == "turn 4: AFTER\n", "its reply is the fourth turn's")
 
-        print("\n[4] one process, then close")
-        self.check(view["turns"] == 4 and view["pid"] == pid, f"one process (pid {pid}) took all four turns")
+        tid = self.wake_scenario(sid)
+
+        print("\n[6] one process, then close")
+        view = self.show(sid)
+        self.check(view["turns"] == 6 and view["pid"] == pid, f"one process (pid {pid}) took all six turns")
+        self.check(len(self.stdin_lines()) == 6, "six lines were written to its stdin, one per turn")
         listed, _, _ = self.board("session", "list")
         self.check(sid in listed, "board session list shows it")
         out, _, _ = self.board("session", "close", sid)
@@ -285,7 +367,14 @@ enabled = true
         # The hub hears `ended` when the node has signalled the process; the node reaps it on a pass soon after.
         self.check(gone(pid), f"its process (pid {pid}) is gone")
 
-        print("\n[5] a new session in the same project, left open while the node is stopped")
+        self.api(self.poster_token, "POST", "/api/posts",
+                 {"body": f"after the close {MARKER}", "type": "request", "thread_id": tid, "to": [AGENT],
+                  "session_id": self.poster_sid})
+        time.sleep(1.5)
+        self.check(len(self.stdin_lines()) == 6 and not any(m["n"] > 6 for m in self.show(sid)["messages"]),
+                   "a post addressed to the agent after the close wakes nothing")
+
+        print("\n[7] a new session in the same project, left open while the node is stopped")
         out, err, took = self.board("session", "start", str(self.project), again, "--agent", AGENT, "--model", "haiku",
                                     "--wait", "--json")
         data = json.loads(out)
@@ -294,6 +383,73 @@ enabled = true
         print(f"  reply: {data['reply']!r}")
         self.open_pid = self.show(data["session"]["session_id"])["pid"]
         self.check(bool(self.open_pid) and alive(self.open_pid), f"its process (pid {self.open_pid}) stays up, idle")
+
+    def wake_scenario(self, sid: str) -> int:
+        limit, body = self.args.max_wake, f"Please look at this. {MARKER} " + " ".join(BODY_WORDS)
+        print("\n[4] a second agent posts a request addressed to the hosted agent   (the session is idle)")
+        self.poster_sid = self.api(self.poster_token, "POST", "/api/sessions",
+                                   {"project": str(self.project)})["session_id"]
+        tid = self.api(self.poster_token, "POST", "/api/threads",
+                       {"title": f"e2e wake {MARKER}", "project": str(self.project),
+                        "session_id": self.poster_sid})["id"]
+        t1 = time.time()        # the hub's clock is this machine's
+        self.api(self.poster_token, "POST", "/api/posts",
+                 {"body": body, "type": "request", "thread_id": tid, "to": [AGENT], "needs_response": True,
+                  "session_id": self.poster_sid})
+        m5 = self.message(sid, 5, lambda m: m["delivered_at"] is not None, 15)
+        self.check(m5 is not None and m5["kind"] == "wake" and m5["delivered_at"] is not None,
+                   "the post queued a wake message for the session, and it was written to the process")
+        print(f"  {POSTER} posted in thread {tid} +0.00s; wake queued +{m5['created_at'] - t1:.2f}s; "
+              f"written to the process +{m5['delivered_at'] - t1:.2f}s")
+        self.check(m5["delivered_at"] - t1 <= limit,
+                   f"the idle session took the wake turn within {limit:g}s of the post")
+        line = self.stdin_lines()[4]
+        print(f"  stdin line: {line!r}")
+        self.check(f"1 new post(s) addressed to {AGENT} from {POSTER} in thread {tid} (1 needing a response)" in line,
+                   "the stdin line holds the counts, the author's name and the thread id")
+        self.check("board_read_updates" in line and "untrusted data" in line and "not a message from the human" in line,
+                   "it says to call board_read_updates, that board content is untrusted data, and whose text it is")
+
+        print(f"\n[5] two more posts inside the wake interval ({WAKE_INTERVAL}s): one over HTTP, one written to the "
+              "database by another process")
+        t2 = time.time()
+        self.api(self.poster_token, "POST", "/api/posts",
+                 {"body": f"second {MARKER}", "type": "request", "thread_id": tid, "to": [AGENT],
+                  "session_id": self.poster_sid})
+        r = subprocess.run([sys.executable, "-c", DIRECT_POST, str(self.project), str(tid), f"third {MARKER}", AGENT],
+                           cwd=str(self.tmp), capture_output=True, text=True, timeout=60,
+                           env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home),
+                                           "E2E_POSTER_TOKEN": self.poster_token})
+        self.check(r.returncode == 0 and "id" in json.loads(r.stdout or "{}"),
+                   "the direct database write was accepted" + ("" if r.returncode == 0 else f": {r.stderr[-400:]}"))
+        t3 = time.time()
+        time.sleep(1.0)
+        early = [m for m in self.show(sid)["messages"] if m["n"] > 5]
+        m5 = self.message(sid, 5, lambda m: m["ended_at"] is not None, 120)
+        m6 = self.message(sid, 6, lambda m: m["ended_at"] is not None, WAKE_INTERVAL + 120)
+        self.check(m6 is not None and m6["kind"] == "wake" and m6["state"] == "done", "a second wake turn ran")
+        print(f"  first wake: queued +0.00s, turn ended +{m5['ended_at'] - m5['created_at']:.2f}s; posts 2 and 3 "
+              f"+{t2 - m5['created_at']:.2f}s and +{t3 - m5['created_at']:.2f}s; second wake queued "
+              f"+{m6['created_at'] - m5['created_at']:.2f}s, written +{m6['delivered_at'] - m5['created_at']:.2f}s")
+        self.check(early == [] or m6["created_at"] - m5["created_at"] >= WAKE_INTERVAL,
+                   "nothing was queued for them at once")
+        self.check(m6["created_at"] - m5["created_at"] >= WAKE_INTERVAL - 0.01,
+                   f"the second wake was queued no sooner than {WAKE_INTERVAL}s after the first")
+        self.check(m6["created_at"] >= m5["ended_at"], "... and only after the first wake's turn had ended")
+        lines = self.stdin_lines()
+        print(f"  stdin line: {lines[5]!r}")
+        self.check(len(lines) == 6 and f"2 new post(s) addressed to {AGENT} from {POSTER} in thread {tid}" in lines[5],
+                   "both posts went as ONE wake")
+        view = self.show(sid)
+        self.check([m["kind"] for m in view["messages"]] == ["user"] * 4 + ["wake"] * 2 and view["queued"] == 0,
+                   "four messages of the human's and two wakes; nothing else was queued")
+        everything = self.stdin_log.read_text() + self.log_text("node")
+        self.check(not any(w in everything for w in (MARKER, *BODY_WORDS, "e2e wake")),
+                   "no part of a post body or of the thread title is in the process's stdin or the node's log")
+        self.check(view["reply_for"] == 6 and bool((view["reply"] or "").strip()),
+                   "the wake turn's reply is the session's last reply (the human's to read)")
+        print(f"  reply: {view['reply']!r}")
+        return tid
 
     # ------------------------------------------------------------ teardown
 
@@ -312,7 +468,9 @@ enabled = true
         self.procs = []
 
     def leftovers(self) -> list[int]:
-        return [pid for pid in self.pids if alive(pid)]
+        """Session processes still there. Each was started in its own process group (its pid), and the wrapper's
+        child (the stand-in, or Claude itself) is in that group: the whole group must be gone."""
+        return [pid for pid in self.pids if alive(pid) or group_alive(pid)]
 
     def cleanup(self) -> None:
         self.stop()
@@ -332,6 +490,8 @@ def main() -> int:
     ap.add_argument("--claude-bin", metavar="PATH", help="the real Claude Code CLI (default: a stand-in script)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
+    ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
+                    help="most seconds from a post addressed to the agent to its wake being written (default 3)")
     ap.add_argument("--gateway", action="store_true", help="the node reaches the hub through `board gateway`")
     ap.add_argument("--keep", action="store_true", help="keep the temp directory (logs, transcript, database)")
     args = ap.parse_args()
@@ -347,7 +507,7 @@ def main() -> int:
         run.write_settings()
         run.start_services()
         run.scenario()
-        print("\n[6] stopping the node (SIGTERM) and the hub")
+        print("\n[8] stopping the node (SIGTERM) and the hub")
         run.stop()
         run.check(not alive(run.open_pid), f"the open session's process (pid {run.open_pid}) was stopped with the node")
         run.check(run.leftovers() == [], "no session process is left behind")

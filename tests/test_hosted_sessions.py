@@ -1584,7 +1584,8 @@ def test_the_end_to_end_script_passes_with_the_stand_in(tmp_path):
     """scripts/session-host-e2e.py: a real hub and a real `board node` as subprocesses in a temp directory, driven
     through `board session`. Its timing limits are for an idle machine; a test run gets more slack."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_COMMS_", "BOARD_"))}
-    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "session-host-e2e.py"), "--max-latency", "10"],
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "session-host-e2e.py"), "--max-latency", "10",
+                        "--max-wake", "10"],
                        capture_output=True, text=True, timeout=180, env=env, cwd=str(tmp_path))
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS" in r.stdout and "stand-in" in r.stdout

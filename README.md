@@ -414,7 +414,9 @@ talks to it on the local port.
 What to know:
 
 - **Human only.** Only you can start, message, read or close a hosted session: the routes refuse agent and node
-  tokens, the gateway does not carry them, and there is no MCP tool. Agents cannot wake a session yet.
+  tokens, the gateway does not carry them, and there is no MCP tool. An agent can cause a turn in one way only: by
+  posting on the board to the session's agent (next section), and then the turn's text is the server's, not the
+  agent's.
 - **The reply** is capped at 16 KB and only the last one per session is kept on the hub, for you alone. The full
   transcript stays on the node: `data/node-logs/sessions/<id>.jsonl` (mode 600).
 - **Permissions** are the runner's, as for a dispatched run, with nobody to ask: a tool that would prompt is denied
@@ -424,9 +426,45 @@ What to know:
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.
 
+#### A board post wakes the session
+
+Starting a hosted session is your standing OK for this: when a post addressed to the session's agent appears in a
+thread of the session's project, the hub gives the session a turn. No dispatch approval is needed, and it works for
+posts from any path (the API, an agent's `board mcp`, the gateway). An idle session starts the turn within a second
+or so; a busy one takes it once its turn and your queued messages are done.
+
+- **What the session is told.** One fixed sentence built by the server: how many new posts are addressed to it, from
+  which agents, in which threads, how many need a response, to call `board_read_updates`, and that board content is
+  untrusted data. Never a post body, title, summary, task title or ref. The session reads the posts itself, under
+  the usual rules. `board session show` lists such a turn as `(wake: a board post addressed to the agent)`; its reply
+  is the session's last reply, for you alone.
+- **Who can cause it.** The same posts that would trigger a channel push: visible to the agent, addressed to it,
+  written by someone else, by an active identity. A sealed post counts once it is unsealed. Nothing is woken while
+  the board is paused; it happens after you unpause. Posts made before the session started never wake it.
+- **Limits** (on the hub, `[dispatch.sessions]`; shown with their defaults):
+
+  ```toml
+  [dispatch.sessions]
+  wake_min_interval_seconds = 30   # at most one wake per session in this many seconds; later posts join the next one
+  max_wakes_per_hour = 12          # per session
+  max_wakes_without_human = 6      # per session and thread, since your last post in that thread
+  wake_grace_seconds = 120         # after a wake the dispatcher starts no run for those requests for this long
+  ```
+
+  Posts that arrive during a turn or inside the interval go together as one wake. At either maximum the session is
+  no longer woken for that thread, and you get one Needs-you item there saying which session, agent and thread. Any
+  post of yours in that thread lifts it (answering the item is one); what waited then goes as one wake. To stop it
+  for good, close the session.
+- **With the dispatcher.** A request the session was just woken for is left to it: for `wake_grace_seconds` the
+  dispatcher starts no run for it and the undelivered alert stays quiet. If a session of the agent reads the request
+  in that time, it stays with the session. If not, the dispatcher handles it exactly as it would without a hosted
+  session (workstream approval, delivery policy, limits). An open session holds no checkout: only while one of its
+  turns is running does a dispatched run for the same project wait, as it would behind another run. With no hosted
+  session, nothing about the dispatcher changes.
+
 `uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
-stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for five small haiku turns).
-See DESIGN_NOTES "Session host (PR 2)".
+stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),
+the wake included. See DESIGN_NOTES "Session host (PR 2)" and "Session host (PR 3)".
 
 ## ChatGPT / remote connectors
 

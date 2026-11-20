@@ -179,3 +179,10 @@ runners = []                # e.g. ["codex-cli"]: Codex runner keys only
 enabled = false
 idle_hours = 8              # a session's process idle this long is stopped; the session stays, its next message resumes it
 max_live = 4                # session processes at once; one more stops the longest-idle one, or waits when none is idle
+# Waking: a post addressed to an agent wakes its hosted session in that thread's project (starting the session is your
+# standing OK). These four are read on the hub, whatever `enabled` says there. At either maximum the session is no
+# longer woken for that thread and you get one Needs-you item; any post of yours in the thread lifts it.
+wake_min_interval_seconds = 30   # at most one wake per session in this many seconds; later posts join the next one
+max_wakes_per_hour = 12          # per session
+max_wakes_without_human = 6      # per session and thread, since your last post in that thread
+wake_grace_seconds = 120         # after a wake the dispatcher starts no run for those requests for this long
