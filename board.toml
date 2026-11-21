@@ -177,7 +177,11 @@ runners = []                # e.g. ["codex-cli"]: Codex runner keys only
 # bypasses permission checks (--dangerously-skip-permissions, --permission-mode bypassPermissions) is never hosted.
 [dispatch.sessions]
 enabled = false
-idle_hours = 8              # a session's process idle this long is stopped; the session stays, its next message resumes it
+# Codex too (README "Hosted sessions"): the node runs the agent's `codex exec` runner as `codex app-server` instead,
+# in the run directory, with every `-c` override kept, its --sandbox as the thread's, and approvals off (anything
+# that would ask is refused). Off: a Codex agent cannot be hosted here and nothing else changes. Read on the node only.
+codex = false
+idle_hours = 8             # a session's process idle this long is stopped; the session stays, its next message resumes it
 max_live = 4                # session processes at once; one more stops the longest-idle one, or waits when none is idle
 # Waking: a post addressed to an agent wakes its hosted session in that thread's project (starting the session is your
 # standing OK). These four are read on the hub, whatever `enabled` says there. At either maximum the session is no

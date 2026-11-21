@@ -819,6 +819,7 @@ class SessionsConfig:
     `enabled = true`: only then does `board node` tell the hub it hosts sessions, and start any."""
 
     enabled: bool = False
+    codex: bool = False         # this machine also hosts Codex sessions (providers/codex.py); read on the node
     idle_hours: float = 8.0     # a session's process idle this long is stopped; its next message resumes it
     max_live: int = 4           # session processes at once; one more stops the longest-idle one, or waits
     # Waking a session for board posts addressed to its agent (hosted_wake.py). These four apply on the hub.
@@ -834,10 +835,10 @@ class SessionsConfig:
             raise ValueError(f"{where} must be a table")
         c = cls()
         for k, v in d.items():
-            if k == "enabled":
+            if k in ("enabled", "codex"):
                 if not isinstance(v, bool):
-                    raise ValueError(f"{where} enabled must be true or false")
-                c.enabled = v
+                    raise ValueError(f"{where} {k} must be true or false")
+                setattr(c, k, v)
             elif k == "idle_hours":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 24 * 366:
                     raise ValueError(f"{where} idle_hours must be a positive number of hours")

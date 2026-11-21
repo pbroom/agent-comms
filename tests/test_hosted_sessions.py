@@ -27,12 +27,13 @@ from agent_comms.dispatch import DispatchConfig
 from agent_comms.node import SELF_STOP_SECONDS, Node, _Local, shut_down
 from agent_comms.node_sessions import HANDED_FILE, LOST, SEQ_FILE, SessionRunner
 from agent_comms.providers.claude import ClaudeSession
-from agent_comms.session_host import SessionHost
+from agent_comms.session_host import PROVIDER_FILE, SessionHost
 
 from conftest import PROJECT, make_env
 from test_dispatch import FakeChild, FakeProcs, FakeSpawner
 from test_nodes import Clock
-from test_session_host import SHIPPED, FakeSessionChild, init, result, value_after
+import test_providers_codex as cx
+from test_session_host import SHIPPED, FakeSessionChild, init, install_codex_stand_in, result, value_after
 
 ROOT = Path(__file__).resolve().parents[1]
 P2, P3 = "/work/second", "/work/third"
@@ -66,7 +67,12 @@ def make_node(env, name="laptop", config=None, log_dir=None) -> Node:
 
 @pytest.fixture
 def senv(tmp_path):
-    env = make_env(tmp_path, dispatch=HUB_DISPATCH)
+    return session_env(tmp_path)
+
+
+def session_env(tmp_path, dispatch=HUB_DISPATCH, config=None):
+    """A hub, its app, and one node (`laptop`) that hosts sessions. `config(env)`: the node's own settings."""
+    env = make_env(tmp_path, dispatch=dispatch)
     env.tmp, env.signals = tmp_path, []
     env.groups = set()      # fake pids whose process group still has a member (none: a group goes with its leader)
     env.work = tmp_path / "checkout"
@@ -76,7 +82,7 @@ def senv(tmp_path):
         env.p[name] = env.board.authenticate(env.tokens[name])
     env.app = create_app(env.board)
     env.human, env.agent, env.laptop = client(env, "human"), client(env, "claude"), client(env, "laptop")
-    env.node = make_node(env)
+    env.node = make_node(env, config=config(env) if config else None)
     env.node.hello()
     return env
 
@@ -1578,6 +1584,315 @@ def test_real_pipes_a_queued_message_runs_right_after_the_turn_before_it(senv, t
     assert show(senv, sid)["pid"] is None
     with pytest.raises(ProcessLookupError):
         os.killpg(pid, 0)
+
+
+# ------------------------------------------------------------ Codex sessions (providers/codex.py)
+
+CODEX_RUNNER = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write", "-c", cx.APPROVE, "{prompt}"]
+CODEX_GRANT = {"nodes": {"laptop": {"projects": [PROJECT, P2, P3], "agents": ["claude", "codex"]}}}
+
+
+def codex_config(env, **sessions) -> DispatchConfig:
+    return node_config(env, runners={"claude-code": SHIPPED, "codex-cli": CODEX_RUNNER},
+                       sessions={"enabled": True, "codex": True} | sessions)
+
+
+@pytest.fixture
+def cenv(tmp_path):
+    """senv, with the hub allowing the node the `codex` agent and the node hosting Codex sessions."""
+    return session_env(tmp_path, dispatch=CODEX_GRANT, config=codex_config)
+
+
+def written(child) -> list[dict]:
+    return [json.loads(x) for x in child.stdin.split(b"\n")[:-1]]
+
+
+def codex_handshake(env, child, node=None, thread=cx.THREAD) -> None:
+    """Codex answers `initialize` and then `thread/start` (or `thread/resume`); the node takes a pass after each."""
+    child.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(env, node)
+    child.emit(cx.reply(2, {**cx.THREAD_RESULT, "thread": {**cx.THREAD_RESULT["thread"], "id": thread}}))
+    tick(env, node)
+
+
+def codex_turn(env, child, text, rid=3, node=None) -> None:
+    child.emit(cx.reply(rid, cx.TURN_REPLY), cx.TURN_STARTED, cx.message("a note", phase="commentary"),
+               cx.message(text), cx.completed())
+    tick(env, node)
+
+
+def test_a_hosted_codex_session_takes_turns_through_the_hub_and_its_thread_id_is_on_the_record(cenv):
+    sid = start(cenv, "first", agent="codex", model="gpt-6-luna")["session_id"]
+    assert sid != cx.THREAD and show(cenv, sid)["provider_id"] is None
+    tick(cenv)
+    [child], [call] = children(cenv), cenv.node.session_spawner.calls
+    assert call["argv"] == ["codex", "app-server", "-c", cx.APPROVE, "--listen", "stdio://"]
+    assert [m["method"] for m in written(child)] == ["initialize"]
+    assert (show(cenv, sid)["state"], msg(cenv, sid, 1)["state"]) == ("starting", "queued"), "nothing is delivered yet"
+    codex_handshake(cenv, child)
+    assert written(child)[2]["params"] == {"sandbox": "workspace-write", "approvalPolicy": "never",
+                                           "model": "gpt-6-luna"}
+    assert call["cwd"] == str(cenv.work), "the process is started in the run directory; Codex is told no other"
+    view = show(cenv, sid)
+    assert (view["state"], view["provider_id"], msg(cenv, sid, 1)["state"]) == ("running", cx.THREAD, "delivered")
+    listing = cenv.laptop.get("/api/nodes/sessions").json()
+    assert listing["sessions"][0]["resume"] is True, "a turn was written to that thread: it is one to resume"
+    assert cx.THREAD not in json.dumps(listing), "the id is the hub's to show, never to hand back to a node"
+
+    send(cenv, sid, "second")
+    codex_turn(cenv, child, "the first answer")
+    view = show(cenv, sid)
+    assert (view["reply"], view["reply_for"], view["turns"]) == ("the first answer", 1, 1)
+    assert msg(cenv, sid, 2)["state"] == "delivered" and written(child)[-1]["method"] == "turn/start"
+    assert cenv.laptop.get("/api/nodes/sessions").json()["sessions"][0]["resume"] is True
+    assert "codex-cli id " + cx.THREAD in cli._fmt_hosted_detail(view)
+    assert cenv.agent.get(f"/api/hosted-sessions/{sid}").status_code == 403, "human only, as for any session"
+    assert cx.THREAD not in json.dumps(cenv.agent.get("/api/state").json())
+
+
+def test_a_restarted_node_resumes_the_codex_thread_from_its_own_record(cenv):
+    sid = start(cenv, "first", agent="codex")["session_id"]
+    tick(cenv)
+    [old] = children(cenv)
+    codex_handshake(cenv, old)
+    codex_turn(cenv, old, "one")
+    cenv.node.sessions.shutdown()
+    assert (show(cenv, sid)["state"], show(cenv, sid)["pid"], show(cenv, sid)["provider_id"]) == ("idle", None, cx.THREAD)
+
+    # The hub's copy is for show only: even a wrong one changes nothing about what the node resumes.
+    cenv.laptop.post(f"/api/nodes/sessions/{sid}", json={"provider_id": cx.CHILD})
+    assert show(cenv, sid)["provider_id"] == cx.CHILD
+    node = make_node(cenv, config=codex_config(cenv), log_dir=cenv.tmp / "laptop-logs")
+    node.sessions.recover()
+    send(cenv, sid, "after the restart")
+    tick(cenv, node)
+    [fresh] = children(cenv, node)
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    resume = written(fresh)[2]
+    assert (resume["method"], resume["params"]["threadId"]) == ("thread/resume", cx.THREAD)
+    fresh.emit(cx.reply(2, cx.THREAD_RESULT))
+    tick(cenv, node)
+    assert written(fresh)[3]["params"]["input"] == [{"type": "text", "text": "after the restart"}]
+    codex_turn(cenv, fresh, "still here", node=node)
+    view = show(cenv, sid)
+    assert (view["reply"], view["turns"], view["provider_id"]) == ("still here", 2, cx.THREAD)
+
+
+def test_a_codex_thread_that_is_gone_fails_one_message_with_the_reason_and_the_hub_sees_the_new_thread(cenv):
+    sid = start(cenv, "first", agent="codex")["session_id"]
+    tick(cenv)
+    [old] = children(cenv)
+    codex_handshake(cenv, old)
+    codex_turn(cenv, old, "one")
+    cenv.node.sessions.shutdown()
+    node = make_node(cenv, config=codex_config(cenv), log_dir=cenv.tmp / "laptop-logs")
+    node.sessions.recover()
+    send(cenv, sid, "second")
+    tick(cenv, node)
+    [gone] = children(cenv, node)
+    gone.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    gone.emit(cx.reply(2, error=cx.NO_ROLLOUT))
+    tick(cenv, node, times=2)
+    m = msg(cenv, sid, 2)
+    assert m["state"] == "failed" and "NEW thread" in m["detail"] and cx.THREAD in m["detail"]
+    view = show(cenv, sid)
+    assert (view["state"], view["provider_id"]) == ("idle", None), "the session stays; its old thread is history"
+    assert cenv.laptop.get("/api/nodes/sessions").json()["sessions"][0]["resume"] is False
+
+    send(cenv, sid, "third")
+    tick(cenv, node)
+    fresh = children(cenv, node)[-1]
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    assert written(fresh)[2]["method"] == "thread/start"
+    codex_handshake(cenv, fresh, node=node, thread=cx.CHILD)
+    assert show(cenv, sid)["provider_id"] == cx.CHILD and msg(cenv, sid, 3)["state"] == "delivered"
+
+
+def test_a_refused_resume_recorded_before_a_crash_starts_a_new_thread_at_restart_whatever_the_hub_says(cenv):
+    """The node records that Codex refused the resume, fails the message, and dies before the hub hears any of it.
+    The hub still says `resume`. The node's own record overrules that: the next message starts the new thread, with
+    no second failed message on the way, and the one lost message says what happened."""
+    sid = start(cenv, "first", agent="codex")["session_id"]
+    tick(cenv)
+    [old] = children(cenv)
+    codex_handshake(cenv, old)
+    codex_turn(cenv, old, "one")
+    cenv.node.sessions.shutdown()
+    logs = cenv.tmp / "laptop-logs"
+    listed = lambda: cenv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+
+    node = make_node(cenv, config=codex_config(cenv), log_dir=logs)
+    node.sessions.recover()
+    send(cenv, sid, "second")
+    tick(cenv, node)
+    [refused] = children(cenv, node)
+    refused.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    node.sessions.client = NoReports(node.sessions.client)      # from here on nothing this node reports arrives
+    refused.emit(cx.reply(2, error=cx.NO_ROLLOUT))
+    tick(cenv, node, times=2)
+    assert json.loads((logs / PROVIDER_FILE).read_text()) == {sid: None}, "the fresh start is on the node's record"
+    assert listed()["resume"] is True and msg(cenv, sid, 2)["state"] == "queued", "the hub heard nothing of it"
+
+    again = make_node(cenv, config=codex_config(cenv), log_dir=logs)       # the node process died and came back
+    again.sessions.recover()
+    tick(cenv, again)
+    m = msg(cenv, sid, 2)
+    assert m["state"] == "failed" and m["detail"].startswith(LOST) and "starts a NEW one" in m["detail"], "loudly"
+    assert children(cenv, again) == [] and listed()["resume"] is False
+    send(cenv, sid, "third")
+    tick(cenv, again)
+    [fresh] = children(cenv, again)
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, again)
+    assert written(fresh)[2]["method"] == "thread/start", "not the refused resume again, and not a 'no record' failure"
+    codex_handshake(cenv, fresh, node=again, thread=cx.CHILD)
+    assert [m["state"] for m in show(cenv, sid)["messages"]] == ["done", "failed", "delivered"], "one failure, no more"
+    assert json.loads((logs / PROVIDER_FILE).read_text()) == {sid: cx.CHILD}, "the new thread's id replaced the mark"
+    assert show(cenv, sid)["provider_id"] == cx.CHILD and listed()["resume"] is True
+
+
+def test_a_session_whose_codex_runs_a_turn_of_its_own_is_neither_idle_stopped_nor_evicted_for_room(tmp_path):
+    """By the host's books such a process is idle. Stopping it would cut a turn that is running."""
+    env = session_env(tmp_path, dispatch=CODEX_GRANT, config=lambda env: codex_config(env, max_live=1, idle_hours=1))
+    a = start(env, "first", agent="codex")["session_id"]
+    tick(env)
+    [codex] = children(env)
+    codex_handshake(env, codex)
+    codex_turn(env, codex, "one")
+    codex.emit(cx.own_turn("turn/started"))             # Codex goes on by itself
+    tick(env)
+    env.clock.advance(3600 + 1)                         # past idle_hours
+    tick(env, times=2)
+    assert codex.terminated == 0 and env.node.sessions.host.park(a) is False, "not stopped for being idle"
+    env.node.hello()                                    # (the node's own loop says hello; an hour has passed)
+    b = start(env, "hello", project=P2)["session_id"]   # a Claude session wants the one process slot
+    tick(env, times=2)
+    assert codex.terminated == 0 and len(children(env)) == 1 and msg(env, b, 1)["state"] == "queued", \
+        "nor stopped to make room: the other session's message waits"
+    codex.emit(cx.own_turn("turn/completed", status="completed"))
+    tick(env, times=3)
+    assert codex.terminated == 1, "its own turn is over: now it is idle, and makes room"
+    assert len(children(env)) == 2 and msg(env, b, 1)["state"] == "delivered"
+
+
+def test_a_codex_agent_cannot_be_hosted_on_a_node_that_did_not_turn_codex_on(tmp_path):
+    env = session_env(tmp_path, dispatch=CODEX_GRANT, config=lambda env: codex_config(env, codex=False))
+    sid = start(env, "first", agent="codex")["session_id"]
+    tick(env)
+    view = show(env, sid)
+    assert view["state"] == "ended" and "cannot be hosted as a session" in view["error"]
+    assert children(env) == [], "no process was started"
+    claude = start(env, "hello")["session_id"]      # everything else is as it was
+    tick(env)
+    run_turn(env, claude, "hi")
+    assert show(env, claude)["reply"] == "hi"
+
+
+def test_the_provider_id_in_a_report_is_checked_and_a_claude_session_never_sends_one(senv):
+    sid = start(senv)["session_id"]
+    post = lambda **body: senv.laptop.post(f"/api/nodes/sessions/{sid}", json=body).status_code
+    assert post(provider_id="two words") == 400 and post(provider_id="") == 400 and post(provider_id="x" * 129) == 400
+    assert post(provider_id=7) == 422 and post(provider_id=["a"]) == 422
+    assert show(senv, sid)["provider_id"] is None
+    assert post(provider_id=cx.THREAD, resume=True) == 200 and show(senv, sid)["provider_id"] == cx.THREAD
+    assert post(state="idle") == 200 and show(senv, sid)["provider_id"] == cx.THREAD, "a report without it keeps it"
+    assert post(resume=False) == 200 and show(senv, sid)["provider_id"] is None, "the node starts the session anew"
+
+    sent = []
+    hub = senv.node.sessions.client
+
+    class Recording:
+        def request(self, method, path, **kw):
+            if method == "POST":
+                sent.append(kw.get("json"))
+            return hub.request(method, path, **kw)
+
+    senv.node.sessions.client = Recording()
+    tick(senv)
+    run_turn(senv, sid, "hello")
+    assert show(senv, sid)["reply"] == "hello" and sent and not any("provider_id" in body for body in sent), \
+        "Claude's own id is the session id: its reports are what they were"
+
+
+def test_a_node_that_died_before_it_could_report_the_first_turn_resumes_the_same_codex_thread(cenv):
+    """Codex may have recorded the turn. The hub was told nothing (not `delivered`, not the thread id, not `resume`),
+    so only the node's own record can keep the restart from silently starting a NEW thread."""
+    sid = start(cenv, "first", agent="codex")["session_id"]
+    cenv.node.sessions.client = NoReports(cenv.node.sessions.client)     # it fetches; nothing it reports arrives
+    tick(cenv)
+    [old] = children(cenv)
+    old.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv)
+    old.emit(cx.reply(2, cx.THREAD_RESULT))
+    tick(cenv)
+    assert written(old)[-1]["method"] == "turn/start"
+    listed = cenv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+    assert listed["resume"] is False and show(cenv, sid)["provider_id"] is None and msg(cenv, sid, 1)["state"] == "queued"
+
+    node = make_node(cenv, config=codex_config(cenv), log_dir=cenv.tmp / "laptop-logs")
+    node.procs.external[old.pid] = f"start-{old.pid}"       # the old session process is still alive
+    node.sessions.recover()
+    tick(cenv, node)
+    m = msg(cenv, sid, 1)
+    assert (m["state"], m["detail"]) == ("failed", LOST), "the turn is lost and said to be; it is not replayed"
+    send(cenv, sid, "second")
+    tick(cenv, node)
+    [fresh] = children(cenv, node)
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    resume = written(fresh)[2]
+    assert (resume["method"], resume["params"]["threadId"]) == ("thread/resume", cx.THREAD)
+    fresh.emit(cx.reply(2, cx.THREAD_RESULT))
+    tick(cenv, node)
+    assert [m["params"]["input"][0]["text"] for m in written(fresh) if m.get("method") == "turn/start"] == ["second"]
+    codex_turn(cenv, fresh, "it remembers", node=node)
+    view = show(cenv, sid)
+    assert (view["reply"], view["provider_id"]) == ("it remembers", cx.THREAD)
+
+
+def test_real_pipes_a_hosted_codex_session_through_the_hub_and_a_node_restart(tmp_path):
+    env = session_env(tmp_path, dispatch=CODEX_GRANT, config=codex_config)     # its hello offers the codex runner
+    exe = install_codex_stand_in(tmp_path / "bin")
+    config = node_config(env, runners={"codex-cli": [str(exe), *CODEX_RUNNER[1:]]}, kill_grace_seconds=5,
+                         sessions={"enabled": True, "codex": True})
+
+    def until(runner, done, seconds=30.0):
+        deadline = time.monotonic() + seconds
+        while not done() and time.monotonic() < deadline:
+            runner.pass_once()
+            time.sleep(0.02)
+        assert done(), show(env, sid)
+
+    runner = SessionRunner(env.laptop, config, tmp_path / "real-logs", long_poll=0, sync_seconds=0)
+    sid = start(env, "sleep 0.5 one", agent="codex")["session_id"]
+    send(env, sid, "deny two")
+    try:
+        until(runner, lambda: msg(env, sid, 2)["state"] in ("done", "failed"))
+        view = show(env, sid)
+        assert [m["state"] for m in view["messages"]] == ["done", "done"]
+        assert (view["reply"], view["turns"], view["denials"]) == ("turn 2: DENY TWO", 2, ["commandExecution"])
+        pid, thread = view["pid"], view["provider_id"]
+        assert pid and os.getpgid(pid) == pid and thread, "one process took both turns"
+    finally:
+        runner.shutdown()
+    assert show(env, sid)["pid"] is None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pid, 0)
+
+    again = SessionRunner(env.laptop, config, tmp_path / "real-logs", long_poll=0, sync_seconds=0)
+    again.recover()
+    send(env, sid, "recall")
+    try:
+        until(again, lambda: msg(env, sid, 3)["state"] in ("done", "failed"))
+        view = show(env, sid)
+        assert view["reply"] == "turn 3: FIRST WAS SLEEP 0.5 ONE", "the same thread, with its earlier turns"
+        assert view["provider_id"] == thread and view["pid"] != pid
+    finally:
+        again.shutdown()
 
 
 def test_the_end_to_end_script_passes_with_the_stand_in(tmp_path):

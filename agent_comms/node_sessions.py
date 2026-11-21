@@ -31,6 +31,8 @@ Rules the hub relies on:
   at the next start. From the moment shutdown begins, shutdown alone reports: the loop posts nothing more.
 - `[dispatch.sessions]`: `idle_hours` (a process idle that long is stopped; its session stays and the next message
   resumes it) and `max_live`.
+- A provider's own id for a session (Codex's thread id) is the host's to keep (session_host.PROVIDER_FILE). This
+  loop reports it to the hub with the status, for the record and the human, and never takes one from the hub.
 """
 from __future__ import annotations
 
@@ -59,6 +61,8 @@ MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 LOST = "the node restarted while this turn was in flight; it was not replayed"
+FRESH_START = (". Before that the agent refused to resume this session's conversation: the next message starts a NEW "
+               "one, without the earlier turns")
 
 
 class SessionRunner:
@@ -74,7 +78,8 @@ class SessionRunner:
         self.handed: dict[str, int] = self._load_handed()
         self.ending: set[str] = set()                 # sessions this node reported (or is reporting) ended
         self.dropped: set[str] = set()                # sessions the hub no longer lists: closed here, not reported
-        self.status: dict[str, tuple] = {}            # session id -> (state, pid, resume) as of the last pass
+        # session id -> (state, pid, resume, the provider's own id when it is not the session id) as of the last pass
+        self.status: dict[str, tuple] = {}
         self.reported: dict[str, tuple] = {}          # ... as the hub last took it
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
@@ -215,6 +220,10 @@ class SessionRunner:
             status = self.status.get(sid)
             if status is not None:
                 body |= {"state": status[0], "pid": status[1], "resume": status[2]}
+                if status[3] is not None:
+                    # Codex's thread id: for the hub's record, never read back. (A hub from before the field refuses
+                    # the report; hubs are upgraded before nodes.)
+                    body["provider_id"] = status[3]
             try:
                 self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
             except Exception as e:
@@ -336,7 +345,9 @@ class SessionRunner:
                 # reported with every status) or the last host's state file. That a message was handed over, or
                 # even written, proves nothing: Claude refuses `--resume` for a conversation that does not exist
                 # just as it refuses `--session-id` for one that does. A wrong guess heals in the host after one
-                # refused start (session_host._correct_start_mode).
+                # refused start (session_host._correct_start_mode). For a provider with an id of its own (Codex) the
+                # host's own record overrules this flag either way (`SessionHost.open`): a recorded id is resumed,
+                # and a recorded fresh start is not, even when the hub (which may not have heard) says resume.
                 resume = view.get("resume") is True or left.get("resume") is True
                 try:
                     s = self.host.open(sid, agent=view.get("agent"), project=view.get("project"),
@@ -358,7 +369,10 @@ class SessionRunner:
                     # Handed to a host that no longer has it, and no result on its way: the turn was lost.
                     self.handed[sid] = max(self.handed.get(sid, 0), n)
                     self._save_handed()
-                    self._add(sid, {"kind": "turn_ended", "message": n, "ok": False, "detail": LOST,
+                    # If the host found its own record that the provider refused to resume this session (the node
+                    # died before that failure reached the hub), the human is told here what follows from it.
+                    self._add(sid, {"kind": "turn_ended", "message": n, "ok": False,
+                                    "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
             self.queue[sid] = queue
         for sid, s in self.host.sessions.items():
@@ -375,6 +389,7 @@ class SessionRunner:
         if set(self.handed) - set(listed):
             self.handed = {sid: n for sid, n in self.handed.items() if sid in listed}
             self._save_handed()
+        self.host.keep_provider_ids(set(listed))
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
 
     def _admit(self, s) -> bool:
@@ -386,7 +401,9 @@ class SessionRunner:
         if len(live) < self.max_live:
             return True
         if not any(x.child is not None and x.stopping_since is not None for x in live):
-            idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended]
+            # (Not one whose provider runs a turn of its own in it: by the host's books it is idle, but it is working.)
+            idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended
+                    and not self.host.holding(x)]
             if idle:
                 self.host.park(min(idle, key=lambda x: self.last_busy.get(x.session_id, 0.0)).session_id)
         return False
@@ -425,7 +442,13 @@ class SessionRunner:
                     d.pop(sid, None)
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:
-                self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume))
+                self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))
+
+    @staticmethod
+    def _own_id(s) -> str | None:
+        """The provider's id for the session when it issued one of its own (Codex's thread id). Claude's is the
+        session id, which the hub has: nothing is added to its reports."""
+        return s.provider_id if s.provider_id != s.session_id else None
 
     # ------------------------------------------------------------ the thread
 
@@ -502,7 +525,7 @@ class SessionRunner:
         self.report_lock.release()
         with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
             self._emit(events)
-            self.status = {sid: (s.state, None, bool(s.resume)) for sid, s in self.host.sessions.items()
+            self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s)) for sid, s in self.host.sessions.items()
                            if not s.ended and sid not in self.dropped}
         try:
             if not self._flush(final=True):
