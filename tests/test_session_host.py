@@ -530,7 +530,7 @@ def test_the_derived_argv_is_scoped_has_no_prompt_and_carries_the_stream_flags(h
     [call] = henv.spawner.calls
     argv = call["argv"]
     assert argv[:2] == ["claude", "-p"]
-    assert not any("{" in a for a in argv), "no placeholder is left"
+    assert not any(a in ("{prompt}", "{project}", "{thread}") for a in argv), "no placeholder is left"
     assert "the message" not in argv, "a turn travels on stdin, never in the argv"
     assert value_after(argv, "--input-format") == "stream-json"
     assert value_after(argv, "--output-format") == "stream-json" and "--verbose" in argv
@@ -546,14 +546,18 @@ def test_the_derived_argv_is_scoped_has_no_prompt_and_carries_the_stream_flags(h
 
 
 def test_a_project_that_is_not_opted_in_keeps_the_runner_as_written(henv):
-    """claude_tool_projects is the human's opt-in to the wider scoped tools; a session never widens a runner itself."""
+    """claude_tool_projects is the human's opt-in to the wider scoped tools; a session never widens a runner itself.
+    The one thing a hosted session adds to the shipped runner is restrictive: the settings key that switches the
+    bypass mode off (session_access.claude_sealed), for every launch that is not a full-access one."""
     open_session(henv)
     henv.host.send(SID, "hello")
     henv.host.tick()
     argv = henv.spawner.calls[0]["argv"]
     assert argv == ["claude", "-p", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms",
+                    "--settings", '{"permissions":{"disableBypassPermissionsMode":"disable"}}',
                     "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                     "--permission-prompts", "none", "--session-id", SID]
+    assert henv.spawner.children[0].stdin.count(b"\n") == 1, "the turn and nothing else: the process is asked nothing"
 
 
 def test_the_shipped_claude_runner_is_the_template_these_tests_derive_from():

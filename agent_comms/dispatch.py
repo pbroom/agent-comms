@@ -814,12 +814,44 @@ HOSTED_HOLDS = "hosted"     # reserve_dispatch_launch's reason when a hosted ses
 
 
 @dataclass
+class SpawnConfig:
+    """`[dispatch.sessions.spawn]`: child sessions under a hosted session (hosted_tree.py). Read on the hub. Off
+    unless `enabled = true`: without it no session can be started under another, and nothing else changes."""
+
+    enabled: bool = False
+    max_children: int = 5       # children of one root session that have not ended, at most
+
+    @classmethod
+    def from_dict(cls, d: Any) -> "SpawnConfig":
+        where = "[dispatch.sessions.spawn]"
+        if not isinstance(d, dict):
+            raise ValueError(f"{where} must be a table")
+        c = cls()
+        for k, v in d.items():
+            if k == "enabled":
+                if not isinstance(v, bool):
+                    raise ValueError(f"{where} enabled must be true or false")
+                c.enabled = v
+            elif k == "max_children":
+                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 50:
+                    raise ValueError(f"{where} max_children must be a whole number from 1 to 50")
+                c.max_children = v
+            else:
+                raise ValueError(f"unknown setting {where} {k}")
+        return c
+
+
+@dataclass
 class SessionsConfig:
     """`[dispatch.sessions]`: hosted sessions on this machine's node (session_host.py, node_sessions.py). Off unless
     `enabled = true`: only then does `board node` tell the hub it hosts sessions, and start any."""
 
     enabled: bool = False
     codex: bool = False         # this machine also hosts Codex sessions (providers/codex.py); read on the node
+    # This machine may run a session with full access (session_access.py): a runner that bypasses permission checks,
+    # or a child session asked for at `full`. Read on the node. Off: such a session is refused, never narrowed.
+    allow_full_access: bool = False
+    spawn: SpawnConfig = field(default_factory=SpawnConfig)   # child sessions; read on the hub
     idle_hours: float = 8.0     # a session's process idle this long is stopped; its next message resumes it
     max_live: int = 4           # session processes at once; one more stops the longest-idle one, or waits
     # Waking a session for board posts addressed to its agent (hosted_wake.py). These four apply on the hub.
@@ -835,10 +867,12 @@ class SessionsConfig:
             raise ValueError(f"{where} must be a table")
         c = cls()
         for k, v in d.items():
-            if k in ("enabled", "codex"):
+            if k in ("enabled", "codex", "allow_full_access"):
                 if not isinstance(v, bool):
                     raise ValueError(f"{where} {k} must be true or false")
                 setattr(c, k, v)
+            elif k == "spawn":
+                c.spawn = SpawnConfig.from_dict(v)
             elif k == "idle_hours":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 24 * 366:
                     raise ValueError(f"{where} idle_hours must be a positive number of hours")

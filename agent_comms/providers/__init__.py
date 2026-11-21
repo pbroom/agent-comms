@@ -18,9 +18,15 @@ from typing import Any, Callable, Protocol
 # session cannot go on (`detail` says why); the host ends it and no other session. `start_failed`: THIS PROCESS cannot
 # serve the session (its handshake was refused; `detail` says why): the host fails the message that was waiting on it
 # and stops the process; the session stays, and the next message starts another process.
+# `mode` and `tools` (turn_started only, where the provider reports them): the permission mode the process really
+# runs the turn in and the tools it really has, which may differ from what its command line asked for (a settings
+# file). The host holds them against the session's access (session_access.verify). Not part of an event's identity.
+# On `ready`, from a provider that learns it there (Codex): `mode` is the sandbox its answer names for the thread.
+# `sealed`: the process's answer to whether bypassing permission checks is switched off in it (`ok`), from a provider
+# that asks (Claude, for a session started from a settings file its host merged).
 # `text` (turn_ended only): the turn's reply, capped by `cap_reply`. It is for the human who sent the message and for
 # nobody else: the hub keeps the last one per session and never hands it to an agent (hosted.py).
-KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed")
+KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed")
 REPLY_MAX_BYTES = 16 * 1024
 REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
 
@@ -45,6 +51,8 @@ class Event:
     denials: tuple[str, ...] = ()
     detail: str = ""
     text: str = ""
+    mode: str | None = field(default=None, compare=False)
+    tools: tuple[str, ...] = field(default=(), compare=False)
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -103,6 +111,15 @@ class ProviderSession(Protocol):
         """True while the provider's session is busy with something no message of the host's started (Codex running
         a turn of its own): a turn written now would not be a turn of its own. The host keeps the next message
         until this is False again, for at most the turn timeout. Optional."""
+        ...
+
+    def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
+        """What the host decided for this session from an access word and this machine's settings
+        (session_access.prepare): `access` "full" (this machine allows the session full access), or another word
+        for an adapter that must set the sandbox itself whatever the runner says, and `effort`, one of
+        session_access.EFFORTS, in the CLI's own terms. Called when the session is opened, before any `argv`, and
+        only when there is something to say. Optional: a session that needs it is refused for an adapter without
+        it."""
         ...
 
 

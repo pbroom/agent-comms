@@ -42,9 +42,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import providers, runner_preflight
-from .dispatch import (DispatchConfig, _signal_group, child_env, probe_process, process_start, render_argv,
-                       spawn_piped, stop_verified, with_writable_roots)
+from . import providers, runner_preflight, session_access
+from .dispatch import (DispatchConfig, _signal_group, _within, child_env, probe_process, process_start,
+                       render_argv, spawn_piped, stop_verified, with_writable_roots)
 from .providers import Event, ProviderSession, validate_model, validate_session_id
 
 log = logging.getLogger("agent_comms.session_host")
@@ -54,6 +54,9 @@ PROVIDER_FILE = "node-session-providers.json"   # session id -> the provider's o
 HANDSHAKE_SECONDS = 60.0            # a process whose provider has a handshake must be ready within this
 SESSIONS_DIR = "sessions"           # <session id>.jsonl (stdout) and <session id>.stderr.log
 STATES = ("starting", "idle", "running", "waiting", "ended")
+TURN_WITHDRAWN = ("the message was not delivered: before all of it was written to the agent's process, the session "
+                  "lost what it needs to take a turn (a child session's parent no longer vouches for it). The "
+                  "process was stopped, so the part already written is never completed or acted on")
 MESSAGE_ID_MAX = 200
 
 
@@ -132,6 +135,44 @@ class Session:
     transcript_fd: int | None = None
     tee_failed: bool = False
     stderr_from: int = 0            # size of the stderr log when this process started: what it wrote comes after
+    # Access (session_access): `asked`, the word it was opened with (None: a session of its own, which runs its
+    # runner as configured); `access`, what it HAS, computed from its command line when it was opened and never
+    # changed by anything its process says afterwards (that can only end it).
+    asked: str | None = None
+    access: str | None = None
+    effort: str | None = None
+    # How bypass was switched off on its command line (session_access.claude_sealed): None (a `full` launch, or not
+    # Claude), "inline" or "merged" (a settings file this host wrote from the runner's own: then every process of
+    # the session must first say the key is in force, and no turn is written to it before it has: `checking`).
+    seal: str | None = None
+    # What a process said is that process's, so each is kept as THE PROCESS that said it and counts only while that
+    # one is the session's live process: `sealed_by` (the key is in force), `confirmed_by` (it runs with full
+    # access: Claude's `init` says bypassPermissions, Codex's answer to thread/start names dangerFullAccess).
+    sealed_by: Any = None
+    confirmed_by: Any = None
+
+    @property
+    def sealed(self) -> bool:
+        return self.child is not None and self.sealed_by is self.child
+
+    @property
+    def checking(self) -> bool:
+        """Its process has been asked whether bypass is switched off in it and has not said so: no turn yet."""
+        return self.seal == "merged" and self.child is not None and not self.sealed
+
+    @property
+    def full_confirmed(self) -> bool:
+        """The session's LIVE process said it runs with full access. Not one that is gone, going down or has
+        exited, and not the one before it: nothing has to be cleared for that, the process is simply another."""
+        return (self.child is not None and self.confirmed_by is self.child and self.stopping_since is None
+                and self.child.poll() is None)
+
+    @property
+    def ceiling(self) -> str | None:
+        """The most a CHILD of this session may have now. Its own access, except that `full` counts only while the
+        process that confirmed it is alive: what a session was started as is not yet what the CLI accepted, and
+        what one process accepted says nothing about the next."""
+        return "workspace" if self.access == "full" and not self.full_confirmed else self.access
 
     @property
     def dormant(self) -> bool:
@@ -150,9 +191,52 @@ class Session:
             return "waiting"
         if self.busy:
             return "running" if self.ready else "starting"
-        if self.child is not None and self.stopping_since is None and not self.ready and self.provider.waits_for_ready:
+        if self.child is not None and self.stopping_since is None and (
+                self.checking or (not self.ready and self.provider.waits_for_ready)):
             return "starting"
         return "idle"
+
+
+DRY_RUN_ID = "00000000-0000-4000-8000-000000000000"
+
+
+def runner_dir(template: list[str]) -> str | None:
+    """The one directory a runner can be a session in, when it names one itself (a Codex runner's `--cd` with a
+    path: a hosted session works in the directory its node starts it in, so that path is the only one it may be).
+    None: any run directory."""
+    if template and os.path.basename(template[0]) == "codex":
+        from .providers.codex import named_directory
+        return named_directory(template)
+    return None
+
+
+def child_words(config: DispatchConfig, template: list[str]) -> list[str]:
+    """The access words a CHILD session of this runner can be started at on this machine: for each word, what
+    opening such a session does to the template (session_access.prepare and claude_launch, the adapter's own argv),
+    tried here without starting or writing anything. Empty: no adapter for its CLI (Codex with `[dispatch.sessions]
+    codex` off), or a runner the adapter refuses at every word (a Codex runner with `--approve-for-me`). `full` is
+    in it only where this machine allows full access. For a runner that names its own directory (`runner_dir`) the
+    words are those it has IN that directory: whether a child would run there is checked when one is asked for."""
+    factory = providers.provider_for(template, codex=config.sessions.codex)
+    if factory is None:
+        return []
+    words, cwd = [], runner_dir(template)
+    for word in session_access.LEVELS:
+        try:
+            prep = session_access.prepare(template, word, allow_full=config.sessions.allow_full_access, cwd=cwd)
+            launch = prep.template
+            if os.path.basename(launch[0]) == "claude":
+                launch, _ = session_access.claude_launch(launch, cwd)
+            provider = factory()
+            if cwd is not None and getattr(provider, "runs_in", None) is not None:
+                provider.runs_in(cwd)
+            if prep.configure is not None:
+                provider.configure(access=prep.configure, effort=None)
+            provider.argv(launch, session_id=DRY_RUN_ID, resume=False, model=None)
+        except Exception:
+            continue
+        words.append(word)
+    return words
 
 
 class SessionHost:
@@ -179,6 +263,11 @@ class SessionHost:
             raise ValueError("timeout_minutes must be positive")
         self.kill_grace = float(config.kill_grace_seconds if kill_grace_seconds is None else kill_grace_seconds)
         self.sessions: dict[str, Session] = {}
+        # Asked at the moment a turn is about to be written, and again before every later write of the same turn
+        # (a pipe can take it in pieces). False before anything of it is buffered keeps the message in the session's
+        # inbox; False once it is on its way withdraws it (TURN_WITHDRAWN). Its caller's rule: a child session's
+        # parent must still be what the child needs.
+        self.turn_gate: Callable[[Session], bool] | None = None
         self._recovered = False
         self._next_message = 0
 
@@ -305,12 +394,17 @@ class SessionHost:
     # ------------------------------------------------------------ the caller's side
 
     def open(self, session_id: str, *, agent: str, project: str, runtime: str | None = None, model: str | None = None,
-             resume: bool = False, thread_id: int = 0) -> Session:
+             resume: bool = False, thread_id: int = 0, access: str | None = None, effort: str | None = None,
+             cwd: str | None = None) -> Session:
         """Register a session. Nothing starts until it has a message. `resume`: the provider already has this session
-        (an earlier host ran it). Raises when this machine cannot host it: no runner, no adapter for the runner's
-        CLI, no run directory, a runner or model that cannot be used."""
+        (an earlier host ran it). `access`: the access word it is to run at (session_access; None: as its runner has
+        it), `effort`: one of session_access.EFFORTS, `cwd`: its run directory when that is not the project's
+        checkout (a child session's own worktree). Raises when this machine cannot host it: no runner, no adapter
+        for the runner's CLI, no run directory, a runner or model that cannot be used, an access level this machine
+        does not grant."""
         validate_session_id(session_id)
         validate_model(model)
+        session_access.effort(effort)
         if session_id in self.sessions:
             raise ValueError("session is already open on this host")
         template = self.config.runner_for(agent, runtime)
@@ -319,17 +413,54 @@ class SessionHost:
         factory = self.provider_for(template)
         if factory is None:
             raise LookupError(f"the runner for {agent} cannot be hosted as a session")
-        cwd = self.config.checkout_for(project)
-        if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        checkout = self.config.checkout_for(project)
+        if not checkout or not os.path.isabs(checkout) or not os.path.isdir(checkout):
             raise FileNotFoundError(f"this machine has no run directory for project {project!r}")
-        if runner_preflight.scoped(template, project, self.config.claude_tool_projects):
+        if cwd is None:
+            cwd = checkout
+        elif not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+            raise FileNotFoundError("the session's own run directory does not exist")
+        try:
+            return self._open(session_id, agent, runtime, project, cwd, template, factory, model, thread_id, resume,
+                              access, effort)
+        except Exception:
+            self._drop_files(session_id)        # what was written for a session that is not opened after all
+            raise
+
+    def _open(self, session_id, agent, runtime, project, cwd, template, factory, model, thread_id, resume, access,
+              effort) -> Session:
+        # The access word becomes flags here, from this machine's runner and settings (nothing executable came from
+        # the hub). Without a word the template is as configured; a Claude runner that names no permission mode
+        # gets the standard one pinned, so that no settings file decides it.
+        prep = session_access.prepare(template, access, allow_full=self.config.sessions.allow_full_access, cwd=cwd,
+                                      board_mcp=lambda configs: self._board_mcp(session_id, configs, cwd))
+        template = prep.template
+        if (prep.as_configured and prep.configure != "full"
+                and runner_preflight.scoped(template, project, self.config.claude_tool_projects)):
             template = runner_preflight.with_denied_tool_instruction(runner_preflight.scoped_template(template))
-        template = with_writable_roots(template, self.config.extra_roots(template, project))
+        if prep.as_configured or prep.granted != "read-only":      # a session narrowed to read-only gets no extra roots
+            template = with_writable_roots(template, self.config.extra_roots(template, project))
+        # What the session has is computed from the command line it is started with, here and now: no process
+        # has to say anything first. (For Claude from the final template, scoping included.)
+        label, seal = prep.granted, None
+        if os.path.basename(template[0]) == "claude":
+            label = session_access.claude_label(template)
+            # Last of all, on the command line as it will be run: refused if Claude would not run it as labelled
+            # (--restricted beside bypass), and bypass switched off by a settings key unless it is a `full` launch.
+            # A runner's own --settings becomes a file written here: Claude takes only its last one.
+            template, seal = session_access.claude_launch(
+                template, cwd, write=lambda data: self._private_json(session_id, "settings", data))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
-                    thread_id=int(thread_id), resume=bool(resume))
+                    thread_id=int(thread_id), resume=bool(resume), asked=access, access=label, effort=effort,
+                    seal=seal)
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
-            runs_in(cwd)
+            runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
+        if prep.configure is not None or effort is not None:
+            configure = getattr(s.provider, "configure", None)
+            if configure is None:
+                raise ValueError(f"the runner for {agent} takes no access level or effort as a hosted session")
+            configure(access=prep.configure, effort=effort)
         adopt = getattr(s.provider, "adopt", None)
         if adopt is not None:
             # This machine's own record, never an id from the hub. It is written before the first turn goes to the
@@ -346,6 +477,89 @@ class SessionHost:
         self._argv(s)       # now, so a runner that cannot be used is refused here and not at the first message
         self.sessions[session_id] = s
         return s
+
+    PRIVATE_FILES = ("mcp", "settings")     # <session id>.<kind>.json beside the transcript, each mode 600
+
+    def _private_json(self, session_id: str, kind: str, data: dict) -> str:
+        """Write `<sessions dir>/<session id>.<kind>.json` (mode 600, atomically) and return its path: a file this
+        host makes for one session's command line. Removed when the session is forgotten."""
+        self.sessions_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.sessions_dir.mkdir(exist_ok=True, mode=0o700)
+        path = self.sessions_dir / f"{validate_session_id(session_id)}.{kind}.json"
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, json.dumps(data).encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        return str(path)
+
+    def keep_private_files(self, session_ids) -> None:
+        """Remove the files this host made for sessions that are neither named here (the hub no longer lists them)
+        nor open: `<session id>.<kind>.json` for the PRIVATE_FILES kinds, and nothing else in the directory. A
+        session's files go with it when it is forgotten (`forget`), but one that was closed while this machine's
+        node was down is never opened again, and a merged settings file can hold the runner's credentials. Looked
+        at when the set of sessions changes (so also once when the node starts)."""
+        wanted = frozenset(session_ids) | frozenset(self.sessions)
+        if wanted == getattr(self, "_private_kept_for", None):
+            return
+        self._private_kept_for = wanted
+        try:
+            names = os.listdir(self.sessions_dir)
+        except OSError:
+            return
+        for name in names:
+            sid, _, rest = name.partition(".")
+            if (rest in {f"{kind}.json" for kind in self.PRIVATE_FILES} and providers.SESSION_ID_RE.fullmatch(sid)
+                    and sid not in wanted):
+                try:
+                    (self.sessions_dir / name).unlink()
+                    log.info("removed %s: its session is gone", name)
+                except OSError as e:
+                    log.warning("could not remove %s (%s)", name, e)
+
+    def _drop_files(self, session_id: str) -> None:
+        for kind in self.PRIVATE_FILES:
+            try:
+                (self.sessions_dir / f"{session_id}.{kind}.json").unlink()
+            except OSError:
+                pass
+
+    def _session_writable(self, path: str, cwd: str) -> bool:
+        """`path` lies where sessions are meant to write: this session's run directory, any directory this machine
+        runs a project in (`[dispatch.worktrees]`, `checkout_roots`), or the directory session and run worktrees
+        are made in. By filesystem identity, symlinks resolved."""
+        places = [cwd, *self.config.worktrees.values(), *self.config.checkout_roots, self.config.worktree_root()]
+        return any(_within(path, place) for place in places if isinstance(place, str) and place)
+
+    def _board_mcp(self, session_id: str, configs: list[str], cwd: str) -> str | None:
+        """For a read-only Claude session: a config holding ONLY the board's MCP server, as the runner's own
+        `--mcp-config` values define it (each a file, or the JSON itself), written beside the session's transcript
+        (mode 600; it names the launcher, never a token). None when the runner names no config with that server:
+        the session then has no MCP server at all. Nothing is looked for in the user's own Claude configuration.
+
+        A config FILE inside a checkout or a worktree is not read (`_session_writable`; a relative path is one in
+        the run directory): that is where other sessions write, and the entry names a command this session would
+        start. Such a runner's read-only child gets no board tools, like one whose runner names no config."""
+        entry = None
+        for value in configs:
+            try:
+                if not value.lstrip().startswith("{") and (not os.path.isabs(value)
+                                                           or self._session_writable(value, cwd)):
+                    log.warning("session %s: the runner's MCP config lies in a checkout or worktree, where sessions "
+                                "write; it is not used for a read-only session", session_id)
+                    continue
+                text = value if value.lstrip().startswith("{") else Path(value).read_text()
+                servers = json.loads(text).get("mcpServers")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(servers, dict) and isinstance(servers.get(session_access.BOARD_SERVER), dict):
+                entry = servers[session_access.BOARD_SERVER]
+        if entry is None:
+            return None
+        return self._private_json(session_id, "mcp", {"mcpServers": {session_access.BOARD_SERVER: entry}})
 
     def send(self, session_id: str, text: str, *, message_id: str | None = None) -> str:
         """Queue a message for the session (first in, first out). Returns its id."""
@@ -380,6 +594,7 @@ class SessionHost:
             raise ValueError("session has not ended, or its process is still stopping")
         del self.sessions[session_id]
         self._record_provider_id(session_id, None)
+        self._drop_files(session_id)    # a read-only session's board-only MCP config, a merged settings file
 
     def _session(self, session_id: str) -> Session:
         s = self.sessions.get(session_id)
@@ -424,8 +639,11 @@ class SessionHost:
                 self._reap(s, now, out)     # a write that failed stopped it
 
     def _read(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        keep = getattr(s.provider, "transcript_line", None)
         for line in s.child.read_lines():
-            self._tee(s, line)
+            # The transcript keeps what the process wrote, except what the provider says must not be kept (Claude's
+            # answer to `get_settings`: the settings in force, which can hold credentials): its own record instead.
+            self._tee(s, line if keep is None else keep(line))
             if s.ended:
                 continue
             events, replies = s.provider.feed(line)
@@ -444,15 +662,48 @@ class SessionHost:
 
     def _on_event(self, s: Session, ev: Event, now: float, out: list[HostEvent]) -> None:
         if ev.kind == "ready":
+            if getattr(s.provider, "reports_sandbox", False):
+                # Codex: the answer to thread/start (or resume) names the thread's sandbox. It ends a session
+                # whose sandbox is not what it was started as, and is what confirms a full one for its children.
+                problem, confirmed = session_access.verify_codex(s.access, ev.mode, s.asked)
+                if problem is not None:
+                    log.warning("session %s: %s", s.session_id, problem)
+                    self._end(s, problem, now, out)
+                    return
+                s.confirmed_by = s.child if confirmed else None
             s.ready, s.provider_id = True, ev.provider_id
             if not s.provider.waits_for_ready:
                 s.resume = True     # Claude: `ready` comes with the first turn, and the session exists from then on
-            if not s.busy:
+            if not s.busy and not s.checking:   # (a process still being asked about its settings stays on the clock)
                 s.busy_since = None
             self._save_state()
         elif ev.kind == "turn_started":
+            # The kill switch. The session's access was decided from its command line before it started; what the
+            # process says it really runs this turn with can only end it: bypassed where it was not started as
+            # full, not bypassed where it was, more than read-only where that was asked, or nothing verifiable where
+            # the access asked for depends on it.
+            problem = (session_access.verify(s.asked, s.access, ev.mode, ev.tools)
+                       if getattr(s.provider, "verifies_mode", False) else None)
+            if problem is not None:
+                log.warning("session %s: %s", s.session_id, problem)
+                self._end(s, problem, now, out)
+                return
+            if s.access == "full" and ev.mode == "bypassPermissions":
+                s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
             if s.in_flight is not None:
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
+        elif ev.kind == "sealed":
+            # The process's own word on whether bypass is switched off in it (asked when it started, for a session
+            # started from a settings file this host merged: Claude ignores a file it finds invalid, whole). Until
+            # it says yes nothing else is written to it (`checking`); if it says no the session ends, and the
+            # message that was waiting is reported as never delivered.
+            if not ev.ok:
+                log.warning("session %s: %s", s.session_id, session_access.NOT_SEALED)
+                self._end(s, session_access.NOT_SEALED, now, out)
+                return
+            s.sealed_by = s.child
+            if not s.busy:
+                s.busy_since = None     # the check is over; the turn's own clock starts when it is written
         elif ev.kind == "turn_ended":
             if s.in_flight is None:
                 log.warning("session %s: a turn ended that the host did not start", s.session_id)
@@ -490,8 +741,9 @@ class SessionHost:
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
         if not s.ready:
             self._correct_start_mode(s)
-        was_ready = s.ready
+        was_ready, was_checking = s.ready, s.checking
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
+        s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.outbuf.clear()
         close = getattr(child, "close", None)
@@ -506,9 +758,10 @@ class SessionHost:
                 self._fail(s, f"the process exited (code {code}) before the turn ended", out)
             elif s.writing is not None:
                 self._fail(s, f"the process exited (code {code}) before the message was written", out)
-            elif s.inbox and s.provider.waits_for_ready and not was_ready:
-                # It went during its handshake. The message that made it start fails with it: otherwise a process
-                # that can never start (a runner flag Codex refuses) would be started again on every pass.
+            elif s.inbox and ((s.provider.waits_for_ready and not was_ready) or was_checking):
+                # It went during its handshake (or before it answered the question it was asked at its start). The
+                # message that made it start fails with it: otherwise a process that can never start (a runner flag
+                # Codex refuses) would be started again on every pass.
                 self._fail_start(s, f"the process exited (code {code}) before it was ready", out)
             s.busy_since = None
         s.held_since = None
@@ -550,10 +803,16 @@ class SessionHost:
                 self._fail(s, self._timeout_detail(), out)
                 self._stop(s, now)
             return
-        if not s.busy and not s.ready:
+        if not s.busy and (not s.ready or s.checking):
             # A handshake, not a turn. It has its own short limit, so a process that never becomes ready fails the
             # message waiting on it now and not after a whole turn's timeout.
             if now - s.busy_since < self.handshake_seconds:
+                return
+            if s.checking:
+                # It never said whether bypass is switched off in it: not accepted where it may not be. Nothing
+                # was written to it but the question.
+                log.warning("session %s: %s", s.session_id, session_access.SEAL_UNVERIFIED)
+                self._end(s, session_access.SEAL_UNVERIFIED, now, out)
                 return
             self._fail_start(s, f"the agent process was not ready after {self.handshake_seconds:g} seconds", out)
             self._stop(s, now)
@@ -649,7 +908,7 @@ class SessionHost:
         except Exception:
             s.proc_start = None
         s.outbuf = bytearray(b"".join(s.provider.on_open()))
-        s.busy_since = now if s.provider.waits_for_ready else None
+        s.busy_since = now if s.provider.waits_for_ready or s.checking else None     # a handshake has its own limit
         try:
             fd = os.open(self.transcript_path(s.session_id),
                          os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -677,7 +936,8 @@ class SessionHost:
             self._spawn(s, now, out)
             if s.child is None:
                 return
-        if not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not self._held(s, now, out):
+        if (not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not s.checking
+                and (self.turn_gate is None or self.turn_gate(s)) and not self._held(s, now, out)):
             s.writing = s.inbox.popleft()
             s.waiting, s.denials, s.busy_since = False, (), now
             if s.provider.waits_for_ready and not s.resume:
@@ -690,6 +950,17 @@ class SessionHost:
             for data in s.provider.turn(s.writing.text):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
+        if s.writing is not None and self.turn_gate is not None and not self.turn_gate(s):
+            # The gate is asked before EVERY write of a turn, not only before the first: a pipe may take a turn in
+            # pieces, over several passes, and what the session needs can go between two of them. A half-written
+            # line must not be completed later, nor left for the process to act on: the process is stopped and the
+            # message fails as never delivered. The session stays, with no process; it starts another for its next
+            # message, when it may take one again.
+            log.warning("session %s: a turn was withdrawn while it was being written", s.session_id)
+            s.outbuf.clear()
+            self._fail(s, TURN_WITHDRAWN, out)
+            self._stop(s, now)
+            return
         if s.outbuf:
             try:
                 n = s.child.write(bytes(s.outbuf))
@@ -699,7 +970,7 @@ class SessionHost:
                 # handshake the message that made the process start is still in the inbox: it fails here too.
                 s.outbuf.clear()
                 detail = f"could not write to the process: {type(e).__name__}"
-                if s.provider.waits_for_ready and not s.ready:
+                if (s.provider.waits_for_ready and not s.ready) or s.checking:
                     self._fail_start(s, detail, out)
                 else:
                     self._fail(s, detail, out)
@@ -765,5 +1036,7 @@ class SessionHost:
                 s.transcript_fd = None
             s.child, s.proc_start, s.ready, s.stopping_since, s.killed = None, None, False, None, False
             s.outbuf.clear()
+        for s in self.sessions.values():
+            s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
         self._save_state()
         return out

@@ -21,6 +21,9 @@ What a turn does is in its text:
 - `mcp ...`: an MCP tool call fails because it would need approval (as under approvalPolicy never).
 - `big ...`: the reply is 40 KB.
 - `recall ...`: the reply names the first message of the THREAD, whichever process took it.
+- `write NAME`: the turn tries to create the file NAME in the thread's `cwd`. Under the `read-only` sandbox nothing
+  is written and, as with Codex, no item says so; under `workspace-write` or `danger-full-access` the file is
+  written. The reply says which: `WROTE NAME` or `WRITE REFUSED BY THE SANDBOX`.
 The reply is otherwise `turn <k of this thread>: <TEXT IN CAPITALS>`: k goes on counting after a resume.
 """
 import json
@@ -44,6 +47,7 @@ class Server:
         self.threads: dict[str, dict] = {}      # loaded in this process
         self.active: dict | None = None         # the turn in flight: {"thread", "id", "interrupted"}
         self.asked = 0                          # ids of the server's own requests start at 0, as Codex's do
+        self.places: dict[str, tuple] = {}      # thread id -> (sandbox, cwd) as this process was given them
         self.answers: dict = {}
 
     # ------------------------------------------------------------ wire
@@ -116,6 +120,7 @@ class Server:
         if method == "thread/start":
             tid = str(uuid.uuid4())
             self.threads[tid] = {"turns": 0, "first": None}
+            self.places[tid] = (params.get("sandbox"), params.get("cwd") or os.getcwd())
             self.write({"id": rid, "result": self.thread_view(tid, params)})
             return self.notify("thread/started", thread={"id": tid, "status": {"type": "idle"}})
         if method == "thread/resume":
@@ -126,6 +131,7 @@ class Server:
                 if not self.path(tid).exists():
                     return self.error(rid, f"no rollout found for thread id {tid}")
                 self.threads[tid] = json.loads(self.path(tid).read_text())
+            self.places[tid] = (params.get("sandbox"), params.get("cwd") or os.getcwd())
             return self.write({"id": rid, "result": self.thread_view(tid, params)})
         if method == "turn/start":
             tid = params.get("threadId")
@@ -147,7 +153,8 @@ class Server:
         return {"thread": {"id": tid, "sessionId": tid, "status": {"type": "idle"}, "turns": [], "ephemeral": False},
                 "model": params.get("model") or "stand-in-default", "modelProvider": "stand-in",
                 "cwd": params.get("cwd") or os.getcwd(), "approvalPolicy": params.get("approvalPolicy") or "on-request",
-                "sandbox": {"type": {"workspace-write": "workspaceWrite"}.get(params.get("sandbox"), "readOnly")}}
+                "sandbox": {"type": {"workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess"}
+                            .get(params.get("sandbox"), "readOnly")}}
 
     @staticmethod
     def turn_view(turn_id: str, status: str, items=(), error=None) -> dict:
@@ -229,6 +236,14 @@ class Server:
             reply = ("x" * 40_000 if text.startswith("big")
                      else f"turn {k}: FIRST WAS {thread['first'].upper()}" if text.startswith("recall")
                      else f"turn {k}: {text.upper()}")
+            wrote = re.match(r"write ([A-Za-z0-9._-]+)$", text)
+            if wrote:
+                sandbox, cwd = self.places.get(tid, (None, os.getcwd()))
+                if sandbox in ("workspace-write", "danger-full-access"):
+                    (Path(cwd) / wrote.group(1)).write_text("written by the stand-in\n")
+                    reply = f"turn {k}: WROTE {wrote.group(1)}"
+                else:
+                    reply = f"turn {k}: WRITE REFUSED BY THE SANDBOX"
             done = self.turn_view(turn_id, "completed", [self.message(tid, turn_id, reply, "final_answer")])
         self.active = None
         self.notify("thread/status/changed", threadId=tid, status={"type": "idle"})

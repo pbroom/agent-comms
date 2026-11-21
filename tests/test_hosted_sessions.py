@@ -1897,10 +1897,24 @@ def test_real_pipes_a_hosted_codex_session_through_the_hub_and_a_node_restart(tm
 
 def test_the_end_to_end_script_passes_with_the_stand_in(tmp_path):
     """scripts/session-host-e2e.py: a real hub and a real `board node` as subprocesses in a temp directory, driven
-    through `board session`. Its timing limits are for an idle machine; a test run gets more slack."""
+    through `board session`. Its timing limits are for an idle machine; a test run gets more slack.
+
+    A run that takes too long is stopped with SIGTERM, on which the script stops its hub, its node and every session
+    process and removes its temp directory; only if that does not end it is it killed. (Killed outright, as
+    `subprocess.run(timeout=...)` does, it would leave all of them running on this machine.)"""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_COMMS_", "BOARD_"))}
-    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "session-host-e2e.py"), "--max-latency", "10",
-                        "--max-wake", "10"],
-                       capture_output=True, text=True, timeout=180, env=env, cwd=str(tmp_path))
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "PASS" in r.stdout and "stand-in" in r.stdout
+    proc = subprocess.Popen([sys.executable, str(ROOT / "scripts" / "session-host-e2e.py"), "--max-latency", "10",
+                             "--max-wake", "10"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path))
+    try:
+        out, err = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            out, err = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+        pytest.fail("the end-to-end script did not finish in 300 seconds and was stopped:\n" + out[-4000:] + err[-2000:])
+    assert proc.returncode == 0, out + err
+    assert "PASS" in out and "stand-in" in out

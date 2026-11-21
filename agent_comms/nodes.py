@@ -87,14 +87,23 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
     return sorted(set(value))
 
 
+def _access_levels() -> tuple[str, ...]:
+    from .session_access import LEVELS
+    return LEVELS
+
+
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
           headless_browser: Any = None, checkout_roots: Any = None, access: Any = None,
-          sessions: Any = None) -> dict:
+          sessions: Any = None, session_host: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
     `access`: the node's `[dispatch.runner_access]`, runner key -> access entries (access.py), for runners it offers.
-    `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py)."""
+    `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py).
+    `session_host`: {"tree": 1, "runners": {key: [words]}} from a node that speaks the child-session protocol
+    (hosted_tree.py): for each runner it can start a child session from, the access words it can start one at
+    (session_access.LEVELS). Optionally `dirs`: {key: directory} for a runner that can be a session in that one
+    directory only. A node that does not say so gets no child sessions."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -117,14 +126,46 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         if set(sessions if isinstance(sessions, dict) else ()) != {"max_live"} or isinstance(live, bool) \
                 or not isinstance(live, int) or not 1 <= live <= 50:
             raise Invalid('sessions must be {"max_live": an integer from 1 to 50}')
+    hosting = None
+    if session_host is not None:
+        tree = session_host.get("tree") if isinstance(session_host, dict) else None
+        keys = set(session_host) if isinstance(session_host, dict) else set()
+        if (sessions is None or not {"tree", "runners"} <= keys <= {"tree", "runners", "dirs"}
+                or isinstance(tree, bool) or not isinstance(tree, int) or not 1 <= tree <= 1000):
+            raise Invalid('session_host must be {"tree": a version number, "runners": {...}} beside sessions')
+        offered = session_host["runners"]
+        # Each item is checked to be a word BEFORE anything is done with the list: an object or an array in it is a
+        # malformed hello (400), not something to hash.
+        if (not isinstance(offered, dict) or len(offered) > MAX_ITEMS or any(
+                k not in runners or not isinstance(w, list) or not w or len(w) > len(_access_levels())
+                or any(not isinstance(x, str) or x not in _access_levels() for x in w) or len(set(w)) != len(w)
+                for k, w in offered.items())):
+            raise Invalid("session_host runners maps runner keys the node offers to the access words (read-only, "
+                          "workspace, full) a child session can be started at")
+        dirs = session_host.get("dirs", {})
+        if (not isinstance(dirs, dict) or any(
+                k not in offered or not isinstance(d, str) or not d.startswith("/") or len(d) > 1024
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in d) for k, d in dirs.items())):
+            raise Invalid("session_host dirs maps runner keys in session_host runners to the one directory (an "
+                          "absolute path) such a runner can be a session in")
+        hosting = {"tree": tree, "runners": {k: [x for x in _access_levels() if x in w] for k, w in offered.items()}}
+        if dirs:
+            hosting["dirs"] = dict(dirs)
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,
             "max_concurrent": max_concurrent, "last_seen": now}
     if sessions is not None:
         info["sessions"] = {"max_live": sessions["max_live"]}
+    if hosting is not None:
+        info["session_host"] = hosting
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
+        if hosting is None:
+            # A node that does not (or no longer) host child sessions is listed none, so it can never report on one
+            # or end it: the hub ends those it had there, in this transaction (hosted_tree.end_orphans).
+            from . import hosted_tree
+            hosted_tree.end_orphans(c, p.name, "hub", now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
         c.execute("""DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ?
                      AND json_valid(value) AND json_extract(value, '$.state') = 'ended'""",

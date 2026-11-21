@@ -54,6 +54,7 @@ class NodeHelloIn(Body):
     checkout_roots: list[str] = []
     access: dict[str, list[str]] = {}
     sessions: dict[str, StrictInt] | None = None    # {"max_live": n}: the node hosts sessions (hosted.py)
+    session_host: dict[str, Any] | None = None      # {"tree": 1, "runners": {key: [words]}[, "dirs": {key: dir}]}
 
 
 class NodeReportIn(Body):
@@ -65,7 +66,7 @@ class NodeReportIn(Body):
 
 
 class HostedEventIn(Body):
-    kind: Literal['delivered', 'turn_started', 'turn_ended', 'approval_requested', 'ended']
+    kind: Literal['delivered', 'turn_started', 'turn_ended', 'approval_requested', 'ended', 'worktree_removed']
     message: StrictInt | None = None
     ok: StrictBool | None = None
     delivered: StrictBool = True
@@ -82,6 +83,10 @@ class NodeSessionReportIn(Body):
     resume: StrictBool | None = None
     seq: StrictInt | None = None    # orders this node's reports on the session; an older status is ignored
     provider_id: str | None = None  # the provider's own id for the session (Codex's thread id), for the record
+    access: str | None = None       # the access the session really has on the node (session_access.LEVELS)
+    worktree: str | None = None     # where a child session's own worktree is on the node
+    ceiling: str | None = None      # a root: the most a child may have under it now (full only once confirmed)
+    checkout: str | None = None     # a root: the directory it runs in on the node
 
 
 class HostedStartIn(Body):
@@ -89,6 +94,19 @@ class HostedStartIn(Body):
     message: str
     agent: str | None = None
     model: str | None = None
+
+
+class HostedChildIn(Body):
+    """A session started under another (hosted_tree.py). Words only: the node maps `access` and `effort` to flags."""
+    message: str
+    agent: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    title: str | None = None
+    role: str | None = None
+    isolation: str | None = None
+    access: str | None = None
+    request_id: str | None = None
 
 
 class HostedMessageIn(Body):
@@ -806,7 +824,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def node_hello(body: NodeHelloIn, p: Principal = P):
         from . import nodes
         return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent,
-                           body.headless_browser, body.checkout_roots, body.access, body.sessions)
+                           body.headless_browser, body.checkout_roots, body.access, body.sessions,
+                           session_host=body.session_host)
 
     @app.get("/api/nodes/assignments")
     def node_assignments(p: Principal = P):
@@ -829,16 +848,20 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         return gone
 
     @app.get("/api/nodes/sessions")
-    async def node_sessions(request: Request, wait: float = 0, seen: str | None = None, p: Principal = P):
+    async def node_sessions(request: Request, wait: float = 0, seen: str | None = None, tree: int = 0,
+                            p: Principal = P):
         # async: wait > 0 long-polls without holding a worker thread (as /api/updates does)
+        # tree: the node says it speaks the child-session protocol; without it no child session is listed to it.
         from . import hosted
-        return await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request))
+        return await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request), tree=tree >= 1)
 
     @app.post("/api/nodes/sessions/{session_id}")
     def node_session_report(session_id: str, body: NodeSessionReportIn, p: Principal = P):
         from . import hosted
         return hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
-                             body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id)
+                             body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
+                             access=body.access, worktree=body.worktree, ceiling=body.ceiling,
+                             checkout=body.checkout)
 
     # Hosted sessions, the human's side: only the human starts, messages, reads or closes one (hosted.py checks on
     # every call; a node identity never gets past `principal`). The reply text is returned here and nowhere else.
@@ -856,6 +879,18 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
             raise Conflict(f"the hub's [dispatch] settings cannot be read: {error}")
         return hosted.start(board, p, body.project, body.message, agent=body.agent, model=body.model,
                             allowed=config.nodes)
+
+    @app.post("/api/hosted-sessions/{session_id}/children")
+    def hosted_child(session_id: str, body: HostedChildIn, p: Principal = P):
+        # A session under another one (hosted_tree.py). Human only, like every route here, and off unless the hub
+        # says [dispatch.sessions.spawn] enabled = true.
+        from . import hosted_tree
+        board._require_human(p, "start a child session")
+        config, error = dispatch_config()
+        if error:
+            raise Conflict(f"the hub's [dispatch] settings cannot be read: {error}")
+        return hosted_tree.start_child(board, p, session_id, body.message, allowed=config.nodes,
+                                       spawn=config.sessions.spawn, **body.model_dump(exclude={"message"}))
 
     @app.get("/api/hosted-sessions/{session_id}")
     def hosted_show(session_id: str, p: Principal = P):

@@ -38,6 +38,9 @@ THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-f
 NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 FEATURE_RE = re.compile(r"[A-Za-z0-9_]{1,80}")
 SANDBOXES = ("read-only", "workspace-write")
+# An access word the host decided for the session (session_access.prepare) as the thread's sandbox. `full` is only
+# ever configured on a machine that allows it ([dispatch.sessions] allow_full_access).
+ACCESS_SANDBOX = {"read-only": "read-only", "workspace": "workspace-write", "full": "danger-full-access"}
 DEFAULT_SANDBOX = "read-only"       # `codex exec` without --sandbox
 MAX_DENIALS = 50
 CLIENT = {"name": "agent-comms", "version": "0.1.0"}
@@ -48,7 +51,8 @@ OPT_OUT = ("item/agentMessage/delta", "item/plan/delta", "item/reasoning/summary
            "command/exec/outputDelta", "process/outputDelta")
 
 BYPASS_REFUSED = ("a Codex runner that turns the sandbox or approvals off (--dangerously-bypass-approvals-and-sandbox, "
-                  "--approve-for-me, or the danger-full-access sandbox) cannot be hosted as a session")
+                  "--approve-for-me, or the danger-full-access sandbox) cannot be hosted as a session unless this "
+                  "node's settings say [dispatch.sessions] allow_full_access = true")
 BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
                           "--approve-for-me", "--yolo"))
 # What a `codex exec` runner may carry. With a value: kept for app-server (`-c`, `--enable`, `--disable`), turned into
@@ -162,6 +166,31 @@ def session_command(template: list[str], model: str | None = None, cwd: str | No
     return [template[0], "app-server", *kept, "--listen", "stdio://"], params
 
 
+def named_directory(template: list[str]) -> str | None:
+    """The directory a `codex exec` runner names with `-C`/`--cd`, when it is a path of its own (not `{project}`):
+    the only directory a hosted session of that runner can work in (`session_command`). None: it names none."""
+    cd, i = None, 1
+    while i < len(template):
+        arg = template[i]
+        i += 1
+        if arg.startswith("--"):
+            flag, eq, value = arg.partition("=")
+        elif arg.startswith("-") and len(arg) >= 2:
+            flag, eq, value = arg[:2], "=" if len(arg) > 2 else "", arg[2:].removeprefix("=")
+        else:
+            continue
+        kind = VALUE_FLAGS.get(flag)
+        if kind is None:
+            continue
+        if not eq:
+            if i >= len(template):
+                break
+            value, i = template[i], i + 1
+        if kind == "cd":
+            cd = value
+    return os.path.normpath(cd) if cd is not None and cd != "{project}" and os.path.isabs(cd) else None
+
+
 def _name(value) -> str:
     return value if isinstance(value, str) and NAME_RE.fullmatch(value) else "unknown"
 
@@ -174,6 +203,7 @@ def _error_text(error) -> str:
 
 class CodexSession:
     waits_for_ready = True      # initialize and thread/start (or thread/resume) come before any turn
+    reports_sandbox = True      # ... and their answer names the thread's sandbox: `ready` carries it (`mode`)
 
     def __init__(self):
         self.session_id: str | None = None
@@ -184,6 +214,8 @@ class CodexSession:
         self._gone = False                      # the thread this process was told to resume cannot be resumed
         self._pending: dict[int, str] = {}      # request id -> its method, until answered
         self._start_id: int | None = None       # the id of the turn/start request of the turn in flight
+        self._access: str | None = None         # the access word whose sandbox the host decided on (`configure`)
+        self._effort: str | None = None
         self._reset()
 
     def _reset(self) -> None:
@@ -211,9 +243,19 @@ class CodexSession:
     def runs_in(self, cwd: str) -> None:
         self._cwd = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
 
+    def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
+        """What the host decided for this session (session_access.prepare), before any `argv`. `access`: the
+        thread's sandbox whatever the runner says (ACCESS_SANDBOX); approvals stay off either way. `effort`: sent
+        with every `turn/start`."""
+        if access is not None and access not in ACCESS_SANDBOX:
+            raise ValueError("unknown access for a Codex session")
+        self._access, self._effort = access, effort
+
     def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
         self.session_id = validate_session_id(session_id)
         argv, self._params = session_command(template, model, self._cwd)
+        if self._access is not None:
+            self._params["sandbox"] = ACCESS_SANDBOX[self._access]
         self._resume, self._gone = bool(resume), False
         self._reset()
         return argv
@@ -225,7 +267,10 @@ class CodexSession:
     def turn(self, text: str) -> list[bytes]:
         self._end_turn()
         self._turn_open = True
-        data = self._request("turn/start", {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]})
+        params = {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]}
+        if self._effort is not None:
+            params["effort"] = self._effort     # "for this turn and subsequent turns": sent each time (a resume too)
+        data = self._request("turn/start", params)
         self._start_id = self._next_id
         return [data]
 
@@ -328,7 +373,11 @@ class CodexSession:
             if method == "thread/resume" and tid.lower() != (self.thread_id or "").lower():
                 return self._fatal("the process reported a thread id other than the one it was given")
             self.thread_id, self._ready = tid, True
-            return [Event("ready", provider_id=tid)], []
+            # The sandbox Codex says the thread has (`sandbox.type`: readOnly, workspaceWrite, dangerFullAccess).
+            sandbox = result.get("sandbox")
+            kind = sandbox.get("type") if isinstance(sandbox, dict) else None
+            return [Event("ready", provider_id=tid,
+                          mode=kind if isinstance(kind, str) and NAME_RE.fullmatch(kind) else None)], []
         if method == "turn/start" and self._turn_open and rid == self._start_id:
             # Only the answer to the request of the turn in flight (an earlier turn's request was retired when that
             # turn ended, so its late answer never names this one).

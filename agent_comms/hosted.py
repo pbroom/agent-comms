@@ -24,6 +24,9 @@ an optional model name and the message text.
   silent) is `failed` with the reason; the human sends again if they want it again.
 - `wake` is the one message kind that is not the human's: hosted_wake.py queues it, with text the hub builds itself,
   when a board post is addressed to the session's agent in the session's project.
+- A session may have children (hosted_tree.py, off unless `[dispatch.sessions.spawn] enabled = true` on the hub):
+  the same records with a `parent`. "One session per (agent, project)" and wakes are for roots only, and a parent
+  that ends takes its children with it.
 """
 from __future__ import annotations
 
@@ -46,6 +49,8 @@ MSG_STATES = ("queued", "delivered", "done", "failed")
 SETTLED = ("done", "failed")
 SESSION_STATES = ("starting", "idle", "running", "waiting", "ended")   # session_host.STATES, as the node reports them
 EVENT_KINDS = ("delivered", "turn_started", "turn_ended", "approval_requested", "ended")
+# The one thing a node may still say about a session that has ended: it removed the child's own worktree.
+WORKTREE_REMOVED = "worktree_removed"
 MESSAGE_MAX_BYTES = 64 * 1024      # one message's text
 MAX_QUEUED = 50                    # messages waiting in one session
 MAX_EVENTS = 200                   # events in one report
@@ -177,7 +182,8 @@ def _human_view(board: Board, r: dict) -> dict:
     out |= {"reply": r.get("reply"), "reply_for": r.get("reply_for"),
             "node_live": board.now() - _node_seen(board.conn, r["node"]) <= nodes.NODE_STALE_SECONDS,
             "transcript": f"data/node-logs/sessions/{r['session_id']}.jsonl on node {r['node']}"}
-    return out
+    from . import hosted_tree
+    return out | hosted_tree.view(r)        # parent, access and the rest; nothing for a session from before trees
 
 
 def _msg_view(m: dict) -> dict:
@@ -237,7 +243,8 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
     with db.write_tx(board.conn) as c:
         _prune(c, now)
         for other in _sessions(c):
-            if other.get("agent") == agent and other.get("project") == project and other.get("state") != "ended":
+            if (other.get("agent") == agent and other.get("project") == project and other.get("state") != "ended"
+                    and not other.get("parent")):       # one ROOT per (agent, project): children do not count
                 raise Conflict(f"{agent} already has a hosted session in {project}: {other['session_id']}. Send to "
                                f"it (`board session send {other['session_id']} ...`) or close it first")
         r = {"session_id": str(uuid.uuid4()), "agent": agent, "runtime": runtime, "project": project, "node": node,
@@ -245,6 +252,10 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
              "in_flight": None, "next_n": 1, "last_result": None, "reply": None, "reply_for": None, "denials": [],
              "stop": None, "error": None, "created_by": p.name, "created_at": now, "updated_at": now,
              "node_reported_at": None, "ended_at": None}
+        from . import hosted_tree
+        if hosted_tree.spawn_config(board).enabled:
+            # A root that may get children. Its access is its node's to say (derived from the runner there).
+            r |= {"parent": None, "root": r["session_id"], "depth": 0, "access": None}
         m = _enqueue(c, r, "user", text, p.name, now)
         from . import hosted_wake
         hosted_wake.begin(c, r["session_id"], now)      # woken for posts made from now on (PR 3)
@@ -276,6 +287,10 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
     r = _settle(board, _session(board.conn, session_id))
     out = _human_view(board, r)
     out["messages"] = [_msg_view(m) for m in _messages(board.conn, r["session_id"])[-SHOW_MESSAGES:]]
+    from . import hosted_tree
+    kids = hosted_tree.children_view(board, r)
+    if kids:
+        out["children"] = kids
     return out
 
 
@@ -306,10 +321,13 @@ def close(board: Board, p: Principal, session_id: Any) -> dict:
     with db.write_tx(board.conn) as c:
         r = _session(c, session_id)
         if r["state"] != "ended":
-            if now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS:   # away, or no longer hosting sessions
+            from . import hosted_tree
+            if (now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS   # away, or no longer hosting sessions
+                    or (hosted_tree.is_child(r) and not hosted_tree.node_supports(c, r["node"]))):   # ... or children
                 _end(c, r, "closed by the human (its node was not connected)", p.name, now)
             elif not r.get("stop"):
                 r |= {"stop": "close", "updated_at": now}
+                hosted_tree.cascade(c, r, p.name, now)      # its children are closed with it, now
             _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     return _human_view(board, r)
 
@@ -324,6 +342,8 @@ def _end(c, r: dict, detail: str, by: str, now: float) -> None:
             _put(c, _msg_key(r["session_id"], m["n"]), m, by, now)
     r |= {"state": "ended", "error": detail, "ended_at": now, "updated_at": now, "pid": None, "queued": 0,
           "in_flight": None}
+    from . import hosted_tree
+    hosted_tree.cascade(c, r, by, now)      # however a parent ended, its children are closed
 
 
 def _lost(conn, r: dict, now: float) -> bool:
@@ -332,6 +352,9 @@ def _lost(conn, r: dict, now: float) -> bool:
     host and its reports on this session."""
     if r.get("state") == "ended" or not (r.get("stop") or r.get("in_flight") is not None):
         return False
+    from . import hosted_tree
+    if hosted_tree.orphaned(conn, r):
+        return True     # a child on a node that hosts no children: that node's hellos say nothing about it
     seen = _node_seen(conn, r["node"])
     return not seen or now - max(seen, float(r.get("node_reported_at") or 0)) > nodes.NODE_LOST_SECONDS
 
@@ -341,12 +364,19 @@ def _settle(board: Board, r: dict) -> dict:
     has a turn in flight, and one being closed is closed. The node stops its own turns well before that
     (node_sessions.py), so the failed turn is not still running somewhere."""
     now = board.now()
-    if not _lost(board.conn, r, now):
+    from . import hosted_tree
+    if not hosted_tree.orphaned(board.conn, r) and not _lost(board.conn, r, now):
         return r
     with db.write_tx(board.conn) as c:
         # Decided again inside the transaction, on what is stored now: a node that reconnected and reported a
         # freshly delivered turn between the check above and here must not have that turn failed under it.
         r = _session(c, r["session_id"])
+        if hosted_tree.orphaned(c, r):
+            # A child whose node hosts no child sessions (any more): nobody there will run it, report on it or end
+            # it. Ended here, its turn in flight failed as lost. (The node's next hello does the same.)
+            _end(c, r, hosted_tree.ORPHANED, "hub", now)
+            _put(c, SESSION_PREFIX + r["session_id"], r, "hub", now)
+            return r
         if not _lost(c, r, now):
             return r
         if r.get("stop"):
@@ -368,22 +398,28 @@ def _settle(board: Board, r: dict) -> dict:
 # ---------------------------------------------------------------- the node's side
 
 
-def node_sessions(board: Board, p: Principal) -> dict:
+def node_sessions(board: Board, p: Principal, tree: bool = False) -> dict:
     """This node's sessions that have not ended, each with its unsettled messages (oldest first). Only the first
     queued message of a session carries its text: the node writes one at a time. `version` changes whenever
-    anything the node acts on does, so the node's long-poll can wait on it."""
+    anything the node acts on does, so the node's long-poll can wait on it.
+    `tree`: the node said, on this request, that it speaks the child-session protocol (hosted_tree.py). Only then
+    is a child session listed to it, or a root asked for its access: a node that does not know the protocol (one
+    rolled back to an earlier version) would open a child as an ordinary session of its agent, in the shared
+    checkout and with its runner's own permissions, whatever access and isolation the child was made with."""
     nodes._require_node(board, p)
     from . import hosted_wake
     # PR 3: queue the wakes that are due; a wake is validated in the transaction that shows it (hosted_wake.listing).
-    return hosted_wake.listing(board, p.name, lambda: _listed(board, p))
+    return hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree))
 
 
-def _listed(board: Board, p: Principal) -> dict:
+def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     """node_sessions' answer, read inside the transaction hosted_wake.listing opened."""
     nodes._require_node(board, p)       # again, in that transaction: a pause may have landed since the first check
+    from . import hosted_tree
+    spawn = hosted_tree.spawn_config(board).enabled
     out, mark = [], []
     for r in sorted(_sessions(board.conn), key=lambda r: r["session_id"]):
-        if r.get("node") != p.name or r.get("state") == "ended":
+        if r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree):
             continue
         msgs, first = [], True
         for m in _messages(board.conn, r["session_id"]):
@@ -397,7 +433,10 @@ def _listed(board: Board, p: Principal) -> dict:
                    | {"resume": r.get("resume") is True, "messages": msgs,
                       # The stamp of the last status applied (`report`): the node stamps above it, whatever its
                       # own clock says. Not part of `version`: it changes with the node's own reports.
-                      "status_seq": int(r.get("status_seq") or 0)})
+                      "status_seq": int(r.get("status_seq") or 0)}
+                   # A child's parent, access word, isolation and effort; `access: None` on a root when child
+                   # sessions are on. Nothing otherwise: the entry is then what it was before there were trees.
+                   | hosted_tree.node_extra(r, spawn and tree))
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] for m in msgs]])
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
     return {"node": p.name, "sessions": out, "version": version}
@@ -408,7 +447,7 @@ def _events(events: Any) -> list[dict]:
         raise Invalid(f"events must be a list of at most {MAX_EVENTS} events")
     out = []
     for ev in events:
-        if not isinstance(ev, dict) or ev.get("kind") not in EVENT_KINDS:
+        if not isinstance(ev, dict) or ev.get("kind") not in (*EVENT_KINDS, WORKTREE_REMOVED):
             raise Invalid("each event needs a kind: " + ", ".join(EVENT_KINDS))
         n, detail, text = ev.get("message"), ev.get("detail", ""), ev.get("text", "")
         denials, meta, ok = ev.get("denials", []), ev.get("meta", {}), ev.get("ok")
@@ -437,6 +476,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
     """One event from the node, applied to the session `r` (stored by the caller) and its message. A message only
     moves forward, so an event that arrives twice, late or for an unknown message changes nothing."""
     kind, n, sid = ev["kind"], ev["message"], r["session_id"]
+    if kind == WORKTREE_REMOVED:
+        return      # only once the session has ended (`report`)
     if kind == "ended":
         _end(c, r, ev["detail"] or "the node ended the session", by, now)
         return
@@ -477,7 +518,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
 
 
 def report(board: Board, p: Principal, session_id: Any, events: Any = None, state: Any = None, pid: Any = None,
-           resume: Any = None, seq: Any = None, provider_id: Any = None) -> dict:
+           resume: Any = None, seq: Any = None, provider_id: Any = None, access: Any = None,
+           worktree: Any = None, ceiling: Any = None, checkout: Any = None) -> dict:
     """The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
     turn_ended, approval_requested, ended), and how the session stands now (`state`, `pid`, `resume`: the provider
     confirmed its session exists). Only the node the session is assigned to may; a repeated report changes nothing.
@@ -487,7 +529,13 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
     and reached the hub late could put a dead pid and `running` back after the node's final report. A report without
     `seq` is applied as it comes.
     `provider_id`: the provider's own id for the session where it issues one (Codex's thread id). It is kept for the
-    record and shown to the human; the hub never sends it back to a node, which resumes from its own record only."""
+    record and shown to the human; the hub never sends it back to a node, which resumes from its own record only.
+    `access`: the access the session really has on the node (session_access; a root's is derived from the node's
+    runner). `worktree`: where a child's own worktree is on the node. Both are for the record and the human, and a
+    node sends them only to a hub that asked (the listing's `access`). `ceiling` (a root's): the most a child may
+    have under it now, which is `full` only once the session's process has confirmed full access; `checkout` (a
+    root's): the directory it runs in there. A `worktree_removed` event is the one thing applied to a session that
+    has ended: the node removes a child's worktree after its process is gone."""
     nodes._require_node(board, p)
     events = _events([] if events is None else events)
     if state is not None and state not in SESSION_STATES:
@@ -500,17 +548,35 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         raise Invalid("seq must be a positive integer")
     if provider_id is not None and valid_provider_id(provider_id) is None:
         raise Invalid("provider_id must be a short plain id")
+    from . import hosted_tree, session_access
+    if access is not None and access not in session_access.LEVELS:
+        raise Invalid("access must be one of " + ", ".join(session_access.LEVELS))
+    if ceiling is not None and ceiling not in session_access.LEVELS:
+        raise Invalid("ceiling must be one of " + ", ".join(session_access.LEVELS))
+    for what, path in (("worktree", worktree), ("checkout", checkout)):
+        if path is not None and (not isinstance(path, str) or not path.startswith("/") or len(path) > 1024
+                                 or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)):
+            raise Invalid(f"{what} must be an absolute path")
     now = board.now()
     with db.write_tx(board.conn) as c:
         r = _get(c, SESSION_PREFIX + _sid(session_id))
         if not isinstance(r, dict) or r.get("node") != p.name:
             raise NotFound(f"session {session_id} is not hosted on this node")
+        removed = (any(ev["kind"] == WORKTREE_REMOVED for ev in events) and r.get("isolation") == "worktree"
+                   and r.get("worktree_removed_at") is None)
         if r["state"] == "ended":
-            return _node_view(r)        # idempotent: nothing is reported into an ended session
+            # Idempotent: nothing is reported into an ended session. But its node removes a child's own worktree
+            # only once the process is gone, which is after the session ended here: that one fact is still taken.
+            if removed:
+                r["worktree_removed_at"] = now
+                _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
+            return _node_view(r)
         for ev in events:
             _apply(c, r, ev, p.name, now)
             if r["state"] == "ended":
                 break
+        if removed and r["state"] == "ended":
+            r["worktree_removed_at"] = now
         if r["state"] != "ended" and (seq is None or seq > int(r.get("status_seq") or 0)):
             if seq is not None:
                 r["status_seq"] = seq
@@ -524,6 +590,7 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
                 r["provider_id"] = provider_id
             elif resume is False:
                 r.pop("provider_id", None)      # the node starts the provider's session anew: the old id is history
+            hosted_tree.reported(r, access, worktree, ceiling, checkout)
         r |= {"updated_at": now, "node_reported_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     return _node_view(r)
@@ -562,13 +629,14 @@ async def _poll(fetch: Callable[[], dict], done: Callable[[dict], bool], seconds
     return out
 
 
-async def node_sessions_wait(board: Board, p: Principal, wait: Any = 0, seen: Any = None, gone=None) -> dict:
+async def node_sessions_wait(board: Board, p: Principal, wait: Any = 0, seen: Any = None, gone=None,
+                             tree: bool = False) -> dict:
     """node_sessions, held back for up to `wait` seconds while its version is still the one the node has `seen`."""
     seconds = _wait_seconds(wait, NODE_WAIT_MAX)
     if seen is not None and (not isinstance(seen, str) or not _SEEN.fullmatch(seen)):
         raise Invalid("seen must be a version this route returned")
-    return await _poll(lambda: node_sessions(board, p), lambda out: seen is None or out["version"] != seen, seconds,
-                       gone)
+    return await _poll(lambda: node_sessions(board, p, tree), lambda out: seen is None or out["version"] != seen,
+                       seconds, gone)
 
 
 async def message_wait(board: Board, p: Principal, session_id: Any, n: Any, wait: Any = 0, gone=None) -> dict:

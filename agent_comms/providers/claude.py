@@ -6,6 +6,18 @@ Code 2.1.322 (DESIGN_NOTES "Session host (PR 1)"):
   `result` event; both carry the `session_id` given as `--session-id` (or `--resume`).
 - A `result` lists the tool calls that were refused as `permission_denials`: objects with `tool_name`, `tool_use_id`
   and `tool_input`. Only the names leave this module: an input can hold file contents and paths.
+- Each `init` also names the `permissionMode` the turn really runs in and the `tools` the session really has. Both
+  can differ from what the command line asked for: a settings file's `permissions.defaultMode` put a process started
+  with no bypass flag into `bypassPermissions` (seen live). The adapter passes both on with `turn_started`, and the
+  host holds them against the session's access (session_access.verify).
+- A `control_request` with `subtype: get_settings` on stdin is answered at once, before any turn, with a
+  `control_response` whose `response.effective` is the settings in force, every source merged (seen live). The
+  adapter asks it once per process when the command line names a settings FILE and does not select bypass: the host
+  wrote that file from the runner's own settings plus the key that switches bypass off, and Claude ignores a
+  settings file it finds invalid, whole and silently. The answer (`sealed`) says whether the key is in force. The
+  host writes no turn to the process before it, and never keeps the answer itself: `effective` is every setting in
+  force, and a settings file can hold credentials (`env`). `transcript_line` gives the transcript one line of the
+  adapter's own in its place, with the one bit.
 - With `--permission-prompts none` anything that would ask is refused on the spot, so the process never waits for an
   answer. A `control_request` asking to use a tool should therefore never arrive; if one does it is reported and left
   unanswered (nothing is approved), and the host's turn timeout ends the turn.
@@ -26,6 +38,7 @@ STREAM_FLAGS = ("--input-format", "stream-json", "--output-format", "stream-json
 NO_PROMPTS = ("--permission-prompts", "none")
 TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 MAX_DENIALS = 50
+MAX_TOOLS = 2000        # tool names taken from one `init`
 # The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
 # (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
@@ -33,13 +46,15 @@ RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_us
 
 
 BYPASS_REFUSED = ("a Claude runner that bypasses permission checks (--dangerously-skip-permissions or --permission-mode "
-                  "bypassPermissions) cannot be hosted as a session")
+                  "bypassPermissions) cannot be hosted as a session unless this node's settings say [dispatch.sessions] "
+                  "allow_full_access = true")
 
 
 def bypasses_permissions(template: list[str]) -> bool:
     """The runner turns Claude's permission checks off, or lets a session turn them off: a hosted session takes
-    turns from messages for as long as it lives, so it is never started that way. Every other permission mode is the
-    machine owner's choice, as for a dispatched run."""
+    turns from messages for as long as it lives, so it is started that way only on a machine that allows sessions
+    full access (`configure`; session_access.py). Every other permission mode is the machine owner's choice, as for
+    a dispatched run."""
     for i, arg in enumerate(template):
         flag, eq, value = arg.partition("=")
         if flag in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
@@ -49,6 +64,22 @@ def bypasses_permissions(template: list[str]) -> bool:
             if mode.lower() == "bypasspermissions":
                 return True
     return False
+
+
+def selects_bypass(argv: list[str]) -> bool:
+    """The command line starts Claude in the bypass mode (unlike `bypasses_permissions`, the flag that only makes
+    the mode selectable does not count)."""
+    return bypasses_permissions([a for a in argv if a.split("=", 1)[0] != "--allow-dangerously-skip-permissions"])
+
+
+def settings_file(argv: list[str]) -> bool:
+    """The command line's settings (its last `--settings`: the one Claude takes) are a file, not the JSON itself."""
+    value = None
+    for i, arg in enumerate(argv):
+        flag, eq, rest = arg.partition("=")
+        if flag == "--settings":
+            value = rest if eq else (argv[i + 1] if i + 1 < len(argv) else None)
+    return value is not None and not value.lstrip().startswith("{")
 
 
 def tool_names(denials) -> tuple[str, ...]:
@@ -72,13 +103,34 @@ def _meta(ev: dict) -> dict:
     return out
 
 
+def _bypass_off(answer: dict) -> bool:
+    """A `get_settings` answer (the `response` of a `control_response`) says the key that switches bypass off is
+    in force: `response.effective.permissions.disableBypassPermissionsMode == "disable"`."""
+    inner = answer.get("response") if answer.get("subtype") == "success" else None
+    effective = inner.get("effective") if isinstance(inner, dict) else None
+    permissions = effective.get("permissions") if isinstance(effective, dict) else None
+    return isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
+
+
 class ClaudeSession:
     waits_for_ready = False     # `init` only arrives once the first turn has been written
+    verifies_mode = True        # ... and says what the turn really runs with: the host's kill switch reads it
 
     def __init__(self):
         self.session_id: str | None = None
         self._ready = False
         self._dead = False
+        self._full = False              # this machine allows the session full access (`configure`)
+        self._effort: str | None = None
+        self._ask = False               # this process is asked whether bypass is switched off in it (`on_open`)
+        self._asked: str | None = None  # the id of that request, until it is answered
+        self._starts = 0
+
+    def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
+        """What the host decided for this session (session_access.prepare), before any `argv`. `access` "full":
+        this machine allows it full access, so a template that bypasses permission checks is not refused.
+        `effort`: Claude Code's `--effort` for the session, replacing the runner's own."""
+        self._full, self._effort = access == "full", effort
 
     def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
         """The runner template (already scoped where the project asks for it) as a session command: without its
@@ -89,7 +141,7 @@ class ClaudeSession:
         model = validate_model(model)
         if not template or os.path.basename(template[0]) != "claude":
             raise ValueError("not a Claude runner")
-        if bypasses_permissions(template):
+        if bypasses_permissions(template) and not self._full:
             raise ValueError(BYPASS_REFUSED)
         out, i = [], 0
         while i < len(template):
@@ -100,7 +152,7 @@ class ClaudeSession:
                 raise ValueError("this Claude runner sets session or stream flags a hosted session sets itself")
             if arg == "{prompt}":
                 continue            # turns arrive on stdin
-            if flag == "--model" and model is not None:
+            if (flag == "--model" and model is not None) or (flag == "--effort" and self._effort is not None):
                 if "=" not in arg and i < len(template):
                     i += 1          # its value
                 continue
@@ -113,13 +165,49 @@ class ClaudeSession:
         out += NO_PROMPTS
         if model is not None:
             out += ["--model", model]
+        if self._effort is not None:
+            out += ["--effort", self._effort]
+        self._ask, self._asked = settings_file(out) and not selects_bypass(out), None
         return out + ["--resume" if resume else "--session-id", self.session_id]
 
     def adopt(self, provider_id: str | None) -> None:
         """Nothing to adopt: Claude's own id for the session is the hub's session id."""
 
     def on_open(self) -> list[bytes]:
-        return []
+        """Nothing, or the one question a process started from a settings file is asked (see the module text)."""
+        if not self._ask:
+            return []
+        self._starts += 1
+        self._asked = "settings-%s-%d" % ((self.session_id or "")[:8], self._starts)   # one per session and process
+        return [json.dumps({"type": "control_request", "request_id": self._asked,
+                            "request": {"subtype": "get_settings"}}).encode() + b"\n"]
+
+    def transcript_line(self, line: bytes) -> bytes:
+        """What the session's transcript keeps of a line the process wrote: the line, except a `control_response`,
+        whose body is never kept (the answer to `get_settings` is the settings in force, credentials included).
+        In its place: who answered what kind of answer, and whether bypass is switched off.
+
+        A line that does NOT parse may be that answer cut short (the process died in the middle of it, or its last
+        bytes came without a line end), and half a settings body is as secret as a whole one. So it is not kept
+        either, only its length, when this process was asked for its settings at all (then nothing unparseable
+        of it is kept, before or after the answer), and for any process when the line names a control response or
+        a question of this adapter's."""
+        try:
+            ev = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            if self._ask or b"control_response" in line or b"get_settings" in line or (
+                    self.session_id is not None and ("settings-" + self.session_id[:8]).encode() in line):
+                return json.dumps({"type": "host", "subtype": "line_withheld", "bytes": len(line),
+                                   "why": "not a complete JSON line"}).encode()
+            return line
+        if not isinstance(ev, dict) or ev.get("type") != "control_response":
+            return line
+        answer = ev.get("response") if isinstance(ev.get("response"), dict) else {}
+        rid, kind = answer.get("request_id"), answer.get("subtype")
+        return json.dumps({"type": "host", "subtype": "control_response_withheld",
+                           "request_id": rid if isinstance(rid, str) and TOOL_NAME_RE.fullmatch(rid) else None,
+                           "answer": kind if kind in ("success", "error") else None,
+                           "bypass_disabled": _bypass_off(answer)}).encode()
 
     def turn(self, text: str) -> list[bytes]:
         # json.dumps escapes every line break inside the text: one turn is exactly one line.
@@ -155,11 +243,22 @@ class ClaudeSession:
         if init:
             events = [] if self._ready else [Event("ready", provider_id=sid)]
             self._ready = True
-            return events + [Event("turn_started")], []
+            mode, tools = ev.get("permissionMode"), ev.get("tools")
+            # A name that is not a plain tool name still counts as a tool the session has: "unknown", never dropped.
+            named = tuple(t if isinstance(t, str) and TOOL_NAME_RE.fullmatch(t) else "unknown"
+                          for t in (tools if isinstance(tools, list) else [])[:MAX_TOOLS + 1])
+            return events + [Event("turn_started", mode=mode if isinstance(mode, str) and len(mode) <= 40 else None,
+                                   tools=named)], []
         if kind == "result":
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
             return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),
                           text=cap_reply(ev.get("result")))], []
+        if kind == "control_response":
+            answer = ev.get("response")
+            if self._asked is None or not isinstance(answer, dict) or answer.get("request_id") != self._asked:
+                return [], []
+            self._asked = None
+            return [Event("sealed", ok=_bypass_off(answer))], []
         if kind == "control_request":
             request = ev.get("request")
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":
