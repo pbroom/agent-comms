@@ -359,8 +359,16 @@ wake = true
                     time.sleep(INTERVAL)
                 t0 = time.monotonic()
                 post = self.post()
-                self.until(f"{step}: a turn and a board_read_updates call",
-                           lambda: results() > before and reads(t0), self.args.max_real_wake)
+                try:
+                    self.until(f"{step}: a turn and a board_read_updates call",
+                               lambda: results() > before and reads(t0), self.args.max_real_wake)
+                except SystemExit:
+                    # Say which half failed: no wake (the hub's record) or a turn without the call (the model).
+                    r = self.record(conv) or {}
+                    print(f"  {step} diagnosis: turns finished {results()} (before the post {before}); waiter "
+                          f"offer {json.dumps(r.get('offer'))}, delivered {json.dumps(r.get('delivered'))}, "
+                          f"pending {list((r.get('pending') or {}))}; transcript in {self.tmp / 'logs'}")
+                    raise
                 took = time.monotonic() - t0
                 self.check(True, f"{step} woken with no input: board_read_updates {took:.1f} s after the post "
                                  f"({json.dumps(reads(t0)[0].get('input'))})")
@@ -409,8 +417,8 @@ wake = true
             except subprocess.TimeoutExpired:
                 print(f"  still running after SIGTERM: pid {p.pid}")
         left = [p.pid for p in self.procs if p.poll() is None]
-        if self.args.keep:
-            print(f"kept {self.tmp}")
+        if self.args.keep or self.failures:
+            print(f"kept {self.tmp}")       # asked for, or something failed: the logs are what explain it
         else:
             import shutil
             shutil.rmtree(self.tmp, ignore_errors=True)
@@ -437,6 +445,8 @@ def main() -> int:
         run.stand_in()
         if args.claude_bin:
             run.real()
+    except SystemExit as e:             # a step that timed out or a process that exited early
+        run.failures.append(str(e) or "stopped")
     finally:
         run.cleanup()
     print("FAILED: " + "; ".join(run.failures) if run.failures else "all checks passed")
