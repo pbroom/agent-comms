@@ -509,7 +509,7 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
 
 def report(board: Board, p: Principal, session_id: Any, events: Any = None, state: Any = None, pid: Any = None,
            resume: Any = None, seq: Any = None, provider_id: Any = None, access: Any = None,
-           worktree: Any = None) -> dict:
+           worktree: Any = None, ceiling: Any = None, checkout: Any = None) -> dict:
     """The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
     turn_ended, approval_requested, ended), and how the session stands now (`state`, `pid`, `resume`: the provider
     confirmed its session exists). Only the node the session is assigned to may; a repeated report changes nothing.
@@ -522,8 +522,10 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
     record and shown to the human; the hub never sends it back to a node, which resumes from its own record only.
     `access`: the access the session really has on the node (session_access; a root's is derived from the node's
     runner). `worktree`: where a child's own worktree is on the node. Both are for the record and the human, and a
-    node sends them only to a hub that asked (the listing's `access`). A `worktree_removed` event is the one thing
-    applied to a session that has ended: the node removes a child's worktree after its process is gone."""
+    node sends them only to a hub that asked (the listing's `access`). `ceiling` (a root's): the most a child may
+    have under it now, which is `full` only once the session's process has confirmed full access; `checkout` (a
+    root's): the directory it runs in there. A `worktree_removed` event is the one thing applied to a session that
+    has ended: the node removes a child's worktree after its process is gone."""
     nodes._require_node(board, p)
     events = _events([] if events is None else events)
     if state is not None and state not in SESSION_STATES:
@@ -539,9 +541,12 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
     from . import hosted_tree, session_access
     if access is not None and access not in session_access.LEVELS:
         raise Invalid("access must be one of " + ", ".join(session_access.LEVELS))
-    if worktree is not None and (not isinstance(worktree, str) or not worktree.startswith("/") or len(worktree) > 1024
-                                 or any(ord(ch) < 32 or ord(ch) == 127 for ch in worktree)):
-        raise Invalid("worktree must be an absolute path")
+    if ceiling is not None and ceiling not in session_access.LEVELS:
+        raise Invalid("ceiling must be one of " + ", ".join(session_access.LEVELS))
+    for what, path in (("worktree", worktree), ("checkout", checkout)):
+        if path is not None and (not isinstance(path, str) or not path.startswith("/") or len(path) > 1024
+                                 or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)):
+            raise Invalid(f"{what} must be an absolute path")
     now = board.now()
     with db.write_tx(board.conn) as c:
         r = _get(c, SESSION_PREFIX + _sid(session_id))
@@ -575,7 +580,7 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
                 r["provider_id"] = provider_id
             elif resume is False:
                 r.pop("provider_id", None)      # the node starts the provider's session anew: the old id is history
-            hosted_tree.reported(r, access, worktree)
+            hosted_tree.reported(r, access, worktree, ceiling, checkout)
         r |= {"updated_at": now, "node_reported_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     return _node_view(r)

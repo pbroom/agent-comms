@@ -45,6 +45,10 @@ Rules the hub relies on:
   handed a turn, only while its parent is open on this node and has at least the child's access (`_parent_problem`).
   The hub's stored words are not enough: this machine's runner may have been edited since. Otherwise the child is
   ended with the reason.
+- `full` under a parent needs the parent's PROCESS to have said it runs that way (session_host: `ceiling`). Until
+  it has, in this node process and for the parent's current process, a `full` child is held: it stays open, its
+  messages stay queued at the hub, and no turn is handed to it. The hub is told the ceiling with every status, and
+  refuses to make such a child meanwhile.
 """
 from __future__ import annotations
 
@@ -501,6 +505,14 @@ class SessionRunner:
             return ABOVE_PARENT.format(have=s.access, limit=parent.access)
         return None
 
+    def _awaits_parent(self, parent_id: str, s) -> bool:
+        """The child's access is within what its parent was STARTED as, but above what the parent's process has
+        confirmed so far (`ceiling`: `full` only once Claude's `init`, or Codex's answer to thread/start, said so,
+        in this node process and for the parent's current process). It is held, not ended: no turn until then."""
+        parent = self.host.sessions.get(parent_id)
+        return (parent is not None and s.access in session_access.LEVELS and parent.ceiling in session_access.LEVELS
+                and not session_access.within(s.access, parent.ceiling))
+
     def _end_child(self, sid: str, why: str) -> None:
         """End a child here and tell the hub why: it is not opened, or is closed if it was open."""
         log.warning("child session %s: %s", sid, why)
@@ -517,7 +529,19 @@ class SessionRunner:
         if "access" not in view and "parent" not in view:
             self.tree.pop(sid, None)
             return
-        tree = {"access": s.access, "worktree": self.worktrees.get(sid, {}).get("path")}
+        self.tree.setdefault(sid, {})
+        self._tree_now(sid, s, root="parent" not in view)
+
+    def _tree_now(self, sid: str, s, root: bool | None = None) -> None:
+        """What this session's reports carry beyond its state, as it is NOW (called on every fetch and after every
+        tick, for a session whose hub asked): its access; for a root also its `ceiling` (the most a child may have
+        under it now: `full` only once its process confirmed it) and its `checkout` (the directory it runs in, which
+        a runner that names its own directory is held against when a child is asked for); a child's own worktree."""
+        if sid not in self.tree:
+            return
+        root = sid not in self.parent_of if root is None else root
+        tree = {"access": s.access, "worktree": self.worktrees.get(sid, {}).get("path"),
+                "ceiling": s.ceiling if root else None, "checkout": s.cwd if root else None}
         if self.tree.get(sid) != tree:
             self.tree[sid] = tree
             self.reported.pop(sid, None)        # say how it stands again, with these
@@ -566,6 +590,8 @@ class SessionRunner:
                 # Not a turn under a parent that is gone here, or that has less access now than this child.
                 self._end_child(sid, self._parent_problem(self.parent_of[sid], s))
                 continue
+            if sid in self.parent_of and self._awaits_parent(self.parent_of[sid], s):
+                continue        # a full child whose parent's process has not confirmed full access (yet, or again)
             if not self._admit(s):
                 continue
             m = queue.pop(0)
@@ -599,6 +625,7 @@ class SessionRunner:
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:
                 self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))
+                self._tree_now(sid, s)      # a root's ceiling changes when its process confirms full access
 
     @staticmethod
     def _own_id(s) -> str | None:
@@ -683,6 +710,8 @@ class SessionRunner:
             self._emit(events)
             self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s)) for sid, s in self.host.sessions.items()
                            if not s.ended and sid not in self.dropped}
+            for sid, s in self.host.sessions.items():
+                self._tree_now(sid, s)      # no process is left to have confirmed anything: the ceiling says so
         try:
             if not self._flush(final=True):
                 log.warning("could not report the session shutdown")

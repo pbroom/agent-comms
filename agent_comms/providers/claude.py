@@ -10,6 +10,11 @@ Code 2.1.322 (DESIGN_NOTES "Session host (PR 1)"):
   can differ from what the command line asked for: a settings file's `permissions.defaultMode` put a process started
   with no bypass flag into `bypassPermissions` (seen live). The adapter passes both on with `turn_started`, and the
   host holds them against the session's access (session_access.verify).
+- A `control_request` with `subtype: get_settings` on stdin is answered at once, before any turn, with a
+  `control_response` whose `response.effective` is the settings in force, every source merged (seen live). The
+  adapter asks it once per process when the command line names a settings FILE and does not select bypass: the host
+  wrote that file from the runner's own settings plus the key that switches bypass off, and Claude ignores a
+  settings file it finds invalid, whole and silently. The answer (`sealed`) says whether the key is in force.
 - With `--permission-prompts none` anything that would ask is refused on the spot, so the process never waits for an
   answer. A `control_request` asking to use a tool should therefore never arrive; if one does it is reported and left
   unanswered (nothing is approved), and the host's turn timeout ends the turn.
@@ -58,6 +63,22 @@ def bypasses_permissions(template: list[str]) -> bool:
     return False
 
 
+def selects_bypass(argv: list[str]) -> bool:
+    """The command line starts Claude in the bypass mode (unlike `bypasses_permissions`, the flag that only makes
+    the mode selectable does not count)."""
+    return bypasses_permissions([a for a in argv if a.split("=", 1)[0] != "--allow-dangerously-skip-permissions"])
+
+
+def settings_file(argv: list[str]) -> bool:
+    """The command line's settings (its last `--settings`: the one Claude takes) are a file, not the JSON itself."""
+    value = None
+    for i, arg in enumerate(argv):
+        flag, eq, rest = arg.partition("=")
+        if flag == "--settings":
+            value = rest if eq else (argv[i + 1] if i + 1 < len(argv) else None)
+    return value is not None and not value.lstrip().startswith("{")
+
+
 def tool_names(denials) -> tuple[str, ...]:
     """The distinct tool names in a result's `permission_denials`, in order. Anything that is not a plain name is
     reported as "unknown" rather than passed on."""
@@ -89,6 +110,9 @@ class ClaudeSession:
         self._dead = False
         self._full = False              # this machine allows the session full access (`configure`)
         self._effort: str | None = None
+        self._ask = False               # this process is asked whether bypass is switched off in it (`on_open`)
+        self._asked: str | None = None  # the id of that request, until it is answered
+        self._starts = 0
 
     def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
         """What the host decided for this session (session_access.prepare), before any `argv`. `access` "full":
@@ -131,13 +155,20 @@ class ClaudeSession:
             out += ["--model", model]
         if self._effort is not None:
             out += ["--effort", self._effort]
+        self._ask, self._asked = settings_file(out) and not selects_bypass(out), None
         return out + ["--resume" if resume else "--session-id", self.session_id]
 
     def adopt(self, provider_id: str | None) -> None:
         """Nothing to adopt: Claude's own id for the session is the hub's session id."""
 
     def on_open(self) -> list[bytes]:
-        return []
+        """Nothing, or the one question a process started from a settings file is asked (see the module text)."""
+        if not self._ask:
+            return []
+        self._starts += 1
+        self._asked = f"settings-{self._starts}"
+        return [json.dumps({"type": "control_request", "request_id": self._asked,
+                            "request": {"subtype": "get_settings"}}).encode() + b"\n"]
 
     def turn(self, text: str) -> list[bytes]:
         # json.dumps escapes every line break inside the text: one turn is exactly one line.
@@ -183,6 +214,16 @@ class ClaudeSession:
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
             return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),
                           text=cap_reply(ev.get("result")))], []
+        if kind == "control_response":
+            answer = ev.get("response")
+            if self._asked is None or not isinstance(answer, dict) or answer.get("request_id") != self._asked:
+                return [], []
+            self._asked = None
+            inner = answer.get("response") if answer.get("subtype") == "success" else None
+            effective = inner.get("effective") if isinstance(inner, dict) else None
+            permissions = effective.get("permissions") if isinstance(effective, dict) else None
+            off = isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
+            return [Event("sealed", ok=off)], []
         if kind == "control_request":
             request = ev.get("request")
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":

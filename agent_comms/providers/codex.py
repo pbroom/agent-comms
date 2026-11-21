@@ -166,6 +166,31 @@ def session_command(template: list[str], model: str | None = None, cwd: str | No
     return [template[0], "app-server", *kept, "--listen", "stdio://"], params
 
 
+def named_directory(template: list[str]) -> str | None:
+    """The directory a `codex exec` runner names with `-C`/`--cd`, when it is a path of its own (not `{project}`):
+    the only directory a hosted session of that runner can work in (`session_command`). None: it names none."""
+    cd, i = None, 1
+    while i < len(template):
+        arg = template[i]
+        i += 1
+        if arg.startswith("--"):
+            flag, eq, value = arg.partition("=")
+        elif arg.startswith("-") and len(arg) >= 2:
+            flag, eq, value = arg[:2], "=" if len(arg) > 2 else "", arg[2:].removeprefix("=")
+        else:
+            continue
+        kind = VALUE_FLAGS.get(flag)
+        if kind is None:
+            continue
+        if not eq:
+            if i >= len(template):
+                break
+            value, i = template[i], i + 1
+        if kind == "cd":
+            cd = value
+    return os.path.normpath(cd) if cd is not None and cd != "{project}" and os.path.isabs(cd) else None
+
+
 def _name(value) -> str:
     return value if isinstance(value, str) and NAME_RE.fullmatch(value) else "unknown"
 
@@ -178,6 +203,7 @@ def _error_text(error) -> str:
 
 class CodexSession:
     waits_for_ready = True      # initialize and thread/start (or thread/resume) come before any turn
+    reports_sandbox = True      # ... and their answer names the thread's sandbox: `ready` carries it (`mode`)
 
     def __init__(self):
         self.session_id: str | None = None
@@ -347,7 +373,11 @@ class CodexSession:
             if method == "thread/resume" and tid.lower() != (self.thread_id or "").lower():
                 return self._fatal("the process reported a thread id other than the one it was given")
             self.thread_id, self._ready = tid, True
-            return [Event("ready", provider_id=tid)], []
+            # The sandbox Codex says the thread has (`sandbox.type`: readOnly, workspaceWrite, dangerFullAccess).
+            sandbox = result.get("sandbox")
+            kind = sandbox.get("type") if isinstance(sandbox, dict) else None
+            return [Event("ready", provider_id=tid,
+                          mode=kind if isinstance(kind, str) and NAME_RE.fullmatch(kind) else None)], []
         if method == "turn/start" and self._turn_open and rid == self._start_id:
             # Only the answer to the request of the turn in flight (an earlier turn's request was retired when that
             # turn ended, so its late answer never names this one).

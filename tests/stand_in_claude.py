@@ -26,6 +26,18 @@ JSON on stdin, whatever tools the session has: `SessionStart` before the first t
 that names the tool before each call of it. A process started without `--settings` has no hooks. A project's own
 `.claude/settings.json` is NOT loaded: Claude Code ignores an untrusted directory's in print mode, and nothing these
 tests run in is trusted. Every turn's `init` says the `permissionMode` in force and the `tools` the session has.
+More of what Claude Code 2.1.322 was seen to do (DESIGN_NOTES, tree review round 3):
+- Of several `--settings` only the LAST is loaded. A settings file with a value of the wrong type is ignored WHOLE.
+- `permissions.disableBypassPermissionsMode: "disable"` takes the bypass mode away: a process started in it runs in
+  `default`.
+- `--restricted` beside `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` or the bypass mode:
+  "Error: bypassPermissions not supported in restricted mode" on stderr, exit 1, before anything is read.
+- A `control_request` line on stdin is answered at once with a `control_response`, and is no turn. `get_settings`:
+  the settings in force (`response.effective`). `set_permission_mode` to `bypassPermissions`: an error,
+  `bypass_disabled` with the key above, else `bypass_not_launched` unless the process was started with one of the
+  skip flags or in the mode; otherwise the mode changes.
+- `--plugin-dir DIR`: the command hooks in `DIR/hooks/hooks.json` run like a settings file's, whatever
+  `--setting-sources` says.
 The reply is otherwise `turn <k of this process>: <TEXT IN CAPITALS>`.
 With STAND_IN_ARGV set (an env var name the runner passes on), each start appends its argv to that file.
 """
@@ -58,15 +70,45 @@ BUILTINS = ("Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Task", "Wri
 MODEL_SECONDS = 1.0     # from a turn's start to its first tool call
 
 
+def single_values(args, name) -> list[str]:
+    """Every value of a flag that takes exactly one: `--flag value` or `--flag=value`."""
+    out = []
+    for i, arg in enumerate(args):
+        flag, eq, value = arg.partition("=")
+        if flag == name and (eq or i + 1 < len(args)):
+            out.append(value if eq else args[i + 1])
+    return out
+
+
 def settings(args) -> dict:
-    """The settings file the process was given with `--settings` (a path, or the JSON itself), or nothing."""
-    for value in flag_values(args, "--settings")[:1]:
+    """The settings the process was given with its LAST `--settings` (a path, or the JSON itself), or nothing. A
+    file with a value of the wrong type is ignored whole, as Claude Code ignores one that fails validation."""
+    for value in single_values(args, "--settings")[-1:]:
         try:
             loaded = json.loads(value if value.lstrip().startswith("{") else open(value).read())
-            return loaded if isinstance(loaded, dict) else {}
         except (OSError, ValueError):
-            pass
+            return {}
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("permissions", {}), dict) \
+                or not isinstance(loaded.get("hooks", {}), dict) \
+                or any(not isinstance(loaded["permissions"].get(k, []), list) for k in ("allow", "deny")
+                       if "permissions" in loaded):
+            return {}
+        return loaded
     return {}
+
+
+def bypass_disabled(args) -> bool:
+    permissions = settings(args).get("permissions")
+    return isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
+
+
+def launched_with_bypass(args) -> bool:
+    """Started with a flag that selects the bypass mode or makes it selectable."""
+    return ("--dangerously-skip-permissions" in args or "--allow-dangerously-skip-permissions" in args
+            or "bypassPermissions" in single_values(args, "--permission-mode"))
+
+
+SET_MODE = None     # a mode a `set_permission_mode` request put the session in
 
 
 def grants(args) -> tuple[str, list[str], list[str]]:
@@ -75,9 +117,9 @@ def grants(args) -> tuple[str, list[str], list[str]]:
     permissions = settings(args).get("permissions")
     permissions = permissions if isinstance(permissions, dict) else {}
     modes = flag_values(args, "--permission-mode")
-    mode = (modes[-1] if modes else "bypassPermissions" if "--dangerously-skip-permissions" in args
-            else permissions.get("defaultMode") or "default")
-    mode = "default" if mode == "manual" else mode
+    mode = SET_MODE or (modes[-1] if modes else "bypassPermissions" if "--dangerously-skip-permissions" in args
+                        else permissions.get("defaultMode") or "default")
+    mode = "default" if mode == "manual" or (mode == "bypassPermissions" and bypass_disabled(args)) else mode
     listed = flag_values(args, "--tools")
     gone = set(flag_values(args, "--disallowedTools", "--disallowed-tools")) | set(permissions.get("deny") or [])
     tools = [t for t in (listed or BUILTINS) if t in BUILTINS and t not in gone]
@@ -90,7 +132,14 @@ def run_hooks(args, event: str, sid: str, tool: str | None = None) -> None:
     """Run the command hooks the settings file has for this event (and, for a tool event, this tool), each with the
     hook's JSON on its stdin. A hook is a command: it runs whether or not the session has any tool at all."""
     hooks = settings(args).get("hooks")
-    for group in (hooks.get(event) or []) if isinstance(hooks, dict) else []:
+    groups = list((hooks.get(event) or []) if isinstance(hooks, dict) else [])
+    for plugin in single_values(args, "--plugin-dir"):        # a plugin's hooks: no settings source decides them
+        try:
+            plugged = json.load(open(os.path.join(plugin, "hooks", "hooks.json"))).get("hooks")
+        except (OSError, ValueError, AttributeError):
+            continue
+        groups += list((plugged.get(event) or []) if isinstance(plugged, dict) else [])
+    for group in groups:
         if not isinstance(group, dict):
             continue
         matcher = group.get("matcher") or ""
@@ -114,9 +163,36 @@ def outcome(tool: str, args) -> str:
     return "yes" if any(a in (tool, tool + "(*)") or a.startswith(tool + "(./") for a in allow) else "denied"
 
 
+def control(request_id, request: dict, args) -> dict:
+    """The answer to one `control_request`."""
+    global SET_MODE
+    kind = request.get("subtype")
+
+    def error(text, code):
+        return {"subtype": "error", "request_id": request_id, "error": text, "error_code": code}
+
+    if kind == "get_settings":
+        loaded = settings(args)
+        return {"subtype": "success", "request_id": request_id,
+                "response": {"effective": loaded, "sources": [{"source": "flagSettings", "settings": loaded}]}}
+    if kind == "set_permission_mode" and request.get("mode") == "bypassPermissions":
+        if bypass_disabled(args):
+            return error("Cannot set permission mode to bypassPermissions because it is disabled by settings or "
+                         "configuration", "bypass_disabled")
+        if not launched_with_bypass(args):
+            return error("Cannot set permission mode to bypassPermissions because the session was not launched with "
+                         "--dangerously-skip-permissions", "bypass_not_launched")
+    if kind == "set_permission_mode":
+        SET_MODE = request.get("mode")
+    return {"subtype": "success", "request_id": request_id}
+
+
 def main() -> None:
     args = sys.argv[1:]
     sid = args[args.index("--resume" if "--resume" in args else "--session-id") + 1]
+    if "--restricted" in args and launched_with_bypass(args):
+        sys.stderr.write("Error: bypassPermissions not supported in restricted mode\n")
+        sys.exit(1)
     record = os.environ.get("STAND_IN_ARGV")
     if record:
         with open(record, "a") as f:
@@ -124,7 +200,13 @@ def main() -> None:
     sys.stderr.write("stand-in started\n")
     turn = 0
     for line in sys.stdin:
-        text = json.loads(line)["message"]["content"]
+        message = json.loads(line)
+        if message.get("type") == "control_request":
+            print(json.dumps({"type": "control_response",
+                              "response": control(message.get("request_id"), message.get("request") or {}, args)}),
+                  flush=True)
+            continue
+        text = message["message"]["content"]
         turn += 1
         if turn == 1:
             run_hooks(args, "SessionStart", sid)

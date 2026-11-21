@@ -196,8 +196,11 @@ wake_grace_seconds = 120         # after a wake the dispatcher starts no run for
 # (Claude: --permission-mode bypassPermissions; Codex: the danger-full-access sandbox). That is a runner written
 # that way, hosted as a session, or a child session asked for with --access full under such a session. Off: both
 # are refused with the reason, never narrowed. Read on the node only. Every hosted Claude session is started with an
-# explicit --permission-mode (a runner that names none gets `manual`), so a settings file's defaultMode cannot
-# select bypassPermissions; a session whose process reports that mode without having been started as full is ended.
+# explicit --permission-mode (a runner that names none gets `manual`), and every one that is not full access with
+# --settings '{"permissions":{"disableBypassPermissionsMode":"disable"}}' (merged with the runner's own settings
+# file if it names one), so nothing can select bypassPermissions in it; a session whose process reports that mode
+# without having been started as full is ended. A full session counts as full for its children only once its
+# process has reported that it runs that way.
 allow_full_access = false
 
 # Child sessions (README "Parent and child sessions"): `board session start --parent <id> ...` starts a session

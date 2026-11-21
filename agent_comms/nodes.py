@@ -102,7 +102,8 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
     `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py).
     `session_host`: {"tree": 1, "runners": {key: [words]}} from a node that speaks the child-session protocol
     (hosted_tree.py): for each runner it can start a child session from, the access words it can start one at
-    (session_access.LEVELS). A node that does not say so gets no child sessions."""
+    (session_access.LEVELS). Optionally `dirs`: {key: directory} for a runner that can be a session in that one
+    directory only. A node that does not say so gets no child sessions."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -128,16 +129,28 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
     hosting = None
     if session_host is not None:
         tree = session_host.get("tree") if isinstance(session_host, dict) else None
-        if (sessions is None or set(session_host if isinstance(session_host, dict) else ()) != {"tree", "runners"}
+        keys = set(session_host) if isinstance(session_host, dict) else set()
+        if (sessions is None or not {"tree", "runners"} <= keys <= {"tree", "runners", "dirs"}
                 or isinstance(tree, bool) or not isinstance(tree, int) or not 1 <= tree <= 1000):
             raise Invalid('session_host must be {"tree": a version number, "runners": {...}} beside sessions')
         offered = session_host["runners"]
+        # Each item is checked to be a word BEFORE anything is done with the list: an object or an array in it is a
+        # malformed hello (400), not something to hash.
         if (not isinstance(offered, dict) or len(offered) > MAX_ITEMS or any(
-                k not in runners or not isinstance(w, list) or not w or len(set(w)) != len(w)
-                or any(x not in _access_levels() for x in w) for k, w in offered.items())):
+                k not in runners or not isinstance(w, list) or not w or len(w) > len(_access_levels())
+                or any(not isinstance(x, str) or x not in _access_levels() for x in w) or len(set(w)) != len(w)
+                for k, w in offered.items())):
             raise Invalid("session_host runners maps runner keys the node offers to the access words (read-only, "
                           "workspace, full) a child session can be started at")
+        dirs = session_host.get("dirs", {})
+        if (not isinstance(dirs, dict) or any(
+                k not in offered or not isinstance(d, str) or not d.startswith("/") or len(d) > 1024
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in d) for k, d in dirs.items())):
+            raise Invalid("session_host dirs maps runner keys in session_host runners to the one directory (an "
+                          "absolute path) such a runner can be a session in")
         hosting = {"tree": tree, "runners": {k: [x for x in _access_levels() if x in w] for k, w in offered.items()}}
+        if dirs:
+            hosting["dirs"] = dict(dirs)
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,

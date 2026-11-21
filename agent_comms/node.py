@@ -203,9 +203,15 @@ class Node:
             # preparation itself decides (session_host.child_words: an adapter for its CLI, a template the adapter
             # accepts, `full` only where this machine allows it). A hub from before the field refuses the hello;
             # hubs are upgraded before nodes.
-            from .session_host import child_words
+            # `dirs`: a runner that names its own directory (a Codex runner's `--cd` with a path) can be a session
+            # only there. Its words are those it has in that directory, and the hub holds a child of it against
+            # the directory the parent runs in.
+            from .session_host import child_words, runner_dir
             words = {k: child_words(self.config, template) for k, template in sorted(self.config.runners.items())}
             body["session_host"] = {"tree": 1, "runners": {k: w for k, w in words.items() if w}}
+            dirs = {k: runner_dir(self.config.runners[k]) for k in body["session_host"]["runners"]}
+            if any(dirs.values()):      # only then: the key is newer than the rest
+                body["session_host"]["dirs"] = {k: d for k, d in dirs.items() if d}
         out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out

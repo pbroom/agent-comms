@@ -15,8 +15,10 @@ true`; with it off no child can be created and nothing else changes.
 - *Rules.* The parent exists, has not ended, is not being closed and is itself a root (depth 1). The child runs on
   the parent's node, in the parent's project, for an agent that node offers a hostable runner for and the hub's
   `[dispatch.nodes.<node>]` lists (the check a root gets). Its access defaults to the parent's and may be narrower;
-  above the parent's is refused. At most `max_children` children of one root that have not ended. The same
-  (parent, request_id) returns the child it made the first time.
+  above the parent's is refused, and so is `full` until the parent's process has confirmed full access (`_limit`).
+  A runner that names its own directory is held against the directory the parent runs in (`_fits`). At most
+  `max_children` children of one root that have not ended. The same (parent, request_id) returns the child it made
+  the first time.
 - *Not for children.* "One session per (agent, project)" (roots only), board wakes (hosted_wake.py: a child has no
   watcher record) and a project's busy directory when the child has its own worktree.
 - *Ending.* A parent that ends or is closed takes its children with it (`cascade`); closing a child leaves its
@@ -24,6 +26,7 @@ true`; with it off no child can be created and nothing else changes.
 """
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from typing import Any
@@ -73,7 +76,19 @@ def view(r: dict) -> dict:
            "depth": 1 if is_child(r) else 0, "access": r.get("access")}
     if is_child(r):
         out |= {k: r.get(k) for k in CHILD_FIELDS}
+    elif r.get("access") in session_access.LEVELS:
+        out["ceiling"] = _limit(r)      # what a child may have under it now
     return out
+
+
+def _limit(parent: dict) -> str:
+    """The most a child may have under this root NOW: the root's access, except that `full` counts only once its
+    node says its process confirmed it (the node's `ceiling`). A full root whose node says nothing of the kind
+    gives `workspace`."""
+    access, ceiling = parent.get("access"), parent.get("ceiling")
+    if ceiling in session_access.LEVELS and session_access.within(ceiling, access):
+        return ceiling
+    return "workspace" if access == "full" else access
 
 
 def node_extra(r: dict, enabled: bool) -> dict:
@@ -155,6 +170,28 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
                        "never hosted)")
 
 
+def _fits(conn, parent: dict, agent: str, runtime: str | None, isolation: str) -> None:
+    """A runner that names its own directory (the node's hello: `dirs`) can be a session in that directory only. A
+    child of it must therefore share the parent's checkout, and that checkout (as the node reported it) must be the
+    directory. Conflict otherwise: refused here, not made and then ended on the node."""
+    info = _get(conn, nodes.NODE_PREFIX + parent["node"])
+    hosting = info.get("session_host") if isinstance(info, dict) else None
+    dirs = hosting.get("dirs") if isinstance(hosting, dict) else None
+    only = dirs.get(nodes.runner_key(info, agent, runtime)) if isinstance(dirs, dict) else None
+    if not isinstance(only, str):
+        return
+    where = (f"node {parent['node']}'s runner for {agent} names its own directory ({only}) and can be a session "
+             "there only")
+    if isolation != "shared":
+        raise Conflict(f"{where}: a child of it cannot have a worktree of its own")
+    here = parent.get("checkout")
+    if not isinstance(here, str):
+        raise Conflict(f"{where}, and where session {parent['session_id']} runs on its node is not known yet (its "
+                       "node reports it once it has opened the session). Try again in a moment")
+    if os.path.normpath(here) != os.path.normpath(only):
+        raise Conflict(f"{where}; session {parent['session_id']} runs in {here}")
+
+
 def _offers(conn, node: str, agent: str, runtime: str | None) -> list[str]:
     """The access words the node's latest hello says a child session of this agent's runner can be started at."""
     info = _get(conn, nodes.NODE_PREFIX + node)
@@ -212,6 +249,13 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         if not session_access.within(access, limit):
             raise Conflict(f"access {access} is above the parent's ({limit}): a child session never gets more access "
                            "than its parent")
+        if not session_access.within(access, _limit(parent)):
+            # The parent was STARTED as full; whether its CLI took that is known once its process says so.
+            raise Conflict(f"session {pid} was started as a full-access session, but its process has not confirmed "
+                           f"that (yet, or since it was last restarted), so a child can have at most {_limit(parent)} "
+                           "under it now. Its node confirms it when the session's next turn starts: try again then, "
+                           "or give a narrower --access")
+        _fits(c, parent, agent, runtime, isolation)
         offered = _offers(c, parent["node"], agent, runtime)
         if access not in offered:
             # What the node itself says it can start from that runner: `full` only where it allows full access, not
@@ -275,10 +319,17 @@ def children_view(board: Board, r: dict) -> list[dict]:
     return out
 
 
-def reported(r: dict, access: Any, worktree: Any) -> None:
+def reported(r: dict, access: Any, worktree: Any, ceiling: Any = None, checkout: Any = None) -> None:
     """A node's report on one of its sessions, the tree's part: the access the session really has there, and where
     a child's own worktree is. A root's `access` is whatever its node says its runner has. A child's `access` stays
-    the word that was asked; what the node granted is kept beside it (`granted`) and is never above it."""
+    the word that was asked; what the node granted is kept beside it (`granted`) and is never above it. A root's
+    `ceiling` (the most a child may have under it now) and `checkout` (where it runs) are the node's to say, with
+    every status: a status that names no ceiling takes the last one back."""
+    if not is_child(r):
+        if ceiling is not None or "ceiling" in r:       # (nothing is added to a root whose node says none of it)
+            r["ceiling"] = ceiling
+        if checkout is not None:
+            r["checkout"] = checkout
     if access is not None:
         if not is_child(r):
             r["access"] = access

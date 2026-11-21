@@ -32,9 +32,30 @@ tools it really has. A session that reports `bypassPermissions` and was not star
 that is not bypassed, and one asked for at `read-only` that is not in `dontAsk` or has a tool beyond the hard list,
 are ended. So is a session asked for at `read-only` or `full` whose process reports no mode at all: where the policy
 depends on the mode, a mode that cannot be verified is not accepted.
+
+Three more things hold for every launch (review round 3):
+- *Bypass is switched off* for every Claude launch that is not `full` (`claude_sealed`): the settings key
+  `permissions.disableBypassPermissionsMode = "disable"`, given with `--settings`, which Claude puts above the
+  user's, the project's and the local settings (seen live: with it a `set_permission_mode` request for
+  `bypassPermissions` is answered `bypass_disabled`, also beside a user-level `defaultMode` of `bypassPermissions`).
+  Claude takes only its LAST `--settings`, so a runner that names one gets a file this node writes (mode 600): the
+  runner's settings and the key. Claude ignores a settings file it finds invalid, whole and silently, so a session
+  started from such a file must also SAY the key is in force (`get_settings`, asked when its process starts) or it
+  is ended.
+- *A launch Claude would refuse is refused here* (`claude_conflict`): `--restricted` beside anything that selects or
+  allows bypass (Claude exits: "bypassPermissions not supported in restricted mode"), and a `full` launch whose own
+  settings switch bypass off (Claude would run it in `default`, silently).
+- *`full` counts for children only once the process has said so* (session_host: `ceiling`). The label says what a
+  session was STARTED as. Whether Claude took the mode is known when its `init` says `bypassPermissions`; until
+  then, and again from the moment a new process is started for the session, a child gets at most `workspace` under
+  it. For Codex the answer to `thread/start` names the thread's sandbox.
+
+What is outside all of this: the machine's MANAGED settings and the plugins its owner installed at user level. They
+are the owner's own configuration, which no agent and no hub can change; hooks and modes they bring are theirs.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -72,6 +93,27 @@ EXTRA_TOOLS = ("it is a read-only session, but its process reports tools beyond 
 UNVERIFIABLE = ("it was asked for at {asked} access, but its process did not report {what}: what cannot be verified "
                 "is not accepted where the access depends on it, and the session was ended")
 
+RESTRICTED_BYPASS = ("this node's Claude runner for the agent carries --restricted beside an option that selects or "
+                     "allows bypassing permission checks; Claude refuses to start that way (\"bypassPermissions not "
+                     "supported in restricted mode\")")
+FULL_DISABLED = ("this node's Claude runner for the agent names settings that switch bypassing off "
+                 "(permissions.disableBypassPermissionsMode), so a full-access session cannot be started from it: "
+                 "Claude would run it in its standard mode instead")
+SETTINGS_UNREADABLE = ("this node's Claude runner for the agent names settings (--settings) that cannot be read as a "
+                       "JSON object ({why}), so the node cannot add the key that switches bypassing off")
+READ_ONLY_UNKNOWN = ("this node's Claude runner for the agent carries {flag}, which a read-only session does not take: "
+                     "only options known not to load settings, plugins, hooks, agents or tools are kept, and this one "
+                     "cannot be dropped safely")
+NOT_SEALED = ("its process says bypassing permission checks is NOT switched off in it (the settings this node started "
+              "it with were not taken: Claude ignores a settings file it finds invalid, whole): the session was ended")
+SEAL_UNVERIFIED = ("its process never said whether bypassing permission checks is switched off in it, and it was "
+                   "started from a settings file of the runner's own, which Claude ignores whole if it finds it "
+                   "invalid: the session was ended")
+CODEX_NOT_FULL = ("it was started as a full-access session, but Codex reports the sandbox {sandbox} for its thread: "
+                  "the session was ended rather than run narrower than asked")
+CODEX_FULL = ("Codex reports the sandbox dangerFullAccess for its thread although it was not started as a full-access "
+              "session: the session was ended")
+
 BOARD_SERVER = "agent-comms"                    # the board's MCP server, as every runner and config here names it
 # Everything a read-only Claude session has: these built-in tools (a hard list, `--tools`) and the board's.
 READ_ONLY_BUILTINS = ("Read", "Grep", "Glob")
@@ -88,7 +130,29 @@ _ALLOW = ("--allowedTools", "--allowed-tools")
 _DENY = ("--disallowedTools", "--disallowed-tools")
 # Flags that take values up to the next option.
 _VARIADIC = frozenset((*_ALLOW, *_DENY, "--add-dir", "--mcp-config", "--tools"))
-_SINGLE = frozenset(("--permission-mode", "--settings", "--setting-sources"))
+_SINGLE = frozenset(("--permission-mode", "--settings", "--setting-sources", "--plugin-dir", "--plugin-url",
+                     "--agents", "--agent"))
+# The settings key that takes the bypass mode away (Claude Code settings: `permissions.disableBypassPermissionsMode`,
+# value "disable"), and the same as the one-token JSON `--settings` takes. Seen live on 2.1.322: with it a launch in
+# `bypassPermissions` runs in `default`, and `set_permission_mode bypassPermissions` is answered `bypass_disabled`.
+NO_BYPASS_KEY = "disableBypassPermissionsMode"
+NO_BYPASS_JSON = json.dumps({"permissions": {NO_BYPASS_KEY: "disable"}}, separators=(",", ":"))
+DRY_SETTINGS = "<the runner's settings and the key that switches bypassing off>"     # a dry run writes no file
+# A session asked for at read-only: what it keeps of its runner, and what goes. Everything else is refused, so an
+# option this list does not know (a future one that loads an extension, say) never rides along.
+_RO_BARE = frozenset(("-p", "--print", "--verbose", "--include-partial-messages", "--include-hook-events",
+                      "--replay-user-messages", "--forward-subagent-text", "--disable-slash-commands",
+                      "--exclude-dynamic-system-prompt-sections", "--no-chrome", "--ax-screen-reader", "--restricted",
+                      "--bare", "--safe-mode"))
+_RO_VALUE = frozenset(("--model", "--fallback-model", "--effort", "--append-system-prompt", "--system-prompt",
+                       "--append-system-prompt-file", "--system-prompt-file", "--max-budget-usd", "--max-turns",
+                       "--name", "-n", "--json-schema", "--autocompact", "--system-prompt-snapshot"))
+# Gone with their values: the permission set-up (replaced), and everything that loads settings, plugins (their
+# hooks run commands whatever tools the session has: seen live with --plugin-dir), agents (an agent definition
+# brings tools, MCP servers and hooks), MCP servers, directories or tools.
+_RO_DROP_BARE = frozenset(("--strict-mcp-config", "--chrome", "--ide", "--brief", *_CLAUDE_BYPASS))
+_RO_DROP_VALUE = frozenset(("--permission-mode", "--settings", "--setting-sources", "--plugin-dir", "--plugin-url",
+                            "--agents", "--agent", "--add-dir", "--mcp-config", "--tools", *_ALLOW, *_DENY))
 # The Codex flags that really turn the sandbox off. The adapter refuses more than these (BYPASS_FLAGS): the others
 # are not full access, and stay refused whatever this machine allows.
 CODEX_SANDBOX_OFF = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--yolo"))
@@ -201,10 +265,39 @@ def claude_read_only(template: list[str],
     - Allowed: the board tools the runner names (a runner that allows only some is not widened to all; one that
       names none gets the server) and reads inside the run directory. Denied: Edit, Write, NotebookEdit, Bash, the
       token directory and ~/.ssh, beside the runner's own deny rules.
-    Its permission mode, allow list, bypass flags, extra directories, tool list, settings and MCP configs go;
-    everything else stays."""
-    kept, values = _without(template, {"--permission-mode", "--add-dir", "--tools", "--mcp-config", "--settings",
-                                       "--setting-sources", "--strict-mcp-config", *_ALLOW, *_DENY, *_CLAUDE_BYPASS})
+    - No plugin and no agent definition of the runner's: `--plugin-dir`, `--plugin-url`, `--agents` and `--agent`
+      go (a plugin's hooks ran in a session with no settings at all: seen live), with `--chrome`, `--ide` and
+      `--brief` (tools).
+    Its permission mode, allow list, bypass flags, extra directories, tool list, settings and MCP configs go too.
+    What stays is what is KNOWN to load nothing (_RO_BARE, _RO_VALUE: the model, the prompts, output options).
+    Any other option is refused (ValueError): one this list does not know is not passed on."""
+    kept, values, i = list(template[:1]), {}, 1
+    while i < len(template):                # one pass that knows which option takes what
+        arg = template[i]
+        i += 1
+        flag, eq, value = arg.partition("=") if arg.startswith("-") else (arg, "", "")
+        if arg == "{prompt}" or flag in _RO_BARE:
+            kept.append(arg)
+        elif flag in _RO_VALUE:
+            kept.append(arg)
+            if not eq and i < len(template):
+                kept.append(template[i])
+                i += 1
+        elif flag in _RO_DROP_BARE:
+            continue
+        elif flag in _RO_DROP_VALUE:
+            got = values.setdefault(flag, [])
+            if eq:
+                got.append(value)
+            elif flag in _VARIADIC:
+                while i < len(template) and not template[i].startswith("-") and template[i] != "{prompt}":
+                    got.append(template[i])
+                    i += 1
+            elif i < len(template) and template[i] != "{prompt}":
+                got.append(template[i])
+                i += 1
+        else:                               # an option this list does not know, or a word that belongs to none
+            raise ValueError(READ_ONLY_UNKNOWN.format(flag=flag[:60] if arg.startswith("-") else "an extra argument"))
     board = [t for flag in _ALLOW for v in values.get(flag, []) for t in runner_preflight.split_tools(v)
              if t == READ_ONLY_ALLOWED[0] or t.startswith(READ_ONLY_ALLOWED[0] + "__")]
     allowed = list(dict.fromkeys(board or [READ_ONLY_ALLOWED[0]])) + list(READ_ONLY_ALLOWED[1:])
@@ -223,6 +316,103 @@ def claude_full(template: list[str]) -> list[str]:
     Its deny rules stay (a denied tool stays unavailable in that mode, DESIGN_NOTES)."""
     kept, _ = _without(template, {"--permission-mode", *_CLAUDE_BYPASS})
     return kept + list(CLAUDE_FULL)
+
+
+def _has(template: list[str], flag: str) -> bool:
+    return any(a.split("=", 1)[0] == flag for a in template)
+
+
+def _own_settings(template: list[str], cwd: str | None) -> tuple[bool, dict | None, str]:
+    """The settings a Claude command line names: (it names some, what they are, why they could not be read). Claude
+    takes its LAST `--settings` (seen live: of two, the first is not loaded at all): a file, or the JSON itself.
+    A relative path is read in the run directory, where the process is started. (A configured runner's arguments
+    hold no braces but whole placeholders, dispatch.validate_runner: its settings are always a file.)"""
+    named = _without(template, {"--settings"})[1].get("--settings", [])
+    if not named:
+        return False, None, ""
+    value = named[-1]
+    try:
+        if value.lstrip().startswith("{"):
+            data = json.loads(value)
+        else:
+            path = value
+            if not os.path.isabs(path):
+                if cwd is None:
+                    return True, None, "its path is relative"
+                path = os.path.join(cwd, path)
+            with open(path, encoding="utf-8") as f:
+                data = json.loads(f.read(4_000_000))
+    except (OSError, ValueError) as e:
+        return True, None, type(e).__name__
+    if not isinstance(data, dict) or not isinstance(data.get("permissions", {}), dict):
+        return True, None, "not an object with a permissions object"
+    return True, data, ""
+
+
+def claude_conflict(template: list[str], cwd: str | None = None) -> str | None:
+    """Why Claude would not run this command line as it is labelled, or None. Refused when the session is opened,
+    so that no session is ever taken for more than its process can be:
+    - `--restricted` beside `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` or the bypass
+      mode: Claude exits at once (seen live on 2.1.322, all three);
+    - bypass selected, and the command line's own settings switch it off: Claude runs in `default` (seen live)."""
+    from .providers.claude import bypasses_permissions
+
+    if _has(template, "--restricted") and bypasses_permissions(template):
+        return RESTRICTED_BYPASS
+    if claude_runs_bypass(template):
+        _, data, _ = _own_settings(template, cwd)
+        if data is not None and data.get("permissions", {}).get(NO_BYPASS_KEY) == "disable":
+            return FULL_DISABLED
+    return None
+
+
+def claude_sealed(template: list[str], cwd: str | None = None,
+                  write: Callable[[dict], str] | None = None) -> tuple[list[str], str | None]:
+    """A Claude command line with bypass switched off, and how: None (it selects bypass: a `full` launch, left as
+    it is), "inline" (the key as the JSON `--settings` takes: the runner names no settings of its own) or "merged"
+    (the runner's own settings and the key, in a file `write` makes and returns the path of; without `write`, a dry
+    run, a placeholder). The one `--settings` goes last. ValueError: the runner's settings cannot be read, so they
+    cannot be merged; such a runner is not started (not without its settings, and not without the key).
+
+    "merged" needs the process's own word that the key is in force (session_host): Claude ignores a settings file
+    it finds invalid, whole and silently (seen live: one wrong value beside the key, and the key was gone)."""
+    if claude_runs_bypass(template):
+        return list(template), None
+    named, data, why = _own_settings(template, cwd)
+    kept = _without(template, {"--settings"})[0]
+    if not named:
+        return kept + ["--settings", NO_BYPASS_JSON], "inline"
+    if data is None:
+        if write is None and why == "its path is relative":
+            return kept + ["--settings", DRY_SETTINGS], "merged"    # a dry run with no directory to read it from
+        raise ValueError(SETTINGS_UNREADABLE.format(why=why))
+    merged = dict(data) | {"permissions": dict(data.get("permissions", {})) | {NO_BYPASS_KEY: "disable"}}
+    return kept + ["--settings", write(merged) if write is not None else DRY_SETTINGS], "merged"
+
+
+def claude_launch(template: list[str], cwd: str | None = None,
+                  write: Callable[[dict], str] | None = None) -> tuple[list[str], str | None]:
+    """The last step for a Claude command line, after scoping and whatever else changes it: refused (ValueError) if
+    Claude would not run it as it is labelled (`claude_conflict`), and bypass switched off in it unless it is a
+    `full` launch (`claude_sealed`, whose result this returns)."""
+    problem = claude_conflict(template, cwd)
+    if problem is not None:
+        raise ValueError(problem)
+    return claude_sealed(template, cwd, write)
+
+
+CODEX_SANDBOX_WORDS = {"readOnly": "read-only", "workspaceWrite": "workspace", "dangerFullAccess": "full"}
+
+
+def verify_codex(launched: str | None, sandbox: Any) -> tuple[str | None, bool]:
+    """What Codex said the thread's sandbox is, in its answer to `thread/start` or `thread/resume` (its `type`:
+    readOnly, workspaceWrite, dangerFullAccess), held against the session: (why it must be ended or None, whether
+    full access is confirmed). The node itself sent the sandbox, so an answer that names none confirms it."""
+    if launched == "full":
+        if sandbox is None or sandbox == "dangerFullAccess":
+            return None, True
+        return CODEX_NOT_FULL.format(sandbox=str(sandbox)[:40]), False
+    return (CODEX_FULL if sandbox == "dangerFullAccess" else None), False
 
 
 def verify(asked: str | None, launched: str | None, mode: Any, tools: Any = ()) -> str | None:

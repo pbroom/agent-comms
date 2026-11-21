@@ -16,6 +16,7 @@ from agent_comms import session_access as access, session_worktrees
 from agent_comms.core import Conflict, Forbidden
 from agent_comms.dispatch import DispatchConfig
 from agent_comms.node_sessions import ABOVE_PARENT, PARENT_GONE, WORKTREES_FILE
+from agent_comms.providers import Event
 from agent_comms.providers.claude import ClaudeSession
 from agent_comms.providers.codex import BYPASS_REFUSED, CodexSession
 from agent_comms.session_host import SessionHost
@@ -52,6 +53,8 @@ def senv(tmp_path):
 
 
 WORKSPACE_TOOLS = ("Bash", "Edit", "Glob", "Grep", "Read", "Write")     # what an ordinary Claude process reports
+# What every Claude launch that is not a full-access one carries: the settings key that switches bypass off.
+SEAL = ["--settings", '{"permissions":{"disableBypassPermissionsMode":"disable"}}']
 
 
 def began(sid, mode="dontAsk", tools=WORKSPACE_TOOLS) -> dict:
@@ -207,9 +210,9 @@ def test_with_spawn_off_no_child_can_be_started_and_a_session_is_what_it_was(tmp
     assert out["message"] == hosted_tree.OFF and "spawn" in out["message"]
     with pytest.raises(Conflict, match="child sessions are off"):
         hosted_tree.create_child(env.board, "human", sid, "go", allowed=TREE["nodes"])
-    assert not {"parent", "root", "depth", "access", "child_counts"} & set(stored(env, sid))
+    assert not {"parent", "root", "depth", "access", "child_counts", "ceiling", "checkout"} & set(stored(env, sid))
     view = show(env, sid)
-    assert not {"parent", "access", "children", "depth"} & set(view)
+    assert not {"parent", "access", "children", "depth", "ceiling"} & set(view)
     assert all(set(body) <= {"events", "seq", "state", "pid", "resume"} for _, body in spy.posts), \
         "and reports what it always reported"
     assert [k for (k,) in env.board.conn.execute("SELECT key FROM board_state WHERE key LIKE 'host.session.%'")] == [
@@ -403,11 +406,13 @@ def test_claude_workspace_is_the_runner_as_configured(senv):
     plain, granted = claude_argv(senv, "none")
     asked, granted2 = claude_argv(senv, "workspace", access_word="workspace")
     assert plain == asked and (granted, granted2) == ("workspace", "workspace")
-    assert plain == ["claude", "-p", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms",
+    assert plain == ["claude", "-p", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms", *SEAL,
                      "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                      "--permission-prompts", "none", "--session-id", UNKNOWN]
+    assert SEAL == ["--settings", access.NO_BYPASS_JSON]
     scoped, _ = claude_argv(senv, "scoped", access_word="workspace", claude_tool_projects=[PROJECT])
     assert "--allowedTools=" + ",".join(rp.ALLOWED) in scoped, "with the opt-in scoping a session already gets"
+    assert scoped[scoped.index("--settings"):][:2] == SEAL, "scoped first, then bypass is switched off"
 
 
 BOARD_ENTRY = {"type": "stdio", "command": "bash", "args": ["/x/stdio.sh"], "env": {"AGENT_COMMS_AGENT": "claude"}}
@@ -441,13 +446,16 @@ def test_claude_read_only_is_a_hard_tool_list_dont_ask_and_the_board_server_alon
         "--disallowedTools=Edit,Write,NotebookEdit,Bash,Read(~/.config/agent-comms/**),Read(~/.ssh/**),Bash(curl *),"
         "WebFetch"), "the runner's deny rules are kept"
     assert not any(a in argv for a in ("acceptEdits", "Edit", "Bash(npm test *)"))
-    assert "--settings" not in argv and "/x/settings.json" not in argv and "--setting-sources=" in argv, \
+    assert "/x/settings.json" not in argv and "--setting-sources=" in argv, \
         "it loads NO settings: a settings file brings hooks, and a hook runs commands whatever tools there are"
+    assert argv.count("--settings") == 1 and value_after(argv, "--settings") == access.NO_BYPASS_JSON, \
+        "the one thing it is given with --settings is the key that switches bypass off"
     assert access.claude_read_only(runner + ["--setting-sources", "user,project"]).count("--setting-sources=") == 1
     assert "user,project" not in access.claude_read_only(runner + ["--setting-sources", "user,project"])
     assert value_after(argv, "--append-system-prompt") == "Be brief." and value_after(argv, "--model") == "sonnet"
     assert argv[-4:] == ["--permission-prompts", "none", "--session-id", UNKNOWN]
-    assert rp.read_only(opened.template), "a runner runner_preflight.read_only recognises"
+    assert opened.template[-2:] == SEAL and rp.read_only(opened.template[:-2]), \
+        "a runner runner_preflight.read_only recognises, and the key"
     host.close(UNKNOWN)
     host.forget(UNKNOWN)
     assert not config.exists(), "the config goes with the session"
@@ -461,6 +469,25 @@ def test_claude_read_only_is_a_hard_tool_list_dont_ask_and_the_board_server_alon
                                                  "--dangerously-skip-permissions",
                                                  "--allow-dangerously-skip-permissions"])
     assert not any("extra" in a or a == "--add-dir" or "dangerously" in a for a in stripped)
+
+    # S2 (round 3). Whatever loads a plugin, an agent definition or more tools goes too: a plugin's hooks run
+    # commands in a session that loads no settings at all (seen live with --plugin-dir).
+    loaded = ["--plugin-dir", "/x/plug", "--plugin-dir=/x/more.zip", "--plugin-url", "https://x.example/p.zip",
+              "--agents", '{"helper": {"description": "d", "prompt": "p"}}', "--agent", "helper", "--chrome", "--ide",
+              "--brief"]
+    kept = access.claude_read_only(runner + loaded)
+    assert kept == access.claude_read_only(runner), "nothing of them is left"
+    assert not any("plug" in a or "agent" in a.split("=")[0] or "helper" in a for a in kept)
+    # ... and an option this list does not know is not passed on: the session is refused.
+    for unknown in (["--worktree"], ["--debug-file", "/x/debug.log"], ["--some-future-loader", "/x"], ["stray"],
+                    ["--plugin-marketplace=/x"]):
+        with pytest.raises(ValueError) as e:
+            access.claude_read_only(runner + unknown)
+        assert "a read-only session does not take" in str(e.value) and "cannot be dropped safely" in str(e.value)
+    assert access.claude_read_only(["claude", "-p", "{prompt}", "--append-system-prompt", "- a dash is a value",
+                                    "--model=haiku", "-n", "name", "--restricted", "--verbose"])[:9] == [
+        "claude", "-p", "{prompt}", "--append-system-prompt", "- a dash is a value", "--model=haiku", "-n", "name",
+        "--restricted"], "what is known to load nothing stays, values and all"
     assert access.READ_ONLY_BUILTINS == ("Read", "Grep", "Glob")
     assert set(rp.READ_ONLY_DENIES) <= set(access.READ_ONLY_DENIED) and "Bash" in access.READ_ONLY_DENIED
     assert set(access.READ_ONLY_ALLOWED) <= set(rp.READ_ONLY_TOOLS)
@@ -474,29 +501,43 @@ def step_one_argv(runner, sid=UNKNOWN) -> list[str]:
                                                      "--session-id", sid]
 
 
+def session_argv(runner, sid=UNKNOWN) -> list[str]:
+    """The command line a hosted session of this runner gets NOW: what step 1 built, and behind the runner's own
+    arguments the settings key that switches bypass off (SEAL), unless the runner selects bypass."""
+    seal = [] if access.claude_runs_bypass(runner) else SEAL
+    return step_one_argv([a for a in runner] + seal, sid)
+
+
 @pytest.mark.parametrize("spawn", [False, True])
 def test_a_root_runs_a_read_only_labelled_runner_exactly_as_its_owner_configured_it(tmp_path, spawn):
     """A session of its own gets NO added `--tools`, `--strict-mcp-config`, MCP config or permission mode: the hard
     read-only mapping is for a session ASKED for read-only by word. With child sessions off (and on), a hosted
-    triage-style runner's command line is byte for byte what step 1 built, its `git log` allowance included."""
+    triage-style runner's command line is what step 1 built, its `git log` allowance included, plus the one
+    settings key that switches bypass off (round 3, S3: restrictive, and the same for every launch that is not
+    full)."""
     assert rp.read_only(TRIAGE), "a runner the dispatcher takes for read-only"
     expected = ["claude", "-p", "--model", "haiku", "--strict-mcp-config", "--mcp-config", "/x/haiku.mcp.json",
                 "--permission-mode", "dontAsk",
                 "--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *)",
                 "--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),"
                 "Read(~/.ssh/**),Read(./data/**)",
+                "--settings", '{"permissions":{"disableBypassPermissionsMode":"disable"}}',
                 "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--permission-prompts", "none", "--session-id"]
-    assert step_one_argv(TRIAGE, "SID") == expected + ["SID"]
+    assert session_argv(TRIAGE, "SID") == expected + ["SID"]
+    assert step_one_argv(TRIAGE, "SID") == expected[:11] + expected[13:] + ["SID"], "step 1's, but for that key"
     env = session_env(tmp_path, dispatch=TREE if spawn else {"nodes": TREE["nodes"]},
                       config=lambda e: tree_config(e, runners={"claude-code": TRIAGE}, claude_tool_projects=[PROJECT]))
     sid = start(env)["session_id"]
     tick(env)
     assert call_for(env, sid)["argv"] == expected + [sid], "through the hub and the node"
-    assert not list((env.tmp / "laptop-logs").rglob("*.mcp.json")), "no MCP config was made for it"
+    assert not list((env.tmp / "laptop-logs").rglob("*.json.tmp")) and not [
+        x for x in (env.tmp / "laptop-logs").rglob("*.json") if x.name.endswith((".mcp.json", ".settings.json"))], \
+        "no MCP config and no settings file was made for it"
     host = host_for(env, "direct", runners={"claude-code": TRIAGE}, sessions={"allow_full_access": True})
     opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT)
-    assert host._argv(opened) == expected + [UNKNOWN] and opened.template == TRIAGE
+    assert host._argv(opened) == expected + [UNKNOWN] and opened.template == TRIAGE + SEAL
+    assert opened.seal == "inline"
     assert access.prepare(TRIAGE).template == TRIAGE and access.prepare(TRIAGE, allow_full=True).template == TRIAGE
 
     # Its label is what its process reports. It has a shell (for `git log`), so it is `workspace`, the honest word.
@@ -516,8 +557,10 @@ ALLOW_ONLY = ["claude", "-p", "{prompt}", "--allow-dangerously-skip-permissions"
 
 
 def test_the_shipped_runners_name_a_mode_so_their_command_lines_are_what_step_one_built():
-    """A. The one thing added to a root's command line is a permission mode, for a runner that names none. Every
-    shipped Claude runner names one: pinned here, with the command line each gets as a hosted session."""
+    """A. `prepare` adds one thing to a root's command line, a permission mode, for a runner that names none. Every
+    shipped Claude runner names one. The host then adds the settings key that switches bypass off (round 3, S3):
+    a deliberate, restrictive addition to every launch that is not full. Pinned here: the command line the shipped
+    runner gets as a hosted session."""
     shipped = DispatchConfig.load(ROOT / "board.toml", local=False)
     claude = {k: t for k, t in shipped.runners.items() if os.path.basename(t[0]) == "claude"}
     assert claude == {"claude-code": SHIPPED}, "the shipped Claude runner (the triage runner ships commented out)"
@@ -530,31 +573,35 @@ def test_the_shipped_runners_name_a_mode_so_their_command_lines_are_what_step_on
     shipped.worktrees[PROJECT] = str(ROOT)
     opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT)
     assert host._argv(opened) == ["claude", "-p", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms",
+                                  "--settings", '{"permissions":{"disableBypassPermissionsMode":"disable"}}',
                                   "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                                   "--permission-prompts", "none", "--session-id", UNKNOWN]
+    assert opened.seal == "inline" and opened.provider.on_open() == [], "nothing is written, nothing is asked"
+    assert host._argv(host.open(UNKNOWN[:-1] + "1", agent="claude", runtime="claude-code", project=PROJECT,
+                                access="workspace")) == host._argv(opened)[:-1] + [UNKNOWN[:-1] + "1"]
 
 
 def test_a_runner_that_names_no_permission_mode_gets_the_standard_one_pinned(senv):
     """A. An explicit mode beats a settings file's defaultMode (seen live), so every hosted Claude session has one.
     A runner that names none gets `manual`, the CLI's standard mode; one that names any keeps it."""
     assert access.PINNED_MODE == "manual"
-    plain = ["claude", "-p", "{prompt}", "--settings", "/x/settings.json"]
+    plain = ["claude", "-p", "{prompt}", "--model", "haiku"]
     assert access.claude_mode(plain) is None
     argv, label = claude_argv(senv, "pin", runner=plain)
-    assert argv == step_one_argv(plain + ["--permission-mode", "manual"]) and label == "workspace", \
-        "the one addition; everything else as its owner configured it"
+    assert argv == session_argv(plain + ["--permission-mode", "manual"]) and label == "workspace", \
+        "the mode and the key; everything else as its owner configured it"
     argv, label = claude_argv(senv, "pin-child", runner=plain, access_word="workspace")
-    assert argv == step_one_argv(plain + ["--permission-mode", "manual"]) and label == "workspace"
+    assert argv == session_argv(plain + ["--permission-mode", "manual"]) and label == "workspace"
     for mode in ("acceptEdits", "auto", "manual", "dontAsk", "plan"):
         named = ["claude", "-p", "{prompt}", "--permission-mode", mode]
-        assert claude_argv(senv, f"named-{mode}", runner=named)[0] == step_one_argv(named), mode
+        assert claude_argv(senv, f"named-{mode}", runner=named)[0] == session_argv(named), mode
         assert claude_argv(senv, f"named-eq-{mode}", runner=["claude", "-p", "{prompt}", f"--permission-mode={mode}"])[0] \
-            == step_one_argv(["claude", "-p", "{prompt}", f"--permission-mode={mode}"])
+            == session_argv(["claude", "-p", "{prompt}", f"--permission-mode={mode}"])
     scoped, _ = claude_argv(senv, "pin-scoped", runner=["claude", "-p", "{prompt}"], claude_tool_projects=[PROJECT])
     assert value_after(scoped, "--permission-mode") == "dontAsk" and scoped.count("--permission-mode") == 1, \
         "an opted-in project still gets the scoped mode, as it always did"
     assert claude_argv(senv, "pin-allow", runner=ALLOW_ONLY, sessions={"allow_full_access": True})[0] == \
-        step_one_argv(ALLOW_ONLY + ["--permission-mode", "manual"])
+        session_argv(ALLOW_ONLY + ["--permission-mode", "manual"])
 
 
 def test_the_access_of_a_session_is_computed_from_its_command_line():
@@ -589,13 +636,18 @@ def test_a_roots_access_is_known_when_it_is_opened_and_never_changes_with_what_i
         call, proc = proc_of(senv, sid, node)
         assert stored(senv, sid)["access"] == label and not proc.stdout, (runner, "its process has said nothing")
         assert node.sessions.host.sessions[sid].access == label
-        kid = child(senv, sid, "go")
-        assert kid["access"] == label, "a child at once, at most at its parent's access"
-        if label != "full":
+        if label == "full":
+            # Started as full, which is what `show` says. For a CHILD it counts once the process has said so.
+            assert "has not confirmed" in child(senv, sid, "go", expect=409)["message"]
+            kid = child(senv, sid, "go", access="read-only")
+        else:
+            kid = child(senv, sid, "go")
+            assert kid["access"] == label, "a child at once, at most at its parent's access"
             wider = access.LEVELS[access.RANK[label] + 1]
             assert f"above the parent's ({label})" in child(senv, sid, access=wider, expect=409)["message"]
         begin(senv, sid, node, tools=("Read",) if label == "workspace" else SAME)       # says less than it may: so?
         assert stored(senv, sid)["access"] == label and show(senv, sid)["state"] != "ended", "nothing is relabelled"
+        assert show(senv, sid)["ceiling"] == label, "... and a full root's process has now said it is one"
         assert senv.human.post(f"/api/hosted-sessions/{sid}/close").status_code == 200
         tick(senv, node, times=3)
         assert show(senv, sid)["state"] == "ended" and show(senv, kid["session_id"])["state"] == "ended"
@@ -613,7 +665,7 @@ def test_a_child_of_a_read_only_labelled_runner(senv, tmp_path, word):
     opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT, access=word)
     argv = host._argv(opened)
     if word == "workspace":
-        assert argv == step_one_argv(runner) and opened.access == "workspace"
+        assert argv == session_argv(runner) and opened.access == "workspace"
         return
     assert opened.access == "read-only" and "--tools=Read,Grep,Glob" in argv and "--strict-mcp-config" in argv
     assert next(a for a in argv if a.startswith("--allowedTools=")) == (
@@ -675,7 +727,8 @@ def test_the_flag_that_only_makes_bypass_selectable_is_not_full_access(senv):
     with pytest.raises(ValueError, match="cannot be hosted as a session"):
         claude_argv(senv, "allow-off", runner=ALLOW_ONLY)
     argv, label = claude_argv(senv, "allow-on", runner=ALLOW_ONLY, sessions={"allow_full_access": True})
-    assert label == "workspace" and argv == step_one_argv(ALLOW_ONLY + ["--permission-mode", "manual"])
+    assert label == "workspace" and argv == session_argv(ALLOW_ONLY + ["--permission-mode", "manual"])
+    assert value_after(argv, "--settings") == access.NO_BYPASS_JSON, "selectable on its command line, switched off"
     argv, label = claude_argv(senv, "allow-ws", runner=ALLOW_ONLY, access_word="workspace")
     assert label == "workspace" and "--allow-dangerously-skip-permissions" not in argv
     assert value_after(argv, "--permission-mode") == "manual"
@@ -839,8 +892,12 @@ def test_the_node_opens_each_child_at_its_access_and_reports_what_it_really_has(
     begin(senv, ro, tools=("Read", "Grep", "Glob", "mcp__agent-comms__board_post"))
     begin(senv, ws)
     assert [show(senv, x)["state"] for x in (ro, ws)] == ["running", "running"], "and their processes agree"
-    assert all(set(body) <= {"events", "seq", "state", "pid", "resume", "provider_id", "access"}
-               for _, body in spy.posts), "words and nothing else"
+    assert all(set(body) <= {"events", "seq", "state", "pid", "resume", "provider_id", "access", "ceiling", "checkout"}
+               for _, body in spy.posts), "words, and where the root runs"
+    roots = [body for path, body in spy.posts if path.endswith(sid) and "state" in body]
+    assert all(b["ceiling"] == "workspace" and b["checkout"] == str(senv.work) for b in roots)
+    assert not any("ceiling" in body or "checkout" in body for path, body in spy.posts if not path.endswith(sid)), \
+        "a child has no ceiling: nothing is started under it"
 
 
 def test_a_full_child_exists_only_under_a_full_root_on_a_node_that_allows_it(senv):
@@ -849,6 +906,8 @@ def test_a_full_child_exists_only_under_a_full_root_on_a_node_that_allows_it(sen
     node.hello()
     sid = root(senv, node=node)
     assert stored(senv, sid)["access"] == "full" and "--dangerously-skip-permissions" in call_for(senv, sid, node)["argv"]
+    assert "--settings" not in call_for(senv, sid, node)["argv"], "a full launch: bypass is not switched off in it"
+    answer(senv, sid, node=node)                         # its process says it runs bypassed: now it counts
     full = child(senv, sid)                              # the default: its parent's
     ro = child(senv, sid, access="read-only")
     out = child(senv, sid, access="workspace", expect=409)      # this node cannot say that word for this runner
@@ -860,9 +919,12 @@ def test_a_full_child_exists_only_under_a_full_root_on_a_node_that_allows_it(sen
     ro_argv = call_for(senv, ro["session_id"], node)["argv"]
     assert value_after(ro_argv, "--permission-mode") == "dontAsk" and "--dangerously-skip-permissions" not in ro_argv
     codex_child = codex_proc(senv, node)
-    codex_handshake(senv, codex_child, node)
+    codex_child.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv, node)
     assert written(codex_child)[2]["params"]["sandbox"] == "danger-full-access"
-    assert stored(senv, cdx["session_id"])["granted"] == "full"
+    codex_child.emit(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "dangerFullAccess"}}))
+    tick(senv, node)
+    assert stored(senv, cdx["session_id"])["granted"] == "full" and show(senv, cdx["session_id"])["state"] != "ended"
 
     # The same hub records, a node that does NOT allow full access: every full session is refused, loudly.
     strict = make_node(senv, config=tree_config(senv, runners={"claude-code": BYPASS}), log_dir=senv.tmp / "strict-logs")
@@ -876,7 +938,8 @@ def test_full_is_refused_when_it_is_asked_of_a_node_that_does_not_offer_it(senv)
     where the node allows full access. The hub refuses the rest when the child is admitted."""
     sid = root(senv)
     # The hub's own record says the parent is full (as a node that allowed it would have reported).
-    senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "idle", "access": "full"})
+    senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "idle", "access": "full",
+                                                         "ceiling": "full"})
     out = child(senv, sid, access="full", expect=409)
     assert out["message"].startswith("node laptop cannot start a session of claude at full access (it can at: "
                                      "read-only, workspace)") and "allow_full_access" in out["message"]
@@ -1420,7 +1483,7 @@ def test_verify_is_a_kill_switch_for_what_a_process_reports():
 def test_a_session_that_reports_bypass_without_being_started_as_full_is_ended(senv):
     """S3, the kill switch. Its command line names a mode (pinned: the runner names none), so no settings file
     should be able to put it into bypassPermissions. If its process reports that mode all the same, it is ended."""
-    plain = ["claude", "-p", "{prompt}", "--settings", "/x/settings.json"]
+    plain = ["claude", "-p", "{prompt}", "--model", "haiku"]
     node = make_node(senv, config=tree_config(senv, runners={"claude-code": plain}), log_dir=senv.tmp / "plain-logs")
     sid = start(senv)["session_id"]
     tick(senv, node)
@@ -1475,6 +1538,7 @@ def test_a_child_whose_process_does_not_run_as_asked_is_ended(senv):
                                                    sessions={"allow_full_access": True}), log_dir=senv.tmp / "f-logs")
     full_node.hello()
     top = root(senv, node=full_node, project=P2)
+    answer(senv, top, node=full_node)
     for mode, why in (("dontAsk", access.NOT_BYPASS.format(mode="dontAsk")),
                       (None, access.UNVERIFIABLE.format(asked="full", what="the permission mode it runs in"))):
         kid = child(senv, top, "go")["session_id"]
@@ -1490,9 +1554,10 @@ def test_a_child_whose_process_does_not_run_as_asked_is_ended(senv):
     senv.node.hello()
 
 
-def test_children_are_held_to_the_parents_computed_access_right_after_a_restart(senv):
-    """S1. No gap after a node restart: the parent has no process and has said nothing, and its access is there
-    all the same, computed from its command line. A full child of a full root goes on."""
+def test_a_full_child_waits_after_a_restart_until_its_parents_process_has_confirmed_full_access(senv):
+    """S1 (round 3). After a node restart the parent's access is there at once, computed from its command line, so
+    its children are not ended. But `full` counts for a child only once the parent's process has said, in THIS node
+    process, that it runs bypassed: until then a full child is held (open, its message queued, no turn)."""
     config = lambda: tree_config(senv, runners={"claude-code": BYPASS}, sessions={"allow_full_access": True})  # noqa: E731
     node = make_node(senv, config=config(), log_dir=senv.tmp / "r-logs")
     node.hello()
@@ -1504,10 +1569,403 @@ def test_children_are_held_to_the_parents_computed_access_right_after_a_restart(
     again = make_node(senv, config=config(), log_dir=senv.tmp / "r-logs")       # the node is restarted
     tick(senv, again)
     parent = again.sessions.host.sessions[sid]
-    assert (parent.access, parent.child) == ("full", None), "no process, nothing reported, and its access is known"
+    assert (parent.access, parent.child, parent.ceiling) == ("full", None, "workspace"), \
+        "no process, nothing reported: its access is known, and nothing has confirmed it"
+    assert show(senv, sid)["ceiling"] == "workspace" and "has not confirmed" in child(senv, sid, expect=409)["message"]
     send(senv, kid, "two")
+    tick(senv, again, times=3)
+    assert show(senv, kid)["state"] != "ended" and msg(senv, kid, 2)["state"] == "queued", "held, not ended"
+    assert again.session_spawner.calls == [], "nothing was started for it"
+    send(senv, sid, "wake up")                                                  # the parent's next turn
     tick(senv, again)
-    assert show(senv, kid)["state"] != "ended" and msg(senv, kid, 2)["state"] == "delivered"
+    assert msg(senv, kid, 2)["state"] == "queued", "its process is up, and has said nothing yet"
+    begin(senv, sid, again)
+    assert again.sessions.host.sessions[sid].ceiling == "full" and show(senv, sid)["ceiling"] == "full"
+    tick(senv, again)
+    assert msg(senv, kid, 2)["state"] == "delivered", "now the child's turn is handed over"
+    senv.node.hello()
+
+
+def test_full_counts_for_children_only_while_the_parents_current_process_has_confirmed_it(senv):
+    """S1 (round 3). What a session was started as is not yet what its CLI accepted. A root labelled `full` gives
+    its children at most `workspace` until its process reports bypassPermissions; the confirmation is that
+    process's, so it is gone when another process is started for the session."""
+    node = make_node(senv, config=tree_config(senv, runners={"claude-code": BYPASS},
+                                              sessions={"allow_full_access": True}), log_dir=senv.tmp / "c-logs")
+    node.hello()
+    sid = root(senv, node=node)
+    host = node.sessions.host
+    assert (host.sessions[sid].access, host.sessions[sid].ceiling) == ("full", "workspace")
+    view = show(senv, sid)
+    assert (view["access"], view["ceiling"]) == ("full", "workspace")
+    assert cli._fmt_access(view) == "full (not confirmed by its process yet: a child can have at most workspace)"
+    for word in (None, "full"):
+        out = child(senv, sid, expect=409, **({"access": word} if word else {}))
+        assert "was started as a full-access session, but its process has not confirmed that" in out["message"]
+    assert "children" not in show(senv, sid), "nothing was made"
+    begin(senv, sid, node)                               # `init`: bypassPermissions
+    assert host.sessions[sid].ceiling == "full" and show(senv, sid)["ceiling"] == "full"
+    assert cli._fmt_access(show(senv, sid)) == "full"
+    kid = child(senv, sid, "one")["session_id"]
+    proc_of(senv, sid, node)[1].emit(result(sid))
+    tick(senv, node, times=2)
+    answer(senv, kid, node=node)
+    assert msg(senv, kid, 1)["state"] == "done"
+    # The parent's process is stopped for idleness: nothing new has been started, the confirmation stands.
+    assert host.park(sid)
+    tick(senv, node, times=2)
+    assert host.sessions[sid].child is None and host.sessions[sid].ceiling == "full"
+    # A new process for the parent: unconfirmed again until IT says so. The child's next message waits.
+    send(senv, sid, "again")
+    tick(senv, node)
+    assert host.sessions[sid].child is not None and host.sessions[sid].ceiling == "workspace"
+    assert show(senv, sid)["ceiling"] == "workspace"
+    send(senv, kid, "two")
+    tick(senv, node, times=3)
+    assert msg(senv, kid, 2)["state"] == "queued" and show(senv, kid)["state"] != "ended"
+    begin(senv, sid, node)
+    tick(senv, node)
+    assert msg(senv, kid, 2)["state"] == "delivered"
+    # A parent whose new process turns out NOT to run bypassed is ended (the kill switch), its children with it.
+    proc_of(senv, sid, node)[1].emit(result(sid))
+    tick(senv, node, times=2)
+    assert host.park(sid)
+    tick(senv, node, times=2)
+    send(senv, sid, "once more")
+    tick(senv, node)
+    begin(senv, sid, node, mode="default")
+    tick(senv, node, times=3)
+    assert show(senv, sid)["state"] == "ended" and show(senv, sid)["error"] == access.NOT_BYPASS.format(mode="default")
+    assert show(senv, kid)["state"] == "ended"
+    senv.node.hello()
+
+
+def test_codex_confirms_full_access_with_its_answer_to_thread_start(senv):
+    """S1 (round 3). The node itself sends `danger-full-access` as the thread's sandbox; Codex's answer names the
+    sandbox the thread has, and that is the confirmation (no turn is needed). An answer that names another sandbox
+    ends a session started as full; one that names dangerFullAccess ends a session that was not."""
+    v = access.verify_codex
+    assert v("full", "dangerFullAccess") == (None, True) and v("full", None) == (None, True)
+    assert v("full", "workspaceWrite") == (access.CODEX_NOT_FULL.format(sandbox="workspaceWrite"), False)
+    assert v("workspace", "workspaceWrite") == (None, False) == v("read-only", "readOnly") == v("workspace", None)
+    assert v("workspace", "dangerFullAccess") == (access.CODEX_FULL, False) == v(None, "dangerFullAccess")
+    p = CodexSession()
+    p.argv(CODEX_RUNNER, session_id=UNKNOWN, resume=False, model=None)
+    p.on_open()
+    p.feed(cx.reply(1, cx.INIT_RESULT))
+    [ready], _ = p.feed(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "dangerFullAccess"}}))
+    assert (ready.kind, ready.mode) == ("ready", "dangerFullAccess") and CodexSession.reports_sandbox
+
+    full_codex = ["codex", "exec", "--cd", "{project}", "--sandbox", "danger-full-access", "{prompt}"]
+    node = make_node(senv, config=tree_config(senv, runners={"codex-cli": full_codex},
+                                              sessions={"allow_full_access": True}), log_dir=senv.tmp / "cx-logs")
+    node.hello()
+    sid = root(senv, node=node, agent="codex")
+    assert stored(senv, sid)["access"] == "full" and show(senv, sid)["ceiling"] == "workspace"
+    proc = codex_proc(senv, node)
+    proc.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv, node)
+    assert written(proc)[2]["params"]["sandbox"] == "danger-full-access"
+    proc.emit(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "dangerFullAccess"}}))
+    tick(senv, node)
+    assert node.sessions.host.sessions[sid].ceiling == "full" and show(senv, sid)["ceiling"] == "full"
+    assert child(senv, sid, agent="claude")["access"] == "full", "a full child, now that Codex has said so"
+
+    # The same root on a restarted node, and this time Codex answers with another sandbox: ended, not run narrower.
+    again = make_node(senv, config=tree_config(senv, runners={"codex-cli": full_codex},
+                                               sessions={"allow_full_access": True}), log_dir=senv.tmp / "cx-logs")
+    send(senv, sid, "more")
+    tick(senv, again)
+    proc = codex_proc(senv, again)
+    proc.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv, again)
+    proc.emit(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "workspaceWrite"}}))
+    tick(senv, again, times=3)
+    assert show(senv, sid)["state"] == "ended"
+    assert show(senv, sid)["error"] == access.CODEX_NOT_FULL.format(sandbox="workspaceWrite")
+    senv.node.hello()
+
+
+def test_a_launch_claude_would_refuse_is_refused_when_the_session_is_opened(senv, tmp_path):
+    """S1a (round 3). The label is computed from the command line, so a command line Claude will not run as
+    labelled must not be opened at all. Seen live on 2.1.322: `--restricted` beside the bypass mode or either skip
+    flag exits with "bypassPermissions not supported in restricted mode"; a launch in the bypass mode whose settings
+    switch it off runs in `default`."""
+    from agent_comms.session_host import child_words
+
+    on = {"sessions": {"allow_full_access": True}}
+    for extra in (["--permission-mode", "bypassPermissions"], ["--permission-mode=bypassPermissions"],
+                  ["--dangerously-skip-permissions"], ["--allow-dangerously-skip-permissions"]):
+        runner = ["claude", "-p", "{prompt}", "--restricted"] + extra
+        assert access.claude_conflict(runner) == access.RESTRICTED_BYPASS
+        with pytest.raises(ValueError) as e:
+            claude_argv(senv, "restricted-" + extra[0].strip("-")[:9] + str(len(extra)), runner=runner, **on)
+        assert str(e.value) == access.RESTRICTED_BYPASS and "not supported in restricted mode" in str(e.value)
+    restricted = SHIPPED + ["--restricted"]
+    assert access.claude_conflict(restricted) is None and claude_argv(senv, "restricted-ok", runner=restricted)[1] == "workspace"
+    with pytest.raises(ValueError) as e:        # a child asked for at full from it: the same refusal
+        claude_argv(senv, "restricted-full", runner=restricted, access_word="full", **on)
+    assert str(e.value) == access.RESTRICTED_BYPASS
+    assert child_words(tree_config(senv, **on), restricted) == ["read-only", "workspace"], "so the hub is never told `full`"
+    assert child_words(tree_config(senv, **on), SHIPPED) == ["read-only", "workspace", "full"]
+
+    off = tmp_path / "no-bypass.json"
+    off.write_text(json.dumps({"permissions": {"disableBypassPermissionsMode": "disable", "allow": ["Read"]}}))
+    assert access.claude_conflict(BYPASS + ["--settings", access.NO_BYPASS_JSON]) == access.FULL_DISABLED
+    assert access.claude_conflict(BYPASS + ["--settings", str(off)]) == access.FULL_DISABLED
+    assert access.claude_conflict(BYPASS + [f"--settings={off}", "--settings", '{"env": {}}']) is None, "the LAST one counts"
+    with pytest.raises(ValueError) as e:
+        claude_argv(senv, "disabled", runner=BYPASS + ["--settings", str(off)], **on)
+    assert str(e.value) == access.FULL_DISABLED
+    with pytest.raises(ValueError) as e:
+        claude_argv(senv, "disabled-child", runner=SHIPPED + ["--settings", str(off)], access_word="full", **on)
+    assert str(e.value) == access.FULL_DISABLED
+    assert child_words(tree_config(senv, **on), SHIPPED + ["--settings", str(off)]) == ["read-only", "workspace"]
+    fine = tmp_path / "fine.json"
+    fine.write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    argv, label = claude_argv(senv, "full-own-settings", runner=BYPASS + ["--settings", str(fine)], **on)
+    assert label == "full" and value_after(argv, "--settings") == str(fine), "a full launch keeps its settings as they are"
+
+
+def merged_host(env, name, runner, **over):
+    host = host_for(env, name, runners={"claude-code": runner}, **over)
+    opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT)
+    return host, opened
+
+
+def test_bypass_is_switched_off_for_every_claude_launch_that_is_not_full(senv, tmp_path):
+    """S3 (round 3). `permissions.disableBypassPermissionsMode = "disable"`, given with `--settings`. A runner with
+    no settings of its own gets the key as JSON on its command line. Claude takes only its LAST `--settings`, so a
+    runner that names one gets a file this node writes: the runner's settings and the key."""
+    assert json.loads(access.NO_BYPASS_JSON) == {"permissions": {"disableBypassPermissionsMode": "disable"}}
+    assert " " not in access.NO_BYPASS_JSON, "one token"
+    for word, runner in ((None, SHIPPED), ("workspace", SHIPPED), ("read-only", SHIPPED), ("read-only", BYPASS),
+                         (None, TRIAGE), (None, HARD), (None, ["claude", "-p", "{prompt}"])):
+        argv, label = claude_argv(senv, f"sealed-{word}-{len(runner)}", runner=runner, access_word=word,
+                                  sessions={"allow_full_access": True})
+        assert label != "full" and argv.count("--settings") == 1 and value_after(argv, "--settings") == access.NO_BYPASS_JSON
+    for word, runner in ((None, BYPASS), ("full", SHIPPED), ("full", BYPASS)):
+        argv, label = claude_argv(senv, f"open-{word}-{len(runner)}", runner=runner, access_word=word,
+                                  sessions={"allow_full_access": True})
+        assert label == "full" and "--settings" not in argv, "a full launch is the one that is left as it is"
+
+    own = tmp_path / "own.json"
+    content = {"permissions": {"allow": ["Bash(ls *)"], "defaultMode": "bypassPermissions"},
+               "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}, "env": {"A": "b"}}
+    own.write_text(json.dumps(content))
+    first = tmp_path / "first.json"
+    first.write_text(json.dumps({"permissions": {"allow": ["Write"]}}))
+    runner = ["claude", "-p", "{prompt}", "--settings", str(first), "--model", "haiku", f"--settings={own}"]
+    host, opened = merged_host(senv, "merged", runner)
+    argv = host._argv(opened)
+    assert opened.seal == "merged" and opened.access == "workspace"
+    assert argv.count("--settings") == 1 and str(own) not in argv and str(first) not in argv
+    assert not any(a.startswith("--settings=") for a in argv)
+    path = Path(value_after(argv, "--settings"))
+    assert path == host.sessions_dir / f"{UNKNOWN}.settings.json" and (path.stat().st_mode & 0o777) == 0o600
+    assert json.loads(path.read_text()) == content | {"permissions": content["permissions"] | {
+        "disableBypassPermissionsMode": "disable"}}, "the runner's LAST settings (the ones Claude takes), and the key"
+    assert json.loads(own.read_text()) == content, "the runner's own file is not touched"
+    assert argv[:argv.index("--settings")] == ["claude", "-p", "--model", "haiku", "--permission-mode", "manual"]
+    host.close(UNKNOWN)
+    host.forget(UNKNOWN)
+    assert not path.exists(), "the file goes with the session"
+
+    # A path relative to the run directory, and the JSON itself (which a configured runner cannot carry: the
+    # settings refuse braces in a runner's arguments; the function takes it all the same).
+    (senv.work / "team.json").write_text(json.dumps({"permissions": {"deny": ["WebFetch"]}}))
+    host, opened = merged_host(senv, "merged-relative", ["claude", "-p", "{prompt}", "--settings", "team.json"])
+    assert json.loads(Path(value_after(host._argv(opened), "--settings")).read_text())["permissions"] == {
+        "deny": ["WebFetch"], "disableBypassPermissionsMode": "disable"}
+    made = []
+    sealed, how = access.claude_sealed(["claude", "-p", "--settings", '{"env": {"A": "b"}}'],
+                                       write=lambda data: made.append(data) or "/written/here.json")
+    assert (sealed, how) == (["claude", "-p", "--settings", "/written/here.json"], "merged")
+    assert made == [{"env": {"A": "b"}, "permissions": {"disableBypassPermissionsMode": "disable"}}]
+    # A dry run (the words a node offers) writes nothing: a placeholder stands for the file.
+    assert access.claude_sealed(["claude", "-p", "--settings", str(own)]) == (
+        ["claude", "-p", "--settings", access.DRY_SETTINGS], "merged")
+    assert access.claude_sealed(["claude", "-p", "--settings", "team.json"])[1] == "merged", "no directory to read it in"
+    # A runner whose settings cannot be read is not started: not without them, and not without the key.
+    for bad in ("/x/none.json", "[1, 2]", '{"permissions": "all"}', '{"permissions": null}', '{"broken": '):
+        if not bad.startswith("/"):
+            (tmp_path / "bad.json").write_text(bad)
+        runner = ["claude", "-p", "{prompt}", "--settings", bad if bad.startswith("/") else str(tmp_path / "bad.json")]
+        host = host_for(senv, f"unreadable-{len(bad)}", runners={"claude-code": runner})
+        with pytest.raises(ValueError, match="cannot be read as a JSON object"):
+            host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT)
+        assert not host.sessions_dir.exists() or not list(host.sessions_dir.iterdir()), "nothing is left behind"
+
+
+def sealed_line(request_id, effective) -> dict:
+    return {"type": "control_response", "response": {"subtype": "success", "request_id": request_id,
+                                                     "response": {"effective": effective, "sources": []}}}
+
+
+def test_a_session_started_from_a_merged_settings_file_must_say_bypass_is_off(senv, tmp_path):
+    """S3 (round 3). Claude ignores a settings file it finds invalid, whole and silently (seen live: one value of
+    the wrong type beside the key, and the key was not in force). So a process started from a file this node merged
+    is asked what is in force (`get_settings`, answered before any turn: seen live), and the session is ended if
+    the key is not, or if a whole turn passes without an answer. A session given the key as JSON is asked nothing."""
+    p = ClaudeSession()
+    p.argv(SHIPPED + SEAL, session_id=UNKNOWN, resume=False, model=None)
+    assert p.on_open() == [], "the key as JSON: nothing to ask"
+    full = ClaudeSession()
+    full.configure(access="full")
+    full.argv(BYPASS + ["--settings", "/x/own.json"], session_id=UNKNOWN, resume=False, model=None)
+    assert full.on_open() == [], "a full launch keeps its own settings file and is asked nothing"
+    p.argv(SHIPPED + ["--settings", "/x/merged.json"], session_id=UNKNOWN, resume=False, model=None)
+    [asked] = p.on_open()
+    request = json.loads(asked)
+    assert request == {"type": "control_request", "request_id": "settings-1", "request": {"subtype": "get_settings"}}
+    assert asked.endswith(b"\n") and asked.count(b"\n") == 1
+    off = {"permissions": {"disableBypassPermissionsMode": "disable", "allow": ["Read"]}}
+    assert p.feed(json.dumps(sealed_line("another", off)).encode()) == ([], []), "not the answer to its question"
+    assert p.feed(json.dumps(sealed_line("settings-1", off)).encode()) == ([Event("sealed", ok=True)], [])
+    assert p.feed(json.dumps(sealed_line("settings-1", off)).encode()) == ([], []), "answered once"
+    for effective in ({}, {"permissions": {}}, {"permissions": {"disableBypassPermissionsMode": "enable"}}, None, "x"):
+        p.argv(SHIPPED + ["--settings", "/x/merged.json"], session_id=UNKNOWN, resume=False, model=None)
+        rid = json.loads(p.on_open()[0])["request_id"]
+        assert p.feed(json.dumps(sealed_line(rid, effective)).encode()) == ([Event("sealed", ok=False)], []), effective
+    p.argv(SHIPPED + ["--settings", "/x/merged.json"], session_id=UNKNOWN, resume=False, model=None)
+    rid = json.loads(p.on_open()[0])["request_id"]
+    refused = {"type": "control_response", "response": {"subtype": "error", "request_id": rid, "error": "no"}}
+    assert p.feed(json.dumps(refused).encode()) == ([Event("sealed", ok=False)], [])
+
+    own = tmp_path / "own.json"
+    own.write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--settings", str(own)]
+    node = make_node(senv, config=tree_config(senv, runners={"claude-code": runner}), log_dir=senv.tmp / "m-logs")
+
+    def opened(project):
+        sid = start(senv, project=project)["session_id"]
+        tick(senv, node)
+        call, proc = proc_of(senv, sid, node)
+        first, turn = written(proc)
+        assert first["request"] == {"subtype": "get_settings"} and turn["type"] == "user", "asked before the turn"
+        assert node.sessions.host.sessions[sid].seal == "merged"
+        return sid, proc, first["request_id"]
+
+    # It says the key is in force: the session goes on, turn after turn, and is asked once per process.
+    sid, proc, rid = opened(PROJECT)
+    proc.emit(sealed_line(rid, off), began(sid), result(sid))
+    tick(senv, node, times=2)
+    assert show(senv, sid)["state"] == "idle" and msg(senv, sid, 1)["state"] == "done"
+    send(senv, sid, "again")
+    tick(senv, node)
+    proc.emit(began(sid), result(sid))
+    tick(senv, node, times=2)
+    assert show(senv, sid)["state"] == "idle" and len(written(proc)) == 3
+    # It says the key is NOT in force (the merged file was ignored): ended at once, before its turn has got anywhere.
+    sid, proc, rid = opened(P2)
+    proc.emit(sealed_line(rid, {"model": "haiku"}))
+    tick(senv, node, times=3)
+    assert show(senv, sid)["state"] == "ended" and show(senv, sid)["error"] == access.NOT_SEALED[:300]
+    assert msg(senv, sid, 1)["state"] == "failed" and proc.terminated == 1
+    # It never says: the first turn's result is taken, and the session is ended with the reason.
+    sid, proc, rid = opened(P3)
+    proc.emit(began(sid), result(sid, text="done"))
+    tick(senv, node, times=3)
+    assert show(senv, sid)["state"] == "ended" and show(senv, sid)["error"] == access.SEAL_UNVERIFIED[:300]
+    assert msg(senv, sid, 1)["state"] == "done", "the turn it did is on record"
+    # Its process dies on the question (a CLI that cannot take it): the message fails, once, and nothing is started
+    # again for it. The next message asks the next process the same.
+    sid, proc, rid = opened(P3)
+    started = len(node.session_spawner.calls)
+    proc.code = 1
+    tick(senv, node, times=4)
+    failed = msg(senv, sid, 1)
+    assert failed["state"] == "failed" and "the process exited (code 1)" in json.dumps(failed), failed
+    assert len(node.session_spawner.calls) == started and show(senv, sid)["state"] == "idle"
+    send(senv, sid, "again")
+    tick(senv, node)
+    assert len(node.session_spawner.calls) == started + 1
+    assert [x.get("type") for x in written(node.session_spawner.children[-1])] == ["control_request", "user"]
+
+
+def test_a_runner_that_names_its_own_directory_is_held_against_where_the_parent_runs(senv, tmp_path):
+    """S8 (round 3). A Codex runner whose `--cd` is a path can be a session in that directory only. The dry run
+    behind the node's hello has no directory, so it used to offer nothing for such a runner. Now the hello offers
+    the words the runner has IN its directory and names the directory (`dirs`), every root reports where it runs
+    (`checkout`), and the hub holds a child against both when it is asked for."""
+    from agent_comms.providers.codex import named_directory
+    from agent_comms.session_host import child_words, runner_dir
+
+    here, other = senv.work, tmp_path / "elsewhere"
+    other.mkdir()
+    bound = ["codex", "exec", "--cd", str(here), "--sandbox", "workspace-write", "{prompt}"]
+    assert named_directory(bound) == str(here) == runner_dir(bound)
+    assert named_directory(["codex", "exec", f"-C{here}/", "{prompt}"]) == str(here)
+    assert named_directory(["codex", "exec", f"--cd={here}", "-C", "{project}", "{prompt}"]) is None, "the last one counts"
+    assert named_directory(CODEX_RUNNER) is None and runner_dir(SHIPPED) is None and runner_dir(CODEX_RUNNER) is None
+    config = tree_config(senv, runners={"codex-cli": bound}, worktrees={PROJECT: str(here), P2: str(other)})
+    assert child_words(config, bound) == ["read-only", "workspace"], "the words it has in its own directory"
+    node = make_node(senv, config=config, log_dir=senv.tmp / "b-logs")
+    node.hello()
+    [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
+    assert info["session_host"] == {"tree": 1, "runners": {"claude-code": ["read-only", "workspace"],
+                                                           "codex-cli": ["read-only", "workspace"]},
+                                    "dirs": {"codex-cli": str(here)}}
+    sid = start(senv)["session_id"]
+    # (a status that says the access and not yet where the session runs, as an earlier node version's would)
+    senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "idle", "access": "workspace",
+                                                         "ceiling": "workspace"})
+    assert f"where session {sid} runs on its node is not known yet" in child(senv, sid, agent="codex", expect=409)["message"]
+    tick(senv, node)
+    assert stored(senv, sid)["checkout"] == str(here)
+    out = child(senv, sid, agent="codex", isolation="worktree", expect=409)
+    assert f"names its own directory ({here})" in out["message"] and "cannot have a worktree of its own" in out["message"]
+    kid = child(senv, sid, "count", agent="codex")
+    tick(senv, node)
+    assert codex_call(senv, node)["cwd"] == str(here) and show(senv, kid["session_id"])["state"] != "ended"
+    elsewhere = root(senv, node=node, project=P2)
+    assert stored(senv, elsewhere)["checkout"] == str(other)
+    out = child(senv, elsewhere, agent="codex", expect=409)
+    assert f"session {elsewhere} runs in {other}" in out["message"] and "children" not in show(senv, elsewhere), \
+        "refused when it is asked for, not made and then ended on the node"
+    assert child(senv, elsewhere, isolation="worktree")["agent"] == "claude", \
+        "a runner that names no directory is not held to one"
+    senv.node.hello()
+    assert "dirs" not in [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"][0]["session_host"]
+
+
+def test_a_malformed_hello_is_a_400_whatever_is_in_its_word_lists(senv):
+    """S15 (round 3). An object or an array among the access words used to reach `set()` and come back as a 500."""
+    hello = {"projects": [PROJECT, P2, P3], "runners": ["claude-code", "codex-cli"], "sessions": {"max_live": 4}}
+    strict = TestClient(senv.app, base_url="http://127.0.0.1:8787", raise_server_exceptions=False,
+                        headers={"Authorization": "Bearer " + senv.tokens["laptop"]})
+    for words in ([{}], [["workspace"]], [1], [None], ["workspace", {"a": 1}], [[]], ["workspace", "workspace"],
+                  ["read-only", "workspace", "full", "full"]):
+        r = strict.post("/api/nodes/hello", json=hello | {"session_host": {"tree": 1, "runners": {"claude-code": words}}})
+        assert r.status_code == 400, (words, r.status_code, r.text)
+    ok = {"tree": 1, "runners": {"codex-cli": ["workspace"]}}
+    for dirs in ("x", {"claude-code": "/x"}, {"codex-cli": "relative"}, {"codex-cli": 5}, {"codex-cli": ["/x"]},
+                 {"codex-cli": "/x\n"}, {"codex-cli": {}}):
+        r = strict.post("/api/nodes/hello", json=hello | {"session_host": ok | {"dirs": dirs}})
+        assert r.status_code == 400, (dirs, r.status_code, r.text)
+    assert strict.post("/api/nodes/hello", json=hello | {"session_host": ok | {"dirs": {"codex-cli": "/x/y"}}}).status_code == 200
+    senv.node.hello()
+
+
+def test_a_read_only_child_of_a_runner_with_an_option_that_cannot_be_dropped_is_refused_when_asked_for(senv):
+    """S2 (round 3). Such a runner is not offered at `read-only` (the node's hello), so the hub refuses the child
+    when it is asked for; a workspace child of it runs the runner as its owner configured it."""
+    from agent_comms.session_host import child_words
+
+    odd = SHIPPED + ["--some-future-loader", "/x/ext"]
+    plugged = SHIPPED + ["--plugin-dir", "/x/plug"]
+    assert child_words(tree_config(senv), odd) == ["workspace"]
+    assert child_words(tree_config(senv), plugged) == ["read-only", "workspace"], "a plugin directory is simply dropped"
+    node = make_node(senv, config=tree_config(senv, runners={"claude-code": odd}), log_dir=senv.tmp / "odd-logs")
+    node.hello()
+    sid = root(senv, node=node)
+    out = child(senv, sid, access="read-only", expect=409)
+    assert "cannot start a session of claude at read-only access (it can at: workspace)" in out["message"]
+    assert child(senv, sid, access="workspace")["access"] == "workspace"
+    argv, label = claude_argv(senv, "plugged-ro", runner=plugged, access_word="read-only")
+    assert label == "read-only" and "--plugin-dir" not in argv and "/x/plug" not in argv
+    argv, label = claude_argv(senv, "plugged-ws", runner=plugged, access_word="workspace")
+    assert value_after(argv, "--plugin-dir") == "/x/plug", "as configured"
     senv.node.hello()
 
 
@@ -1536,7 +1994,7 @@ def test_children_need_a_node_whose_latest_hello_declares_the_protocol(senv):
     kid = child(senv, sid)["session_id"]
     hello = {"projects": [PROJECT, P2, P3], "runners": ["claude-code", "codex-cli"], "sessions": {"max_live": 4}}
     for bad in ({"tree": 0, "runners": {}}, {"tree": 1}, {"tree": 1, "runners": {"grok": ["workspace"]}},
-                {"tree": True, "runners": {}}, {"tree": 1, "runners": {}, "extra": 1}, "yes",
+                {"tree": True, "runners": {}}, {"tree": 1, "runners": {}, "extra": 1}, "yes", {"runners": {}},
                 {"tree": 1, "runners": ["claude-code"]}, {"tree": 1, "runners": {"claude-code": ["root"]}},
                 {"tree": 1, "runners": {"claude-code": []}}, {"tree": 1, "runners": {"claude-code": "workspace"}}):
         r = senv.laptop.post("/api/nodes/hello", json=hello | {"session_host": bad})
