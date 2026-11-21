@@ -49,7 +49,7 @@ if [[ "$wake" == add ]]; then
   [[ "$home$here" != *"'"* ]] || { echo "Paths with a single quote are not supported." >&2; exit 1; }
   # Fails loudly if the token does not authenticate against this board home (or its hub).
   AGENT_COMMS_HOME="$home" bash "$here/board.sh" brief --agent "$agent" --project / >/dev/null
-  hooks add --command "AGENT_COMMS_HOME='$home' AGENT_COMMS_AGENT='$agent' bash '$here/wait.sh'"
+  hooks add --home "$home" --agent "$agent"
   cat <<MSG
 Added the agent-comms wake hooks (Stop and SessionStart, asyncRewake, agent '$agent') to $claude_settings.
 Sessions started from now on wait for the hub to wake them; the hub needs [dispatch.sessions.interactive]

@@ -1159,6 +1159,7 @@ def child_env(agent: str, config: DispatchConfig, environ: dict[str, str] | None
     env = {k: src[k] for k in names if k in src}
     env.setdefault("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin")
     env["AGENT_COMMS_HOME"] = str(home())   # where the board lives (not a secret); MCP launchers read it
+    env["AGENT_COMMS_MANAGED"] = "1"        # a launched run or hosted session: its wake hook stays out (waiter.py)
     return env
 
 
@@ -1867,7 +1868,7 @@ class Dispatcher:
         def check() -> str | None:
             try:
                 thread = conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
-                if thread is None or hosted_wake.reserve(conn, agent, thread["project"], item["post_id"], now):
+                if thread is None or hosted_wake.reserve(self.board, agent, thread["project"], item["post_id"], now):
                     return None
                 return HOSTED_HOLDS
             except Exception:

@@ -21,6 +21,10 @@ S3. The process named by CLAUDE_PID ends: the waiting process exits 0 within a f
 S4. Two conversations of the agent in the project wait; a post wakes only the one armed last.
 S5. SIGTERM (what Claude sends at the hook's timeout and when the session ends) ends a waiter with exit 0.
 S6. A hub that cannot be reached: wait.sh exits 0 at once.
+S7. A process the dispatcher, a node or the session host started (AGENT_COMMS_MANAGED=1): wait.sh exits 0 at once
+    and the hub never hears of it.
+S8. SIGTERM to wait.sh alone (not its group): the `board wait` under it (through board.sh and `uv run`) ends too,
+    and nothing of it polls the hub any more.
 
 Real step (--claude-bin): `claude -p --input-format stream-json --output-format stream-json --model haiku
 --setting-sources= --settings <temp file> --strict-mcp-config --mcp-config <temp file>`, in the temp project
@@ -224,8 +228,9 @@ wake = true
                    f"S1 woken: exit {code} {took:.1f} s after the post (at most {self.args.max_wake} s)")
         self.check(err == self.expected() + "\n", f"S1 the wake text is the hub's: {err.strip()!r}")
         self.check(not any(w in err for w in BODY_WORDS + (MARKER,)), "S1 no word of the post's body in it")
-        self.check(str(post) in (self.record(one) or {}).get("woken", {}), "S1 the hub recorded the wake")
-        self.check((self.record(one) or {}).get("queued", 1) is None, "S1 board wait acknowledged it: no offer open")
+        self.check(str(post) in (self.record(one) or {}).get("delivered", {}),
+                   "S1 board wait acknowledged it: the hub recorded the wake as delivered")
+        self.check((self.record(one) or {}).get("offer", 1) is None, "S1 no offer is left open")
 
         since = self.record(one)["armed_at"]
         b = self.arm(one, parent)
@@ -273,11 +278,30 @@ wake = true
         self.check(code == 0 and err == "", f"S6 no hub: exit {code} after {took:.1f} s")
         p4.send_signal(signal.SIGTERM)
 
+        p5, managed = self.sleeper(), str(uuid.uuid4())
+        m = self.arm(managed, p5, self.env | {"AGENT_COMMS_MANAGED": "1"})
+        code, err, took = self.exited(m, 20)
+        self.check(code == 0 and err == "" and self.record(managed) is None,
+                   f"S7 a managed process: exit {code} after {took:.1f} s, the hub never heard of it")
+
+        alone = str(uuid.uuid4())
+        w = self.arm(alone, p5)
+        self.armed(alone)
+        os.kill(w.pid, signal.SIGTERM)          # the script only, not its group
+        code, err, took = self.exited(w, 10)
+        time.sleep(waiter.CALL_SECONDS + 3)     # the hub's side of the last open call runs out
+        last = (self.record(alone) or {}).get("seen", 0)
+        time.sleep(8)
+        left = subprocess.run(["pgrep", "-g", str(w.pid)], capture_output=True, text=True).stdout.split()
+        self.check(code == 0 and (self.record(alone) or {}).get("seen", 0) == last and not left,
+                   f"S8 SIGTERM to wait.sh alone: exit {code} after {took:.1f} s, nothing left polling ({left})")
+        p5.send_signal(signal.SIGTERM)
+
     # ------------------------------------------------------------ the real session
 
     def real(self) -> None:
         print("real step: claude --model haiku, stream-json, the wake hooks only")
-        command = f"AGENT_COMMS_HOME='{self.home}' AGENT_COMMS_AGENT='claude' bash '{WAIT_SH}'"
+        command = claude_hooks.command(str(self.home), "claude", str(WAIT_SH))
         settings = claude_hooks.add({}, str(WAIT_SH), command, 600)
         (self.tmp / "claude-settings.json").write_text(json.dumps(settings, indent=2))
         (self.tmp / "claude-mcp.json").write_text(json.dumps({"mcpServers": {"agent-comms": {
@@ -346,7 +370,7 @@ wake = true
                 receipt = db.execute("SELECT 1 FROM board_state WHERE key = ?",
                                      (f"delivery.receipt.{post}.claude",)).fetchone() is not None
                 db.close()
-                self.check(str(post) in rec.get("woken", {}) and (shown or receipt),
+                self.check(str(post) in rec.get("delivered", {}) and (shown or receipt),
                            f"{step} the hub noted the woken session was shown post {post} "
                            f"(read mark: {shown}, delivery receipt: {receipt})")
             self.until("the second turn to end", lambda: results() >= 2, self.args.max_real_wake)

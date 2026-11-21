@@ -3797,6 +3797,9 @@ Both reproduced first with tests that failed on 07bf749.
 
 ## Waking an interactive session (2026-11-21)
 
+(Review round 1, below, changed how limits, holds, offers and the project work; where the two differ, round 1
+is what the code does.)
+
 **Report.** A session the human opened himself (terminal, Claude desktop app) saw new posts only when he told it to
 look; the channel push (above) needs a development flag at launch and does not work in the desktop app. This change
 wakes such a session the way a hosted session is woken (Session host (PR 3)), off by default
@@ -3905,3 +3908,90 @@ woken from `SessionStart` before any turn, again from `Stop` after the wake turn
   a board session whose conversation id is recorded and differs is not counted, but sessions through a remote hub
   record none.
 - No dashboard view of waiters.
+
+### Waking an interactive session: review round 1 (2026-11-21)
+
+Round 1 of review (on 38f21b6) found thirteen points. Each has a test in `tests/test_interactive_wake_round1.py`,
+written first and run against 38f21b6: every one failed there. For S12, the shell half was already shown by the
+earlier suite passing a non-wake text through.
+
+- **S1. What an agent token can do as a waiter.** The coordinator ruled that an agent arming for its own identity
+  is that agent: the hook holds only the agent's own token, and the hub cannot tell a process holding that token
+  from the agent's real session. So that remains possible, and it is said in the README. What could be bounded is
+  bounded:
+  - *The limits are the pair's.* The interval, the hour and the per-thread count now live in one record per agent
+    and project (`wake.pair.<agent>.<hash>`), not per conversation. A new conversation id resets nothing.
+  - *Strict input.* The conversation id must be a lowercase UUID. A project must be absolute, normalized (no `.`,
+    `..` or `//`), printable and at most 1024 characters.
+  - *Holds need an offer.* The dispatcher is held only by a wake actually offered, and only until that request's
+    deadline (S7). A waiter that is merely connected holds nothing.
+- **S2. A wake stuck with a waiter that is not the one to wake.**
+  - A decided wake is now an *offer* bound to the waiter's current nonce. It is taken back whenever it stops
+    standing: past ACK_SECONDS, superseded, its waiter gone (not seen for 20 s) or no longer the one armed last.
+  - Every look at the pair (any waiter's call, each dispatcher pass) checks this. So a wake decided for a process
+    that went away, or for an older waiter after a newer one armed, goes back to the posts' waiting list.
+  - The other waiters keep their pending posts until a wake is acknowledged; only a *delivered* wake removes a post
+    from them.
+  - At most one offer stands per pair at a time.
+- **S3. First call during a pause.** The record, and with it the mark, is made on the first call, paused or not.
+  Decisions wait for the unpause. Posts made while the session waited through the pause wake it after.
+- **S4. Acknowledgements.**
+  - An ack is checked first (`_ack`) and changes nothing unless it is accepted. Accepted means: the offer's id, the
+    calling process's nonce equal to the offer's and to the record's current one, and inside the deadline.
+  - Otherwise the hub answers "rejected" (or "superseded"), with no nonce take-over and no state change.
+  - `board wait` exits 2 only when the ack is answered "acked", or when it could not be delivered at all (an
+    exception or a 5xx: the lost-ack case, after which the hub may offer the same posts once more). Any other answer
+    to the ack is exit 0.
+- **S5. Managed processes.** `dispatch.child_env`, the one function that builds the environment of every process
+  the dispatcher, a node (`node.py`) or the session host (`session_host.py`) starts, now sets
+  `AGENT_COMMS_MANAGED=1`. That is one line in dispatch.py; session_host.py and node.py are untouched.
+  `wait.sh` and `board wait` exit 0 at once when it is set. Tested: `child_env`, a hosted session's spawn
+  environment, a dispatched run's, `board wait`, `wait.sh`, and in the e2e (S7).
+- **S6. Charging.** A wake is charged when it is acknowledged, for the threads of the posts it covered then, and
+  for no other. A thread whose posts left the offer before hand-over is not charged.
+- **S7. One grace per request.** The pair keeps, per request, the deadline set by its first offer (`holds`). Take-
+  backs and re-offers do not move it. After it, the request is held only by a read after an acknowledged wake.
+- **S8. Off is off at once.** `holds`, `claim` and `handed` read the live setting.
+  - A bare connection counts as off. For that reason `hosted_wake.reserve` now accepts the Board, and the dispatcher
+    and delivery.py pass the Board where they passed `board.conn` (three call sites, same connection).
+  - `hosted_wake.holds` passes on what it was given.
+- **S9. The project.** `board wait` binds the hook cwd's main repository (for a worktree, the repository it belongs
+  to; the logical form when $PWD shows one) whether or not a thread is there yet. The hub takes the first project
+  it is sent.
+- **S10. The installer's entries.** `claude_hooks` owns only `Stop` and `SessionStart` hooks of exactly the four
+  keys it writes, with exactly its command shape. It drops a group only if taking its hook out left that group
+  empty and the group had nothing but `hooks`. A hook that merely mentions `wait.sh`, or sits under another
+  event, stays. `add` now takes `--home` and `--agent`, and the command is built in one place (`command()`).
+- **S11. An interrupted first call.** Only a refused connection on the very first call ends `board wait` at once.
+  Anything else (a timeout, a dropped connection, a 5xx) may have reached the hub and armed the process. It is
+  retried with the same nonce within RETRY_SECONDS, like any later failure.
+- **S12. The wake's shape.** `board wait` (`waiter.WAKE_RE`) and `wait.sh` (the same pattern in ERE) pass on only
+  the whole shape of hosted_wake.wake_text, not merely its prefix. That shape is: the counts, an agent name or
+  "you", optional author names and "and N more", thread ids, the optional "needing a response" count, and the fixed
+  sentences and note.
+- **S13. SIGTERM to the hook script alone.** `wait.sh` runs `board wait` as a tracked background child with the
+  hook's stdin passed on explicitly. A trap on TERM, HUP and INT ends the child and exits 0. The e2e (S8) shows the
+  whole chain, board.sh and `uv run` included, ends and nothing polls the hub afterwards.
+
+**The long-poll blind spot, measured.** The probe ran an in-process server on a free port and wrapped each route's
+look function. It killed curl 3 s into a 20 s wait, then counted looks over the next 22 s:
+
+| Route | Middleware as shipped | `localhost_only` middleware removed |
+|---|---|---|
+| `/api/nodes/sessions` (`hosted.node_sessions_wait`) | 67 looks, the last 17 s after the caller was gone | 0 |
+| `/api/wait` | 17 looks, the last 17 s after the caller was gone | 0 |
+
+So the cause is the app's `@app.middleware("http")` (Starlette's BaseHTTPMiddleware): behind it,
+`request.is_disconnected()` never sees the disconnect. That affects `waiter_gone` too.
+
+*Cost for a node.* A node whose process dies or restarts mid-wait leaves its old fetch running for up to
+NODE_WAIT_MAX (25 s): four database reads a second, each through `hosted_wake.listing`. A wake that comes due in
+that window can be marked handed (`handed_at`) into the dead response. It stays queued and is listed to the node's
+next fetch, so it is probably not lost, but its grace runs from that hand-over. I did not trace that path to the
+end.
+
+*Not fixed here.* Replacing the decorator with a pure ASGI middleware would fix both routes. It touches every
+route, so it is not a one-line change. The `stopping` check keeps a hub restart from being held up by such waits.
+
+**Not verified.** The node-route cost above is read from the code, not run. A crash of Claude (SIGKILL) is still
+covered only by the `CLAUDE_PID` watch, tested with a stand-in parent.

@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agent_comms import claude_hooks, delivery, gateway, hosted, interactive_wake as iw, waiter
+from agent_comms import claude_hooks, delivery, gateway, hosted, hosted_wake, interactive_wake as iw, waiter
 from agent_comms.dispatch import DispatchConfig, SessionsConfig
 
 from conftest import PROJECT
@@ -37,12 +37,17 @@ def wait(env, conv=ONE, nonce=NA, who="claude", projects=(PROJECT,), ack=True, *
     assert r.status_code == 200, r.text
     out = r.json()
     if out.get("state") == "wake":
-        assert iw.ACK_RE.fullmatch(out.pop("id"))
+        wake_id = out.pop("id")
+        assert iw.ACK_RE.fullmatch(wake_id)
         if ack:
-            a = client(env, who).post("/api/wait", json=body | {"ack": rec(env, conv, who)["queued"]["id"]})
+            a = client(env, who).post("/api/wait", json=body | {"ack": wake_id})
             assert a.json() == {"state": "acked"}, a.text
-            assert rec(env, conv, who)["queued"] is None
+            assert rec(env, conv, who)["offer"] is None
     return out
+
+
+def pair(env, agent="claude", project=PROJECT) -> dict:
+    return iw._pair(env.board.conn, agent, project)
 
 
 def rec(env, conv=ONE, agent="claude") -> dict:
@@ -112,7 +117,7 @@ def test_a_post_addressed_to_the_agent_wakes_its_waiting_session_once(senv):
     post = ask(senv, tid)
     assert wait(senv) == {"state": "wake", "text": text(senv, 1, [tid])}
     r = rec(senv)
-    assert r["woken"] == {str(post["id"]): senv.clock()} and r["pending"] == {} and r["queued"] is None
+    assert r["delivered"] == {str(post["id"]): senv.clock()} and r["pending"] == {} and r["offer"] is None
     assert wait(senv, nonce=NB) == {"state": "idle"}, "the hook armed again after the wake turn: one post, one wake"
 
 
@@ -133,13 +138,15 @@ def test_history_is_not_replayed_and_only_qualifying_posts_wake(senv):
     assert woke(senv) is None
 
 
-def test_the_project_is_the_first_candidate_with_threads(senv):
+def test_the_project_is_the_first_one_sent_whether_or_not_it_has_threads(senv):
     on(senv)
     tid = senv.thread()
-    wait(senv, projects=("/somewhere/worktree", PROJECT + "/"))
+    wait(senv, projects=(PROJECT + "/", "/somewhere/worktree"))
     assert rec(senv)["project"] == PROJECT
     ask(senv, tid)
-    assert woke(senv, projects=("/somewhere/worktree", PROJECT)) == text(senv, 1, [tid])
+    assert woke(senv) == text(senv, 1, [tid])
+    wait(senv, conv=TWO, nonce=NB, projects=("/somewhere/new", PROJECT))
+    assert rec(senv, TWO)["project"] == "/somewhere/new", "bound to the canonical project the client names"
 
 
 def test_an_inactive_author_a_sealed_post_and_a_revoked_agent(senv):
@@ -190,7 +197,7 @@ def test_nothing_an_agent_wrote_reaches_the_wake_text_or_the_record(senv):
     for hay in (json.dumps(out), stored):
         for needle in ("IGNORE", "rm -rf", "human.token", "TITLE", "SUMMARY", "TASKTITLE", "REFPATH", MARKER):
             assert needle not in hay, needle
-    assert waiter.TEXT_RE.fullmatch(out["text"]), "the CLI passes it on"
+    assert waiter.WAKE_RE.fullmatch(out["text"]), "the CLI passes it on"
 
 
 # ------------------------------------------------------------ limits
@@ -235,7 +242,7 @@ def test_the_thread_maximum_holds_until_the_human_posts_there(senv):
         ask(senv, tid)
         assert woke(senv) is not None
     ask(senv, tid)
-    assert woke(senv) is None and rec(senv)["threads"][str(tid)]["stopped"] == "thread"
+    assert woke(senv) is None and pair(senv)["threads"][str(tid)]["stopped"] == "thread"
     ask(senv, other)
     assert woke(senv) == text(senv, 1, [other]), "another thread is not stopped"
     senv.post("human", tid, "carry on")
@@ -266,7 +273,7 @@ def test_one_waiter_per_agent_and_project_the_one_armed_last(senv):
     post = ask(senv, tid)
     assert woke(senv, conv=ONE) is None, "not the most recently active one"
     assert woke(senv, conv=TWO, nonce=NB) == text(senv, 1, [tid])
-    senv.clock.advance(iw.PRESENT_SECONDS + 1)      # the second session's turn runs: its hook is not waiting
+    senv.clock.advance(31)      # the second session's turn runs (its hook is not waiting); past the interval
     assert woke(senv, conv=ONE) is None, "a post another waiter was woken for wakes nobody else"
     assert str(post["id"]) not in rec(senv, ONE)["pending"]
     ask(senv, tid, as_="grok")
@@ -337,7 +344,9 @@ def test_holds_within_the_grace_then_only_with_the_waiters_own_read(senv):
     post = ask(senv, tid)
     assert not holds(senv, post)
     wait(senv)
-    assert holds(senv, post) and hosted.holds(senv.board.conn, "claude", PROJECT + "/", post["id"], senv.clock())
+    assert holds(senv, post) and holds(senv, post, project=PROJECT + "/")
+    assert not hosted.holds(senv.board.conn, "claude", PROJECT, post["id"], senv.clock()), \
+        "a bare connection cannot tell whether the feature is on: it holds nothing"
     assert not holds(senv, post, agent="codex") and not holds(senv, post, project=P2)
     senv.clock.advance(GRACE - 1)
     assert holds(senv, post)
@@ -371,8 +380,8 @@ def test_the_dispatcher_does_not_launch_beside_a_waiter_it_just_woke_and_does_af
     allow(denv)
     wait(denv)
     post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
-    denv.d.tick()               # the dispatcher's own pass queues the wake before it decides
-    assert launched(denv) == [] and rec(denv)["queued"]["posts"] == [post["id"]]
+    denv.d.tick()               # the dispatcher's own pass offers the wake before it decides
+    assert launched(denv) == [] and list(rec(denv)["offer"]["entries"]) == [str(post["id"])]
     assert woke(denv) == text(denv, 1, [denv.tid], authors="human"), "the open call hands it"
     denv.clock.advance(GRACE - 20)
     denv.d.tick()
@@ -401,17 +410,19 @@ def test_a_wake_nobody_acknowledged_is_taken_back_and_offered_again(senv):
     tid = senv.thread()
     wait(senv)
     post = ask(senv, tid)
-    assert woke(senv, ack=False) == text(senv, 1, [tid])       # offered; the process died before acknowledging
-    assert holds(senv, post), "held while the offer is open"
+    first = client(senv, "claude").post("/api/wait", json={"client_session_id": ONE, "projects": [PROJECT],
+                                                           "nonce": NA}).json()
+    assert first["state"] == "wake" and holds(senv, post), "offered (the process died before acknowledging): held"
     senv.clock.advance(iw.ACK_SECONDS - 1)
-    assert woke(senv, nonce=NB) is None, "not offered twice while the first offer is open"
+    again = client(senv, "claude").post("/api/wait", json={"client_session_id": ONE, "projects": [PROJECT],
+                                                           "nonce": NA}).json()
+    assert again == first, "the same offer while it stands, to the same process"
     senv.clock.advance(1)
-    assert woke(senv, nonce=NB) is None and rec(senv)["queued"] is None and rec(senv)["sent"] == []
-    assert str(post["id"]) in rec(senv)["pending"] and not holds(senv, post), "taken back: not counted, not held"
-    assert woke(senv, nonce=NB) == text(senv, 1, [tid]), "offered again to the conversation's next process"
+    assert pair(senv)["sent"] == [], "never acknowledged: not counted"
+    assert woke(senv, nonce=NB) == text(senv, 1, [tid]), "taken back and offered to the conversation's next process"
     stale = client(senv, "claude").post("/api/wait", json={"client_session_id": ONE, "projects": [PROJECT],
                                                            "nonce": NB, "ack": "f" * 16})
-    assert stale.json() == {"state": "idle"}, "an id that is not the open offer's acknowledges nothing"
+    assert stale.json() == {"state": "rejected"}, "an id that is not the open offer's acknowledges nothing"
 
 
 def test_the_dispatchers_pass_takes_back_an_offer_nobody_acknowledged(senv):
@@ -420,12 +431,13 @@ def test_the_dispatchers_pass_takes_back_an_offer_nobody_acknowledged(senv):
     wait(senv, conv=ONE)
     senv.clock.advance(1)
     wait(senv, conv=TWO, nonce=NB)
-    post = ask(senv, tid)
+    ask(senv, tid)
     assert woke(senv, conv=TWO, nonce=NB, ack=False) is not None    # the session armed last; it died meanwhile
     senv.clock.advance(iw.ACK_SECONDS)
     iw.tick(senv.board)
-    assert rec(senv, TWO)["queued"] is None and str(post["id"]) in rec(senv, TWO)["pending"]
     senv.clock.advance(iw.PRESENT_SECONDS - iw.ACK_SECONDS + 1)
+    iw.tick(senv.board)
+    assert rec(senv, TWO)["offer"] is None, "its waiter is gone: taken back"
     assert woke(senv, conv=ONE) == text(senv, 1, [tid]), "the other waiting session of the agent gets it"
 
 
@@ -447,11 +459,11 @@ def test_a_wake_queued_by_the_dispatcher_loses_a_post_read_meanwhile(denv):
     tid = denv.thread()
     post = ask(denv, tid)
     denv.d.tick()
-    assert rec(denv)["queued"]["posts"] == [post["id"]]
+    assert list(rec(denv)["offer"]["entries"]) == [str(post["id"])]
     s = denv.session("claude")
     out = denv.board.read_updates(denv.p["claude"], s)
     denv.board.ack(denv.p["claude"], s, out["ack_through"])
-    assert woke(denv) is None and rec(denv)["queued"] is None and rec(denv)["sent"] == [], "dropped, not counted"
+    assert woke(denv) is None and rec(denv)["offer"] is None and pair(denv)["sent"] == [], "dropped, not counted"
 
 
 # ------------------------------------------------------------ board wait (the CLI side)
@@ -480,10 +492,12 @@ def run_wait(hub, stdin=None, **kw):
     return code, err.getvalue()
 
 
+WAKE = hosted_wake.wake_text("claude", [[4, "codex", True, 9]])
+
+
 def test_board_wait_exits_2_with_the_wake_text_and_0_otherwise():
-    hub = FakeHub({"state": "idle"},
-                  {"state": "wake", "text": "agent-comms: 1 new post(s) addressed to claude.", "id": "0" * 16})
-    assert run_wait(hub) == (2, "agent-comms: 1 new post(s) addressed to claude.\n")
+    hub = FakeHub({"state": "idle"}, {"state": "wake", "text": WAKE, "id": "0" * 16})
+    assert run_wait(hub) == (2, WAKE + "\n")
     body = hub.bodies[0]
     assert body["client_session_id"] == ONE and body["projects"] == [PROJECT] and len(body["nonce"]) == 32
     assert hub.bodies[1]["nonce"] == body["nonce"], "one nonce per process"
@@ -493,11 +507,12 @@ def test_board_wait_exits_2_with_the_wake_text_and_0_otherwise():
             if json.get("ack") is not None:
                 raise httpx.ConnectError("gone")
             return super().post(path, json)
-    assert run_wait(AckLost({"state": "wake", "text": "agent-comms: x", "id": "1" * 16})) == (2, "agent-comms: x\n"), \
-        "woken even when the acknowledgement is lost"
+    assert run_wait(AckLost({"state": "wake", "text": WAKE, "id": "1" * 16})) == (2, WAKE + "\n"), \
+        "woken even when the acknowledgement could not be delivered"
     for answers in ([{"state": "off"}], [{"state": "superseded"}], [(401, {"error": "unauthorized"})],
-                    [{"state": "wake", "text": "not the fixed form"}],
-                    [{"state": "wake", "text": "agent-comms: two\nlines"}], [{"state": "something new"}],
+                    [{"state": "wake", "text": "not the fixed form", "id": "0" * 16}],
+                    [{"state": "wake", "text": WAKE + "\nlines", "id": "0" * 16}], [{"state": "something new"}],
+                    [{"state": "wake", "text": WAKE}],
                     [httpx.ConnectError("refused")]):
         assert run_wait(FakeHub(*answers)) == (0, ""), answers
     assert run_wait(FakeHub(), stdin="not json") == (0, "")
@@ -506,7 +521,7 @@ def test_board_wait_exits_2_with_the_wake_text_and_0_otherwise():
 
 def test_board_wait_rides_out_a_short_outage_then_gives_up():
     t = [0.0]
-    hub = FakeHub({"state": "idle"}, httpx.ConnectError("x"), (502, {}), {"state": "wake", "text": "agent-comms: x"})
+    hub = FakeHub({"state": "idle"}, httpx.ConnectError("x"), (502, {}), {"state": "wake", "text": WAKE, "id": "0" * 16})
     assert run_wait(hub, clock=lambda: t[0])[0] == 2
     errors = [httpx.ConnectError("x")] * 100
 
@@ -549,8 +564,8 @@ def test_wait_sh_passes_on_only_the_wake_text(tmp_path):
     shim = tmp_path / "integrations" / "claude-code"
     shim.mkdir(parents=True)
     (shim / "wait.sh").write_text((ROOT / "integrations/claude-code/wait.sh").read_text())
-    for rc, err, expect in ((2, "agent-comms: 1 new post(s) addressed to claude.", 2), (2, "usage: board ...", 0),
-                            (2, "agent-comms: a\x07bell", 0), (0, "agent-comms: x", 0), (1, "boom", 0)):
+    for rc, err, expect in ((2, WAKE, 2), (2, "usage: board ...", 0), (2, "agent-comms: x", 0),
+                            (2, WAKE.replace("thread 4", "thread 4\x07"), 0), (0, WAKE, 0), (1, "boom", 0)):
         (tmp_path / "err").write_text(err)
         (shim / "board.sh").write_text(f"cat >/dev/null; cat '{tmp_path / 'err'}' >&2; exit {rc}\n")
         r = subprocess.run(["bash", str(shim / "wait.sh")], input="{}", capture_output=True, text=True, timeout=10)
@@ -567,9 +582,10 @@ def test_claude_hooks_add_is_idempotent_and_remove_takes_out_only_ours(tmp_path)
                                     "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "b"}]}]}}
     f.write_text(json.dumps(mine))
     os.chmod(f, 0o640)
-    cmd = "AGENT_COMMS_AGENT='claude' bash '/x/wait.sh'"
+    cmd = claude_hooks.command("/b", "claude", "/x/wait.sh")
+    add = ["add", "--settings", str(f), "--script", "/x/wait.sh", "--home", "/b", "--agent", "claude"]
     for _ in range(2):
-        assert claude_hooks.main(["add", "--settings", str(f), "--script", "/x/wait.sh", "--command", cmd]) == 0
+        assert claude_hooks.main(add) == 0
     got = json.loads(f.read_text())
     ours = {"type": "command", "command": cmd, "asyncRewake": True, "timeout": 86400}
     assert got["hooks"]["Stop"] == mine["hooks"]["Stop"] + [{"hooks": [ours]}]
@@ -579,7 +595,7 @@ def test_claude_hooks_add_is_idempotent_and_remove_takes_out_only_ours(tmp_path)
     assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
     assert json.loads(f.read_text()) == mine
     f.write_text("[1]")
-    assert claude_hooks.main(["add", "--settings", str(f), "--script", "/x/wait.sh", "--command", cmd]) == 1
+    assert claude_hooks.main(add) == 1
     assert f.read_text() == "[1]"
     assert claude_hooks.main(["remove", "--settings", str(tmp_path / "none.json"), "--script", "/x/wait.sh"]) == 0
     assert not (tmp_path / "none.json").exists()
