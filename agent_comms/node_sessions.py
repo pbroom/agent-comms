@@ -40,6 +40,11 @@ Rules the hub relies on:
   (session_worktrees.py, recorded in WORKTREES_FILE), made when it is first opened and removed once the session has
   ended and it holds nothing unique. A hub that says none of this gets none of it: the session is opened and
   reported exactly as before.
+- This node says it speaks that protocol on every fetch (`tree=1`), and only then does the hub list children to it.
+- A child runs only under its parent AS THE PARENT IS HERE NOW. Roots are reconciled first; a child is opened, and
+  handed a turn, only while its parent is open on this node and has at least the child's access (`_parent_problem`).
+  The hub's stored words are not enough: this machine's runner may have been edited since. Otherwise the child is
+  ended with the reason.
 """
 from __future__ import annotations
 
@@ -53,7 +58,7 @@ from typing import Any, Callable
 
 import httpx
 
-from . import session_worktrees
+from . import session_access, session_worktrees
 from .dispatch import DispatchConfig
 from .session_host import HostEvent, SessionHost
 
@@ -71,6 +76,11 @@ SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp th
 WORKTREES_FILE = "node-session-worktrees.json"   # session id -> {path, checkout}: a child session's own worktree
 SWEEP_SECONDS = 3600.0      # how often the worktrees of sessions that are gone are looked at again
 PARENT_ENDED = "its parent session ended"
+PARENT_GONE = ("its parent session is not open on this node (it could not be opened here, or has ended): a child "
+               "session runs only under its parent")
+PARENT_UNKNOWN = "its parent session's access is not known on this node"
+ABOVE_PARENT = ("its access ({have}) is above what its parent session has on this node now ({limit}): a child session "
+                "never has more access than its parent")
 LOST = "the node restarted while this turn was in flight; it was not replayed"
 FRESH_START = (". Before that the agent refused to resume this session's conversation: the next message starts a NEW "
                "one, without the earlier turns")
@@ -85,6 +95,7 @@ class SessionRunner:
         self.host = host or SessionHost(config, self.log_dir, clock=clock, **host_kw)
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
+        self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
         self.worktrees: dict[str, dict] = self._load_worktrees()
         self.swept = float("-inf")
         self.max_live, self.idle_seconds = config.sessions.max_live, config.sessions.idle_hours * 3600
@@ -280,7 +291,7 @@ class SessionRunner:
         return True
 
     def _sync(self, wait: float) -> dict:
-        params: dict[str, Any] = {"wait": wait}
+        params: dict[str, Any] = {"wait": wait, "tree": 1}     # this node speaks the child-session protocol
         if wait and self.version:
             params["seen"] = self.version
         if not wait:
@@ -353,7 +364,8 @@ class SessionRunner:
             return
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
-        for sid, view in listed.items():
+        # Roots first: a child is only opened under a parent that is open here (`_parent_problem`).
+        for sid, view in sorted(listed.items(), key=lambda kv: isinstance(kv[1].get("parent"), str)):
             applied = view.get("status_seq")
             if type(applied) is int:
                 self.hub_seq = max(self.hub_seq, applied)
@@ -374,6 +386,12 @@ class SessionRunner:
                     self.ending.add(sid)
                     self._add(sid, {"kind": "ended", "detail": why})
                 continue
+            parent = view.get("parent") if isinstance(view.get("parent"), str) else None
+            if parent is not None:
+                self.parent_of[sid] = parent
+                if self._parent_problem(parent, None) is not None:     # before anything is opened or made for it
+                    self._end_child(sid, self._parent_problem(parent, None))
+                    continue
             if s is None:
                 left = self.recovered.pop(sid, None) or {}
                 # Resume only a session the provider confirmed: the hub's record of it (the host's own `resume`,
@@ -395,6 +413,9 @@ class SessionRunner:
                                     "detail": f"this node cannot host the session: {type(e).__name__}: {e}"[:300]})
                     continue
                 self.last_busy[sid] = self.clock()
+            if parent is not None and self._parent_problem(parent, s) is not None:
+                self._end_child(sid, self._parent_problem(parent, s))   # the access it has here is above its parent's
+                continue
             self._tree_status(sid, view, s)
             held, queue = self._held(s), []
             for m in sorted((m for m in view.get("messages", []) if isinstance(m, dict) and type(m.get("n")) is int),
@@ -464,12 +485,40 @@ class SessionRunner:
             raise ValueError("unknown isolation for a child session")
         return kw
 
-    def _tree_status(self, sid: str, view: dict, s) -> None:
-        """Whether this session's reports carry its access and worktree: only for a hub that asked."""
-        if "access" not in view and "parent" not in view:
+    def _parent_problem(self, parent_id: str, s) -> str | None:
+        """Why a child may not be opened or take a turn under its parent as the parent is on this node NOW, or None.
+        `s`: the child once it is open; its access here is then held against the parent's. The parent's access is
+        what this machine's runner gives it today, or what its process last reported (session_host)."""
+        parent = self.host.sessions.get(parent_id)
+        if parent is None or parent.ended or parent_id in self.ending or parent_id in self.dropped:
+            return PARENT_GONE
+        if s is None:
+            return None
+        if parent.access not in session_access.LEVELS or s.access not in session_access.LEVELS:
+            return PARENT_UNKNOWN
+        if not session_access.within(s.access, parent.access):
+            return ABOVE_PARENT.format(have=s.access, limit=parent.access)
+        return None
+
+    def _end_child(self, sid: str, why: str) -> None:
+        """End a child here and tell the hub why: it is not opened, or is closed if it was open."""
+        log.warning("child session %s: %s", sid, why)
+        if sid in self.host.sessions:
+            self._emit(self.host.close(sid, why))
+        else:
+            self.ending.add(sid)
+            self._add(sid, {"kind": "ended", "detail": why[:300]})
+
+    def _tree_status(self, sid: str, view: dict | None, s) -> None:
+        """Whether this session's reports carry its access and worktree: only for a hub that asked (`view`: its
+        entry in the hub's list; None: as decided at the last fetch). The access is reported once it is known:
+        for Claude that is when its process has said what it really runs with (session_host), not before."""
+        if view is not None and "access" not in view and "parent" not in view:
             self.tree.pop(sid, None)
             return
-        tree = {"access": s.access, "worktree": self.worktrees.get(sid, {}).get("path")}
+        if view is None and sid not in self.tree:
+            return
+        tree = {"access": s.access if s.access_known else None, "worktree": self.worktrees.get(sid, {}).get("path")}
         if self.tree.get(sid) != tree:
             self.tree[sid] = tree
             self.reported.pop(sid, None)        # say how it stands again, with these
@@ -509,10 +558,16 @@ class SessionRunner:
         return False
 
     def _hand_over(self, now: float) -> None:
-        for sid, queue in self.queue.items():
+        for sid, queue in list(self.queue.items()):     # ending a child here drops its queue
             s = self.host.sessions.get(sid)
             if (not queue or s is None or s.ended or s.busy or s.inbox or s.stopping_since is not None
-                    or not isinstance(queue[0].get("text"), str) or not self._admit(s)):
+                    or not isinstance(queue[0].get("text"), str)):
+                continue
+            if sid in self.parent_of and self._parent_problem(self.parent_of[sid], s) is not None:
+                # Not a turn under a parent that is gone here, or that has less access now than this child.
+                self._end_child(sid, self._parent_problem(self.parent_of[sid], s))
+                continue
+            if not self._admit(s):
                 continue
             m = queue.pop(0)
             self.handed[sid] = m["n"]
@@ -538,12 +593,14 @@ class SessionRunner:
                 self.last_busy[sid] = now
             if s.ended and s.child is None:
                 self.host.forget(sid)
-                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree):
+                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree,
+                          self.parent_of):
                     d.pop(sid, None)
                 self._drop_worktree(sid)        # a child's own worktree, now that its process is gone
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:
                 self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))
+                self._tree_status(sid, None, s)     # its access may just have been verified (a turn started)
 
     @staticmethod
     def _own_id(s) -> str | None:

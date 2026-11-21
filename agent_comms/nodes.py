@@ -89,12 +89,15 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
 
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
           headless_browser: Any = None, checkout_roots: Any = None, access: Any = None,
-          sessions: Any = None) -> dict:
+          sessions: Any = None, session_host: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
     `access`: the node's `[dispatch.runner_access]`, runner key -> access entries (access.py), for runners it offers.
-    `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py)."""
+    `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py).
+    `session_host`: {"tree": 1, "runners": [...]} from a node that speaks the child-session protocol
+    (hosted_tree.py): `runners` are the runner keys it can host as sessions at all (it has an adapter for their
+    CLI). A node that does not say so gets no child sessions."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -117,12 +120,22 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         if set(sessions if isinstance(sessions, dict) else ()) != {"max_live"} or isinstance(live, bool) \
                 or not isinstance(live, int) or not 1 <= live <= 50:
             raise Invalid('sessions must be {"max_live": an integer from 1 to 50}')
+    hosting = None
+    if session_host is not None:
+        tree = session_host.get("tree") if isinstance(session_host, dict) else None
+        if (sessions is None or set(session_host if isinstance(session_host, dict) else ()) != {"tree", "runners"}
+                or isinstance(tree, bool) or not isinstance(tree, int) or not 1 <= tree <= 1000):
+            raise Invalid('session_host must be {"tree": a version number, "runners": [...]} beside sessions')
+        hosting = {"tree": tree, "runners": _strings(session_host["runners"], "session_host runners",
+                                                     lambda v: v in runners)}
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,
             "max_concurrent": max_concurrent, "last_seen": now}
     if sessions is not None:
         info["sessions"] = {"max_live": sessions["max_live"]}
+    if hosting is not None:
+        info["session_host"] = hosting
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.

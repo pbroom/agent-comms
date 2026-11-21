@@ -6,6 +6,10 @@ Code 2.1.322 (DESIGN_NOTES "Session host (PR 1)"):
   `result` event; both carry the `session_id` given as `--session-id` (or `--resume`).
 - A `result` lists the tool calls that were refused as `permission_denials`: objects with `tool_name`, `tool_use_id`
   and `tool_input`. Only the names leave this module: an input can hold file contents and paths.
+- Each `init` also names the `permissionMode` the turn really runs in and the `tools` the session really has. Both
+  can differ from what the command line asked for: a settings file's `permissions.defaultMode` put a process started
+  with no bypass flag into `bypassPermissions` (seen live). The adapter passes both on with `turn_started`, and the
+  host holds them against the session's access (session_access.verify).
 - With `--permission-prompts none` anything that would ask is refused on the spot, so the process never waits for an
   answer. A `control_request` asking to use a tool should therefore never arrive; if one does it is reported and left
   unanswered (nothing is approved), and the host's turn timeout ends the turn.
@@ -26,6 +30,7 @@ STREAM_FLAGS = ("--input-format", "stream-json", "--output-format", "stream-json
 NO_PROMPTS = ("--permission-prompts", "none")
 TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 MAX_DENIALS = 50
+MAX_TOOLS = 2000        # tool names taken from one `init`
 # The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
 # (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
@@ -76,6 +81,7 @@ def _meta(ev: dict) -> dict:
 
 class ClaudeSession:
     waits_for_ready = False     # `init` only arrives once the first turn has been written
+    verifies_mode = True        # ... and says what the turn really runs with: the session's access is known then
 
     def __init__(self):
         self.session_id: str | None = None
@@ -167,7 +173,12 @@ class ClaudeSession:
         if init:
             events = [] if self._ready else [Event("ready", provider_id=sid)]
             self._ready = True
-            return events + [Event("turn_started")], []
+            mode, tools = ev.get("permissionMode"), ev.get("tools")
+            # A name that is not a plain tool name still counts as a tool the session has: "unknown", never dropped.
+            named = tuple(t if isinstance(t, str) and TOOL_NAME_RE.fullmatch(t) else "unknown"
+                          for t in (tools if isinstance(tools, list) else [])[:MAX_TOOLS + 1])
+            return events + [Event("turn_started", mode=mode if isinstance(mode, str) and len(mode) <= 40 else None,
+                                   tools=named)], []
         if kind == "result":
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
             return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),

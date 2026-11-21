@@ -54,6 +54,7 @@ class NodeHelloIn(Body):
     checkout_roots: list[str] = []
     access: dict[str, list[str]] = {}
     sessions: dict[str, StrictInt] | None = None    # {"max_live": n}: the node hosts sessions (hosted.py)
+    session_host: dict[str, Any] | None = None      # {"tree": 1, "runners": [...]}: it speaks the child protocol
 
 
 class NodeReportIn(Body):
@@ -821,7 +822,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def node_hello(body: NodeHelloIn, p: Principal = P):
         from . import nodes
         return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent,
-                           body.headless_browser, body.checkout_roots, body.access, body.sessions)
+                           body.headless_browser, body.checkout_roots, body.access, body.sessions,
+                           session_host=body.session_host)
 
     @app.get("/api/nodes/assignments")
     def node_assignments(p: Principal = P):
@@ -844,10 +846,12 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         return gone
 
     @app.get("/api/nodes/sessions")
-    async def node_sessions(request: Request, wait: float = 0, seen: str | None = None, p: Principal = P):
+    async def node_sessions(request: Request, wait: float = 0, seen: str | None = None, tree: int = 0,
+                            p: Principal = P):
         # async: wait > 0 long-polls without holding a worker thread (as /api/updates does)
+        # tree: the node says it speaks the child-session protocol; without it no child session is listed to it.
         from . import hosted
-        return await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request))
+        return await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request), tree=tree >= 1)
 
     @app.post("/api/nodes/sessions/{session_id}")
     def node_session_report(session_id: str, body: NodeSessionReportIn, p: Principal = P):

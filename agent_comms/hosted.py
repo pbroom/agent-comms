@@ -321,11 +321,12 @@ def close(board: Board, p: Principal, session_id: Any) -> dict:
     with db.write_tx(board.conn) as c:
         r = _session(c, session_id)
         if r["state"] != "ended":
-            if now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS:   # away, or no longer hosting sessions
+            from . import hosted_tree
+            if (now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS   # away, or no longer hosting sessions
+                    or (hosted_tree.is_child(r) and not hosted_tree.node_supports(c, r["node"]))):   # ... or children
                 _end(c, r, "closed by the human (its node was not connected)", p.name, now)
             elif not r.get("stop"):
                 r |= {"stop": "close", "updated_at": now}
-                from . import hosted_tree
                 hosted_tree.cascade(c, r, p.name, now)      # its children are closed with it, now
             _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     return _human_view(board, r)
@@ -387,24 +388,28 @@ def _settle(board: Board, r: dict) -> dict:
 # ---------------------------------------------------------------- the node's side
 
 
-def node_sessions(board: Board, p: Principal) -> dict:
+def node_sessions(board: Board, p: Principal, tree: bool = False) -> dict:
     """This node's sessions that have not ended, each with its unsettled messages (oldest first). Only the first
     queued message of a session carries its text: the node writes one at a time. `version` changes whenever
-    anything the node acts on does, so the node's long-poll can wait on it."""
+    anything the node acts on does, so the node's long-poll can wait on it.
+    `tree`: the node said, on this request, that it speaks the child-session protocol (hosted_tree.py). Only then
+    is a child session listed to it, or a root asked for its access: a node that does not know the protocol (one
+    rolled back to an earlier version) would open a child as an ordinary session of its agent, in the shared
+    checkout and with its runner's own permissions, whatever access and isolation the child was made with."""
     nodes._require_node(board, p)
     from . import hosted_wake
     # PR 3: queue the wakes that are due; a wake is validated in the transaction that shows it (hosted_wake.listing).
-    return hosted_wake.listing(board, p.name, lambda: _listed(board, p))
+    return hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree))
 
 
-def _listed(board: Board, p: Principal) -> dict:
+def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     """node_sessions' answer, read inside the transaction hosted_wake.listing opened."""
     nodes._require_node(board, p)       # again, in that transaction: a pause may have landed since the first check
     from . import hosted_tree
     spawn = hosted_tree.spawn_config(board).enabled
     out, mark = [], []
     for r in sorted(_sessions(board.conn), key=lambda r: r["session_id"]):
-        if r.get("node") != p.name or r.get("state") == "ended":
+        if r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree):
             continue
         msgs, first = [], True
         for m in _messages(board.conn, r["session_id"]):
@@ -421,7 +426,7 @@ def _listed(board: Board, p: Principal) -> dict:
                       "status_seq": int(r.get("status_seq") or 0)}
                    # A child's parent, access word, isolation and effort; `access: None` on a root when child
                    # sessions are on. Nothing otherwise: the entry is then what it was before there were trees.
-                   | hosted_tree.node_extra(r, spawn))
+                   | hosted_tree.node_extra(r, spawn and tree))
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] for m in msgs]])
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
     return {"node": p.name, "sessions": out, "version": version}
@@ -609,13 +614,14 @@ async def _poll(fetch: Callable[[], dict], done: Callable[[dict], bool], seconds
     return out
 
 
-async def node_sessions_wait(board: Board, p: Principal, wait: Any = 0, seen: Any = None, gone=None) -> dict:
+async def node_sessions_wait(board: Board, p: Principal, wait: Any = 0, seen: Any = None, gone=None,
+                             tree: bool = False) -> dict:
     """node_sessions, held back for up to `wait` seconds while its version is still the one the node has `seen`."""
     seconds = _wait_seconds(wait, NODE_WAIT_MAX)
     if seen is not None and (not isinstance(seen, str) or not _SEEN.fullmatch(seen)):
         raise Invalid("seen must be a version this route returned")
-    return await _poll(lambda: node_sessions(board, p), lambda out: seen is None or out["version"] != seen, seconds,
-                       gone)
+    return await _poll(lambda: node_sessions(board, p, tree), lambda out: seen is None or out["version"] != seen,
+                       seconds, gone)
 
 
 async def message_wait(board: Board, p: Principal, session_id: Any, n: Any, wait: Any = 0, gone=None) -> dict:

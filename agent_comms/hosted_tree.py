@@ -122,9 +122,19 @@ def _existing(conn, parent_id: str, request_id: str | None) -> dict | None:
     return None
 
 
+def node_supports(conn, node: str) -> bool:
+    """The node's latest hello says it speaks the child-session protocol. One that does not (an earlier version,
+    or one rolled back to it) is listed no child and can be given none."""
+    info = _get(conn, nodes.NODE_PREFIX + node)
+    hosting = info.get("session_host") if isinstance(info, dict) else None
+    return isinstance(hosting, dict) and type(hosting.get("tree")) is int and hosting["tree"] >= 1
+
+
 def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[str, dict] | None) -> None:
     """The child's agent on the PARENT'S node: the hub's grant for that node must cover the project and the agent
-    (as for a root), and the node must be connected as a session host with a runner for the agent."""
+    (as for a root), and the node must be connected as a session host with a runner for the agent, speak the
+    child-session protocol NOW (its latest hello), and be able to host that runner as a session (it has an adapter
+    for its CLI: a Codex runner only where the node turned Codex sessions on)."""
     node, project = parent["node"], parent["project"]
     grant = (allowed or {}).get(node)
     if (not isinstance(grant, dict) or not nodes.grant_covers(grant, project)
@@ -134,6 +144,14 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
     if nodes.node_for(board, project, agent, runtime, {node: grant}, room=False, sessions=True) != node:
         raise Conflict(f"node {node}, which hosts the parent session, is not connected as a session host with a "
                        f"runner for {agent} (a child session runs on its parent's node)")
+    if not node_supports(board.conn, node):
+        raise Conflict(f"node {node} does not host child sessions: it runs a version of agent-comms from before "
+                       "them (or was rolled back to one). Update it and start `board node` again")
+    info = _get(board.conn, nodes.NODE_PREFIX + node)
+    if nodes.runner_key(info, agent, runtime) not in info["session_host"]["runners"]:
+        raise Conflict(f"node {node} cannot host {agent} as a session: it has a runner for it, but no way to keep "
+                       "that runner's CLI open as a session (for a Codex runner the node's settings need "
+                       "[dispatch.sessions] codex = true)")
 
 
 def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any = None, model: Any = None,
@@ -220,7 +238,8 @@ def cascade(c, parent: dict, by: str, now: float) -> None:
     if is_child(parent):
         return
     for child in children(c, parent["session_id"], live=True):
-        if now - hosted._node_seen(c, child["node"]) > nodes.NODE_STALE_SECONDS:
+        if (now - hosted._node_seen(c, child["node"]) > nodes.NODE_STALE_SECONDS
+                or not node_supports(c, child["node"])):        # nobody there will carry a stop flag out
             hosted._end(c, child, PARENT_ENDED + " (its node was not connected)", by, now)
         elif not child.get("stop"):
             child |= {"stop": "parent", "updated_at": now}

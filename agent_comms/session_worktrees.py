@@ -7,10 +7,14 @@ worktree_dir` (default ~/agent-comms-worktrees), beside the dispatcher's run wor
 named `session-<session id>`, which the dispatcher's own pruning never takes for one of its `<agent>-t<thread>`
 directories.
 
-- Created when the session is first opened on the node, reused when it is opened again (a node restart). A directory
-  there that is not a worktree of this checkout is refused, never reused or overwritten.
-- Removed only when the session has ended AND the dispatcher's safe-removal rule holds: nothing uncommitted or
-  untracked, and its HEAD is on some branch or remote-tracking ref. Otherwise it stays where it is, for the human.
+- Created when the session is first opened on the node, reused when it is opened again (a node restart). Only a
+  directory that git itself lists as a linked worktree of this checkout, at exactly this path with no symlink in
+  it, is reused: anything else there is refused, never reused or overwritten. (That a directory is inside the
+  repository is not enough: git finds the checkout's own `.git` from any plain folder under it.)
+- Removed only when the session has ended AND nothing unique is in it: the dispatcher's rule (nothing uncommitted
+  or untracked, HEAD on some branch or remote-tracking ref) and, beyond it, no IGNORED file either. A build output
+  or a local `.env` is ignored and is still somebody's work; neither `git status` nor an unforced `git worktree
+  remove` looks at ignored files. Otherwise it stays where it is, for the human.
 - Nothing here takes a path from the hub: the hub says `worktree`, and the path follows from this machine's settings
   and the session id.
 """
@@ -20,11 +24,12 @@ import os
 import subprocess
 
 from .core import Conflict
-from .dispatch import (DispatchConfig, _git_common_dir, _within, ensure_run_worktree, protected_paths,
-                       removable_run_worktree, run_worktree_path)
+from .dispatch import (DispatchConfig, _within, ensure_run_worktree, protected_paths, removable_run_worktree,
+                       run_worktree_path)
 from .providers import SESSION_ID_RE, validate_session_id
 
 PREFIX = "session-"
+NOT_OURS = "the session's worktree path exists but is not a linked worktree of this checkout registered at that path"
 
 
 def _check_root(config: DispatchConfig) -> str:
@@ -45,29 +50,58 @@ def path_for(config: DispatchConfig, checkout: str, session_id: str) -> str:
     return os.path.join(repo, PREFIX + validate_session_id(session_id))
 
 
+def _git(cwd: str, *args: str, timeout: float = 30) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def registered(checkout: str, path: str) -> bool:
+    """git lists `path` as a LINKED worktree of this checkout (`git worktree list`, never the main one), and the
+    path is canonical: a real directory, itself and every ancestor free of symlinks."""
+    if os.path.islink(path) or not os.path.isdir(path) or os.path.realpath(path) != path:
+        return False
+    r = _git(checkout, "worktree", "list", "--porcelain", "-z")
+    if r is None or r.returncode != 0:
+        return False
+    listed = [field[len("worktree "):] for field in r.stdout.split("\0") if field.startswith("worktree ")]
+    return any(os.path.realpath(p) == path for p in listed[1:])     # the first entry is the main worktree
+
+
 def ensure(config: DispatchConfig, checkout: str, session_id: str) -> str:
     """Create the session's worktree, detached at the checkout's HEAD, or reuse the one it has. Conflict: the
-    checkout is not a Git repository, the path is taken by something else, or git refused."""
-    return ensure_run_worktree(checkout, path_for(config, checkout, session_id))
+    checkout is not a Git repository, the path is taken by anything that is not this checkout's registered linked
+    worktree at exactly that path, a symlink is on the way, or git refused."""
+    path = path_for(config, checkout, session_id)
+    if os.path.lexists(path):
+        if not registered(checkout, path):
+            raise Conflict(NOT_OURS)
+        return path
+    made = ensure_run_worktree(checkout, path)      # refuses a parent directory reached through a symlink
+    if not registered(checkout, made):
+        raise Conflict(NOT_OURS)
+    return made
+
+
+def holds_nothing(path: str) -> bool:
+    """Nothing of anybody's is in this worktree: nothing modified, staged, untracked or IGNORED, and its HEAD is on a
+    branch or remote-tracking ref (dispatch.removable_run_worktree). Every untracked and ignored file is listed, one
+    by one: a directory git would otherwise sum up as one line, or skip, counts."""
+    r = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")
+    return r is not None and r.returncode == 0 and not r.stdout.strip() and removable_run_worktree(path)
 
 
 def remove_if_safe(checkout: str, path: str) -> str:
     """After the session ended: "removed", "gone" (there is nothing there any more), or "kept". Only a directory
-    named as `path_for` names them, that is a worktree of this checkout and holds nothing unique
-    (removable_run_worktree), is removed, and by git itself (`git worktree remove`, which refuses a dirty tree)."""
+    named as `path_for` names them, that git lists as a linked worktree of this checkout at exactly that path and
+    that holds nothing (`holds_nothing`, ignored files included), is removed, and by git itself."""
     name = os.path.basename(path)
     if not name.startswith(PREFIX) or not SESSION_ID_RE.fullmatch(name[len(PREFIX):]) or not os.path.isabs(path):
         return "kept"
     if not os.path.lexists(path):
         return "gone"
-    if os.path.islink(path) or not os.path.isdir(path):
+    if not registered(checkout, path) or not holds_nothing(path):
         return "kept"
-    common = _git_common_dir(checkout)
-    if common is None or _git_common_dir(path) != common or not removable_run_worktree(path):
-        return "kept"
-    try:
-        r = subprocess.run(["git", "-C", checkout, "worktree", "remove", path], capture_output=True, text=True,
-                           timeout=60, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return "kept"
-    return "removed" if r.returncode == 0 and not os.path.lexists(path) else "kept"
+    r = _git(checkout, "worktree", "remove", path, timeout=60)
+    return "removed" if r is not None and r.returncode == 0 and not os.path.lexists(path) else "kept"

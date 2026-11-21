@@ -249,10 +249,22 @@ def main(argv: list[str] | None = None) -> None:
     def raw(x):     # `board session list --json` as well as `board --json session list`
         x.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print raw JSON")
 
+    # Two forms. A session of its own takes two required positionals, as it always did, so options may stand before,
+    # between and after them (`start /repo --agent codex hello`). With --parent written out, the project is the
+    # parent's and there is one positional. Which form applies is read from the arguments before they are parsed: an
+    # optional first positional would take the message for the project whenever an option stood between the two.
+    given = sys.argv[1:] if argv is None else list(argv)
+    given = given[:given.index("--")] if "--" in given else given
+    child_form = any(g == "--parent" or g.startswith("--parent=") for g in given)
     x = ssub.add_parser("start", help="start a session of an agent in a project, with its first message; with "
-                                      "--parent, a child session under another one")
-    x.add_argument("project", nargs="?", help="the project's path as the board knows it (a relative path is made "
-                                              "absolute). Not with --parent: a child runs in its parent's project")
+                                      "--parent, a child session under another one",
+                        usage="board session start [options] <project> <message>\n"
+                              "       board session start --parent ID [options] <message>")
+    if child_form:
+        x.set_defaults(project=None)
+    else:
+        x.add_argument("project", help="the project's path as the board knows it (a relative path is made "
+                                       "absolute). Not with --parent: a child runs in its parent's project")
     x.add_argument("message", help="the first message; - reads it from stdin")
     x.add_argument("--agent", metavar="NAME", help="default: the one agent with a Claude runtime, if there is only "
                                                    "one; with --parent, the parent's agent")
@@ -902,11 +914,10 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
                   "effort": getattr(a, "effort", None), "role": getattr(a, "role", None),
                   "title": getattr(a, "title", None), "request_id": getattr(a, "request_id", None)}
     if a.session_cmd == "start" and a.parent:
-        if a.project is not None:
-            raise SystemExit("error: with --parent give only the message: a child session runs in its parent's project")
+        if a.project is not None:       # --parent was abbreviated, so the two-positional form was parsed
+            raise SystemExit("error: with --parent (written in full) give only the message: a child session runs in "
+                             "its parent's project")
     elif a.session_cmd == "start":
-        if a.project is None:
-            raise SystemExit("error: say which project: board session start <project> <message>")
         given = [k for k, v in child_only.items() if v is not None]
         if given:
             raise SystemExit("error: --" + ", --".join(k.replace("_", "-") for k in given)

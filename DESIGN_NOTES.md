@@ -2869,30 +2869,30 @@ adapter what it must know (`configure`, a new optional method of the provider se
 
 | word | Claude (2.1.322) | Codex (0.171.0) |
 | --- | --- | --- |
-| `read-only` | the runner without its `--permission-mode`, `--allowedTools`, `--add-dir` and bypass flags, plus `--permission-mode dontAsk --allowedTools=<board tools>,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *),Bash(git status *),Bash(git rev-parse *) --disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),Read(~/.ssh/**),<the runner's own deny rules>`; `--strict-mcp-config` added when the runner has its own `--mcp-config` | `thread/start` with `sandbox: "read-only"` |
+| `read-only` | the runner without its `--permission-mode`, `--allowedTools`, `--tools`, `--mcp-config`, `--add-dir` and bypass flags, plus `--strict-mcp-config [--mcp-config <a config with the board's server alone>] --tools=Read,Grep,Glob --permission-mode dontAsk --allowedTools=<board tools>,Read(./**),Grep(./**),Glob(./**) --disallowedTools=Edit,Write,NotebookEdit,Bash,Read(~/.config/agent-comms/**),Read(~/.ssh/**),<the runner's own deny rules>` (review round 1, S2, below) | `thread/start` with `sandbox: "read-only"` |
 | `workspace` | the runner as configured, scoped as before in a `claude_tool_projects` project | the runner as configured (`read-only` or `workspace-write`) |
 | `full` | the runner with its permission mode replaced by `--permission-mode bypassPermissions`; `--permission-prompts none` stays; its deny rules stay | `thread/start` with `sandbox: "danger-full-access"`, `approvalPolicy` still `never` |
 
-- *A root's access is its runner's* (`native`): bypass flags are `full`, a runner `runner_preflight.read_only`
-  recognises is `read-only`, anything else `workspace`; for Codex the runner's sandbox. The hub does not have the
-  node's runner, so the NODE derives it and reports it (`access` in a session report), and the hub records it on
-  the root. A child can therefore be started only once the parent's node has opened the parent (one pass); before
-  that, and for a node from before this PR (which never reports it), the answer is a 409 that says so. That a node
-  reported an access at all is also how the hub knows the node understands children.
+- *A root's access is its runner's* (`native`): flags that SELECT bypass are `full`, a runner
+  `runner_preflight.read_only` recognises is `read-only`, anything else `workspace`; for Codex the runner's sandbox.
+  The hub does not have the node's runner, so the NODE reports it (`access` in a session report), and the hub
+  records it on the root. For Claude that report is the VERIFIED one (review round 1, S3, below): what the process
+  itself says it runs with when its first turn starts, not what the flags suggest. A child can therefore be
+  started only once the parent's first turn has started on its node; before that the answer is a 409 that says so.
 - *`full` needs `[dispatch.sessions] allow_full_access = true` on the node* (shipped `false`). Without it a child
   asked for at `full` ends with `session_access.FULL_REFUSED`; nothing is narrowed. The same setting replaces the
   unconditional refusal of a bypass runner: with it such a session is hosted as configured and is `full`; without
   it the adapters refuse it exactly as before (their messages now name the setting).
-- *`workspace` on a read-only runner* is the runner as configured: the node reports `read-only` and the hub keeps
-  it beside the word asked (`granted`; `list` prints "its node gives read-only"). The hub never records a `granted`
-  above the word it asked.
+- *`workspace` on a read-only runner* gives a read-only session (for Claude with the hard limits of S2 below): the
+  node reports `read-only` and the hub keeps it beside the word asked (`granted`; `list` prints "its node gives
+  read-only"). The hub never records a `granted` above the word it asked.
 - *A Claude runner that bypasses, asked for at `workspace`,* is refused (`WORKSPACE_FROM_BYPASS`): nothing on the
   node says what its workspace permissions would be. `read-only` and `full` work. A Codex runner that bypasses,
   asked for at `workspace`, gets `workspace-write`: there the word is the sandbox.
 - *Read-only narrowing.* The board tools the runner names are kept as named (a runner allowing two board tools is
-  not widened to all); a runner naming none gets `mcp__agent-comms`. A runner with `--settings` is refused for
-  read-only (its grants cannot be seen). A session narrowed to read-only gets no `[dispatch] writable_roots` and no
-  scoped tools. With `--strict-mcp-config` the result passes `runner_preflight.read_only` (tested).
+  not widened to all); a runner naming none gets `mcp__agent-comms`. A session narrowed to read-only gets no
+  `[dispatch] writable_roots` and no scoped tools. A runner's `--settings` stays: the hard tool list holds whatever
+  that file grants (S2 below). With a board config the result passes `runner_preflight.read_only` (tested).
 - *Effort* is one word of `low | medium | high | xhigh | max`, refused at the hub otherwise: Claude's `--effort`
   (replacing the runner's own), Codex's `effort` on every `turn/start`. Children only; a root keeps its runner's.
 - *Codex and the adapter's own refusals.* `session_command` still refuses, by name, every flag that turns the
@@ -3006,7 +3006,7 @@ through `session_access.prepare`; `Session.access`/`.effort`. `node_sessions.py`
 view, roots-only uniqueness, a root's tree fields, `show`'s children, the cascade in `close` and `_end`, the
 listing's extra keys, `report`'s `access`/`worktree` and the `worktree_removed` event.
 
-**Proof.** `tests/test_hosted_tree.py` (62 tests, fakes; real git where a worktree is made): the gate and that a
+**Proof.** `tests/test_hosted_tree.py` (90 tests after review round 1, fakes; real git where a worktree is made): the gate and that a
 session is byte for byte what it was with it off; every creation rule; access ordering and each word's argv or
 thread parameters for Claude and Codex; `full` with and without the node's setting; shared and worktree
 directories, the busy-directory rule, safe removal and the hourly second look; the cascade three ways; roots-only
@@ -3014,22 +3014,101 @@ wakes and uniqueness; a child's read and receipt not counting for its root; huma
 `list` and `show`. `scripts/session-host-e2e.py` runs its earlier scenarios with spawn off, then starts the hub and
 node again with it on for the tree scenario (stand-ins; real: above), and with a real Codex it checks the user's
 `~/.codex/config.toml` after the tree scenario as it does after the Codex one. The stand-ins learned
-two turns: `write NAME` (the Write tool, decided by the argv or the thread's sandbox) and, for Claude, `touch NAME`
-(Bash).
+turns that use a tool: `write NAME` (the Write tool, decided by the argv or the thread's sandbox) and, for Claude,
+`touch NAME` (Bash) and `try A B` (both). The Claude stand-in models what decides them as Claude Code does: `--tools`,
+the permission mode, allow rules on the command line and in a `--settings` file, that file's `defaultMode`; and its
+`init` reports the mode and tools.
+
+**Review round 1** (2026-11-21; head 6a70ae9). Each fix has a test in `tests/test_hosted_tree.py` that fails
+without it (checked by taking each one out again).
+- *S1, the node checks the LOCAL parent.* The hub's stored words say what held when a child was made; the node's
+  runner may have been edited since. `SessionRunner._reconcile` takes roots first, and `_parent_problem` is asked
+  before a child is opened, after it is opened (the access it has HERE against the parent's here) and before every
+  turn is handed to it: the parent must be open on this node and have at least the child's access. Otherwise the
+  child is ended with the reason ("its access (workspace) is above what its parent session has on this node now
+  (read-only)"; "its parent session is not open on this node"). The parent's access here is what this machine's
+  runner gives it today, replaced by what its process reported once a turn has started.
+- *S2, read-only is a hard tool list.* Seen live (2.1.322): with `--permission-mode dontAsk` and nothing allowed
+  on the command line, a `--settings` file allowing `Bash(*)`, `Write` and `Edit` let the session write a file and
+  run `touch`. `--allowedTools` only adds approvals. So `claude_read_only` now also passes `--tools=Read,Grep,Glob`
+  (`init` then reports exactly those three built-in tools; Write and Bash answer "No such tool available"),
+  `--permission-mode dontAsk` explicitly (it beat a settings file's `defaultMode: bypassPermissions`, also seen
+  live), and `--strict-mcp-config` with, at most, one `--mcp-config`: a file the host writes beside the transcript
+  (mode 600, removed with the session) holding only the `agent-comms` entry of the configs the runner itself
+  names. Bash is gone, so the read-only git allowances are too. `--tools` was chosen over `--restricted`: it is the
+  allowlist itself and shows in `init`, where `--restricted` is a bundle that also drops the owner's settings and
+  hooks. A runner already labelled read-only (the triage runner) goes through the same function, for a root as for
+  a child, with spawn on or off: this changes a hosted triage session (it loses `git log`/`git show`); a
+  dispatched run is untouched. `--settings` on a runner is no longer a reason to refuse read-only.
+- *S3, the effective mode is verified.* Seen live: a `--settings` file with `"permissions": {"defaultMode":
+  "bypassPermissions"}` put a process with no bypass flag on its command line into `bypassPermissions`. Claude's
+  `init` names the `permissionMode` and the `tools` of every turn; the adapter passes them on with `turn_started`
+  (`Event.mode`, `Event.tools`, not part of an event's identity) and the host holds them against the session
+  (`session_access.verify`): `bypassPermissions` stands only on a node with `allow_full_access` and for a session
+  not asked for at less; a session asked for at `full` that is not bypassed, and a read-only one that is not in
+  `dontAsk` or has a tool beyond the hard list and the board's, are ended as well. Ended means ended, with the
+  reason on the session; nothing is run narrower. A session's access as reported to the hub is the verified one
+  (`Session.access_known`), so a root has none until its first turn has started, and the hub's 409 covers the gap.
+  `--allow-dangerously-skip-permissions` alone no longer counts as `full`: it selects nothing; such a runner is
+  still refused where full access is not allowed, and elsewhere is a workspace session started without the flag.
+- *S4.* Only `--dangerously-bypass-approvals-and-sandbox`, `--yolo` and a `danger-full-access` sandbox are full
+  access for Codex (`CODEX_SANDBOX_OFF`). `--approve-for-me` and `--dangerously-bypass-hook-trust` are left in the
+  template for the adapter to refuse, and on a node that allows full access they are refused by name.
+- *S5, a node declares the child protocol.* In its hello (`session_host: {"tree": 1, "runners": [...]}`) and on
+  every listing request (`tree=1`). The hub lists a child, and asks a root for its access, only on a request that
+  declares it, and `create_child` requires the parent's node's latest hello to declare it. A node rolled back to
+  the earlier version gets its roots as it always did and no child. A child whose node no longer declares it ends
+  at once when it or its parent is closed (nobody there would carry a stop flag out).
+- *S6.* A worktree is removed only if `git status --porcelain --ignored --untracked-files=all` is empty as well:
+  ignored files are somebody's work too, and neither the dispatcher's check nor an unforced `git worktree remove`
+  looks at them.
+- *S7.* `_shadowed` asks for any child of the root's AGENT in the root's PROJECT, under whichever root (a Codex
+  child under a Claude root is, to the board, the same reader as a separate Codex root there), and a stored read
+  mark is held to it too: it counts only if no such child was alive between the wake and the mark.
+- *S8.* The hello's `runners` are the runner keys the node has a session adapter for (Codex only with `codex =
+  true`); `create_child` refuses an agent whose runner is not among them, instead of making a child the node ends.
+- *S9.* `board session start` has its two required positionals again; the one-positional form is parsed only when
+  `--parent` is written out (the parser is built for the form the arguments show). `start /repo --agent codex
+  hello` works as before.
+- *S10.* A session's worktree is reused or removed only if git lists exactly that canonical path (no symlink in it)
+  as a LINKED worktree of the checkout (`git worktree list --porcelain`). A plain folder inside the repository no
+  longer passes by git's parent-directory discovery.
+- *Live* (the tree scenario again, real Claude and Codex: nine haiku turns, one of them ended as it started, and two Codex turns). T4c: the temp
+  checkout's `.claude/settings.json` allows `Bash(*)`, `Write`, `Edit`; a `dontAsk` runner loads it with
+  `--settings`. Its `workspace` child wrote `granted-write.txt` and touched `granted-touch.txt`; its `read-only`
+  child, asked the same, made neither file, and its process reported `dontAsk` and the built-in tools `['Glob',
+  'Grep', 'Read']`. T6b: a runner with no mode flag loads a settings file with `defaultMode: bypassPermissions`
+  on a node without `allow_full_access`; its process reported `bypassPermissions`, the session was ended 1.3 s
+  after the start with the reason, the turn failed, no file was made and its transcript holds no tool call. The
+  fixtures are passed with `--settings` because Claude ignores an untrusted directory's own `.claude/settings.json`
+  in print mode (its stderr says so, and a control with only the project file wrote nothing), and with
+  `--setting-sources=project` rather than the user's settings, so that the user's own hooks are not run by the
+  script. `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json` were byte for byte and to
+  the nanosecond what they were before.
 
 **Residual risks / not verified.**
 - Codex at `full` (`sandbox: "danger-full-access"`) was not run live: the value is from the generated schema and
   the stand-in. A Codex child narrowed to `read-only` by its access word (the live children ran as their runner
   is configured), any Codex effort but `low`, and Claude's `--effort` above `low` were not run live either.
-- Read-only for Claude is an allow list under `dontAsk`: allow rules in the user's or the project's Claude Code
-  settings still apply and cannot be seen from the argv (the live run used `--setting-sources=`). A machine whose
-  settings allow `Bash(*)` gives a read-only child a shell. The same limit `runner_preflight.read_only` documents.
+- Read-only for Claude: the built-in tools are a hard list now (S2), but READS are still an allow list under
+  `dontAsk`. A `Read` grant in a settings file widens where a read-only session may read (the token directory and
+  `~/.ssh` stay denied). `--restricted` would confine reads to the working directories and drop the settings files;
+  it was not chosen because it also drops the owner's hooks, and was not tried.
+- A read-only Claude session has the board's tools only when its runner's own `--mcp-config` names the
+  `agent-comms` server. The shipped `claude-code` runner relies on the user's Claude configuration for it, which
+  the node does not read: a read-only child of that runner has no board tools.
+- The mode check needs Claude to report `permissionMode` and `tools` in `init` (2.1.322 does). A CLI that reports
+  neither is not verified: its session goes on, its access is never reported, and so it gets no children. A
+  session is ended when its turn STARTS in a mode it may not have; that is before the model's first answer, but
+  the process is alive for the fraction of a second until the next pass reads the line. Managed settings were not
+  tried. Codex reports no mode: its sandbox is the explicit `thread/start` parameter, not verified from an answer.
+- A newer node's hello (`session_host`) is refused by a hub from before this change: update the hub first.
 - The node's session loop runs git itself (`git worktree add`, the removal check) and waits for it; on a very
   large checkout every session on that node pauses for that long. Not measured beyond the temp repository.
 - A worktree child resumed after a node restart was checked for its directory only (fakes), not with a real
   `--resume`. A worktree child in a `claude_tool_projects` project was not run.
 - A root's access is re-derived whenever its node opens it. If the runner there is edited to something narrower,
-  existing children keep the word they were made with.
+  a child above it is ended on the node (S1); the hub's record of the root changes only when its next turn starts.
 - A child the hub ended while its node was away may still have a process until the node is back; if that was
   before a wake, `_shadowed` does not count it. The window ends at the node's first fetch.
 - `--request-id` returns the first child whatever the new call asked for; it does not compare the two.

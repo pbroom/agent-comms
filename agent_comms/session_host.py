@@ -132,7 +132,13 @@ class Session:
     transcript_fd: int | None = None
     tee_failed: bool = False
     stderr_from: int = 0            # size of the stderr log when this process started: what it wrote comes after
-    access: str | None = None       # the access it really has (session_access.prepare): read-only | workspace | full
+    # Access (session_access): `asked`, the word it was opened with (None: a session of its own); `started`, what
+    # its command line was made for; `access`, what it has as far as this host knows (`started`, then what its
+    # process reported); `access_known`, once that is verified (at once for a CLI that reports no mode).
+    asked: str | None = None
+    started: str | None = None
+    access: str | None = None
+    access_known: bool = False
     effort: str | None = None
 
     @property
@@ -335,7 +341,8 @@ class SessionHost:
             raise FileNotFoundError("the session's own run directory does not exist")
         # The access word becomes flags here, from this machine's runner and settings (nothing executable came from
         # the hub). Without a word, and without allow_full_access, the template is untouched.
-        prep = session_access.prepare(template, access, allow_full=self.config.sessions.allow_full_access, cwd=cwd)
+        prep = session_access.prepare(template, access, allow_full=self.config.sessions.allow_full_access, cwd=cwd,
+                                      board_mcp=lambda configs: self._board_mcp(session_id, configs))
         template = prep.template
         if (prep.as_configured and prep.configure != "full"
                 and runner_preflight.scoped(template, project, self.config.claude_tool_projects)):
@@ -343,7 +350,10 @@ class SessionHost:
         if prep.as_configured or prep.granted != "read-only":      # a session narrowed to read-only gets no extra roots
             template = with_writable_roots(template, self.config.extra_roots(template, project))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
-                    thread_id=int(thread_id), resume=bool(resume), access=prep.granted, effort=effort)
+                    thread_id=int(thread_id), resume=bool(resume), asked=access, started=prep.granted,
+                    access=prep.granted, effort=effort)
+        # A CLI that reports the mode it really runs in (Claude) has its access verified when its first turn starts.
+        s.access_known = not getattr(s.provider, "verifies_mode", False)
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
             runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
@@ -368,6 +378,35 @@ class SessionHost:
         self._argv(s)       # now, so a runner that cannot be used is refused here and not at the first message
         self.sessions[session_id] = s
         return s
+
+    def _board_mcp(self, session_id: str, configs: list[str]) -> str | None:
+        """For a read-only Claude session: a config holding ONLY the board's MCP server, as the runner's own
+        `--mcp-config` values define it (each a file, or the JSON itself), written beside the session's transcript
+        (mode 600; it names the launcher, never a token). None when the runner names no config with that server:
+        the session then has no MCP server at all. Nothing is looked for in the user's own Claude configuration."""
+        entry = None
+        for value in configs:
+            try:
+                text = value if value.lstrip().startswith("{") else Path(value).read_text()
+                servers = json.loads(text).get("mcpServers")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(servers, dict) and isinstance(servers.get(session_access.BOARD_SERVER), dict):
+                entry = servers[session_access.BOARD_SERVER]
+        if entry is None:
+            return None
+        self.sessions_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.sessions_dir.mkdir(exist_ok=True, mode=0o700)
+        path = self.sessions_dir / f"{validate_session_id(session_id)}.mcp.json"
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, json.dumps({"mcpServers": {session_access.BOARD_SERVER: entry}}).encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        return str(path)
 
     def send(self, session_id: str, text: str, *, message_id: str | None = None) -> str:
         """Queue a message for the session (first in, first out). Returns its id."""
@@ -402,6 +441,10 @@ class SessionHost:
             raise ValueError("session has not ended, or its process is still stopping")
         del self.sessions[session_id]
         self._record_provider_id(session_id, None)
+        try:
+            (self.sessions_dir / f"{session_id}.mcp.json").unlink()     # a read-only session's board-only MCP config
+        except OSError:
+            pass
 
     def _session(self, session_id: str) -> Session:
         s = self.sessions.get(session_id)
@@ -473,6 +516,17 @@ class SessionHost:
                 s.busy_since = None
             self._save_state()
         elif ev.kind == "turn_started":
+            # What the process says it really runs this turn with, against what the session may have. A mode from a
+            # settings file is past this machine's runner: bypassed permission checks where they may not be, or a
+            # read-only session that is not, end the session here, before the turn has done anything.
+            verified, problem = session_access.verify(s.asked, s.started, ev.mode, ev.tools,
+                                                      allow_full=self.config.sessions.allow_full_access)
+            if problem is not None:
+                log.warning("session %s: %s", s.session_id, problem)
+                self._end(s, problem, now, out)
+                return
+            if verified is not None and (verified != s.access or not s.access_known):
+                s.access, s.access_known = verified, True
             if s.in_flight is not None:
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
         elif ev.kind == "turn_ended":

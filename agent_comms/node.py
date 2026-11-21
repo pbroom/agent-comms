@@ -198,6 +198,13 @@ class Node:
             body["access"] = held
         if self.sessions is not None:   # only then: a hub older than this field refuses any hello that carries it
             body["sessions"] = {"max_live": self.config.sessions.max_live}
+            # This node speaks the child-session protocol (hosted_tree.py), and these are the runners it can host
+            # as sessions at all (an adapter exists here: Codex only with [dispatch.sessions] codex = true). A hub
+            # from before the field refuses the hello; hubs are upgraded before nodes.
+            from .providers import provider_for
+            body["session_host"] = {"tree": 1, "runners": sorted(
+                k for k, template in self.config.runners.items()
+                if provider_for(template, codex=self.config.sessions.codex) is not None)}
         out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out

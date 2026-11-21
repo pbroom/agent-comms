@@ -18,6 +18,9 @@ from typing import Any, Callable, Protocol
 # session cannot go on (`detail` says why); the host ends it and no other session. `start_failed`: THIS PROCESS cannot
 # serve the session (its handshake was refused; `detail` says why): the host fails the message that was waiting on it
 # and stops the process; the session stays, and the next message starts another process.
+# `mode` and `tools` (turn_started only, where the provider reports them): the permission mode the process really
+# runs the turn in and the tools it really has, which may differ from what its command line asked for (a settings
+# file). The host holds them against the session's access (session_access.verify). Not part of an event's identity.
 # `text` (turn_ended only): the turn's reply, capped by `cap_reply`. It is for the human who sent the message and for
 # nobody else: the hub keeps the last one per session and never hands it to an agent (hosted.py).
 KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed")
@@ -45,6 +48,8 @@ class Event:
     denials: tuple[str, ...] = ()
     detail: str = ""
     text: str = ""
+    mode: str | None = field(default=None, compare=False)
+    tools: tuple[str, ...] = field(default=(), compare=False)
 
     def __post_init__(self):
         if self.kind not in KINDS:
