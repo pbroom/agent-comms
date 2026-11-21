@@ -332,7 +332,9 @@ What it does not cover:
 - **A session that just went away.** The hub cannot see a caller hang up, so for up to 25 s after a session ends
   its last call still counts as waiting. A wake is counted only once `board wait` acknowledges it; one offered to
   a session that is gone is taken back after 10 s and goes to the next session that waits. If the
-  acknowledgement itself is lost on the way, the session is woken and the same posts may wake it once more.
+  acknowledgement itself is lost on the way, the session is woken and the same posts may wake it once more. If the
+  hub rejects it (the offer ran out on the way, the board was paused, a hosted session or the dispatcher took the
+  request meanwhile), the session is not woken and goes on waiting; the remaining posts come in a new wake.
 - **Where it was checked.** With `claude -p --input-format stream-json`, which is how the desktop app runs Claude
   Code (`scripts/interactive-wake-e2e.py --claude-bin ...`). The desktop app itself and the terminal interface were
   not driven in a test. Cloud sessions (claude.ai/code) are out of scope: they cannot reach a hub on your machines

@@ -3797,8 +3797,8 @@ Both reproduced first with tests that failed on 07bf749.
 
 ## Waking an interactive session (2026-11-21)
 
-(Review round 1, below, changed how limits, holds, offers and the project work; where the two differ, round 1
-is what the code does.)
+(Review rounds 1 and 2, below, changed how limits, holds, offers and the project work; where they differ, the
+latest round is what the code does. The offer's state machine is written out in interactive_wake.py's docstring.)
 
 **Report.** A session the human opened himself (terminal, Claude desktop app) saw new posts only when he told it to
 look; the channel push (above) needs a development flag at launch and does not work in the desktop app. This change
@@ -3995,3 +3995,72 @@ route, so it is not a one-line change. The `stopping` check keeps a hub restart 
 
 **Not verified.** The node-route cost above is read from the code, not run. A crash of Claude (SIGKILL) is still
 covered only by the `CLAUDE_PID` watch, tested with a stand-in parent.
+
+### Waking an interactive session: review round 2 (2026-11-21)
+
+Round 2 (on f05a3c3) found that S4 was still open and raised six new points, all in the offer and acknowledgement
+logic. That is the second round to find races there, so the logic is now written out first, as a state machine in
+`interactive_wake.py`'s docstring, and the code follows it one transition at a time:
+- *States.* NONE, and an offer that STANDS or is STALE. An offer is ISSUED once its text has gone to a process.
+- *Transitions.* O1 offer, O2 hand-over, O3 acknowledge, O4 take back. Each is one write transaction, with the
+  clock read inside it.
+- *STANDING* is one predicate, `_stands`: feature on, not paused, inside the deadline, the waiter's current nonce,
+  and the waiter is the one to wake (connected, armed last, no hosted root). O2 and O3 re-check it inside their
+  transaction, and O1 checks its own conditions there.
+
+Each finding has a test in `tests/test_interactive_wake_round2.py`, written first and run against f05a3c3. Two
+fixes were already in place there: S19's end-to-end hub path passed, because S19's fault is client-side and the
+client test failed; and two guard parameters of the S4 reply test passed. Every other targeted test failed.
+
+- **S4.** The ack reads the clock inside its write transaction, so an ack that waited for the lock past the
+  deadline is rejected. On the client, a reply to the ack that arrives but cannot be read (not JSON, not an object,
+  an unknown state) is no longer taken for "could not be delivered". It never wakes the session; `board wait` waits
+  on with the same nonce.
+- **S14.** The ack re-checks, inside its transaction, that the offer still stands, pause and hosted root included.
+  The dispatcher's pass checks the pause inside each offer transaction too.
+- **S15.** A nonce take-over takes the old offer back (O4) before it rebinds the waiter to another project and sets
+  the new mark there. The new process never receives the old project's wake.
+- **S16.** An issued offer's batch never changes. A reservation (`claim`) of one of its posts, or a post that stops
+  qualifying at hand-over, takes it back whole. The id the client holds is then rejected, and the remaining posts
+  come again under a new id with their own text. An offer not issued yet may simply lose the post.
+- **S17.** The pair keeps the posts delivered to any of its waiters (`delivered`, pruned with the usual retention).
+  O1 de-duplicates against it, not against the other waiter records, so a waiter that moved or was evicted does not
+  free its posts for a second conversation.
+- **S18.** O3 runs `hosted_wake._lift` on the pair before it charges the wake, in the same transaction. A human post
+  between offer and ack resets the thread first, and the charge then stands.
+- **S19.** The hub answers a failed ack "superseded" (that process was replaced) or "rejected" (anything else,
+  while the process is still current). `board wait` goes on waiting with the same nonce after "rejected", and
+  after an unreadable 200. It gives up after MAX_REJECTED (5) rejections in a row rather than spin. "superseded",
+  "off" and a 4xx still end it.
+
+**The randomized test** (`test_randomized_offers_keep_their_invariants`, seeds 1 to 4, 300 steps each, about a
+second) drives the hub through the real routes with a fake clock. Its moves are interleaved and random:
+- arm, re-arm with a new nonce, and move a conversation to the other project (three conversations, two projects);
+- agent posts, and human posts;
+- pause and unpause;
+- dispatcher passes, with random reservations through `hosted_wake.reserve`;
+- acks in time and late;
+- reads from a conversation's own board session, and time steps;
+- a hosted root that comes and goes.
+
+After every step it checks:
+- at most one standing offer per pair;
+- every hold deadline is that request's first offer plus the grace;
+- a held request is inside its deadline or was read after delivery.
+
+At every accepted ack it checks:
+- the board is not paused and no hosted root is in that project;
+- no post was delivered to two conversations;
+- every thread of the batch has exactly the count the test expects: acknowledged wakes containing it since the
+  human's last post there;
+- no thread outside the batch went up.
+
+It also asserts that each run did enough to mean something: at least 10 offers issued, 3 accepted, 1 rejected, and
+some holds. The limits are loosened for it, an interval of 2 s and a per-thread maximum of 3, so that many wakes
+happen. It needs the new module's helpers, so it cannot run against f05a3c3; the targeted tests are what show the
+old head failing.
+
+**Not verified.** The randomized test checks counts only at the moment of each accepted ack. Between acks a
+thread's stored count can still be stale, higher than true until the next look lifts it, by design: the lift is
+lazy. The clock-inside-the-transaction fix is tested by advancing the fake clock as the lock is taken; no real
+lock contention was produced.

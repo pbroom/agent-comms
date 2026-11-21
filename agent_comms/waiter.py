@@ -9,7 +9,8 @@ with the hook's JSON on stdin (`session_id`, `cwd`, `hook_event_name`). This pro
   names) and is passed on only when it has exactly that text's form (WAKE_RE); nothing else is ever printed. First
   it acknowledges the wake (`ack`; the hub cannot see a caller hang up, and takes back a wake nobody acknowledged):
   it exits 2 when the hub accepts the acknowledgement, or when the acknowledgement could not be delivered at all
-  (then the hub may offer the same posts once more), and 0 when the hub answers it with anything else;
+  (then the hub may offer the same posts once more); it waits on with the same nonce when the hub rejects it while
+  this is still the current process, or answers in a way it cannot read (see `_woken`);
 - exits 0, silently, in every other case: the hub says the feature is off, or that a newer process of the same
   conversation took over (the hook ran again); the hub cannot be reached when it first calls (once a call may have
   reached it, a restart or a dropped connection is retried for RETRY_SECONDS with the same nonce); the process was
@@ -44,6 +45,7 @@ CALL_SECONDS = 25.0         # one call's wait at the hub (at most interactive_wa
 RETRY_SECONDS = 120.0       # after the first call: give up once the hub has been unreachable this long
 DEFAULT_MAX_SECONDS = 86340.0   # the installed hook's timeout is 86400 (README "Waking a session you opened")
 WATCH_SECONDS = 1.0
+MAX_REJECTED = 5            # acknowledgements in a row the hub rejected before this process gives up
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MANAGED = "AGENT_COMMS_MANAGED"     # set by dispatch.child_env for every launched run and hosted session
 _NAME = r"[a-z][a-z0-9_-]{0,31}"
@@ -169,7 +171,7 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
                               timeout=httpx.Timeout(CALL_SECONDS + 20, connect=5),
                               headers={"Authorization": "Bearer " + token})
     body = {"client_session_id": sid, "projects": projects, "nonce": secrets.token_hex(16), "client": "claude-code"}
-    deadline, reached, failing_since, failures = clock() + max_seconds, False, None, 0
+    deadline, reached, failing_since, failures, rejected = clock() + max_seconds, False, None, 0, 0
     while (left := deadline - clock()) >= 1:
         try:
             r = client.post("/api/wait", json=body | {"wait": min(CALL_SECONDS, left)})
@@ -195,27 +197,44 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
         failing_since, failures = None, 0
         state = answer.get("state") if isinstance(answer, dict) else None
         if state == "wake":
-            return _woken(client, body, answer, stderr)
+            woken = _woken(client, body, answer, stderr)
+            if woken is not None:
+                return woken
+            rejected += 1
+            if rejected >= MAX_REJECTED:
+                return 0    # the hub keeps refusing what it offers: give up rather than spin
+            continue
         if state != "idle":
             return 0        # off, superseded, refused, or an answer this version does not know
     return 0
 
 
-def _woken(client: Any, body: dict, answer: dict, stderr: Any) -> int:
-    """Acknowledge the wake, then wake the session: when the hub accepts the acknowledgement, or when it could not be
-    delivered at all (the hub then takes the wake back after a while and may offer the same posts once more). An
-    explicit other answer (rejected: too late, or no longer this process's; superseded; off) wakes nothing."""
+def _woken(client: Any, body: dict, answer: dict, stderr: Any) -> int | None:
+    """Acknowledge the wake, then wake the session (WAKE): when the hub accepts the acknowledgement, or when it could
+    not be delivered at all (no answer, or a 5xx: the hub then takes the wake back after a while and may offer the
+    same posts once more). 0 when the hub says this process was superseded or the feature is off, or refuses the
+    call (4xx). None (wait on, with the same nonce) when the hub rejects it while the process is still the current
+    one (the offer expired in transit, a pause, a reservation), or answers 200 with something this version cannot
+    read: a reply that was not "acked" is never taken for one."""
     text, wake_id = answer.get("text"), answer.get("id")
     if not (isinstance(text, str) and WAKE_RE.fullmatch(text) and isinstance(wake_id, str)):
         return 0
     try:
         r = client.post("/api/wait", json=body | {"ack": wake_id, "wait": 0}, timeout=5)
-        delivered = r.status_code < 500
-        accepted = r.status_code == 200 and isinstance(r.json(), dict) and r.json().get("state") == "acked"
     except Exception:
-        delivered, accepted = False, False
-    if delivered and not accepted:
-        return 0
+        r = None        # not delivered: woken all the same
+    if r is not None and r.status_code < 500:
+        if r.status_code != 200:
+            return 0
+        try:
+            reply = r.json()
+        except ValueError:
+            reply = None
+        state = reply.get("state") if isinstance(reply, dict) else None
+        if state in ("superseded", "off"):
+            return 0
+        if state != "acked":
+            return None
     stderr.write(text + "\n")
     stderr.flush()
     return WAKE
