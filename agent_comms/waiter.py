@@ -6,7 +6,8 @@ with the hook's JSON on stdin (`session_id`, `cwd`, `hook_event_name`). This pro
 
 - exits 2 with the wake text on stderr when the hub says wake: Claude then wakes the idle session at once and shows
   it that text as a system reminder. The text is the hub's (hosted_wake.wake_text: counts, thread ids and agent
-  names) and is passed on only when it has that text's fixed form; nothing else is ever printed;
+  names) and is passed on only when it has that text's fixed form; nothing else is ever printed. First it tells
+  the hub it has the wake (`ack`): the hub cannot see a caller hang up, and takes back a wake nobody acknowledged;
 - exits 0, silently, in every other case: the hub says the feature is off, or that a newer process of the same
   conversation took over (the hook ran again); the hub cannot be reached; the hook's JSON has no conversation id;
   its own time is up (`--max-seconds`, kept below the hook's `timeout` so that Claude never has to end it); the
@@ -31,7 +32,8 @@ import time
 from typing import Any, Callable
 
 WAKE = 2
-CALL_SECONDS = 50.0         # one call's wait at the hub (its maximum is interactive_wake.WAIT_MAX)
+CALL_SECONDS = 25.0         # one call's wait at the hub (at most interactive_wake.WAIT_MAX). Short: when this process
+#                             dies, the hub's side of its open call goes on looking until its wait is up
 RETRY_SECONDS = 120.0       # after the first call: give up once the hub has been unreachable this long
 DEFAULT_MAX_SECONDS = 86340.0   # the installed hook's timeout is 86400 (README "Waking a session you opened")
 WATCH_SECONDS = 1.0
@@ -150,12 +152,18 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
         armed, failing_since, failures = True, None, 0
         state = answer.get("state") if isinstance(answer, dict) else None
         if state == "wake":
-            text = answer.get("text")
-            if isinstance(text, str) and TEXT_RE.fullmatch(text):
-                stderr.write(text + "\n")
-                stderr.flush()
-                return WAKE
-            return 0
+            text, wake_id = answer.get("text"), answer.get("id")
+            if not (isinstance(text, str) and TEXT_RE.fullmatch(text)):
+                return 0
+            # Tell the hub this process has the wake (it cannot see a caller hang up, and takes back a wake nobody
+            # acknowledged). Woken either way: if the acknowledgement is lost, the hub may offer it again later.
+            try:
+                client.post("/api/wait", json=body | {"ack": wake_id, "wait": 0}, timeout=5)
+            except Exception:
+                pass
+            stderr.write(text + "\n")
+            stderr.flush()
+            return WAKE
         if state != "idle":
             return 0        # off, superseded, refused, or an answer this version does not know
     return 0

@@ -29,9 +29,12 @@ this module assumes Claude: a waiter is any client that keeps such a call open f
   per-thread count since the human's last new post there. At a maximum the posts wait: a thread's stop lifts when the
   human posts in that thread, the hourly one when the hour has room. No Needs-you item is posted (the human is at that
   session; its prompt hook shows the posts when he next types).
-- *Queued, then handed.* A pass (the route's own, or each dispatcher pass) decides a wake and records it (`queued`,
-  with the posts it covers: `woken`, so `holds` sees it before the dispatcher launches). The route hands it to the
-  waiter's open call after checking its posts again (`_qualifying`); with none left it is dropped and not counted.
+- *Queued, offered, acknowledged.* A pass (the route's own, or each dispatcher pass) decides a wake and records it
+  (`queued`, with the posts it covers: `woken`, so `holds` sees it before the dispatcher launches). The route offers
+  it to the waiter's open call after checking its posts again (`_qualifying`); with none left it is dropped and not
+  counted. The hub cannot tell that the caller of an open call has gone (an open call of a process that was killed
+  goes on looking, and writing `seen`, until its time is up), so `board wait` acknowledges the wake it was given
+  (`ack`) before it exits 2; an offer not acknowledged within ACK_SECONDS is taken back and its posts wait again.
 - *The dispatcher* (`holds`, `claim`, `handed`): as for a hosted wake. For `wake_grace_seconds` after a wake, or once
   a board session of the agent in the project read the post after it (a read mark or a delivery receipt; never a
   dispatched run's session, nor one whose recorded conversation is another), the dispatcher launches nothing for the
@@ -44,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import time
 from typing import Any, Callable
 
@@ -57,20 +61,24 @@ log = logging.getLogger("agent_comms.interactive_wake")
 
 PREFIX = "wake.waiter."          # <agent>.<conversation id>: one waiter's record
 HUB = hosted_wake.HUB
-PRESENT_SECONDS = 20.0           # a waiter seen this recently is connected (its call re-reads every POLL_SECONDS)
+PRESENT_SECONDS = 20.0           # a waiter seen this recently is connected (its call re-reads every POLL_SECONDS;
+#                                  the open call of a process that died goes on for up to its `wait`)
 HEARTBEAT_SECONDS = 5.0          # an open call writes `seen` at most this often while nothing else changes
 POLL_SECONDS = 1.0               # how often an open call re-reads the database (core.WAIT_POLL_SECONDS)
-WAIT_MAX = 55                    # seconds one call may stay open (the gateway allows 300)
+WAIT_MAX = 25                    # seconds one call may stay open: also how long a call whose caller is gone goes on
 KEEP_SECONDS = 2 * 86400         # a waiter not seen for this long is dropped (its limits and marks with it)
 MAX_WAITERS = 50                 # per agent; the one seen longest ago goes first
 MAX_RETIRED = 20                 # nonces of superseded processes remembered
 MAX_PROJECTS = 8
 CLIENTS = ("claude-code", "codex")
 NONCE_RE = re.compile(r"[0-9a-f]{32}")
+ACK_RE = re.compile(r"[0-9a-f]{16}")
+ACK_SECONDS = 10.0               # an offered wake not acknowledged in this long is taken back
 
 OFF = {"state": "off"}
 IDLE = {"state": "idle"}
 SUPERSEDED = {"state": "superseded"}
+ACKED = {"state": "acked"}
 
 
 def enabled(board: Board) -> bool:
@@ -224,10 +232,18 @@ def _advance(board: Board, c, key: str, rec: dict, p: Principal, cfg, now: float
     log.info("waiter %s: wake queued for %d post(s)", key, len(batch))
 
 
-def _hand(board: Board, c, rec: dict, p: Principal, now: float) -> str | None:
-    """The queued wake, checked again as it is handed (hosted_wake._recheck's rule): posts that stopped qualifying are
-    taken off it and lose their coverage; with none left it is not sent and not counted. Returns its text."""
-    m, rec["queued"] = rec["queued"], None
+def _hand(board: Board, c, rec: dict, p: Principal, now: float) -> dict | None:
+    """The queued wake, checked again as it is offered (hosted_wake._recheck's rule): posts that stopped qualifying are
+    taken off it and lose their coverage; with none left it is not sent and not counted. Returns the answer that
+    offers it, or None. An offer stays open for ACK_SECONDS: the hub cannot tell that the caller of an open call has
+    gone, so a wake counts as delivered only once `board wait` acknowledges it (`_acked`); an offer nobody
+    acknowledged is taken back (`_take_back`) and the posts wait for the next wake."""
+    m = rec["queued"]
+    if _num(m.get("offered")):
+        if now - m["offered"] < ACK_SECONDS:
+            return None         # offered to a call that may be answering right now
+        _take_back(c, rec)
+        return None
     keep = {} if _hosted_root(c, rec["agent"], rec["project"]) else \
         hosted_wake._qualifying(board, p, rec["project"], [i for i in m["posts"] if type(i) is int], rec)
     for k in (str(i) for i in m["posts"]):
@@ -238,8 +254,34 @@ def _hand(board: Board, c, rec: dict, p: Principal, now: float) -> str | None:
                 rec[table].pop(k, None)
     if not keep:
         hosted_wake._uncount(rec, m)
+        rec["queued"] = None
         return None
-    return hosted_wake.wake_text(rec["agent"], list(keep.values()))
+    m |= {"posts": sorted(int(k) for k in keep), "offered": now, "id": secrets.token_hex(8)}
+    return {"state": "wake", "text": hosted_wake.wake_text(rec["agent"], list(keep.values())), "id": m["id"]}
+
+
+def _take_back(c, rec: dict) -> None:
+    """An offered wake nobody acknowledged never reached a session: its posts lose their coverage and wait again in
+    `pending` (re-qualified before the next wake, as hosted_wake._set_aside does), and it is not counted."""
+    m, rec["queued"] = rec["queued"], None
+    ids = [i for i in m["posts"] if type(i) is int]
+    for k in (str(i) for i in ids):
+        for table in ("woken", "handed", "read"):
+            rec[table].pop(k, None)
+    for row in c.execute("""SELECT id, thread_id, agent, needs_response, seq FROM posts
+                            WHERE id IN (SELECT value FROM json_each(?))""", (json.dumps(ids),)):
+        if str(row["id"]) not in rec["claimed"]:
+            rec["pending"][str(row["id"])] = hosted_wake._entry(row)
+    hosted_wake._uncount(rec, m)
+    log.info("waiter: an offered wake was not acknowledged; its %d post(s) wait again", len(ids))
+
+
+def _acked(rec: dict, ack: str | None) -> bool:
+    m = rec["queued"]
+    if ack is not None and m is not None and m.get("id") == ack:
+        rec["queued"] = None    # delivered: the session has the text
+        return True
+    return False
 
 
 def _checked(body: Any) -> dict:
@@ -252,17 +294,21 @@ def _checked(body: Any) -> dict:
         raise Invalid("nonce must be 32 lowercase hex digits, new for each waiting process")
     if client not in CLIENTS:
         raise Invalid("client must be one of " + ", ".join(CLIENTS))
+    ack = body.get("ack")
+    if ack is not None and (not isinstance(ack, str) or not ACK_RE.fullmatch(ack)):
+        raise Invalid("ack must be the id of the wake this process was offered")
     projects = body.get("projects")
     if (not isinstance(projects, list) or not 1 <= len(projects) <= MAX_PROJECTS
             or not all(isinstance(x, str) and x.strip().startswith("/") for x in projects)):
         raise Invalid(f"projects must list 1 to {MAX_PROJECTS} absolute paths")
-    return {"client_session_id": sid, "nonce": nonce, "client": client,
+    return {"client_session_id": sid, "nonce": nonce, "client": client, "ack": ack,
             "projects": list(dict.fromkeys(_norm_path(x) for x in projects))}
 
 
 def poll(board: Board, p: Principal, body: Any) -> dict:
-    """One look for this waiter: "wake" with the text, "idle" (nothing yet), "superseded" (a newer process of the
-    same conversation took over) or "off". Also its heartbeat: the record says the waiter is connected."""
+    """One look for this waiter: "wake" with the text and its id, "idle" (nothing yet), "superseded" (a newer process
+    of the same conversation took over) or "off"; with `ack` (the id of the wake this process was offered),
+    "acked". Also its heartbeat: the record says the waiter is connected."""
     if not enabled(board):
         return OFF
     if p.is_human:
@@ -276,7 +322,8 @@ def poll(board: Board, p: Principal, body: Any) -> dict:
     if board.is_paused():
         return IDLE         # nothing is decided or written while paused; the posts are found after the unpause
     if (rec is not None and rec["nonce"] == body["nonce"] and rec["queued"] is None and not rec["pending"]
-            and now - rec["seen"] < HEARTBEAT_SECONDS and hosted_wake._tops(conn)[0] <= rec["mark"]):
+            and body["ack"] is None and now - rec["seen"] < HEARTBEAT_SECONDS
+            and hosted_wake._tops(conn)[0] <= rec["mark"]):
         return IDLE         # nothing new since the last look: no write
     cfg = hosted_wake.limits(board)
     with db.write_tx(conn) as c:
@@ -291,11 +338,16 @@ def poll(board: Board, p: Principal, body: Any) -> dict:
         elif rec["nonce"] != body["nonce"]:
             rec["retired"].append(rec["nonce"])
             rec |= {"nonce": body["nonce"], "armed_at": now, "project": _pick(c, body["projects"])}
+        if body["ack"] is not None:
+            # The process that was offered the wake has it and is about to exit: nothing else to look at.
+            ok = rec["nonce"] == body["nonce"] and _acked(rec, body["ack"])
+            _save(c, key, rec, now)
+            return ACKED if ok else IDLE
         rec["seen"] = now
         _advance(board, c, key, rec, p, cfg, now)
-        text = _hand(board, c, rec, p, now) if rec["queued"] is not None else None
+        out = _hand(board, c, rec, p, now) if rec["queued"] is not None else None
         _save(c, key, rec, now)
-    return {"state": "wake", "text": text} if text else IDLE
+    return out or IDLE
 
 
 def _evict(c, agent: str, now: float) -> None:
@@ -339,7 +391,16 @@ def tick(board: Board) -> None:
                 with db.write_tx(board.conn) as c:
                     c.execute("DELETE FROM board_state WHERE key = ?", (key,))
                 continue
-            if not _present(rec, now) or rec["queued"] is not None or (top <= rec["mark"] and not rec["pending"]):
+            q = rec["queued"]
+            if q is not None and _num(q.get("offered")) and now - q["offered"] >= ACK_SECONDS:
+                with db.write_tx(board.conn) as c:      # offered to a process that never acknowledged it
+                    rec = _load(c, key)
+                    if rec is not None and rec["queued"] is not None and _num(rec["queued"].get("offered")) \
+                            and now - rec["queued"]["offered"] >= ACK_SECONDS:
+                        _take_back(c, rec)
+                        _save(c, key, rec, now)
+                continue
+            if not _present(rec, now) or q is not None or (top <= rec["mark"] and not rec["pending"]):
                 continue    # nobody to hand it to, a wake already waits, or nothing new: no write
             with db.write_tx(board.conn) as c:
                 rec = _load(c, key)

@@ -3851,10 +3851,18 @@ hand-over: still eligible, not acknowledged by any session of the agent, not res
   go when the hour has room.
 - *The project.* The client sends what `board brief` would use (the hook cwd's checkout, its main repository and
   their logical forms); the hub takes the first that some thread is in.
-- *Queued, then handed.* A pass (the open call's own look, or each dispatcher pass right after `hosted_wake.tick`)
-  records the decided wake in `queued` and marks its posts `woken`, so `hosted.holds` sees it before the dispatcher
-  decides; the open call hands it over after `_qualifying` again (none left: dropped and uncounted). A wake the
-  dispatcher queued for a waiter that has gone meanwhile is handed to that conversation's next `board wait`.
+- *Queued, offered, acknowledged.* A pass (the open call's own look, or each dispatcher pass right after
+  `hosted_wake.tick`) records the decided wake in `queued` and marks its posts `woken`, so `hosted.holds` sees it
+  before the dispatcher decides; the open call offers it after `_qualifying` again (none left: dropped and
+  uncounted), with an id. `board wait` sends that id back (`ack`) before it exits 2; only then is the wake
+  delivered. An offer not acknowledged within 10 s is taken back: the posts lose their coverage, go back to
+  `pending`, and the wake is not counted, so the conversation's next `board wait`, or another waiting session of the
+  agent, gets them. Found in the real run: the hub's side of an open call does NOT see its caller hang up (a curl
+  killed 3 s into a 40 s wait left the call heartbeating for the rest of it; `request.is_disconnected` never turned
+  true behind this app's `@app.middleware("http")`). Without the acknowledgement a wake offered into such a call
+  was lost, and `seen` lingered. `board wait` therefore keeps each call to 25 s, which bounds how long a session that
+  has gone still counts as waiting. Whether `hosted.node_sessions_wait` (`waiter_gone`) has the same blind spot was
+  not checked.
 
 **The dispatcher's side** goes through the hooks it already has, so delivery.py and dispatch.py ask nothing new:
 `hosted_wake.holds` ends by asking `interactive_wake.holds` (the same rule on a waiter's record: within the grace,
@@ -3889,8 +3897,10 @@ woken from `SessionStart` before any turn, again from `Stop` after the wake turn
   mode, which was. The coordinator checks the desktop app at deploy time.
 - Cloud sessions are out of scope. Codex sessions the human opened are a separate change.
 - A session armed more than a day ago without a turn since, or started before `--wake`, is not woken.
-- A hub answer lost on the way (the wake was recorded, the process never saw it) is a lost wake; the dispatcher's
-  grace runs out as for an unread one.
+- For up to 25 s after a session ends, its last call still counts as waiting; the one armed last may then be a
+  session that is gone, and the wake reaches a live one only after the 10 s take-back (or that call's end).
+- An acknowledgement lost on the way: the session was woken, the hub takes the wake back and may offer the same
+  posts once more (unless the session's read moved its cursor past them).
 - Two sessions of the agent in one project that both read are one reader to `holds` (as for hosted sessions);
   a board session whose conversation id is recorded and differs is not counted, but sessions through a remote hub
   record none.

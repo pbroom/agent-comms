@@ -32,7 +32,8 @@ R1. The session opens and its SessionStart hook waits. The poster posts a reques
     notes it was shown the post.
 R2. When that turn ends, its Stop hook waits again (a newer process of the same conversation). A second request: a
     second turn, board_read_updates again.
-R3. The session is ended with SIGTERM: no `board wait` of it is left polling the hub.
+R3. The session is ended with SIGTERM: no `board wait` of it is left, and once the hub's side of its last open call
+    has run out (at most waiter.CALL_SECONDS) nothing polls for it any more.
 """
 from __future__ import annotations
 
@@ -54,7 +55,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from agent_comms import claude_hooks, hosted_wake  # noqa: E402
+from agent_comms import claude_hooks, hosted_wake, waiter  # noqa: E402
 from agent_comms.config import create_agent  # noqa: E402
 
 WAIT_SH = ROOT / "integrations" / "claude-code" / "wait.sh"
@@ -224,6 +225,7 @@ wake = true
         self.check(err == self.expected() + "\n", f"S1 the wake text is the hub's: {err.strip()!r}")
         self.check(not any(w in err for w in BODY_WORDS + (MARKER,)), "S1 no word of the post's body in it")
         self.check(str(post) in (self.record(one) or {}).get("woken", {}), "S1 the hub recorded the wake")
+        self.check((self.record(one) or {}).get("queued", 1) is None, "S1 board wait acknowledged it: no offer open")
 
         since = self.record(one)["armed_at"]
         b = self.arm(one, parent)
@@ -356,7 +358,9 @@ wake = true
             except subprocess.TimeoutExpired:
                 os.killpg(claude.pid, signal.SIGTERM)
                 claude.wait(10)
-        time.sleep(3)           # the hub's open call may look once more before it sees the caller hung up
+        # The hub's side of an open call does not see its caller hang up: it goes on looking (and writing `seen`)
+        # until its wait is up, at most waiter.CALL_SECONDS.
+        time.sleep(waiter.CALL_SECONDS + 3)
         last = (self.record(conv) or {}).get("seen", 0)
         time.sleep(8)           # more than interactive_wake.HEARTBEAT_SECONDS
         left = subprocess.run(["pgrep", "-f", str(WAIT_SH)], capture_output=True, text=True).stdout.split()

@@ -29,11 +29,20 @@ def on(env, **sessions) -> None:
     env.settings.dispatch = {**env.settings.dispatch, "sessions": {"interactive": {"wake": True}, **sessions}}
 
 
-def wait(env, conv=ONE, nonce=NA, who="claude", projects=(PROJECT,), **kw) -> dict:
-    r = client(env, who).post("/api/wait", json={"client_session_id": conv, "projects": list(projects),
-                                                 "nonce": nonce, **kw})
+def wait(env, conv=ONE, nonce=NA, who="claude", projects=(PROJECT,), ack=True, **kw) -> dict:
+    """One call, as `board wait` makes it; a wake it is offered is acknowledged (as `board wait` does) unless
+    ack=False, and returned without its id."""
+    body = {"client_session_id": conv, "projects": list(projects), "nonce": nonce, **kw}
+    r = client(env, who).post("/api/wait", json=body)
     assert r.status_code == 200, r.text
-    return r.json()
+    out = r.json()
+    if out.get("state") == "wake":
+        assert iw.ACK_RE.fullmatch(out.pop("id"))
+        if ack:
+            a = client(env, who).post("/api/wait", json=body | {"ack": rec(env, conv, who)["queued"]["id"]})
+            assert a.json() == {"state": "acked"}, a.text
+            assert rec(env, conv, who)["queued"] is None
+    return out
 
 
 def rec(env, conv=ONE, agent="claude") -> dict:
@@ -386,6 +395,40 @@ def test_a_waiter_that_read_the_request_keeps_it_from_the_dispatcher(denv):
     assert launched(denv) == []
 
 
+def test_a_wake_nobody_acknowledged_is_taken_back_and_offered_again(senv):
+    """The hub cannot see that the caller of an open call has gone: a wake offered into a dead call is not lost."""
+    on(senv)
+    tid = senv.thread()
+    wait(senv)
+    post = ask(senv, tid)
+    assert woke(senv, ack=False) == text(senv, 1, [tid])       # offered; the process died before acknowledging
+    assert holds(senv, post), "held while the offer is open"
+    senv.clock.advance(iw.ACK_SECONDS - 1)
+    assert woke(senv, nonce=NB) is None, "not offered twice while the first offer is open"
+    senv.clock.advance(1)
+    assert woke(senv, nonce=NB) is None and rec(senv)["queued"] is None and rec(senv)["sent"] == []
+    assert str(post["id"]) in rec(senv)["pending"] and not holds(senv, post), "taken back: not counted, not held"
+    assert woke(senv, nonce=NB) == text(senv, 1, [tid]), "offered again to the conversation's next process"
+    stale = client(senv, "claude").post("/api/wait", json={"client_session_id": ONE, "projects": [PROJECT],
+                                                           "nonce": NB, "ack": "f" * 16})
+    assert stale.json() == {"state": "idle"}, "an id that is not the open offer's acknowledges nothing"
+
+
+def test_the_dispatchers_pass_takes_back_an_offer_nobody_acknowledged(senv):
+    on(senv)
+    tid = senv.thread()
+    wait(senv, conv=ONE)
+    senv.clock.advance(1)
+    wait(senv, conv=TWO, nonce=NB)
+    post = ask(senv, tid)
+    assert woke(senv, conv=TWO, nonce=NB, ack=False) is not None    # the session armed last; it died meanwhile
+    senv.clock.advance(iw.ACK_SECONDS)
+    iw.tick(senv.board)
+    assert rec(senv, TWO)["queued"] is None and str(post["id"]) in rec(senv, TWO)["pending"]
+    senv.clock.advance(iw.PRESENT_SECONDS - iw.ACK_SECONDS + 1)
+    assert woke(senv, conv=ONE) == text(senv, 1, [tid]), "the other waiting session of the agent gets it"
+
+
 def test_the_dispatchers_pass_writes_nothing_for_a_waiter_with_nothing_new(senv):
     on(senv)
     senv.thread()
@@ -418,9 +461,11 @@ class FakeHub:
     def __init__(self, *answers):
         self.answers, self.bodies = list(answers), []
 
-    def post(self, path, json):
+    def post(self, path, json, **kw):
         assert path == "/api/wait"
         self.bodies.append(json)
+        if json.get("ack") is not None:
+            return httpx.Response(200, json={"state": "acked"})
         a = self.answers.pop(0)
         if isinstance(a, Exception):
             raise a
@@ -436,11 +481,20 @@ def run_wait(hub, stdin=None, **kw):
 
 
 def test_board_wait_exits_2_with_the_wake_text_and_0_otherwise():
-    hub = FakeHub({"state": "idle"}, {"state": "wake", "text": "agent-comms: 1 new post(s) addressed to claude."})
+    hub = FakeHub({"state": "idle"},
+                  {"state": "wake", "text": "agent-comms: 1 new post(s) addressed to claude.", "id": "0" * 16})
     assert run_wait(hub) == (2, "agent-comms: 1 new post(s) addressed to claude.\n")
     body = hub.bodies[0]
     assert body["client_session_id"] == ONE and body["projects"] == [PROJECT] and len(body["nonce"]) == 32
     assert hub.bodies[1]["nonce"] == body["nonce"], "one nonce per process"
+    assert hub.bodies[2] == body | {"ack": "0" * 16, "wait": 0}, "the wake is acknowledged before the exit"
+    class AckLost(FakeHub):
+        def post(self, path, json, **kw):
+            if json.get("ack") is not None:
+                raise httpx.ConnectError("gone")
+            return super().post(path, json)
+    assert run_wait(AckLost({"state": "wake", "text": "agent-comms: x", "id": "1" * 16})) == (2, "agent-comms: x\n"), \
+        "woken even when the acknowledgement is lost"
     for answers in ([{"state": "off"}], [{"state": "superseded"}], [(401, {"error": "unauthorized"})],
                     [{"state": "wake", "text": "not the fixed form"}],
                     [{"state": "wake", "text": "agent-comms: two\nlines"}], [{"state": "something new"}],

@@ -317,8 +317,10 @@ What it does not cover:
   and a session started before `--wake` are not covered.
 - **A wake during a turn.** Claude starts the `Stop` hook when a turn ends, and it keeps waiting if you start the
   next turn. A wake that comes then is taken as its own turn right after yours.
-- **A lost answer.** If the hub's answer never reaches `board wait` (a network drop at that moment), that wake is
-  lost; the dispatcher's grace then runs out as for an unread wake.
+- **A session that just went away.** The hub cannot see a caller hang up, so for up to 25 s after a session ends
+  its last call still counts as waiting. A wake is counted only once `board wait` acknowledges it; one offered to
+  a session that is gone is taken back after 10 s and goes to the next session that waits. If the
+  acknowledgement itself is lost on the way, the session is woken and the same posts may wake it once more.
 - **Where it was checked.** With `claude -p --input-format stream-json`, which is how the desktop app runs Claude
   Code (`scripts/interactive-wake-e2e.py --claude-bin ...`). The desktop app itself and the terminal interface were
   not driven in a test. Cloud sessions (claude.ai/code) are out of scope: they cannot reach a hub on your machines

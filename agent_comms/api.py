@@ -121,6 +121,7 @@ class WaitIn(Body):
     nonce: str
     client: str = "claude-code"
     wait: float = 0
+    ack: str | None = None      # the id of the wake this process was offered: it has it
 
 
 class RequestRouteIn(Body):
