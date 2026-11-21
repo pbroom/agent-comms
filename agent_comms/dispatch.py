@@ -1324,6 +1324,14 @@ def _active_records(board: Board) -> list[dict]:
     return out
 
 
+def occupied_run_dirs(board: Board) -> set[str]:
+    """The run directories of the dispatched runs that may still be going, from their records (hub-local runs and
+    runs on a node alike): what Dispatcher._busy_dirs holds for this loop's children and for the runs an earlier
+    loop left, for a caller that is not the dispatcher. hosted_wake.py asks it so that no automatic turn of a
+    hosted session starts in a checkout a run is using; `_busy_dirs` prevents the opposite order."""
+    return {os.path.realpath(d["cwd"]) for d in _active_records(board) if isinstance(d.get("cwd"), str) and d["cwd"]}
+
+
 def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), note: str = "",
                   ended_as: dict[str, str] | None = None, respect_owner: bool = True,
                   stop_mode: str | None = None) -> list[dict]:

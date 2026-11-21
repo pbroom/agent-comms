@@ -453,18 +453,24 @@ also one you send just after a wake was queued.
   wake_grace_seconds = 120         # after a wake the dispatcher starts no run for those requests for this long
   ```
 
-  Posts that arrive during a turn or inside the interval go together as one wake. At either maximum the session is
-  no longer woken for that thread, and you get one Needs-you item there saying which session, agent and thread. Any
-  new post of yours in that thread lifts that stop (answering the item is one); what waited then goes as one wake.
-  It lifts nothing else: the interval and the hourly maximum always hold, so after an hourly stop the wake goes once
-  fewer than the maximum lie within the past hour, and you are not asked again for that same full hour. To stop it
-  for good, close the session.
+  Posts that arrive during a turn or inside the interval go together as one wake. At a thread's own maximum the
+  session is no longer woken for that thread, and you get one Needs-you item there saying which session, agent and
+  thread. The hourly maximum is the session's: you get ONE item for it, naming every thread it holds, however many
+  there are. Items are few: at most five in one pass and five a day per session; a stop whose item has to wait
+  stands all the same. Any new post of yours in a stopped thread lifts that stop (answering the item is one; for an
+  hourly stop, a post in any of its threads lifts it for all of them); what waited then goes as one wake. It lifts
+  nothing else: the interval and the hourly maximum always hold, so after an hourly stop the wake goes once fewer
+  than the maximum lie within the past hour, and you are not asked again for that same full hour. To stop it for
+  good, close the session.
 - **With the dispatcher.** A request the session was just woken for is left to it: for `wake_grace_seconds` the
-  dispatcher starts no run for it and the undelivered alert stays quiet. If a session of the agent reads the request
-  in that time (any `board_read_updates` view that returns it counts), it stays with the session. If not, the
-  dispatcher handles it exactly as it would without a hosted session (workstream approval, delivery policy, limits). An open session holds no checkout: only while one of its
-  turns is running does a dispatched run for the same project wait, as it would behind another run. With no hosted
-  session, nothing about the dispatcher changes.
+  dispatcher starts no run for it and the undelivered alert stays quiet. If the session reads the request in that
+  time (any `board_read_updates` view that returns it counts, from its own board session in that project), it stays
+  with the session. If not, the dispatcher handles it exactly as it would without a hosted session (workstream
+  approval, delivery policy, retries, limits), and from then on the request is the dispatcher's. An open session
+  holds no checkout: only while one of its turns is running does a dispatched run for the same project wait, as it
+  would behind another run. The same the other way round: while a dispatched run is using that checkout, a post
+  does not wake the session; it does when the run is over (your own `board session send` is not held back). A run
+  in its own parallel worktree does not count. With no hosted session, nothing about the dispatcher changes.
 
 `uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
 stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),

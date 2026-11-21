@@ -21,7 +21,7 @@ GRACE = 120
 
 
 def limits(env, **over) -> None:
-    env.settings.dispatch = HUB_DISPATCH | {"sessions": over}
+    env.settings.dispatch = {**env.settings.dispatch, "sessions": over}
 
 
 def ready(env, project=PROJECT, **kw) -> str:
@@ -270,7 +270,7 @@ def test_the_thread_limit_stops_waking_and_asks_the_human_once(senv):
     assert item["agent"] == "human" and item["type"] == "question" and item["to"] == [] and item["needs_response"]
     assert item["automatic"] is True and item["id"] in needs_you(senv)
     assert item["body"] == hosted_wake.HEADER.format(
-        sid=sid, agent="claude", thread=tid, then="",
+        sid=sid, agent="claude", where=f"thread #{tid}", lift="this thread", then="",
         why=f"was woken 3 times for thread #{tid} with no post of yours there in between")
     q = item["decision_question"]
     assert q["recommended_option_id"] == "go-on" and [o["id"] for o in q["options"]] == ["go-on", "close-session"]
@@ -305,35 +305,46 @@ def test_the_automatic_item_itself_does_not_lift_the_limit(senv):
     assert len(alerts(senv, tid)) == 1
 
 
-def test_the_hourly_limit_stops_the_threads_it_catches_and_the_humans_answer_lifts_only_the_stop(senv):
+def items(env) -> list[dict]:
+    """Every wake-limit item on the board."""
+    return [p for (tid,) in env.board.conn.execute("SELECT id FROM threads ORDER BY id").fetchall()
+            for p in alerts(env, tid)]
+
+
+def test_the_hourly_limit_is_one_stop_and_one_item_for_the_session_and_the_answer_lifts_only_the_stop(senv):
     limits(senv, max_wakes_per_hour=3)
     sid = ready(senv)
-    threads = [senv.thread() for _ in range(5)]
+    threads = [senv.thread() for _ in range(6)]
     assert [woken(senv, sid, t) for t in threads[:3]] == [True] * 3
     first = record(senv, sid)["sent"][0]
-    assert woken(senv, sid, threads[3]) is False and woken(senv, sid, threads[4]) is False
-    [item] = alerts(senv, threads[3])
+    ask(senv, threads[3])
+    ask(senv, threads[4], as_="grok")
+    later(senv, 31)
+    tick(senv)                          # the hour is full: both threads are caught in one pass
+    [item] = items(senv)
+    assert item["thread_id"] == threads[3], "ONE item for the session, in the first of the threads it holds"
     assert item["body"] == hosted_wake.HEADER.format(
-        sid=sid, agent="claude", thread=threads[3], why="was woken 3 times within an hour",
+        sid=sid, agent="claude", why="was woken 3 times within an hour",
+        where=f"threads #{threads[3]}, #{threads[4]}", lift="any of those threads (for all of them)",
         then=" (the session is woken again once fewer than 3 wakes lie within the past hour)")
-    assert "as soon as fewer than 3 wakes lie within the past hour" in json.dumps(item["decision_question"])
-    assert len(alerts(senv, threads[4])) == 1 and alerts(senv, threads[0]) == []
-    assert woken(senv, sid, threads[3]) is False and len(alerts(senv, threads[3])) == 1
+    q = item["decision_question"]
+    assert "hourly wake limit (2 thread(s) held)" in q["question"]
+    assert "as soon as fewer than 3 wakes lie within the past hour" in json.dumps(q)
+    assert woken(senv, sid, threads[5]) is False and woken(senv, sid, threads[3]) is False
+    rec = record(senv, sid)
+    assert {t: rec["threads"][str(t)]["stopped"] for t in threads[3:]} == dict.fromkeys(threads[3:], "hour")
+    assert len(items(senv)) == 1, "a thread the same full hour catches later joins that item"
 
-    senv.post("human", threads[3], "go on")             # the answer lifts the stop, not the hour
+    senv.post("human", threads[3], "go on")             # the answer lifts the stop, for all of them, not the hour
     later(senv, 31)
     tick(senv)
     rec = record(senv, sid)
     assert len(wakes(senv, sid)) == 3 and len(rec["sent"]) == 3, "still three wakes in the past hour: none is added"
-    assert rec["threads"][str(threads[3])]["stopped"] is None and len(rec["pending"]) == 3
+    assert not any(str(t) in rec["threads"] for t in threads[3:]) and len(rec["pending"]) == 4
     assert item["id"] not in needs_you(senv), "the answered item is closed"
-    assert woken(senv, sid, threads[3]) is False and woken(senv, sid, threads[3], as_="grok") is False
-    assert len(alerts(senv, threads[3])) == 1, "no second item for the hour the human already answered for"
-    assert record(senv, sid)["threads"][str(threads[3])]["stopped"] is None, "held, not stopped again"
-    assert woken(senv, sid, threads[0]) is False and len(alerts(senv, threads[0])) == 1, \
-        "a thread the same full hour catches for the first time gets its own item ..."
-    assert record(senv, sid)["threads"][str(threads[3])]["stopped"] is None and len(alerts(senv, threads[3])) == 1, \
-        "... and the answered one is still only held"
+    assert woken(senv, sid, threads[3]) is False and woken(senv, sid, threads[0], as_="grok") is False
+    assert len(items(senv)) == 1, "no second item for the hour the human already answered for"
+    assert not any(t.get("stopped") for t in record(senv, sid)["threads"].values()), "held, not stopped again"
 
     later(senv, first + 3600 - senv.clock() - 1)
     tick(senv)
@@ -341,14 +352,60 @@ def test_the_hourly_limit_stops_the_threads_it_catches_and_the_humans_answer_lif
     later(senv, 2)
     tick(senv)
     assert len(wakes(senv, sid)) == 4 and len(record(senv, sid)["sent"]) == 3, "sent when the hour has room"
-    assert turns(senv)[-1] == text_for(senv, 4, [threads[3]], authors="codex, grok"), "what was held, as one wake"
+    assert turns(senv)[-1] == text_for(senv, 6, [threads[0], threads[3], threads[4], threads[5]],
+                                       authors="codex, grok"), "everything that was held, as one wake"
     run_turn(senv, sid)
-    assert record(senv, sid)["threads"][str(threads[4])]["stopped"] == "hour", "the other one waits for its own post"
     limits(senv, max_wakes_per_hour=3, wake_min_interval_seconds=5)
     ask(senv, threads[3])               # the hour is full again (that wake and two older ones): a NEW full hour
     later(senv, 10)
     tick(senv)
-    assert len(wakes(senv, sid)) == 4 and len(alerts(senv, threads[3])) == 2, "which gets its own item"
+    assert len(wakes(senv, sid)) == 4 and len(items(senv)) == 2, "which gets its own item"
+
+
+def test_wake_limit_items_are_capped_per_pass_and_per_day(senv):
+    """As the undelivered alert is capped (delivery.ALERTS_PER_PASS, DAILY_CAP): many threads reaching their own
+    limit at once do not fill Needs you."""
+    limits(senv, max_wakes_without_human=1)
+    sid = ready(senv)
+    threads = [senv.thread() for _ in range(7)]
+    assert [woken(senv, sid, t) for t in threads] == [True] * 7
+    for t in threads:
+        ask(senv, t)
+    later(senv, 31)
+    tick(senv)                          # all seven are stopped in this one pass
+    rec = record(senv, sid)
+    assert [rec["threads"][str(t)]["stopped"] for t in threads] == ["thread"] * 7
+    assert len(items(senv)) == delivery.ALERTS_PER_PASS == 5
+    later(senv, 61)
+    tick(senv, times=3)
+    assert len(items(senv)) == delivery.DAILY_CAP == 5, "no more for this session today; the stops stand"
+    assert wakes(senv, sid)[-1]["n"] == 8 and len(record(senv, sid)["pending"]) == 7
+    later(senv, 86400)
+    tick(senv)
+    assert len(items(senv)) == 7, "the other two when the day has room"
+
+
+def test_a_request_the_dispatcher_routed_in_the_humans_name_is_not_the_human_stepping_in(senv):
+    """access.route_successor posts a request as the human without the automatic marker; the server marks it under
+    access.ROUTED_PREFIX in the same transaction. It does not lift a stop."""
+    from agent_comms.access import ROUTED_PREFIX
+
+    limits(senv, max_wakes_without_human=1)
+    sid = ready(senv)
+    tid = senv.thread()
+    assert woken(senv, sid, tid) is True and woken(senv, sid, tid) is False
+    with db.write_tx(senv.board.conn) as c:
+        routed = senv.board.create_post(senv.p["human"], senv.sid["human"], thread_id=tid, type="request",
+                                        to=["grok"], body="Routed request", _in_transaction=True)
+        c.execute("INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, '{}', 'human', ?)",
+                  (ROUTED_PREFIX + str(routed["id"]), senv.clock()))
+    later(senv, 31)
+    tick(senv, times=2)
+    assert record(senv, sid)["threads"][str(tid)]["stopped"] == "thread" and len(wakes(senv, sid)) == 1
+    senv.post("human", tid, "carry on")
+    later(senv, 31)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 2, "the human's own post does"
 
 
 def test_an_ended_sessions_items_are_closed_and_its_record_dropped(senv):
@@ -507,10 +564,11 @@ def denv(senv, tmp_path, monkeypatch):
     workdir = tmp_path / "hub-repo"
     workdir.mkdir()
     senv.workdir = str(workdir)
-    senv.config = DispatchConfig.from_dict(HUB_DISPATCH | {
+    senv.settings.dispatch = HUB_DISPATCH | {       # the hub's settings: the dispatcher's and the watcher's alike
         "runners": {"claude": ["claude-fake", "-p", "{prompt}"], "codex": ["codex-fake", "{prompt}"]},
         "worktrees": {PROJECT: str(workdir)}, "live_minutes": 2, "timeout_minutes": 30, "max_concurrent": 2,
-        "undelivered_alert_minutes": 10})
+        "undelivered_alert_minutes": 10}
+    senv.config = DispatchConfig.from_dict(senv.settings.dispatch)
     senv.spawner = FakeSpawner()
     procs = FakeProcs(senv.spawner)
     senv.d = Dispatcher(senv.board, senv.p["human"], senv.config, spawner=senv.spawner,
@@ -827,10 +885,14 @@ def test_a_request_the_dispatcher_launched_for_is_taken_off_a_wake_not_yet_hande
     [wake] = wakes(denv, sid)
     assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.NOT_SENT)
     assert turns(denv) == ["first"], "no wake turn beside the run"
-    denv.post("codex", denv.tid, "a later one", "request", to=["claude"])
+    denv.post("codex", denv.thread(), "a later one", "request", to=["claude"])
     later(denv, 31)
     tick(denv)
-    assert turns(denv)[-1] == text_for(denv, 1, [denv.tid]), "a later post still wakes the session"
+    assert turns(denv) == ["first"], "not while that run is using the checkout"
+    denv.spawner.children[0].code = 0
+    denv.d.tick()
+    tick(denv)
+    assert turns(denv)[-1].startswith("agent-comms: 1 new post(s)"), "a later post still wakes the session"
 
 
 def test_a_managed_continuations_post_wakes_nobody(senv):
@@ -1199,3 +1261,188 @@ def test_only_the_agents_own_read_in_the_project_that_returned_the_post_counts(s
     assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now())
     assert not hosted.holds(senv.board, "claude", P2, post["id"], now())
     assert not hosted.holds(senv.board, "grok", PROJECT, post["id"], now())
+
+
+# ------------------------------------------------------------ review of PR #87
+
+
+def dispatched(env, post, hosted_session: bool, policy: bool) -> tuple[list[int], dict]:
+    """A request nobody settles: each run the dispatcher starts for it registers as that run's session, reads the
+    request with post_ids and exits. Returns the number of launches after each of 40 passes and the request row."""
+    counts = []
+    for _ in range(40):
+        later(env, 45)
+        env.d.tick()
+        for r in dispatch.list_runs(env.board, env.p["human"], limit=50):
+            if r["status"] == "running":
+                sid = env.board.register_session(env.p["claude"], PROJECT, None,
+                                                 dispatch_run_id=r["run_id"])["session_id"]
+                env.board.read_updates(env.p["claude"], sid, post_ids=[post["id"]])
+        for child in env.spawner.children:
+            child.code = 0 if child.code is None else child.code
+        counts.append(len(launched(env)))
+    return counts, env.board.get_post(env.p["human"], post["id"])["requests"][0]
+
+
+@pytest.mark.parametrize("policy", [False, True])
+@pytest.mark.parametrize("hosted_session", [False, True])
+def test_a_request_its_hosted_session_never_read_is_relaunched_as_without_one(denv, hosted_session, policy):
+    """A. Woken, not read, the grace passes, the dispatcher launches; that run reads the request and exits without
+    settling it. The request is the dispatcher's from its reservation on: its own run's read is no sign that the
+    hosted session has it, so it is retried and then blocked exactly as with no hosted session."""
+    if policy:
+        denv.board.create_delivery_policy(denv.p["human"], agent="claude", project=PROJECT)
+        tid = denv.board.create_thread(denv.p["codex"], denv.sid["codex"], "an agent's thread", PROJECT)["id"]
+    else:
+        allow(denv)
+        tid = denv.tid
+    sid = ready(denv) if hosted_session else None
+    later(denv, 5 * 60)
+    post = denv.post("codex" if policy else "human", tid, "your turn", "handoff" if policy else "request",
+                     to=["claude"])
+    counts, row = dispatched(denv, post, hosted_session, policy)
+    assert counts[-1] == 3 and row["state"] == "blocked", "one launch, two automatic retries, then blocked"
+    assert "automatic retries used: 2" in row["reason"]
+    if hosted_session:
+        assert counts[1] == 0 and 1 in counts, "only the first launch waits, for the wake's grace"
+        assert not hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
+        rec = record(denv, sid)
+        assert str(post["id"]) in rec["claimed"] and str(post["id"]) not in rec["woken"]
+        own = denv.board.read_updates(denv.p["claude"], denv.session("claude"), only="addressed")
+        assert post["id"] in [p["id"] for p in own["posts"]]
+        assert record(denv, sid)["read"] == {} and not hosted.holds(
+            denv.board, "claude", PROJECT, post["id"], denv.clock()), "claimed: not even the session's own read"
+
+
+def test_a_read_by_a_dispatched_runs_session_does_not_keep_the_request_with_the_hosted_session(denv):
+    """A. A board session bound to a dispatcher run is never the hosted session's own, also one registered in the
+    project that is shown the post after the wake and before any launch for it."""
+    sid = ready(denv)
+    denv.d._record({"run_id": "earlier", "agent": "claude", "thread_id": denv.tid, "status": "running",
+                    "cwd": "/somewhere/else", "started_at": denv.clock(), "pid": None})
+    worker = denv.board.register_session(denv.p["claude"], PROJECT, None, dispatch_run_id="earlier")["session_id"]
+    assert denv.board.conn.execute("SELECT dispatch_run_id, project FROM sessions WHERE id = ?",
+                                   (worker,)).fetchone()[:] == ("earlier", PROJECT)
+    post = ask(denv, denv.thread())
+    tick(denv)
+    run_turn(denv, sid, text="did not read the board")
+    for view in ({"only": "addressed"}, {}):            # the mark's path, and the delivery receipt's
+        shown = denv.board.read_updates(denv.p["claude"], worker, **view)
+        assert post["id"] in [p["id"] for p in shown["posts"]]
+    assert delivery.receipt(denv.board.conn, post["id"], "claude")["session_id"] == worker
+    assert record(denv, sid)["read"] == {}
+    later(denv, GRACE)
+    assert not hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
+
+
+def test_a_read_by_the_agent_in_another_project_does_not_keep_the_request_with_the_hosted_session(denv):
+    """A. An unfiltered read after the wake by a session of the agent registered elsewhere leaves a delivery receipt.
+    It is not the hosted session's: after the grace the dispatcher launches as without a hosted session."""
+    allow(denv)
+    sid = ready(denv)
+    later(denv, 5 * 60)
+    post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
+    tick(denv)
+    run_turn(denv, sid, text="did not read the board")
+    elsewhere = denv.session("claude", P2)
+    assert post["id"] in [p["id"] for p in denv.board.read_updates(denv.p["claude"], elsewhere)["posts"]]
+    assert delivery.receipt(denv.board.conn, post["id"], "claude")["session_id"] == elsewhere
+    later(denv, GRACE + 5 * 60)             # past the grace, and that session is no longer live
+    assert not hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
+    denv.d.tick()
+    assert launched(denv) == ["claude-fake"]
+
+
+def test_no_wake_is_queued_or_handed_while_a_dispatched_run_uses_the_checkout(denv):
+    """B. One run per run directory, both ways round: an automatic turn does not start beside a dispatched run in
+    the same checkout either. The posts wait and go when the directory is free."""
+    allow(denv)
+    sid = ready(denv)
+    other = denv.thread()
+    later(denv, 5 * 60)
+    denv.post("human", denv.tid, "your turn", "request", to=["codex"])
+    denv.d.tick()
+    assert launched(denv) == ["codex-fake"] and denv.spawner.calls[0]["cwd"] == denv.workdir
+    assert hosted_wake._occupied(denv.board, show(denv, sid))
+    post = ask(denv, other, as_="grok")     # addressed to the hosted agent while that run is going
+    tick(denv, times=2)
+    denv.d.tick()
+    assert wakes(denv, sid) == [] and list(record(denv, sid)["pending"]) == [str(post["id"])], "it waits"
+    assert not hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
+    send(denv, sid, "mine")                 # the human's own message is the human's call: it goes
+    tick(denv)
+    assert turns(denv)[-1] == "mine"
+    run_turn(denv, sid)
+    tick(denv)
+    assert wakes(denv, sid) == []
+    denv.spawner.children[0].code = 0       # the run ends; the dispatcher's next pass sees it
+    denv.d.tick()
+    tick(denv)
+    assert turns(denv)[-1] == text_for(denv, 1, [other], authors="grok"), "the directory is free: woken"
+    # The other order is Dispatcher._busy_dirs:
+    # test_a_hosted_sessions_directory_is_busy_only_while_one_of_its_turns_runs.
+
+
+def test_a_wake_queued_before_the_run_started_steps_back_when_the_node_is_shown_it(denv):
+    """B. Queued while the checkout was free, not yet shown to the node when a run took the checkout: not handed."""
+    allow(denv)
+    sid = ready(denv)
+    other = denv.thread()
+    later(denv, 5 * 60)
+    post = ask(denv, other, as_="grok")
+    hosted_wake.tick(denv.board)
+    assert [m["state"] for m in wakes(denv, sid)] == ["queued"]
+    denv.d._record({"run_id": "elsewhere", "agent": "codex", "thread_id": denv.tid, "status": "running",
+                    "cwd": denv.workdir, "started_at": denv.clock(), "pid": None})
+    tick(denv)
+    [wake] = wakes(denv, sid)
+    assert (wake["state"], wake["detail"]) == ("failed", hosted_wake.OCCUPIED) and turns(denv) == ["first"]
+    rec = record(denv, sid)
+    assert list(rec["pending"]) == [str(post["id"])] and rec["woken"] == {} and rec["sent"] == []
+
+
+def test_only_a_run_in_the_same_run_directory_blocks_a_wake(senv, tmp_path):
+    """B. The dispatcher's notion of an occupied run directory: a run in its own parallel worktree has another
+    directory; a node run is recorded with the project path, which is also where a run for the project would go when
+    the hub has no checkout of it."""
+    sid = ready(senv)
+    tid = senv.thread()
+
+    def run(run_id, status, **fields) -> None:
+        with db.write_tx(senv.board.conn) as c:
+            c.execute("""INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'dispatcher', ?)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                      ("dispatch.run." + run_id, json.dumps({"run_id": run_id, "agent": "codex", "status": status,
+                                                            **fields}), senv.clock()))
+
+    run("worktree", "running", cwd=str(tmp_path / "agent-comms-worktrees" / "repo-abc" / "codex-t1"))
+    run("ended", "exited", cwd=PROJECT)
+    assert dispatch.occupied_run_dirs(senv.board) == {str((tmp_path / "agent-comms-worktrees" / "repo-abc"
+                                                           / "codex-t1").resolve())}
+    assert woken(senv, sid, tid) is True, "neither blocks"
+    run("on-a-node", "running", cwd=PROJECT, node="desktop")
+    assert woken(senv, sid, tid) is False and len(record(senv, sid)["pending"]) == 1, "a node run in the project does"
+    run("on-a-node", "exited", cwd=PROJECT, node="desktop")
+    later(senv, 31)
+    tick(senv)
+    assert len(wakes(senv, sid)) == 2
+
+
+def test_a_wake_the_node_was_shown_is_never_settled_as_not_sent(senv):
+    """C. The node may be writing it already. A later fetch that finds its post read meanwhile leaves it alone, and
+    the turn is tracked to its end."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    [first] = senv.laptop.get("/api/nodes/sessions").json()["sessions"]     # shown to the node (not yet processed)
+    assert first["messages"][0]["kind"] == "wake" and "text" in first["messages"][0]
+    reader = senv.session("claude")
+    senv.board.read_updates(senv.p["claude"], reader)
+    senv.board.ack(senv.p["claude"], reader, post["seq"])                   # read past it between two fetches
+    _revoke(senv, "codex")
+    [again] = senv.laptop.get("/api/nodes/sessions").json()["sessions"]
+    assert again["messages"] == first["messages"], "the same message with the same text"
+    assert [m["state"] for m in wakes(senv, sid)] == ["queued"]
+    tick(senv)
+    assert turns(senv)[-1] == first["messages"][0]["text"] and wakes(senv, sid)[0]["state"] == "delivered"
+    run_turn(senv, sid, text="done")
+    assert (wakes(senv, sid)[0]["state"], show(senv, sid)["reply"], show(senv, sid)["turns"]) == ("done", "done", 2)

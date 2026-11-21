@@ -101,13 +101,15 @@ def readers(conn, post_id: int, recipient: str) -> list[int]:
         if k[len(prefix):].isdigit()]
 
 
-def read_since(conn, post_id: int, recipient: str, since: float) -> bool:
+def read_since(conn, post_id: int, recipient: str, since: float,
+               reader: Callable[[Any], bool] | None = None) -> bool:
     """A session of `recipient` was handed this request at or after `since` (hosted_wake.holds: a hosted session that
-    was woken for a request and then read it has it)."""
+    was woken for a request and then read it has it). `reader`: only a receipt of a session it accepts counts."""
     prefix = _key(READER_PREFIX, post_id, recipient) + "."
     values = [receipt(conn, post_id, recipient)] + [_get(conn, k) for (k,) in conn.execute(
         "SELECT key FROM board_state WHERE key >= ? AND key < ?", (prefix, prefix[:-1] + "/")).fetchall()]
-    return any(isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and v["at"] >= since for v in values)
+    return any(isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and v["at"] >= since
+               and (reader is None or reader(v.get("session_id"))) for v in values)
 
 
 def annotate(conn, post_id: int, row: dict) -> None:

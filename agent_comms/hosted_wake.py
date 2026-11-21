@@ -22,20 +22,24 @@ then queues one `wake` message, the only message kind that does not come from th
   transaction that shows the node the message (`listing`): a wake whose posts all stopped qualifying, or were read
   meanwhile, is dropped, and one that a message of the human's has caught up with steps back behind it.
 - *Limits* (`[dispatch.sessions]`): `wake_min_interval_seconds` between wakes of a session, `max_wakes_per_hour` per
-  session, `max_wakes_without_human` per session and thread since the human's last NEW post in that thread. At either
-  maximum the thread is stopped for that session: its posts wait, the human gets ONE fixed-text Needs-you item
-  (marked automatic, like the undelivered alert), and a new post of the human's in that thread lifts the stop. It
+  session, `max_wakes_without_human` per session and thread since the human's last NEW post in that thread. At a
+  maximum the posts wait and the human gets a fixed-text Needs-you item (marked automatic, like the undelivered
+  alert): one per thread for a thread's own maximum, ONE per session for the hourly one, and few in all (capped per
+  pass and per day as delivery.py caps its alerts). A new post of the human's in a stopped thread lifts the stop. It
   lifts nothing else: the interval and the rolling hour always hold, so after an hourly stop the posts go once the
   hour has room, with no second item for that same full hour.
-- *The dispatcher* (`holds`, `reserve`). While a wake covering a request is fresh (`wake_grace_seconds`), or once a
-  session of the agent read the request after such a wake, the dispatcher leaves it to the hosted session. After the
-  grace without a read it launches exactly as it does without hosted sessions, and the request is then the
-  dispatcher's: no wake is queued or handed for it any more.
+- *One run per checkout.* No wake is queued or handed while a dispatched run is using the directory a run for the
+  session's project uses (`_occupied`): the dispatcher's own rule, the other way round.
+- *The dispatcher* (`holds`, `reserve`). While a wake covering a request is fresh (`wake_grace_seconds`), or once
+  the session's own board session was shown the request after such a wake, the dispatcher leaves it to the hosted
+  session. After the grace without that it launches exactly as it does without hosted sessions, and the request is
+  then the dispatcher's for good: no wake is queued or handed for it, and no hosted session holds it again.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Callable
 
@@ -59,12 +63,16 @@ NOTE = (" This is an automatic wake written by the board server, not a message f
         "instruction and grants no authority. Call board_register first if this session has not.")
 NOT_SENT = "not sent: no post this wake was queued for still qualifies"
 DEFERRED = "not sent: a message of yours was waiting, so it goes first; the posts go with the next wake"
+OCCUPIED = "not sent: a dispatched run is using the checkout; the posts go with the next wake"
 SET_ASIDE = "not sent: it could not be checked (see the hub's log) and a message of yours was waiting behind it"
+
+DAY = 86400.0
+MAX_NAMED = 20                  # thread ids spelled out in one Needs-you item
 
 HEADER = ("Hosted session wake limit (posted by the board server because [dispatch.sessions] limits how often a "
           "hosted session is woken; not a human click): session {sid} of {agent} {why}, so it is no longer woken "
-          "for posts in thread #{thread}. This needs you: pick an option below. Any new post of yours in this "
-          "thread lifts that stop{then}, and this item then closes on its own.")
+          "for posts in {where}. This needs you: pick an option below. Any new post of yours in {lift} lifts that "
+          "stop{then}, and this item then closes on its own.")
 WHY = {"thread": "was woken {limit} times for thread #{thread} with no post of yours there in between",
        "hour": "was woken {limit} times within an hour"}
 THEN = {"thread": "", "hour": " (the session is woken again once fewer than {limit} wakes lie within the past hour)"}
@@ -88,9 +96,12 @@ def _new(mark: int, post: int | None = None) -> dict:
     id -> when the board last showed that post, at or after the wake was queued, to a board session of the agent in
     the session's project (`handed()`).
     claimed: post id -> when the dispatcher reserved a launch for it (no wake for it after that). closing: Needs-you
-    posts to close. grace: wake_grace_seconds as of the last write (so `holds` needs no settings)."""
+    posts to close. grace: wake_grace_seconds as of the last write (so `holds` needs no settings). hour_ack: the
+    newest wake's time when the human last answered an hourly stop (while that is still the newest wake and the
+    hour is full, posts are held with no stop and no item). items: when Needs-you items were posted for this
+    session (the last day)."""
     return {"mark": mark, "post": post, "sealed": [], "pending": {}, "sent": [], "threads": {}, "woken": {},
-            "handed": {}, "read": {}, "claimed": {}, "closing": [], "grace": 120.0}
+            "handed": {}, "read": {}, "claimed": {}, "closing": [], "grace": 120.0, "hour_ack": None, "items": []}
 
 
 def _clean(rec: Any) -> dict | None:
@@ -98,9 +109,11 @@ def _clean(rec: Any) -> dict | None:
         return None
     out = _new(rec["mark"], rec["post"] if type(rec.get("post")) is int else None)
     for key, kind in (("pending", dict), ("threads", dict), ("woken", dict), ("handed", dict), ("read", dict),
-                      ("claimed", dict), ("sent", list), ("closing", list), ("sealed", list)):
+                      ("claimed", dict), ("sent", list), ("closing", list), ("sealed", list), ("items", list)):
         if isinstance(rec.get(key), kind):
             out[key] = rec[key]
+    if isinstance(rec.get("hour_ack"), (int, float)) and not isinstance(rec.get("hour_ack"), bool):
+        out["hour_ack"] = rec["hour_ack"]
     if isinstance(rec.get("grace"), (int, float)) and not isinstance(rec.get("grace"), bool):
         out["grace"] = float(rec["grace"])
     return out
@@ -132,6 +145,7 @@ def _recent(times: dict | list, now: float, keep: float, most: int | None = None
 
 def _save(c, session_id: str, rec: dict, now: float) -> None:
     rec["sent"] = _recent(rec["sent"], now, HOUR)
+    rec["items"] = _recent(rec["items"], now, DAY)
     rec["woken"] = _recent(rec["woken"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["handed"] = _recent(rec["handed"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["read"] = _recent(rec["read"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
@@ -176,11 +190,16 @@ def _human(conn) -> Principal | None:
 
 
 def _human_post(conn, thread_id: int) -> int:
-    """The id of the newest post in the thread that the human made (not an automatic one). An id, not a seq: an
-    agent's progress on one of the human's requests gives that post a new seq, and that is not the human posting."""
+    """The id of the newest post in the thread that the human made: not an automatic one (Board.NOT_AUTOMATIC),
+    and not a request the dispatcher routed to another agent in the human's name (access.route_successor, which the
+    server marks under access.ROUTED_PREFIX in the transaction that posts it). An id, not a seq: an agent's progress
+    on one of the human's requests gives that post a new seq, and that is not the human posting."""
+    from .access import ROUTED_PREFIX
     return conn.execute(
         f"""SELECT COALESCE(MAX(p.id), 0) FROM posts p JOIN agents a ON a.name = p.agent AND a.is_human = 1
-            WHERE p.thread_id = ? AND {Board.NOT_AUTOMATIC.format(post='p')}""", (thread_id,)).fetchone()[0]
+            WHERE p.thread_id = ? AND {Board.NOT_AUTOMATIC.format(post='p')}
+              AND NOT EXISTS (SELECT 1 FROM board_state br WHERE br.key = ? || p.id)""",
+        (thread_id, ROUTED_PREFIX)).fetchone()[0]
 
 
 def _managed(conn, post_id: int) -> bool:
@@ -221,9 +240,8 @@ def _stopped(rec: dict, thread_id: int) -> str | None:
     return t.get("stopped") if isinstance(t, dict) else None
 
 
-def _fresh(human: int, hour_ack: float | None = None) -> dict:
-    return {"count": 0, "human": human, "stopped": None, "limit": None, "alert": None, "tried": None,
-            "hour_ack": hour_ack}
+def _fresh(human: int) -> dict:
+    return {"count": 0, "human": human, "stopped": None, "limit": None, "alert": None, "tried": None}
 
 
 def _thread(c, rec: dict, thread_id: int) -> dict:
@@ -238,17 +256,42 @@ def _free(r: dict) -> bool:
 
 
 def _waiting(rec: dict, cfg, now: float) -> bool:
-    """Some waiting post can be acted on now: sent, or its thread stopped. Not when all that is left is held by a
-    full hour the human already answered for (those go, silently, when the hour has room)."""
+    """Some waiting post can be acted on now: sent, or its thread stopped. Not while the hour is full and the human
+    already answered for it (`hour_ack`): then everything is held, silently, until the hour has room."""
     sent = _recent(rec["sent"], now, HOUR)
-    last = max(sent, default=None)
-    held = len(sent) >= cfg.max_wakes_per_hour
-    for e in rec["pending"].values():
-        t = rec["threads"].get(str(e[0]))
-        t = t if isinstance(t, dict) else {}
-        if not t.get("stopped") and not (held and t.get("hour_ack") == last):
-            return True
-    return False
+    if len(sent) >= cfg.max_wakes_per_hour and rec.get("hour_ack") == max(sent, default=None):
+        return False
+    return any(not _stopped(rec, e[0]) for e in rec["pending"].values())
+
+
+def _run_dir(board: Board, project: str) -> str:
+    """Where the dispatcher runs something for this project on the hub's settings (DispatchConfig.run_dir, what
+    Dispatcher._busy_dirs asks for a hosted session's turn). Settings that do not validate leave the project path."""
+    from .dispatch import DispatchConfig
+
+    key = (id(board), board.settings_generation, id(board.s.dispatch))
+    if _run_dir_cache.get("key") != key:
+        try:
+            cfg = DispatchConfig.from_dict(board.s.dispatch, settings=board.s)
+        except Exception:
+            cfg = None
+        _run_dir_cache.update(key=key, cfg=cfg)
+    cfg = _run_dir_cache["cfg"]
+    return cfg.run_dir(project) if cfg is not None else project
+
+
+_run_dir_cache: dict = {}
+
+
+def _occupied(board: Board, r: dict) -> bool:
+    """A dispatched run that may still be going is using the directory a run for this session's project uses: the
+    dispatcher's own rule of one run per run directory (dispatch.occupied_run_dirs, the directories its `_busy_dirs`
+    holds), applied the other way round, so that no automatic turn starts beside a run in the same checkout. A run
+    in its own parallel worktree has another directory and does not count. Only wakes ask this: a message of the
+    human's is the human's call."""
+    from . import dispatch
+
+    return os.path.realpath(_run_dir(board, r["project"])) in dispatch.occupied_run_dirs(board)
 
 
 # ---------------------------------------------------------------- one pass
@@ -279,7 +322,9 @@ def _tick(board: Board, node: str | None) -> None:
     rows, recs = hosted._sessions(conn), _records(conn)
     if not (rows or recs) or board.is_paused():
         return      # no hosted session: two reads that find nothing, and no write
-    now, cfg = board.now(), limits(board)
+    from .delivery import ALERTS_PER_PASS
+
+    now, cfg, budget = board.now(), limits(board), [ALERTS_PER_PASS]    # Needs-you items this pass may still post
     live = {r["session_id"]: r for r in rows if r.get("state") != "ended"}
     for sid, rec in recs.items():
         if sid not in live:
@@ -290,18 +335,18 @@ def _tick(board: Board, node: str | None) -> None:
                 or now - hosted._node_seen(conn, r["node"]) > nodes.NODE_STALE_SECONDS):
             continue    # a session nobody can hand a wake to keeps its mark: its posts are found when its node is back
         rec = recs.get(sid)
-        if rec is None or _due(rec, r, top, now, cfg):
+        if rec is None or _due(board, rec, r, top, now, cfg):
             rec = _advance(board, sid, cfg, now)
         if rec is not None and (rec["closing"] or any(isinstance(t, dict) and t.get("stopped") and not t.get("alert")
                                                       for t in rec["threads"].values())):
-            _tell(board, r, rec, now)
+            _tell(board, r, rec, now, budget)
 
 
-def _due(rec: dict, r: dict, top: int, now: float, cfg) -> bool:
+def _due(board: Board, rec: dict, r: dict, top: int, now: float, cfg) -> bool:
     if top > rec["mark"]:
         return True
     return (_free(r) and now - max(rec["sent"], default=float("-inf")) >= cfg.wake_min_interval_seconds
-            and _waiting(rec, cfg, now))
+            and _waiting(rec, cfg, now) and not _occupied(board, r))
 
 
 def _look(board: Board, c, rec: dict, r: dict, p: Principal, top: int, top_id: int) -> None:
@@ -326,20 +371,24 @@ def _look(board: Board, c, rec: dict, r: dict, p: Principal, top: int, top_id: i
 def _lift(c, rec: dict, last: float | None) -> None:
     """A NEW post of the human's in a thread lifts that thread's stop and starts its count over; the item that
     reported the stop is closed. Nothing else is lifted: `sent` stays, so the interval and the rolling hour hold.
-    After an hourly stop the thread remembers which wake was the newest when the human answered (`hour_ack`): while
-    that hour is still full its posts are held without another item."""
-    for tid, t in list(rec["threads"].items()):
-        human = _human_post(c, int(tid))
-        if isinstance(t, dict) and human <= int(t.get("human") or 0):
-            continue
-        t = t if isinstance(t, dict) else {}
-        if t.get("alert"):
+    The hourly maximum is the session's, and so is its stop: the human's post in any thread it stopped lifts it for
+    all of them, and the record remembers which wake was the newest then (`hour_ack`): while that hour is still
+    full, posts are held without another stop or item."""
+    def drop(tid: str, t: Any) -> None:
+        if isinstance(t, dict) and t.get("alert") and t["alert"] not in rec["closing"]:
             rec["closing"].append(t["alert"])
-        ack = last if t.get("stopped") == "hour" else t.get("hour_ack")
-        if ack is not None and ack == last:
-            rec["threads"][tid] = _fresh(human, ack)
-        else:
-            del rec["threads"][tid]
+        del rec["threads"][tid]
+
+    hourly = False
+    for tid, t in list(rec["threads"].items()):
+        if not isinstance(t, dict) or _human_post(c, int(tid)) > int(t.get("human") or 0):
+            hourly = hourly or (isinstance(t, dict) and t.get("stopped") == "hour")
+            drop(tid, t)
+    if hourly:
+        rec["hour_ack"] = last
+        for tid, t in list(rec["threads"].items()):
+            if isinstance(t, dict) and t.get("stopped") == "hour":
+                drop(tid, t)
 
 
 def _advance(board: Board, session_id: str, cfg, now: float) -> dict | None:
@@ -365,7 +414,7 @@ def _advance(board: Board, session_id: str, cfg, now: float) -> dict | None:
             _look(board, c, rec, r, p, top, top_id)
             _lift(c, rec, last)
         if (_free(r) and (last is None or now - last >= cfg.wake_min_interval_seconds)
-                and _waiting(rec, cfg, now)):
+                and _waiting(rec, cfg, now) and not _occupied(board, r)):
             # Checked again now, not only when found: the batch may have waited (a turn, the interval, a pause).
             rec["pending"] = _qualifying(board, p, r["project"], [int(k) for k in rec["pending"]], rec)
             batch = {k: e for k, e in rec["pending"].items() if not _stopped(rec, e[0])}
@@ -375,10 +424,12 @@ def _advance(board: Board, session_id: str, cfg, now: float) -> dict | None:
                     t |= {"stopped": "thread", "limit": cfg.max_wakes_without_human}
             batch = {k: e for k, e in batch.items() if not _stopped(rec, e[0])}
             if batch and len(sent) >= cfg.max_wakes_per_hour:
+                # One hourly stop per session, and so one item: a thread the full hour catches later joins the item
+                # that is already out (`_tell` posts one for all the threads that have none yet).
+                out = next((t["alert"] for t in rec["threads"].values()
+                            if isinstance(t, dict) and t.get("stopped") == "hour" and t.get("alert")), None)
                 for tid in sorted({e[0] for e in batch.values()}):
-                    t = _thread(c, rec, tid)
-                    if t.get("hour_ack") != last:   # else: the human answered for this very hour; held, no item
-                        t |= {"stopped": "hour", "limit": cfg.max_wakes_per_hour}
+                    _thread(c, rec, tid).update(stopped="hour", limit=cfg.max_wakes_per_hour, alert=out)
                 batch = {}
             if batch:
                 m = hosted._enqueue(c, r, "wake", wake_text(r["agent"], list(batch.values())), HUB, now)
@@ -516,18 +567,16 @@ def _next_queued(conn, session_id: str) -> tuple[dict | None, bool]:
 
 
 def _unsettled(board: Board, node: str) -> list[str]:
-    """This node's sessions whose next message is a wake that needs a write before it may be shown: never handed
-    yet, or no longer for exactly the posts recorded on it."""
-    conn, out = board.conn, []
-    for r in hosted._sessions(conn):
+    """This node's sessions whose next message is a wake the node was never shown: it needs the re-check, and a
+    write, before it may be. A wake that was shown once is the node's: it may be writing it already, so it is
+    neither checked nor changed again (settling it then would leave its turn running with nobody tracking it)."""
+    out = []
+    for r in hosted._sessions(board.conn):
         if r.get("node") != node or r.get("state") == "ended" or not int(r.get("queued") or 0):
             continue
-        m, _ = _next_queued(conn, r["session_id"])
-        if m is None or m.get("kind") != "wake" or not isinstance(m.get("posts"), list):
-            continue
-        p, rec = _agent(conn, r["agent"]), _load(conn, r["session_id"]) or _new(0, 0)
-        keep = _qualifying(board, p, r["project"], m["posts"], rec) if p is not None else {}
-        if m.get("handed_at") is None or sorted(int(k) for k in keep) != m["posts"]:
+        m, _ = _next_queued(board.conn, r["session_id"])
+        if (m is not None and m.get("kind") == "wake" and isinstance(m.get("posts"), list)
+                and m.get("handed_at") is None):
             out.append(r["session_id"])
     return out
 
@@ -542,12 +591,13 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
     r = _get(c, hosted.SESSION_PREFIX + session_id)
     m, human_waiting = _next_queued(c, session_id)
     if (not isinstance(r, dict) or r.get("state") == "ended" or m is None or m.get("kind") != "wake"
-            or not isinstance(m.get("posts"), list)):
-        return
+            or not isinstance(m.get("posts"), list) or m.get("handed_at") is not None):
+        return      # nothing to check, or already the node's (never settled as not sent once it was shown)
     rec = _load(c, session_id) or _new(*_tops(c))
     p = _agent(c, r["agent"])
     keep = _qualifying(board, p, r["project"], m["posts"], rec) if p is not None else {}
-    defer = bool(keep) and m.get("handed_at") is None and human_waiting
+    occupied = bool(keep) and not human_waiting and _occupied(board, r)
+    defer = bool(keep) and (human_waiting or occupied)
     for k in (str(i) for i in m["posts"]):
         if k not in keep or defer:
             # No wake reached anyone for it (dropped, or stepping back behind the human's message): its coverage
@@ -567,8 +617,8 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
         m |= {"posts": sorted(int(k) for k in keep), "text": wake_text(r["agent"], list(keep.values())),
               "handed_at": m.get("handed_at") or now, "updated_at": now}
     else:
-        m |= {"state": "failed", "ok": False, "detail": DEFERRED if defer else NOT_SENT, "text": "",
-              "ended_at": now, "updated_at": now}
+        m |= {"state": "failed", "ok": False, "text": "", "ended_at": now, "updated_at": now,
+              "detail": OCCUPIED if occupied else DEFERRED if defer else NOT_SENT}
         r |= {"queued": max(0, int(r.get("queued") or 0) - 1), "updated_at": now}
         _put(c, hosted.SESSION_PREFIX + session_id, r, HUB, now)
     _put(c, hosted._msg_key(session_id, m["n"]), m, HUB, now)
@@ -593,16 +643,18 @@ def _matching(conn, agent: str, project: Any, now: float) -> list[dict]:
 def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> bool:
     """A hosted session has this request, so nothing else should be started for it: a session of `agent` in `project`
     that has not ended, on a node seen within nodes.NODE_STALE_SECONDS, and either a wake covering the post was
-    queued or handed less than `wake_grace_seconds` ago, or the board showed the post to a session of the agent at
-    or after such a wake: in any view, to a board session in this project (`handed`, the record's `read`), or as a
-    delivery receipt. A session that was never woken for the post, or was woken and was not shown it, holds nothing
-    once the grace has passed."""
+    queued or handed less than `wake_grace_seconds` ago, or the board showed the post, at or after that wake was
+    queued, to a board session that can be the hosted one: a session of the agent registered in this project that is
+    not a dispatched run's (`_own_reader`). Shown means the record's `read` mark (any view, `handed`) or a delivery
+    receipt of such a session. A session that was never woken for the post, or was woken and was not shown it,
+    holds nothing once the grace has passed; and a post the dispatcher reserved a run for is the dispatcher's
+    (`reserve`): whatever that run or anybody else reads afterwards, no hosted session holds it."""
     conn = getattr(board_or_conn, "conn", board_or_conn)
     if type(post_id) is not int:
         return False
     for r in _matching(conn, agent, project, now):
         rec = _load(conn, r["session_id"])
-        at = rec["woken"].get(str(post_id)) if rec else None
+        at = rec["woken"].get(str(post_id)) if rec and str(post_id) not in rec["claimed"] else None
         if not isinstance(at, (int, float)):
             continue
         handed_at = rec["handed"].get(str(post_id))
@@ -612,9 +664,19 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         if isinstance(read, (int, float)) and read >= at:
             return True
         from . import delivery
-        if delivery.read_since(conn, post_id, agent, at):
+        if delivery.read_since(conn, post_id, agent, at, lambda sid: _own_reader(conn, sid, agent, r["project"])):
             return True
     return False
+
+
+def _own_reader(conn, session_id: Any, agent: str, project: str) -> bool:
+    """This board session can be the hosted session's own: the agent's, registered in the hosted session's project,
+    and not the session of a dispatched run (which registers with its run id). A read by any other session, the
+    dispatcher's cold run or the agent in another project, is no sign that the hosted session has the request."""
+    row = conn.execute("SELECT agent, project, dispatch_run_id FROM sessions WHERE id = ?", (session_id,)).fetchone() \
+        if type(session_id) is int else None
+    return (row is not None and row["agent"] == agent and row["dispatch_run_id"] is None
+            and (row["project"].rstrip("/") or "/") == project)
 
 
 def _unmarked(rec: dict, ids: list[int]) -> list[str]:
@@ -630,7 +692,8 @@ def _unmarked(rec: dict, ids: list[int]) -> list[str]:
 def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> None:
     """Called where the board returns posts to a reader (Board.read_updates, every view): note, for `holds`, that a
     board session of a hosted session's agent, registered in that session's project, was really shown a post a wake
-    had covered. This is not a delivery receipt (delivery.py keeps its own rule: an unfiltered read or the post_ids
+    had covered (`_own_reader`: never a dispatched run's session). This is not a delivery receipt (delivery.py
+    keeps its own rule: an unfiltered read or the post_ids
     view); it exists because a woken session may read with `only="addressed"`, which the wake's wording invites and
     which leaves no receipt. Only what is in `posts`, the response itself, is noted. Never raises, and without a
     hosted session of the reader it reads one key range and writes nothing."""
@@ -640,11 +703,10 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
                 if r.get("agent") == p.name and r.get("state") != "ended"] if ids else []
         if not mine:
             return
-        row = board.conn.execute("SELECT project FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        project = (row["project"].rstrip("/") or "/") if row else None
         now = board.now()
         for r in mine:
-            rec = _load(board.conn, r["session_id"]) if r.get("project") == project else None
+            rec = (_load(board.conn, r["session_id"])
+                   if _own_reader(board.conn, session_id, p.name, r.get("project")) else None)
             if rec is None or not _unmarked(rec, ids):
                 continue        # nothing to note: no write (a re-read, or a post no wake covered)
             with db.write_tx(board.conn) as c:
@@ -676,7 +738,8 @@ def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:
             continue
         rec = _load(conn, r["session_id"])
         if rec is not None:
-            rec["pending"].pop(str(post_id), None)
+            for table in ("pending", "woken", "handed", "read"):    # no longer waiting here, no longer covered
+                rec[table].pop(str(post_id), None)
             rec["claimed"][str(post_id)] = now
             _save(conn, r["session_id"], rec, now)
     return True
@@ -696,27 +759,51 @@ def turn_projects(board_or_conn: Any, now: float) -> set[str]:
 # ---------------------------------------------------------------- telling the human
 
 
-def _question(session_id: str, agent: str, thread_id: int, limit: int, reason: str) -> dict:
+def _named(tids: list[int]) -> str:
+    """Thread ids, and nothing else of the threads."""
+    shown = ", ".join(f"#{t}" for t in tids[:MAX_NAMED])
+    more = f" and {len(tids) - MAX_NAMED} more" if len(tids) > MAX_NAMED else ""
+    return ("thread " if len(tids) == 1 else "threads ") + shown + more
+
+
+def item_body(session_id: str, agent: str, tids: list[int], limit: int, reason: str) -> str:
+    """The fixed text of a wake-limit item: the session id, the agent's name, thread ids and the limit."""
+    return HEADER.format(sid=session_id, agent=agent, where=_named(tids), then=THEN[reason].format(limit=limit),
+                         why=WHY[reason].format(limit=limit, thread=tids[0]),
+                         lift="this thread" if len(tids) == 1 else "any of those threads (for all of them)")
+
+
+def _question(session_id: str, agent: str, tids: list[int], limit: int, reason: str) -> dict:
+    hour = reason == "hour"
     when = (f" as soon as fewer than {limit} wakes lie within the past hour (the hourly limit itself stays)"
-            if reason == "hour" else "")
-    go = {"id": "go-on", "label": f"Keep waking {agent} for thread #{thread_id}"[:200], "outcome": "answered",
+            if hour else "")
+    where = "here" if len(tids) == 1 else f"in {_named(tids)}"
+    label = f"Keep waking {agent}'s hosted session" if hour else f"Keep waking {agent} for thread #{tids[0]}"
+    go = {"id": "go-on", "label": label[:200], "outcome": "answered",
           "description": (f"Your answer is a post in this thread, which lifts the stop: the session is woken again "
-                          f"for posts addressed to {agent} here, the ones that waited included{when}, until a limit "
-                          "is reached again and an item like this comes back. Costs agent turns (tokens).")}
+                          f"for posts addressed to {agent} {where}, the ones that waited included{when}, until a "
+                          "limit is reached again and an item like this comes back. Costs agent turns (tokens).")}
     close = {"id": "close-session", "label": "I'll close the session first", "outcome": "answered",
              "description": (f"Run `board session close {session_id}`, then answer here. A closed session is never "
                              f"woken; later requests to {agent} in that project are handled as without a hosted "
                              "session. Costs nothing. Answering without closing it lifts the stop like the other "
                              "option.")}
-    return {"question": f"{agent}'s hosted session reached its wake limit on thread #{thread_id}. Keep waking it?",
+    asked = (f"{agent}'s hosted session reached its hourly wake limit ({len(tids)} thread(s) held). Keep waking it?"
+             if hour else f"{agent}'s hosted session reached its wake limit on thread #{tids[0]}. Keep waking it?")
+    return {"question": asked,
             "context": (f"The limit is {limit}; it exists so that agents cannot keep each other's sessions taking "
                         "turns without you looking in. Recommended: keep waking it, since the limit comes back."),
             "options": [go, close], "recommended_option_id": "go-on"}
 
 
-def _tell(board: Board, r: dict, rec: dict, now: float) -> None:
-    """Outside the pass's transaction: close the items of threads the human posted in, and post the ONE Needs-you
-    item of each newly stopped thread. A failure here is logged and tried again; it never undoes a stop."""
+def _tell(board: Board, r: dict, rec: dict, now: float, budget: list[int]) -> None:
+    """Outside the pass's transaction: close the items of threads the human posted in, and post the Needs-you items
+    that are due. ONE per session for an hourly stop, naming the threads it holds; one per thread for a thread's own
+    limit. And few: at most delivery.ALERTS_PER_PASS items a pass over all sessions (`budget`, what is left of it)
+    and delivery.DAILY_CAP a rolling day per session, as the undelivered alert is capped. A stop whose item has to
+    wait stands all the same and gets its item on a later pass. A failure here is logged and tried again."""
+    from .delivery import DAILY_CAP
+
     human = _human(board.conn)
     if human is None:
         return
@@ -726,26 +813,37 @@ def _tell(board: Board, r: dict, rec: dict, now: float) -> None:
             _close(board, human, sid, post_id, now)
         except Exception:
             log.exception("session %s: could not close wake-limit item %s", sid, post_id)
-    for tid, t in sorted(rec["threads"].items()):
-        if (isinstance(t, dict) and t.get("stopped") and not t.get("alert")
-                and now - float(t.get("tried") or float("-inf")) >= ALERT_RETRY_SECONDS):
-            try:
-                _alert(board, human, r, int(tid), now)
-            except Exception as e:
-                log.warning("session %s: could not post the wake-limit item on thread %s: %s", sid, tid, e)
-                with db.write_tx(board.conn) as c:
-                    cur = _load(c, sid)
-                    if cur and isinstance(cur["threads"].get(tid), dict) and not cur["threads"][tid].get("alert"):
+    due = {int(tid): t["stopped"] for tid, t in rec["threads"].items()
+           if isinstance(t, dict) and t.get("stopped") in WHY and not t.get("alert")
+           and now - float(t.get("tried") or float("-inf")) >= ALERT_RETRY_SECONDS}
+    hourly = sorted(tid for tid, why in due.items() if why == "hour")
+    posted = len(_recent(rec["items"], now, DAY))
+    for tids in ([hourly] if hourly else []) + [[tid] for tid in sorted(due) if due[tid] == "thread"]:
+        if budget[0] <= 0 or posted >= DAILY_CAP:
+            break
+        try:
+            _alert(board, human, r, tids, now)
+            budget[0] -= 1
+            posted += 1
+        except Exception as e:
+            log.warning("session %s: could not post the wake-limit item on thread(s) %s: %s", sid, tids, e)
+            with db.write_tx(board.conn) as c:
+                cur = _load(c, sid)
+                for tid in (str(t) for t in tids) if cur else []:
+                    if isinstance(cur["threads"].get(tid), dict) and not cur["threads"][tid].get("alert"):
                         cur["threads"][tid]["tried"] = now
-                        _save(c, sid, cur, now)
+                if cur:
+                    _save(c, sid, cur, now)
 
 
-def _alert(board: Board, human: Principal, r: dict, thread_id: int, now: float) -> int:
+def _alert(board: Board, human: Principal, r: dict, tids: list[int], now: float) -> int:
+    """One Needs-you item for these stopped threads of the session (one thread, or all an hourly stop holds), posted
+    in the first of them."""
     from . import human_actions, issues
     from .autorecover import POST_PREFIX, _insert
 
-    sid, agent, key = r["session_id"], r["agent"], str(thread_id)
-    t = (_load(board.conn, sid) or _new(0))["threads"].get(key) or {}
+    sid, agent, keys = r["session_id"], r["agent"], [str(t) for t in tids]
+    t = (_load(board.conn, sid) or _new(0))["threads"].get(keys[0]) or {}
     reason, limit = t.get("stopped"), int(t.get("limit") or 0)
     if reason not in WHY or not channel.NAME_RE.match(agent):
         raise Conflict("nothing to report")
@@ -753,26 +851,29 @@ def _alert(board: Board, human: Principal, r: dict, thread_id: int, now: float) 
     def check() -> None:
         if board.is_paused():
             raise Conflict("the board is paused")
-        cur = (_load(board.conn, sid) or _new(0))["threads"].get(key)
-        if not isinstance(cur, dict) or cur.get("stopped") != reason or cur.get("alert"):
+        cur = (_load(board.conn, sid) or _new(0))["threads"]
+        if any(not isinstance(cur.get(k), dict) or cur[k].get("stopped") != reason or cur[k].get("alert")
+               for k in keys):
             raise Conflict("the wake limit changed meanwhile")
 
     def hook(post: dict) -> None:
         _insert(board.conn, POST_PREFIX + str(post["id"]),
-                {"kind": MARKER_KIND, "thread_id": thread_id, "session_id": sid, "agent": agent}, now)
+                {"kind": MARKER_KIND, "thread_id": tids[0], "thread_ids": tids, "session_id": sid, "agent": agent},
+                now)
         cur = _load(board.conn, sid)
-        cur["threads"][key]["alert"] = post["id"]
+        for k in keys:
+            cur["threads"][k]["alert"] = post["id"]
+        cur["items"].append(now)
         _save(board.conn, sid, cur, now)
 
-    question = _question(sid, agent, thread_id, limit, reason)
+    question = _question(sid, agent, tids, limit, reason)
     issues._question(board, question)
-    body = HEADER.format(sid=sid, agent=agent, thread=thread_id, then=THEN[reason].format(limit=limit),
-                         why=WHY[reason].format(limit=limit, thread=thread_id))
-    post, _ = human_actions.post_as_human(board, human, thread_id=thread_id, body=body, type="question", to=[],
+    post, _ = human_actions.post_as_human(board, human, thread_id=tids[0], type="question", to=[],
+                                          body=item_body(sid, agent, tids, limit, reason),
                                           needs_response=True, decision_question=question, post_check=check,
                                           post_hook=hook)
-    log.warning("session %s of %s reached its wake limit (%s) on thread %s; told the human in post %s", sid, agent,
-                reason, thread_id, post["id"])
+    log.warning("session %s of %s reached its wake limit (%s) on thread(s) %s; told the human in post %s", sid, agent,
+                reason, tids, post["id"])
     return post["id"]
 
 
@@ -809,8 +910,8 @@ def _retire(board: Board, session_id: str, now: float) -> None:
         c.execute("DELETE FROM board_state WHERE key = ?", (WAKE_PREFIX + session_id,))
     human = _human(board.conn)
     if rec is not None and human is not None:
-        for post_id in rec["closing"] + [t.get("alert") for t in rec["threads"].values()
-                                         if isinstance(t, dict) and t.get("alert")]:
+        for post_id in dict.fromkeys(rec["closing"] + [t.get("alert") for t in rec["threads"].values()
+                                                       if isinstance(t, dict) and t.get("alert")]):
             try:
                 _close(board, human, session_id, post_id, now)
             except Exception:

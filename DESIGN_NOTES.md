@@ -2416,7 +2416,9 @@ wake in a session's queue, and posts that arrive during a turn or inside the int
 is checked three times: when the post is found, when the wake is queued, and when the node is shown the message with
 its text. The last two also drop a post a session of the agent has already acknowledged (its cursor is past it) and
 one the dispatcher has reserved a run for. A wake with no post left is settled `failed` with "not sent: ..." and
-never reaches the node; one with fewer is rendered again.
+never reaches the node; one with fewer is rendered again. All of this happens before the node is first shown the
+wake. Once it was shown, the wake is the node's (it may be writing it already): it is never checked, changed or
+settled as not sent again, since that would leave its turn running with nobody tracking it.
 
 *Shown and validated in one transaction* (`hosted_wake.listing`, which `hosted.node_sessions` now goes through). In
 one read snapshot the hub looks at the wake each session would be handed next; if each was handed before and still
@@ -2451,31 +2453,64 @@ session's last reply like any other, for the human alone.
 
 **Limits** (`[dispatch.sessions]`, read on the hub whatever `enabled` says there; strict keys):
 `wake_min_interval_seconds` 30, `max_wakes_per_hour` 12 (per session), `max_wakes_without_human` 6 (per session and
-thread, counted since the human's last NEW post in that thread that is not an automatic one, `Board.NOT_AUTOMATIC`;
-the newest such post is found by id and author, not by seq, so an agent's progress on a request of the human's is
-not the human stepping in),
-`wake_grace_seconds` 120. The interval only delays. At either maximum the thread is *stopped* for that session: its
-posts stay in `pending`, and the human gets ONE needs-response question in that thread (fixed text: the session id,
-the agent's name, the thread id and the limit; marked automatic with an `auto_recovery.post.` marker of kind
-`wake_limit`, so it is labelled and does not itself count as the human posting). It is not repeated for that session
-and thread. A new post of the human's in the thread lifts that stop and nothing else: the count starts over, the item
-is closed if it is still open, and what waited goes as one wake. The wake times are never cleared, so the interval
-and the rolling hour always hold. After an hourly stop the answered thread's posts are therefore held until fewer
-than the maximum lie within the past hour, with no second item meanwhile: the thread remembers which wake was the
-newest when the human answered (`hour_ack`), and only a full hour that includes a later wake is a new one. Both
-options of the question are answers, so both lift it; the second says to close the session first. An ended session's items are closed and its record deleted.
+thread, counted since the human's last NEW post in that thread), `wake_grace_seconds` 120. The interval only delays.
+- *The human stepped in* means a new post by the human identity in that thread, found by id and author, not by seq
+  (an agent's progress on a request of the human's moves that post's seq and is not the human). Two kinds of post
+  the server writes in the human's name do not count: an automatic one (`Board.NOT_AUTOMATIC`) and a request the
+  dispatcher routed to another agent (`access.route_successor`, which marks it under `access.ROUTED_PREFIX` in the
+  transaction that posts it).
+- *A thread's own maximum* stops that thread for that session: its posts stay in `pending`, and the human gets ONE
+  needs-response question in that thread (fixed text: the session id, the agent's name, thread ids and the limit;
+  marked automatic with an `auto_recovery.post.` marker of kind `wake_limit`, so it is labelled and does not itself
+  count as the human posting). It is not repeated for that session and thread.
+- *The hourly maximum* is the session's, and so are its stop and its item: every thread the full hour catches is
+  stopped, and ONE item is posted for the session, in the first of those threads, naming all of them by id. A thread
+  caught later while that item is out joins it without a post of its own. (An earlier version posted one item per
+  thread: fifteen threads gave fifteen items in one pass.)
+- *Few items.* As the undelivered alert is capped: at most `delivery.ALERTS_PER_PASS` (5) wake-limit items a pass
+  over all sessions, and `delivery.DAILY_CAP` (5) a rolling day per session. A stop whose item has to wait stands all
+  the same and gets its item later.
+- *Lifting.* A new post of the human's in a stopped thread lifts that stop and nothing else: the count starts over,
+  the item is closed if it is still open, and what waited goes as one wake. For an hourly stop the post may be in
+  any of the threads it stopped and lifts it for all of them. The wake times are never cleared, so the interval and
+  the rolling hour always hold: after an hourly stop the posts are held until fewer than the maximum lie within the
+  past hour, with no second stop or item meanwhile. The record remembers which wake was the newest when the human
+  answered (`hour_ack`); only a full hour that includes a later wake is a new one. Both options of the question are
+  answers, so both lift it; the second says to close the session first. An ended session's items are closed and its
+  record deleted.
+
+**One run per checkout, both ways round.** `Dispatcher._busy_dirs` keeps a dispatched run out of a checkout in which
+a hosted turn is running. The watcher applies the same rule to its own turns: while a dispatched run that may still
+be going (hub-local or on a node) is recorded with the run directory a run for the session's project would use
+(`dispatch.occupied_run_dirs`, the directories `_busy_dirs` holds, read from the run records; `DispatchConfig.run_dir`
+on the hub's settings), no wake is queued, and one queued just before is not shown to the node: it steps back like
+one the human's message caught up with. The posts stay in `pending` and go when the directory is free. A run in its
+own parallel worktree has another directory and does not block. This is about automatic turns only: a message the
+human sends is the human's call.
 
 **The dispatcher** (`hosted.holds(board_or_conn, agent, project, post_id, now)`). True when a session of the agent
-in that project has not ended and is not being closed, its node was seen within `NODE_STALE_SECONDS`, and either a
-wake covering the post was queued or handed less than `wake_grace_seconds` ago, or the board showed the post to a
-session of the agent at or after that wake. "Showed" is either of two records. One is a delivery receipt or reader
-record (an unfiltered read or the `post_ids` view, by any session of the agent). The other is the watcher's own
-`read` mark, written by `hosted_wake.handed` where `Board.read_updates` returns posts, in EVERY view: when the
-reader is the hosted session's agent, its board session is registered in the session's project, and the response
-really contains a post a wake covered, the time is noted. The record keeps two times per covered post: `woken`,
-when its wake was queued, which is what read evidence (mark or dated receipt) is compared with, and `handed`, when
-the node was first shown that wake, which only extends the grace (it counts from the later of the two). A read
-between the two therefore counts. With the grace in force stored too, `holds` needs only a connection.
+in that project has not ended and is not being closed, its node was seen within `NODE_STALE_SECONDS`, the dispatcher
+has not reserved a run for the post, and either a wake covering the post was queued or handed less than
+`wake_grace_seconds` ago, or the board showed the post, at or after that wake was queued, to a board session that
+can be the hosted one. Such a session is the agent's, registered in the hosted session's project, and not bound to
+a dispatcher run (`_own_reader`). "Showed" is either of two records about such a session: a delivery receipt or
+reader record (an unfiltered read or the `post_ids` view), or the watcher's own `read` mark, written by
+`hosted_wake.handed` where `Board.read_updates` returns posts, in EVERY view, when the response really contains a
+post a wake covered. The record keeps two times per covered post: `woken`, when its wake was queued, which is what
+read evidence is compared with, and `handed`, when the node was first shown that wake, which only extends the grace
+(it counts from the later of the two). A read between the two therefore counts. With the grace in force stored too,
+`holds` needs only a connection. It is asked in `_policy_held`, at the launch gate for all three kinds of rule, and
+by the undelivered alert, also in the transaction that posts the alert. After the grace without such a read it is
+False and the dispatcher launches as before: an idle hosted session that did not read a request holds nothing
+("Fast pickup").
+
+*Whose read counts* (found in review of #87). Any receipt used to count. So after a wake nobody read, the grace
+passed, the dispatcher launched, its run read the request with `post_ids` and exited without settling it; that
+read made `holds` true again and the request was never retried, where without a hosted session it is retried twice
+and then blocked. The same with an unfiltered read by the agent's session in another project. Now a post the
+dispatcher reserved a run for is the dispatcher's for good (`claimed`: `holds` is false, and the reservation drops
+its coverage), and neither a dispatched run's session nor a session registered elsewhere is ever taken for the
+hosted one.
 
 *Why the second record* (observed, 2026-11-20). In two of eight real `--with-board` runs the woken session read the
 post and the hub had no delivery receipt. The second time the script printed the calls: `board_register({"project":
@@ -2486,21 +2521,20 @@ the undelivered alert are unchanged), and the wake's own wording ("addressed to 
 hold must not depend on how the session read. The mark is not a receipt: it says nothing to the sender, the alert
 does not read it, and without a hosted session of the reader nothing is written. A session without board access is
 shown nothing, so it still holds nothing after the grace. After the change, five consecutive real runs passed, one
-of them again with `only="addressed"`: no receipt, `holds` true after the grace. It is asked in `_policy_held`, at the
-launch gate for all three kinds of rule, and by the undelivered alert. After the grace without a read it is False
-and the dispatcher launches as before: an idle hosted session that did not read a request holds nothing ("Fast
-pickup"). The dispatcher's own pass runs the watcher before launching, so a trigger it has just scanned is never
-launched for in the gap before a node's fetch would have queued the wake. Two rechecks close what is left of that
-gap without a new lock. `Board.reserve_dispatch_launch` takes a `check` that runs last inside its write
+of them again with `only="addressed"`: no receipt, `holds` true after the grace.
+
+*The gap between the gate and the launch.* The dispatcher's own pass runs the watcher before launching, so a trigger
+it has just scanned is never launched for before a node's fetch would have queued the wake. Two rechecks close what
+is left without a new lock. `Board.reserve_dispatch_launch` takes a `check` that runs last inside its write
 transaction; the dispatcher always passes `hosted_wake.reserve` for an ordinary request (whether the agent has a
 hosted session is decided inside that transaction, not before it), which refuses the launch if a hosted session
 holds the request after all (the trigger stays pending, nothing is spent) and otherwise marks the request as the
 dispatcher's (`claimed`) in the record of every session of the agent in the project that has not ended, whether or
-not its node is connected: it leaves `pending`, and a wake already queued for it loses it when the node is shown
-that wake, also a node that was away when the launch was reserved. Without a hosted session of the agent the check
-reads the session list, refuses nothing and writes nothing. The undelivered alert asks `holds` again in the transaction that posts it. `_busy_dirs` adds the run directory of a
-hosted session's project only while the hub has a message of that session in flight and its node is not lost
-(`hosted._lost`, the test PR 2 uses to fail such a turn).
+not its node is connected: it leaves `pending` and loses its coverage, and a wake already queued for it loses it
+when the node is shown that wake, also a node that was away when the launch was reserved. Without a hosted session
+of the agent the check reads the session list, refuses nothing and writes nothing. `_busy_dirs` adds the run
+directory of a hosted session's project only while the hub has a message of that session in flight and its node is
+not lost (`hosted._lost`, the test PR 2 uses to fail such a turn).
 
 **Changes to core.py** (not PR 2's, but everybody's): `reserve_dispatch_launch` takes the optional `check`, and
 `read_updates` calls `hosted_wake.handed` at its two return points (the ordinary read, every view, and the
@@ -2542,7 +2576,10 @@ work was needed, and the session said it had not loaded the request-progress too
   (`Board._scope_sql`), which is what a wake announces. Not run.
 - A wake counts toward the interval and the hourly maximum when it is queued, also if it is then dropped at
   hand-over.
-- `_busy_dirs` compares directories as the hub sees them (`run_dir(project)`): with a hub checkout of the same
+- "A board session that can be the hosted one" is told by agent, project and not being a dispatched run's. A
+  session the human opens by hand for the same agent in the same project is indistinguishable from it, so its read
+  after a wake keeps the request with the hosted session too.
+- `_busy_dirs` and the watcher's `_occupied` compare directories as the hub sees them (`run_dir(project)`): with a hub checkout of the same
   project on another machine than the node, a hub run waits for a turn it would not have collided with.
 - After a pause or a node's absence the session is woken for what arrived meanwhile; a run the dispatcher started
   for the same request in that time is not noticed unless that run already acknowledged the post.
