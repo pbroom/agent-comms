@@ -810,6 +810,7 @@ def with_writable_roots(template: list[str], roots: list[str]) -> list[str]:
 SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_seconds", "max_concurrent",
            "max_runs_per_agent", "undelivered_alert_minutes")
 WORKTREE_PRUNE_SECONDS = 3600
+HOSTED_HOLDS = "hosted"     # reserve_dispatch_launch's reason when a hosted session took the request meanwhile
 
 
 @dataclass
@@ -820,6 +821,11 @@ class SessionsConfig:
     enabled: bool = False
     idle_hours: float = 8.0     # a session's process idle this long is stopped; its next message resumes it
     max_live: int = 4           # session processes at once; one more stops the longest-idle one, or waits
+    # Waking a session for board posts addressed to its agent (hosted_wake.py). These four apply on the hub.
+    wake_min_interval_seconds: float = 30.0   # at most one wake per session in this many seconds
+    max_wakes_per_hour: int = 12              # per session
+    max_wakes_without_human: int = 6          # per session and thread, since the human last posted in that thread
+    wake_grace_seconds: float = 120.0         # how long a wake keeps the dispatcher from launching for its requests
 
     @classmethod
     def from_dict(cls, d: Any) -> "SessionsConfig":
@@ -840,6 +846,14 @@ class SessionsConfig:
                 if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 50:
                     raise ValueError(f"{where} max_live must be a whole number from 1 to 50")
                 c.max_live = v
+            elif k in ("wake_min_interval_seconds", "wake_grace_seconds"):
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 3600:
+                    raise ValueError(f"{where} {k} must be a number of seconds from 0 to 3600")
+                setattr(c, k, float(v))
+            elif k in ("max_wakes_per_hour", "max_wakes_without_human"):
+                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 1000:
+                    raise ValueError(f"{where} {k} must be a whole number from 1 to 1000")
+                setattr(c, k, v)
             else:
                 raise ValueError(f"unknown setting {where} {k}")
         return c
@@ -1310,6 +1324,14 @@ def _active_records(board: Board) -> list[dict]:
     return out
 
 
+def occupied_run_dirs(board: Board) -> set[str]:
+    """The run directories of the dispatched runs that may still be going, from their records (hub-local runs and
+    runs on a node alike): what Dispatcher._busy_dirs holds for this loop's children and for the runs an earlier
+    loop left, for a caller that is not the dispatcher. hosted_wake.py asks it so that no automatic turn of a
+    hosted session starts in a checkout a run is using; `_busy_dirs` prevents the opposite order."""
+    return {os.path.realpath(d["cwd"]) for d in _active_records(board) if isinstance(d.get("cwd"), str) and d["cwd"]}
+
+
 def check_orphans(board: Board, probe: Probe, exclude: set[str] = frozenset(), note: str = "",
                   ended_as: dict[str, str] | None = None, respect_owner: bool = True,
                   stop_mode: str | None = None) -> list[dict]:
@@ -1459,6 +1481,10 @@ class Dispatcher:
         self._auto_recover()
         self._undelivered_alerts()
         pending = self._scan()
+        # After the scan, so every trigger it found was first offered to a hosted session of its agent (hosted_wake.py)
+        # and `_hosted_holds` below sees that wake. Without hosted sessions this reads two keys and writes nothing.
+        from . import hosted_wake
+        hosted_wake.tick(self.board)
         self._launch_due(pending, now, foreign)
         self._prune_worktrees(foreign)
 
@@ -1741,12 +1767,50 @@ class Dispatcher:
 
     def _live(self, agent: str, now: float) -> bool:
         """A session seen within live_minutes, or a dispatched run that ended that recently (its session may
-        not have registered at all, and a run that exits at once must not be relaunched in a tight loop)."""
+        not have registered at all, and a run that exits at once must not be relaunched in a tight loop). Agent-wide:
+        a hosted session that has one particular request is `_hosted_holds`, asked beside this at the launch gate."""
         window = self.config.live_minutes * 60
         if now - self.ended.get(agent, float("-inf")) < window:
             return True
         last = self.board.conn.execute("SELECT MAX(last_seen) FROM sessions WHERE agent = ?", (agent,)).fetchone()[0]
         return last is not None and last >= now - window
+
+    def _hosted_holds(self, agent: str, item: dict, now: float) -> bool:
+        """A hosted session of the agent in the thread's project was just woken for this request, or read it after
+        being woken (hosted.holds): no run is launched beside it. Once the wake's grace has passed without a read,
+        this is False and everything is decided as without hosted sessions (DESIGN_NOTES "Session host (PR 3)")."""
+        if not item.get("post_id"):
+            return False
+        from . import hosted
+        try:
+            thread = self.board.conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
+            return thread is not None and hosted.holds(self.board, agent, thread["project"], item["post_id"], now)
+        except Exception:
+            log.exception("could not tell whether a hosted session has request %s", item.get("post_id"))
+            return False
+
+    def _hosted_recheck(self, agent: str, item: dict, now: float) -> dict:
+        """The `check` for reserve_dispatch_launch, as keyword arguments: inside the reservation's own write
+        transaction, the hold is asked again, and a launch that is reserved takes the request away from any wake
+        still waiting or queued for it (hosted_wake.reserve). Everything is decided inside that transaction, on what
+        is stored then, also whether the agent has a hosted session at all; without one the check reads the session
+        list, refuses nothing and writes nothing. Managed continuations stay on their own path: no wake is ever for
+        them."""
+        if not item.get("post_id") or item.get("managed"):
+            return {}
+        from . import hosted_wake
+        conn = self.board.conn
+
+        def check() -> str | None:
+            try:
+                thread = conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
+                if thread is None or hosted_wake.reserve(conn, agent, thread["project"], item["post_id"], now):
+                    return None
+                return HOSTED_HOLDS
+            except Exception:
+                log.exception("could not recheck the hosted hold for request %s", item["post_id"])
+                return None
+        return {"check": check}
 
     def _runtime(self, agent: str) -> str | None:
         row = self.board.conn.execute("SELECT runtime FROM agents WHERE name = ?", (agent,)).fetchone()
@@ -1815,6 +1879,8 @@ class Dispatcher:
             return True
         if not item.get("post_id"):
             return False
+        if self._hosted_holds(agent, item, now):
+            return True
         got = delivery.receipt(self.board.conn, item["post_id"], agent)
         sessions = set(delivery.readers(self.board.conn, item["post_id"], agent))
         if got and isinstance(got.get("session_id"), int):
@@ -1892,6 +1958,9 @@ class Dispatcher:
                 continue
             live = (now - self.ended.get(agent,float('-inf')) < self.config.live_minutes * 60 if inbox
                     else self._policy_held(agent, rule['project'], item, now) if policy else self._live(agent, now))
+            # A hosted session of the agent that was just woken for this request, or read it after that, has it:
+            # no run is started beside it, whichever rule covers the request (False without hosted sessions).
+            live = live or self._hosted_holds(agent, item, now)
             if (runs_of_agent >= self.config.max_runs_per_agent
                     or len(self.running) + len(foreign) >= self.config.max_concurrent
                     or (not item.get('managed') and live)):
@@ -1940,7 +2009,8 @@ class Dispatcher:
                 del pending[key]
                 changed = True
                 continue
-            res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence())
+            res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence(),
+                                                     **self._hosted_recheck(agent, item, now))
             if not res["ok"]:
                 if res["reason"] == "fenced":
                     log.warning("another dispatcher owns this board now; this one stops launching")
@@ -1948,6 +2018,8 @@ class Dispatcher:
                     break
                 if res["reason"] == "paused":
                     break  # temporary: everything stays pending until the human unpauses
+                if res["reason"] == HOSTED_HOLDS:
+                    continue  # a hosted session was woken for it since the gate above: wait, as the gate would
                 rules = self.board.active_dispatch_rules(self.human)
                 if self._rule_for(rules, item) is None:  # permanent, and no other approval covers it
                     log.info("not launching %s for thread %s: rule %s is %s", agent, thread_id, rule["id"],
@@ -2408,8 +2480,15 @@ class Dispatcher:
 
     def _busy_dirs(self, foreign: list[dict]) -> set[str]:
         """Run directories of the dispatched runs that may still be going: this loop's children and live runs an
-        earlier dispatcher left (`foreign`, from check_orphans)."""
+        earlier dispatcher left (`foreign`, from check_orphans). And the directory a run for a hosted session's project
+        would use, but only while one of that session's turns is running (hosted_wake.turn_projects): an idle hosted
+        session holds no directory."""
         dirs = {self._dir_key(r.cwd) for r in self.running.values()} | {self._dir_key(r.get("cwd")) for r in foreign}
+        from . import hosted_wake
+        try:
+            dirs |= {self._dir_key(self.config.run_dir(p)) for p in hosted_wake.turn_projects(self.board, self.board.now())}
+        except Exception:
+            log.exception("could not read the hosted sessions' turns")
         dirs.discard(None)
         return dirs
 

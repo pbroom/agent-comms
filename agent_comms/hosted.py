@@ -20,7 +20,8 @@ an optional model name and the message text.
   queued -> delivered -> done | failed and never back, so a repeated or late event changes nothing.
 - The host never retries a lost turn. A turn that was lost (timeout, the process died, the node restarted or went
   silent) is `failed` with the reason; the human sends again if they want it again.
-- `wake` is a reserved message kind (PR 3: a board post addressed to the session's agent); nothing creates one yet.
+- `wake` is the one message kind that is not the human's: hosted_wake.py queues it, with text the hub builds itself,
+  when a board post is addressed to the session's agent in the session's project.
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ from .providers import SESSION_ID_RE, cap_reply, validate_model
 
 SESSION_PREFIX = "host.session."   # <uuid>: the session record
 MSG_PREFIX = "host.msg."           # <uuid>.<n>: one message, n counting from 1 per session
-KINDS = ("user", "wake")           # `wake` is reserved for PR 3; only `user` can be sent now
+KINDS = ("user", "wake")           # `user`: the human's (start, send); `wake`: the hub's own (hosted_wake.py)
 MSG_STATES = ("queued", "delivered", "done", "failed")
 SETTLED = ("done", "failed")
 SESSION_STATES = ("starting", "idle", "running", "waiting", "ended")   # session_host.STATES, as the node reports them
@@ -242,6 +243,8 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
              "stop": None, "error": None, "created_by": p.name, "created_at": now, "updated_at": now,
              "node_reported_at": None, "ended_at": None}
         m = _enqueue(c, r, "user", text, p.name, now)
+        from . import hosted_wake
+        hosted_wake.begin(c, r["session_id"], now)      # woken for posts made from now on (PR 3)
     return {"session": _human_view(board, r), "message": _msg_view(m)}
 
 
@@ -367,6 +370,14 @@ def node_sessions(board: Board, p: Principal) -> dict:
     queued message of a session carries its text: the node writes one at a time. `version` changes whenever
     anything the node acts on does, so the node's long-poll can wait on it."""
     nodes._require_node(board, p)
+    from . import hosted_wake
+    # PR 3: queue the wakes that are due; a wake is validated in the transaction that shows it (hosted_wake.listing).
+    return hosted_wake.listing(board, p.name, lambda: _listed(board, p))
+
+
+def _listed(board: Board, p: Principal) -> dict:
+    """node_sessions' answer, read inside the transaction hosted_wake.listing opened."""
+    nodes._require_node(board, p)       # again, in that transaction: a pause may have landed since the first check
     out, mark = [], []
     for r in sorted(_sessions(board.conn), key=lambda r: r["session_id"]):
         if r.get("node") != p.name or r.get("state") == "ended":
@@ -505,6 +516,13 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         r |= {"updated_at": now, "node_reported_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     return _node_view(r)
+
+
+def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> bool:
+    """A hosted session of `agent` in `project` was just woken for this request, or read it after being woken: the
+    dispatcher and the undelivered alert leave the request to it (hosted_wake.holds)."""
+    from . import hosted_wake
+    return hosted_wake.holds(board_or_conn, agent, project, post_id, now)
 
 
 # ---------------------------------------------------------------- waiting (long-poll, as Board.read_updates_async)

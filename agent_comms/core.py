@@ -876,11 +876,14 @@ class Board:
     DISPATCH_TEMPORARY = ("paused", "fenced")
 
     def reserve_dispatch_launch(self, p: Principal, rule_id: int, agent: str,
-                                fence: tuple[str, str] | None = None) -> dict:
+                                fence: tuple[str, str] | None = None,
+                                check: Callable[[], str | None] | None = None) -> dict:
         """Atomically spend one launch from a rule, in one write transaction that also rechecks pause and,
         with `fence=(key, value)`, that board_state[key] still holds `value` (the dispatcher's ownership
         token, so a superseded loop cannot launch). Returns {"ok": True, "launches_left": n} or
-        {"ok": False, "reason": paused | fenced | revoked | expired | exhausted | not_allowed | invalid}."""
+        {"ok": False, "reason": paused | fenced | revoked | expired | exhausted | not_allowed | invalid}.
+        `check` runs last, inside the transaction, and refuses the launch by returning a reason (the dispatcher's
+        recheck that no hosted session took the request meanwhile, hosted_wake.reserve)."""
         self._require_human(p, "run the dispatcher")
         with db.write_tx(self.conn) as c:
             if fence is not None:
@@ -898,6 +901,9 @@ class Board:
                 return {"ok": False, "reason": state}
             if agent not in t["agents"]:
                 return {"ok": False, "reason": "not_allowed"}
+            refused = check() if check is not None else None
+            if refused:
+                return {"ok": False, "reason": refused}
             if t.get('kind') in BUDGET_KINDS and t['budget_day'] != int(self.now() // 86400):
                 t.update(budget_day=int(self.now() // 86400), launches_left=t['max_launches'], launches_used=0)
             if not t.get('unlimited'):
@@ -1901,8 +1907,9 @@ class Board:
                 d["thread_title"] = rows[i]["thread_title"]
                 d["project"] = rows[i]["thread_project"]
                 posts.append(d)
-        from . import delivery
+        from . import delivery, hosted_wake
         delivery.record(self, p, session_id, posts)
+        hosted_wake.handed(self, p, session_id, posts)
         return {"notice": UNTRUSTED_NOTICE, "session_id": session_id, "paused": self.is_paused(), "posts": posts,
                 "missing": [i for i in ids if i not in rows], "more": False, "ack_through": None,
                 "how_to_ack": "This is a view only (post_ids): it neither reads nor moves your cursor."}
@@ -1986,6 +1993,10 @@ class Board:
         if not view_only:
             from . import delivery
             delivery.record(self, p, session_id, posts)
+        # Any view, filtered ones too: what a hosted session of the reader was really shown (hosted_wake.handed). Not
+        # a delivery receipt, and nothing is read or written unless the reader has a hosted session.
+        from . import hosted_wake
+        hosted_wake.handed(self, p, session_id, posts)
         from . import issues
         my_tasks = [self._task_out(r) for r in self.conn.execute(
             "SELECT * FROM tasks WHERE owner_agent = ? AND status NOT IN ('done','declined')", (p.name,))]

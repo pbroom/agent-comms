@@ -15,11 +15,30 @@ What it does and checks:
 2. `board session send <id> <message> --wait` to the idle session: written to the process within --max-latency.
 3. A long turn, and right behind it a second `send --wait`: the second message is queued while the first turn is in
    flight, the first turn is not interrupted, and the second is written within --max-latency of the first ending.
-4. One process took every turn; `close` ends the session and its process.
-5. The project takes a new session; stopping the node stops that session's idle process too.
+4. A second agent identity posts a request addressed to the hosted agent, in a thread of the project, over the
+   hub's HTTP API: the idle session takes a wake turn within --max-wake. The line written to the process's stdin
+   names the thread and the counts and holds no part of the post's body.
+5. Two more posts inside the hub's wake interval, one over HTTP and one written straight to the database by another
+   process (what `board mcp` does): no wake until the interval has passed and the turn before is over, then ONE wake
+   for both.
+6. One process took every turn; `close` ends the session and its process; a later post wakes nothing.
+7. The project takes a new session; stopping the node stops that session's idle process too.
 
-With the real CLI the runner is `claude -p {prompt} --permission-mode dontAsk --setting-sources= --strict-mcp-config`
-(no user settings, hooks or MCP servers), run in the empty temp checkout: five small haiku turns.
+The session's process is started through a small wrapper named `claude` that copies every stdin line to
+logs/session-stdin.log before passing it on, so the script can check what was written. With the real CLI the wrapper
+runs `claude -p {prompt} --permission-mode dontAsk --setting-sources= --strict-mcp-config` (no user settings, hooks or
+MCP servers) in the empty temp checkout: seven small haiku turns.
+
+    python scripts/session-host-e2e.py --claude-bin "$(command -v claude)" --with-board
+
+runs another, shorter scenario (two haiku turns) in which the session has ONE MCP server: this checkout's `board mcp`
+on the temp hub's database, signed in as the temp agent from a token file in the temp directory, with only that
+server's tools allowed. The second agent posts a request addressed to the hosted agent and the session is told
+nothing but the wake. The script reports what the session did (its tool calls, its reply, the board session it
+registered, each board call's arguments and whether its result held the post) and checks that the hub noted the
+session was shown the post (hosted_wake.handed; a delivery receipt too when the read was unfiltered) and that
+`hosted.holds` is true for it
+once the wake's grace has passed.
 """
 from __future__ import annotations
 
@@ -43,6 +62,61 @@ from agent_comms.config import create_agent  # noqa: E402
 
 NODE = "e2enode"
 AGENT = "claude"
+POSTER = "codex"                # the second agent identity: it posts the requests that wake the hosted session
+WAKE_INTERVAL = 6               # the hub's [dispatch.sessions] wake_min_interval_seconds for this run
+MARKER = "E2E-BODY-MARKER-4c1e9a"
+BODY_WORDS = ("zebra", "quartz", "lantern")
+
+# The session's process, wrapped: every stdin line is appended to a log before the real program gets it.
+WRAPPER = """#!{python}
+import subprocess, sys
+log = open({log!r}, "ab", buffering=0)
+child = subprocess.Popen([{real!r}, *sys.argv[1:]], stdin=subprocess.PIPE)
+try:
+    for line in sys.stdin.buffer:
+        log.write(line)
+        child.stdin.write(line)
+        child.stdin.flush()
+    child.stdin.close()
+except OSError:
+    pass
+sys.exit(child.wait())
+"""
+
+# A post written straight to the hub's database by another process, as `board mcp` (stdio) does.
+DIRECT_POST = """
+import json, os, sys
+from agent_comms.config import Settings
+from agent_comms.core import Board
+board = Board(Settings.load())
+p = board.authenticate(os.environ["E2E_POSTER_TOKEN"])
+sid = board.register_session(p, sys.argv[1])["session_id"]
+post = board.create_post(p, sid, body=sys.argv[3], type="request", thread_id=int(sys.argv[2]), to=[sys.argv[4]])
+print(json.dumps({"id": post["id"]}))
+"""
+
+BOARD_GRACE = 5                 # --with-board: the hub's wake_grace_seconds, short so `holds` is asked after it
+BOARD_BOUND = 90                # --with-board: most seconds from the post to the session's delivery receipt
+
+# --with-board: what the hub's database says about one request, read by another process on that database.
+PROBE = """
+import json, sys, time
+from agent_comms import delivery, hosted, hosted_wake
+from agent_comms.config import Settings
+from agent_comms.core import Board
+board = Board(Settings.load())
+agent, project, post_id, sid = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+c, now = board.conn, time.time()
+rec = hosted_wake._load(c, sid) or {}
+rows = [dict(r) for r in c.execute("SELECT id, project, worktree, started_at, last_seen FROM sessions "
+                                   "WHERE agent = ? ORDER BY id", (agent,))]
+print(json.dumps({"now": now, "holds": hosted.holds(board, agent, project, post_id, now),
+                  "woken_at": (rec.get("woken") or {}).get(str(post_id)), "grace": rec.get("grace"),
+                  "shown_at": (rec.get("read") or {}).get(str(post_id)),
+                  "handed_at": (rec.get("handed") or {}).get(str(post_id)),
+                  "receipt": delivery.receipt(c, post_id, agent), "readers": delivery.readers(c, post_id, agent),
+                  "sessions": rows}))
+"""
 
 
 def free_port() -> int:
@@ -59,6 +133,14 @@ def listening(port: int) -> bool:
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
         return True
     except OSError:
         return False
@@ -101,7 +183,8 @@ class Run:
     def write_settings(self) -> None:
         agents = self.hub_home / "agents.toml"
         self.human_token = create_agent(agents, "human", "human", is_human=True)
-        create_agent(agents, AGENT, "claude-code")
+        agent_token = create_agent(agents, AGENT, "claude-code")
+        self.poster_token = create_agent(agents, POSTER, "codex-cli")
         self.node_token = create_agent(agents, NODE, "node")
         (self.hub_home / "board.toml").write_text(f"""[server]
 host = "127.0.0.1"
@@ -115,16 +198,40 @@ enabled = false
 [dispatch.nodes.{NODE}]
 projects = {toml_list([str(self.project)])}
 agents = {toml_list([AGENT])}
-""")
+
+[dispatch.sessions]
+wake_min_interval_seconds = {WAKE_INTERVAL}
+""" + (f"wake_grace_seconds = {BOARD_GRACE}\n" if self.args.with_board else ""))
+        real = self.args.claude_bin
+        if not self.real:
+            real = self.tmp / "stand-in" / "claude"
+            real.parent.mkdir()
+            real.write_text(f"#!{sys.executable}\n" + (ROOT / "tests" / "stand_in_claude.py").read_text())
+            real.chmod(0o700)
+        self.stdin_log = self.tmp / "logs" / "session-stdin.log"
+        exe = self.tmp / "bin" / "claude"           # the adapter goes by the executable's name
+        exe.parent.mkdir()
+        exe.write_text(WRAPPER.format(python=sys.executable, log=str(self.stdin_log), real=str(real)))
+        exe.chmod(0o700)
+        runner = [str(exe), "-p", "{prompt}", "--permission-mode", "dontAsk"]
         if self.real:
-            runner = [self.args.claude_bin, "-p", "{prompt}", "--permission-mode", "dontAsk", "--setting-sources=",
-                      "--strict-mcp-config"]
-        else:
-            exe = self.tmp / "bin" / "claude"       # the adapter goes by the executable's name
-            exe.parent.mkdir()
-            exe.write_text(f"#!{sys.executable}\n" + (ROOT / "tests" / "stand_in_claude.py").read_text())
-            exe.chmod(0o700)
-            runner = [str(exe), "-p", "{prompt}", "--permission-mode", "dontAsk"]
+            runner += ["--setting-sources=", "--strict-mcp-config"]
+        if self.args.with_board:
+            # The session's only MCP server: this checkout's `board mcp` (stdio), on the TEMP hub's database, signed
+            # in as the temp agent from a token file in the temp directory. Nothing else is configured or allowed:
+            # no user settings (--setting-sources=), no other MCP server (--strict-mcp-config), and only the board's
+            # tools are allowed (dontAsk refuses what would prompt; Bash and the file tools are disallowed outright).
+            token_file = self.tmp / "tokens" / f"{AGENT}.token"
+            token_file.touch(mode=0o600)
+            token_file.write_text(agent_token + "\n")
+            (self.tmp / "tokens").chmod(0o700)
+            mcp = self.tmp / "claude-mcp.json"
+            mcp.write_text(json.dumps({"mcpServers": {"agent-comms": {
+                "type": "stdio", "command": sys.executable, "args": ["-m", "agent_comms.cli", "mcp", "--agent", AGENT],
+                "env": {"AGENT_COMMS_HOME": str(self.hub_home), "AGENT_COMMS_TOKEN_DIR": str(self.tmp / "tokens"),
+                        "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}}}}, indent=2))
+            runner += ["--mcp-config", str(mcp), "--allowedTools=mcp__agent-comms",
+                       "--disallowedTools=Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"]
         (self.node_home / "board.toml").write_text(f"""[conversations]
 enabled = false
 
@@ -206,6 +313,27 @@ enabled = true
             self.pids.add(view["pid"])
         return view
 
+    def api(self, token: str, method: str, path: str, body: dict | None = None) -> dict:
+        """One call to the hub's HTTP API as the identity with this token."""
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    def message(self, sid: str, n: int, until, seconds: float) -> dict | None:
+        """The session's message `n` once `until(message)` holds, or as it stands when the time is up."""
+        deadline = time.monotonic() + seconds
+        while True:
+            m = next((m for m in self.show(sid)["messages"] if m["n"] == n), None)
+            if (m is not None and until(m)) or time.monotonic() >= deadline:
+                return m
+            time.sleep(0.1)
+
+    def stdin_lines(self) -> list[str]:
+        """What was written to the session processes' stdin so far: the text of each turn, in order."""
+        return [json.loads(line)["message"]["content"] for line in self.stdin_log.read_text().splitlines()]
+
     def check(self, condition: bool, what: str) -> None:
         if not condition:
             raise SystemExit(f"FAIL: {what}")
@@ -270,8 +398,12 @@ enabled = true
         if not self.real:
             self.check(out == "turn 4: AFTER\n", "its reply is the fourth turn's")
 
-        print("\n[4] one process, then close")
-        self.check(view["turns"] == 4 and view["pid"] == pid, f"one process (pid {pid}) took all four turns")
+        tid = self.wake_scenario(sid)
+
+        print("\n[6] one process, then close")
+        view = self.show(sid)
+        self.check(view["turns"] == 6 and view["pid"] == pid, f"one process (pid {pid}) took all six turns")
+        self.check(len(self.stdin_lines()) == 6, "six lines were written to its stdin, one per turn")
         listed, _, _ = self.board("session", "list")
         self.check(sid in listed, "board session list shows it")
         out, _, _ = self.board("session", "close", sid)
@@ -285,7 +417,14 @@ enabled = true
         # The hub hears `ended` when the node has signalled the process; the node reaps it on a pass soon after.
         self.check(gone(pid), f"its process (pid {pid}) is gone")
 
-        print("\n[5] a new session in the same project, left open while the node is stopped")
+        self.api(self.poster_token, "POST", "/api/posts",
+                 {"body": f"after the close {MARKER}", "type": "request", "thread_id": tid, "to": [AGENT],
+                  "session_id": self.poster_sid})
+        time.sleep(1.5)
+        self.check(len(self.stdin_lines()) == 6 and not any(m["n"] > 6 for m in self.show(sid)["messages"]),
+                   "a post addressed to the agent after the close wakes nothing")
+
+        print("\n[7] a new session in the same project, left open while the node is stopped")
         out, err, took = self.board("session", "start", str(self.project), again, "--agent", AGENT, "--model", "haiku",
                                     "--wait", "--json")
         data = json.loads(out)
@@ -294,6 +433,203 @@ enabled = true
         print(f"  reply: {data['reply']!r}")
         self.open_pid = self.show(data["session"]["session_id"])["pid"]
         self.check(bool(self.open_pid) and alive(self.open_pid), f"its process (pid {self.open_pid}) stays up, idle")
+
+    # ------------------------------------------------------------ --with-board: a woken session reads the board
+
+    def probe(self, post_id: int, sid: str) -> dict:
+        r = subprocess.run([sys.executable, "-c", PROBE, AGENT, str(self.project), str(post_id), sid],
+                           cwd=str(self.tmp), capture_output=True, text=True, timeout=60,
+                           env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home)})
+        if r.returncode != 0:
+            raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
+        return json.loads(r.stdout)
+
+    def tool_uses(self, sid: str) -> list[dict]:
+        """The tool calls the session's process made, in order, from its transcript on the node."""
+        uses = []
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                content = (ev.get("message") or {}).get("content") if ev.get("type") == "assistant" else None
+                uses += [b for b in content or [] if isinstance(b, dict) and b.get("type") == "tool_use"]
+        return uses
+
+    def tool_results(self, sid: str) -> dict[str, str]:
+        """What each tool call returned to the session (tool_use id -> the result, as text), from its transcript."""
+        out = {}
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                content = (ev.get("message") or {}).get("content") if ev.get("type") == "user" else None
+                for b in content if isinstance(content, list) else []:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        out[b.get("tool_use_id")] = json.dumps(b.get("content"))
+        return out
+
+    def tool_calls(self, sid: str) -> list[str]:
+        return [b.get("name", "?") for b in self.tool_uses(sid)]
+
+    def board_scenario(self) -> None:
+        """A real session with the temp board's tools: is a wake enough for it to read the board? Reports what the
+        session did either way (its tool calls and its reply) before anything is asserted about the receipt."""
+        print("\n[1] board session start <project> <message> --wait   (the session has the temp board's MCP tools)")
+        out, _, took = self.board("session", "start", str(self.project), "Reply with exactly the word: ready",
+                                  "--agent", AGENT, "--model", "haiku", "--wait", "--json")
+        data = json.loads(out)
+        sid = data["session"]["session_id"]
+        print(f"  session {sid}; wall {took:.2f}s; reply: {data['reply']!r}")
+        self.check(data["message"]["state"] == "done", "the first turn ended")
+        before = self.tool_calls(sid)       # the board's own instructions say to register at session start
+        print(f"  tools called in the first turn: {before or 'none'}; board sessions of {AGENT} so far: "
+              f"{[row['id'] for row in self.probe(0, sid)['sessions']] or 'none'}")
+
+        print(f"\n[2] {POSTER} posts a request addressed to {AGENT}; nothing else is said to the session")
+        self.poster_sid = self.api(self.poster_token, "POST", "/api/sessions",
+                                   {"project": str(self.project)})["session_id"]
+        tid = self.api(self.poster_token, "POST", "/api/threads",
+                       {"title": "delivery check", "project": str(self.project),
+                        "session_id": self.poster_sid})["id"]
+        t1 = time.time()        # the hub's clock is this machine's
+        post = self.api(self.poster_token, "POST", "/api/posts",
+                        {"body": f"Delivery check {MARKER}: no work is needed. Reading this post is enough.",
+                         "type": "request", "thread_id": tid, "to": [AGENT], "needs_response": True,
+                         "session_id": self.poster_sid})
+        m2 = self.message(sid, 2, lambda m: m["delivered_at"] is not None, 15)
+        self.check(m2 is not None and m2["kind"] == "wake" and m2["delivered_at"] is not None,
+                   "the post queued a wake and it was written to the process")
+        print(f"  post #{post['id']} in thread {tid} +0.00s; wake written +{m2['delivered_at'] - t1:.2f}s")
+        print(f"  stdin line: {self.stdin_lines()[1]!r}")
+        self.check(MARKER not in self.stdin_log.read_text(), "the stdin line holds no part of the post's body")
+
+        deadline, state = time.monotonic() + BOARD_BOUND, self.probe(post["id"], sid)
+        while state["shown_at"] is None and time.monotonic() < deadline:
+            time.sleep(0.5)
+            state = self.probe(post["id"], sid)
+        m2 = self.message(sid, 2, lambda m: m["ended_at"] is not None, 180)
+        view = self.show(sid)
+        calls = self.tool_calls(sid)[len(before):]
+        print(f"  wake turn: {m2['state']}" + (f", ended +{m2['ended_at'] - t1:.2f}s" if m2["ended_at"] else "")
+              + (f"; tools denied: {view['denials']}" if view.get("denials") else ""))
+        print(f"  tools the session called in the wake turn: {calls or 'none'}")
+        results = self.tool_results(sid)
+        for use in self.tool_uses(sid)[len(before):]:
+            if use.get("name", "").startswith("mcp__agent-comms__"):   # its own arguments, on the temp board
+                got = results.get(use.get("id"))
+                print(f"    {use['name'].removeprefix('mcp__agent-comms__')}({json.dumps(use.get('input'))[:300]})"
+                      f" -> the result held the post's body: "
+                      + ("no result seen" if got is None else "yes" if MARKER in got else "no"))
+        print(f"  reply: {view['reply']!r}")
+        posts = self.api(self.poster_token, "GET", f"/api/threads/{tid}/posts")["posts"]
+        for p in posts:
+            print(f"  thread {tid}: #{p['id']} by {p['agent']} ({p['type']}): {p['body'][:160]!r}")
+        self.check(m2["state"] == "done", "the wake turn ran to its end")
+        self.check(state["shown_at"] is not None,
+                   f"the hub noted that a session of {AGENT} was shown post #{post['id']} within {BOARD_BOUND}s")
+        shown, receipt = state["shown_at"], state["receipt"]
+        print(f"  shown: +{shown - t1:.2f}s after the post (+{shown - m2['delivered_at']:.2f}s after the wake was "
+              "written); delivery receipt: "
+              + (f"board session {receipt['session_id']}, +{receipt['at'] - t1:.2f}s" if receipt
+                 else "none (a filtered view leaves none)"))
+        self.check(shown >= m2["delivered_at"], "it was shown after the wake was written: the read happened in the "
+                                                "wake turn (the session was idle before it)")
+        self.check("mcp__agent-comms__board_read_updates" in calls, "the wake turn called board_read_updates")
+        self.check(not {"Bash", "Edit", "Write", "NotebookEdit"} & set(calls), "... and no shell or file-writing tool")
+
+        # The grace counts from the later of the wake being queued and the node being shown it (the hub's records).
+        def grace_from(st: dict) -> float:
+            return max(st["woken_at"], st["handed_at"] or st["woken_at"])
+        wait = grace_from(state) + BOARD_GRACE + 0.5 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        state = self.probe(post["id"], sid)
+        print(f"  holds: {state['holds']} at +{state['now'] - t1:.2f}s; wake queued +{state['woken_at'] - t1:.2f}s, "
+              f"handed to the node +{grace_from(state) - t1:.2f}s; wake_grace_seconds {state['grace']:g}; "
+              f"readers {state['readers']}")
+        self.check(state["now"] - grace_from(state) > state["grace"] and state["holds"] is True,
+                   "hosted.holds is true for the post after the grace (counted from the hand-over): the session was "
+                   "shown it after the wake")
+        print("  board sessions of the hosted agent (what it registered with):")
+        for row in state["sessions"]:
+            print(f"    session {row['id']}: project {row['project']!r}, worktree {row['worktree']!r}")
+        same = bool(state["sessions"]) and all(row["project"] == str(self.project) for row in state["sessions"])
+        print(f"  the thread's project is {str(self.project)!r}: the session registered "
+              + ("under the SAME project" if same else "under ANOTHER project"))
+        self.open_pid = view["pid"]
+        self.check(bool(self.open_pid) and alive(self.open_pid),
+                   f"the session's process (pid {self.open_pid}) stays up")
+
+    def wake_scenario(self, sid: str) -> int:
+        limit, body = self.args.max_wake, f"Please look at this. {MARKER} " + " ".join(BODY_WORDS)
+        print("\n[4] a second agent posts a request addressed to the hosted agent   (the session is idle)")
+        self.poster_sid = self.api(self.poster_token, "POST", "/api/sessions",
+                                   {"project": str(self.project)})["session_id"]
+        tid = self.api(self.poster_token, "POST", "/api/threads",
+                       {"title": f"e2e wake {MARKER}", "project": str(self.project),
+                        "session_id": self.poster_sid})["id"]
+        t1 = time.time()        # the hub's clock is this machine's
+        self.api(self.poster_token, "POST", "/api/posts",
+                 {"body": body, "type": "request", "thread_id": tid, "to": [AGENT], "needs_response": True,
+                  "session_id": self.poster_sid})
+        m5 = self.message(sid, 5, lambda m: m["delivered_at"] is not None, 15)
+        self.check(m5 is not None and m5["kind"] == "wake" and m5["delivered_at"] is not None,
+                   "the post queued a wake message for the session, and it was written to the process")
+        print(f"  {POSTER} posted in thread {tid} +0.00s; wake queued +{m5['created_at'] - t1:.2f}s; "
+              f"written to the process +{m5['delivered_at'] - t1:.2f}s")
+        self.check(m5["delivered_at"] - t1 <= limit,
+                   f"the idle session took the wake turn within {limit:g}s of the post")
+        line = self.stdin_lines()[4]
+        print(f"  stdin line: {line!r}")
+        self.check(f"1 new post(s) addressed to {AGENT} from {POSTER} in thread {tid} (1 needing a response)" in line,
+                   "the stdin line holds the counts, the author's name and the thread id")
+        self.check("board_read_updates" in line and "untrusted data" in line and "not a message from the human" in line,
+                   "it says to call board_read_updates, that board content is untrusted data, and whose text it is")
+
+        print(f"\n[5] two more posts inside the wake interval ({WAKE_INTERVAL}s): one over HTTP, one written to the "
+              "database by another process")
+        t2 = time.time()
+        self.api(self.poster_token, "POST", "/api/posts",
+                 {"body": f"second {MARKER}", "type": "request", "thread_id": tid, "to": [AGENT],
+                  "session_id": self.poster_sid})
+        r = subprocess.run([sys.executable, "-c", DIRECT_POST, str(self.project), str(tid), f"third {MARKER}", AGENT],
+                           cwd=str(self.tmp), capture_output=True, text=True, timeout=60,
+                           env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home),
+                                           "E2E_POSTER_TOKEN": self.poster_token})
+        self.check(r.returncode == 0 and "id" in json.loads(r.stdout or "{}"),
+                   "the direct database write was accepted" + ("" if r.returncode == 0 else f": {r.stderr[-400:]}"))
+        t3 = time.time()
+        time.sleep(1.0)
+        early = [m for m in self.show(sid)["messages"] if m["n"] > 5]
+        m5 = self.message(sid, 5, lambda m: m["ended_at"] is not None, 120)
+        m6 = self.message(sid, 6, lambda m: m["ended_at"] is not None, WAKE_INTERVAL + 120)
+        self.check(m6 is not None and m6["kind"] == "wake" and m6["state"] == "done", "a second wake turn ran")
+        print(f"  first wake: queued +0.00s, turn ended +{m5['ended_at'] - m5['created_at']:.2f}s; posts 2 and 3 "
+              f"+{t2 - m5['created_at']:.2f}s and +{t3 - m5['created_at']:.2f}s; second wake queued "
+              f"+{m6['created_at'] - m5['created_at']:.2f}s, written +{m6['delivered_at'] - m5['created_at']:.2f}s")
+        self.check(early == [] or m6["created_at"] - m5["created_at"] >= WAKE_INTERVAL,
+                   "nothing was queued for them at once")
+        self.check(m6["created_at"] - m5["created_at"] >= WAKE_INTERVAL - 0.01,
+                   f"the second wake was queued no sooner than {WAKE_INTERVAL}s after the first")
+        self.check(m6["created_at"] >= m5["ended_at"], "... and only after the first wake's turn had ended")
+        lines = self.stdin_lines()
+        print(f"  stdin line: {lines[5]!r}")
+        self.check(len(lines) == 6 and f"2 new post(s) addressed to {AGENT} from {POSTER} in thread {tid}" in lines[5],
+                   "both posts went as ONE wake")
+        view = self.show(sid)
+        self.check([m["kind"] for m in view["messages"]] == ["user"] * 4 + ["wake"] * 2 and view["queued"] == 0,
+                   "four messages of the human's and two wakes; nothing else was queued")
+        everything = self.stdin_log.read_text() + self.log_text("node")
+        self.check(not any(w in everything for w in (MARKER, *BODY_WORDS, "e2e wake")),
+                   "no part of a post body or of the thread title is in the process's stdin or the node's log")
+        self.check(view["reply_for"] == 6 and bool((view["reply"] or "").strip()),
+                   "the wake turn's reply is the session's last reply (the human's to read)")
+        print(f"  reply: {view['reply']!r}")
+        return tid
 
     # ------------------------------------------------------------ teardown
 
@@ -312,7 +648,9 @@ enabled = true
         self.procs = []
 
     def leftovers(self) -> list[int]:
-        return [pid for pid in self.pids if alive(pid)]
+        """Session processes still there. Each was started in its own process group (its pid), and the wrapper's
+        child (the stand-in, or Claude itself) is in that group: the whole group must be gone."""
+        return [pid for pid in self.pids if alive(pid) or group_alive(pid)]
 
     def cleanup(self) -> None:
         self.stop()
@@ -332,22 +670,34 @@ def main() -> int:
     ap.add_argument("--claude-bin", metavar="PATH", help="the real Claude Code CLI (default: a stand-in script)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
+    ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
+                    help="most seconds from a post addressed to the agent to its wake being written (default 3)")
     ap.add_argument("--gateway", action="store_true", help="the node reaches the hub through `board gateway`")
+    ap.add_argument("--with-board", action="store_true",
+                    help="with --claude-bin: another scenario, in which the session has the temp board's MCP tools "
+                         "(and only those). A post addressed to its agent must wake it AND be read by it")
     ap.add_argument("--keep", action="store_true", help="keep the temp directory (logs, transcript, database)")
     args = ap.parse_args()
     if args.claude_bin is not None:
         args.claude_bin = os.path.abspath(os.path.expanduser(args.claude_bin))
         if os.path.basename(args.claude_bin) != "claude" or not os.access(args.claude_bin, os.X_OK):
             ap.error("--claude-bin must be an executable named claude")
+    elif args.with_board:
+        ap.error("--with-board needs --claude-bin: the stand-in calls no tools")
     run = Run(args)
     print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
-                       else "stand-in (tests/stand_in_claude.py), no model"))
+                       else "stand-in (tests/stand_in_claude.py), no model")
+          + (", with the temp board's MCP tools" if args.with_board else ""))
     print(f"temp directory: {run.tmp}")
     try:
         run.write_settings()
         run.start_services()
-        run.scenario()
-        print("\n[6] stopping the node (SIGTERM) and the hub")
+        if args.with_board:
+            run.board_scenario()
+        else:
+            run.scenario()
+        print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
+              else "\n[8] stopping the node (SIGTERM) and the hub")
         run.stop()
         run.check(not alive(run.open_pid), f"the open session's process (pid {run.open_pid}) was stopped with the node")
         run.check(run.leftovers() == [], "no session process is left behind")

@@ -801,7 +801,9 @@ def _fmt_hosted_detail(s: dict) -> str:
                      + (f": {last['detail']}" if last.get("detail") else "")
                      + (f" (tools denied: {', '.join(last['denials'])})" if last.get("denials") else ""))
     for m in s.get("messages", []):
-        lines.append(f"  message {m['n']} [{m['state']}]" + (f" {m['detail']}" if m.get("detail") else ""))
+        lines.append(f"  message {m['n']} [{m['state']}]" + (" (wake: a board post addressed to the agent)"
+                                                              if m.get("kind") == "wake" else "")
+                     + (f" {m['detail']}" if m.get("detail") else ""))
     lines.append(f"  transcript: {s['transcript']}")
     if s.get("reply") is not None:
         lines += [f"reply to message {s['reply_for']}:", s["reply"]]

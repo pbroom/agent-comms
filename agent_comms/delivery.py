@@ -101,6 +101,17 @@ def readers(conn, post_id: int, recipient: str) -> list[int]:
         if k[len(prefix):].isdigit()]
 
 
+def read_since(conn, post_id: int, recipient: str, since: float,
+               reader: Callable[[Any], bool] | None = None) -> bool:
+    """A session of `recipient` was handed this request at or after `since` (hosted_wake.holds: a hosted session that
+    was woken for a request and then read it has it). `reader`: only a receipt of a session it accepts counts."""
+    prefix = _key(READER_PREFIX, post_id, recipient) + "."
+    values = [receipt(conn, post_id, recipient)] + [_get(conn, k) for (k,) in conn.execute(
+        "SELECT key FROM board_state WHERE key >= ? AND key < ?", (prefix, prefix[:-1] + "/")).fetchall()]
+    return any(isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and v["at"] >= since
+               and (reader is None or reader(v.get("session_id"))) for v in values)
+
+
 def annotate(conn, post_id: int, row: dict) -> None:
     """Add `delivered_at` / `delivered_session` to one request row (requests.for_post)."""
     got = receipt(conn, post_id, row["recipient"])
@@ -152,7 +163,7 @@ def _undelivered(board: Board, human: Principal, now: float, window: float,
     c = board.conn
     watermark = _get(c, WATERMARK_KEY)
     rules = board.active_dispatch_rules(human)
-    from . import workstreams
+    from . import hosted, workstreams
     out: dict[int, list[tuple[int, str]]] = {}
     for post in c.execute("""SELECT p.*, t.project AS thread_project FROM posts p JOIN threads t ON t.id = p.thread_id
                              WHERE t.status = 'open' AND p.sealed = 0 AND p.created_at >= ? AND p.created_at <= ?
@@ -172,6 +183,8 @@ def _undelivered(board: Board, human: Principal, now: float, window: float,
                     "managed": workstreams.get_for_post(board, post["id"]) is not None}
             if rule_for(rules, item) is not None:
                 continue   # the dispatcher would launch for it: its pickup path launches and reports it
+            if hosted.holds(c, agent, post["thread_project"], post["id"], now):
+                continue   # a hosted session of the recipient was just woken for it (hosted_wake.py)
             if c.execute("SELECT 1 FROM sessions WHERE agent = ? AND project = ? AND last_seen >= ?",
                          (agent, post["thread_project"], now - window)).fetchone():
                 continue   # a session in the project is live and will read it; it may only be busy
@@ -219,9 +232,13 @@ def _alert(board: Board, human: Principal, fence: tuple[str, str], thread_id: in
             raise Conflict("another dispatcher owns this board now")
         if board.is_paused():
             raise Conflict("the board is paused")
+        from . import hosted
+        thread = board.conn.execute("SELECT project FROM threads WHERE id = ?", (thread_id,)).fetchone()
         for (post_id, agent), key in zip(entries, keys):
             if _get(board.conn, key) is not None or receipt(board.conn, post_id, agent) is not None:
                 raise Conflict(f"{key} changed meanwhile")
+            if thread is not None and hosted.holds(board.conn, agent, thread["project"], post_id, now):
+                raise Conflict(f"a hosted session was woken for request #{post_id} meanwhile")
 
     def hook(post: dict) -> None:
         _insert(board.conn, POST_PREFIX + str(post["id"]),
