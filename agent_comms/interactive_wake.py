@@ -18,6 +18,8 @@ Records (`board_state`)
   deadline per request (`holds`). A new conversation id resets none of it.
 
 The offer: a state machine (every transition is ONE write transaction; `now` is read inside it)
+- *Every write transaction* in this module reads the live setting right after it holds the lock, before it changes
+  anything: off, it writes nothing (the dispatcher's clean-up of records left from when it was on excepted).
 - *States.* NONE (no `offer`), and an offer {id, nonce, at, entries}, which is STANDING or STALE. It STANDS while all
   of these hold (`_stands`): the feature is on (the live setting, read inside the transaction); the board is not
   paused; `now - at < ACK_SECONDS`; its nonce is the
@@ -43,7 +45,13 @@ The offer: a state machine (every transition is ONE write transaction; `now` is 
   nothing changes, except that a batch that no longer qualifies whole is taken back (O4: its id must not be
   acknowledged for fewer posts).
 - *O3' replay* (`_ack`): the same nonce sending the same id again within REPLAY_SECONDS of its acceptance (its
-  reply was lost or unreadable) is answered "acked" again, and nothing is charged or changed.
+  reply was lost or unreadable) is answered "acked" again, and nothing is charged or changed. On purpose (review
+  round 4, S24 and S25 declined), this holds also after a newer process took the conversation over, and also once
+  the board was paused after the acceptance: the hub had already committed that ack (its posts are delivered, the
+  wake is charged), and refusing the replay would leave nobody woken for a charged wake (the newer process is never
+  offered those posts). The replaced process wakes the same conversation, once; it is the answer it was owed. No
+  double wake comes this way: a process whose first reply it could read has exited and never replays, and a replay
+  changes and charges nothing. Only the nonce that made the ack, of that conversation's record, gets it.
 - *O4 take back* STALE (or STANDING, below) -> NONE (`_take_back`). Its posts go back to `pending` (except the
   claimed ones), nothing is charged. Made by: `_advance` for any offer of the pair that no longer stands; a nonce
   take-over (before the waiter is rebound to another project); `_hand` (above); `claim` of a post of an issued
@@ -428,6 +436,8 @@ def poll(board: Board, p: Principal, body: Any) -> dict:
         return IDLE         # nothing new since the last look: no write
     cfg = hosted_wake.limits(board)
     with db.write_tx(conn) as c:
+        if not enabled(board):
+            return OFF          # turned off while this call waited for the lock: nothing is written
         now = board.now()
         rec = _load(c, key)
         if rec is None:
@@ -491,12 +501,15 @@ def tick(board: Board) -> None:
             return
         if not enabled(board):
             with db.write_tx(board.conn) as c:
-                for key in list(recs) + pairs:
-                    c.execute("DELETE FROM board_state WHERE key = ?", (key,))
+                if not enabled(board):          # still off now that the lock is held
+                    for key in list(recs) + pairs:
+                        c.execute("DELETE FROM board_state WHERE key = ?", (key,))
             return
         cfg = hosted_wake.limits(board)
         for key in recs:
             with db.write_tx(board.conn) as c:
+                if not enabled(board):
+                    return          # turned off meanwhile: this pass writes nothing more
                 now = board.now()
                 rec = _load(c, key)
                 if rec is None:
@@ -518,6 +531,8 @@ def tick(board: Board) -> None:
         for key in pairs:
             if key not in live:
                 with db.write_tx(board.conn) as c:
+                    if not enabled(board):
+                        return
                     pr = _get(c, key)
                     if not isinstance(pr, dict) or board.now() - float(pr.get("seen") or 0) > KEEP_SECONDS:
                         c.execute("DELETE FROM board_state WHERE key = ?", (key,))
@@ -572,7 +587,7 @@ def claim(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     """Inside the dispatcher's reservation (hosted_wake.reserve): the request is the dispatcher's from here on. It
     leaves every waiter of the pair (waiting, delivered, read) and the pair's holds; an offer that covers it is taken
     back whole (O4), so that its id is never acknowledged for a batch it no longer is. Off, or without a waiter:
-    nothing is written."""
+    nothing is written. It opens no transaction of its own: the setting is read here, inside the caller's."""
     conn, on = _live(board_or_conn)
     if not on or type(post_id) is not int or not isinstance(project, str):
         return
@@ -610,6 +625,8 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
             if not todo or not _reader(board.conn, session_id, p.name, rec):
                 continue
             with db.write_tx(board.conn) as c:
+                if not enabled(board):
+                    return          # turned off while this read waited for the lock: no read mark
                 now = board.now()
                 rec = _load(c, key)
                 if rec is None:

@@ -4105,3 +4105,42 @@ The invariants it adds:
   acknowledged batch wakes the client exactly once.
 
 It also asserts that each run exercised replays.
+
+### Waking an interactive session: review round 4 (2026-11-21)
+
+Round 4 (on 122a659) narrowed S21 and S23 and raised S24 and S25, which the coordinator declined. Tests are in
+`tests/test_interactive_wake_round4.py`.
+
+- **S21.** Every write transaction in `interactive_wake.py` now reads the live setting right after it holds the
+  lock, before it changes anything: poll, ack, the dispatcher's pass (its offers and its clean-ups), and the read
+  marks in `handed`. `claim` opens no transaction of its own; it runs inside the dispatcher's reservation and reads
+  the setting there.
+  - The open shape was a first poll turned off while it waited for the lock: it created both records and answered
+    `idle`. It now answers `off` and writes nothing.
+  - The tests turn the setting off as each transaction starts. On 122a659 the poll and read-mark paths failed. The
+    dispatcher's offer path already passed, because round 3's setting check in O1 runs inside that transaction.
+- **S23.** The e2e script records surviving processes as a failure before it decides whether to delete its temp
+  directory, so a survivor keeps the logs. This failed on 122a659.
+- **S24 (declined).** A replaced hook can replay its accepted ack and get `acked`. The reviewer's proposed fix was
+  to confirm a replay only for the waiter's current nonce. The ruling keeps the replay valid for the nonce that
+  made the accepted ack, also after a newer process took the conversation over, because the hub has already
+  committed that ack: its posts are delivered and the wake is charged. Refusing the replay would leave nobody woken
+  for a charged wake, since the newer process is never offered those posts. That is the lost wake S20 was raised to
+  prevent. The replaced process wakes the same conversation, once. A double wake cannot come this way: a process
+  whose first reply it could read has already exited and never replays, and a replay changes and charges nothing.
+- **S25 (declined).** A replay can wake while the board is paused, if the ack was accepted before the pause. The
+  same reasoning holds: the replay only repeats the answer the process was owed, within the 60 s window, at the
+  moment a session that got its reply normally would have woken. Deferring it past the window would lose the wake.
+
+The behaviour is written down in the state machine's docstring next to O3', and pinned by one test each:
+- `test_s24_...`: a replay after a take-over is answered `acked`, charged once, never for another conversation or
+  another process of the same one; the newer process is idle, is not offered those posts again, and is woken for
+  new posts as usual.
+- `test_s25_...`: a replay just after the pause began is answered `acked`; while paused, no new offer is made,
+  handed over or acknowledged; after the unpause the waiting post comes under a new id.
+
+Both pass on 122a659, as pins of existing behaviour should. The randomized test's model already agrees with the
+rulings, not with the proposed fix. It expects `acked` for a replay whenever the waiter's last accepted id matches
+and the window holds, whatever the current nonce and whether or not the board is paused, and it asserts nothing is
+charged. Writing these tests turned up no double wake and no wake of a different conversation through the replay
+path: a replay is looked up on the conversation's own record and needs the nonce that made the ack.

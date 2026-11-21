@@ -418,13 +418,13 @@ wake = true
             except subprocess.TimeoutExpired:
                 print(f"  still running after SIGTERM: pid {p.pid}")
         left = [p.pid for p in self.procs if p.poll() is None]
+        if left:        # recorded first: a process that survived is a failure, and its logs must stay
+            self.failures.append(f"processes left: {left}")
         if self.args.keep or self.failures or not self.ok:
             print(f"kept {self.tmp}")       # asked for, or something failed: the logs are what explain it
         else:
             import shutil
             shutil.rmtree(self.tmp, ignore_errors=True)
-        if left:
-            self.failures.append(f"processes left: {left}")
 
 
 def main() -> int:
