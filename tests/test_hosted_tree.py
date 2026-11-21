@@ -2038,9 +2038,11 @@ def test_the_settings_a_process_reports_never_reach_the_transcript_the_hub_or_a_
     assert secret not in json.dumps(spy.posts) and secret not in json.dumps(show(senv, sid))
     assert secret not in caplog.text and "ANTHROPIC_API_KEY" not in caplog.text
     # The record says what the answer was worth, also when it is not the one hoped for.
-    keep = ClaudeSession.transcript_line
+    never_asked = ClaudeSession()
+    never_asked.argv(SHIPPED + SEAL, session_id=UNKNOWN, resume=False, model=None)
+    keep = never_asked.transcript_line
     plain = json.dumps(began(sid)).encode()
-    assert keep(plain) is plain and keep(b"not json control_response") == b"not json control_response"
+    assert keep(plain) is plain and keep(b"a line that is not JSON") == b"a line that is not JSON"
     refused = {"type": "control_response", "response": {"subtype": "error", "request_id": "settings-1",
                                                         "error": f"no: {secret}"}}
     assert json.loads(keep(json.dumps(refused).encode())) == {
@@ -2048,6 +2050,182 @@ def test_the_settings_a_process_reports_never_reach_the_transcript_the_hub_or_a_
         "bypass_disabled": False}
     odd = {"type": "control_response", "response": {"subtype": secret, "request_id": {"x": secret}, "response": secret}}
     assert secret.encode() not in keep(json.dumps(odd).encode())
+
+
+def test_an_answer_cut_short_never_reaches_the_transcript_either(senv, tmp_path, caplog):
+    """S16 (round 5). A line that does not parse may be the answer to `get_settings` cut short: the process died
+    in the middle of it, or its last bytes came with no line end (the pipe reader hands such a tail on as a line).
+    Half a settings body is as secret as a whole one. For a process that was asked, nothing unparseable is kept,
+    only its length; for any process, nothing unparseable that names a control response or one of the adapter's
+    questions."""
+    secret, later = "SECRET-TOKEN-51c0-aa9e", "SECRET-TOKEN-88d2-07bf"
+    own = tmp_path / "own.json"
+    own.write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--settings", str(own)]
+    node = make_node(senv, config=tree_config(senv, runners={"claude-code": runner}), log_dir=senv.tmp / "cut-logs")
+    spy = node.sessions.client = Spy(node.sessions.client)
+    sid = start(senv)["session_id"]
+    tick(senv, node)
+    proc = proc_of(senv, sid, node)[1]
+    rid = written(proc)[0]["request_id"]
+    whole = json.dumps(sealed_line(rid, {"permissions": {"disableBypassPermissionsMode": "disable"},
+                                         "env": {"ANTHROPIC_API_KEY": secret}})).encode()
+    cut = whole[:whole.index(secret.encode()) + len(secret)]                 # mid-stream, cut after the secret
+    no_marker = b'{"response": {"response": {"effective": {"env": {"KEY": "' + secret.encode() + b'"'  # no type yet
+    proc.emit(cut, no_marker)
+    tick(senv, node, times=2)
+    transcript = senv.tmp / "cut-logs" / "sessions" / f"{sid}.jsonl"
+    assert [json.loads(x) for x in transcript.read_text().splitlines()] == [
+        {"type": "host", "subtype": "line_withheld", "bytes": len(cut), "why": "not a complete JSON line"},
+        {"type": "host", "subtype": "line_withheld", "bytes": len(no_marker), "why": "not a complete JSON line"}]
+    assert node.sessions.host.sessions[sid].checking and len(written(proc)) == 1, "no answer yet: still no turn"
+    # The complete answer, then more that does not parse: a process that was asked keeps none of it, before or after.
+    proc.emit(whole)
+    tick(senv, node)
+    proc.emit(began(sid), b'{"effective": {"env": {"KEY": "' + later.encode(), result(sid))
+    tick(senv, node, times=3)
+    assert msg(senv, sid, 1)["state"] == "done"
+    kinds = [(x.get("type"), x.get("subtype")) for x in map(json.loads, transcript.read_text().splitlines())]
+    assert kinds[2:] == [("host", "control_response_withheld"), ("system", "init"), ("host", "line_withheld"),
+                         ("result", "success")]
+    # ... and as the tail a dying process leaves: the same answer, cut, with nothing after it.
+    send(senv, sid, "again")
+    tick(senv, node)
+    proc.emit(began(sid), cut.replace(secret.encode(), later.encode()))
+    proc.code = 1
+    tick(senv, node, times=3)
+    assert msg(senv, sid, 2)["state"] == "failed"
+    last = json.loads(transcript.read_text().splitlines()[-1])
+    assert (last["type"], last["subtype"]) == ("host", "line_withheld")
+    for value in (secret, later, "ANTHROPIC_API_KEY"):
+        for path in senv.tmp.rglob("*"):
+            if path.is_file():
+                assert value.encode() not in path.read_bytes(), (value, path)
+        assert value not in json.dumps(spy.posts) and value not in json.dumps(show(senv, sid))
+        assert value not in caplog.text
+    # A process that was never asked (the key as JSON) keeps what does not parse, unless it names a control
+    # response or a question of the adapter's.
+    plain = ClaudeSession()
+    plain.argv(SHIPPED + SEAL, session_id=UNKNOWN, resume=False, model=None)
+    assert plain.transcript_line(b"some text, not JSON") == b"some text, not JSON"
+    for line in (cut, b'{"type":"control_response","resp', b'... get_settings ...',
+                 b'{"request_id": "settings-' + UNKNOWN[:8].encode() + b'-1", "response": {"effe'):
+        assert json.loads(plain.transcript_line(line)) == {"type": "host", "subtype": "line_withheld",
+                                                           "bytes": len(line), "why": "not a complete JSON line"}
+
+
+def test_a_turn_half_written_when_its_parents_process_goes_is_withdrawn(senv):
+    """S1 (round 5). The gate was asked before a turn was buffered, and never again: a pipe that takes a turn in
+    pieces got the rest of it in a later pass, and the turn was reported delivered, though the parent's process had
+    gone in between. Now it is asked before every write of a pending turn. A half-written line is never completed:
+    the child's process is stopped and the message fails as undelivered. The child stays open and held."""
+    from agent_comms.session_host import TURN_WITHDRAWN
+
+    node = full_node(senv, "w")
+    sid = root(senv, node=node)
+    answer(senv, sid, node=node)
+    kid = child(senv, sid, "one")["session_id"]
+    tick(senv, node)
+    answer(senv, kid, node=node)
+    host, kid_proc, parent_proc = node.sessions.host, proc_of(senv, kid, node)[1], proc_of(senv, sid, node)[1]
+    first = len(kid_proc.stdin)
+    kid_proc.accept = 12                                 # the pipe takes twelve bytes of a write, no more
+    send(senv, kid, "two, which is longer than twelve bytes")
+    tick(senv, node)
+    assert len(kid_proc.stdin) == first + 12 and host.sessions[kid].writing is not None
+    assert msg(senv, kid, 2)["state"] == "queued", "partly written is not delivered"
+    parent_proc.code = 1                                 # the parent's process dies before the next write
+    kid_proc.accept = None
+    started = len(node.session_spawner.calls)
+    tick(senv, node, times=4)
+    assert len(kid_proc.stdin) == first + 12, "not one byte more: a half-written line is never completed"
+    assert kid_proc.terminated == 1 and host.sessions[kid].child is None, "its process was stopped"
+    failed = msg(senv, kid, 2)
+    assert failed["state"] == "failed" and failed["delivered_at"] is None and "was not delivered" in json.dumps(failed)
+    assert TURN_WITHDRAWN[:60] in json.dumps(failed)
+    view = show(senv, kid)
+    assert view["state"] == "idle" and view["turns"] == 1, "the child itself stays open; one turn is all it had"
+    assert len(node.session_spawner.calls) == started, "and nothing is started again for that message"
+    # Held like any full child whose parent has no process, until the parent's next turn says it runs bypassed.
+    send(senv, kid, "three")
+    tick(senv, node, times=3)
+    assert msg(senv, kid, 3)["state"] == "queued" and len(node.session_spawner.calls) == started
+    send(senv, sid, "again")
+    tick(senv, node)
+    begin(senv, sid, node)
+    tick(senv, node, times=2)
+    fresh = proc_of(senv, kid, node)[1]
+    assert fresh is not kid_proc and msg(senv, kid, 3)["state"] == "delivered"
+    assert [x["message"]["content"] for x in written(fresh)] == ["three"], "a fresh process, and only the new message"
+    senv.node.hello()
+
+
+def test_two_parents_and_two_waiting_full_children_in_two_slots_make_progress(senv):
+    """S18 (round 5). A parent was spared from being stopped whenever a full child of it had a message queued. With
+    `max_live = 2`, two idle confirmed parents and a waiting full child each, every slot was pinned by a parent
+    waiting for a child that could never get a slot. Now such a pin holds only while something else can be
+    stopped: one parent makes room, the other pair runs, and the first pair runs when its parent has had a turn
+    again. No child is ever started under a parent whose live process has not confirmed full access."""
+    node = full_node(senv, "s18", max_live=2)
+    host, runner = node.sessions.host, node.sessions
+    parents = [root(senv, node=node), root(senv, node=node, project=P2)]
+    for sid in parents:
+        answer(senv, sid, node=node)
+    assert [host.sessions[sid].ceiling for sid in parents] == ["full", "full"]
+    under, real_spawn = [], host._spawn
+
+    def spawn(s, now, out):
+        parent = runner.parent_of.get(s.session_id)
+        if parent is not None:
+            under.append((s.session_id, host.sessions[parent].ceiling))
+        return real_spawn(s, now, out)
+
+    host._spawn = spawn
+    kids = [child(senv, sid, f"go {i}")["session_id"] for i, sid in enumerate(parents)]
+    tick(senv, node, times=5)
+    states = [msg(senv, k, 1)["state"] for k in kids]
+    assert sorted(states) == ["delivered", "queued"], "one pair runs; the other child waits"
+    first, second = (0, 1) if states[0] == "delivered" else (1, 0)
+    assert host.sessions[parents[first]].child is not None and host.sessions[parents[second]].child is None, \
+        "the OTHER pair's parent made room; the running child's own parent was not touched"
+    assert show(senv, kids[second])["state"] != "ended" and show(senv, parents[second])["ceiling"] == "workspace"
+    answer(senv, kids[first], node=node)
+    tick(senv, node, times=3)
+    assert msg(senv, kids[first], 1)["state"] == "done" and msg(senv, kids[second], 1)["state"] == "queued"
+    assert [k for k, _ in under] == [kids[first]], "nothing was started for the child whose parent has no process"
+    # The second pair: its parent's next turn brings its process back and confirms it; then its child runs.
+    send(senv, parents[second], "again")
+    tick(senv, node, times=3)
+    begin(senv, parents[second], node)
+    tick(senv, node, times=4)
+    assert msg(senv, kids[second], 1)["state"] == "delivered" and host.sessions[parents[second]].ceiling == "full"
+    assert [k for k, _ in under] == [kids[first], kids[second]] and all(c == "full" for _, c in under), \
+        "each child was started under a parent whose live process had confirmed full access"
+    senv.node.hello()
+
+
+def test_a_node_with_one_slot_cannot_run_a_full_child(senv):
+    """S18 (round 5). A full child takes turns only while its parent's process is up beside its own: `max_live`
+    below 2 can never fit that. The hub knows the number from the node's hello and refuses the child when it is
+    asked for; a child that exists already when the node comes back with one slot is ended there with the reason."""
+    from agent_comms.node_sessions import NO_ROOM_FOR_FULL
+
+    two = full_node(senv, "one-slot", max_live=2)
+    sid = root(senv, node=two)
+    answer(senv, sid, node=two)
+    kid = child(senv, sid, "one")["session_id"]
+    one = full_node(senv, "one-slot", max_live=1)        # the node is restarted with one slot
+    tick(senv, one, times=3)
+    assert show(senv, kid)["state"] == "ended" and show(senv, kid)["error"] == NO_ROOM_FOR_FULL.format(n=1)
+    assert msg(senv, kid, 1)["state"] == "failed" and show(senv, sid)["state"] != "ended"
+    send(senv, sid, "again")
+    tick(senv, one)
+    begin(senv, sid, one)
+    assert show(senv, sid)["ceiling"] == "full"
+    out = child(senv, sid, expect=409)
+    assert "runs at most 1 session process at a time" in out["message"] and "max_live must be at least 2" in out["message"]
+    assert child(senv, sid, access="read-only")["access"] == "read-only", "a narrower child needs no such room"
+    senv.node.hello()
 
 
 def test_a_board_config_inside_a_checkout_or_a_worktree_is_not_used_for_a_read_only_session(senv, tmp_path):

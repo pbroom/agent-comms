@@ -54,6 +54,9 @@ PROVIDER_FILE = "node-session-providers.json"   # session id -> the provider's o
 HANDSHAKE_SECONDS = 60.0            # a process whose provider has a handshake must be ready within this
 SESSIONS_DIR = "sessions"           # <session id>.jsonl (stdout) and <session id>.stderr.log
 STATES = ("starting", "idle", "running", "waiting", "ended")
+TURN_WITHDRAWN = ("the message was not delivered: before all of it was written to the agent's process, the session "
+                  "lost what it needs to take a turn (a child session's parent no longer vouches for it). The "
+                  "process was stopped, so the part already written is never completed or acted on")
 MESSAGE_ID_MAX = 200
 
 
@@ -260,8 +263,10 @@ class SessionHost:
             raise ValueError("timeout_minutes must be positive")
         self.kill_grace = float(config.kill_grace_seconds if kill_grace_seconds is None else kill_grace_seconds)
         self.sessions: dict[str, Session] = {}
-        # Asked at the moment a turn is about to be written, the last moment there is: False keeps the message in
-        # the session's inbox (its caller's rule: a child session's parent must still be what the child needs).
+        # Asked at the moment a turn is about to be written, and again before every later write of the same turn
+        # (a pipe can take it in pieces). False before anything of it is buffered keeps the message in the session's
+        # inbox; False once it is on its way withdraws it (TURN_WITHDRAWN). Its caller's rule: a child session's
+        # parent must still be what the child needs.
         self.turn_gate: Callable[[Session], bool] | None = None
         self._recovered = False
         self._next_message = 0
@@ -921,6 +926,17 @@ class SessionHost:
             for data in s.provider.turn(s.writing.text):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
+        if s.writing is not None and self.turn_gate is not None and not self.turn_gate(s):
+            # The gate is asked before EVERY write of a turn, not only before the first: a pipe may take a turn in
+            # pieces, over several passes, and what the session needs can go between two of them. A half-written
+            # line must not be completed later, nor left for the process to act on: the process is stopped and the
+            # message fails as never delivered. The session stays, with no process; it starts another for its next
+            # message, when it may take one again.
+            log.warning("session %s: a turn was withdrawn while it was being written", s.session_id)
+            s.outbuf.clear()
+            self._fail(s, TURN_WITHDRAWN, out)
+            self._stop(s, now)
+            return
         if s.outbuf:
             try:
                 n = s.child.write(bytes(s.outbuf))

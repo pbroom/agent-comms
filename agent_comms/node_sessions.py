@@ -50,8 +50,10 @@ Rules the hub relies on:
   held: it stays open, its messages stay queued at the hub, and no turn is handed to it. That is decided from the
   parent's process as it is at the moment the child is considered, so a parent that is about to be started in a
   pass never lends an earlier process's word to a child in that pass. The hub is told the ceiling with every
-  status, and refuses to make such a child meanwhile. A parent whose process a waiting or working full child
-  depends on is not stopped to make room, nor for being idle (`_lends_full`).
+  status, and refuses to make such a child meanwhile. A parent whose process a working full child depends on is
+  not stopped to make room, nor for being idle; one whose full child is only waiting is spared while anything else
+  can be stopped (`_admit`, `_lends_full`). A node whose `max_live` is 1 cannot run a full child at all, and such
+  a child is refused (at the hub, which knows the number from the node's hello) or ended here with the reason.
 """
 from __future__ import annotations
 
@@ -86,6 +88,9 @@ PARENT_ENDED = "its parent session ended"
 PARENT_GONE = ("its parent session is not open on this node (it could not be opened here, or has ended): a child "
                "session runs only under its parent")
 PARENT_UNKNOWN = "its parent session's access is not known on this node"
+NO_ROOM_FOR_FULL = ("this node runs at most {n} session process at a time ([dispatch.sessions] max_live): a "
+                    "full-access child takes turns only while its parent's process is up beside its own, so it "
+                    "needs max_live of at least 2")
 ABOVE_PARENT = ("its access ({have}) is above what its parent session has on this node now ({limit}): a child session "
                 "never has more access than its parent")
 LOST = "the node restarted while this turn was in flight; it was not replayed"
@@ -424,6 +429,9 @@ class SessionRunner:
             if parent is not None and self._parent_problem(parent, s) is not None:
                 self._end_child(sid, self._parent_problem(parent, s))   # the access it has here is above its parent's
                 continue
+            if parent is not None and s.access == "full" and self.max_live < 2:
+                self._end_child(sid, NO_ROOM_FOR_FULL.format(n=self.max_live))  # it could never take a turn here
+                continue
             self._tree_status(sid, view, s)
             held, queue = self._held(s), []
             for m in sorted((m for m in view.get("messages", []) if isinstance(m, dict) and type(m.get("n")) is int),
@@ -579,23 +587,30 @@ class SessionRunner:
         parent = self.host.sessions.get(parent_id)
         return parent is not None and not parent.ended and not self._awaits_parent(parent_id, s)
 
-    def _lends_full(self, sid: str) -> bool:
-        """This session's live process is what lets a `full` child of it take turns, and such a child has a turn,
-        a message, or one queued at the hub. Stopping that process would hold the child until the parent's next
-        turn, so it is not stopped to make room or for being idle."""
+    def _lends_full(self, sid: str, waiting: bool = True) -> bool:
+        """This session's live process is what lets a `full` child of it take turns, and such a child is at work
+        (a turn in flight, or a message already handed to it) or, with `waiting`, has one queued at the hub.
+        Stopping that process would hold the child until the parent's next turn."""
         parent = self.host.sessions.get(sid)
         if parent is None or parent.ceiling != "full":
             return False
         for kid, pid in self.parent_of.items():
             k = self.host.sessions.get(kid)
             if (pid == sid and k is not None and not k.ended and k.access == "full"
-                    and (k.busy or k.inbox or self.queue.get(kid))):
+                    and (k.busy or k.inbox or (waiting and self.queue.get(kid)))):
                 return True
         return False
 
     def _admit(self, s) -> bool:
         """May this session's process start now? Not while `max_live` processes are up: then the longest-idle one is
-        stopped (one at a time) and the message waits; with none idle it just waits."""
+        stopped (one at a time) and the message waits; with none idle it just waits.
+
+        Which idle process may be stopped. Never the parent a full child is AT WORK under, and never the parent of
+        the full child asking here (it would then have a slot and nobody to vouch for it). A parent whose full
+        child is only WAITING (a message queued at the hub) is spared as long as something else can be stopped
+        instead. If nothing else can, that pin does not hold: it could not be honoured anyway, the waiting child
+        having no slot either, and with every slot held by a parent waiting for a child nothing would ever start.
+        Its child is then held until the parent's next turn, like any full child whose parent has no process."""
         if s.child is not None:
             return True
         live = [x for x in self.host.sessions.values() if x.child is not None or x.inbox]
@@ -603,10 +618,13 @@ class SessionRunner:
             return True
         if not any(x.child is not None and x.stopping_since is not None for x in live):
             # (Not one whose provider runs a turn of its own in it: by the host's books it is idle, but it is working.)
+            own = self.parent_of.get(s.session_id) if s.access == "full" else None
             idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended
-                    and not self.host.holding(x) and not self._lends_full(x.session_id)]
-            if idle:
-                self.host.park(min(idle, key=lambda x: self.last_busy.get(x.session_id, 0.0)).session_id)
+                    and not self.host.holding(x) and x.session_id != own
+                    and not self._lends_full(x.session_id, waiting=False)]
+            spared = [x for x in idle if not self._lends_full(x.session_id)]
+            if spared or idle:
+                self.host.park(min(spared or idle, key=lambda x: self.last_busy.get(x.session_id, 0.0)).session_id)
         return False
 
     def _hand_over(self, now: float) -> None:

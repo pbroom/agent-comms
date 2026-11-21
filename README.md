@@ -436,7 +436,8 @@ What to know:
     written to it until it has said the key is: a turn waits for that answer. If the key is not in force, or no
     answer comes within a minute, the session is ended and the waiting message fails undelivered. The answer
     itself (all your settings, which may hold credentials) is not kept: the transcript gets one line saying
-    whether the key was in force.
+    whether the key was in force. Nor is any line of such a process that is not complete JSON (an answer cut
+    short): the transcript notes its length.
   A session whose process reports `bypassPermissions` without having been started as a full-access one is ended.
   Otherwise the runner is hosted as written. A project in `claude_tool_projects` gets the scoped tools, as a run
   does.
@@ -614,7 +615,11 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     message stays queued, and nothing is written to it. The confirmation is that one process's: when the parent's
     process has been stopped (the idle limit, a node restart) or replaced, the parent's next turn gives it again,
     so send the parent a message. The node does not stop a parent's process to make room, or for being idle,
-    while a `full` child of it is working or waiting.
+    while a `full` child of it is working; while one is only waiting it stops something else if it can. A `full`
+    child needs its parent's process up beside its own, so the node's `max_live` must be at least 2 (with 1 the
+    child is refused), and with few slots and several full parents a waiting child can find its parent stopped to
+    make room: it then waits for that parent's next turn. A turn that was only partly written to a child when its
+    parent's process went is withdrawn: the child's process is stopped and the message fails undelivered.
 
   A session you start without `--parent` has the access its command line gives, and `show` prints it as soon as
   its node has opened it: a runner that selects bypass (`--permission-mode bypassPermissions`,

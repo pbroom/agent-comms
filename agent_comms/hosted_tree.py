@@ -170,6 +170,14 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
                        "never hosted)")
 
 
+def _max_live(conn, node: str) -> int:
+    """How many session processes the node says it runs at once (its hello's `sessions.max_live`)."""
+    info = _get(conn, nodes.NODE_PREFIX + node)
+    sessions = info.get("sessions") if isinstance(info, dict) else None
+    live = sessions.get("max_live") if isinstance(sessions, dict) else None
+    return live if type(live) is int else 0
+
+
 def _fits(conn, parent: dict, agent: str, runtime: str | None, isolation: str) -> None:
     """A runner that names its own directory (the node's hello: `dirs`) can be a session in that directory only. A
     child of it must therefore share the parent's checkout, and that checkout (as the node reported it) must be the
@@ -255,6 +263,12 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
                            f"that (it has no process now, or one that has not said so yet), so a child can have at "
                            f"most {_limit(parent)} under it now. Its node confirms it when the session's next turn "
                            "starts: send it a message and try again, or give a narrower --access")
+        if access == "full" and _max_live(c, parent["node"]) < 2:
+            # A full child takes turns only while its parent's process is up beside its own.
+            raise Conflict(f"node {parent['node']} runs at most {_max_live(c, parent['node'])} session process at a "
+                           "time ([dispatch.sessions] max_live there): a full-access child needs its parent's "
+                           "process up beside its own, so max_live must be at least 2. Raise it, or give a "
+                           "narrower --access")
         _fits(c, parent, agent, runtime, isolation)
         offered = _offers(c, parent["node"], agent, runtime)
         if access not in offered:

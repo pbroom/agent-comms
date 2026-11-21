@@ -3013,7 +3013,7 @@ through `session_access.prepare`; `Session.access`/`.effort`. `node_sessions.py`
 view, roots-only uniqueness, a root's tree fields, `show`'s children, the cascade in `close` and `_end`, the
 listing's extra keys, `report`'s `access`/`worktree` and the `worktree_removed` event.
 
-**Proof.** `tests/test_hosted_tree.py` (111 tests after review round 4, fakes; real git where a worktree is made): the gate and that a
+**Proof.** `tests/test_hosted_tree.py` (115 tests after review round 5, fakes; real git where a worktree is made): the gate and that a
 session is byte for byte what it was with it off; every creation rule; access ordering and each word's argv or
 thread parameters for Claude and Codex; `full` with and without the node's setting; shared and worktree
 directories, the busy-directory rule, safe removal and the hourly second look; the cascade three ways; roots-only
@@ -3407,6 +3407,44 @@ merged as #88: the branch's diff against main is this PR alone).
     answer `{"type": "dangerFullAccess"}`.
   - The user's `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json`: unchanged (mtime and
     SHA-256).
+
+**Review round 5** (2026-11-21; head b91484d). Three narrow defects, each with a test that fails without the fix
+(six mutations, taken out by a pytest plugin).
+- *S1, the gate is asked at every write of a turn.* Round 4 asked `turn_gate` before a turn was buffered. A pipe
+  can take a turn in pieces over several passes, and the later writes skipped it: a full child got the rest of its
+  turn, reported delivered, after its parent's process had gone. `_write` now asks before each write while a turn
+  is pending (`s.writing`). If the answer is no by then, the buffer is dropped, the process is stopped (a
+  half-written line is never completed, nor left for the process to act on) and the message fails as never
+  delivered (`TURN_WITHDRAWN`). The child session stays open with no process and no message of its own, so
+  nothing is started again; its next message is held like any full child's until the parent has confirmed again,
+  and then goes to a fresh process.
+- *S16, what does not parse is not kept either.* The redactor gave back a line it could not parse, and the pipe
+  reader hands an unterminated tail on as a line at EOF, so an answer to `get_settings` cut short went to the
+  transcript verbatim. `transcript_line` is now the adapter's own (it knows whether this process was asked): for a
+  process that was asked, NOTHING unparseable is kept, before or after the answer (a cut answer need not even name
+  its type: key order is the writer's), and for any process nothing unparseable that names `control_response`,
+  `get_settings` or one of the adapter's request ids. What is kept instead: `{"type": "host", "subtype":
+  "line_withheld", "bytes": N, "why": "not a complete JSON line"}`.
+- *S18, a pin holds only if it can be honoured.* Round 4 spared a parent from being stopped whenever a full child
+  of it had a message queued. Two idle confirmed parents, a waiting full child each, `max_live = 2`: both slots
+  pinned, neither child could ever start. `_admit` now tells two pins apart. A parent whose full child is AT WORK
+  (a turn in flight, or a message already handed to it) is never stopped to make room, and neither is the parent
+  of the full child that is asking. A parent whose full child is only WAITING is spared while anything else can be
+  stopped; when nothing else can, that pin does not hold. In the case above one parent makes room and the other
+  pair runs; the child whose parent was stopped is held, as any full child whose parent has no process, and runs
+  after that parent's next turn (it cannot be sooner: only a live process of the parent's can vouch for it). And a
+  node with `max_live` below 2 can never run a full child, so one is refused: at the hub, which has the number
+  from the node's hello (409), or ended on the node with `NO_ROOM_FOR_FULL` if it exists already.
+- *Tests added:* `test_a_turn_half_written_when_its_parents_process_goes_is_withdrawn`,
+  `test_an_answer_cut_short_never_reaches_the_transcript_either`,
+  `test_two_parents_and_two_waiting_full_children_in_two_slots_make_progress` (it also records, at every start of a
+  child's process, that the parent's ceiling was `full`), `test_a_node_with_one_slot_cannot_run_a_full_child`.
+- *Live* (the tree scenario on the round-5 code, real Claude Code 2.1.322 and Codex 0.171.0, once: PASS, 62 checks,
+  as in round 4: the settings question first and alone, then the turn; the node's record and no answer in the
+  transcript; the full root's children refused after a node restart and started after its next turn; the Codex
+  child at `full`). The three fixes of this round are about a pipe that takes a turn in pieces, an answer cut
+  short and a node with every slot pinned: none of them arises in that run, and each is shown by its test only.
+  The user's `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json`: unchanged.
 
 **Residual risks / not verified.**
 - A Codex child narrowed to `read-only` by its access word (the live children ran as their runner is configured or

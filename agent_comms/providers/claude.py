@@ -182,16 +182,23 @@ class ClaudeSession:
         return [json.dumps({"type": "control_request", "request_id": self._asked,
                             "request": {"subtype": "get_settings"}}).encode() + b"\n"]
 
-    @staticmethod
-    def transcript_line(line: bytes) -> bytes:
+    def transcript_line(self, line: bytes) -> bytes:
         """What the session's transcript keeps of a line the process wrote: the line, except a `control_response`,
         whose body is never kept (the answer to `get_settings` is the settings in force, credentials included).
-        In its place: who answered what kind of answer, and whether bypass is switched off."""
-        if b"control_response" not in line:
-            return line
+        In its place: who answered what kind of answer, and whether bypass is switched off.
+
+        A line that does NOT parse may be that answer cut short (the process died in the middle of it, or its last
+        bytes came without a line end), and half a settings body is as secret as a whole one. So it is not kept
+        either, only its length, when this process was asked for its settings at all (then nothing unparseable
+        of it is kept, before or after the answer), and for any process when the line names a control response or
+        a question of this adapter's."""
         try:
             ev = json.loads(line)
         except (ValueError, UnicodeDecodeError):
+            if self._ask or b"control_response" in line or b"get_settings" in line or (
+                    self.session_id is not None and ("settings-" + self.session_id[:8]).encode() in line):
+                return json.dumps({"type": "host", "subtype": "line_withheld", "bytes": len(line),
+                                   "why": "not a complete JSON line"}).encode()
             return line
         if not isinstance(ev, dict) or ev.get("type") != "control_response":
             return line
