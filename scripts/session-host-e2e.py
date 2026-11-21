@@ -6,11 +6,27 @@ board.toml and logs, the project checkout, and the identities (a human, an agent
 and the node are subprocesses on free localhost ports and are stopped at the end. Nothing here reads or writes the
 real board database, board.local.toml, agents.toml, the real token files or ~/Library/LaunchAgents.
 
-    python scripts/session-host-e2e.py                         # a stand-in for Claude (tests/stand_in_claude.py)
+    python scripts/session-host-e2e.py                         # stand-ins for Claude and Codex (tests/stand_in_*.py)
     python scripts/session-host-e2e.py --claude-bin "$(command -v claude)"    # the real CLI, with --model haiku
+    python scripts/session-host-e2e.py --codex-bin "$(command -v codex)" --only codex     # the real Codex CLI
     python scripts/session-host-e2e.py --gateway               # the node reaches the hub through `board gateway`
 
-What it does and checks:
+A hosted Codex session comes first (`--only claude` skips it, `--only codex` runs nothing else):
+C1. `board session start <project> <message> --agent <the Codex agent> --wait`: the node starts `codex app-server`,
+    finishes the handshake (nothing of the message is written before it) and the turn's reply is printed.
+C2. `send --wait` to the idle session: written within --max-latency.
+C3. A long turn and a second `send --wait` right behind it: queued, the long turn is not interrupted.
+C4. The node is stopped (the session's process goes with it) and started again; the next message resumes the SAME
+    Codex thread (`thread/resume` with the id the node recorded) and its reply shows the earlier turns are there.
+C5. `close` ends the session and its process.
+The default is tests/stand_in_codex.py installed as `codex`. With --codex-bin the real CLI runs in the empty temp
+checkout with the read-only sandbox, `--codex-model` (default gpt-6-luna) at low effort, plugins and apps off, and
+every MCP server of the user's Codex configuration disabled by a `-c` override for these processes only (the script
+asks `codex mcp list --json` for their names and checks that the overrides took; ~/.codex/config.toml is never
+written): five small turns. Codex keeps its threads in the user's Codex home (~/.codex/sessions), as any Codex run
+does.
+
+Then the Claude session. What it does and checks:
 1. `board session start <project> <message> --wait`: the turn runs, the reply is printed.
 2. `board session send <id> <message> --wait` to the idle session: written to the process within --max-latency.
 3. A long turn, and right behind it a second `send --wait`: the second message is queued while the first turn is in
@@ -63,6 +79,7 @@ from agent_comms.config import create_agent  # noqa: E402
 NODE = "e2enode"
 AGENT = "claude"
 POSTER = "codex"                # the second agent identity: it posts the requests that wake the hosted session
+CODEX_AGENT = "codex-host"      # the agent whose hosted session is a Codex one (its own runner on the node)
 WAKE_INTERVAL = 6               # the hub's [dispatch.sessions] wake_min_interval_seconds for this run
 MARKER = "E2E-BODY-MARKER-4c1e9a"
 BODY_WORDS = ("zebra", "quartz", "lantern")
@@ -161,6 +178,7 @@ class Run:
     def __init__(self, args):
         self.args = args
         self.real = args.claude_bin is not None
+        self.real_codex = args.codex_bin is not None
         self.tmp = Path(tempfile.mkdtemp(prefix="session-host-e2e-")).resolve()
         self.procs: list[tuple[str, subprocess.Popen]] = []
         self.pids: set[int] = set()
@@ -174,9 +192,9 @@ class Run:
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_COMMS_", "BOARD_"))}
         self.env |= {"PYTHONPATH": str(ROOT), "AGENT_COMMS_TOKEN_DIR": str(self.tmp / "tokens"),
                      "AGENT_COMMS_TOKEN_FILE": str(self.tmp / "tokens" / "human.token"), "PYTHONUNBUFFERED": "1"}
-        if not self.real:
+        if not self.real and not self.real_codex:
             (self.tmp / "home").mkdir()
-            self.env["HOME"] = str(self.tmp / "home")     # the stand-in needs nothing of the user's
+            self.env["HOME"] = str(self.tmp / "home")     # the stand-ins need nothing of the user's
 
     # ------------------------------------------------------------ set-up
 
@@ -185,6 +203,7 @@ class Run:
         self.human_token = create_agent(agents, "human", "human", is_human=True)
         agent_token = create_agent(agents, AGENT, "claude-code")
         self.poster_token = create_agent(agents, POSTER, "codex-cli")
+        create_agent(agents, CODEX_AGENT, "codex-cli")
         self.node_token = create_agent(agents, NODE, "node")
         (self.hub_home / "board.toml").write_text(f"""[server]
 host = "127.0.0.1"
@@ -197,7 +216,7 @@ enabled = false
 
 [dispatch.nodes.{NODE}]
 projects = {toml_list([str(self.project)])}
-agents = {toml_list([AGENT])}
+agents = {toml_list([AGENT, CODEX_AGENT])}
 
 [dispatch.sessions]
 wake_min_interval_seconds = {WAKE_INTERVAL}
@@ -240,16 +259,63 @@ kill_grace_seconds = 5
 
 [dispatch.runners]
 {AGENT} = {toml_list(runner)}
+{CODEX_AGENT} = {toml_list(self.codex_runner())}
 
 [dispatch.worktrees]
 {json.dumps(str(self.project))} = {json.dumps(str(self.project))}
 
 [dispatch.sessions]
 enabled = true
+codex = true
 """)
 
+    def codex_runner(self) -> list[str]:
+        """The Codex agent's runner on the node: a `codex exec` template, as a dispatched run would use. The session
+        host turns it into `codex app-server`. The executable is a wrapper named `codex` that logs every stdin line."""
+        real = self.args.codex_bin
+        if not self.real_codex:
+            real = self.tmp / "stand-in" / "codex"      # it keeps its threads beside itself, in the temp directory
+            real.parent.mkdir(exist_ok=True)
+            real.write_text(f"#!{sys.executable}\n" + (ROOT / "tests" / "stand_in_codex.py").read_text())
+            real.chmod(0o700)
+        self.codex_stdin_log = self.tmp / "logs" / "codex-stdin.log"
+        exe = self.tmp / "bin" / "codex"               # the adapter goes by the executable's name
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_text(WRAPPER.format(python=sys.executable, log=str(self.codex_stdin_log), real=str(real)))
+        exe.chmod(0o700)
+        runner = [str(exe), "exec", "--cd", "{project}", "--sandbox", "read-only"]
+        if self.real_codex:
+            runner += ["--disable", "plugins", "--disable", "apps", *self.codex_quiet(),
+                       "-c", 'model_reasoning_effort="low"']
+        else:
+            runner += ["-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="approve"']
+        return runner + ["{prompt}"]
+
+    def codex_quiet(self) -> list[str]:
+        """`-c` overrides that disable every MCP server the user's Codex configuration names, for the processes this
+        run starts only. One of them may be the user's real board: a session here must never start it. The names
+        come from Codex itself, and the overrides are checked before anything is started."""
+        base = [self.args.codex_bin, "mcp", "list", "--json", "--disable", "plugins", "--disable", "apps"]
+
+        def listed(extra: list[str]) -> list[dict]:
+            r = subprocess.run(base + extra, cwd=str(self.tmp), capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                raise SystemExit(f"`codex mcp list` failed:\n{r.stderr[-800:]}")
+            return [x for x in json.loads(r.stdout) if isinstance(x, dict)]
+
+        names = [x.get("name") for x in listed([]) if x.get("enabled") is not False]
+        odd = [n for n in names if not isinstance(n, str) or not n.replace("-", "").replace("_", "").isalnum()]
+        if odd:
+            raise SystemExit(f"cannot disable these MCP servers with a -c override: {odd}")
+        quiet = [x for n in names for x in ("-c", f"mcp_servers.{n}.enabled=false")]
+        left = [x.get("name") for x in listed(quiet) if x.get("enabled") is not False]
+        if left:
+            raise SystemExit(f"these MCP servers of the Codex configuration could not be disabled: {left}")
+        print(f"codex: {len(names)} configured MCP server(s) disabled for this run's sessions by -c override")
+        return quiet
+
     def spawn(self, name: str, home: Path, *argv: str, **extra_env: str) -> subprocess.Popen:
-        log = open(self.tmp / "logs" / f"{name}.log", "w")
+        log = open(self.tmp / "logs" / f"{name}.log", "a")     # a restarted node goes on in the same file
         proc = subprocess.Popen([sys.executable, "-m", "agent_comms.cli", *argv], cwd=str(self.tmp), stdout=log,
                                 stderr=subprocess.STDOUT, env=self.env | {"AGENT_COMMS_HOME": str(home)} | extra_env)
         self.procs.append((name, proc))
@@ -289,6 +355,7 @@ enabled = true
             target = free_port()
             self.spawn("gateway", self.hub_home, "gateway", "--port", str(target))
             self.wait_for("the gateway to listen", lambda: listening(target))
+        self.node_port, self.node_runs = target, 1
         self.spawn("node", self.node_home, "node", "--hub", f"http://127.0.0.1:{target}", "--name", NODE,
                    AGENT_COMMS_TOKEN=self.node_token)
         self.wait_for("the node to connect", lambda: "connected to" in self.log_text("node"))
@@ -329,6 +396,29 @@ enabled = true
             if (m is not None and until(m)) or time.monotonic() >= deadline:
                 return m
             time.sleep(0.1)
+
+    def codex_stdin(self) -> list[dict]:
+        """Every message written to the Codex session processes' stdin so far, in order."""
+        try:
+            return [json.loads(line) for line in self.codex_stdin_log.read_text().splitlines()]
+        except OSError:
+            return []
+
+    def restart_node(self) -> float:
+        """SIGTERM the node, wait for it to go, start another over the same home and logs. Returns how many seconds
+        the stop took."""
+        proc = next(p for n, p in self.procs if n == "node")
+        t0 = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(40)
+        took = time.monotonic() - t0
+        self.procs = [(n, p) for n, p in self.procs if p is not proc]
+        self.node_runs += 1
+        self.spawn("node", self.node_home, "node", "--hub", f"http://127.0.0.1:{self.node_port}", "--name", NODE,
+                   AGENT_COMMS_TOKEN=self.node_token)      # the same log file, appended to
+        self.wait_for("the node to connect again",
+                      lambda: self.log_text("node").count("connected to") >= self.node_runs)
+        return took
 
     def stdin_lines(self) -> list[str]:
         """What was written to the session processes' stdin so far: the text of each turn, in order."""
@@ -433,6 +523,127 @@ enabled = true
         print(f"  reply: {data['reply']!r}")
         self.open_pid = self.show(data["session"]["session_id"])["pid"]
         self.check(bool(self.open_pid) and alive(self.open_pid), f"its process (pid {self.open_pid}) stays up, idle")
+
+    # ------------------------------------------------------------ a hosted Codex session
+
+    def codex_scenario(self) -> None:
+        limit, model = self.args.max_latency, self.args.codex_model
+        if self.real_codex:
+            first = "Remember this word for later: lantern. Now reply with exactly the word: ready"
+            second, after = "Reply with exactly the word: pong", "Reply with exactly the word: after"
+            long = "Write the integers from 1 to 300, one per line, and nothing else."
+            recall = "Reply with exactly the word I asked you to remember at the start of this conversation."
+        else:
+            first, second, long, after, recall = "remember lantern", "pong", "sleep 4 then count", "after", "recall"
+
+        print(f"\n[C1] board session start <project> <message> --agent {CODEX_AGENT} --wait   (a hosted Codex session)")
+        out, err, took = self.board("session", "start", str(self.project), first, "--agent", CODEX_AGENT,
+                                    "--model", model, "--wait", "--json")
+        data = json.loads(out)
+        sid, m1 = data["session"]["session_id"], data["message"]
+        print(f"  session {sid} on node {data['session']['node']}; wall {took:.2f}s; queued -> written "
+              f"{m1['delivered_at'] - m1['created_at']:.2f}s (the process start and Codex's handshake included); "
+              f"turn {m1['ended_at'] - m1['delivered_at']:.2f}s")
+        print(f"  reply: {data['reply']!r}")
+        self.check(m1["state"] == "done" and bool(data["reply"].strip()), "the first turn ended with a reply")
+        view = self.show(sid)
+        pid, thread = view["pid"], view["provider_id"]
+        print(f"  Codex thread {thread}, process {pid}")
+        self.check(bool(thread) and thread != sid, "the hub's record holds Codex's own thread id (not the session id)")
+        wrote = self.codex_stdin()
+        self.check([m.get("method") for m in wrote] == ["initialize", "initialized", "thread/start", "turn/start"],
+                   "stdin got the handshake first and then the one turn: initialize, initialized, thread/start, "
+                   "turn/start")
+        start = wrote[2]["params"]
+        print(f"  thread/start: {json.dumps({k: v for k, v in start.items() if k != 'developerInstructions'})}")
+        self.check(start.get("approvalPolicy") == "never" and start.get("sandbox") == "read-only"
+                   and start.get("cwd") == str(self.project) and start.get("model") == model,
+                   "the thread was started with approvals off, the runner's sandbox and --cd, and the hub's model")
+        self.check(wrote[3]["params"]["threadId"] == thread
+                   and wrote[3]["params"]["input"] == [{"type": "text", "text": first}],
+                   "the turn went to that thread with the message as its only input")
+        if self.real_codex:
+            self.check("ready" in data["reply"].lower(), "the reply is the model's answer")
+        else:
+            self.check(data["reply"] == "turn 1: REMEMBER LANTERN",
+                       "the reply is the turn's final answer (not its progress note, not a sub-agent's answer)")
+
+        print("\n[C2] board session send <id> <message> --wait   (the session is idle)")
+        out, err, took = self.board("session", "send", sid, second, "--wait")
+        m2 = next(m for m in self.show(sid)["messages"] if m["n"] == 2)
+        print(f"  wall {took:.2f}s; queued -> written {m2['delivered_at'] - m2['created_at']:.2f}s; "
+              f"turn {m2['ended_at'] - m2['delivered_at']:.2f}s")
+        print(f"  reply: {out.strip()!r}")
+        self.check(m2["state"] == "done" and bool(out.strip()), "the turn ended and stdout is its reply")
+        self.check(m2["delivered_at"] - m2["created_at"] <= limit,
+                   f"a message to the idle session was written within {limit:g}s")
+        if not self.real_codex:
+            self.check(out == "turn 2: PONG\n", "stdout is exactly the reply")
+
+        print("\n[C3] a long turn, then at once: board session send <id> <message> --wait   (the session is busy)")
+        self.board("session", "send", sid, long)
+        out, err, took = self.board("session", "send", sid, after, "--wait")
+        view = self.show(sid)
+        m3, m4 = (next(m for m in view["messages"] if m["n"] == n) for n in (3, 4))
+        t0 = m3["created_at"]
+        print(f"  long turn:   sent +0.00s, written +{m3['delivered_at'] - t0:.2f}s, ended +{m3['ended_at'] - t0:.2f}s")
+        print(f"  queued send: sent +{m4['created_at'] - t0:.2f}s, written +{m4['delivered_at'] - t0:.2f}s "
+              f"({m4['delivered_at'] - m3['ended_at']:.2f}s after the long turn ended), ended "
+              f"+{m4['ended_at'] - t0:.2f}s; wall {took:.2f}s")
+        print(f"  reply: {out.strip()!r}")
+        self.check(m3["delivered_at"] - m3["created_at"] <= limit, f"the long turn started within {limit:g}s")
+        self.check(m3["created_at"] < m4["created_at"] < m3["ended_at"],
+                   "the second message was sent before the long turn ended, so it had to queue")
+        self.check(m3["state"] == "done", "the long turn ran to its end: nothing was interrupted")
+        self.check(m4["delivered_at"] >= m3["ended_at"], "the queued message was written only after the long turn ended")
+        self.check(m4["delivered_at"] - m3["ended_at"] <= limit, f"... and within {limit:g}s of it")
+        self.check(m4["state"] == "done" and bool(out.strip()), "the queued turn ended with a reply")
+        self.check(view["turns"] == 4 and view["pid"] == pid and view["provider_id"] == thread,
+                   f"one process (pid {pid}) and one Codex thread took all four turns")
+        methods = [m.get("method") for m in self.codex_stdin()]
+        self.check(methods.count("turn/start") == 4 and methods.count("thread/start") == 1
+                   and "turn/interrupt" not in methods, "four turn/start lines, one thread, no interrupt")
+
+        print("\n[C4] the node is stopped and started again; the next message goes to the same Codex thread")
+        took = self.restart_node()
+        self.check(gone(pid), f"the session's process (pid {pid}) went with the node ({took:.1f}s after SIGTERM)")
+        view = self.show(sid)
+        self.check(view["state"] == "idle" and view["pid"] is None and view["provider_id"] == thread,
+                   "the session is still there, idle, with no process, and its thread id on record")
+        before = len(self.codex_stdin())
+        out, err, took = self.board("session", "send", sid, recall, "--wait")
+        m5 = next(m for m in self.show(sid)["messages"] if m["n"] == 5)
+        view = self.show(sid)
+        print(f"  wall {took:.2f}s; queued -> written {m5['delivered_at'] - m5['created_at']:.2f}s (a new process and "
+              f"its handshake included); turn {m5['ended_at'] - m5['delivered_at']:.2f}s; process {view['pid']}")
+        print(f"  reply: {out.strip()!r}")
+        wrote = self.codex_stdin()[before:]
+        self.check([m.get("method") for m in wrote] == ["initialize", "initialized", "thread/resume", "turn/start"],
+                   "the new process was told to resume: initialize, initialized, thread/resume, turn/start")
+        self.check(wrote[2]["params"]["threadId"] == thread and wrote[3]["params"]["threadId"] == thread,
+                   "... the same thread, by the id the node kept on disk")
+        self.check(view["pid"] not in (None, pid) and view["provider_id"] == thread and m5["state"] == "done",
+                   "a new process took the turn in the old thread")
+        if self.real_codex:
+            self.check("lantern" in out.lower(), "the reply holds the word from the first turn: the conversation "
+                                                 "was kept across the restart")
+        else:
+            self.check(out == "turn 5: FIRST WAS REMEMBER LANTERN\n",
+                       "the reply counts on from turn 4 and names the first message: the conversation was kept")
+        record = json.loads((self.node_home / "data" / "node-logs" / "node-session-providers.json").read_text())
+        self.check(record == {sid: thread}, "node-session-providers.json on the node holds the thread id")
+
+        print("\n[C5] close")
+        pid = view["pid"]
+        out, _, _ = self.board("session", "close", sid)
+        print(f"  {out.strip()}")
+        deadline = time.monotonic() + 20
+        while self.show(sid)["state"] != "ended" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.check(self.show(sid)["state"] == "ended", "the node confirmed the close")
+        out, err, _ = self.board("session", "send", sid, "too late", ok=False)
+        self.check("has ended" in err, "a closed session takes no message")
+        self.check(gone(pid), f"its process (pid {pid}) is gone")
 
     # ------------------------------------------------------------ --with-board: a woken session reads the board
 
@@ -668,6 +879,11 @@ enabled = true
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--claude-bin", metavar="PATH", help="the real Claude Code CLI (default: a stand-in script)")
+    ap.add_argument("--codex-bin", metavar="PATH", help="the real Codex CLI (default: a stand-in script)")
+    ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
+                    help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
+                         "one codex-cli 0.171.0 lists)")
+    ap.add_argument("--only", choices=("claude", "codex"), help="run only that agent's scenario (default: both)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
     ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
@@ -684,22 +900,38 @@ def main() -> int:
             ap.error("--claude-bin must be an executable named claude")
     elif args.with_board:
         ap.error("--with-board needs --claude-bin: the stand-in calls no tools")
+    if args.codex_bin is not None:
+        args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
+        if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
+            ap.error("--codex-bin must be an executable named codex")
+    if args.with_board and args.only == "codex":
+        ap.error("--with-board is a Claude scenario")
+    codex, claude = args.only != "claude" and not args.with_board, args.only != "codex"
     run = Run(args)
-    print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
-                       else "stand-in (tests/stand_in_claude.py), no model")
-          + (", with the temp board's MCP tools" if args.with_board else ""))
+    if claude:
+        print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
+                           else "stand-in (tests/stand_in_claude.py), no model")
+              + (", with the temp board's MCP tools" if args.with_board else ""))
+    if codex:
+        print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
+                                 else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
     try:
         run.write_settings()
         run.start_services()
+        if codex:
+            run.codex_scenario()
         if args.with_board:
             run.board_scenario()
-        else:
+        elif claude:
             run.scenario()
         print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
-              else "\n[8] stopping the node (SIGTERM) and the hub")
+              else "\n[8] stopping the node (SIGTERM) and the hub" if claude
+              else "\n[C6] stopping the node (SIGTERM) and the hub")
         run.stop()
-        run.check(not alive(run.open_pid), f"the open session's process (pid {run.open_pid}) was stopped with the node")
+        if claude:
+            run.check(not alive(run.open_pid),
+                      f"the open session's process (pid {run.open_pid}) was stopped with the node")
         run.check(run.leftovers() == [], "no session process is left behind")
         print("\nPASS")
         return 0

@@ -115,6 +115,9 @@ class ClaudeSession:
             out += ["--model", model]
         return out + ["--resume" if resume else "--session-id", self.session_id]
 
+    def adopt(self, provider_id: str | None) -> None:
+        """Nothing to adopt: Claude's own id for the session is the hub's session id."""
+
     def on_open(self) -> list[bytes]:
         return []
 

@@ -31,6 +31,8 @@ Rules the hub relies on:
   at the next start. From the moment shutdown begins, shutdown alone reports: the loop posts nothing more.
 - `[dispatch.sessions]`: `idle_hours` (a process idle that long is stopped; its session stays and the next message
   resumes it) and `max_live`.
+- A provider's own id for a session (Codex's thread id) is the host's to keep (session_host.PROVIDER_FILE). This
+  loop reports it to the hub with the status, for the record and the human, and never takes one from the hub.
 """
 from __future__ import annotations
 
@@ -74,7 +76,9 @@ class SessionRunner:
         self.handed: dict[str, int] = self._load_handed()
         self.ending: set[str] = set()                 # sessions this node reported (or is reporting) ended
         self.dropped: set[str] = set()                # sessions the hub no longer lists: closed here, not reported
-        self.status: dict[str, tuple] = {}            # session id -> (state, pid, resume) as of the last pass
+        # session id -> (state, pid, resume, the provider's own id when it is not the session id) as of the last pass
+        self.status: dict[str, tuple] = {}
+        self.plain_reports = False                    # this hub refuses a report that carries `provider_id` (an older one)
         self.reported: dict[str, tuple] = {}          # ... as the hub last took it
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
@@ -215,8 +219,20 @@ class SessionRunner:
             status = self.status.get(sid)
             if status is not None:
                 body |= {"state": status[0], "pid": status[1], "resume": status[2]}
+                if status[3] is not None and not self.plain_reports:
+                    body["provider_id"] = status[3]     # Codex's thread id: for the hub's record, never read back
             try:
-                self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                try:
+                    self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code != 422 or "provider_id" not in body:
+                        raise
+                    # A hub from before the field refuses the whole report. The events matter more than its record
+                    # of the id (the id that counts is on this machine): send it again without, and from now on.
+                    log.warning("the hub refuses `provider_id` in a session report (an older hub); reporting without")
+                    self.plain_reports = True
+                    del body["provider_id"]
+                    self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
@@ -375,6 +391,7 @@ class SessionRunner:
         if set(self.handed) - set(listed):
             self.handed = {sid: n for sid, n in self.handed.items() if sid in listed}
             self._save_handed()
+        self.host.keep_provider_ids(set(listed))
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
 
     def _admit(self, s) -> bool:
@@ -425,7 +442,13 @@ class SessionRunner:
                     d.pop(sid, None)
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:
-                self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume))
+                self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))
+
+    @staticmethod
+    def _own_id(s) -> str | None:
+        """The provider's id for the session when it issued one of its own (Codex's thread id). Claude's is the
+        session id, which the hub has: nothing is added to its reports."""
+        return s.provider_id if s.provider_id != s.session_id else None
 
     # ------------------------------------------------------------ the thread
 
@@ -502,7 +525,7 @@ class SessionRunner:
         self.report_lock.release()
         with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
             self._emit(events)
-            self.status = {sid: (s.state, None, bool(s.resume)) for sid, s in self.host.sessions.items()
+            self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s)) for sid, s in self.host.sessions.items()
                            if not s.ended and sid not in self.dropped}
         try:
             if not self._flush(final=True):
