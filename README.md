@@ -422,9 +422,9 @@ What to know:
 - **Permissions** are the runner's, as for a dispatched run, with nobody to ask: a tool that would prompt is denied
   and listed (`show` says which). A runner with `--dangerously-skip-permissions` or `--permission-mode
   bypassPermissions` is not hosted unless the node says `allow_full_access = true` ("Parent and child sessions"
-  below), and a session that ends up in that mode through a settings file is ended when its turn starts. A
-  read-only runner is hosted with a hard tool list (same section). A project in `claude_tool_projects` gets the
-  scoped tools, as a run does.
+  below), and a session that ends up in that mode through a settings file is ended when its turn starts.
+  Otherwise the runner is hosted exactly as written. A project in `claude_tool_projects` gets the scoped tools, as
+  a run does.
 - **A lost turn is not retried.** A turn that timed out (`[dispatch] timeout_minutes`), whose process died, or whose
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.
@@ -552,9 +552,11 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   removed once the session has ended and holds nothing unique (nothing uncommitted, untracked or ignored, and its
   HEAD on a branch or remote ref); otherwise it stays and `show` says where it is. Ignored files count: a build
   output or a local `.env` in it is still yours.
-- **Access** is one word, and the node turns it into flags from its own runner for that agent. The hub sends
-  nothing executable.
-  - `read-only`: Claude with a hard list of built-in tools, `--tools=Read,Grep,Glob`, so that nothing that writes
+- **Access** is one word. For a child it is ENFORCED: the node turns the word you asked for into flags from its
+  own runner for that agent (the hub sends nothing executable). For a session you start without `--parent` it is
+  OBSERVED: that session runs its runner exactly as you configured it, and its access is a label read off what its
+  process reports (below).
+  - `read-only`, asked for with `--access read-only`: Claude with a hard list of built-in tools, `--tools=Read,Grep,Glob`, so that nothing that writes
     or runs a command exists in the session whatever a settings file allows (`--allowedTools` only adds approvals:
     a `Bash(*)` or `Write` grant in your settings stays in force under `dontAsk`); in `dontAsk` mode, given
     explicitly; with no MCP server but the board's (`--strict-mcp-config` and a config holding only the
@@ -563,8 +565,7 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     `~/.ssh` denied beside the runner's own deny rules. No shell means no `git log` either. Codex with the
     `read-only` sandbox.
   - `workspace`: the runner as the node configured it (what a hosted session always got, `claude_tool_projects`
-    scoping included). A runner that is read-only as written (the triage runner) is hosted with the read-only
-    limits above, whatever word it is asked for at, and `list` says so.
+    scoping included). Nothing is added to it.
   - `full`: Claude with `--permission-mode bypassPermissions` (the runner's deny rules still hold); Codex with the
     `danger-full-access` sandbox. Only on a node whose board.local.toml says:
 
@@ -577,18 +578,23 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     setting decides whether a runner that bypasses permission checks can be hosted at all: with it, such a session
     is `full`; without it, it is refused as before.
 
-  A session you start without `--parent` has what its runner has (`show` prints it). A child's access defaults to
-  its parent's and may be narrower; above the parent's is refused. So a `full` child needs a `full` parent. A Claude
-  runner that bypasses permission checks can be asked for at `full` or `read-only`, not `workspace`.
+  A session you start without `--parent` runs its runner as you configured it: nothing is added to its command
+  line, also when the runner calls itself read-only (the triage runner keeps its `git log`). Its access, as `show`
+  prints it, is a label: Claude reporting `bypassPermissions` is `full`; `dontAsk` with no built-in tool beyond
+  Read, Grep and Glob is `read-only`; anything else is `workspace`. So a triage runner that allows `git log` has a
+  shell and is labelled `workspace`, which is what it is. A child's access defaults to its parent's label and may
+  be narrower; above it is refused. So a `full` child needs a `full` parent, and a child asked for at `read-only`
+  gets the hard limits above whatever its runner calls itself. A Claude runner that bypasses permission checks can
+  be asked for at `full` or `read-only`, not `workspace`.
 
   **What a Claude session really runs with is checked.** Flags are a request; a settings file can decide otherwise
   (`"defaultMode": "bypassPermissions"` in a file the runner loads puts a session with no bypass flag into that
   mode). Claude says, at the start of every turn, which permission mode it is in and which tools it has, and the
   node holds that against the session: one that runs with permission checks bypassed on a node without
-  `allow_full_access`, or that was asked for at less than `full`, is ended with the reason, and so is a read-only
-  session that is not in `dontAsk` or has a tool beyond its list, and a `full` one that is not bypassed. Nothing is
-  run narrower instead. A session's access as `show` prints it is that verified one, so it is known once its first
-  turn has started, and no child can be started under it before. `--allow-dangerously-skip-permissions` alone is
+  `allow_full_access`, or that was asked for at less than `full`, is ended with the reason, and so is a child asked
+  for at `read-only` that is not in `dontAsk` or has a tool beyond its list, and one asked for at `full` that is
+  not bypassed. Nothing is run narrower instead. A session's access as `show` prints it is that reported one, so
+  it is known once its first turn has started, and no child can be started under it before. `--allow-dangerously-skip-permissions` alone is
   not full access (it selects nothing).
 
   **A child runs only under its parent as the parent is on the node now.** If you edit a runner and restart the

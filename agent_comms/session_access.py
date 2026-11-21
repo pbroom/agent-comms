@@ -5,19 +5,24 @@ executable crosses the wire: the hub orders the words (a child never gets more t
 word into flags for the agent's CLI from ITS OWN runner template and settings (`prepare`).
 
 - `workspace`: the runner as the node configured it (with the `claude_tool_projects` scoping a session already
-  gets).
-- `read-only`: Claude with a HARD list of built-in tools (`--tools=Read,Grep,Glob`: nothing that writes or runs a
-  command exists in the session, whatever any settings file allows), `dontAsk`, no MCP server but the board's
-  (`--strict-mcp-config` and a config holding only that one), its own deny rules kept (`claude_read_only`); Codex
-  with `sandbox: read-only`. A runner that already calls itself read-only gets the same.
+  gets). Nothing is added to it.
+- `read-only`, ASKED FOR BY WORD (a child): Claude with a HARD list of built-in tools (`--tools=Read,Grep,Glob`:
+  nothing that writes or runs a command exists in the session, whatever any settings file allows), `dontAsk`, no MCP
+  server but the board's (`--strict-mcp-config` and a config holding only that one), its own deny rules kept
+  (`claude_read_only`); Codex with `sandbox: read-only`.
 - `full`: Claude with `--permission-mode bypassPermissions` (its deny rules kept); Codex with
   `sandbox: danger-full-access`. Only on a node that set `[dispatch.sessions] allow_full_access = true`; without it a
   request for `full` is refused, never narrowed.
 
+A session of its own (a ROOT, opened without a word) runs its runner exactly as this machine's owner configured
+it: its command line is the one a hosted session always had, and its access is a LABEL, read off what its process
+reports when a turn starts (`verify`): `bypassPermissions` is `full`, `dontAsk` with no built-in tool beyond the
+read tools is `read-only`, anything else `workspace`. So a root's label is observed, a child's word is enforced.
+
 Flags are what a session is ASKED to run with. What Claude really runs with can also come from settings files the
-argv does not show (a `permissions.defaultMode`), so the mode and the tools its process reports when a turn starts
-are checked against what was asked (`verify`), and a session that runs with permission checks bypassed where it may
-not is ended. A session's access as the hub hears it is the verified one.
+argv does not show (a `permissions.defaultMode`), so the mode and the tools its process reports are held against
+what was asked, and a session that runs with permission checks bypassed where it may not, or that was asked for at
+`read-only` and has more than that, is ended. A session's access as the hub hears it is the verified one.
 """
 from __future__ import annotations
 
@@ -144,11 +149,17 @@ def claude_runs_bypass(template: list[str]) -> bool:
 
 
 def claude_native(template: list[str]) -> str:
-    """What a Claude runner asks for as it is written. What its process really runs with is checked at each turn's
-    start (`verify`)."""
+    """What a session of this Claude runner, as it is written, is EXPECTED to be labelled, by the rule `verify`
+    applies to what its process reports: selecting bypass is `full`; `dontAsk` with a `--tools` list within the read
+    tools is `read-only`; anything else `workspace`. (A runner that only calls itself read-only, with allow rules
+    for `git log` and so a shell, is `workspace`.) Until its process has reported, this is what the node goes by."""
     if claude_runs_bypass(template):
         return "full"
-    return "read-only" if runner_preflight.read_only(template) else "workspace"
+    _, values = _without(template, {"--permission-mode", "--tools"})
+    modes = values.get("--permission-mode", [])
+    tools = [t for v in values.get("--tools", []) for t in runner_preflight.split_tools(v)]
+    hard = "--tools" in values and bool(tools) and set(tools) <= set(READ_ONLY_BUILTINS)
+    return "read-only" if modes[-1:] == ["dontAsk"] and hard else "workspace"
 
 
 def claude_read_only(template: list[str],
@@ -189,20 +200,25 @@ def claude_full(template: list[str]) -> list[str]:
     return kept + list(CLAUDE_FULL)
 
 
-def verify(asked: str | None, started: str | None, mode: Any, tools: Any = (), *,
+def verify(asked: str | None, mode: Any, tools: Any = (), *,
            allow_full: bool = False) -> tuple[str | None, str | None]:
     """What a Claude process reported when a turn started (`permissionMode`, `tools`), held against the session:
-    `asked` is the access word it was opened with (None: a session of its own, which has what its runner has) and
-    `started` what `prepare` started it with. Returns (the access it really has, None), or (None, why it must be
-    ended). A mode that was not reported (not a name) verifies nothing: (None, None).
+    `asked` is the access word it was opened with (None: a session of its own, which runs its runner as configured).
+    Returns (the access it really has, None), or (None, why it must be ended). A mode that was not reported (not a
+    name) verifies nothing: (None, None).
 
     - `bypassPermissions` is full access. It stands only where this machine allows full access and the session was
       not asked for at less. Otherwise the session is ended: the mode came from a settings file, past the runner.
     - A session asked for at `full` that does not run that way is ended too, not run narrower.
-    - A read-only session must report `dontAsk` and no tool beyond READ_ONLY_BUILTINS and the board's.
-    - Anything else is `workspace`: the runner as configured, in whatever mode the machine's owner chose."""
+    - A session ASKED FOR at `read-only` must report `dontAsk` and no tool beyond READ_ONLY_BUILTINS and the
+      board's; one that has more is ended.
+    - Any other session (a root, or one asked for at `workspace`) is not held to a list: it is LABELLED. `dontAsk`
+      with at least one tool reported and none beyond the read tools and the board's is `read-only`; anything else
+      is `workspace`, the runner as configured, in whatever mode the machine's owner chose."""
     if not isinstance(mode, str) or not _MODE.fullmatch(mode):
         return None, None
+    named = [t for t in tools if isinstance(t, str)] if isinstance(tools, (list, tuple)) else []
+    extra = [t for t in named if t not in READ_ONLY_BUILTINS and not t.startswith(READ_ONLY_ALLOWED[0] + "__")]
     if mode == "bypassPermissions":
         if not allow_full:
             return None, BYPASS_MODE.format(why="this node does not allow full access ([dispatch.sessions] "
@@ -212,15 +228,13 @@ def verify(asked: str | None, started: str | None, mode: Any, tools: Any = (), *
         return "full", None
     if asked == "full":
         return None, NOT_BYPASS.format(mode=mode)
-    if started == "read-only":
+    if asked == "read-only":
         if mode != "dontAsk":
             return None, NOT_DONT_ASK.format(mode=mode)
-        extra = [t for t in tools if isinstance(t, str) and t not in READ_ONLY_BUILTINS
-                 and not t.startswith(READ_ONLY_ALLOWED[0] + "__")] if isinstance(tools, (list, tuple)) else []
         if extra:
             return None, EXTRA_TOOLS.format(tools=", ".join(extra[:5]) + (" ..." if len(extra) > 5 else ""))
         return "read-only", None
-    return "workspace", None
+    return ("read-only" if mode == "dontAsk" and named and not extra else "workspace"), None
 
 
 def _codex_safe(template: list[str]) -> tuple[list[str], bool]:
@@ -268,13 +282,15 @@ def _codex_sandbox(template: list[str], cwd: str | None) -> str:
 
 def prepare(template: list[str], access: Any = None, *, allow_full: bool = False, cwd: str | None = None,
             board_mcp: Callable[[list[str]], str | None] | None = None) -> Prepared:
-    """The runner template for a session that is to run at `access` (None: as its runner has it), what the session
-    is started with, and what its adapter must be told. ValueError: this machine cannot grant it (`full` without
-    `allow_full`; a level this runner cannot be brought to). `cwd`: the session's run directory, which is the only
-    thing a Codex runner's `--cd` may name. `board_mcp`: see `claude_read_only`.
+    """The runner template for a session that is to run at `access` (None: a session of its own, which runs its
+    runner as it is), what the session is expected to have, and what its adapter must be told. ValueError: this
+    machine cannot grant it (`full` without `allow_full`; a level this runner cannot be brought to). `cwd`: the
+    session's run directory, which is the only thing a Codex runner's `--cd` may name. `board_mcp`: see
+    `claude_read_only`.
 
-    A runner that turns permission checks or the sandbox off, opened without a word on a machine that does not
-    allow full access, is returned untouched: its adapter refuses it, as it did before there were access levels."""
+    Without a word a Claude template is NEVER changed: a root's command line is the one a hosted session had
+    before there were access levels, a read-only-labelled runner included. A runner that turns permission checks
+    or the sandbox off is then refused by its adapter, as ever, unless this machine allows full access."""
     access = level(access)
     kind = os.path.basename(template[0]) if template else ""
     if kind not in ("claude", "codex"):
@@ -285,21 +301,23 @@ def prepare(template: list[str], access: Any = None, *, allow_full: bool = False
         from .providers.claude import bypasses_permissions
 
         native = claude_native(template)
-        if access is None and not allow_full and bypasses_permissions(template):
-            return Prepared(list(template), native, None, True)
-        want = access or native
-        if want == "full":
+        if access is None:
+            # As configured, whatever it is. The adapter refuses bypass flags unless it is told this machine allows
+            # full access; what the session's access IS, its process says when a turn starts (`verify`).
+            return Prepared(list(template), native, "full" if allow_full and bypasses_permissions(template) else None,
+                            True)
+        if access == "full":
             if not allow_full:
                 raise ValueError(FULL_REFUSED)
             return Prepared(list(template) if native == "full" else claude_full(template), "full", "full",
                             native == "full")
-        if want == "read-only" or native == "read-only":
-            # Also a runner that is read-only as written, and `workspace` asked of one: the same hard limits.
+        if access == "read-only":
             return Prepared(claude_read_only(template, board_mcp), "read-only", None, False)
         if native == "full":
             raise ValueError(WORKSPACE_FROM_BYPASS)
-        # As configured, less the flag that would only make bypassing selectable: this is not a full session.
-        return Prepared(_without(template, {_CLAUDE_ALLOW_BYPASS})[0], "workspace", None, True)
+        # `workspace`: as configured, less the flag that would only make bypassing selectable (a child asked for at
+        # workspace is not a full session). Nothing is added.
+        return Prepared(_without(template, {_CLAUDE_ALLOW_BYPASS})[0], native, None, True)
     from .providers.codex import BYPASS_FLAGS
 
     other = sorted(a.split("=", 1)[0] for a in template if a.split("=", 1)[0] in BYPASS_FLAGS - CODEX_SANDBOX_OFF)

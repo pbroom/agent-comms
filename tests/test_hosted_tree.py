@@ -26,7 +26,7 @@ from test_hosted_sessions import (CODEX_RUNNER, P2, P3, UNKNOWN, children, clien
                                   codex_turn, make_node, msg, node_config, send, session_env, show, start,
                                   tick, written)
 from test_hosted_wake import GRACE, ask, later, record, wakes
-from test_session_host import SHIPPED, init, result, value_after
+from test_session_host import SHIPPED, result, value_after
 
 ROOT = Path(__file__).resolve().parents[1]
 TREE = {"nodes": {"laptop": {"projects": [PROJECT, P2, P3], "agents": ["claude", "codex", "grok"]}},
@@ -51,12 +51,42 @@ def senv(tmp_path):
     return session_env(tmp_path, dispatch=TREE, config=tree_config)
 
 
-def began(sid, mode="dontAsk", tools=("Read",)) -> dict:
+WORKSPACE_TOOLS = ("Bash", "Edit", "Glob", "Grep", "Read", "Write")     # what an ordinary Claude process reports
+
+
+def began(sid, mode="dontAsk", tools=WORKSPACE_TOOLS) -> dict:
     """What a Claude process writes when a turn starts: the mode it REALLY runs in and the tools it really has."""
     return {"type": "system", "subtype": "init", "session_id": sid, "permissionMode": mode, "tools": list(tools)}
 
 
-def begin(env, sid, node=None, mode="dontAsk", tools=("Read",)) -> None:
+def as_started(argv) -> tuple[str, tuple]:
+    """(mode, built-in tools) a Claude process started with this command line reports, with no settings file in
+    play: the mode it names (else `default`), and the tools `--tools=` leaves it (else the ordinary ones)."""
+    mode = value_after(argv, "--permission-mode") if "--permission-mode" in argv else "default"
+    listed = [a.split("=", 1)[1].split(",") for a in argv if a.startswith("--tools=")]
+    return mode, tuple(listed[-1]) if listed else WORKSPACE_TOOLS
+
+
+@pytest.fixture(autouse=True)
+def _reports_follow_the_command_line(request, monkeypatch):
+    """test_hosted_sessions' fake turns (its `clienv` among them) always report `dontAsk` and the one tool Read,
+    which is what a read-only session looks like. Here a session without a word is LABELLED by what its process
+    reports, so those turns report what the process's own command line gives (`as_started`)."""
+    import test_hosted_sessions
+
+    def reported(sid):
+        for name in ("senv", "wtenv"):
+            if name in request.fixturenames:
+                calls = request.getfixturevalue(name).node.session_spawner.calls
+                for call in reversed(calls):
+                    if sid in call["argv"]:
+                        return began(sid, *as_started(call["argv"]))
+        return began(sid)
+
+    monkeypatch.setattr(test_hosted_sessions, "init", reported)
+
+
+def begin(env, sid, node=None, mode="dontAsk", tools=WORKSPACE_TOOLS) -> None:
     """The session's Claude process starts the turn it was given (and says what it runs with); the node reports."""
     node = node or env.node
     i = max(i for i, c in enumerate(node.session_spawner.calls) if sid in c["argv"])
@@ -94,7 +124,7 @@ def answer(env, sid, text="ok", node=None) -> None:
     cannot tell a Codex process's argv from a Claude one's.)"""
     node = node or env.node
     i = max(i for i, c in enumerate(node.session_spawner.calls) if sid in c["argv"])
-    node.session_spawner.children[i].emit(init(sid), result(sid, text=text))
+    node.session_spawner.children[i].emit(began(sid), result(sid, text=text))
     tick(env, node)
 
 
@@ -383,8 +413,8 @@ def test_claude_read_only_is_a_hard_tool_list_dont_ask_and_the_board_server_alon
     host = host_for(senv, "ro", runners={"claude-code": runner})
     opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT, access="read-only")
     argv = host._argv(opened)
-    assert (opened.asked, opened.started, opened.access, opened.access_known) == (
-        "read-only", "read-only", "read-only", False), "known once its process has said what it runs with"
+    assert (opened.asked, opened.access, opened.access_known) == ("read-only", "read-only", False), \
+        "known once its process has said what it runs with"
     assert "--tools=Read,Grep,Glob" in argv and "--tools" not in argv and "Bash" not in argv, \
         "the built-in tools it HAS: nothing that writes or runs a command exists in the session"
     assert value_after(argv, "--permission-mode") == "dontAsk" and argv.count("--permission-mode") == 1
@@ -422,18 +452,90 @@ def test_claude_read_only_is_a_hard_tool_list_dont_ask_and_the_board_server_alon
     assert set(access.READ_ONLY_ALLOWED) <= set(rp.READ_ONLY_TOOLS)
 
 
-@pytest.mark.parametrize("word", [None, "read-only", "workspace"])
-def test_a_runner_already_labelled_read_only_gets_the_same_hard_limits(senv, tmp_path, word):
-    """S2. The triage runner's own allow list is a pre-approval list too: hosted, it gets the hard tool list, the
-    explicit mode and the board-only MCP config like any read-only session, whatever word it was asked for at."""
+def step_one_argv(runner, sid=UNKNOWN) -> list[str]:
+    """The command line step 1 built for a hosted session of this runner (not scoped, no model override): the
+    runner without its {prompt}, the stream flags, `--permission-prompts none`, the session id. Nothing else."""
+    return [a for a in runner if a != "{prompt}"] + ["--input-format", "stream-json", "--output-format",
+                                                     "stream-json", "--verbose", "--permission-prompts", "none",
+                                                     "--session-id", sid]
+
+
+@pytest.mark.parametrize("spawn", [False, True])
+def test_a_root_runs_a_read_only_labelled_runner_exactly_as_its_owner_configured_it(tmp_path, spawn):
+    """A session of its own gets NO added `--tools`, `--strict-mcp-config`, MCP config or permission mode: the hard
+    read-only mapping is for a session ASKED for read-only by word. With child sessions off (and on), a hosted
+    triage-style runner's command line is byte for byte what step 1 built, its `git log` allowance included."""
+    assert rp.read_only(TRIAGE), "a runner the dispatcher takes for read-only"
+    expected = ["claude", "-p", "--model", "haiku", "--strict-mcp-config", "--mcp-config", "/x/haiku.mcp.json",
+                "--permission-mode", "dontAsk",
+                "--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**),Bash(git log *),Bash(git show *)",
+                "--disallowedTools=Edit,Write,NotebookEdit,Bash(git *--output*),Read(~/.config/agent-comms/**),"
+                "Read(~/.ssh/**),Read(./data/**)",
+                "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--permission-prompts", "none", "--session-id"]
+    assert step_one_argv(TRIAGE, "SID") == expected + ["SID"]
+    env = session_env(tmp_path, dispatch=TREE if spawn else {"nodes": TREE["nodes"]},
+                      config=lambda e: tree_config(e, runners={"claude-code": TRIAGE}, claude_tool_projects=[PROJECT]))
+    sid = start(env)["session_id"]
+    tick(env)
+    assert call_for(env, sid)["argv"] == expected + [sid], "through the hub and the node"
+    assert not list((env.tmp / "laptop-logs").rglob("*.mcp.json")), "no MCP config was made for it"
+    host = host_for(env, "direct", runners={"claude-code": TRIAGE}, sessions={"allow_full_access": True})
+    opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT)
+    assert host._argv(opened) == expected + [UNKNOWN] and opened.template == TRIAGE
+    assert access.prepare(TRIAGE).template == TRIAGE and access.prepare(TRIAGE, allow_full=True).template == TRIAGE
+
+    # Its label is what its process reports. It has a shell (for `git log`), so it is `workspace`, the honest word.
+    begin(env, sid, tools=("Bash", "Glob", "Grep", "Read"))
+    if spawn:
+        assert stored(env, sid)["access"] == "workspace"
+        assert child(env, sid)["access"] == "workspace"
+        assert "above the parent's (workspace)" in child(env, sid, access="full", expect=409)["message"]
+    else:
+        assert "access" not in stored(env, sid), "nobody asked: nothing more is reported"
+    assert env.node.sessions.host.sessions[sid].access == "workspace"
+    assert show(env, sid)["state"] != "ended"
+
+
+def test_a_roots_label_is_read_only_only_when_its_process_has_nothing_but_the_read_tools(senv):
+    """Observed, not enforced: `dontAsk` and no built-in tool beyond Read, Grep and Glob (the board's tools aside)
+    is `read-only`; a root with anything more is `workspace`, and is never ended for it."""
+    hard = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob"]
+    assert access.claude_native(hard) == "read-only" and access.claude_native(TRIAGE) == "workspace"
+    node = make_node(senv, config=tree_config(senv, runners={"claude-code": hard}), log_dir=senv.tmp / "hard-logs")
+    sid = start(senv)["session_id"]
+    tick(senv, node)
+    assert call_for(senv, sid, node)["argv"] == step_one_argv(hard, sid), "as configured: nothing was added"
+    begin(senv, sid, node, tools=("Glob", "Grep", "Read", "mcp__agent-comms__board_post"))
+    assert stored(senv, sid)["access"] == "read-only"
+    assert child(senv, sid)["access"] == "read-only", "its children may be at most read-only"
+    assert "above the parent's (read-only)" in child(senv, sid, access="workspace", expect=409)["message"]
+    answer(senv, sid, node=node)
+    send(senv, sid, "again")
+    tick(senv, node)
+    begin(senv, sid, node, tools=("Bash", "Read"))          # a later turn reports more: relabelled, not ended
+    assert stored(senv, sid)["access"] == "workspace" and show(senv, sid)["state"] != "ended"
+    send(senv, sid, "once more")
+    answer(senv, sid, node=node)
+    tick(senv, node)
+    begin(senv, sid, node, mode="acceptEdits", tools=("Read",))
+    assert stored(senv, sid)["access"] == "workspace", "only dontAsk is read-only"
+
+
+@pytest.mark.parametrize("word", ["read-only", "workspace"])
+def test_a_child_of_a_read_only_labelled_runner(senv, tmp_path, word):
+    """Asked for at `read-only`, a child gets the hard limits whatever its runner calls itself. Asked for at
+    `workspace`, it runs the runner as configured, like a root: nothing is added."""
     own = tmp_path / "haiku.mcp.json"
     own.write_text(json.dumps({"mcpServers": {"agent-comms": BOARD_ENTRY}}))
     runner = [str(own) if a == "/x/haiku.mcp.json" else a for a in TRIAGE]
-    assert rp.read_only(runner) and access.claude_native(runner) == "read-only"
     host = host_for(senv, f"triage-{word}", runners={"claude-code": runner}, claude_tool_projects=[PROJECT])
     opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT, access=word)
     argv = host._argv(opened)
-    assert opened.started == "read-only" and "--tools=Read,Grep,Glob" in argv and "--strict-mcp-config" in argv
+    if word == "workspace":
+        assert argv == step_one_argv(runner) and opened.access == "workspace"
+        return
+    assert opened.access == "read-only" and "--tools=Read,Grep,Glob" in argv and "--strict-mcp-config" in argv
     assert next(a for a in argv if a.startswith("--allowedTools=")) == (
         "--allowedTools=mcp__agent-comms,Read(./**),Grep(./**),Glob(./**)"), "its git allowances need Bash: gone"
     denied = next(a for a in argv if a.startswith("--disallowedTools="))
@@ -487,27 +589,33 @@ def test_a_bypass_runner_is_a_full_root_only_where_the_node_allows_full_access(s
 
 def test_the_flag_that_only_makes_bypass_selectable_is_not_full_access(senv):
     """S3. `--allow-dangerously-skip-permissions` selects nothing. Such a runner is still refused where full access
-    is not allowed (as ever); where it is, the session is a workspace one, started without the flag."""
+    is not allowed (as ever). Where it is, a root runs it as configured and is whatever its process reports; a
+    child asked for at workspace is started without the flag."""
     runner = ["claude", "-p", "{prompt}", "--allow-dangerously-skip-permissions"]
     assert access.claude_native(runner) == "workspace" and not access.claude_runs_bypass(runner)
     with pytest.raises(ValueError, match="cannot be hosted as a session"):
         claude_argv(senv, "allow-off", runner=runner)
-    argv, granted = claude_argv(senv, "allow-on", runner=runner, sessions={"allow_full_access": True})
-    assert granted == "workspace" and "--allow-dangerously-skip-permissions" not in argv
-    argv, granted = claude_argv(senv, "allow-ws", runner=runner, access_word="workspace")
-    assert granted == "workspace" and "--allow-dangerously-skip-permissions" not in argv
+    argv, expected = claude_argv(senv, "allow-on", runner=runner, sessions={"allow_full_access": True})
+    assert expected == "workspace" and argv == step_one_argv(runner), "a root: as its owner configured it"
+    argv, expected = claude_argv(senv, "allow-ws", runner=runner, access_word="workspace")
+    assert expected == "workspace" and "--allow-dangerously-skip-permissions" not in argv
 
 
-def test_a_root_derives_its_access_from_its_runner(senv):
-    assert access.claude_native(SHIPPED) == "workspace" and access.claude_native(TRIAGE) == "read-only"
-    assert access.claude_native(BYPASS) == "full"
-    assert access.prepare(TRIAGE).granted == "read-only" and access.prepare(SHIPPED).granted == "workspace"
-    assert "--tools=Read,Grep,Glob" in access.prepare(TRIAGE).template
-    assert access.prepare(BYPASS, allow_full=True).granted == "full"
-    plain = access.prepare(SHIPPED)
-    assert (plain.template, plain.configure, plain.as_configured) == (SHIPPED, None, True), "nothing is touched"
-    untouched = access.prepare(BYPASS)
-    assert (untouched.template, untouched.as_configured) == (BYPASS, True), "left for its adapter to refuse"
+def test_what_a_runner_is_expected_to_be_before_its_process_has_said(senv):
+    """`claude_native`: what the node goes by until a session's process reports, by the rule its report is read
+    with. Without a word nothing in a Claude template is ever changed."""
+    assert access.claude_native(SHIPPED) == "workspace" and access.claude_native(BYPASS) == "full"
+    assert access.claude_native(TRIAGE) == "workspace", "it allows `git log`: it has a shell"
+    assert access.claude_native(["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--tools=Read,Glob"]) \
+        == "read-only"
+    assert access.claude_native(["claude", "-p", "{prompt}", "--tools=Read,Glob"]) == "workspace", "not dontAsk"
+    for runner in (SHIPPED, TRIAGE, BYPASS, ["claude", "-p", "{prompt}", "--allow-dangerously-skip-permissions"]):
+        for allow in (False, True):
+            got = access.prepare(runner, allow_full=allow)
+            assert (got.template, got.as_configured) == (runner, True), "nothing is touched"
+    assert access.prepare(SHIPPED).configure is None and access.prepare(BYPASS).configure is None, \
+        "a bypass runner is left for its adapter to refuse"
+    assert access.prepare(BYPASS, allow_full=True).configure == "full" and access.prepare(BYPASS).granted == "full"
     assert access.prepare(["grok", "{prompt}"]).granted is None
     with pytest.raises(ValueError, match="no access levels"):
         access.prepare(["grok", "{prompt}"], "read-only")
@@ -1128,7 +1236,8 @@ def test_a_child_is_not_resumed_above_what_its_parent_has_on_the_node_now(senv):
     kid = child(senv, sid, "work", agent="codex")["session_id"]      # workspace: its Codex runner is workspace-write
     tick(senv)
     assert codex_call(senv)["cwd"] == str(senv.work) and stored(senv, kid)["granted"] == "workspace"
-    edited = make_node(senv, config=tree_config(senv, runners={"claude-code": TRIAGE}), log_dir=senv.tmp / "laptop-logs")
+    hard = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--tools=Read,Grep,Glob"]
+    edited = make_node(senv, config=tree_config(senv, runners={"claude-code": hard}), log_dir=senv.tmp / "laptop-logs")
     send(senv, kid, "more")
     tick(senv, edited, times=2)
     assert edited.sessions.host.sessions[sid].access == "read-only", "the parent as this machine's runner has it now"
@@ -1195,31 +1304,33 @@ def test_the_parent_is_checked_again_at_the_moment_a_turn_is_handed_over(senv):
 
 
 def test_verify_holds_what_a_process_reports_against_what_the_session_may_have():
-    """S3. session_access.verify: (asked, started, reported mode, reported tools) -> the access it really has, or
-    why it is ended."""
+    """S3. session_access.verify: (the word asked, reported mode, reported tools) -> the access it really has, or
+    why it is ended. A word is enforced; without one (a root) the access is a label read off the report."""
     v = access.verify
-    assert v(None, "workspace", "dontAsk") == ("workspace", None) and v(None, "workspace", "acceptEdits")[0] == "workspace"
-    assert v(None, "workspace", None) == (None, None) == v("full", "full", {"not": "a name"}), "nothing was reported"
-    # bypassPermissions: only where this machine allows full access, and not for a session asked for at less
-    assert v(None, "workspace", "bypassPermissions", allow_full=True) == ("full", None)
-    assert v("full", "full", "bypassPermissions", allow_full=True) == ("full", None)
-    for asked, started, allow in ((None, "workspace", False), (None, "full", False), ("full", "full", False),
-                                  ("workspace", "workspace", True), ("read-only", "read-only", True)):
-        got, why = v(asked, started, "bypassPermissions", allow_full=allow)
-        assert got is None and why.startswith("its process runs with permission checks bypassed"), (asked, allow)
-    assert "allow_full_access" in v(None, "workspace", "bypassPermissions")[1]
-    assert "asked for at workspace access" in v("workspace", "workspace", "bypassPermissions", allow_full=True)[1]
-    # asked for full, not running that way: ended, not run narrower
-    assert v("full", "full", "default", allow_full=True) == (None, access.NOT_BYPASS.format(mode="default"))
-    # a root whose runner selects bypass but whose process does not run that way is what it runs as
-    assert v(None, "full", "default", allow_full=True) == ("workspace", None)
-    # read-only: dontAsk, and no tool beyond the hard list and the board's
     board = ("mcp__agent-comms__board_post", "mcp__agent-comms__board_read_updates")
-    assert v("read-only", "read-only", "dontAsk", ("Read", "Grep", "Glob", *board)) == ("read-only", None)
-    assert v(None, "read-only", "dontAsk", ("Read",)) == ("read-only", None)
-    assert v("read-only", "read-only", "default", ("Read",)) == (None, access.NOT_DONT_ASK.format(mode="default"))
+    assert v(None, None) == (None, None) == v("full", {"not": "a name"}), "nothing was reported"
+    # A root, and a session asked for at workspace: labelled, never held to a list.
+    for asked in (None, "workspace"):
+        assert v(asked, "dontAsk", ("Bash", "Read")) == ("workspace", None)
+        assert v(asked, "dontAsk", ("Read", "Grep", "Glob", *board)) == ("read-only", None)
+        assert v(asked, "dontAsk", ()) == ("workspace", None), "no tools reported: not known to be read-only"
+        assert v(asked, "acceptEdits", ("Read",)) == ("workspace", None) == v(asked, "default", ("Read",))
+        assert v(asked, "dontAsk", ("Read", "mcp__other__tool")) == ("workspace", None)
+    # bypassPermissions: only where this machine allows full access, and not for a session asked for at less
+    assert v(None, "bypassPermissions", allow_full=True) == ("full", None)
+    assert v("full", "bypassPermissions", allow_full=True) == ("full", None)
+    for asked, allow in ((None, False), ("full", False), ("workspace", True), ("read-only", True)):
+        got, why = v(asked, "bypassPermissions", allow_full=allow)
+        assert got is None and why.startswith("its process runs with permission checks bypassed"), (asked, allow)
+    assert "allow_full_access" in v(None, "bypassPermissions")[1]
+    assert "asked for at workspace access" in v("workspace", "bypassPermissions", allow_full=True)[1]
+    # asked for full, not running that way: ended, not run narrower
+    assert v("full", "default", allow_full=True) == (None, access.NOT_BYPASS.format(mode="default"))
+    # asked for read-only: dontAsk, and no tool beyond the hard list and the board's, or it is ended
+    assert v("read-only", "dontAsk", ("Read", "Grep", "Glob", *board)) == ("read-only", None)
+    assert v("read-only", "default", ("Read",)) == (None, access.NOT_DONT_ASK.format(mode="default"))
     for extra in ("Bash", "Write", "Task", "mcp__other__tool", "mcp__agent-comms-evil__x", "unknown"):
-        got, why = v("workspace", "read-only", "dontAsk", ("Read", extra))
+        got, why = v("read-only", "dontAsk", ("Read", extra))
         assert got is None and extra in why, extra
 
 

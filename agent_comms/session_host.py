@@ -132,11 +132,11 @@ class Session:
     transcript_fd: int | None = None
     tee_failed: bool = False
     stderr_from: int = 0            # size of the stderr log when this process started: what it wrote comes after
-    # Access (session_access): `asked`, the word it was opened with (None: a session of its own); `started`, what
-    # its command line was made for; `access`, what it has as far as this host knows (`started`, then what its
-    # process reported); `access_known`, once that is verified (at once for a CLI that reports no mode).
+    # Access (session_access): `asked`, the word it was opened with (None: a session of its own, which runs its
+    # runner as configured); `access`, what it has as far as this host knows (what its command line is expected to
+    # give, then what its process reported); `access_known`, once that is verified (at once for a CLI that reports
+    # no mode).
     asked: str | None = None
-    started: str | None = None
     access: str | None = None
     access_known: bool = False
     effort: str | None = None
@@ -350,8 +350,8 @@ class SessionHost:
         if prep.as_configured or prep.granted != "read-only":      # a session narrowed to read-only gets no extra roots
             template = with_writable_roots(template, self.config.extra_roots(template, project))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
-                    thread_id=int(thread_id), resume=bool(resume), asked=access, started=prep.granted,
-                    access=prep.granted, effort=effort)
+                    thread_id=int(thread_id), resume=bool(resume), asked=access, access=prep.granted,
+                    effort=effort)
         # A CLI that reports the mode it really runs in (Claude) has its access verified when its first turn starts.
         s.access_known = not getattr(s.provider, "verifies_mode", False)
         runs_in = getattr(s.provider, "runs_in", None)
@@ -518,8 +518,9 @@ class SessionHost:
         elif ev.kind == "turn_started":
             # What the process says it really runs this turn with, against what the session may have. A mode from a
             # settings file is past this machine's runner: bypassed permission checks where they may not be, or a
-            # read-only session that is not, end the session here, before the turn has done anything.
-            verified, problem = session_access.verify(s.asked, s.started, ev.mode, ev.tools,
+            # session asked for at read-only that has more, end the session here, before the turn has done anything.
+            # For a session of its own this is also where its access is read off: a label, not a limit.
+            verified, problem = session_access.verify(s.asked, ev.mode, ev.tools,
                                                       allow_full=self.config.sessions.allow_full_access)
             if problem is not None:
                 log.warning("session %s: %s", s.session_id, problem)
