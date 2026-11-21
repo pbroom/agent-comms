@@ -249,11 +249,29 @@ def main(argv: list[str] | None = None) -> None:
     def raw(x):     # `board session list --json` as well as `board --json session list`
         x.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print raw JSON")
 
-    x = ssub.add_parser("start", help="start a session of an agent in a project, with its first message")
-    x.add_argument("project", help="the project's path as the board knows it (a relative path is made absolute)")
+    x = ssub.add_parser("start", help="start a session of an agent in a project, with its first message; with "
+                                      "--parent, a child session under another one")
+    x.add_argument("project", nargs="?", help="the project's path as the board knows it (a relative path is made "
+                                              "absolute). Not with --parent: a child runs in its parent's project")
     x.add_argument("message", help="the first message; - reads it from stdin")
-    x.add_argument("--agent", metavar="NAME", help="default: the one agent with a Claude runtime, if there is only one")
+    x.add_argument("--agent", metavar="NAME", help="default: the one agent with a Claude runtime, if there is only "
+                                                   "one; with --parent, the parent's agent")
     x.add_argument("--model", metavar="M", help="model for the session, e.g. haiku (default: the runner's own)")
+    x.add_argument("--parent", metavar="ID", help="start a CHILD session under this hosted session, on its node and "
+                   "in its project (needs [dispatch.sessions.spawn] enabled = true on the hub; README \"Hosted "
+                   "sessions\"). The options below apply to a child only")
+    x.add_argument("--access", choices=("read-only", "workspace", "full"),
+                   help="the child's access (default: its parent's; never above it; full also needs "
+                        "[dispatch.sessions] allow_full_access = true on the node)")
+    x.add_argument("--isolation", choices=("shared", "worktree"),
+                   help="shared (default): the parent's checkout; worktree: a new git worktree from its HEAD")
+    x.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                   help="reasoning effort for the child (default: the runner's own)")
+    x.add_argument("--role", choices=("implementation", "research", "review", "design", "test", "general"),
+                   help="what the child is for (default general); its name is <role>-<n>")
+    x.add_argument("--title", metavar="T", help="a one-line title for the child")
+    x.add_argument("--request-id", metavar="X", help="idempotency: the same id under the same parent returns the "
+                                                     "child it made the first time instead of another")
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
     raw(x)
     x = ssub.add_parser("send", help="send a message: the next turn if the session is idle, queued behind the "
@@ -787,6 +805,42 @@ def _fmt_hosted(s: dict) -> str:
             + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else ""))
 
 
+def _fmt_access(s: dict) -> str:
+    """A session's access word; with what its node gives when that is narrower (a runner that is read-only there)."""
+    access = s.get("access") or "not reported yet"
+    return access + (f" (its node gives {s['granted']})" if s.get("granted") not in (None, s.get("access")) else "")
+
+
+def _fmt_child(s: dict) -> str:
+    """One child session in a tree: name, id, state, agent, model, access, isolation."""
+    where = "" if s["node_live"] or s["state"] == "ended" else " (not connected)"
+    return (f"{s.get('name') or 'child'} {s['session_id']} "
+            f"[{s['state']}{', closing' if s.get('stop') and s['state'] != 'ended' else ''}] {s['agent']}"
+            + (f", model {s['model']}" if s.get("model") else "")
+            + (f", effort {s['effort']}" if s.get("effort") else "")
+            + f", access {_fmt_access(s)}, {s.get('isolation') or 'shared'}{where}, turns {s['turns']}, "
+            f"queued {s['queued']}"
+            + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else ""))
+
+
+def _fmt_hosted_tree(sessions: list[dict]) -> str:
+    """`board session list`: each session on its line as ever, a session's children indented under it."""
+    ids = {s["session_id"] for s in sessions}
+    kids: dict[str, list[dict]] = {}
+    for s in sessions:
+        if s.get("parent") in ids:
+            kids.setdefault(s["parent"], []).append(s)
+    lines = []
+    for s in sessions:
+        if s.get("parent") in ids:
+            continue
+        lines.append(_fmt_hosted(s) + (f" (child {s.get('name')} of {s['parent']}, which is not listed)"
+                                       if s.get("parent") else ""))
+        mine = sorted(kids.get(s["session_id"], []), key=lambda k: (k["created_at"], k.get("child_no") or 0))
+        lines += ["    " + _fmt_child(k) for k in mine]
+    return "\n".join(lines)
+
+
 def _fmt_hosted_detail(s: dict) -> str:
     from .core import iso
 
@@ -794,6 +848,23 @@ def _fmt_hosted_detail(s: dict) -> str:
              f"  created {iso(s['created_at'])}, updated {iso(s['updated_at'])}"
              + (f", model {s['model']}" if s.get("model") else "") + (f", pid {s['pid']}" if s.get("pid") else "")
              + (f", {s['runtime']} id {s['provider_id']}" if s.get("provider_id") else "")]
+    if s.get("parent"):
+        lines.append(f"  child {s.get('name')} of {s['parent']}: role {s.get('role')}"
+                     + (f", title {s['title']!r}" if s.get("title") else "") + f", access {_fmt_access(s)}, "
+                     f"isolation {s.get('isolation')}" + (f", effort {s['effort']}" if s.get("effort") else "")
+                     + (f", request id {s['request_id']}" if s.get("request_id") else ""))
+        if s.get("isolation") == "worktree":
+            lines.append("  worktree: " + (
+                "not made yet (its node makes it when it opens the session)" if not s.get("worktree")
+                else f"{s['worktree']} on node {s['node']}" + (
+                    " (removed by its node after the session ended)" if s.get("worktree_removed_at") else
+                    " (it stays there while it holds uncommitted work or commits on no branch)"
+                    if s["state"] == "ended" else "")))
+    elif "access" in s:
+        lines.append(f"  access {_fmt_access(s)}")
+    if s.get("children"):
+        lines.append("  children:")
+        lines += ["    " + _fmt_child(k) for k in s["children"]]
     if s.get("error"):
         lines.append(f"  ended: {s['error']}")
     last = s.get("last_result")
@@ -818,7 +889,7 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
 
     if a.session_cmd == "list":
         r = _api(settings, token, "GET", "/api/hosted-sessions" + ("?all=true" if a.all else ""))
-        return out(r, "\n".join(_fmt_hosted(s) for s in r["sessions"]) or "(no hosted sessions)")
+        return out(r, _fmt_hosted_tree(r["sessions"]) or "(no hosted sessions)")
     sid = quote(a.session_id, safe="") if a.session_cmd != "start" else ""
     if a.session_cmd == "show":
         r = _api(settings, token, "GET", f"/api/hosted-sessions/{sid}")
@@ -827,15 +898,39 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
         r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/close")
         return out(r, f"session {r['session_id']} " + ("ended" if r["state"] == "ended" else
                                                          f"is closing (node {r['node']} stops it and confirms)"))
+    child_only = {"access": getattr(a, "access", None), "isolation": getattr(a, "isolation", None),
+                  "effort": getattr(a, "effort", None), "role": getattr(a, "role", None),
+                  "title": getattr(a, "title", None), "request_id": getattr(a, "request_id", None)}
+    if a.session_cmd == "start" and a.parent:
+        if a.project is not None:
+            raise SystemExit("error: with --parent give only the message: a child session runs in its parent's project")
+    elif a.session_cmd == "start":
+        if a.project is None:
+            raise SystemExit("error: say which project: board session start <project> <message>")
+        given = [k for k, v in child_only.items() if v is not None]
+        if given:
+            raise SystemExit("error: --" + ", --".join(k.replace("_", "-") for k in given)
+                             + " apply to a child session only (--parent ID)")
     text = sys.stdin.read() if a.message == "-" else a.message
-    if a.session_cmd == "start":
+    if a.session_cmd == "start" and a.parent:
+        body = {"message": text} | {k: v for k, v in (("agent", a.agent), ("model", a.model), *child_only.items())
+                                    if v is not None}
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{quote(a.parent, safe='')}/children", body)
+    elif a.session_cmd == "start":
         body = {"project": os.path.abspath(os.path.expanduser(a.project)), "message": text}
         body |= {k: v for k, v in (("agent", a.agent), ("model", a.model)) if v}
         r = _api(settings, token, "POST", "/api/hosted-sessions", body)
     else:
         r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", {"message": text})
     s, m = r["session"], r["message"]
-    info = f"session {_fmt_hosted(s)}; message {m['n']} queued"
+    if s.get("parent"):
+        if m is None:       # --request-id found the child it made before, and its first message is no longer on record
+            return out(r, f"child {_fmt_child(s)} of {s['parent']}: already started for this request id")
+        info = (f"child {_fmt_child(s)} of {s['parent']}; "
+                + (f"message {m['n']} queued" if r.get("created", True) else
+                   f"already started for this request id (message {m['n']}: {m['state']}); nothing new was sent"))
+    else:
+        info = f"session {_fmt_hosted(s)}; message {m['n']} queued"
     if not s["node_live"]:
         info += f"\nnote: node {s['node']} is not connected; the message waits until it is"
     if not a.wait:

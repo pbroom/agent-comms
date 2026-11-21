@@ -174,7 +174,8 @@ runners = []                # e.g. ["codex-cli"]: Codex runner keys only
 # session and writes your messages to it as turns (`board session start|send|show|list|close`, human only). Off:
 # the node tells the hub nothing about sessions and starts none. Turn it on per machine in board.local.toml, and on
 # the hub allow the node its projects and agents under [dispatch.nodes.<name>] as for a node run. A runner that
-# bypasses permission checks (--dangerously-skip-permissions, --permission-mode bypassPermissions) is never hosted.
+# bypasses permission checks (--dangerously-skip-permissions, --permission-mode bypassPermissions) is not hosted
+# unless this machine says allow_full_access = true (below).
 [dispatch.sessions]
 enabled = false
 # Codex too (README "Hosted sessions"): the node runs the agent's `codex exec` runner as `codex app-server` instead,
@@ -191,3 +192,17 @@ wake_min_interval_seconds = 30   # at most one wake per session in this many sec
 max_wakes_per_hour = 12          # per session
 max_wakes_without_human = 6      # per session and thread, since your last post in that thread
 wake_grace_seconds = 120         # after a wake the dispatcher starts no run for those requests for this long
+# Full access (README "Parent and child sessions"): this machine may run a session with permission checks bypassed
+# (Claude: --permission-mode bypassPermissions; Codex: the danger-full-access sandbox). That is a runner written
+# that way, hosted as a session, or a child session asked for with --access full under such a session. Off: both
+# are refused with the reason, never narrowed. Read on the node only.
+allow_full_access = false
+
+# Child sessions (README "Parent and child sessions"): `board session start --parent <id> ...` starts a session
+# under another one, on the same node and in the same project, possibly for another agent and model, with its own
+# access (read-only, workspace or full; never above its parent's) and isolation (the parent's checkout, or a git
+# worktree of its own). Human only. Off: no session can be started under another, and nothing else changes. Read on
+# the hub. A node's max_live counts children too: it must be at least 1 + the children you want live at once.
+[dispatch.sessions.spawn]
+enabled = false
+max_children = 5            # children of one session that have not ended, at most

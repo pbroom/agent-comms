@@ -33,6 +33,13 @@ Rules the hub relies on:
   resumes it) and `max_live`.
 - A provider's own id for a session (Codex's thread id) is the host's to keep (session_host.PROVIDER_FILE). This
   loop reports it to the hub with the status, for the record and the human, and never takes one from the hub.
+- Child sessions (hosted_tree.py). A hub that has them says more about a session: an `access` word (None on a
+  root: "as your runner has it"), and for a child its `parent`, `isolation` and `effort`. The host turns the word
+  into flags from this machine's runner and settings (session_access.prepare) and this loop reports the access the
+  session really has. A child with `isolation: worktree` runs in a git worktree of its own
+  (session_worktrees.py, recorded in WORKTREES_FILE), made when it is first opened and removed once the session has
+  ended and it holds nothing unique. A hub that says none of this gets none of it: the session is opened and
+  reported exactly as before.
 """
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ from typing import Any, Callable
 
 import httpx
 
+from . import session_worktrees
 from .dispatch import DispatchConfig
 from .session_host import HostEvent, SessionHost
 
@@ -60,6 +68,9 @@ REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the 
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
+WORKTREES_FILE = "node-session-worktrees.json"   # session id -> {path, checkout}: a child session's own worktree
+SWEEP_SECONDS = 3600.0      # how often the worktrees of sessions that are gone are looked at again
+PARENT_ENDED = "its parent session ended"
 LOST = "the node restarted while this turn was in flight; it was not replayed"
 FRESH_START = (". Before that the agent refused to resume this session's conversation: the next message starts a NEW "
                "one, without the earlier turns")
@@ -70,7 +81,12 @@ class SessionRunner:
                  clock: Callable[[], float] = time.monotonic, self_stop_seconds: float = 90.0,
                  long_poll: float = LONG_POLL_SECONDS, sync_seconds: float = SYNC_SECONDS, **host_kw):
         self.client, self.log_dir, self.clock = client, Path(log_dir), clock
+        self.config = config
         self.host = host or SessionHost(config, self.log_dir, clock=clock, **host_kw)
+        # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
+        self.tree: dict[str, dict] = {}
+        self.worktrees: dict[str, dict] = self._load_worktrees()
+        self.swept = float("-inf")
         self.max_live, self.idle_seconds = config.sessions.max_live, config.sessions.idle_hours * 3600
         self.self_stop_seconds, self.long_poll, self.sync_seconds = self_stop_seconds, long_poll, sync_seconds
         self.pending: list[tuple[str, dict]] = []     # (session id, event) not yet taken by the hub, oldest first
@@ -123,6 +139,22 @@ class SessionRunner:
 
     def _save_handed(self) -> None:
         self._write_private(self._handed_path(), self.handed)
+
+    def _load_worktrees(self) -> dict[str, dict]:
+        try:
+            data = json.loads((self.log_dir / WORKTREES_FILE).read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)
+                and isinstance(v.get("path"), str) and isinstance(v.get("checkout"), str)}
+
+    def _save_worktrees(self) -> None:
+        try:
+            self._write_private(self.log_dir / WORKTREES_FILE, self.worktrees)
+        except OSError as e:
+            log.warning("could not record the session worktrees in %s (%s)", WORKTREES_FILE, e)
 
     def _load_seq(self) -> int:
         try:
@@ -224,6 +256,8 @@ class SessionRunner:
                     # Codex's thread id: for the hub's record, never read back. (A hub from before the field refuses
                     # the report; hubs are upgraded before nodes.)
                     body["provider_id"] = status[3]
+                # The access the session really has here and a child's own worktree, for a hub that asked.
+                body |= {k: v for k, v in self.tree.get(sid, {}).items() if v is not None}
             try:
                 self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
             except Exception as e:
@@ -333,11 +367,12 @@ class SessionRunner:
                     self._add(sid, {"kind": "ended", "detail": "the session ended on its node"})
                 continue
             if view.get("stop"):
+                why = PARENT_ENDED if view.get("stop") == "parent" else "closed by the human"
                 if s is not None:
-                    self._emit(self.host.close(sid, "closed by the human"))
+                    self._emit(self.host.close(sid, why))
                 else:
                     self.ending.add(sid)
-                    self._add(sid, {"kind": "ended", "detail": "closed by the human"})
+                    self._add(sid, {"kind": "ended", "detail": why})
                 continue
             if s is None:
                 left = self.recovered.pop(sid, None) or {}
@@ -351,7 +386,8 @@ class SessionRunner:
                 resume = view.get("resume") is True or left.get("resume") is True
                 try:
                     s = self.host.open(sid, agent=view.get("agent"), project=view.get("project"),
-                                       runtime=view.get("runtime"), model=view.get("model"), resume=resume)
+                                       runtime=view.get("runtime"), model=view.get("model"), resume=resume,
+                                       **self._tree_open(sid, view))
                 except Exception as e:
                     log.warning("cannot host session %s: %s", sid, e)
                     self.ending.add(sid)
@@ -359,6 +395,7 @@ class SessionRunner:
                                     "detail": f"this node cannot host the session: {type(e).__name__}: {e}"[:300]})
                     continue
                 self.last_busy[sid] = self.clock()
+            self._tree_status(sid, view, s)
             held, queue = self._held(s), []
             for m in sorted((m for m in view.get("messages", []) if isinstance(m, dict) and type(m.get("n")) is int),
                             key=lambda m: m["n"]):
@@ -390,7 +427,70 @@ class SessionRunner:
             self.handed = {sid: n for sid, n in self.handed.items() if sid in listed}
             self._save_handed()
         self.host.keep_provider_ids(set(listed))
+        if self.worktrees and self.clock() - self.swept >= SWEEP_SECONDS:
+            # Worktrees of child sessions that are gone here (ended while this node was away, or kept because they
+            # held something): each is removed once it holds nothing unique.
+            self.swept = self.clock()
+            for sid in [x for x in self.worktrees if x not in listed and x not in self.host.sessions]:
+                self._drop_worktree(sid)
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
+
+    # ------------------------------------------------------------ child sessions (hosted_tree.py)
+
+    def _tree_open(self, sid: str, view: dict) -> dict:
+        """What a hub with child sessions adds to opening a session: its access word and effort, and for a child
+        with its own worktree that directory, made now if it is not there. Nothing for an entry without the keys:
+        the session is then opened exactly as before."""
+        if "access" not in view and "parent" not in view:
+            return {}
+        kw: dict[str, Any] = {"access": view.get("access"), "effort": view.get("effort")}
+        isolation = view.get("isolation") if "parent" in view else None
+        if isolation == "worktree":
+            checkout = self.config.checkout_for(view.get("project"))
+            if not checkout:
+                raise FileNotFoundError(f"this machine has no run directory for project {view.get('project')!r}")
+            path = session_worktrees.path_for(self.config, checkout, sid)
+            known = sid in self.worktrees
+            self.worktrees[sid] = {"path": path, "checkout": checkout}
+            self._save_worktrees()      # on record before it exists: a crash in between leaves nothing unknown
+            try:
+                kw["cwd"] = session_worktrees.ensure(self.config, checkout, sid)
+            except Exception:
+                if not known:
+                    del self.worktrees[sid]
+                    self._save_worktrees()
+                raise
+        elif isolation not in (None, "shared"):
+            raise ValueError("unknown isolation for a child session")
+        return kw
+
+    def _tree_status(self, sid: str, view: dict, s) -> None:
+        """Whether this session's reports carry its access and worktree: only for a hub that asked."""
+        if "access" not in view and "parent" not in view:
+            self.tree.pop(sid, None)
+            return
+        tree = {"access": s.access, "worktree": self.worktrees.get(sid, {}).get("path")}
+        if self.tree.get(sid) != tree:
+            self.tree[sid] = tree
+            self.reported.pop(sid, None)        # say how it stands again, with these
+
+    def _drop_worktree(self, sid: str) -> None:
+        """The session is over here: remove its own worktree if nothing unique is in it, and tell the hub. One that
+        holds uncommitted work, or commits on no branch, stays where it is and is looked at again later."""
+        w = self.worktrees.get(sid)
+        if w is None:
+            return
+        try:
+            outcome = session_worktrees.remove_if_safe(w["checkout"], w["path"])
+        except Exception:
+            log.exception("session %s: could not look at its worktree", sid)
+            outcome = "kept"
+        if outcome == "kept":
+            log.info("session %s: its worktree %s is kept (uncommitted work, or commits on no branch)", sid, w["path"])
+            return
+        del self.worktrees[sid]
+        self._save_worktrees()
+        self._add(sid, {"kind": "worktree_removed"})
 
     def _admit(self, s) -> bool:
         """May this session's process start now? Not while `max_live` processes are up: then the longest-idle one is
@@ -438,8 +538,9 @@ class SessionRunner:
                 self.last_busy[sid] = now
             if s.ended and s.child is None:
                 self.host.forget(sid)
-                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent):
+                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree):
                     d.pop(sid, None)
+                self._drop_worktree(sid)        # a child's own worktree, now that its process is gone
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:
                 self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))

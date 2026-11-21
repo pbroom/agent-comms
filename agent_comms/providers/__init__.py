@@ -105,6 +105,15 @@ class ProviderSession(Protocol):
         until this is False again, for at most the turn timeout. Optional."""
         ...
 
+    def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
+        """What the host decided for this session from an access word and this machine's settings
+        (session_access.prepare): `access` "full" (this machine allows the session full access), or another word
+        for an adapter that must set the sandbox itself whatever the runner says, and `effort`, one of
+        session_access.EFFORTS, in the CLI's own terms. Called when the session is opened, before any `argv`, and
+        only when there is something to say. Optional: a session that needs it is refused for an adapter without
+        it."""
+        ...
+
 
 # A model name is one argv element the hub chose. It may never read as an option or carry anything but a name.
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}")

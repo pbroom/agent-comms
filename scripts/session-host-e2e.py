@@ -10,6 +10,7 @@ real board database, board.local.toml, agents.toml, the real token files or ~/Li
     python scripts/session-host-e2e.py --claude-bin "$(command -v claude)"    # the real CLI, with --model haiku
     python scripts/session-host-e2e.py --codex-bin "$(command -v codex)" --only codex     # the real Codex CLI
     python scripts/session-host-e2e.py --gateway               # the node reaches the hub through `board gateway`
+    python scripts/session-host-e2e.py --only tree             # parent and child sessions only (below)
 
 A hosted Codex session comes first (`--only claude` skips it, `--only codex` runs nothing else):
 C1. `board session start <project> <message> --agent <the Codex agent> --wait`: the node starts `codex app-server`,
@@ -58,6 +59,31 @@ registered, each board call's arguments and whether its result held the post) an
 session was shown the post (hosted_wake.handed; a delivery receipt too when the read was unfiltered) and that
 `hosted.holds` is true for it
 once the wake's grace has passed.
+
+Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
+skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
+the same temp directory with `[dispatch.sessions.spawn] enabled = true` on the hub, and on the node a worktree
+directory inside the temp directory, `allow_full_access = true`, a Claude runner that may edit files in its run
+directory (`dontAsk` with Write and Edit allowed there, no Bash) and a second Claude agent whose runner bypasses
+permission checks. The temp checkout becomes a Git repository with one commit.
+T1. A Claude parent: `board session start <project> <message> --wait`; its node reports its access (`workspace`).
+T2. `start --parent <id> --access read-only`: the child is asked to write a file with the Write tool and cannot.
+T3. `start --parent <id> --isolation worktree`: the child writes a file; it is in the child's own worktree (made
+    from the checkout's HEAD) and not in the parent's checkout.
+T4. `start --parent <id> --agent <the Codex agent> --effort low`: a Codex child under the Claude parent, in the
+    parent's checkout, with the sandbox its runner has. Its `thread/start` names no `cwd` (Codex would record a
+    named directory as trusted); Codex reports the checkout as the thread's working directory all the same.
+T4b. The same with `--isolation worktree`: no `cwd` either, and the thread works in the child's own worktree,
+    because that is where its process was started.
+T5. `board session list` shows the four under their parent; `show` of the parent lists them.
+T6. `close` of the parent ends all four; no process is left; the worktree that holds a file stays, and `show` says
+    where it is; the Codex child's worktree, which holds nothing of its own, is removed.
+T7. Full access: a root of the bypass runner is `full`. Two children are asked to run `touch <file>` with the Bash
+    tool: one of the ordinary Claude agent at `--access workspace` (its `dontAsk` runner: refused) and one at the
+    root's own access (`full`: the file is made). Closing the root ends both.
+With --claude-bin the Claude sessions are real (`--model haiku`, six small turns), with --codex-bin the Codex
+children are (two small turns, under the workspace-write sandbox), and the user's `~/.codex/config.toml` is checked
+to be unchanged afterwards (mtime and SHA-256), as after the Codex scenario.
 """
 from __future__ import annotations
 
@@ -84,6 +110,7 @@ NODE = "e2enode"
 AGENT = "claude"
 POSTER = "codex"                # the second agent identity: it posts the requests that wake the hosted session
 CODEX_AGENT = "codex-host"      # the agent whose hosted session is a Codex one (its own runner on the node)
+FULL_AGENT = "claude-full"      # the tree scenario's second Claude agent: its runner bypasses permission checks
 WAKE_INTERVAL = 6               # the hub's [dispatch.sessions] wake_min_interval_seconds for this run
 MARKER = "E2E-BODY-MARKER-4c1e9a"
 BODY_WORDS = ("zebra", "quartz", "lantern")
@@ -282,6 +309,8 @@ codex = true
             real.parent.mkdir(exist_ok=True)
             real.write_text(f"#!{sys.executable}\n" + (ROOT / "tests" / "stand_in_codex.py").read_text())
             real.chmod(0o700)
+        if getattr(self, "codex_template", None):
+            return self.codex_template          # the tree scenario's node settings name the same runner again
         self.codex_stdin_log = self.tmp / "logs" / "codex-stdin.log"
         exe = self.tmp / "bin" / "codex"               # the adapter goes by the executable's name
         exe.parent.mkdir(exist_ok=True)
@@ -296,7 +325,8 @@ codex = true
                        "-c", 'model_reasoning_effort="low"']
         else:
             runner += ["-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="approve"']
-        return runner + ["{prompt}"]
+        self.codex_template = runner + ["{prompt}"]
+        return self.codex_template
 
     def codex_quiet(self) -> list[str]:
         """`-c` overrides that disable every MCP server the user's Codex configuration names, for the processes this
@@ -363,12 +393,12 @@ codex = true
             target = free_port()
             self.spawn("gateway", self.hub_home, "gateway", "--port", str(target))
             self.wait_for("the gateway to listen", lambda: listening(target))
-        self.node_port, self.node_runs = target, 1
+        self.node_port, self.node_runs = target, self.log_text("node").count("connected to") + 1
         self.spawn("node", self.node_home, "node", "--hub", f"http://127.0.0.1:{target}", "--name", NODE,
                    AGENT_COMMS_TOKEN=self.node_token)
-        self.wait_for("the node to connect", lambda: "connected to" in self.log_text("node"))
+        self.wait_for("the node to connect", lambda: self.log_text("node").count("connected to") >= self.node_runs)
         print(f"hub on 127.0.0.1:{self.port}" + (f", gateway on 127.0.0.1:{target}" if self.args.gateway else "")
-              + f"; {self.log_text('node').strip().splitlines()[0]}")
+              + f"; {[x for x in self.log_text('node').splitlines() if 'connected to' in x][-1].strip()}")
 
     # ------------------------------------------------------------ the CLI
 
@@ -418,6 +448,17 @@ codex = true
             return path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
             return None
+
+    def check_codex_config(self, before: tuple[int, str] | None) -> None:
+        """The user's Codex config.toml is what it was when `before` was taken."""
+        after = self.codex_config()
+        print("  ~/.codex/config.toml: " + ("none" if after is None else
+                                          f"mtime {after[0]} ns, sha256 {after[1][:16]}...")
+              + (" (as before the run)" if after == before else
+                 f"; BEFORE the run: {before and (before[0], before[1][:16])}"))
+        self.check(after == before,
+                   "the user's Codex config.toml is byte for byte and to the nanosecond what it was before the "
+                   "run: Codex recorded no trust for the fresh checkout")
 
     def fresh_git_checkout(self) -> None:
         """Make the temp checkout a git repository: one no Codex has seen, so nothing has marked it trusted."""
@@ -890,6 +931,264 @@ codex = true
         print(f"  reply: {view['reply']!r}")
         return tid
 
+    # ------------------------------------------------------------ parent and child sessions
+
+    def git(self, *argv: str) -> str:
+        r = subprocess.run(["git", "-C", str(self.project), "-c", "user.name=e2e", "-c", "user.email=e2e@example.invalid",
+                            "-c", "commit.gpgsign=false", *argv], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise SystemExit(f"`git {' '.join(argv)}` failed in the temp checkout:\n{r.stderr[-800:]}")
+        return r.stdout.strip()
+
+    def enable_tree(self) -> None:
+        """The settings of the tree scenario, written while nothing runs: child sessions on (hub); a worktree
+        directory in the temp directory, full access allowed, and the runners described in the module text (node)."""
+        agents = self.hub_home / "agents.toml"
+        create_agent(agents, FULL_AGENT, "claude-code")
+        hub = (self.hub_home / "board.toml").read_text()
+        hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT])}", f"agents = {toml_list([AGENT, CODEX_AGENT, FULL_AGENT])}")
+        (self.hub_home / "board.toml").write_text(hub + "\n[dispatch.sessions.spawn]\nenabled = true\n")
+        exe = str(self.tmp / "bin" / "claude")
+        quiet = ["--setting-sources=", "--strict-mcp-config"] if self.real else []
+        worker = [exe, "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=Write(./**),Edit(./**)", *quiet]
+        bypass = [exe, "-p", "{prompt}", "--permission-mode", "bypassPermissions", *quiet]
+        self.worktrees = self.tmp / "worktrees"
+        (self.node_home / "board.toml").write_text(f"""[conversations]
+enabled = false
+
+[dispatch]
+kill_grace_seconds = 5
+worktree_dir = {json.dumps(str(self.worktrees))}
+
+[dispatch.runners]
+{AGENT} = {toml_list(worker)}
+{FULL_AGENT} = {toml_list(bypass)}
+{CODEX_AGENT} = {toml_list(self.codex_runner())}
+
+[dispatch.worktrees]
+{json.dumps(str(self.project))} = {json.dumps(str(self.project))}
+
+[dispatch.sessions]
+enabled = true
+codex = true
+allow_full_access = true
+max_live = 5
+""")
+        if not (self.project / ".git").exists():
+            self.git("init", "-q")
+        if subprocess.run(["git", "-C", str(self.project), "rev-parse", "-q", "--verify", "HEAD"],
+                          capture_output=True, timeout=60).returncode != 0:     # no commit yet: a worktree needs one
+            (self.project / "README").write_text("the e2e checkout\n")
+            self.git("add", "README")
+            self.git("commit", "-q", "-m", "init")
+
+    def wait_ended(self, sid: str, seconds: float = 20.0) -> dict:
+        deadline = time.monotonic() + seconds
+        while self.show(sid)["state"] != "ended" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        return self.show(sid)
+
+    def spawn_child(self, parent: str, text: str, *options: str) -> tuple[dict, dict, float]:
+        """`board session start --parent ... --wait --json`: the child, its first message, and the wall time."""
+        out, _, took = self.board("session", "start", "--parent", parent, *options, text, "--wait", "--json")
+        data = json.loads(out)
+        view = self.show(data["session"]["session_id"])     # also notes its pid, for the leftover check
+        print(f"  {view['name']} {view['session_id']}: {view['agent']}, access {view['access']}, {view['isolation']}; "
+              f"wall {took:.2f}s; queued -> written "
+              f"{data['message']['delivered_at'] - data['message']['created_at']:.2f}s; turn "
+              f"{data['message']['ended_at'] - data['message']['delivered_at']:.2f}s; reply: {data['reply']!r}")
+        return view, data, took
+
+    def permission_mode(self, sid: str) -> str | None:
+        """The permission mode the real Claude process of this session reported in its `init` event."""
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "system" and ev.get("subtype") == "init" and ev.get("permissionMode"):
+                    return ev["permissionMode"]
+        return None
+
+    def tree_scenario(self) -> None:
+        model = ["--model", "haiku"]
+        if self.real:
+            first = "Reply with exactly the word: ready"
+            refuse = "If the tool is refused or not available, do not try any other way."
+            write_ro = (f"Use the Write tool to create a file named ro-proof.txt in the current directory, containing "
+                        f"the word ok. {refuse} Then reply with exactly one word: written or refused.")
+            write_wt = ("Use the Write tool to create a file named wt-proof.txt in the current working directory, "
+                        "containing the word ok. Then reply with exactly one word: written or refused.")
+
+            def touch(name: str) -> str:
+                return (f"Run exactly this shell command with the Bash tool, once: touch {name}\n{refuse} Then reply "
+                        "with exactly one word: done or refused.")
+        else:
+            first, write_ro, write_wt = "ready", "write ro-proof.txt", "write wt-proof.txt"
+
+            def touch(name: str) -> str:
+                return f"touch {name}"
+        pong = "Reply with exactly the word: pong" if self.real_codex else "pong"
+
+        print("\n[T0] the hub and the node run again, now with [dispatch.sessions.spawn] enabled = true")
+        left = [s for s in json.loads(self.board("session", "list", "--json")[0])["sessions"]]
+        for s in left:
+            self.board("session", "close", s["session_id"])
+            self.check(self.wait_ended(s["session_id"])["state"] == "ended",
+                       f"the session an earlier scenario left open ({s['session_id']}) is closed first")
+        out, err, _ = self.board("session", "start", "--parent", "9e8d7c6b-5a49-4382-a1b0-c9d8e7f6a5b4", "x", ok=False)
+        self.check("no such hosted session" in err, "a child needs a parent that exists")
+
+        print("\n[T1] a Claude parent")
+        out, _, took = self.board("session", "start", str(self.project), first, "--agent", AGENT, *model, "--wait", "--json")
+        data = json.loads(out)
+        sid = data["session"]["session_id"]
+        parent = self.show(sid)
+        print(f"  session {sid}; wall {took:.2f}s; reply: {data['reply']!r}; access {parent.get('access')}")
+        self.check(data["message"]["state"] == "done" and parent.get("access") == "workspace",
+                   "the parent's turn ended, and its node reported its access: workspace (the runner as configured)")
+        out, err, _ = self.board("session", "start", "--parent", sid, "--access", "full", "x", ok=False)
+        self.check("above the parent's (workspace)" in err, "a child above its parent's access is refused")
+
+        print("\n[T2] board session start --parent <id> --access read-only   (asked to write a file)")
+        ro, data, _ = self.spawn_child(sid, write_ro, "--access", "read-only", "--role", "review", "--title",
+                                       "Try to write", *model)
+        self.check(data["message"]["state"] == "done" and ro["parent"] == sid and ro["name"] == "review-1",
+                   "the read-only child took its turn under the parent, as review-1")
+        self.check(not list(self.tmp.rglob("ro-proof.txt")), "it could not write: no ro-proof.txt anywhere in the temp "
+                                                              "directory")
+        if not self.real:
+            self.check(data["reply"] == "turn 1: NO SUCH TOOL: WRITE", "Write is not among its tools")
+        else:
+            print(f"  its process reported permission mode {self.permission_mode(ro['session_id'])!r}")
+            self.check(self.permission_mode(ro["session_id"]) == "dontAsk", "... in dontAsk mode")
+
+        print("\n[T3] board session start --parent <id> --isolation worktree   (asked to write a file)")
+        (self.project / "uncommitted.txt").write_text("the parent's work in progress\n")
+        wt, data, _ = self.spawn_child(sid, write_wt, "--isolation", "worktree", "--role", "implementation", *model)
+        path = Path(wt["worktree"] or "/nonexistent")
+        print(f"  worktree: {path}")
+        self.check(data["message"]["state"] == "done" and wt["isolation"] == "worktree" and path.is_dir()
+                   and str(path).startswith(str(self.worktrees) + os.sep),
+                   "the child has its own worktree, under the node's worktree directory")
+        self.check((path / "wt-proof.txt").is_file() and not (self.project / "wt-proof.txt").exists(),
+                   "the file it wrote is in its worktree and not in the parent's checkout")
+        self.check((path / "README").is_file() and not (path / "uncommitted.txt").exists()
+                   and self.git("rev-parse", "HEAD") in subprocess.run(
+                       ["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True).stdout,
+                   "the worktree was made from the checkout's HEAD: the parent's uncommitted file is not in it")
+
+        print(f"\n[T4] board session start --parent <id> --agent {CODEX_AGENT} --effort low   (a Codex child)")
+        before = len(self.codex_stdin())
+        cdx, data, _ = self.spawn_child(sid, pong, "--agent", CODEX_AGENT, "--model", self.args.codex_model,
+                                        "--effort", "low", "--role", "research")
+        wrote = self.codex_stdin()[before:]
+        start = next(m["params"] for m in wrote if m.get("method") == "thread/start")
+        turn = next(m["params"] for m in wrote if m.get("method") == "turn/start")
+        print(f"  thread/start: {json.dumps(start)}; turn/start effort: {turn.get('effort')!r}")
+        self.check(data["message"]["state"] == "done" and bool(data["reply"].strip()) and cdx["agent"] == CODEX_AGENT
+                   and cdx["parent"] == sid, "the Codex child took its turn under the Claude parent")
+        self.check(start == {"sandbox": self.codex_sandbox, "approvalPolicy": "never", "model": self.args.codex_model}
+                   and turn.get("effort") == "low",
+                   "its thread was started with the runner's sandbox, approvals off and the model, and nothing else "
+                   "(no cwd); the turn carries effort low")
+        where = self.codex_thread_cwd(cdx["session_id"], cdx["provider_id"])
+        print(f"  Codex reports the thread's working directory as {where}")
+        self.check(where is not None and os.path.realpath(where) == str(self.project),
+                   "the thread works in the parent's checkout, which is where its process was started")
+
+        print(f"\n[T4b] board session start --parent <id> --agent {CODEX_AGENT} --isolation worktree   (a Codex "
+              "child in its own worktree)")
+        before = len(self.codex_stdin())
+        cwt, data, _ = self.spawn_child(sid, pong, "--agent", CODEX_AGENT, "--model", self.args.codex_model,
+                                        "--isolation", "worktree", "--role", "test")
+        wrote = self.codex_stdin()[before:]
+        start = next(m["params"] for m in wrote if m.get("method") == "thread/start")
+        codex_path = Path(cwt["worktree"] or "/nonexistent")
+        where = self.codex_thread_cwd(cwt["session_id"], cwt["provider_id"])
+        print(f"  thread/start: {json.dumps(start)}")
+        print(f"  worktree: {codex_path}; Codex reports the thread's working directory as {where}")
+        self.check(data["message"]["state"] == "done" and "cwd" not in start
+                   and start == {"sandbox": self.codex_sandbox, "approvalPolicy": "never", "model": self.args.codex_model},
+                   "its thread/start names no cwd either")
+        self.check(codex_path.is_dir() and str(codex_path).startswith(str(self.worktrees) + os.sep)
+                   and codex_path != path and where is not None and os.path.realpath(where) == str(codex_path),
+                   "the thread works in the child's own worktree: its process was started there")
+
+        print("\n[T5] board session list / show")
+        listed, _, _ = self.board("session", "list")
+        print("\n".join("  | " + line for line in listed.splitlines()))
+        lines = listed.splitlines()
+        at = next(i for i, line in enumerate(lines) if line.startswith(sid))
+        under = lines[at + 1:at + 5]
+        self.check(len(under) == 4 and all(line.startswith("    ") for line in under)
+                   and [line.split()[0] for line in under] == ["review-1", "implementation-1", "research-1", "test-1"],
+                   "the four children are indented under their parent, in the order they were started")
+        self.check("access read-only, shared" in under[0] and "access workspace, worktree" in under[1]
+                   and f"] {CODEX_AGENT}," in under[2] and "effort low" in under[2],
+                   "each line names the child's agent, access and isolation")
+        shown, _, _ = self.board("session", "show", sid)
+        self.check("  children:" in shown and all(c["session_id"] in shown for c in (ro, wt, cdx, cwt)),
+                   "`show` of the parent lists its children")
+
+        print("\n[T6] closing the parent ends its children")
+        pids = {c["name"]: self.show(c["session_id"])["pid"] for c in (ro, wt, cdx, cwt)}
+        pids |= {"parent": self.show(sid)["pid"]}
+        t0 = time.monotonic()
+        out, _, _ = self.board("session", "close", sid)
+        print(f"  {out.strip()}")
+        ended = [self.wait_ended(x) for x in (sid, ro["session_id"], wt["session_id"], cdx["session_id"],
+                                              cwt["session_id"])]
+        self.check([v["state"] for v in ended] == ["ended"] * 5,
+                   f"the parent and all four children ended ({time.monotonic() - t0:.1f}s after the close)")
+        self.check(all("its parent session ended" in (v["error"] or "") for v in ended[1:]),
+                   "each child says why: its parent session ended")
+        self.check(all(gone(pid) for pid in pids.values() if pid), f"their processes are gone ({pids})")
+        shown, _, _ = self.board("session", "show", wt["session_id"])
+        line = next(x for x in shown.splitlines() if x.strip().startswith("worktree:"))
+        print(f"  {line.strip()}")
+        self.check(path.is_dir() and (path / "wt-proof.txt").is_file() and str(path) in line and "it stays there" in line,
+                   "the worktree holds an uncommitted file, so it stays, and `show` says where it is")
+        deadline = time.monotonic() + 15
+        while codex_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        removed = self.show(cwt["session_id"])
+        self.check(not codex_path.exists() and removed.get("worktree_removed_at") is not None,
+                   "the Codex child's worktree held nothing of its own, so its node removed it and told the hub")
+
+        print("\n[T7] full access: a root whose runner bypasses permission checks, and two children asked to `touch`")
+        out, _, took = self.board("session", "start", str(self.project), first, "--agent", FULL_AGENT, *model,
+                                  "--wait", "--json")
+        data = json.loads(out)
+        full_root = data["session"]["session_id"]
+        view = self.show(full_root)
+        print(f"  session {full_root}; wall {took:.2f}s; reply: {data['reply']!r}; access {view.get('access')}")
+        self.check(view.get("access") == "full", "its node reported its access: full (it allows it: allow_full_access)")
+        ws, data, _ = self.spawn_child(full_root, touch("touch-workspace.txt"), "--agent", AGENT, "--access", "workspace",
+                                       "--role", "test", *model)
+        self.check(data["message"]["state"] == "done" and not list(self.tmp.rglob("touch-workspace.txt")),
+                   "the workspace child (a dontAsk runner) did not run the command: no touch-workspace.txt")
+        print(f"  tools denied in its turn: {data['message']['denials']}")
+        self.check("Bash" in data["message"]["denials"], "... and its turn lists Bash as denied")
+        fc, data, _ = self.spawn_child(full_root, touch("touch-full.txt"), "--role", "test", *model)
+        self.check(fc["access"] == "full" and fc["agent"] == FULL_AGENT, "the other child has its parent's access: full")
+        self.check(data["message"]["state"] == "done" and (self.project / "touch-full.txt").is_file()
+                   and data["message"]["denials"] == [],
+                   "the full child ran the same kind of command: touch-full.txt is in the checkout, nothing denied")
+        if self.real:
+            modes = {x["name"]: self.permission_mode(x["session_id"]) for x in (ws, fc)}
+            print(f"  permission modes the processes reported: {modes}")
+            self.check(modes == {"test-1": "dontAsk", "test-2": "bypassPermissions"},
+                       "the workspace child ran in dontAsk, the full child in bypassPermissions")
+        pids = [self.show(x)["pid"] for x in (full_root, ws["session_id"], fc["session_id"])]
+        self.board("session", "close", full_root)
+        ended = [self.wait_ended(x) for x in (full_root, ws["session_id"], fc["session_id"])]
+        self.check([v["state"] for v in ended] == ["ended"] * 3 and all(gone(pid) for pid in pids if pid),
+                   "closing the root ended both children; their processes are gone")
+        listed, _, _ = self.board("session", "list")
+        self.check(listed.strip() == "(no hosted sessions)", "no hosted session is left")
+
     # ------------------------------------------------------------ teardown
 
     def stop(self) -> None:
@@ -931,7 +1230,8 @@ def main() -> int:
     ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
                     help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
                          "one codex-cli 0.171.0 lists)")
-    ap.add_argument("--only", choices=("claude", "codex"), help="run only that agent's scenario (default: both)")
+    ap.add_argument("--only", choices=("claude", "codex", "tree"),
+                    help="run only that scenario: one agent's, or parent and child sessions (default: all)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
     ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
@@ -952,47 +1252,52 @@ def main() -> int:
         args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
         if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
             ap.error("--codex-bin must be an executable named codex")
-    if args.with_board and args.only == "codex":
+    if args.with_board and args.only in ("codex", "tree"):
         ap.error("--with-board is a Claude scenario")
-    codex, claude = args.only != "claude" and not args.with_board, args.only != "codex"
+    codex, claude = args.only in (None, "codex") and not args.with_board, args.only in (None, "claude")
+    tree = args.only in (None, "tree") and not args.with_board
     run = Run(args)
-    if claude:
+    if claude or tree:
         print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
                            else "stand-in (tests/stand_in_claude.py), no model")
               + (", with the temp board's MCP tools" if args.with_board else ""))
-    if codex:
+    if codex or tree:
         print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
     try:
-        if codex and run.real_codex:
+        config_before = None
+        if (codex or tree) and run.real_codex:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
-        run.start_services()
-        if codex:
-            run.codex_scenario()
-        if args.with_board:
-            run.board_scenario()
-        elif claude:
-            run.scenario()
-        print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
-              else "\n[8] stopping the node (SIGTERM) and the hub" if claude
-              else "\n[C6] stopping the node (SIGTERM) and the hub")
-        run.stop()
-        if claude:
-            run.check(not alive(run.open_pid),
-                      f"the open session's process (pid {run.open_pid}) was stopped with the node")
-        run.check(run.leftovers() == [], "no session process is left behind")
-        if codex and run.real_codex:
-            config_after = run.codex_config()
-            print("  ~/.codex/config.toml: " + ("none" if config_after is None else
-                                              f"mtime {config_after[0]} ns, sha256 {config_after[1][:16]}...")
-                  + (" (as before the run)" if config_after == config_before else
-                     f"; BEFORE the run: {config_before and (config_before[0], config_before[1][:16])}"))
-            run.check(config_after == config_before,
-                      "the user's Codex config.toml is byte for byte and to the nanosecond what it was before the "
-                      "run: Codex recorded no trust for the fresh checkout")
+        if codex or claude or args.with_board:
+            run.start_services()
+            if codex:
+                run.codex_scenario()
+            if args.with_board:
+                run.board_scenario()
+            elif claude:
+                run.scenario()
+            print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
+                  else "\n[8] stopping the node (SIGTERM) and the hub" if claude
+                  else "\n[C6] stopping the node (SIGTERM) and the hub")
+            run.stop()
+            if claude:
+                run.check(not alive(run.open_pid),
+                          f"the open session's process (pid {run.open_pid}) was stopped with the node")
+            run.check(run.leftovers() == [], "no session process is left behind")
+            if codex and run.real_codex:
+                run.check_codex_config(config_before)
+        if tree:
+            run.enable_tree()
+            run.start_services()
+            run.tree_scenario()
+            print("\n[T8] stopping the node (SIGTERM) and the hub")
+            run.stop()
+            run.check(run.leftovers() == [], "no session process is left behind")
+            if run.real_codex:
+                run.check_codex_config(config_before)
         print("\nPASS")
         return 0
     except SystemExit as e:

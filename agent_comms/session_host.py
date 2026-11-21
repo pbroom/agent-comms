@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import providers, runner_preflight
+from . import providers, runner_preflight, session_access
 from .dispatch import (DispatchConfig, _signal_group, child_env, probe_process, process_start, render_argv,
                        spawn_piped, stop_verified, with_writable_roots)
 from .providers import Event, ProviderSession, validate_model, validate_session_id
@@ -132,6 +132,8 @@ class Session:
     transcript_fd: int | None = None
     tee_failed: bool = False
     stderr_from: int = 0            # size of the stderr log when this process started: what it wrote comes after
+    access: str | None = None       # the access it really has (session_access.prepare): read-only | workspace | full
+    effort: str | None = None
 
     @property
     def dormant(self) -> bool:
@@ -305,12 +307,17 @@ class SessionHost:
     # ------------------------------------------------------------ the caller's side
 
     def open(self, session_id: str, *, agent: str, project: str, runtime: str | None = None, model: str | None = None,
-             resume: bool = False, thread_id: int = 0) -> Session:
+             resume: bool = False, thread_id: int = 0, access: str | None = None, effort: str | None = None,
+             cwd: str | None = None) -> Session:
         """Register a session. Nothing starts until it has a message. `resume`: the provider already has this session
-        (an earlier host ran it). Raises when this machine cannot host it: no runner, no adapter for the runner's
-        CLI, no run directory, a runner or model that cannot be used."""
+        (an earlier host ran it). `access`: the access word it is to run at (session_access; None: as its runner has
+        it), `effort`: one of session_access.EFFORTS, `cwd`: its run directory when that is not the project's
+        checkout (a child session's own worktree). Raises when this machine cannot host it: no runner, no adapter
+        for the runner's CLI, no run directory, a runner or model that cannot be used, an access level this machine
+        does not grant."""
         validate_session_id(session_id)
         validate_model(model)
+        session_access.effort(effort)
         if session_id in self.sessions:
             raise ValueError("session is already open on this host")
         template = self.config.runner_for(agent, runtime)
@@ -319,17 +326,32 @@ class SessionHost:
         factory = self.provider_for(template)
         if factory is None:
             raise LookupError(f"the runner for {agent} cannot be hosted as a session")
-        cwd = self.config.checkout_for(project)
-        if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        checkout = self.config.checkout_for(project)
+        if not checkout or not os.path.isabs(checkout) or not os.path.isdir(checkout):
             raise FileNotFoundError(f"this machine has no run directory for project {project!r}")
-        if runner_preflight.scoped(template, project, self.config.claude_tool_projects):
+        if cwd is None:
+            cwd = checkout
+        elif not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+            raise FileNotFoundError("the session's own run directory does not exist")
+        # The access word becomes flags here, from this machine's runner and settings (nothing executable came from
+        # the hub). Without a word, and without allow_full_access, the template is untouched.
+        prep = session_access.prepare(template, access, allow_full=self.config.sessions.allow_full_access, cwd=cwd)
+        template = prep.template
+        if (prep.as_configured and prep.configure != "full"
+                and runner_preflight.scoped(template, project, self.config.claude_tool_projects)):
             template = runner_preflight.with_denied_tool_instruction(runner_preflight.scoped_template(template))
-        template = with_writable_roots(template, self.config.extra_roots(template, project))
+        if prep.as_configured or prep.granted != "read-only":      # a session narrowed to read-only gets no extra roots
+            template = with_writable_roots(template, self.config.extra_roots(template, project))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
-                    thread_id=int(thread_id), resume=bool(resume))
+                    thread_id=int(thread_id), resume=bool(resume), access=prep.granted, effort=effort)
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
-            runs_in(cwd)
+            runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
+        if prep.configure is not None or effort is not None:
+            configure = getattr(s.provider, "configure", None)
+            if configure is None:
+                raise ValueError(f"the runner for {agent} takes no access level or effort as a hosted session")
+            configure(access=prep.configure, effort=effort)
         adopt = getattr(s.provider, "adopt", None)
         if adopt is not None:
             # This machine's own record, never an id from the hub. It is written before the first turn goes to the

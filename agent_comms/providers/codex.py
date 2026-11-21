@@ -38,6 +38,9 @@ THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-f
 NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 FEATURE_RE = re.compile(r"[A-Za-z0-9_]{1,80}")
 SANDBOXES = ("read-only", "workspace-write")
+# An access word the host decided for the session (session_access.prepare) as the thread's sandbox. `full` is only
+# ever configured on a machine that allows it ([dispatch.sessions] allow_full_access).
+ACCESS_SANDBOX = {"read-only": "read-only", "workspace": "workspace-write", "full": "danger-full-access"}
 DEFAULT_SANDBOX = "read-only"       # `codex exec` without --sandbox
 MAX_DENIALS = 50
 CLIENT = {"name": "agent-comms", "version": "0.1.0"}
@@ -48,7 +51,8 @@ OPT_OUT = ("item/agentMessage/delta", "item/plan/delta", "item/reasoning/summary
            "command/exec/outputDelta", "process/outputDelta")
 
 BYPASS_REFUSED = ("a Codex runner that turns the sandbox or approvals off (--dangerously-bypass-approvals-and-sandbox, "
-                  "--approve-for-me, or the danger-full-access sandbox) cannot be hosted as a session")
+                  "--approve-for-me, or the danger-full-access sandbox) cannot be hosted as a session unless this "
+                  "node's settings say [dispatch.sessions] allow_full_access = true")
 BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
                           "--approve-for-me", "--yolo"))
 # What a `codex exec` runner may carry. With a value: kept for app-server (`-c`, `--enable`, `--disable`), turned into
@@ -184,6 +188,8 @@ class CodexSession:
         self._gone = False                      # the thread this process was told to resume cannot be resumed
         self._pending: dict[int, str] = {}      # request id -> its method, until answered
         self._start_id: int | None = None       # the id of the turn/start request of the turn in flight
+        self._access: str | None = None         # the access word whose sandbox the host decided on (`configure`)
+        self._effort: str | None = None
         self._reset()
 
     def _reset(self) -> None:
@@ -211,9 +217,19 @@ class CodexSession:
     def runs_in(self, cwd: str) -> None:
         self._cwd = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
 
+    def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
+        """What the host decided for this session (session_access.prepare), before any `argv`. `access`: the
+        thread's sandbox whatever the runner says (ACCESS_SANDBOX); approvals stay off either way. `effort`: sent
+        with every `turn/start`."""
+        if access is not None and access not in ACCESS_SANDBOX:
+            raise ValueError("unknown access for a Codex session")
+        self._access, self._effort = access, effort
+
     def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
         self.session_id = validate_session_id(session_id)
         argv, self._params = session_command(template, model, self._cwd)
+        if self._access is not None:
+            self._params["sandbox"] = ACCESS_SANDBOX[self._access]
         self._resume, self._gone = bool(resume), False
         self._reset()
         return argv
@@ -225,7 +241,10 @@ class CodexSession:
     def turn(self, text: str) -> list[bytes]:
         self._end_turn()
         self._turn_open = True
-        data = self._request("turn/start", {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]})
+        params = {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]}
+        if self._effort is not None:
+            params["effort"] = self._effort     # "for this turn and subsequent turns": sent each time (a resume too)
+        data = self._request("turn/start", params)
         self._start_id = self._next_id
         return [data]
 

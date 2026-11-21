@@ -33,13 +33,15 @@ RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_us
 
 
 BYPASS_REFUSED = ("a Claude runner that bypasses permission checks (--dangerously-skip-permissions or --permission-mode "
-                  "bypassPermissions) cannot be hosted as a session")
+                  "bypassPermissions) cannot be hosted as a session unless this node's settings say [dispatch.sessions] "
+                  "allow_full_access = true")
 
 
 def bypasses_permissions(template: list[str]) -> bool:
     """The runner turns Claude's permission checks off, or lets a session turn them off: a hosted session takes
-    turns from messages for as long as it lives, so it is never started that way. Every other permission mode is the
-    machine owner's choice, as for a dispatched run."""
+    turns from messages for as long as it lives, so it is started that way only on a machine that allows sessions
+    full access (`configure`; session_access.py). Every other permission mode is the machine owner's choice, as for
+    a dispatched run."""
     for i, arg in enumerate(template):
         flag, eq, value = arg.partition("=")
         if flag in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
@@ -79,6 +81,14 @@ class ClaudeSession:
         self.session_id: str | None = None
         self._ready = False
         self._dead = False
+        self._full = False              # this machine allows the session full access (`configure`)
+        self._effort: str | None = None
+
+    def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
+        """What the host decided for this session (session_access.prepare), before any `argv`. `access` "full":
+        this machine allows it full access, so a template that bypasses permission checks is not refused.
+        `effort`: Claude Code's `--effort` for the session, replacing the runner's own."""
+        self._full, self._effort = access == "full", effort
 
     def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
         """The runner template (already scoped where the project asks for it) as a session command: without its
@@ -89,7 +99,7 @@ class ClaudeSession:
         model = validate_model(model)
         if not template or os.path.basename(template[0]) != "claude":
             raise ValueError("not a Claude runner")
-        if bypasses_permissions(template):
+        if bypasses_permissions(template) and not self._full:
             raise ValueError(BYPASS_REFUSED)
         out, i = [], 0
         while i < len(template):
@@ -100,7 +110,7 @@ class ClaudeSession:
                 raise ValueError("this Claude runner sets session or stream flags a hosted session sets itself")
             if arg == "{prompt}":
                 continue            # turns arrive on stdin
-            if flag == "--model" and model is not None:
+            if (flag == "--model" and model is not None) or (flag == "--effort" and self._effort is not None):
                 if "=" not in arg and i < len(template):
                     i += 1          # its value
                 continue
@@ -113,6 +123,8 @@ class ClaudeSession:
         out += NO_PROMPTS
         if model is not None:
             out += ["--model", model]
+        if self._effort is not None:
+            out += ["--effort", self._effort]
         return out + ["--resume" if resume else "--session-id", self.session_id]
 
     def adopt(self, provider_id: str | None) -> None:

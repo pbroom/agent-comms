@@ -408,8 +408,8 @@ uv run board session close <id>
 ```
 
 `start` takes `--agent NAME` (default: the one agent with a Claude runtime, if there is only one) and `--model M`;
-every command takes `--json`. One session per agent and project at a time. `board serve` must be running: the CLI
-talks to it on the local port.
+every command takes `--json`. One session per agent and project at a time (child sessions, below, do not count).
+`board serve` must be running: the CLI talks to it on the local port.
 
 What to know:
 
@@ -421,7 +421,8 @@ What to know:
   transcript stays on the node: `data/node-logs/sessions/<id>.jsonl` (mode 600).
 - **Permissions** are the runner's, as for a dispatched run, with nobody to ask: a tool that would prompt is denied
   and listed (`show` says which). A runner with `--dangerously-skip-permissions` or `--permission-mode
-  bypassPermissions` is never hosted. A project in `claude_tool_projects` gets the scoped tools, as a run does.
+  bypassPermissions` is not hosted unless the node says `allow_full_access = true` ("Parent and child sessions"
+  below). A project in `claude_tool_projects` gets the scoped tools, as a run does.
 - **A lost turn is not retried.** A turn that timed out (`[dispatch] timeout_minutes`), whose process died, or whose
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.
@@ -516,12 +517,81 @@ also one you send just after a wake was queued.
   does not wake the session; it does when the run is over (your own `board session send` is not held back). A run
   in its own parallel worktree does not count. With no hosted session, nothing about the dispatcher changes.
 
+#### Parent and child sessions
+
+A hosted session can have children: sessions you start under it, on the same node and in the same project, possibly
+for another agent and model, each with its own access level and its own or the parent's checkout. Off unless the
+HUB's board.local.toml says so (restart `board serve`); with it off nothing about hosted sessions changes:
+
+```toml
+[dispatch.sessions.spawn]
+enabled = true
+max_children = 5     # children of one session that have not ended, at most
+```
+
+```bash
+uv run board session start --parent <id> "Review the diff on this branch" --role review --access read-only --wait
+uv run board session start --parent <id> --agent codex --model gpt-6-luna --effort low "Count the TODOs" --wait
+uv run board session start --parent <id> --isolation worktree --title "Try the refactor" "Rename the module"
+uv run board session list            # children are indented under their parent: name, agent, model, access, isolation, state
+uv run board session show <id>       # a parent lists its children; a child says whose it is and where its worktree is
+```
+
+`start --parent <id>` takes `--agent A` (default: the parent's), `--model M`, `--effort low|medium|high|xhigh|max`,
+`--title T`, `--role implementation|research|review|design|test|general` (default general; the child's name is
+`<role>-<n>`), `--isolation shared|worktree`, `--access read-only|workspace|full` and `--request-id X` (the same id
+under the same parent returns the child it made the first time instead of making another). There is no project
+argument: a child runs in its parent's project. `send`, `show` and `close` take a child's id like any session's.
+
+- **Human only**, like everything here: no agent or node can start or message a child, and there is no MCP tool.
+- **Where it runs.** `shared` (the default): the parent's checkout, beside the parent, as T3 Code does. `worktree`:
+  a new git worktree made on the node from the HEAD of the parent's checkout (so the parent's uncommitted edits are
+  not in it), under `[dispatch] worktree_dir` (default `~/agent-comms-worktrees`), named `session-<id>`. It is
+  removed once the session has ended and holds nothing unique (nothing uncommitted or untracked, and its HEAD on a
+  branch or remote ref); otherwise it stays and `show` says where it is.
+- **Access** is one word, and the node turns it into flags from its own runner for that agent. The hub sends
+  nothing executable.
+  - `read-only`: Claude in `dontAsk` mode with only reads inside its directory, local read-only git and the board's
+    tools allowed, and Edit, Write, NotebookEdit, the token directory and `~/.ssh` denied beside the runner's own
+    deny rules; Codex with the `read-only` sandbox.
+  - `workspace`: the runner as the node configured it (what a hosted session always got, `claude_tool_projects`
+    scoping included). A runner that is read-only as written stays read-only, and `list` says so.
+  - `full`: Claude with `--permission-mode bypassPermissions` (the runner's deny rules still hold); Codex with the
+    `danger-full-access` sandbox. Only on a node whose board.local.toml says:
+
+    ```toml
+    [dispatch.sessions]
+    allow_full_access = true
+    ```
+
+    Without it a request for `full` ends that session with the reason; it is never run narrower instead. The same
+    setting decides whether a runner that bypasses permission checks can be hosted at all: with it, such a session
+    is `full`; without it, it is refused as before.
+
+  A session you start without `--parent` has what its runner has (`show` prints it). A child's access defaults to
+  its parent's and may be narrower; above the parent's is refused. So a `full` child needs a `full` parent. A Claude
+  runner that bypasses permission checks can be asked for at `full` or `read-only`, not `workspace`.
+- **Limits.** A child cannot have children. At most `max_children` children of one session that have not ended.
+  The node's `max_live` counts children too: set it to at least 1 + the children you want live at once (a child
+  that cannot get a process waits, and an idle one is stopped to make room, as for any session). "One session per
+  agent and project" is about the sessions you start without `--parent`; children do not count.
+- **Ending.** Closing a session, or its ending for any reason, closes its children. Closing a child leaves its
+  parent alone.
+- **The board.** A post never wakes a child: wakes go to sessions started without `--parent`. A child of the same
+  agent signs in to the board as that agent, and the board cannot yet tell its sign-in from its parent's, so while
+  such a child is around (or was, since the wake) a read of a request does not count as the parent having it: after
+  `wake_grace_seconds` the dispatcher handles that request as it would without a hosted session.
+- **With the dispatcher.** A child in the shared checkout counts like its parent: while its turn runs, a dispatched
+  run for that project waits. A child in its own worktree keeps nothing busy.
+
 `uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
 stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),
-the wake included. Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
+the wake included, and then parent and child sessions (`--only tree` runs just that: a read-only child that cannot
+write, a child in its own worktree, a Codex child under a Claude parent, the cascade, and a `full` child doing what
+a `workspace` one is refused). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
 board's MCP tools and nothing else: it checks that a woken session really calls `board_read_updates` (the hub's
-delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)"
-and "Session host (PR 3)".
+delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)",
+"Session host (PR 3)" and "Session host: parent and child sessions".
 
 ## ChatGPT / remote connectors
 
