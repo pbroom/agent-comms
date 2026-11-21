@@ -269,7 +269,12 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--agent", metavar="NAME", help="default: the one agent with a Claude runtime, if there is only "
                                                    "one; with --parent, the parent's agent")
     x.add_argument("--model", metavar="M", help="model for the session, e.g. haiku (default: the runner's own)")
-    x.add_argument("--parent", metavar="ID", help="start a CHILD session under this hosted session, on its node and "
+    def parent_id(value: str) -> str:
+        if not value.strip():
+            raise argparse.ArgumentTypeError("needs the id of the session to start under (board session list)")
+        return value.strip()
+
+    x.add_argument("--parent", metavar="ID", type=parent_id, help="start a CHILD session under this hosted session, on its node and "
                    "in its project (needs [dispatch.sessions.spawn] enabled = true on the hub; README \"Hosted "
                    "sessions\"). The options below apply to a child only")
     x.add_argument("--access", choices=("read-only", "workspace", "full"),

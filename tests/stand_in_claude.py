@@ -12,14 +12,18 @@ What a turn does is in its text:
 - `write NAME`: the turn tries to create the file NAME in its working directory with the Write tool.
 - `touch NAME`: the turn tries to run `touch NAME` with the Bash tool.
 - `try A B`: both, one after the other: Write A, then `touch B`.
+- `probe R A B`: the Read tool on the file R first, then as `try A B`.
   What comes of a tool call follows from what the process was started with, as it does for Claude Code (`grants`):
   the tool does not exist when `--tools` leaves it out or `--disallowedTools` names it (`NO SUCH TOOL: WRITE`, no
   denial listed); it runs in `bypassPermissions`, for Write also in `acceptEdits`, and when an allow rule names it,
-  on the command line OR in a settings file (`WROTE NAME`, `TOUCHED NAME`); otherwise it is refused and the result
-  lists the denial (`WRITE DENIED`, `BASH DENIED`). A second passes between the turn's start and its first tool
-  call, as a model takes.
+  on the command line OR in a settings file (`WROTE NAME`, `TOUCHED NAME`, `READ NAME`); otherwise it is refused and
+  the result lists the denial (`WRITE DENIED`, `BASH DENIED`, `READ DENIED`). A second passes between the turn's
+  start and its first tool call, as a model takes.
 Settings: the file (or JSON) given with `--settings` is loaded: its `permissions.allow` rules count like the command
-line's, and its `permissions.defaultMode` is the mode when no `--permission-mode` is given. A project's own
+line's, and its `permissions.defaultMode` is the mode when no `--permission-mode` is given (an explicit mode wins;
+`manual` is reported as `default`, as Claude Code reports it). Its `hooks` RUN, as shell commands with the hook's
+JSON on stdin, whatever tools the session has: `SessionStart` before the first turn, `PreToolUse` with a matcher
+that names the tool before each call of it. A process started without `--settings` has no hooks. A project's own
 `.claude/settings.json` is NOT loaded: Claude Code ignores an untrusted directory's in print mode, and nothing these
 tests run in is trusted. Every turn's `init` says the `permissionMode` in force and the `tools` the session has.
 The reply is otherwise `turn <k of this process>: <TEXT IN CAPITALS>`.
@@ -28,6 +32,7 @@ With STAND_IN_ARGV set (an env var name the runner passes on), each start append
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -53,25 +58,50 @@ BUILTINS = ("Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Task", "Wri
 MODEL_SECONDS = 1.0     # from a turn's start to its first tool call
 
 
-def grants(args) -> tuple[str, list[str], list[str]]:
-    """(the permission mode in force, the built-in tools the session has, the allow rules in force), from the
-    command line and the `--settings` file as Claude Code combines them."""
-    permissions = {}
+def settings(args) -> dict:
+    """The settings file the process was given with `--settings` (a path, or the JSON itself), or nothing."""
     for value in flag_values(args, "--settings")[:1]:
         try:
             loaded = json.loads(value if value.lstrip().startswith("{") else open(value).read())
-            permissions = loaded.get("permissions") if isinstance(loaded.get("permissions"), dict) else {}
-        except (OSError, ValueError, AttributeError):
+            return loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
             pass
+    return {}
+
+
+def grants(args) -> tuple[str, list[str], list[str]]:
+    """(the permission mode in force, the built-in tools the session has, the allow rules in force), from the
+    command line and the `--settings` file as Claude Code combines them."""
+    permissions = settings(args).get("permissions")
+    permissions = permissions if isinstance(permissions, dict) else {}
     modes = flag_values(args, "--permission-mode")
     mode = (modes[-1] if modes else "bypassPermissions" if "--dangerously-skip-permissions" in args
             else permissions.get("defaultMode") or "default")
+    mode = "default" if mode == "manual" else mode
     listed = flag_values(args, "--tools")
     gone = set(flag_values(args, "--disallowedTools", "--disallowed-tools")) | set(permissions.get("deny") or [])
     tools = [t for t in (listed or BUILTINS) if t in BUILTINS and t not in gone]
     allow = flag_values(args, "--allowedTools", "--allowed-tools") + [a for a in permissions.get("allow") or []
                                                                     if isinstance(a, str)]
     return mode, tools, allow
+
+
+def run_hooks(args, event: str, sid: str, tool: str | None = None) -> None:
+    """Run the command hooks the settings file has for this event (and, for a tool event, this tool), each with the
+    hook's JSON on its stdin. A hook is a command: it runs whether or not the session has any tool at all."""
+    hooks = settings(args).get("hooks")
+    for group in (hooks.get(event) or []) if isinstance(hooks, dict) else []:
+        if not isinstance(group, dict):
+            continue
+        matcher = group.get("matcher") or ""
+        if tool is not None and matcher not in ("", "*") and tool not in matcher.split("|"):
+            continue
+        for hook in group.get("hooks") or []:
+            if isinstance(hook, dict) and hook.get("type") == "command" and isinstance(hook.get("command"), str):
+                payload = {"session_id": sid, "hook_event_name": event, "cwd": os.getcwd()}
+                payload |= {"tool_name": tool} if tool is not None else {}
+                subprocess.run(hook["command"], shell=True, input=json.dumps(payload), text=True, timeout=30,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def outcome(tool: str, args) -> str:
@@ -96,6 +126,8 @@ def main() -> None:
     for line in sys.stdin:
         text = json.loads(line)["message"]["content"]
         turn += 1
+        if turn == 1:
+            run_hooks(args, "SessionStart", sid)
         mode, tools, _ = grants(args)
         print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "permissionMode": mode,
                           "tools": tools}), flush=True)
@@ -106,18 +138,20 @@ def main() -> None:
         reply = "x" * 40_000 if text.startswith("big") else f"turn {turn}: {text.upper()}"
         denials = ([{"tool_name": "Write", "tool_use_id": "toolu_01", "tool_input": {"file_path": "/tmp/x"}}]
                    if text.startswith("deny") else [])
-        acts = re.match(r"(write|touch|try) ([A-Za-z0-9._-]+)(?: ([A-Za-z0-9._-]+))?$", text)
+        acts = re.match(r"(write|touch|try|probe)((?: [A-Za-z0-9._-]+){1,3})$", text)
         if acts:
             time.sleep(MODEL_SECONDS)
-            kind, first, second = acts.groups()
-            calls = [("Write", first), ("Bash", second)] if kind == "try" else [("Write" if kind == "write" else "Bash",
-                                                                                 first)]
+            kind, names = acts.group(1), acts.group(2).split()
+            order = {"write": ["Write"], "touch": ["Bash"], "try": ["Write", "Bash"],
+                     "probe": ["Read", "Write", "Bash"]}[kind]
             said, denials = [], []
-            for tool, name in calls:
-                if name is None:
-                    continue
+            for tool, name in zip(order, names):
                 got = outcome(tool, args)
-                if got == "yes":
+                if got != "gone":
+                    run_hooks(args, "PreToolUse", sid, tool)
+                if got == "yes" and tool == "Read":
+                    said.append("READ " + name if os.path.isfile(os.path.join(os.getcwd(), name)) else "NO FILE " + name)
+                elif got == "yes":
                     with open(os.path.join(os.getcwd(), name), "a") as f:
                         f.write("written by the stand-in\n" if tool == "Write" else "")
                     said.append(("WROTE " if tool == "Write" else "TOUCHED ") + name)

@@ -75,18 +75,24 @@ T4. `start --parent <id> --agent <the Codex agent> --effort low`: a Codex child 
     named directory as trusted); Codex reports the checkout as the thread's working directory all the same.
 T4b. The same with `--isolation worktree`: no `cwd` either, and the thread works in the child's own worktree,
     because that is where its process was started.
-T4c. Grants in a settings file do not widen a read-only child. The temp checkout has a `.claude/settings.json` that
-    allows `Bash(*)`, `Write` and `Edit`, and a third Claude agent's runner loads that file with `--settings` (in
-    `dontAsk`, with nothing on its command line allowing either). A `workspace` child of that agent writes a file
-    and runs a command: the grants are in force. A `read-only` child of the same agent, asked the same, can do
-    neither, and its process reports `dontAsk` and no tool but Read, Grep and Glob.
+T4c. A settings file does not reach a read-only child. The temp checkout has a `.claude/settings.json` that
+    allows `Bash(*)`, `Write`, `Edit` and `Read`, and has two COMMAND HOOKS: a SessionStart hook and a PreToolUse
+    hook on Read, each appending its input to a log in the temp directory. A third Claude agent's runner loads that
+    file with `--settings` (in `dontAsk`, with nothing on its command line allowing anything). A `workspace` child
+    of that agent reads a file, writes one and runs a command, and both hooks ran for it: grants and hooks are in
+    force. A `read-only` child of the same agent, asked the same, reads the file and can do neither of the other
+    two; NO hook ran for it (it is started with `--setting-sources=` and without the runner's `--settings`), and
+    its process reports `dontAsk` and no tool but Read, Grep and Glob.
 T5. `board session list` shows the six under their parent; `show` of the parent lists them.
 T6. `close` of the parent ends all six; no process is left; the worktree that holds a file stays, and `show` says
     where it is; the Codex child's worktree, which holds nothing of its own, is removed.
-T6b. A mode from a settings file. A second temp checkout has a `.claude/settings.json` whose `defaultMode` is
-    `bypassPermissions`, and a fourth Claude agent's runner loads it with `--settings` and names no mode itself. The
-    node does not allow full access. A session of that agent is ended when its first turn starts and its process
-    reports `bypassPermissions`; the command it was asked to run did not run.
+T6b. A mode from a settings file never takes effect. A second temp checkout has a `.claude/settings.json` whose
+    `defaultMode` is `bypassPermissions`, and a fourth Claude agent's runner loads it with `--settings` and names no
+    mode itself. The node does not allow full access. Every hosted Claude session is started with an explicit
+    permission mode (a runner that names none gets `manual`), and an explicit mode beats the file: the session's
+    process reports `default`, the command it was asked to run is refused, and the session is an ordinary
+    `workspace` one. (Were the process to report `bypassPermissions` after all, the host would end it: that is a
+    deterministic test, tests/test_hosted_tree.py.)
 T6c. The node is restarted with `allow_full_access = true`.
 T7. Full access: a root of the bypass runner is `full`. Two children are asked to run `touch <file>` with the Bash
     tool: one of the ordinary Claude agent at `--access workspace` (its `dontAsk` runner: refused) and one at the
@@ -128,7 +134,7 @@ CODEX_AGENT = "codex-host"      # the agent whose hosted session is a Codex one 
 FULL_AGENT = "claude-full"      # the tree scenario's second Claude agent: its runner bypasses permission checks
 GRANT_AGENT = "claude-granted"  # ... a third: its runner loads a settings file that allows Bash(*), Write and Edit
 MODE_AGENT = "claude-defmode"   # ... a fourth: its runner loads a settings file whose defaultMode is bypassPermissions
-GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit"]}}
+GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit", "Read"]}}     # ... and two hooks (enable_tree)
 BYPASS_BY_SETTINGS = {"permissions": {"defaultMode": "bypassPermissions"}}
 WAKE_INTERVAL = 6               # the hub's [dispatch.sessions] wake_min_interval_seconds for this run
 MARKER = "E2E-BODY-MARKER-4c1e9a"
@@ -968,7 +974,16 @@ codex = true
             create_agent(agents, name, "claude-code")
         self.project_mode = self.tmp / "checkout-mode"      # where a settings file selects bypassPermissions
         self.worktrees = self.tmp / "worktrees"
-        for directory, fixture in ((self.project, GRANTS), (self.project_mode, BYPASS_BY_SETTINGS)):
+        # The grants fixture also carries two command hooks. Each appends the JSON it is given on stdin (it names
+        # the session) to a log in the temp directory, so a hook that ran for a session is on record.
+        self.hook_logs = {"SessionStart": self.tmp / "logs" / "hook-session-start.log",
+                          "PreToolUse": self.tmp / "logs" / "hook-pre-read.log"}
+        hooked = GRANTS | {"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command",
+                                         "command": f"(cat; echo) >> {self.hook_logs['SessionStart']}"}]}],
+            "PreToolUse": [{"matcher": "Read", "hooks": [{"type": "command",
+                                                          "command": f"(cat; echo) >> {self.hook_logs['PreToolUse']}"}]}]}}
+        for directory, fixture in ((self.project, hooked), (self.project_mode, BYPASS_BY_SETTINGS)):
             (directory / ".claude").mkdir(parents=True, exist_ok=True)
             (directory / ".claude" / "settings.json").write_text(json.dumps(fixture, indent=2) + "\n")
         hub = (self.hub_home / "board.toml").read_text()
@@ -1053,6 +1068,17 @@ max_live = 8
               f"{data['message']['ended_at'] - data['message']['delivered_at']:.2f}s; reply: {data['reply']!r}")
         return view, data, took
 
+    def hooks_ran(self, sid: str) -> list[str]:
+        """The hook events of the settings fixture that ran for this session (their logs name it)."""
+        out = []
+        for event, path in self.hook_logs.items():
+            try:
+                if sid in path.read_text():
+                    out.append(event)
+            except OSError:
+                pass
+        return out
+
     def init_facts(self, sid: str) -> tuple[str | None, list[str]]:
         """What the session's Claude process reported when its (last) turn started: the permission mode it really
         ran in and the built-in tools it really had (MCP tools left out), from its transcript on the node."""
@@ -1086,7 +1112,8 @@ max_live = 8
                         "with exactly one word: done or refused.")
 
             def both(written: str, touched: str) -> str:
-                return (f"First use the Write tool to create a file named {written} in the current directory, "
+                return (f"First use the Read tool to read the file README in the current directory. Then use the "
+                        f"Write tool to create a file named {written} in the current directory, "
                         f"containing the word ok. Then run exactly this shell command with the Bash tool, once: "
                         f"touch {touched}\nIf a tool is refused or not available, do not try any other way. Then "
                         "reply with exactly one word: done.")
@@ -1097,7 +1124,7 @@ max_live = 8
                 return f"touch {name}"
 
             def both(written: str, touched: str) -> str:
-                return f"try {written} {touched}"
+                return f"probe README {written} {touched}"
         pong = "Reply with exactly the word: pong" if self.real_codex else "pong"
 
         print("\n[T0] the hub and the node run again, now with [dispatch.sessions.spawn] enabled = true")
@@ -1185,34 +1212,48 @@ max_live = 8
                    and codex_path != path and where is not None and os.path.realpath(where) == str(codex_path),
                    "the thread works in the child's own worktree: its process was started there")
 
-        print("\n[T4c] a settings file allows Bash(*), Write and Edit: in force for a workspace child, not for a "
+        print("\n[T4c] a settings file with grants and command hooks: in force for a workspace child, not for a "
               "read-only one")
         fixture = self.project / ".claude" / "settings.json"
-        print(f"  {fixture}: {json.dumps(json.loads(fixture.read_text()))} (loaded by {GRANT_AGENT}'s runner with "
-              "--settings; that runner is in dontAsk and allows nothing on its command line)")
+        loaded = json.loads(fixture.read_text())
+        print(f"  {fixture} (loaded by {GRANT_AGENT}'s runner with --settings; that runner is in dontAsk and allows "
+              f"nothing on its command line): permissions {json.dumps(loaded['permissions'])}; hooks "
+              + "; ".join(f"{event}{'(' + g['matcher'] + ')' if g.get('matcher') else ''}: {g['hooks'][0]['command']}"
+                          for event, groups in loaded["hooks"].items() for g in groups))
         ctl, data, _ = self.spawn_child(sid, both("granted-write.txt", "granted-touch.txt"), "--agent", GRANT_AGENT,
                                         "--access", "workspace", "--role", "test", *model)
         mode, tools = self.init_facts(ctl["session_id"])
-        print(f"  its process reported permission mode {mode!r}; denied: {data['message']['denials']}")
+        print(f"  its process reported permission mode {mode!r}; denied: {data['message']['denials']}; hooks that "
+              f"ran for it: {self.hooks_ran(ctl['session_id'])}")
         self.check(data["message"]["state"] == "done" and (self.project / "granted-write.txt").is_file()
                    and (self.project / "granted-touch.txt").is_file() and mode == "dontAsk",
                    "the grants are in force under dontAsk: the workspace child wrote a file with Write and ran "
                    "`touch` with Bash")
+        self.check(self.hooks_ran(ctl["session_id"]) == ["SessionStart", "PreToolUse"],
+                   "the hooks are in force too: the SessionStart hook and the PreToolUse hook on Read both ran a "
+                   "command for the workspace child")
         gro, data, _ = self.spawn_child(sid, both("readonly-write.txt", "readonly-touch.txt"), "--agent", GRANT_AGENT,
                                         "--access", "read-only", "--role", "review", *model)
         mode, tools = self.init_facts(gro["session_id"])
-        print(f"  its process reported permission mode {mode!r} and the built-in tools {tools}")
+        print(f"  its process reported permission mode {mode!r} and the built-in tools {tools}; hooks that ran for "
+              f"it: {self.hooks_ran(gro['session_id'])}")
         self.check(data["message"]["state"] == "done" and not list(self.tmp.rglob("readonly-write.txt"))
                    and not list(self.tmp.rglob("readonly-touch.txt")),
                    "the read-only child of the SAME runner, asked the same, wrote no file and ran no command: "
                    "neither readonly-write.txt nor readonly-touch.txt exists anywhere in the temp directory")
+        self.check(self.hooks_ran(gro["session_id"]) == [],
+                   "NO hook ran for the read-only child, at its start or on its Read: it loads no settings")
+        used = [u.get("name") for u in self.tool_uses(gro["session_id"])]
+        self.check((not self.real and "READ README" in data["reply"]) or "Read" in used,
+                   "... though it did use the Read tool, which is what the PreToolUse hook is on"
+                   + (f" (its tool calls: {used})" if self.real else ""))
         self.check(mode == "dontAsk" and bool(tools) and set(tools) <= {"Read", "Grep", "Glob"},
-                   "its process reports dontAsk and no built-in tool but Read, Grep and Glob: the settings file's "
-                   "Bash, Write and Edit grants have nothing to apply to")
+                   "its process reports dontAsk and no built-in tool but Read, Grep and Glob")
         self.check(gro["access"] == "read-only" and self.show(gro["session_id"]).get("granted") == "read-only",
-                   "... and that is what its node reported for it: read-only, verified from its process")
+                   "... and read-only is what its node reported for it")
         if not self.real:
-            self.check(data["reply"] == "turn 1: NO SUCH TOOL: WRITE; NO SUCH TOOL: BASH", "neither tool exists for it")
+            self.check(data["reply"] == "turn 1: READ README; NO SUCH TOOL: WRITE; NO SUCH TOOL: BASH",
+                       "it read the file; neither of the other tools exists for it")
 
         print("\n[T5] board session list / show")
         listed, _, _ = self.board("session", "list")
@@ -1255,31 +1296,30 @@ max_live = 8
         self.check(not codex_path.exists() and removed.get("worktree_removed_at") is not None,
                    "the Codex child's worktree held nothing of its own, so its node removed it and told the hub")
 
-        print("\n[T6b] a settings file's defaultMode is bypassPermissions; this node does not allow full access")
+        print("\n[T6b] a settings file's defaultMode is bypassPermissions; the session is started with an explicit "
+              "mode, so it never takes effect")
         fixture = self.project_mode / ".claude" / "settings.json"
         print(f"  {fixture}: {json.dumps(json.loads(fixture.read_text()))} (loaded by {MODE_AGENT}'s runner with "
-              "--settings; that runner names no permission mode and no bypass flag)")
+              "--settings; that runner names no permission mode and no bypass flag, and this node does not allow "
+              "full access)")
         out, err, took = self.board("session", "start", str(self.project_mode), touch("bypass-proof.txt"), "--agent",
-                                    MODE_AGENT, *model, "--wait", "--json", ok=False)
+                                    MODE_AGENT, *model, "--wait", "--json")
         data = json.loads(out)
-        bad = data["session"]["session_id"]
-        view = self.wait_ended(bad)
-        mode, tools = self.init_facts(bad)
-        print(f"  session {bad}; wall {took:.2f}s; its process reported permission mode {mode!r}")
-        print(f"  state {view['state']}: {view['error']}")
-        print(f"  message 1: {data['message']['state']}: {data['message']['detail']}")
-        self.check(mode == "bypassPermissions",
-                   "its process really started the turn in bypassPermissions: the mode came from the settings file")
-        self.check(view["state"] == "ended" and (view["error"] or "").startswith(
-            "its process runs with permission checks bypassed") and "allow_full_access" in view["error"],
-            "the session was ended, with the reason")
-        self.check(data["message"]["state"] == "failed" and view.get("access") is None,
-                   "its turn failed, and it was never reported as having any access")
-        self.check(not list(self.tmp.rglob("bypass-proof.txt")) and self.tool_uses(bad) == [],
-                   "nothing ran with bypass: no bypass-proof.txt anywhere in the temp directory, and no tool call in "
-                   "its transcript")
-        self.check(subprocess.run(["pgrep", "-f", bad], capture_output=True).returncode != 0,
-                   "no process with that session id on its command line is left")
+        pinned = data["session"]["session_id"]
+        view = self.show(pinned)
+        mode, tools = self.init_facts(pinned)
+        print(f"  session {pinned}; wall {took:.2f}s; its process reported permission mode {mode!r}; reply: "
+              f"{data['reply']!r}; denied: {data['message']['denials']}; access {view.get('access')}")
+        self.check(mode == "default",
+                   "its process reports the standard mode (`default`, which is what `--permission-mode manual` is): "
+                   "the explicit mode on its command line beat the settings file's bypassPermissions")
+        self.check(view["state"] != "ended" and data["message"]["state"] == "done" and view.get("access") == "workspace",
+                   "the session runs on as an ordinary workspace session; its node reported that when it opened it")
+        self.check(not list(self.tmp.rglob("bypass-proof.txt")) and "Bash" in data["message"]["denials"],
+                   "the command was refused, not run: no bypass-proof.txt anywhere in the temp directory, and the "
+                   "turn lists Bash as denied")
+        self.board("session", "close", pinned)
+        self.check(self.wait_ended(pinned)["state"] == "ended", "closed")
 
         print("\n[T6c] the node is restarted with [dispatch.sessions] allow_full_access = true")
         self.node_settings(allow_full=True)

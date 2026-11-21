@@ -81,7 +81,7 @@ def _meta(ev: dict) -> dict:
 
 class ClaudeSession:
     waits_for_ready = False     # `init` only arrives once the first turn has been written
-    verifies_mode = True        # ... and says what the turn really runs with: the session's access is known then
+    verifies_mode = True        # ... and says what the turn really runs with: the host's kill switch reads it
 
     def __init__(self):
         self.session_id: str | None = None

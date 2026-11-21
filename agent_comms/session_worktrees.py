@@ -58,15 +58,37 @@ def _git(cwd: str, *args: str, timeout: float = 30) -> subprocess.CompletedProce
 
 
 def registered(checkout: str, path: str) -> bool:
-    """git lists `path` as a LINKED worktree of this checkout (`git worktree list`, never the main one), and the
-    path is canonical: a real directory, itself and every ancestor free of symlinks."""
+    """`path` IS a linked worktree of this checkout, now:
+    - the path is canonical: a real directory, itself and every ancestor free of symlinks;
+    - git lists it (`git worktree list`, never the main one) and does not call the entry `prunable`. A stale entry
+      whose directory was deleted stays listed until it is pruned, and any folder later made at that path would
+      otherwise pass;
+    - the directory itself answers as that worktree: its git top level is the path, its git directory is one of the
+      checkout's `worktrees/` entries and not the checkout's own. (From a plain folder git would find some
+      repository above it and answer with that one's top level.)"""
     if os.path.islink(path) or not os.path.isdir(path) or os.path.realpath(path) != path:
         return False
     r = _git(checkout, "worktree", "list", "--porcelain", "-z")
     if r is None or r.returncode != 0:
         return False
-    listed = [field[len("worktree "):] for field in r.stdout.split("\0") if field.startswith("worktree ")]
-    return any(os.path.realpath(p) == path for p in listed[1:])     # the first entry is the main worktree
+    entries = [[field for field in block.split("\0") if field] for block in r.stdout.split("\0\0")]
+    listed = False
+    for entry in [e for e in entries if e][1:]:         # the first entry is the main worktree
+        where = next((f[len("worktree "):] for f in entry if f.startswith("worktree ")), None)
+        stale = any(f == "prunable" or f.startswith("prunable ") for f in entry)
+        if where is not None and os.path.realpath(where) == path and not stale:
+            listed = True
+    if not listed:
+        return False
+    top = _git(path, "rev-parse", "--show-toplevel")
+    own = _git(path, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+    main = _git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if any(x is None or x.returncode != 0 for x in (top, own, main)):
+        return False
+    dirs = [os.path.realpath(d) for d in own.stdout.splitlines() if d.strip()]
+    common = os.path.realpath(main.stdout.strip())
+    return (os.path.realpath(top.stdout.strip()) == path and len(dirs) == 2 and dirs[1] == common
+            and dirs[0] != common and os.path.dirname(dirs[0]) == os.path.join(common, "worktrees"))
 
 
 def ensure(config: DispatchConfig, checkout: str, session_id: str) -> str:

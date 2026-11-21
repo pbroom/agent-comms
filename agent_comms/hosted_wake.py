@@ -665,10 +665,13 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         if now - max(at, handed_at if isinstance(handed_at, (int, float)) else at) < rec["grace"]:
             return True
         read = rec["read"].get(str(post_id))
-        if isinstance(read, (int, float)) and read >= at and not _shadowed(conn, r, at, until=read):
-            return True     # a stored mark is checked too: no child that could have made it was there by then
         if _shadowed(conn, r, at):
-            continue        # a receipt cannot be told to be the root's own: after the grace it holds nothing
+            # Neither a read mark nor a receipt can be told to be the root's own, whenever it was made: a child of
+            # the agent in the project that has been around since the wake may be its reader, or may be the one
+            # that goes on to work from it. After the grace such a root holds nothing.
+            continue
+        if isinstance(read, (int, float)) and read >= at:
+            return True
         from . import delivery
         if delivery.read_since(conn, post_id, agent, at, lambda sid: _own_reader(conn, sid, agent, r["project"])):
             return True
@@ -685,9 +688,9 @@ def _own_reader(conn, session_id: Any, agent: str, project: str) -> bool:
             and (row["project"].rstrip("/") or "/") == project)
 
 
-def _shadowed(conn, r: dict, since: float, until: float | None = None) -> bool:
-    """Some CHILD session of this root's agent in this root's project was alive between `since` and `until` (None:
-    to this day), whichever root it was started under. Such a child signs in to the board with the same identity,
+def _shadowed(conn, r: dict, since: float) -> bool:
+    """Some CHILD session of this root's agent in this root's project has been alive at or after `since` (to this
+    day), whichever root it was started under. Such a child signs in to the board with the same identity,
     and nothing in a board session's row says which hosted session opened it: registered in the project (a shared
     child runs there; a worktree child may name it too) it passes `_own_reader` exactly as the root's own board
     session does. A Codex child under a Claude root is, to the board, the same reader as a separate Codex root in
@@ -696,7 +699,6 @@ def _shadowed(conn, r: dict, since: float, until: float | None = None) -> bool:
     identity or place and is never mistaken (`_own_reader` asks for the root's agent and project)."""
     return any(is_child(x) and x.get("agent") == r.get("agent") and x.get("project") == r.get("project")
                and (x.get("state") != "ended" or float(x.get("ended_at") or 0) >= since)
-               and (until is None or float(x.get("created_at") or 0) <= until)
                for x in hosted._sessions(conn))
 
 

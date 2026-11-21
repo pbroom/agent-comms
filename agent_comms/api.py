@@ -54,7 +54,7 @@ class NodeHelloIn(Body):
     checkout_roots: list[str] = []
     access: dict[str, list[str]] = {}
     sessions: dict[str, StrictInt] | None = None    # {"max_live": n}: the node hosts sessions (hosted.py)
-    session_host: dict[str, Any] | None = None      # {"tree": 1, "runners": [...]}: it speaks the child protocol
+    session_host: dict[str, Any] | None = None      # {"tree": 1, "runners": {key: [words]}}: the child protocol
 
 
 class NodeReportIn(Body):

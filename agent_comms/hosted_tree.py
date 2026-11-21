@@ -133,8 +133,9 @@ def node_supports(conn, node: str) -> bool:
 def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[str, dict] | None) -> None:
     """The child's agent on the PARENT'S node: the hub's grant for that node must cover the project and the agent
     (as for a root), and the node must be connected as a session host with a runner for the agent, speak the
-    child-session protocol NOW (its latest hello), and be able to host that runner as a session (it has an adapter
-    for its CLI: a Codex runner only where the node turned Codex sessions on)."""
+    child-session protocol NOW (its latest hello), and be able to start a child session from that runner at all
+    (its hello says at which access words: none for a Codex runner where Codex sessions are off, or one its
+    session preparation refuses). The word itself is checked when the child is admitted (`_offers`)."""
     node, project = parent["node"], parent["project"]
     grant = (allowed or {}).get(node)
     if (not isinstance(grant, dict) or not nodes.grant_covers(grant, project)
@@ -147,11 +148,20 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
     if not node_supports(board.conn, node):
         raise Conflict(f"node {node} does not host child sessions: it runs a version of agent-comms from before "
                        "them (or was rolled back to one). Update it and start `board node` again")
-    info = _get(board.conn, nodes.NODE_PREFIX + node)
-    if nodes.runner_key(info, agent, runtime) not in info["session_host"]["runners"]:
-        raise Conflict(f"node {node} cannot host {agent} as a session: it has a runner for it, but no way to keep "
-                       "that runner's CLI open as a session (for a Codex runner the node's settings need "
-                       "[dispatch.sessions] codex = true)")
+    if not _offers(board.conn, node, agent, runtime):
+        raise Conflict(f"node {node} cannot host {agent} as a session: it has a runner for it, but cannot start a "
+                       "session from that runner (for a Codex runner the node's settings need [dispatch.sessions] "
+                       "codex = true, and a runner its session host refuses, say one with --approve-for-me, is "
+                       "never hosted)")
+
+
+def _offers(conn, node: str, agent: str, runtime: str | None) -> list[str]:
+    """The access words the node's latest hello says a child session of this agent's runner can be started at."""
+    info = _get(conn, nodes.NODE_PREFIX + node)
+    hosting = info.get("session_host") if isinstance(info, dict) else None
+    offered = hosting.get("runners") if isinstance(hosting, dict) else None
+    words = offered.get(nodes.runner_key(info, agent, runtime)) if isinstance(offered, dict) else None
+    return [w for w in words if w in session_access.LEVELS] if isinstance(words, list) else []
 
 
 def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any = None, model: Any = None,
@@ -202,6 +212,13 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         if not session_access.within(access, limit):
             raise Conflict(f"access {access} is above the parent's ({limit}): a child session never gets more access "
                            "than its parent")
+        offered = _offers(c, parent["node"], agent, runtime)
+        if access not in offered:
+            # What the node itself says it can start from that runner: `full` only where it allows full access, not
+            # `workspace` from a Claude runner that bypasses, and so on. Refused here, not made and then ended.
+            raise Conflict(f"node {parent['node']} cannot start a session of {agent} at {access} access (it can at: "
+                           f"{', '.join(offered) or 'none'}). `full` needs [dispatch.sessions] allow_full_access = "
+                           "true on the node")
         live = children(c, pid, live=True)
         if len(live) >= spawn.max_children:
             raise Conflict(f"session {pid} already has {len(live)} child sessions that have not ended (the hub's "

@@ -133,12 +133,10 @@ class Session:
     tee_failed: bool = False
     stderr_from: int = 0            # size of the stderr log when this process started: what it wrote comes after
     # Access (session_access): `asked`, the word it was opened with (None: a session of its own, which runs its
-    # runner as configured); `access`, what it has as far as this host knows (what its command line is expected to
-    # give, then what its process reported); `access_known`, once that is verified (at once for a CLI that reports
-    # no mode).
+    # runner as configured); `access`, what it HAS, computed from its command line when it was opened and never
+    # changed by anything its process says afterwards (that can only end it).
     asked: str | None = None
     access: str | None = None
-    access_known: bool = False
     effort: str | None = None
 
     @property
@@ -161,6 +159,32 @@ class Session:
         if self.child is not None and self.stopping_since is None and not self.ready and self.provider.waits_for_ready:
             return "starting"
         return "idle"
+
+
+DRY_RUN_ID = "00000000-0000-4000-8000-000000000000"
+
+
+def child_words(config: DispatchConfig, template: list[str]) -> list[str]:
+    """The access words a CHILD session of this runner can be started at on this machine: for each word, what
+    opening such a session does to the template (session_access.prepare, the adapter's own argv), tried here without
+    starting anything. Empty: no adapter for its CLI (Codex with `[dispatch.sessions] codex` off), or a runner the
+    adapter refuses at every word (a Codex runner with `--approve-for-me`). `full` is in it only where this machine
+    allows full access."""
+    factory = providers.provider_for(template, codex=config.sessions.codex)
+    if factory is None:
+        return []
+    words = []
+    for word in session_access.LEVELS:
+        try:
+            prep = session_access.prepare(template, word, allow_full=config.sessions.allow_full_access)
+            provider = factory()
+            if prep.configure is not None:
+                provider.configure(access=prep.configure, effort=None)
+            provider.argv(prep.template, session_id=DRY_RUN_ID, resume=False, model=None)
+        except Exception:
+            continue
+        words.append(word)
+    return words
 
 
 class SessionHost:
@@ -340,7 +364,8 @@ class SessionHost:
         elif not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
             raise FileNotFoundError("the session's own run directory does not exist")
         # The access word becomes flags here, from this machine's runner and settings (nothing executable came from
-        # the hub). Without a word, and without allow_full_access, the template is untouched.
+        # the hub). Without a word the template is as configured; a Claude runner that names no permission mode
+        # gets the standard one pinned, so that no settings file decides it.
         prep = session_access.prepare(template, access, allow_full=self.config.sessions.allow_full_access, cwd=cwd,
                                       board_mcp=lambda configs: self._board_mcp(session_id, configs))
         template = prep.template
@@ -349,11 +374,11 @@ class SessionHost:
             template = runner_preflight.with_denied_tool_instruction(runner_preflight.scoped_template(template))
         if prep.as_configured or prep.granted != "read-only":      # a session narrowed to read-only gets no extra roots
             template = with_writable_roots(template, self.config.extra_roots(template, project))
+        # What the session has is computed from the command line it is started with, here and now: no process
+        # has to say anything first. (For Claude from the final template, scoping included.)
+        label = session_access.claude_label(template) if os.path.basename(template[0]) == "claude" else prep.granted
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
-                    thread_id=int(thread_id), resume=bool(resume), asked=access, access=prep.granted,
-                    effort=effort)
-        # A CLI that reports the mode it really runs in (Claude) has its access verified when its first turn starts.
-        s.access_known = not getattr(s.provider, "verifies_mode", False)
+                    thread_id=int(thread_id), resume=bool(resume), asked=access, access=label, effort=effort)
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
             runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
@@ -516,18 +541,16 @@ class SessionHost:
                 s.busy_since = None
             self._save_state()
         elif ev.kind == "turn_started":
-            # What the process says it really runs this turn with, against what the session may have. A mode from a
-            # settings file is past this machine's runner: bypassed permission checks where they may not be, or a
-            # session asked for at read-only that has more, end the session here, before the turn has done anything.
-            # For a session of its own this is also where its access is read off: a label, not a limit.
-            verified, problem = session_access.verify(s.asked, ev.mode, ev.tools,
-                                                      allow_full=self.config.sessions.allow_full_access)
+            # The kill switch. The session's access was decided from its command line before it started; what the
+            # process says it really runs this turn with can only end it: bypassed where it was not started as
+            # full, not bypassed where it was, more than read-only where that was asked, or nothing verifiable where
+            # the access asked for depends on it.
+            problem = (session_access.verify(s.asked, s.access, ev.mode, ev.tools)
+                       if getattr(s.provider, "verifies_mode", False) else None)
             if problem is not None:
                 log.warning("session %s: %s", s.session_id, problem)
                 self._end(s, problem, now, out)
                 return
-            if verified is not None and (verified != s.access or not s.access_known):
-                s.access, s.access_known = verified, True
             if s.in_flight is not None:
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
         elif ev.kind == "turn_ended":

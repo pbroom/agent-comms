@@ -87,6 +87,11 @@ def _strings(value: Any, what: str, check=None) -> list[str]:
     return sorted(set(value))
 
 
+def _access_levels() -> tuple[str, ...]:
+    from .session_access import LEVELS
+    return LEVELS
+
+
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
           headless_browser: Any = None, checkout_roots: Any = None, access: Any = None,
           sessions: Any = None, session_host: Any = None) -> dict:
@@ -95,9 +100,9 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
     `access`: the node's `[dispatch.runner_access]`, runner key -> access entries (access.py), for runners it offers.
     `sessions`: {"max_live": n} when the node hosts sessions (its `[dispatch.sessions] enabled`, hosted.py).
-    `session_host`: {"tree": 1, "runners": [...]} from a node that speaks the child-session protocol
-    (hosted_tree.py): `runners` are the runner keys it can host as sessions at all (it has an adapter for their
-    CLI). A node that does not say so gets no child sessions."""
+    `session_host`: {"tree": 1, "runners": {key: [words]}} from a node that speaks the child-session protocol
+    (hosted_tree.py): for each runner it can start a child session from, the access words it can start one at
+    (session_access.LEVELS). A node that does not say so gets no child sessions."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -125,9 +130,14 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         tree = session_host.get("tree") if isinstance(session_host, dict) else None
         if (sessions is None or set(session_host if isinstance(session_host, dict) else ()) != {"tree", "runners"}
                 or isinstance(tree, bool) or not isinstance(tree, int) or not 1 <= tree <= 1000):
-            raise Invalid('session_host must be {"tree": a version number, "runners": [...]} beside sessions')
-        hosting = {"tree": tree, "runners": _strings(session_host["runners"], "session_host runners",
-                                                     lambda v: v in runners)}
+            raise Invalid('session_host must be {"tree": a version number, "runners": {...}} beside sessions')
+        offered = session_host["runners"]
+        if (not isinstance(offered, dict) or len(offered) > MAX_ITEMS or any(
+                k not in runners or not isinstance(w, list) or not w or len(set(w)) != len(w)
+                or any(x not in _access_levels() for x in w) for k, w in offered.items())):
+            raise Invalid("session_host runners maps runner keys the node offers to the access words (read-only, "
+                          "workspace, full) a child session can be started at")
+        hosting = {"tree": tree, "runners": {k: [x for x in _access_levels() if x in w] for k, w in offered.items()}}
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,

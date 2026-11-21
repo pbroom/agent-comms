@@ -487,8 +487,9 @@ class SessionRunner:
 
     def _parent_problem(self, parent_id: str, s) -> str | None:
         """Why a child may not be opened or take a turn under its parent as the parent is on this node NOW, or None.
-        `s`: the child once it is open; its access here is then held against the parent's. The parent's access is
-        what this machine's runner gives it today, or what its process last reported (session_host)."""
+        `s`: the child once it is open; its access here is then held against the parent's. Both are computed from
+        the command lines this machine's runners give today (session_host): valid before either process has said
+        anything, and after any restart or change of a runner."""
         parent = self.host.sessions.get(parent_id)
         if parent is None or parent.ended or parent_id in self.ending or parent_id in self.dropped:
             return PARENT_GONE
@@ -509,16 +510,14 @@ class SessionRunner:
             self.ending.add(sid)
             self._add(sid, {"kind": "ended", "detail": why[:300]})
 
-    def _tree_status(self, sid: str, view: dict | None, s) -> None:
-        """Whether this session's reports carry its access and worktree: only for a hub that asked (`view`: its
-        entry in the hub's list; None: as decided at the last fetch). The access is reported once it is known:
-        for Claude that is when its process has said what it really runs with (session_host), not before."""
-        if view is not None and "access" not in view and "parent" not in view:
+    def _tree_status(self, sid: str, view: dict, s) -> None:
+        """Whether this session's reports carry its access and worktree: only for a hub that asked. The access
+        is the one computed from the session's command line when it was opened (session_host): it is there from the
+        first report on."""
+        if "access" not in view and "parent" not in view:
             self.tree.pop(sid, None)
             return
-        if view is None and sid not in self.tree:
-            return
-        tree = {"access": s.access if s.access_known else None, "worktree": self.worktrees.get(sid, {}).get("path")}
+        tree = {"access": s.access, "worktree": self.worktrees.get(sid, {}).get("path")}
         if self.tree.get(sid) != tree:
             self.tree[sid] = tree
             self.reported.pop(sid, None)        # say how it stands again, with these
@@ -600,7 +599,6 @@ class SessionRunner:
                 self.dropped.discard(sid)
             elif not s.ended and sid not in self.dropped:
                 self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))
-                self._tree_status(sid, None, s)     # its access may just have been verified (a turn started)
 
     @staticmethod
     def _own_id(s) -> str | None:
