@@ -24,8 +24,10 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   in `<log dir>/node-sessions.json`, so a host that starts after a crash stops what the last one left (`recover`,
   verified by pid and start time like node.py's runs) before it starts anything.
 - A provider that issues its own id for a session (Codex's thread id) has it recorded in
-  `<log dir>/node-session-providers.json` (mode 600) when the process confirms the session, and is handed it again
-  (`adopt`) when the session is opened after a restart. The id never comes from the hub.
+  `<log dir>/node-session-providers.json` (mode 600) before the first turn is written to that session, and is
+  handed it again (`adopt`) when the session is opened after a restart: a recorded id is resumed, whatever the
+  caller knows. The id never comes from the hub. It is dropped when the provider refuses to resume it.
+- A message waits while the provider runs something of its own in the session (`holds_turns`).
 - A provider with a handshake (`waits_for_ready`) gets `handshake_seconds` for it, not the turn timeout.
 """
 from __future__ import annotations
@@ -118,6 +120,7 @@ class Session:
     in_flight: _Message | None = None   # delivered; its turn has not ended
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
+    held_since: float | None = None     # since when the next message waits for a turn of the provider's own
     interrupted_at: float | None = None
     stopping_since: float | None = None
     killed: bool = False
@@ -308,11 +311,19 @@ class SessionHost:
         template = with_writable_roots(template, self.config.extra_roots(template, project))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
                     thread_id=int(thread_id), resume=bool(resume))
+        runs_in = getattr(s.provider, "runs_in", None)
+        if runs_in is not None:
+            runs_in(cwd)
         adopt = getattr(s.provider, "adopt", None)
         if adopt is not None:
-            # What this machine recorded when an earlier process confirmed the session; never an id from the hub.
+            # This machine's own record, never an id from the hub. It is written before the first turn goes to the
+            # provider's session (`_write`), so its being there says a turn may be in that session, whatever the
+            # caller's `resume` says: a node that crashed before it could report the turn must not start a NEW
+            # conversation and silently lose that one.
             s.provider_id = self._provider_ids().get(session_id)
             adopt(s.provider_id)
+            if s.provider_id is not None:
+                s.resume = True
         self._argv(s)       # now, so a runner that cannot be used is refused here and not at the first message
         self.sessions[session_id] = s
         return s
@@ -402,7 +413,8 @@ class SessionHost:
             if s.stopping_since is not None:
                 # This process's turn was already given up: its late turn events are dropped. That the provider's
                 # session exists still counts, or the next process would start it anew and be refused.
-                if any(ev.kind == self._confirms(s) for ev in events) and not s.resume:
+                # (Not for a provider with a handshake: its `ready` says only that an id was issued, see `_write`.)
+                if any(ev.kind == "ready" for ev in events) and not s.resume and not s.provider.waits_for_ready:
                     s.resume = True
                     self._save_state()
                 continue
@@ -411,23 +423,13 @@ class SessionHost:
             for ev in events:
                 self._on_event(s, ev, now, out)
 
-    @staticmethod
-    def _confirms(s: Session) -> str:
-        """The provider event after which a later process must RESUME the provider's session. Without a handshake
-        (Claude) `ready` arrives with the first turn, and the session exists from then on. With one (Codex) `ready`
-        only says a thread id was issued: Codex keeps nothing of a thread until a turn has started in it, and refuses
-        to resume one it kept nothing of."""
-        return "turn_started" if s.provider.waits_for_ready else "ready"
-
     def _on_event(self, s: Session, ev: Event, now: float, out: list[HostEvent]) -> None:
-        if ev.kind == self._confirms(s) and not s.resume:
-            s.resume = True
-            self._save_state()
         if ev.kind == "ready":
             s.ready, s.provider_id = True, ev.provider_id
+            if not s.provider.waits_for_ready:
+                s.resume = True     # Claude: `ready` comes with the first turn, and the session exists from then on
             if not s.busy:
                 s.busy_since = None
-            self._record_provider_id(s.session_id, ev.provider_id)
             self._save_state()
         elif ev.kind == "turn_started":
             if s.in_flight is not None:
@@ -452,9 +454,12 @@ class SessionHost:
         elif ev.kind == "start_failed":
             # This process cannot serve the session (its handshake was refused). The message that was waiting on it
             # fails with the reason, the process is stopped, the session stays: the next message starts another.
-            if not s.busy and s.inbox:
-                s.writing = s.inbox.popleft()
-            self._fail(s, ev.detail or "the agent process refused to start the session", out)
+            # If the provider says its session cannot be resumed, that is put on record FIRST (the flag, the state
+            # file, the provider id's record): a host that restarts right after the failure was reported must not
+            # try the same resume again.
+            self._correct_start_mode(s)
+            self._save_state()
+            self._fail_start(s, ev.detail or "the agent process refused to start the session", out)
             self._stop(s, now)
 
     def _reap(self, s: Session, now: float, out: list[HostEvent]) -> None:
@@ -485,9 +490,9 @@ class SessionHost:
             elif s.inbox and s.provider.waits_for_ready and not was_ready:
                 # It went during its handshake. The message that made it start fails with it: otherwise a process
                 # that can never start (a runner flag Codex refuses) would be started again on every pass.
-                s.writing = s.inbox.popleft()
-                self._fail(s, f"the process exited (code {code}) before it was ready", out)
+                self._fail_start(s, f"the process exited (code {code}) before it was ready", out)
             s.busy_since = None
+        s.held_since = None
         self._save_state()
 
     def _correct_start_mode(self, s: Session) -> None:
@@ -530,9 +535,7 @@ class SessionHost:
             # message waiting on it now and not after a whole turn's timeout.
             if now - s.busy_since < self.handshake_seconds:
                 return
-            if s.inbox:
-                s.writing = s.inbox.popleft()
-            self._fail(s, f"the agent process was not ready after {self.handshake_seconds:g} seconds", out)
+            self._fail_start(s, f"the agent process was not ready after {self.handshake_seconds:g} seconds", out)
             self._stop(s, now)
             return
         if now - s.busy_since < self.timeout_minutes * 60:
@@ -553,6 +556,30 @@ class SessionHost:
         if msg is not None:
             out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=False, delivered=delivered, detail=detail))
 
+    def _fail_start(self, s: Session, detail: str, out: list[HostEvent]) -> None:
+        """A process did not get through its handshake (refused, timed out, exited, or would not take the bytes). The
+        message that made it start fails with it, exactly once: it leaves the inbox here, so whichever path sees the
+        failure first settles it and nothing starts a process for it again."""
+        if not s.busy and s.inbox:
+            s.writing = s.inbox.popleft()
+        self._fail(s, detail, out)
+
+    def _held(self, s: Session, now: float, out: list[HostEvent]) -> bool:
+        """The provider's session is busy with something of its own (`holds_turns`): the next message waits, for at
+        most the turn timeout. Past that the message fails and the process is stopped (the next one resumes)."""
+        holds = getattr(s.provider, "holds_turns", None)
+        if holds is None or not holds():
+            s.held_since = None
+            return False
+        if s.held_since is None:
+            s.held_since = now
+        if now - s.held_since >= self.timeout_minutes * 60:
+            s.writing, s.held_since = s.inbox.popleft(), None
+            self._fail(s, f"the agent was busy with a turn of its own for {self.timeout_minutes:g} minutes; the "
+                          "message was not written", out)
+            self._stop(s, now)
+        return True
+
     def _stop(self, s: Session, now: float) -> None:
         if s.child is not None and s.stopping_since is None:
             s.stopping_since = now
@@ -572,11 +599,7 @@ class SessionHost:
     # ------------------------------------------------------------ starting and writing
 
     def _argv(self, s: Session) -> list[str]:
-        # {project} and {thread} are filled in first: an adapter may need the run directory as a value of its own
-        # protocol (Codex's `--cd` becomes a thread parameter) and not as an argv element. {prompt} stays for the
-        # adapter to drop.
-        template = render_argv(s.template, prompt="{prompt}", project=s.cwd, thread_id=s.thread_id)
-        argv = s.provider.argv(template, session_id=s.session_id, resume=s.resume, model=s.model)
+        argv = s.provider.argv(s.template, session_id=s.session_id, resume=s.resume, model=s.model)
         return render_argv(argv, prompt="", project=s.cwd, thread_id=s.thread_id)
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
@@ -628,9 +651,16 @@ class SessionHost:
             self._spawn(s, now, out)
             if s.child is None:
                 return
-        if not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready):
+        if not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not self._held(s, now, out):
             s.writing = s.inbox.popleft()
             s.waiting, s.denials, s.busy_since = False, (), now
+            if s.provider.waits_for_ready and not s.resume:
+                # The first turn for a session the provider only issued an id for (Codex's thread). From the moment
+                # its bytes may be in the pipe the provider may have recorded the turn, so that the session is to be
+                # RESUMED is on record first: the flag and the id (PROVIDER_FILE, which `open` trusts after a
+                # restart). If the provider never got the turn, the resume is refused and that is said out loud.
+                s.resume = True
+                self._record_provider_id(s.session_id, s.provider_id)
             for data in s.provider.turn(s.writing.text):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
@@ -639,9 +669,14 @@ class SessionHost:
                 n = s.child.write(bytes(s.outbuf))
             except OSError as e:
                 # The process no longer reads. A message that was not fully written never reached it; a turn in
-                # flight (an answer to the process could not be written) is lost with the process.
+                # flight (an answer to the process could not be written) is lost with the process. During a
+                # handshake the message that made the process start is still in the inbox: it fails here too.
                 s.outbuf.clear()
-                self._fail(s, f"could not write to the process: {type(e).__name__}", out)
+                detail = f"could not write to the process: {type(e).__name__}"
+                if s.provider.waits_for_ready and not s.ready:
+                    self._fail_start(s, detail, out)
+                else:
+                    self._fail(s, detail, out)
                 self._stop(s, now)
                 return
             del s.outbuf[:n]

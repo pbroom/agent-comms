@@ -78,7 +78,6 @@ class SessionRunner:
         self.dropped: set[str] = set()                # sessions the hub no longer lists: closed here, not reported
         # session id -> (state, pid, resume, the provider's own id when it is not the session id) as of the last pass
         self.status: dict[str, tuple] = {}
-        self.plain_reports = False                    # this hub refuses a report that carries `provider_id` (an older one)
         self.reported: dict[str, tuple] = {}          # ... as the hub last took it
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
@@ -219,20 +218,12 @@ class SessionRunner:
             status = self.status.get(sid)
             if status is not None:
                 body |= {"state": status[0], "pid": status[1], "resume": status[2]}
-                if status[3] is not None and not self.plain_reports:
-                    body["provider_id"] = status[3]     # Codex's thread id: for the hub's record, never read back
+                if status[3] is not None:
+                    # Codex's thread id: for the hub's record, never read back. (A hub from before the field refuses
+                    # the report; hubs are upgraded before nodes.)
+                    body["provider_id"] = status[3]
             try:
-                try:
-                    self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code != 422 or "provider_id" not in body:
-                        raise
-                    # A hub from before the field refuses the whole report. The events matter more than its record
-                    # of the id (the id that counts is on this machine): send it again without, and from now on.
-                    log.warning("the hub refuses `provider_id` in a session report (an older hub); reporting without")
-                    self.plain_reports = True
-                    del body["provider_id"]
-                    self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):

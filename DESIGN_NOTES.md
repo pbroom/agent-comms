@@ -2596,10 +2596,12 @@ node says `[dispatch.sessions] codex = true` (strictly parsed, shipped `false`):
 offers no adapter for a Codex runner and everything is as it was. No parent/child sessions and no agent-callable
 tools yet (next PR).
 
-**Shape.** `providers/codex.py` is the second `ProviderSession`. The seam grew by three things, all optional for an
+**Shape.** `providers/codex.py` is the second `ProviderSession`. The seam grew by these, all optional for an
 adapter: the event `start_failed` (this PROCESS cannot serve the session: the host fails the message waiting on its
 handshake with the reason and stops the process; the session stays), `adopt(provider_id)` (the provider's own id
-for the session, handed back when a session is opened again; Claude ignores it), and `session_exists` may now answer
+for the session, handed back when a session is opened again; Claude ignores it), `runs_in(cwd)` (the directory the
+host starts the process in), `holds_turns()` (the provider is busy with something of its own: the next message
+waits), and `session_exists` may now answer
 from the adapter's own protocol state as well as from stderr. `provider_for(template, codex=...)` carries the gate;
 `SessionHost` binds it from its config, so an injected `provider_for` still takes just the template.
 
@@ -2614,7 +2616,8 @@ names matched the plan except where noted):
   initialized"`. Then the notification `initialized` (the server answered `model/list` without it; the adapter
   sends it all the same). With the delta methods opted out no delta notification arrived. `--listen stdio://` may
   be given explicitly (the adapter does). An unknown method is `-32600 "Invalid request: unknown variant ..."`.
-- *Thread.* `thread/start {cwd, model, sandbox, approvalPolicy, developerInstructions}` -> `{thread: {id, ...},
+- *Thread.* `thread/start {model, sandbox, approvalPolicy}` (it also takes `cwd` and `developerInstructions`, which
+  the adapter no longer sends: see "No `cwd` on `thread/start`" below) -> `{thread: {id, ...},
   model, cwd, sandbox, approvalPolicy, ...}` and a `thread/started` notification (its id is under `params.thread`,
   not `params.threadId`). The id is a lower-case UUID (v7) and equals `thread.sessionId`. Without `cwd` the
   process's own directory is used; a `cwd` that does not exist is accepted. An unknown `sandbox` or
@@ -2669,17 +2672,34 @@ names matched the plan except where noted):
 **The command.** From the node's own `codex exec` runner for the agent, as `ClaudeSession.argv` derives from the
 Claude one (`providers.codex.session_command`): `codex app-server <kept> --listen stdio://`. Kept: every
 `-c`/`--config` pair in any spelling, `--enable`/`--disable <feature>`, `--strict-config`. Turned into `thread/start`
-parameters: `-m/--model` (the hub's override, validated by `validate_model`, wins), `-s/--sandbox` (else `-c
-sandbox_mode`, else `read-only` as `codex exec` has it), `-C/--cd`. Dropped: `exec`, `{prompt}`,
-`--skip-git-repo-check`, `--json`, `--color`. Refused, by flag name and never by value: everything else (a profile,
+parameters: `-m/--model` (the hub's override, validated by `validate_model`, wins) and `-s/--sandbox` (else `-c
+sandbox_mode`, else `read-only` as `codex exec` has it). Dropped: `exec`, `{prompt}`, `--skip-git-repo-check`,
+`--json`, `--color`, and `--cd` (below). Refused, by flag name and never by value: everything else (a profile,
 `--add-dir`, `--ephemeral`, images, an output file, a second positional), and with its own message anything that
 turns the sandbox or approvals off (`--dangerously-bypass-approvals-and-sandbox`, `--approve-for-me`,
-`danger-full-access` by flag or `-c`). `approvalPolicy` is always `never`, and `developerInstructions` is a fixed
-note that nobody can approve anything here (left out when the runner sets `developer_instructions` itself).
-`SessionHost._argv` now fills in `{project}` and `{thread}` BEFORE the adapter sees the template (the adapter needs
-the run directory as a protocol value); `{prompt}` still reaches it to be dropped, and for Claude the argv is
-unchanged. `with_writable_roots` already adds the Codex `-c` override. Nothing executable crosses the wire: the
-hub still sends agent, project and model only.
+`danger-full-access` by flag or `-c`). `approvalPolicy` is always `never`. `with_writable_roots` already adds the
+Codex `-c` override. Nothing executable crosses the wire: the hub still sends agent, project and model only.
+
+**No `cwd` on `thread/start`, no instructions of ours** (review round 1). The first version sent the run directory
+as `cwd` and a fixed `developerInstructions` note. Both are gone:
+- *`cwd`.* A `thread/start` that names a `cwd` makes the 0.171.0 app-server record that directory as TRUSTED in the
+  user's config.toml, and a trusted checkout's own `.codex` config is loaded, which can start host processes
+  (reviewer, from `app-server/src/request_processors/thread_processor.rs`). Seen live in a TEMPORARY Codex home
+  (`CODEX_HOME`, nothing of the user's), each time in a fresh `git init` directory: `thread/start` with `cwd` and
+  `workspace-write` wrote `[projects."<dir>"] trust_level = "trusted"`; with `read-only` it wrote nothing;
+  `thread/start` WITHOUT `cwd` wrote nothing under either sandbox and the thread's directory was the process's own;
+  `thread/resume` wrote nothing with or without `cwd` under either sandbox. `codex exec` leaves `cwd` out of its
+  own `thread/start`. So the session's process is started in the node's run directory (the host always did:
+  `spawner(..., cwd=)`) and `thread/start` names none. `--cd` in the runner may therefore only say that directory
+  (`{project}`, or the same path): anything else is refused at `open`, since it could no longer be honoured. The
+  host tells the adapter the directory (`runs_in`), and `SessionHost._argv` is back to what it was (the pre-rendering
+  of `{project}` is gone).
+- *`thread/resume` does name it.* Without `cwd` a resumed thread goes on in the directory it was CREATED in
+  (seen live: process in another directory, thread still in the old one), which after a `[dispatch.worktrees]`
+  change is an old checkout. The adapter sends the directory the node resolves now.
+- *`developerInstructions`* on `thread/start` replaces the owner's configured `developer_instructions` (reviewer,
+  from `core/src/config/mod.rs`). Nothing is injected: `approvalPolicy: never` and the refusals above already keep
+  the session unattended. A runner's own `-c developer_instructions=...` is passed on like any other override.
 
 **Denials** (names only, as for Claude; the turn then leaves the session `waiting`): a server request is answered
 at once with its refusal and reported by kind (`commandExecution`, `fileChange`, `permissions`, `mcpElicitation`,
@@ -2691,26 +2711,36 @@ an argument. A sub-agent's request is refused the same way. `approval_requested`
 unanswered.
 
 **The thread id** is Codex's, so it must outlive the process. The host records it in
-`data/node-logs/node-session-providers.json` (mode 600, written when `ready` arrives; dropped when the session is
-forgotten, and pruned to the sessions the hub lists) and hands it to the adapter when the session is opened
-(`adopt`). The node also reports it (`provider_id` in the status of a report, only when it is not the session id, so
-a Claude session's reports are byte for byte what they were) and the hub keeps it on the session record and shows it
-to the human (`board session show`). The hub NEVER sends it back to a node: a thread id from the hub would let the
-hub point a session at any Codex conversation on that machine. A hub from before the field refuses the whole report
-(422, `extra="forbid"`); the node then sends it again without the id and stops sending it.
+`data/node-logs/node-session-providers.json` (mode 600; dropped when the session is forgotten, and pruned to the
+sessions the hub lists) and hands it to the adapter when the session is opened (`adopt`). The node also reports it
+(`provider_id` in the status of a report, only when it is not the session id, so a Claude session's reports are byte
+for byte what they were) and the hub keeps it on the session record and shows it to the human (`board session
+show`). The hub NEVER sends it back to a node: a thread id from the hub would let the hub point a session at any
+Codex conversation on that machine. A hub from before the field refuses such a report (422, `extra="forbid"`): hubs
+are upgraded before nodes. (The first version retried without the id and then stopped sending it; review round 1
+took that out, since one 422 for any other reason would have suppressed the id for good.)
 
-**When is there something to resume.** For Claude `ready` arrives with the first turn, and the session exists from
-then on. For Codex `ready` only means an id was issued; Codex keeps nothing until a turn has started. So the host's
-`resume` flag is now set by `turn_started` for a provider with a handshake (`SessionHost._confirms`), by `ready`
-otherwise. A thread whose process died between the two is simply started anew.
+**When is there something to resume** (review round 1). For Claude `ready` arrives with the first turn, and the
+session exists from then on. For Codex `ready` only means an id was issued: Codex keeps nothing of a thread until a
+turn has started in it. The first version set `resume` when `turn_started` was read. That left a window: Codex
+records the turn, the node dies before it reads `turn/started`, both flags (the hub's and the state file's) still
+say "nothing to resume", and the restart starts a NEW thread without a word. Now the host puts it on record BEFORE
+the first `turn/start` is written (`SessionHost._write`): `resume` is set and the thread id goes into
+`node-session-providers.json` then, and not at `ready`. `open` trusts that record over whatever the caller says: a
+recorded id is resumed. A thread that only got an id (no turn written) has no record and is simply started anew.
+If the turn never reached Codex after all, the resume is refused and that is said (below). The lost turn itself is
+reported failed as ever and never written again.
 
-**Start-mode correction, the Codex way.** The spike showed "unknown thread" can be told apart ("no rollout found for
-thread id"). A refused `thread/resume` with that message, or a session opened with `resume` and no id on record,
-is `start_failed` with a detail that names the thread and says "The next message starts a NEW thread, without the
-earlier turns"; the adapter's `session_exists` then answers False, `_correct_start_mode` flips `resume` and the host
-forgets the id (memory and file). So: one failed message, loudly, then a new thread; never a silent switch. Any
-other refused resume or start fails that message with Codex's reason and changes nothing (the next message tries
-again). A resume that answers with another thread id, or a start without a usable id, is `fatal` for the session.
+**Start-mode correction, the Codex way** (review round 1). ANY refused `thread/resume` gives the thread up, not only
+"no rollout found for thread id" (a refusal that does not go away would otherwise fail every later message the same
+way); so does a session opened with `resume` and no id on record. It is `start_failed` with a detail that names the
+thread, gives Codex's reason, and ends "The next message starts a NEW thread, without the earlier turns". The fresh
+start is on record BEFORE that failure is reported: when the host reads `start_failed` it asks the adapter
+(`session_exists`, False) and clears `resume`, the state file's flag and the id's record at once, where the first
+version waited until the process had been reaped (a node that restarted in between tried the same resume again).
+So: one failed message, loudly, then a new thread; never a silent switch. A refused `thread/start` fails that
+message with Codex's reason and changes nothing. A resume that answers with another thread id, or a start without a
+usable id, is `fatal` for the session.
 
 **Handshake timeout.** A provider with `waits_for_ready` used to inherit the turn timeout for its handshake (30
 minutes). It now has `handshake_seconds` (constructor argument, default 60): the message waiting on it fails with
@@ -2718,7 +2748,23 @@ minutes). It now has `handshake_seconds` (constructor argument, default 60): the
 on the way: a process that EXITED during its handshake failed nothing, so its message stayed in the inbox and a new
 process was started on every pass, for ever (reachable with a runner flag Codex refuses, e.g. `--strict-config`
 against a config with an unknown key). It now fails the message that started it ("the process exited (code N)
-before it was ready").
+before it was ready"). Review round 1 found the same loop one path over: a pipe that breaks while `initialize` is
+written stopped the process from the host's side, so neither the write path (no turn to fail) nor the reap (the
+host had stopped it) settled the message. Every handshake failure now goes through `_fail_start` (refused, timed
+out, exited, not writable), which takes the message out of the inbox and fails it, once.
+
+**Turn ids** (review round 1). The answer to a `turn/start` is matched to the request of the turn in flight, and
+that request is retired when its turn ends. Before, a turn named by its `turn/started` could end while the answer
+to its request was still on its way; that answer then named the NEXT turn with the old id, whose end was ignored
+and whose interrupt named the wrong turn. The answer is also what names a turn when a `turn/started` came first.
+
+**A turn Codex begins by itself** (review round 1). Between messages the adapter now watches its own thread: a
+`turn/started` there that no message started is a turn of Codex's own (it goes on with a goal, runs a queued
+prompt). A `turn/start` written during it would be steered into it and answered with its result (above), so
+`holds_turns()` is True until that turn's `turn/completed` (or the thread reports `idle`), and the host keeps the
+next message in its inbox, unwritten and undelivered, for at most the turn timeout; past that the message fails
+("the agent was busy with a turn of its own for N minutes") and the process is stopped. Nothing of such a turn is
+reported. Not seen live: no automatic turn was provoked.
 
 **Proof.**
 - `tests/test_providers_codex.py`: the adapter from recorded strings (handshake, start vs resume, turn, text, the
@@ -2726,7 +2772,7 @@ before it was ready").
 - `tests/test_session_host.py`: the host with the fake handshake provider and with the real adapter over fake pipes
   (nothing but `initialize` before ready, handshake timeout, in-band interrupt, restart adopts the recorded id, a
   thread that is gone), and `tests/stand_in_codex.py` through real pipes. `tests/test_hosted_sessions.py`: the same
-  through the hub and a node (the record, the restart, the gate, an older hub).
+  through the hub and a node (the record, the restart, the gate, a node that died before its first report).
 - `tests/stand_in_codex.py`: a stand-in app-server speaking these lines, with threads on disk so another process
   can resume them, a sub-agent's thread and a commentary message in every turn, and an approval request on demand.
 - `scripts/session-host-e2e.py` runs a Codex session first (`--codex-bin PATH`, default the stand-in; `--only`):
@@ -2738,6 +2784,11 @@ before it was ready").
   start (process start and handshake included), 0.13 s to an idle session, the queued turn 0.00 s after a 12 s
   turn ended, and after the node restart 0.90 s to the write and the reply "lantern", the word given in turn 1.
   Its transcript: five `turn/completed`, all `completed`; five `final_answer` messages; no server request.
+  After review round 1 the real run uses a fresh `git init` checkout and the workspace-write sandbox (the case in
+  which a `cwd` would record trust) and compares the user's `~/.codex/config.toml` before and after: `thread/start`
+  was `{sandbox, approvalPolicy, model}` and nothing else, Codex reported the checkout as the thread's directory,
+  the resume named it, and the file's mtime (to the nanosecond) and SHA-256 were unchanged; 1.24 s to the first
+  write, 0.21 s to an idle session, 0.78 s across the restart, reply "lantern".
 
 **Residual risks / not verified.**
 - A sandbox refusal is invisible in the events (above), so `show` lists no denial for it; only what Codex asks for
@@ -2746,11 +2797,15 @@ before it was ready").
   `partial_answer` were not seen. `item/permissions/requestApproval`, `mcpServer/elicitation/request`,
   `item/tool/requestUserInput`, `item/fileChange/requestApproval` and the two legacy approvals are answered from
   the schema only; only the command approval was exercised live.
-- Whether `developerInstructions` on `thread/start` replaces or adds to a `developer_instructions` in the user's
-  config.toml was not checked (the adapter sends none when the runner sets one by `-c`).
-- The "no rollout found" wording is 0.171.0's. If a later version words it differently, a lost thread fails every
-  message with Codex's reason until the session is closed (as the same risk for Claude's two messages); a test
-  pins the string.
+- The trust findings are 0.171.0's, in a temporary Codex home with fresh `git init` directories. A later version
+  could record trust on another request; the real-Codex e2e compares the user's config.toml (mtime and SHA-256)
+  before and after its run, in a fresh git checkout under workspace-write, and fails if it changed.
+- A crash after the first `turn/start` was written but before Codex recorded anything costs one loudly failed
+  message at the next start (the resume is refused), where it used to start a new thread quietly. Chosen: the
+  other error loses a conversation without a word.
+- If the node dies after the host recorded a fresh start and before the hub heard of the failed message, the hub
+  still says `resume`; the next message then fails once more ("this node has no record of the Codex thread") before
+  the new thread starts. Loud both times.
 - A thread lives in the node machine's Codex home; the hub cannot move a session, and deleting
   `~/.codex/sessions` loses hosted conversations (loudly, as above). The spike and the real run left about fifteen
   small threads there.
@@ -2760,6 +2815,7 @@ before it was ready").
   configuration names.
 - `[dispatch.sessions] codex` is the node's switch only; the hub places a Codex session on any hosting node that
   has a runner for the agent, and a node without the switch ends it with the reason.
-- Codex's own automatic turns in a hosted thread (a goal, a queued prompt) were not looked at: a message written
-  while one runs would be steered into it.
+- Codex's own automatic turns in a hosted thread (a goal, a queued prompt) are held against from the protocol's
+  shape only (above); none was seen live. One that starts in the instant between the host's check and its write
+  would still take the message.
 - Not run on the second Mac or against the live hub and node; nothing was deployed or enabled.

@@ -1630,13 +1630,13 @@ def test_a_hosted_codex_session_takes_turns_through_the_hub_and_its_thread_id_is
     assert [m["method"] for m in written(child)] == ["initialize"]
     assert (show(cenv, sid)["state"], msg(cenv, sid, 1)["state"]) == ("starting", "queued"), "nothing is delivered yet"
     codex_handshake(cenv, child)
-    start_params = written(child)[2]["params"]
-    assert (start_params["model"], start_params["cwd"], start_params["approvalPolicy"]) == (
-        "gpt-6-luna", str(cenv.work), "never")
+    assert written(child)[2]["params"] == {"sandbox": "workspace-write", "approvalPolicy": "never",
+                                           "model": "gpt-6-luna"}
+    assert call["cwd"] == str(cenv.work), "the process is started in the run directory; Codex is told no other"
     view = show(cenv, sid)
     assert (view["state"], view["provider_id"], msg(cenv, sid, 1)["state"]) == ("running", cx.THREAD, "delivered")
     listing = cenv.laptop.get("/api/nodes/sessions").json()
-    assert listing["sessions"][0]["resume"] is False, "a thread without a turn is nothing to resume"
+    assert listing["sessions"][0]["resume"] is True, "a turn was written to that thread: it is one to resume"
     assert cx.THREAD not in json.dumps(listing), "the id is the hub's to show, never to hand back to a node"
 
     send(cenv, sid, "second")
@@ -1750,26 +1750,40 @@ def test_the_provider_id_in_a_report_is_checked_and_a_claude_session_never_sends
         "Claude's own id is the session id: its reports are what they were"
 
 
-def test_a_hub_from_before_the_field_still_gets_every_event_of_a_codex_session(cenv):
-    """An older hub refuses a report with a field it does not know (422), whole. The node sends it again without."""
-    hub, refused = cenv.node.sessions.client, []
-
-    class OlderHub:
-        def request(self, method, path, **kw):
-            if method == "POST" and "provider_id" in (kw.get("json") or {}):
-                refused.append(path)
-                return httpx.Response(422, request=httpx.Request(method, "http://127.0.0.1:8787" + path))
-            return hub.request(method, path, **kw)
-
-    cenv.node.sessions.client = OlderHub()
+def test_a_node_that_died_before_it_could_report_the_first_turn_resumes_the_same_codex_thread(cenv):
+    """Codex may have recorded the turn. The hub was told nothing (not `delivered`, not the thread id, not `resume`),
+    so only the node's own record can keep the restart from silently starting a NEW thread."""
     sid = start(cenv, "first", agent="codex")["session_id"]
+    cenv.node.sessions.client = NoReports(cenv.node.sessions.client)     # it fetches; nothing it reports arrives
     tick(cenv)
-    [child] = children(cenv)
-    codex_handshake(cenv, child)
-    assert len(refused) == 1 and cenv.node.sessions.plain_reports is True
-    assert msg(cenv, sid, 1)["state"] == "delivered" and show(cenv, sid)["provider_id"] is None
-    codex_turn(cenv, child, "the answer")
-    assert show(cenv, sid)["reply"] == "the answer" and len(refused) == 1, "it is not tried again"
+    [old] = children(cenv)
+    old.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv)
+    old.emit(cx.reply(2, cx.THREAD_RESULT))
+    tick(cenv)
+    assert written(old)[-1]["method"] == "turn/start"
+    listed = cenv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+    assert listed["resume"] is False and show(cenv, sid)["provider_id"] is None and msg(cenv, sid, 1)["state"] == "queued"
+
+    node = make_node(cenv, config=codex_config(cenv), log_dir=cenv.tmp / "laptop-logs")
+    node.procs.external[old.pid] = f"start-{old.pid}"       # the old session process is still alive
+    node.sessions.recover()
+    tick(cenv, node)
+    m = msg(cenv, sid, 1)
+    assert (m["state"], m["detail"]) == ("failed", LOST), "the turn is lost and said to be; it is not replayed"
+    send(cenv, sid, "second")
+    tick(cenv, node)
+    [fresh] = children(cenv, node)
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    resume = written(fresh)[2]
+    assert (resume["method"], resume["params"]["threadId"]) == ("thread/resume", cx.THREAD)
+    fresh.emit(cx.reply(2, cx.THREAD_RESULT))
+    tick(cenv, node)
+    assert [m["params"]["input"][0]["text"] for m in written(fresh) if m.get("method") == "turn/start"] == ["second"]
+    codex_turn(cenv, fresh, "it remembers", node=node)
+    view = show(cenv, sid)
+    assert (view["reply"], view["provider_id"]) == ("it remembers", cx.THREAD)
 
 
 def test_real_pipes_a_hosted_codex_session_through_the_hub_and_a_node_restart(tmp_path):

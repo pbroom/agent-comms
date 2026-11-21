@@ -441,11 +441,17 @@ uv run board session start /Users/peter/the-little-things "Summarise the open TO
 ```
 
 The node takes the agent's ordinary `codex exec` runner and starts `codex app-server` from it instead: every `-c`
-override is kept (the board tool approvals, `sandbox_workspace_write.*`, `[dispatch] writable_roots`), `--model`,
-`--sandbox` and `--cd` become the conversation's settings, and `--model` on `board session start` replaces the
-runner's model. A runner with a flag the node does not understand is refused with the flag's name, and so is one
-that turns the sandbox or approvals off (`--dangerously-bypass-approvals-and-sandbox`, `--approve-for-me`,
+override is kept (the board tool approvals, `sandbox_workspace_write.*`, `[dispatch] writable_roots`), `--model`
+and `--sandbox` become the conversation's settings, and `--model` on `board session start` replaces the runner's
+model. A runner with a flag the node does not understand is refused with the flag's name, and so is one that turns
+the sandbox or approvals off (`--dangerously-bypass-approvals-and-sandbox`, `--approve-for-me`,
 `danger-full-access`). Everything above holds for a Codex session too. What differs:
+
+- **It works in the node's run directory for the project**, where its process is started. `--cd` in the runner
+  must be `{project}` (as shipped) or that same directory: Codex is never told a directory when the conversation
+  starts, because that request would make it mark the checkout as trusted in `~/.codex/config.toml` and load the
+  checkout's own Codex settings. Nothing is added to Codex's instructions either: your `developer_instructions`
+  stay as you configured them.
 
 - **Approvals are always off** (`approvalPolicy: never`), whatever the runner or `~/.codex/config.toml` says: nobody
   is there to answer. A board tool the runner approves with `-c` works. An MCP tool that would need approval fails
@@ -454,10 +460,12 @@ that turns the sandbox or approvals off (`--dangerously-bypass-approvals-and-san
 - **The conversation is a Codex thread** with an id of Codex's own. The node keeps it in
   `data/node-logs/node-session-providers.json` (mode 600) and resumes that thread after a restart or an idle stop;
   `board session show` prints it (`codex-cli id ...`). The thread itself lives in the node machine's Codex home
-  (`~/.codex/sessions`), like any Codex run. If Codex no longer has the thread, one message fails and says that the
-  next one starts a NEW thread; nothing switches threads silently.
+  (`~/.codex/sessions`), like any Codex run. If Codex refuses to resume the thread (it no longer has it, or for any
+  other reason), one message fails and says that the next one starts a NEW thread; nothing switches threads
+  silently.
 - **A turn past the timeout is interrupted, not killed:** the process stays and takes the next message. A process
-  that does not finish its handshake within a minute fails the message that started it.
+  that does not finish its handshake within a minute fails the message that started it. While Codex runs a turn of
+  its own in the conversation (it goes on with a goal), your next message waits for that turn to end.
 - **Not hosted yet:** the dispatcher's Codex inbox and browser additions (a hosted session gets the runner as
   written), and a wake's `board_read_updates` needs the board MCP server in that machine's Codex configuration, as
   a dispatched Codex run does.

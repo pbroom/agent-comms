@@ -178,8 +178,8 @@ runners = []                # e.g. ["codex-cli"]: Codex runner keys only
 [dispatch.sessions]
 enabled = false
 # Codex too (README "Hosted sessions"): the node runs the agent's `codex exec` runner as `codex app-server` instead,
-# with every `-c` override kept, its --sandbox and --cd as the thread's, and approvals off (anything that would ask
-# is refused). Off: a Codex agent cannot be hosted here and nothing else changes. Read on the node only.
+# in the run directory, with every `-c` override kept, its --sandbox as the thread's, and approvals off (anything
+# that would ask is refused). Off: a Codex agent cannot be hosted here and nothing else changes. Read on the node only.
 codex = false
 idle_hours = 8             # a session's process idle this long is stopped; the session stays, its next message resumes it
 max_live = 4                # session processes at once; one more stops the longest-idle one, or waits when none is idle

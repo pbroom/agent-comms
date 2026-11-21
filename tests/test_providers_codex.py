@@ -10,7 +10,7 @@ import pytest
 from agent_comms import providers
 from agent_comms.dispatch import DispatchConfig, with_writable_roots
 from agent_comms.providers import Event
-from agent_comms.providers.codex import BYPASS_REFUSED, HOSTED_INSTRUCTION, OPT_OUT, CodexSession, session_command
+from agent_comms.providers.codex import BYPASS_REFUSED, NEW_THREAD, OPT_OUT, CodexSession, session_command
 
 ROOT = Path(__file__).resolve().parents[1]
 SID = "0a00c308-20b7-40fc-9a1c-19b8bc832d6d"            # the hub's session id
@@ -19,7 +19,7 @@ TURN = "01a1fe39-5945-7782-b043-ba8a65280ee8"
 CHILD, CHILD_TURN = "01a1fe3c-8ce8-7290-90e5-c94c043adeaa", "01a1fe3c-8cf0-7583-b267-81b961155e03"
 WORK = "/Users/someone/work/checkout"
 APPROVE = 'mcp_servers.agent-comms.tools.board_post.approval_mode="approve"'
-RUNNER = ["codex", "exec", "--cd", WORK, "--sandbox", "workspace-write", "-c", APPROVE, "{prompt}"]
+RUNNER = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write", "-c", APPROVE, "{prompt}"]
 
 INIT_RESULT = {"userAgent": "agent-comms/0.171.0 (Mac OS 27.0.1; arm64) unknown (agent-comms; 0.1.0)",
                "codexHome": "/Users/someone/.codex", "platformFamily": "unix", "platformOs": "macos"}
@@ -64,6 +64,7 @@ def sent(writes) -> list[dict]:
 
 def session(resume=False, model=None, template=RUNNER, thread=None):
     p = CodexSession()
+    p.runs_in(WORK)         # the host starts the process there (SessionHost.open)
     p.adopt(thread)
     return p, p.argv(template, session_id=SID, resume=resume, model=model)
 
@@ -93,9 +94,8 @@ def in_turn(text="hello", **kw) -> CodexSession:
 def test_the_session_command_is_app_server_with_every_override_kept_and_the_rest_as_thread_parameters():
     argv, params = session_command(RUNNER)
     assert argv == ["codex", "app-server", "-c", APPROVE, "--listen", "stdio://"]
-    assert params == {"sandbox": "workspace-write", "approvalPolicy": "never", "cwd": WORK,
-                      "developerInstructions": HOSTED_INSTRUCTION}
-    assert "exec" not in argv and "{prompt}" not in argv and WORK not in argv
+    assert params == {"sandbox": "workspace-write", "approvalPolicy": "never"}
+    assert "exec" not in argv and "{prompt}" not in argv and "{project}" not in argv and "--cd" not in argv
 
 
 def test_the_shipped_codex_runner_can_be_hosted_with_all_its_board_tool_approvals():
@@ -106,12 +106,10 @@ def test_the_shipped_codex_runner_can_be_hosted_with_all_its_board_tool_approval
     assert len(overrides) > 20 and [argv[i + 1] for i, a in enumerate(argv) if a == "-c"] == overrides
     assert argv[:2] == ["codex", "app-server"] and argv[-2:] == ["--listen", "stdio://"]
     assert len(argv) == 2 + 2 * len(overrides) + 2, "nothing else is passed on"
-    # An unrendered {project} is not a directory: the process's own cwd (the run directory) is the thread's.
-    assert params == {"sandbox": "workspace-write", "approvalPolicy": "never",
-                      "developerInstructions": HOSTED_INSTRUCTION}
+    assert params == {"sandbox": "workspace-write", "approvalPolicy": "never"}, "no cwd, no instructions of ours"
 
 
-def test_model_sandbox_and_cd_are_read_in_every_spelling_and_the_hubs_model_wins():
+def test_model_and_sandbox_are_read_in_every_spelling_and_the_hubs_model_wins():
     for own in (["-m", "gpt-6-sol"], ["--model", "gpt-6-sol"], ["--model=gpt-6-sol"], ["-mgpt-6-sol"]):
         assert session_command(["codex", "exec", *own, "{prompt}"])[1]["model"] == "gpt-6-sol"
         argv, params = session_command(["codex", "exec", *own, "{prompt}"], "gpt-6-luna")
@@ -121,9 +119,24 @@ def test_model_sandbox_and_cd_are_read_in_every_spelling_and_the_hubs_model_wins
                   ["-c", "sandbox_mode=read-only", "--sandbox", "workspace-write"]):
         assert session_command(["codex", "exec", *flags, "{prompt}"])[1]["sandbox"] == "workspace-write"
     assert session_command(["codex", "exec", "{prompt}"])[1]["sandbox"] == "read-only", "as `codex exec` without it"
-    for flags in (["-C", WORK], ["--cd=" + WORK], ["--cd", WORK]):
-        assert session_command(["codex", "exec", *flags, "{prompt}"])[1]["cwd"] == WORK
-    assert "cwd" not in session_command(["codex", "exec", "{prompt}"])[1]
+
+
+def test_the_run_directory_is_never_sent_on_thread_start_and_cd_may_only_name_it():
+    """A `cwd` on thread/start makes Codex 0.171.0 record that directory as trusted in the user's config.toml under
+    the workspace-write sandbox (seen live, in a temporary Codex home). `codex exec` sends none; neither do we: the
+    process is started in the run directory, which is then the thread's."""
+    for flags in (["-C", "{project}"], ["--cd={project}"], ["--cd", "{project}"], ["--cd", WORK], ["-C", WORK + "/"],
+                  []):
+        argv, params = session_command(["codex", "exec", *flags, "--sandbox", "workspace-write", "{prompt}"], cwd=WORK)
+        assert "cwd" not in params and WORK not in argv and "--cd" not in argv and "-C" not in argv, flags
+    for flags, cwd in ((["--cd", "/Users/someone/elsewhere"], WORK), (["--cd", WORK], None),
+                       (["--cd", "relative/dir"], WORK), (["-C", "{thread}"], WORK)):
+        with pytest.raises(ValueError, match=r"--cd must be \{project\}"):
+            session_command(["codex", "exec", *flags, "{prompt}"], cwd=cwd)
+    p, _ = session()
+    p.on_open()
+    start = sent(p.feed(reply(1, INIT_RESULT))[1])[1]
+    assert start["method"] == "thread/start" and "cwd" not in start["params"]
 
 
 def test_features_strict_config_and_every_spelling_of_an_override_are_kept_and_exec_only_flags_dropped():
@@ -133,9 +146,19 @@ def test_features_strict_config_and_every_spelling_of_an_override_are_kept_and_e
     assert argv == ["/opt/bin/codex", "app-server", "--disable", "plugins", "--enable", "goals", "-c", "a=1",
                     "-c", "b=2", "-c", "c=3", "--strict-config", "--listen", "stdio://"]
     assert params["approvalPolicy"] == "never"
-    # A runner with its own developer instructions keeps them: the thread is started without the hosted note.
-    assert "developerInstructions" not in session_command(
-        ["codex", "exec", "-c", 'developer_instructions="mine"', "{prompt}"])[1]
+
+
+def test_no_developer_instructions_are_injected_so_the_node_owners_own_stay_in_force():
+    """`developerInstructions` on thread/start REPLACES the `developer_instructions` of the owner's Codex config.
+    The approval policy and the refusals already keep the session unattended; nothing is added to the prompt."""
+    for template in (RUNNER, ["codex", "exec", "-c", 'developer_instructions="mine"', "{prompt}"]):
+        argv, params = session_command(template, cwd=WORK)
+        assert "developerInstructions" not in params and "baseInstructions" not in params
+    assert 'developer_instructions="mine"' in argv, "the runner's own override is passed on like any other"
+    for resume in (False, True):
+        p, _ = session(resume=resume, thread=THREAD)
+        p.on_open()
+        assert "developerInstructions" not in sent(p.feed(reply(1, INIT_RESULT))[1])[1]["params"]
 
 
 def test_writable_roots_reach_a_hosted_codex_session_as_the_same_override_a_dispatched_run_gets():
@@ -161,7 +184,7 @@ def test_a_runner_that_turns_the_sandbox_or_approvals_off_cannot_be_hosted(extra
     (["resume", "--last"], "extra positional"), (["some words"], "extra positional"),
     (["--sandbox", "bogus"], "sandbox must be one of"), (["--sandbox"], "has no value"),
     (["-c", "novalue"], "not key=value"), (["--enable", "a b"], "does not name a feature"),
-    (["--cd", "relative/dir"], "not an absolute path"), (["-m", "--dangerously-bypass"], "plain model name")])
+    (["--cd", "relative/dir"], "--cd must be"), (["-m", "--dangerously-bypass"], "plain model name")])
 def test_a_flag_the_adapter_does_not_understand_is_refused_never_passed_on(extra, why):
     with pytest.raises(ValueError, match=why):
         session_command(["codex", "exec", "{prompt}", *extra])
@@ -220,8 +243,7 @@ def test_the_handshake_is_initialize_then_initialized_and_thread_start():
     initialized, start = sent(writes)
     assert initialized == {"method": "initialized"}
     assert start == {"id": 2, "method": "thread/start", "params": {
-        "sandbox": "workspace-write", "approvalPolicy": "never", "model": "gpt-6-luna", "cwd": WORK,
-        "developerInstructions": HOSTED_INSTRUCTION}}
+        "sandbox": "workspace-write", "approvalPolicy": "never", "model": "gpt-6-luna"}}
     assert p.feed(reply(2, THREAD_RESULT)) == ([Event("ready", provider_id=THREAD)], [])
     assert p.feed(line(THREAD_STARTED)) == ([], []) and p.thread_id == THREAD
 
@@ -232,8 +254,10 @@ def test_a_restarted_process_resumes_the_thread_it_was_handed_and_never_starts_o
     _, writes = p.feed(reply(1, INIT_RESULT))
     resume = sent(writes)[1]
     assert resume["method"] == "thread/resume"
+    # The directory this node resolves NOW: without it Codex goes on where the thread was created (seen live), which
+    # may be an old checkout. On a resume a `cwd` records no trust (seen live, both sandboxes).
     assert resume["params"] == {"threadId": THREAD, "excludeTurns": True, "sandbox": "workspace-write",
-                                "approvalPolicy": "never", "cwd": WORK, "developerInstructions": HOSTED_INSTRUCTION}
+                                "approvalPolicy": "never", "cwd": WORK}
     assert p.feed(reply(2, THREAD_RESULT)) == ([Event("ready", provider_id=THREAD)], [])
     assert p.session_exists("") is None
     # The same adapter starts the next process too: per-process state starts over, the thread stays.
@@ -248,7 +272,7 @@ def test_a_thread_codex_has_no_record_of_fails_the_start_loudly_and_the_next_one
     p.feed(reply(1, INIT_RESULT))
     [ev], writes = p.feed(reply(2, error=NO_ROLLOUT))
     assert ev.kind == "start_failed" and writes == []
-    assert THREAD in ev.detail and "NEW thread" in ev.detail and "cannot be resumed" in ev.detail
+    assert THREAD in ev.detail and NEW_THREAD in ev.detail and "no rollout found" in ev.detail
     assert p.session_exists("") is False and p.thread_id is None, "the host flips to a fresh start"
     assert p.feed(reply(2, THREAD_RESULT)) == ([], []), "nothing more of this process is read"
     p.argv(RUNNER, session_id=SID, resume=False, model=None)
@@ -267,16 +291,22 @@ def test_resume_without_a_recorded_thread_id_is_the_same_loud_failure():
 
 
 @pytest.mark.parametrize("error, why", [
-    ({"code": -32600, "message": "invalid session id: invalid character: expected an optional prefix"}, "resume"),
+    ({"code": -32600, "message": "invalid session id: invalid character: expected an optional prefix"}, "invalid"),
     ({"code": -32603, "message": "failed to read the rollout:\n  disk error"}, "failed to read the rollout: disk"),
+    ({"code": -32603, "message": "x" * 500}, "x" * 120),
     ({"code": -32603}, "no reason given"), ("boom", "no reason given")])
-def test_any_other_refused_resume_fails_this_start_and_keeps_the_thread(error, why):
+def test_any_refused_resume_gives_the_thread_up_and_says_the_next_message_starts_a_new_one(error, why):
+    """Not only "no rollout found": a refusal that does not go away would fail every later message the same way."""
     p, _ = session(resume=True, thread=THREAD)
     p.on_open()
     p.feed(reply(1, INIT_RESULT))
     [ev], _ = p.feed(reply(2, error=error))
-    assert ev.kind == "start_failed" and why in ev.detail and "NEW thread" not in ev.detail
-    assert p.session_exists("") is None and p.thread_id == THREAD, "the next process tries to resume it again"
+    assert ev.kind == "start_failed" and why in ev.detail and THREAD in ev.detail and len(ev.detail) <= 300
+    assert ev.detail.endswith(NEW_THREAD), "never silently"
+    assert p.session_exists("") is False and p.thread_id is None, "decided before the failure is reported"
+    p.argv(RUNNER, session_id=SID, resume=False, model=None)
+    p.on_open()
+    assert sent(p.feed(reply(1, INIT_RESULT))[1])[1]["method"] == "thread/start"
 
 
 def test_a_refused_handshake_or_thread_start_fails_the_start():
@@ -410,6 +440,88 @@ def test_turn_started_names_the_turn_when_it_comes_before_the_reply():
     assert sent(p.interrupt())[0]["params"]["turnId"] == TURN
     assert p.feed(reply(3, TURN_REPLY)) == ([], [])
     assert p.feed(line(completed()))[0][0].kind == "turn_ended"
+
+
+def test_a_late_answer_to_an_earlier_turns_request_never_names_the_next_turn():
+    """Turn A is named by its `turn/started` and ends before the answer to its `turn/start` arrives. Turn B is sent.
+    A's answer must not make A's id B's: B's own end would be ignored and its interrupt would name A."""
+    p = ready()
+    p.turn("A")                                                             # request 3
+    assert p.feed(line(TURN_STARTED)) == ([Event("turn_started")], [])
+    p.feed(line(message("A's answer")))
+    assert p.feed(line(completed()))[0][0].text == "A's answer"
+    p.turn("B")                                                             # request 4
+    assert p.feed(reply(3, TURN_REPLY)) == ([], []), "A's request was retired with A"
+    assert p.interrupt() is None, "B has no id yet: A's is not taken for it"
+    b = {"turn": {**TURN_REPLY["turn"], "id": CHILD_TURN}}
+    assert p.feed(reply(4, b)) == ([], [])
+    assert sent(p.interrupt())[0]["params"]["turnId"] == CHILD_TURN
+    p.feed(line(message("B's answer", turn=CHILD_TURN)))
+    [ev], _ = p.feed(line(completed(turn=CHILD_TURN)))
+    assert (ev.kind, ev.ok, ev.text) == ("turn_ended", True, "B's answer")
+
+
+def test_a_refusal_of_an_earlier_turns_request_does_not_fail_the_next_turn():
+    p = ready()
+    p.turn("A")
+    p.feed(line(TURN_STARTED))
+    p.feed(line(completed("interrupted")))
+    p.turn("B")
+    assert p.feed(reply(3, error={"code": -32600, "message": "too late"})) == ([], [])
+    assert p.feed(reply(4, {"turn": {**TURN_REPLY["turn"], "id": CHILD_TURN}})) == ([], [])
+    assert p.feed(line(completed(turn=CHILD_TURN)))[0][0].ok is True
+
+
+def test_the_answer_to_the_turns_own_request_is_what_names_it():
+    """Also when a `turn/started` came first: a `turn/start` written while Codex ran a turn of its own is answered
+    with THAT turn, and it is that turn's end the message then waits for."""
+    p = ready()
+    p.turn("hello")
+    p.feed(line(TURN_STARTED))
+    assert p.feed(reply(3, {"turn": {**TURN_REPLY["turn"], "id": CHILD_TURN}})) == ([], [])
+    assert sent(p.interrupt())[0]["params"]["turnId"] == CHILD_TURN
+
+
+# ------------------------------------------------------------ a turn Codex begins by itself
+
+
+def own_turn(method, turn=CHILD_TURN, status="inProgress") -> bytes:
+    return line({"method": method, "params": {"threadId": THREAD, "turn": {"id": turn, "status": status, "items": []}}})
+
+
+def test_a_turn_codex_begins_in_the_sessions_thread_holds_the_next_message_until_it_is_over():
+    """Between two messages Codex may run a turn nobody here started. A `turn/start` written then is added to THAT
+    turn and answered with it (seen live), so the adapter says to hold, and reports nothing of the turn."""
+    p = ready()
+    assert p.holds_turns() is False
+    assert p.feed(own_turn("turn/started")) == ([], []) and p.holds_turns() is True
+    assert p.feed(line(message("not a reply to anyone", turn=CHILD_TURN))) == ([], [])
+    assert p.feed(own_turn("turn/completed", turn=TURN, status="completed")) == ([], []) and p.holds_turns() is True, \
+        "another turn's end is not this one's"
+    assert p.feed(own_turn("turn/completed", status="inProgress")) == ([], []) and p.holds_turns() is True
+    assert p.feed(own_turn("turn/completed", status="completed")) == ([], []) and p.holds_turns() is False
+    p.turn("hello")
+    p.feed(reply(3, TURN_REPLY))
+    p.feed(line(message("the answer")))
+    assert p.feed(line(completed()))[0][0].text == "the answer", "the held turn's message left nothing behind"
+
+
+def test_the_thread_going_idle_or_a_new_process_also_ends_the_hold_and_other_threads_never_start_one():
+    p = ready()
+    p.feed(own_turn("turn/started"))
+    p.feed(line({"method": "thread/status/changed", "params": {"threadId": THREAD, "status": {"type": "active"}}}))
+    assert p.holds_turns() is True
+    p.feed(line({"method": "thread/status/changed", "params": {"threadId": THREAD, "status": {"type": "idle"}}}))
+    assert p.holds_turns() is False
+    p.feed(own_turn("turn/started"))
+    p.argv(RUNNER, session_id=SID, resume=True, model=None)
+    assert p.holds_turns() is False, "a new process starts clean"
+    p = ready()
+    p.feed(line({"method": "turn/started", "params": {"threadId": CHILD, "turn": {"id": CHILD_TURN}}}))
+    assert p.holds_turns() is False, "a sub-agent's thread is not this session's"
+    p = in_turn()
+    p.feed(own_turn("turn/started"))
+    assert p.holds_turns() is False, "while a message's turn is in flight nothing is held"
 
 
 # ------------------------------------------------------------ other threads and other lines

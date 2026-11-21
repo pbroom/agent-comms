@@ -8,6 +8,10 @@ adapter relies on was observed on codex-cli 0.171.0 (DESIGN_NOTES "Session host:
 - Handshake: `initialize` (its result names the Codex home), the client notification `initialized`, then
   `thread/start` (Codex issues the thread id, a UUID) or `thread/resume` for a thread an earlier process had. The
   hub's session id is not Codex's: the thread id is this session's `provider_id`, and the node keeps it on disk.
+- The thread works in the directory the process is started in. `thread/start` is never given a `cwd`: with one,
+  the app-server records that directory as trusted in the user's config.toml (see `session_command`).
+  `thread/resume` is given the node's run directory: without it a thread goes on where it was created.
+- Nothing is added to the model's instructions: `developerInstructions` would replace the owner's configured ones.
 - A turn: `turn/start` answers with the turn's id, then come `turn/started`, `item/completed` for each item and one
   `turn/completed` whose `turn.status` is `completed`, `interrupted` or `failed` (with `turn.error`). The reply is
   the `agentMessage` item with `phase: "final_answer"`; `commentary` items are progress notes written before tool
@@ -42,19 +46,14 @@ OPT_OUT = ("item/agentMessage/delta", "item/plan/delta", "item/reasoning/summary
            "item/reasoning/summaryPartAdded", "item/reasoning/textDelta", "item/commandExecution/outputDelta",
            "item/fileChange/outputDelta", "item/fileChange/patchUpdated", "item/mcpToolCall/progress",
            "command/exec/outputDelta", "process/outputDelta")
-# Told to every hosted thread unless the runner sets `developer_instructions` itself (`-c`).
-HOSTED_INSTRUCTION = (
-    "This conversation is hosted by agent-comms: each turn is a message its node writes to you, and nobody is "
-    "watching a terminal. No one can approve a command, a file change or a tool call here, so anything that would "
-    "ask is refused at once. If something you need is refused, do not work around it: say in your reply what was "
-    "refused, and stop.")
 
 BYPASS_REFUSED = ("a Codex runner that turns the sandbox or approvals off (--dangerously-bypass-approvals-and-sandbox, "
                   "--approve-for-me, or the danger-full-access sandbox) cannot be hosted as a session")
 BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
                           "--approve-for-me", "--yolo"))
 # What a `codex exec` runner may carry. With a value: kept for app-server (`-c`, `--enable`, `--disable`), turned into
-# a `thread/start` parameter (model, sandbox, cd) or dropped as meaningless without exec's own output (`--color`).
+# a `thread/start` parameter (model, sandbox), checked and dropped (`--cd`: the process is started in the run
+# directory instead) or dropped as meaningless without exec's own output (`--color`).
 VALUE_FLAGS = {"-c": "config", "--config": "config", "-m": "model", "--model": "model", "-s": "sandbox",
                "--sandbox": "sandbox", "-C": "cd", "--cd": "cd", "--enable": "enable", "--disable": "disable",
                "--color": "color"}
@@ -62,6 +61,7 @@ BARE_KEPT = frozenset(("--strict-config",))
 BARE_DROPPED = frozenset(("--skip-git-repo-check", "--json"))    # app-server needs no git repository; its output is fixed
 
 NO_ROLLOUT = "no rollout found for thread id"       # thread/resume's error for a thread Codex has no record of
+NEW_THREAD = "The next message starts a NEW thread, without the earlier turns"
 NEEDS_APPROVAL = "requires approval"                # in an mcpToolCall's error under approvalPolicy never
 NO_SURFACE = "agent-comms hosts this session without an approval surface: nothing is approved here"
 # Requests the server may send, each answered at once with its refusal. The name is what is reported as denied.
@@ -85,17 +85,23 @@ def _unquoted(value: str) -> str:
     return value.strip().strip("\"'")
 
 
-def session_command(template: list[str], model: str | None = None) -> tuple[list[str], dict]:
+def session_command(template: list[str], model: str | None = None, cwd: str | None = None) -> tuple[list[str], dict]:
     """A `codex exec` runner template as a hosted session: the `codex app-server` argv and the `thread/start`
-    parameters. Every `-c` override, `--enable` and `--disable` is kept; `-m/--model`, `--sandbox` and `--cd` become
-    thread parameters (`model` from the caller wins); `exec`, the {prompt} element and exec's own output flags are
-    dropped. Anything else is refused: a flag this adapter does not understand is never passed on."""
+    parameters. Every `-c` override, `--enable` and `--disable` is kept; `-m/--model` and `--sandbox` become thread
+    parameters (`model` from the caller wins); `exec`, the {prompt} element and exec's own output flags are dropped.
+    Anything else is refused: a flag this adapter does not understand is never passed on.
+
+    `--cd` is never sent to Codex. A `thread/start` that names a `cwd` makes the app-server record that directory
+    as TRUSTED in the user's config.toml when the sandbox is workspace-write (seen live on 0.171.0), and with trust
+    comes the checkout's own Codex config. `codex exec` leaves `cwd` out of its own `thread/start`, and so does a
+    hosted session: its process is started in the run directory (`cwd`, the session host's), which is then the
+    thread's. So `--cd` may only say that directory: `{project}`, or the same path."""
     if not template or os.path.basename(template[0]) != "codex":
         raise ValueError("not a Codex runner")
     model = validate_model(model)
     kept: list[str] = []
     values: dict[str, str] = {}
-    own_instructions = exec_seen = False
+    exec_seen = False
     i = 1
     while i < len(template):
         arg = template[i]
@@ -131,8 +137,6 @@ def session_command(template: list[str], model: str | None = None) -> tuple[list
                 if _unquoted(val) == "danger-full-access":
                     raise ValueError(BYPASS_REFUSED)
                 values["config_sandbox"] = _unquoted(val)       # as in Codex, the last one counts
-            elif key == "developer_instructions":
-                own_instructions = True
             kept += ["-c", value]
         elif kind in ("enable", "disable"):
             if not FEATURE_RE.fullmatch(value):
@@ -151,13 +155,10 @@ def session_command(template: list[str], model: str | None = None) -> tuple[list
     model = model if model is not None else validate_model(values.get("model"))
     if model is not None:
         params["model"] = model
-    cwd = values.get("cd")
-    if cwd is not None and cwd != "{project}":      # unrendered: the process's own directory is the run directory
-        if not os.path.isabs(cwd):
-            raise ValueError("this Codex runner's --cd is not an absolute path")
-        params["cwd"] = cwd
-    if not own_instructions:
-        params["developerInstructions"] = HOSTED_INSTRUCTION
+    cd = values.get("cd")
+    if cd is not None and cd != "{project}" and (cwd is None or os.path.normpath(cd) != os.path.normpath(cwd)):
+        raise ValueError("this Codex runner's --cd must be {project}: a hosted session works in the run directory "
+                         "its node starts it in")
     return [template[0], "app-server", *kept, "--listen", "stdio://"], params
 
 
@@ -177,18 +178,25 @@ class CodexSession:
     def __init__(self):
         self.session_id: str | None = None
         self.thread_id: str | None = None       # Codex's id for this session: adopted, or issued by thread/start
+        self._cwd: str | None = None            # where the host starts this session's process (`runs_in`)
         self._params: dict = {}
         self._resume = False
-        self._gone = False                      # the thread this process was told to resume does not exist
+        self._gone = False                      # the thread this process was told to resume cannot be resumed
+        self._pending: dict[int, str] = {}      # request id -> its method, until answered
+        self._start_id: int | None = None       # the id of the turn/start request of the turn in flight
         self._reset()
 
     def _reset(self) -> None:
         self._next_id = 0
-        self._pending: dict[int, str] = {}      # request id -> its method, until answered
+        self._pending = {}
         self._ready = self._dead = False
+        self._own_turn: str | None = None       # a turn Codex began in this thread that no message here started
         self._end_turn()
 
     def _end_turn(self) -> None:
+        # The turn's own request is retired with it: its answer, should it still come, belongs to no later turn.
+        self._pending.pop(self._start_id, None)
+        self._start_id = None
         self._turn_open = self._started = False
         self._turn_id: str | None = None
         self._final: str | None = None          # the last final_answer of the turn
@@ -200,9 +208,12 @@ class CodexSession:
     def adopt(self, provider_id: str | None) -> None:
         self.thread_id = provider_id if isinstance(provider_id, str) and THREAD_ID_RE.fullmatch(provider_id) else None
 
+    def runs_in(self, cwd: str) -> None:
+        self._cwd = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+
     def argv(self, template: list[str], *, session_id: str, resume: bool, model: str | None) -> list[str]:
         self.session_id = validate_session_id(session_id)
-        argv, self._params = session_command(template, model)
+        argv, self._params = session_command(template, model, self._cwd)
         self._resume, self._gone = bool(resume), False
         self._reset()
         return argv
@@ -214,7 +225,15 @@ class CodexSession:
     def turn(self, text: str) -> list[bytes]:
         self._end_turn()
         self._turn_open = True
-        return [self._request("turn/start", {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]})]
+        data = self._request("turn/start", {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]})
+        self._start_id = self._next_id
+        return [data]
+
+    def holds_turns(self) -> bool:
+        """Codex is running a turn of its own in this thread (one no message here started). A `turn/start` written
+        now would not start a turn: Codex adds its text to the turn in flight and answers with THAT turn, whose
+        result is not the message's. The host keeps the next message until that turn is over."""
+        return self._own_turn is not None and not self._dead
 
     def interrupt(self) -> list[bytes] | None:
         """`turn/interrupt` for the turn in flight, once Codex has named it; before that the host stops the process."""
@@ -223,8 +242,8 @@ class CodexSession:
         return [self._request("turn/interrupt", {"threadId": self.thread_id, "turnId": self._turn_id})]
 
     def session_exists(self, stderr: str) -> bool | None:
-        """False once Codex said it has no record of the thread this process was told to resume (or this machine had
-        no thread id to give it): the next process starts a new thread. Codex never refuses a start because a thread
+        """False once Codex refused to resume the thread this process was told to resume (or this machine had no
+        thread id to give it): the next process starts a new thread. Codex never refuses a start because a thread
         exists, so this is never True."""
         return False if self._gone else None
 
@@ -281,18 +300,27 @@ class CodexSession:
                 self._gone = True
                 return self._start_failed(
                     "this node has no record of the Codex thread for this session, so its conversation cannot be "
-                    "resumed. The next message starts a NEW thread, without the earlier turns")
-            start = (self._request("thread/resume", {"threadId": self.thread_id, "excludeTurns": True} | self._params)
-                     if self._resume else self._request("thread/start", dict(self._params)))
+                    "resumed. " + NEW_THREAD)
+            if self._resume:
+                # The run directory as this node resolves it NOW: left out, Codex would go on in the directory the
+                # thread was created in, which may be an old checkout. (Unlike on thread/start, a `cwd` here does
+                # not make Codex record the directory as trusted: seen live on 0.171.0.)
+                where = {"cwd": self._cwd} if self._cwd else {}
+                start = self._request("thread/resume",
+                                      {"threadId": self.thread_id, "excludeTurns": True} | self._params | where)
+            else:
+                start = self._request("thread/start", dict(self._params))
             return [], [_line({"method": "initialized"}), start]
         if method in ("thread/start", "thread/resume"):
+            if failed and method == "thread/resume":
+                # Whatever the reason, this thread is not tried again: a refusal that does not go away would
+                # otherwise fail every later message the same way. `_gone` is set before the failure is reported,
+                # so the host records the fresh start first (session_exists).
+                lost, self.thread_id, self._gone = self.thread_id, None, True
+                reason = "it has no record of it (no rollout found)" if NO_ROLLOUT in why else why
+                return self._start_failed(f"Codex could not resume thread {lost}: {reason[:120]}. " + NEW_THREAD)
             if failed:
-                if method == "thread/resume" and NO_ROLLOUT in why:
-                    lost, self.thread_id, self._gone = self.thread_id, None, True
-                    return self._start_failed(
-                        f"Codex has no thread {lost} for this session (no rollout found), so its conversation cannot "
-                        "be resumed. The next message starts a NEW thread, without the earlier turns")
-                return self._start_failed(f"Codex could not {'resume' if self._resume else 'start'} the thread: {why}")
+                return self._start_failed(f"Codex could not start the thread: {why}")
             thread = result.get("thread")
             tid = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(tid, str) or not THREAD_ID_RE.fullmatch(tid):
@@ -301,13 +329,15 @@ class CodexSession:
                 return self._fatal("the process reported a thread id other than the one it was given")
             self.thread_id, self._ready = tid, True
             return [Event("ready", provider_id=tid)], []
-        if method == "turn/start" and self._turn_open:
+        if method == "turn/start" and self._turn_open and rid == self._start_id:
+            # Only the answer to the request of the turn in flight (an earlier turn's request was retired when that
+            # turn ended, so its late answer never names this one).
             if failed:
                 denials = tuple(self._denials)
                 self._end_turn()
                 return [Event("turn_ended", ok=False, denials=denials, detail=f"Codex refused the turn: {why}")], []
             turn = result.get("turn")
-            if self._turn_id is None and isinstance(turn, dict) and isinstance(turn.get("id"), str):
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
                 self._turn_id = turn["id"]
         return [], []       # turn/interrupt's answer, either way: the turn's own end says what happened
 
@@ -324,7 +354,10 @@ class CodexSession:
 
     def _notified(self, method: str, params: dict) -> tuple[list[Event], list[bytes]]:
         # Only this session's thread. A sub-agent's thread reports its own turns and answers on this connection.
-        if not self._ready or params.get("threadId") != self.thread_id or not self._turn_open:
+        if not self._ready or params.get("threadId") != self.thread_id:
+            return [], []
+        if not self._turn_open:
+            self._between_turns(method, params)
             return [], []
         if method == "turn/started":
             turn = params.get("turn")
@@ -352,6 +385,21 @@ class CodexSession:
                 return [], []
             return [self._ended(turn)], []
         return [], []
+
+    def _between_turns(self, method: str, params: dict) -> None:
+        """This thread, with no message's turn in flight: Codex may begin a turn by itself (it goes on with a goal,
+        runs a queued prompt). Nothing of it is reported; only that it is running is kept (`holds_turns`), until its
+        own end or the thread saying it is idle."""
+        turn = params.get("turn")
+        tid = turn.get("id") if isinstance(turn, dict) else None
+        if method == "turn/started" and isinstance(tid, str):
+            self._own_turn = tid
+        elif method == "turn/completed" and tid == self._own_turn and turn.get("status") != "inProgress":
+            self._own_turn = None
+        elif method == "thread/status/changed":
+            status = params.get("status")
+            if isinstance(status, dict) and status.get("type") == "idle":
+                self._own_turn = None
 
     def _item(self, item: dict) -> None:
         kind = item.get("type")

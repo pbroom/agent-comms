@@ -19,11 +19,14 @@ C3. A long turn and a second `send --wait` right behind it: queued, the long tur
 C4. The node is stopped (the session's process goes with it) and started again; the next message resumes the SAME
     Codex thread (`thread/resume` with the id the node recorded) and its reply shows the earlier turns are there.
 C5. `close` ends the session and its process.
-The default is tests/stand_in_codex.py installed as `codex`. With --codex-bin the real CLI runs in the empty temp
-checkout with the read-only sandbox, `--codex-model` (default gpt-6-luna) at low effort, plugins and apps off, and
-every MCP server of the user's Codex configuration disabled by a `-c` override for these processes only (the script
-asks `codex mcp list --json` for their names and checks that the overrides took; ~/.codex/config.toml is never
-written): five small turns. Codex keeps its threads in the user's Codex home (~/.codex/sessions), as any Codex run
+The default is tests/stand_in_codex.py installed as `codex`. With --codex-bin the real CLI runs in the temp checkout,
+made a fresh git repository Codex has never seen, with the workspace-write sandbox (the shipped runner's),
+`--codex-model` (default gpt-6-luna) at low effort, plugins and apps off, and every MCP server of the user's Codex
+configuration disabled by a `-c` override for these processes only (the script asks `codex mcp list --json` for
+their names and checks that the overrides took): five small turns. The user's ~/.codex/config.toml is never
+written, by the script or by Codex: its mtime and SHA-256 are taken before anything starts and compared at the end
+(a `thread/start` that named the checkout would have Codex record it there as trusted; the session names none, and
+the script checks that too). Codex keeps its threads in the user's Codex home (~/.codex/sessions), as any Codex run
 does.
 
 Then the Claude session. What it does and checks:
@@ -59,6 +62,7 @@ once the wake's grace has passed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -283,7 +287,10 @@ codex = true
         exe.parent.mkdir(exist_ok=True)
         exe.write_text(WRAPPER.format(python=sys.executable, log=str(self.codex_stdin_log), real=str(real)))
         exe.chmod(0o700)
-        runner = [str(exe), "exec", "--cd", "{project}", "--sandbox", "read-only"]
+        # The real run uses the shipped runner's sandbox: it is the one under which a `cwd` on thread/start would make
+        # Codex record the checkout as trusted in the user's config.toml, which this run proves does not happen.
+        self.codex_sandbox = "workspace-write" if self.real_codex else "read-only"
+        runner = [str(exe), "exec", "--cd", "{project}", "--sandbox", self.codex_sandbox]
         if self.real_codex:
             runner += ["--disable", "plugins", "--disable", "apps", *self.codex_quiet(),
                        "-c", 'model_reasoning_effort="low"']
@@ -298,7 +305,8 @@ codex = true
         base = [self.args.codex_bin, "mcp", "list", "--json", "--disable", "plugins", "--disable", "apps"]
 
         def listed(extra: list[str]) -> list[dict]:
-            r = subprocess.run(base + extra, cwd=str(self.tmp), capture_output=True, text=True, timeout=60)
+            r = subprocess.run(base + extra, cwd=str(self.tmp), capture_output=True, text=True, timeout=60,
+                               env=self.codex_env())
             if r.returncode != 0:
                 raise SystemExit(f"`codex mcp list` failed:\n{r.stderr[-800:]}")
             return [x for x in json.loads(r.stdout) if isinstance(x, dict)]
@@ -396,6 +404,38 @@ codex = true
             if (m is not None and until(m)) or time.monotonic() >= deadline:
                 return m
             time.sleep(0.1)
+
+    def codex_env(self) -> dict[str, str]:
+        """The environment as far as Codex's home goes for a session's process: the node passes HOME on and not
+        CODEX_HOME (dispatch.child_env), so that home is ~/.codex."""
+        return {k: v for k, v in self.env.items() if k != "CODEX_HOME"}
+
+    def codex_config(self) -> tuple[int, str] | None:
+        """(mtime in ns, SHA-256) of the Codex config.toml the session processes use, or None when there is none.
+        Read to be compared, never written and never shown."""
+        path = Path(self.env["HOME"]) / ".codex" / "config.toml"
+        try:
+            return path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def fresh_git_checkout(self) -> None:
+        """Make the temp checkout a git repository: one no Codex has seen, so nothing has marked it trusted."""
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True, capture_output=True, timeout=60,
+                       env=self.env)
+
+    def codex_thread_cwd(self, sid: str, thread: str) -> str | None:
+        """The working directory Codex reported for the thread (its answer to thread/start or thread/resume, the
+        last one), from the session's transcript on the node."""
+        cwd = None
+        for line in (self.node_home / "data" / "node-logs" / "sessions" / f"{sid}.jsonl").read_text().splitlines():
+            try:
+                result = json.loads(line).get("result")
+            except ValueError:
+                continue
+            if isinstance(result, dict) and (result.get("thread") or {}).get("id") == thread:
+                cwd = result.get("cwd")
+        return cwd
 
     def codex_stdin(self) -> list[dict]:
         """Every message written to the Codex session processes' stdin so far, in order."""
@@ -555,10 +595,14 @@ codex = true
                    "stdin got the handshake first and then the one turn: initialize, initialized, thread/start, "
                    "turn/start")
         start = wrote[2]["params"]
-        print(f"  thread/start: {json.dumps({k: v for k, v in start.items() if k != 'developerInstructions'})}")
-        self.check(start.get("approvalPolicy") == "never" and start.get("sandbox") == "read-only"
-                   and start.get("cwd") == str(self.project) and start.get("model") == model,
-                   "the thread was started with approvals off, the runner's sandbox and --cd, and the hub's model")
+        print(f"  thread/start: {json.dumps(start)}")
+        self.check(start == {"sandbox": self.codex_sandbox, "approvalPolicy": "never", "model": model},
+                   "the thread was started with approvals off, the runner's sandbox and the hub's model, and "
+                   "nothing else: no cwd, no instructions")
+        where = self.codex_thread_cwd(sid, thread)
+        print(f"  Codex reports the thread's working directory as {where}")
+        self.check(where is not None and os.path.realpath(where) == str(self.project),
+                   "the thread works in the node's run directory, which is where its process was started")
         self.check(wrote[3]["params"]["threadId"] == thread
                    and wrote[3]["params"]["input"] == [{"type": "text", "text": first}],
                    "the turn went to that thread with the message as its only input")
@@ -622,6 +666,10 @@ codex = true
                    "the new process was told to resume: initialize, initialized, thread/resume, turn/start")
         self.check(wrote[2]["params"]["threadId"] == thread and wrote[3]["params"]["threadId"] == thread,
                    "... the same thread, by the id the node kept on disk")
+        where = self.codex_thread_cwd(sid, thread)
+        self.check(wrote[2]["params"].get("cwd") == str(self.project) and where is not None
+                   and os.path.realpath(where) == str(self.project),
+                   "the resume names the node's run directory, and Codex goes on there")
         self.check(view["pid"] not in (None, pid) and view["provider_id"] == thread and m5["state"] == "done",
                    "a new process took the turn in the old thread")
         if self.real_codex:
@@ -917,6 +965,9 @@ def main() -> int:
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
     try:
+        if codex and run.real_codex:
+            run.fresh_git_checkout()
+            config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
         run.start_services()
         if codex:
@@ -933,6 +984,15 @@ def main() -> int:
             run.check(not alive(run.open_pid),
                       f"the open session's process (pid {run.open_pid}) was stopped with the node")
         run.check(run.leftovers() == [], "no session process is left behind")
+        if codex and run.real_codex:
+            config_after = run.codex_config()
+            print("  ~/.codex/config.toml: " + ("none" if config_after is None else
+                                              f"mtime {config_after[0]} ns, sha256 {config_after[1][:16]}...")
+                  + (" (as before the run)" if config_after == config_before else
+                     f"; BEFORE the run: {config_before and (config_before[0], config_before[1][:16])}"))
+            run.check(config_after == config_before,
+                      "the user's Codex config.toml is byte for byte and to the nanosecond what it was before the "
+                      "run: Codex recorded no trust for the fresh checkout")
         print("\nPASS")
         return 0
     except SystemExit as e:

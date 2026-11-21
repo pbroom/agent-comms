@@ -93,6 +93,18 @@ class ProviderSession(Protocol):
         session is opened, before any `argv`. Optional."""
         ...
 
+    def runs_in(self, cwd: str) -> None:
+        """The directory the host starts this session's process in (this machine's run directory for the project).
+        Called when the session is opened, before any `argv`. Optional: for a provider whose protocol must be told
+        the directory, or must be kept from being told another one."""
+        ...
+
+    def holds_turns(self) -> bool:
+        """True while the provider's session is busy with something no message of the host's started (Codex running
+        a turn of its own): a turn written now would not be a turn of its own. The host keeps the next message
+        until this is False again, for at most the turn timeout. Optional."""
+        ...
+
 
 # A model name is one argv element the hub chose. It may never read as an option or carry anything but a name.
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}")

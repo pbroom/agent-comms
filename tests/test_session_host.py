@@ -766,11 +766,11 @@ def test_a_provider_with_a_handshake_gets_no_turn_before_it_is_ready_and_interru
     child.emit(b"hello")
     assert kinds(host.tick()) == [("delivered", mid)]
     assert child.stdin.splitlines()[1:] == [b'{"method":"initialized"}', b'{"method": "turn/start", "text": "do it"}']
-    assert (s.state, s.provider_id, s.resume) == ("running", "thread-1", False), \
-        "an id alone is nothing to resume: such a provider keeps a session only once a turn has started in it"
-    child.emit(b"started")
-    assert kinds(host.tick()) == [("turn_started", mid)] and s.resume is True
+    assert (s.state, s.provider_id, s.resume) == ("running", "thread-1", True), \
+        "from the first turn written to it the provider's session is one to resume"
     assert json.loads((henv.log_dir / STATE_FILE).read_text())[SID]["resume"] is True
+    child.emit(b"started")
+    assert kinds(host.tick()) == [("turn_started", mid)]
 
     child.emit(b"asks")
     [ev] = host.tick()
@@ -964,6 +964,88 @@ def test_a_provider_session_that_is_gone_fails_one_message_loudly_and_the_next_s
     assert kinds(host.tick()) == [("delivered", third)]
 
 
+def test_a_crash_right_after_the_first_turn_was_written_resumes_the_thread_and_never_starts_a_new_one(henv):
+    """The provider may have recorded the turn although this node never read `turn/started` nor reported anything:
+    the hub and the old state file both say there is nothing to resume. This machine's own record says otherwise,
+    and it was written before the turn's first byte."""
+    host, s = handshake_host(henv)
+    mid = host.send(SID, "do it")
+    host.tick()
+    assert not (henv.log_dir / PROVIDER_FILE).exists(), "an id alone, with no turn written, is nothing to resume"
+    henv.spawner.children[0].emit(b"hello")
+    assert kinds(host.tick()) == [("delivered", mid)]
+    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: "thread-1"} and s.resume is True
+
+    later = make_host(henv, provider_for=lambda template: HandshakeProvider)    # the node process died and restarted
+    s2 = later.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=False)
+    assert s2.resume is True and s2.provider.adopted == ["thread-1"], "not a NEW conversation, silently"
+    after = later.send(SID, "after")
+    later.tick()
+    fresh = henv.spawner.children[-1]
+    assert henv.spawner.calls[-1]["argv"] == ["codex", "app-server", "resume", SID]
+    fresh.emit(b"hello")
+    assert kinds(later.tick()) == [("delivered", after)]
+    assert b"do it" not in fresh.stdin and fresh.stdin.count(b"turn/start") == 1, "the lost turn is not replayed"
+
+
+def test_a_handshake_that_cannot_be_written_fails_its_message_once_and_starts_nothing_more_for_it(henv):
+    """The pipe breaks on `initialize`: the message that made the process start is still in the inbox. It must fail
+    there and then, or every pass would start another process for it and report nothing."""
+    henv.config.runners["codex-cli"] = ["codex", "exec", "{prompt}"]
+    made = []
+
+    def spawner(argv, **kw):
+        made.append(FakeSessionChild(2000 + len(made)))
+        made[-1].broken = True
+        return made[-1]
+
+    host = make_host(henv, provider_for=lambda template: HandshakeProvider, spawner=spawner)
+    s = host.open(SID, agent="codex", runtime="codex-cli", project=PROJECT)
+    mid, queued = host.send(SID, "do it"), host.send(SID, "next")
+    [ev] = host.tick()
+    assert (ev.kind, ev.message_id, ev.ok, ev.delivered) == ("turn_ended", mid, False, False)
+    assert "could not write" in ev.detail and len(made) == 1 and made[0].terminated == 1
+    [ev] = host.tick()
+    assert (ev.message_id, ev.delivered) == (queued, False) and len(made) == 2, "the next message: its own start, once"
+    for _ in range(5):
+        assert host.tick() == []
+    assert len(made) == 2 and not s.ended and not s.inbox
+
+
+def test_a_resume_the_provider_refuses_is_on_record_before_its_failure_is_reported(henv):
+    """The fresh start is decided when the refusal is read, not when the process has gone: a node that restarts
+    right after reporting the failed message must not try the same resume again."""
+    host, s = handshake_host(henv)
+    host.send(SID, "do it")
+    host.tick()
+    henv.spawner.children[0].emit(b"hello")
+    host.tick()
+    henv.spawner.children[0].emit(b"started", b"interrupted")
+    host.tick()
+    host.stop_all()
+
+    stubborn = FakeSessionChild(3000, exits_on_terminate=False)
+    later = make_host(henv, provider_for=lambda template: HandshakeProvider, spawner=lambda argv, **kw: stubborn)
+    s2 = later.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=True)
+    lost = later.send(SID, "second")
+    later.tick()
+    stubborn.emit(b"gone")
+    [ev] = later.tick()
+    assert (ev.message_id, ev.ok) == (lost, False) and "NEW thread" in ev.detail
+    assert s2.child is stubborn and s2.stopping_since is not None, "the process has not even gone yet"
+    assert (s2.resume, s2.provider_id) == (False, None)
+    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {}
+    assert json.loads((henv.log_dir / STATE_FILE).read_text())[SID]["resume"] is False
+
+    third = make_host(henv, provider_for=lambda template: HandshakeProvider)     # a restart at this very moment
+    left = third.recover()[SID]
+    s3 = third.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=left["resume"])
+    assert (s3.resume, s3.provider.adopted) == (False, [None])
+    third.send(SID, "third")
+    third.tick()
+    assert henv.spawner.calls[-1]["argv"] == ["codex", "app-server", "new", SID]
+
+
 # ------------------------------------------------------------ the Codex adapter behind the host (fake pipes)
 
 
@@ -1012,21 +1094,20 @@ def test_a_hosted_codex_session_writes_only_the_handshake_before_it_is_ready(hen
     child.emit(cx.reply(1, cx.INIT_RESULT))
     assert host.tick() == []
     assert [m["method"] for m in written(child)] == ["initialize", "initialized", "thread/start"]
-    assert written(child)[2]["params"] == {
-        "sandbox": "workspace-write", "approvalPolicy": "never", "cwd": henv.work,
-        "developerInstructions": cx.HOSTED_INSTRUCTION}, "the run directory, as the runner's --cd names it"
+    assert written(child)[2]["params"] == {"sandbox": "workspace-write", "approvalPolicy": "never"}, \
+        "no cwd (the process was started in the run directory) and no instructions of ours"
     assert "the message" not in child.stdin.decode(), "still no turn"
 
     child.emit(cx.reply(2, cx.THREAD_RESULT), cx.THREAD_STARTED)
     assert kinds(host.tick()) == [("delivered", mid)]
     assert written(child)[3] == {"id": 3, "method": "turn/start", "params": {
         "threadId": cx.THREAD, "input": [{"type": "text", "text": "the message"}]}}
-    assert (s.state, s.provider_id, s.resume) == ("running", cx.THREAD, False)
+    assert (s.state, s.provider_id, s.resume) == ("running", cx.THREAD, True)
     assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: cx.THREAD}
 
     queued = host.send(SID, "second")
     child.emit(cx.reply(3, cx.TURN_REPLY), cx.TURN_STARTED, cx.message("a note", phase="commentary"))
-    assert kinds(host.tick()) == [("turn_started", mid)] and s.resume is True
+    assert kinds(host.tick()) == [("turn_started", mid)]
     assert len(written(child)) == 4, "the second message waits for the turn to end"
     child.emit(cx.message("the answer"), cx.completed())
     events = host.tick()
@@ -1098,6 +1179,7 @@ def test_a_restarted_host_resumes_the_codex_thread_it_recorded(henv):
     resume = written(fresh)[2]
     assert resume["method"] == "thread/resume" and resume["params"]["threadId"] == cx.THREAD
     assert resume["params"]["excludeTurns"] is True and resume["params"]["approvalPolicy"] == "never"
+    assert resume["params"]["cwd"] == henv.work, "where this node runs the project NOW, not where the thread began"
     fresh.emit(cx.reply(2, cx.THREAD_RESULT))
     assert kinds(later.tick()) == [("delivered", mid)]
     assert written(fresh)[3]["params"]["threadId"] == cx.THREAD
@@ -1132,6 +1214,74 @@ def test_a_codex_thread_that_is_gone_fails_one_message_loudly_then_a_new_thread_
     fresh.emit(cx.reply(2, new))
     assert kinds(host.tick()) == [("delivered", third)] and s.provider_id == cx.CHILD
     assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: cx.CHILD}
+
+
+def test_a_codex_runner_whose_cd_is_another_directory_cannot_be_hosted(henv, tmp_path):
+    """The thread works where its process is started (the node's run directory): no `cwd` is sent that could name
+    another place, so a runner that asks for one is refused instead of quietly working somewhere else."""
+    henv.config.sessions.codex = True
+    henv.config.runners["codex-cli"] = ["codex", "exec", "--cd", str(tmp_path), "{prompt}"]
+    with pytest.raises(ValueError, match="--cd must be"):
+        make_host(henv).open(SID, agent="codex", runtime="codex-cli", project=PROJECT)
+    henv.config.runners["codex-cli"] = ["codex", "exec", "--cd", henv.work, "{prompt}"]
+    host = make_host(henv)
+    host.open(SID, agent="codex", runtime="codex-cli", project=PROJECT)       # the run directory itself, spelled out
+    host.send(SID, "hello")
+    host.tick()
+    assert henv.spawner.calls[-1]["cwd"] == henv.work and henv.work not in henv.spawner.calls[-1]["argv"]
+
+
+def codex_idle_after_one_turn(henv):
+    host, s = codex_host(henv)
+    host.send(SID, "first")
+    host.tick()
+    [child] = henv.spawner.children
+    codex_ready(host, child)
+    host.tick()
+    child.emit(cx.reply(3, cx.TURN_REPLY), cx.TURN_STARTED, cx.message("one"), cx.completed())
+    host.tick()
+    assert s.state == "idle"
+    return host, s, child
+
+
+def test_a_message_waits_while_codex_runs_a_turn_of_its_own_in_the_thread(henv):
+    """Written now, the message would be added to Codex's own turn and get THAT turn's result."""
+    host, s, child = codex_idle_after_one_turn(henv)
+    child.emit(cx.own_turn("turn/started"))
+    held = host.send(SID, "second")
+    before = len(written(child))
+    for _ in range(3):
+        henv.clock.advance(5)
+        assert host.tick() == []
+    assert len(written(child)) == before and len(s.inbox) == 1 and s.state == "idle", "not written, not delivered"
+    child.emit(cx.message("Codex's own business", turn=cx.CHILD_TURN), cx.own_turn("turn/completed", status="completed"))
+    assert kinds(host.tick()) == [("delivered", held)]
+    assert written(child)[-1]["params"]["input"] == [{"type": "text", "text": "second"}]
+    child.emit(cx.reply(4, cx.TURN_REPLY), cx.TURN_STARTED, cx.message("two"), cx.completed())
+    events = host.tick()
+    assert kinds(events) == [("turn_started", held), ("turn_ended", held)] and events[1].text == "two"
+
+
+def test_a_message_held_for_a_whole_turn_timeout_fails_and_the_process_is_stopped(henv):
+    host, s, child = codex_idle_after_one_turn(henv)
+    child.emit(cx.own_turn("turn/started"))
+    held = host.send(SID, "second")
+    assert host.tick() == []
+    henv.clock.advance(30 * 60 - 1)
+    assert host.tick() == [] and child.terminated == 0
+    henv.clock.advance(1)
+    [ev] = host.tick()
+    assert (ev.kind, ev.message_id, ev.ok, ev.delivered) == ("turn_ended", held, False, False)
+    assert "a turn of its own for 30 minutes" in ev.detail and child.terminated == 1 and not s.ended
+    after = host.send(SID, "third")
+    host.tick()
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and written(fresh)[0]["method"] == "initialize"
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    host.tick()
+    assert written(fresh)[2]["method"] == "thread/resume", "the thread, with whatever that turn did, is resumed"
+    fresh.emit(cx.reply(2, cx.THREAD_RESULT))
+    assert kinds(host.tick()) == [("delivered", after)]
 
 
 def test_a_codex_process_that_exits_before_it_is_ready_fails_the_message_and_the_session_stays(henv):
@@ -1345,8 +1495,11 @@ def test_real_pipes_a_codex_session_takes_turns_declines_is_interrupted_in_band_
         assert json.loads((store / "argv.jsonl").read_text()) == ["app-server", "-c", cx.APPROVE, "--listen", "stdio://"]
         [started] = [json.loads(x) for x in (store / "requests.jsonl").read_text().splitlines()]
         assert started == {"method": "thread/start", "params": {
-            "sandbox": "read-only", "approvalPolicy": "never", "model": "gpt-6-luna",
-            "cwd": str(tmp_path / "checkout"), "developerInstructions": cx.HOSTED_INSTRUCTION}}
+            "sandbox": "read-only", "approvalPolicy": "never", "model": "gpt-6-luna"}}
+        ready = next(m for m in map(json.loads, host.transcript_path(SID).read_text().splitlines())
+                     if isinstance(m.get("result"), dict) and "thread" in m["result"])
+        assert os.path.realpath(ready["result"]["cwd"]) == os.path.realpath(tmp_path / "checkout"), \
+            "the thread works where its process was started"
         transcript = [json.loads(x) for x in host.transcript_path(SID).read_text().splitlines()]
         declined = [m["params"]["item"]["status"] for m in transcript if m.get("method") == "item/completed"
                     and m["params"]["item"].get("type") == "commandExecution"]
@@ -1375,6 +1528,7 @@ def test_real_pipes_a_codex_session_takes_turns_declines_is_interrupted_in_band_
         assert s2.child.pid != pid and s2.provider_id == thread
         resumed = json.loads((store / "requests.jsonl").read_text().splitlines()[-1])
         assert resumed["method"] == "thread/resume" and resumed["params"]["threadId"] == thread
+        assert resumed["params"]["cwd"] == str(tmp_path / "checkout")
     finally:
         later.stop_all()
 
