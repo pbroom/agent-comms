@@ -199,8 +199,8 @@ wake_grace_seconds = 120         # after a wake the dispatcher starts no run for
 # explicit --permission-mode (a runner that names none gets `manual`), and every one that is not full access with
 # --settings '{"permissions":{"disableBypassPermissionsMode":"disable"}}' (merged with the runner's own settings
 # file if it names one), so nothing can select bypassPermissions in it; a session whose process reports that mode
-# without having been started as full is ended. A full session counts as full for its children only once its
-# process has reported that it runs that way.
+# without having been started as full is ended. A full session counts as full for its children only while it has
+# a live process that has reported it runs that way.
 allow_full_access = false
 
 # Child sessions (README "Parent and child sessions"): `board session start --parent <id> ...` starts a session

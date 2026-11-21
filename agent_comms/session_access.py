@@ -39,19 +39,23 @@ Three more things hold for every launch (review round 3):
   user's, the project's and the local settings (seen live: with it a `set_permission_mode` request for
   `bypassPermissions` is answered `bypass_disabled`, also beside a user-level `defaultMode` of `bypassPermissions`).
   Claude takes only its LAST `--settings`, so a runner that names one gets a file this node writes (mode 600): the
-  runner's settings and the key. Claude ignores a settings file it finds invalid, whole and silently, so a session
-  started from such a file must also SAY the key is in force (`get_settings`, asked when its process starts) or it
-  is ended.
+  runner's settings and the key. Claude ignores a settings file it finds invalid, whole and silently, so a process
+  started from such a file must first SAY the key is in force (`get_settings`, asked when it starts): no turn is
+  written to it before it has, and the session is ended if it says otherwise or says nothing.
 - *A launch Claude would refuse is refused here* (`claude_conflict`): `--restricted` beside anything that selects or
   allows bypass (Claude exits: "bypassPermissions not supported in restricted mode"), and a `full` launch whose own
   settings switch bypass off (Claude would run it in `default`, silently).
-- *`full` counts for children only once the process has said so* (session_host: `ceiling`). The label says what a
-  session was STARTED as. Whether Claude took the mode is known when its `init` says `bypassPermissions`; until
-  then, and again from the moment a new process is started for the session, a child gets at most `workspace` under
-  it. For Codex the answer to `thread/start` names the thread's sandbox.
+- *`full` counts for children only while the process that said so is alive* (session_host: `ceiling`). The label
+  says what a session was STARTED as. Whether Claude took the mode is known when its `init` says
+  `bypassPermissions`; for Codex when the answer to `thread/start` names `dangerFullAccess`. The confirmation is
+  that process's: a session with no process, with one that is going down, or with a new one that has not said so,
+  gives a child at most `workspace`.
 
-What is outside all of this: the machine's MANAGED settings and the plugins its owner installed at user level. They
-are the owner's own configuration, which no agent and no hub can change; hooks and modes they bring are theirs.
+What all of this assumes: that the files the node trusts are not rewritten by a session. Its own code and
+settings, a runner's settings and MCP config, the owner's Claude and Codex configuration and plugins, managed
+settings. The node does not sandbox Claude at the OS level: a session with a shell or with full access runs as the
+node's OS user and can write whatever that user can. So the guarantees hold against what the hub sends and against
+a session's own command line, and against other sessions only as far as they cannot rewrite those files.
 """
 from __future__ import annotations
 
@@ -106,9 +110,9 @@ READ_ONLY_UNKNOWN = ("this node's Claude runner for the agent carries {flag}, wh
                      "cannot be dropped safely")
 NOT_SEALED = ("its process says bypassing permission checks is NOT switched off in it (the settings this node started "
               "it with were not taken: Claude ignores a settings file it finds invalid, whole): the session was ended")
-SEAL_UNVERIFIED = ("its process never said whether bypassing permission checks is switched off in it, and it was "
+SEAL_UNVERIFIED = ("its process did not say whether bypassing permission checks is switched off in it, and it was "
                    "started from a settings file of the runner's own, which Claude ignores whole if it finds it "
-                   "invalid: the session was ended")
+                   "invalid: no turn was written to it, and the session was ended")
 CODEX_NOT_FULL = ("it was started as a full-access session, but Codex reports the sandbox {sandbox} for its thread: "
                   "the session was ended rather than run narrower than asked")
 CODEX_FULL = ("Codex reports the sandbox dangerFullAccess for its thread although it was not started as a full-access "
@@ -407,9 +411,13 @@ CODEX_SANDBOX_WORDS = {"readOnly": "read-only", "workspaceWrite": "workspace", "
 def verify_codex(launched: str | None, sandbox: Any) -> tuple[str | None, bool]:
     """What Codex said the thread's sandbox is, in its answer to `thread/start` or `thread/resume` (its `type`:
     readOnly, workspaceWrite, dangerFullAccess), held against the session: (why it must be ended or None, whether
-    full access is confirmed). The node itself sent the sandbox, so an answer that names none confirms it."""
+    full access is confirmed). Only an answer that NAMES `dangerFullAccess` confirms. A full launch whose answer
+    names no sandbox at all runs on (the node itself sent the parameter, and nothing says it was not taken), but
+    it is not confirmed: no child may be `full` under it. One whose answer names another sandbox is ended."""
     if launched == "full":
-        if sandbox is None or sandbox == "dangerFullAccess":
+        if sandbox is None:
+            return None, False
+        if sandbox == "dangerFullAccess":
             return None, True
         return CODEX_NOT_FULL.format(sandbox=str(sandbox)[:40]), False
     return (CODEX_FULL if sandbox == "dangerFullAccess" else None), False

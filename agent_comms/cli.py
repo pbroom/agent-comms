@@ -826,7 +826,7 @@ def _fmt_access(s: dict) -> str:
     """A session's access word; with what its node gives when that is narrower (a runner that is read-only there)."""
     access = s.get("access") or "not reported yet"
     if access == "full" and s.get("ceiling") not in (None, "full"):
-        access += f" (not confirmed by its process yet: a child can have at most {s['ceiling']})"
+        access += f" (not confirmed by a live process of its own: a child can have at most {s['ceiling']})"
     return access + (f" (its node gives {s['granted']})" if s.get("granted") not in (None, s.get("access")) else "")
 
 

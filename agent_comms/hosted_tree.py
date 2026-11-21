@@ -82,8 +82,8 @@ def view(r: dict) -> dict:
 
 
 def _limit(parent: dict) -> str:
-    """The most a child may have under this root NOW: the root's access, except that `full` counts only once its
-    node says its process confirmed it (the node's `ceiling`). A full root whose node says nothing of the kind
+    """The most a child may have under this root NOW: the root's access, except that `full` counts only while its
+    node says its live process confirmed it (the node's `ceiling`). A full root whose node says nothing of the kind
     gives `workspace`."""
     access, ceiling = parent.get("access"), parent.get("ceiling")
     if ceiling in session_access.LEVELS and session_access.within(ceiling, access):
@@ -252,9 +252,9 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         if not session_access.within(access, _limit(parent)):
             # The parent was STARTED as full; whether its CLI took that is known once its process says so.
             raise Conflict(f"session {pid} was started as a full-access session, but its process has not confirmed "
-                           f"that (yet, or since it was last restarted), so a child can have at most {_limit(parent)} "
-                           "under it now. Its node confirms it when the session's next turn starts: try again then, "
-                           "or give a narrower --access")
+                           f"that (it has no process now, or one that has not said so yet), so a child can have at "
+                           f"most {_limit(parent)} under it now. Its node confirms it when the session's next turn "
+                           "starts: send it a message and try again, or give a narrower --access")
         _fits(c, parent, agent, runtime, isolation)
         offered = _offers(c, parent["node"], agent, runtime)
         if access not in offered:

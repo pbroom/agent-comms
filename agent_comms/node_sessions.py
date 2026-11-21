@@ -45,10 +45,13 @@ Rules the hub relies on:
   handed a turn, only while its parent is open on this node and has at least the child's access (`_parent_problem`).
   The hub's stored words are not enough: this machine's runner may have been edited since. Otherwise the child is
   ended with the reason.
-- `full` under a parent needs the parent's PROCESS to have said it runs that way (session_host: `ceiling`). Until
-  it has, in this node process and for the parent's current process, a `full` child is held: it stays open, its
-  messages stay queued at the hub, and no turn is handed to it. The hub is told the ceiling with every status, and
-  refuses to make such a child meanwhile.
+- `full` under a parent needs the parent's LIVE process to have said it runs that way (session_host: `ceiling`).
+  While the parent has no process, one that is going down, or a new one that has not said so, a `full` child is
+  held: it stays open, its messages stay queued at the hub, and no turn is handed to it. That is decided from the
+  parent's process as it is at the moment the child is considered, so a parent that is about to be started in a
+  pass never lends an earlier process's word to a child in that pass. The hub is told the ceiling with every
+  status, and refuses to make such a child meanwhile. A parent whose process a waiting or working full child
+  depends on is not stopped to make room, nor for being idle (`_lends_full`).
 """
 from __future__ import annotations
 
@@ -97,6 +100,7 @@ class SessionRunner:
         self.client, self.log_dir, self.clock = client, Path(log_dir), clock
         self.config = config
         self.host = host or SessionHost(config, self.log_dir, clock=clock, **host_kw)
+        self.host.turn_gate = self._turn_allowed      # a child's turn is held to its parent when it is WRITTEN, too
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
@@ -506,9 +510,9 @@ class SessionRunner:
         return None
 
     def _awaits_parent(self, parent_id: str, s) -> bool:
-        """The child's access is within what its parent was STARTED as, but above what the parent's process has
-        confirmed so far (`ceiling`: `full` only once Claude's `init`, or Codex's answer to thread/start, said so,
-        in this node process and for the parent's current process). It is held, not ended: no turn until then."""
+        """The child's access is within what its parent was STARTED as, but above what the parent's LIVE process
+        has confirmed (`ceiling`: `full` only while the process whose `init`, or whose answer to thread/start, said
+        so is the parent's process and is up). It is held, not ended: no turn until then."""
         parent = self.host.sessions.get(parent_id)
         return (parent is not None and s.access in session_access.LEVELS and parent.ceiling in session_access.LEVELS
                 and not session_access.within(s.access, parent.ceiling))
@@ -535,7 +539,7 @@ class SessionRunner:
     def _tree_now(self, sid: str, s, root: bool | None = None) -> None:
         """What this session's reports carry beyond its state, as it is NOW (called on every fetch and after every
         tick, for a session whose hub asked): its access; for a root also its `ceiling` (the most a child may have
-        under it now: `full` only once its process confirmed it) and its `checkout` (the directory it runs in, which
+        under it now: `full` only while its live process has confirmed it) and its `checkout` (where it runs, which
         a runner that names its own directory is held against when a child is asked for); a child's own worktree."""
         if sid not in self.tree:
             return
@@ -564,6 +568,31 @@ class SessionRunner:
         self._save_worktrees()
         self._add(sid, {"kind": "worktree_removed"})
 
+    def _turn_allowed(self, s) -> bool:
+        """The host asks this as it is about to write a turn. A message is handed to a child only under a parent
+        that allows it (`_hand_over`), but it can wait in the child's inbox for a handshake, and the parent's
+        process can go in that time: so the same is asked again here, of the parent as it is now. False leaves the
+        message where it is; a child whose parent is gone is ended at the next fetch."""
+        parent_id = self.parent_of.get(s.session_id)
+        if parent_id is None:
+            return True
+        parent = self.host.sessions.get(parent_id)
+        return parent is not None and not parent.ended and not self._awaits_parent(parent_id, s)
+
+    def _lends_full(self, sid: str) -> bool:
+        """This session's live process is what lets a `full` child of it take turns, and such a child has a turn,
+        a message, or one queued at the hub. Stopping that process would hold the child until the parent's next
+        turn, so it is not stopped to make room or for being idle."""
+        parent = self.host.sessions.get(sid)
+        if parent is None or parent.ceiling != "full":
+            return False
+        for kid, pid in self.parent_of.items():
+            k = self.host.sessions.get(kid)
+            if (pid == sid and k is not None and not k.ended and k.access == "full"
+                    and (k.busy or k.inbox or self.queue.get(kid))):
+                return True
+        return False
+
     def _admit(self, s) -> bool:
         """May this session's process start now? Not while `max_live` processes are up: then the longest-idle one is
         stopped (one at a time) and the message waits; with none idle it just waits."""
@@ -575,7 +604,7 @@ class SessionRunner:
         if not any(x.child is not None and x.stopping_since is not None for x in live):
             # (Not one whose provider runs a turn of its own in it: by the host's books it is idle, but it is working.)
             idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended
-                    and not self.host.holding(x)]
+                    and not self.host.holding(x) and not self._lends_full(x.session_id)]
             if idle:
                 self.host.park(min(idle, key=lambda x: self.last_busy.get(x.session_id, 0.0)).session_id)
         return False
@@ -606,7 +635,7 @@ class SessionRunner:
 
     def _park_idle(self, now: float) -> None:
         for sid, s in self.host.sessions.items():
-            if s.busy or s.inbox:
+            if s.busy or s.inbox or self._lends_full(sid):
                 self.last_busy[sid] = now
             elif s.child is not None and now - self.last_busy.setdefault(sid, now) >= self.idle_seconds:
                 if self.host.park(sid):

@@ -431,8 +431,12 @@ What to know:
     switch to it. This one is added to the shipped runner too. Claude takes only its last `--settings`, so a runner
     that already names a settings file is started from a copy the node writes beside the session's transcript (mode
     600): your settings plus that key, made again each time the node opens the session. A runner whose settings
-    file cannot be read as a JSON object is not hosted, and a session started from such a copy is ended if its
-    process does not confirm the key is in force (Claude ignores a settings file it finds invalid, whole).
+    file cannot be read as a JSON object is not hosted. Claude ignores a settings file it finds invalid, whole, so
+    every process started from such a copy is first asked which settings are in force, and nothing else is
+    written to it until it has said the key is: a turn waits for that answer. If the key is not in force, or no
+    answer comes within a minute, the session is ended and the waiting message fails undelivered. The answer
+    itself (all your settings, which may hold credentials) is not kept: the transcript gets one line saying
+    whether the key was in force.
   A session whose process reports `bypassPermissions` without having been started as a full-access one is ended.
   Otherwise the runner is hosted as written. A project in `claude_tool_projects` gets the scoped tools, as a run
   does.
@@ -578,7 +582,10 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     from the runner's own `--mcp-config`); reads inside its directory allowed, and Edit, Write, NotebookEdit, Bash,
     the token directory and `~/.ssh` denied beside the runner's own deny rules. No shell means no `git log` either.
     A runner that names no MCP config of its own (the shipped `claude-code` runner) gives a read-only child NO board
-    tools: a child reports to its parent, and fewer tools is the safer default. Of the runner's other options only
+    tools: a child reports to its parent, and fewer tools is the safer default. The same goes for a runner whose
+    MCP config file lies inside a project directory or the worktree directory (or is given as a relative path):
+    that is where sessions write, and the config names a command the child would start, so it is not read. Keep
+    such a config outside your checkouts. Of the runner's other options only
     those known to load nothing are kept (the model, the prompts, output options, `--restricted`, `--bare`,
     `--safe-mode`); a runner with any option outside that list cannot be started at `read-only` at all, and
     `start --parent ... --access read-only` says so. Codex with the `read-only` sandbox.
@@ -598,14 +605,16 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     Claude itself would not start that way is refused when the session is opened: `--restricted` beside anything
     that selects or allows bypass, and a bypass runner whose own settings switch bypass off.
 
-    **`full` counts for a child only once the parent's process has said so.** A session is `full` from the moment
-    it is opened (that is what it is started as, and what `show` says). But a child may be `full` under it only
-    after its process has reported that it really runs that way: Claude at the start of a turn
-    (`bypassPermissions`), Codex in its answer to `thread/start`. Until then `show` adds "not confirmed by its
-    process yet", `start --parent` at `full` is refused, and a `full` child that already exists is held: it stays
-    open and its message stays queued. The confirmation belongs to the process that gave it: after a node
-    restart, or when a new process is started for the parent, it has to be given again, which happens with the
-    parent's next turn.
+    **`full` counts for a child only while the parent's own process vouches for it.** A session is `full` from
+    the moment it is opened (that is what it is started as, and what `show` says). But a child may be `full` under
+    it only while the parent has a live process that has reported it really runs that way: Claude at the start of
+    a turn (`bypassPermissions`), Codex in its answer to `thread/start` (a sandbox named `dangerFullAccess`; an
+    answer that names none confirms nothing). Otherwise `show` adds "not confirmed by a live process of its own",
+    `start --parent` at `full` is refused, and a `full` child that already exists is held: it stays open and its
+    message stays queued, and nothing is written to it. The confirmation is that one process's: when the parent's
+    process has been stopped (the idle limit, a node restart) or replaced, the parent's next turn gives it again,
+    so send the parent a message. The node does not stop a parent's process to make room, or for being idle,
+    while a `full` child of it is working or waiting.
 
   A session you start without `--parent` has the access its command line gives, and `show` prints it as soon as
   its node has opened it: a runner that selects bypass (`--permission-mode bypassPermissions`,
@@ -628,10 +637,14 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   node, a child whose access is above what its parent's command line then gives is ended instead of resumed, and no
   child is opened or given a turn while its parent is not open on the node. This holds from the moment the node is
   up: nothing has to wait for the parent's process to say anything.
-- **What these guarantees cover.** What the hub, another agent, or a session's own command line can cause. The
-  node owner's machine-level MANAGED Claude settings, and the plugins the owner installed at user level, are the
-  owner's own configuration, which no agent can change: their hooks run in every session, a read-only one
-  included, and nothing here tries to defeat them.
+- **What these guarantees assume.** That the files the node trusts are not changed by a session: its own code and
+  settings, a runner's settings file and MCP config, your Claude and Codex configuration and plugins. The node
+  does not sandbox Claude at the OS level. A session with a shell or with full access runs as the node's OS user
+  and can change anything that user can write, those files included. `read-only` is the only word that takes
+  the shell and the write tools away, and what it promises holds against anything the hub sends and against the
+  session's own command line; against OTHER sessions it holds only as far as they cannot rewrite those files.
+  Managed Claude settings are protected only where the OS protects them. Hooks from your managed settings and
+  from plugins you installed at user level run in every session, a read-only one included.
 - **Versions.** Children need a node that says it hosts them (this version's does, in its hello and on every
   fetch). Its hello also says, for each runner, the access words a child of it can really be started at there (a
   Codex runner only with `codex = true`; `full` only with `allow_full_access`; nothing for a runner its session

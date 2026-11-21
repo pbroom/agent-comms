@@ -14,7 +14,10 @@ Code 2.1.322 (DESIGN_NOTES "Session host (PR 1)"):
   `control_response` whose `response.effective` is the settings in force, every source merged (seen live). The
   adapter asks it once per process when the command line names a settings FILE and does not select bypass: the host
   wrote that file from the runner's own settings plus the key that switches bypass off, and Claude ignores a
-  settings file it finds invalid, whole and silently. The answer (`sealed`) says whether the key is in force.
+  settings file it finds invalid, whole and silently. The answer (`sealed`) says whether the key is in force. The
+  host writes no turn to the process before it, and never keeps the answer itself: `effective` is every setting in
+  force, and a settings file can hold credentials (`env`). `transcript_line` gives the transcript one line of the
+  adapter's own in its place, with the one bit.
 - With `--permission-prompts none` anything that would ask is refused on the spot, so the process never waits for an
   answer. A `control_request` asking to use a tool should therefore never arrive; if one does it is reported and left
   unanswered (nothing is approved), and the host's turn timeout ends the turn.
@@ -100,6 +103,15 @@ def _meta(ev: dict) -> dict:
     return out
 
 
+def _bypass_off(answer: dict) -> bool:
+    """A `get_settings` answer (the `response` of a `control_response`) says the key that switches bypass off is
+    in force: `response.effective.permissions.disableBypassPermissionsMode == "disable"`."""
+    inner = answer.get("response") if answer.get("subtype") == "success" else None
+    effective = inner.get("effective") if isinstance(inner, dict) else None
+    permissions = effective.get("permissions") if isinstance(effective, dict) else None
+    return isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
+
+
 class ClaudeSession:
     waits_for_ready = False     # `init` only arrives once the first turn has been written
     verifies_mode = True        # ... and says what the turn really runs with: the host's kill switch reads it
@@ -166,9 +178,29 @@ class ClaudeSession:
         if not self._ask:
             return []
         self._starts += 1
-        self._asked = f"settings-{self._starts}"
+        self._asked = "settings-%s-%d" % ((self.session_id or "")[:8], self._starts)   # one per session and process
         return [json.dumps({"type": "control_request", "request_id": self._asked,
                             "request": {"subtype": "get_settings"}}).encode() + b"\n"]
+
+    @staticmethod
+    def transcript_line(line: bytes) -> bytes:
+        """What the session's transcript keeps of a line the process wrote: the line, except a `control_response`,
+        whose body is never kept (the answer to `get_settings` is the settings in force, credentials included).
+        In its place: who answered what kind of answer, and whether bypass is switched off."""
+        if b"control_response" not in line:
+            return line
+        try:
+            ev = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            return line
+        if not isinstance(ev, dict) or ev.get("type") != "control_response":
+            return line
+        answer = ev.get("response") if isinstance(ev.get("response"), dict) else {}
+        rid, kind = answer.get("request_id"), answer.get("subtype")
+        return json.dumps({"type": "host", "subtype": "control_response_withheld",
+                           "request_id": rid if isinstance(rid, str) and TOOL_NAME_RE.fullmatch(rid) else None,
+                           "answer": kind if kind in ("success", "error") else None,
+                           "bypass_disabled": _bypass_off(answer)}).encode()
 
     def turn(self, text: str) -> list[bytes]:
         # json.dumps escapes every line break inside the text: one turn is exactly one line.
@@ -219,11 +251,7 @@ class ClaudeSession:
             if self._asked is None or not isinstance(answer, dict) or answer.get("request_id") != self._asked:
                 return [], []
             self._asked = None
-            inner = answer.get("response") if answer.get("subtype") == "success" else None
-            effective = inner.get("effective") if isinstance(inner, dict) else None
-            permissions = effective.get("permissions") if isinstance(effective, dict) else None
-            off = isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
-            return [Event("sealed", ok=off)], []
+            return [Event("sealed", ok=_bypass_off(answer))], []
         if kind == "control_request":
             request = ev.get("request")
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":

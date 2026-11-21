@@ -3013,7 +3013,7 @@ through `session_access.prepare`; `Session.access`/`.effort`. `node_sessions.py`
 view, roots-only uniqueness, a root's tree fields, `show`'s children, the cascade in `close` and `_end`, the
 listing's extra keys, `report`'s `access`/`worktree` and the `worktree_removed` event.
 
-**Proof.** `tests/test_hosted_tree.py` (107 tests after review round 3, fakes; real git where a worktree is made): the gate and that a
+**Proof.** `tests/test_hosted_tree.py` (111 tests after review round 4, fakes; real git where a worktree is made): the gate and that a
 session is byte for byte what it was with it off; every creation rule; access ordering and each word's argv or
 thread parameters for Claude and Codex; `full` with and without the node's setting; shared and worktree
 directories, the busy-directory rule, safe removal and the hourly second look; the cascade three ways; roots-only
@@ -3167,10 +3167,12 @@ restart. Now access is decided before launch and `init` is a kill switch.
   `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json` were unchanged (mtime and SHA-256).
 
 **Review round 3** (2026-11-21; head 48ce631). What was left of S1, S2 and S3 on narrower cases, S8, and a nit
-(S15). Each fix has a test that fails without it (16 mutations, each taken out again by a pytest plugin).
-- *What the guarantees cover* (the owner's decision). What the hub, another agent, or a session's own command line
-  can cause. The node owner's machine-level MANAGED settings, and the plugins the owner installed at user level,
-  are trusted configuration that no agent can change: they are outside the guarantee. Their hooks run in every
+(S15). Each fix has a test that fails without it (16 mutations, each taken out again by a pytest plugin). Round 4,
+below, changed three things said here: what the guarantees assume (S17), whose word the `full` ceiling is and
+when it lapses (S1), and when the question about the settings is asked (S3).
+- *What the guarantees cover* (the owner's decision; restated in round 4, S17). What the hub, another agent, or a
+  session's own command line can cause. The node owner's machine-level MANAGED settings, and the plugins the owner
+  installed at user level, are trusted configuration: they are outside the guarantee. Their hooks run in every
   session, a read-only one included (the live `init` of a session started with `--setting-sources=` still lists
   the user's installed plugins), and nothing here tries to defeat them.
 - *S1a, a launch Claude would refuse is refused when the session is opened* (`session_access.claude_conflict`,
@@ -3189,12 +3191,12 @@ restart. Now access is decided before launch and `init` is a kill switch.
   setting, running as root, a future refusal). A root counts as `full` for its children once THIS process has
   reported `bypassPermissions` in its `init`; until then its ceiling is `workspace`. The flag is in memory, set by
   the host's event handler, cleared when a new process is started for the session (`_spawn`) and when the host
-  shuts down: so it holds only in this node process and for the parent's current process. (A parent whose process
-  was parked for idleness keeps it: nothing new was started.) Codex: its answer to `thread/start` and
+  shuts down: so it holds only in this node process and for the parent's current process. (Round 4: it is the
+  live process's, and a parent with no process has none.) Codex: its answer to `thread/start` and
   `thread/resume` names the thread's sandbox (`sandbox.type`; seen live on 0.171.0 in a private CODEX_HOME:
   `readOnly`, `workspaceWrite`, `dangerFullAccess`, for the three values of the parameter). The adapter passes it
-  on with `ready`; `verify_codex` confirms a full session on `dangerFullAccess` (or on an answer that names no
-  sandbox: the node itself sent the parameter), ends one started as full whose answer names another sandbox, and
+  on with `ready`; `verify_codex` confirms a full session on `dangerFullAccess` (round 4: on that only; an
+  answer that names no sandbox confirms nothing), ends one started as full whose answer names another sandbox, and
   ends one NOT started as full whose answer names `dangerFullAccess`.
   On the node a child whose access is within what its parent was started as, but above the parent's ceiling, is
   HELD (`_awaits_parent` in `_hand_over`): open, its messages queued at the hub, no turn. (A turn of the child
@@ -3240,8 +3242,8 @@ restart. Now access is decided before launch and `init` is a kill switch.
     process starts (`ClaudeSession.on_open`, only when the command line's settings are a file and it does not
     select bypass). Seen live: it is answered at once, before any turn (alone, and written together with a turn:
     the answer came before `init`), with `response.effective`, every source merged. The answer is the `sealed`
-    event: the key not in force ends the session at once (`NOT_SEALED`); no answer by the end of the process's
-    first turn ends it too (`SEAL_UNVERIFIED`). A session given the key as JSON is asked nothing, so the bytes
+    event: the key not in force ends the session at once (`NOT_SEALED`); no answer ends it too
+    (`SEAL_UNVERIFIED`; round 4: within the handshake's limit, and no turn is written before the answer). A session given the key as JSON is asked nothing, so the bytes
     written to an ordinary session's process are what they were.
   What was seen WITHOUT the key, for the record: a `set_permission_mode` request for bypass is already refused
   (`bypass_not_launched`) in a session not started with a skip flag, also when a `--settings` file's `defaultMode`
@@ -3311,6 +3313,101 @@ restart. Now access is decided before launch and `init` is a kill switch.
   - The user's `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json` were unchanged (mtime
     and SHA-256, by the script and checked again by hand).
 
+**Review round 4** (2026-11-21; head 22ed183, then rebased onto main f3a07f7, where the Codex adapter had been
+merged as #88: the branch's diff against main is this PR alone).
+- *S17, what the guarantees assume.* Round 3 said no agent can change managed settings or user-level plugins.
+  That is too broad. The guarantees assume that the files the node trusts are not modified by a session: its own
+  code and configuration, a runner's settings file and MCP config, the owner's Claude and Codex configuration and
+  plugins. The node does not sandbox Claude at the OS level: a session with a shell or with full access runs as
+  the node's OS user and can write whatever that user can, those files included. `read-only` is the only word
+  that removes the shell and the write tools, and its guarantee holds against hub input and the session's own
+  command line; against other sessions only to the extent they cannot rewrite those files. Managed settings are
+  protected only where the OS protects them.
+- *S2, the coordinator's ruling, and one hardening.* The finding: a read-only launch trusts whatever MCP entry
+  named `agent-comms` the runner's `--mcp-config` holds, and if that config or the launcher it names is writable
+  by another agent, the child starts that agent's command. Ruling: the runner's configuration is the node
+  owner's, like the node's own code, and any session with a shell runs as the same OS user, so "protected node
+  configuration" is not something the node can promise. Declined as a general fix. The hardening that is cheap
+  and right: `_board_mcp` does not read a config FILE that lies where sessions are meant to write
+  (`_session_writable`: the session's run directory, any `[dispatch.worktrees]` directory or `checkout_roots`
+  root, the worktree directory; by filesystem identity, symlinks resolved; a relative path counts as the run
+  directory's). Such a runner's read-only child gets no board tools, as with a runner that names no config. A
+  workspace or full session is not touched: it runs its runner as configured.
+- *S1a, a Codex answer that names no sandbox confirms nothing.* `verify_codex("full", None)` is `(None, False)`:
+  only `dangerFullAccess`, named, confirms. Decided: such a session is NOT ended. The node itself sent the
+  parameter and nothing says it was not taken, so ending it would punish a Codex that merely says less; what
+  matters is that it is never taken for more than was confirmed, and it is not: no child may be `full` under it,
+  ever, since nothing later can confirm it. (0.171.0 always names the sandbox; its schema requires the field.)
+- *S1b, the confirmation is the live process's.* Round 3 kept a flag and cleared it when the next process was
+  started. But the node hands messages to children BEFORE the host starts processes in a pass, so a parent that
+  was about to be restarted still lent its old process's word to a child in that pass. Now there is no flag to
+  clear: `Session.confirmed_by` is the process object that said it, and `full_confirmed` is true only while that
+  object is the session's process, is not going down, and has not exited (`poll()`). A parent with no process
+  (stopped for idleness, after a node restart, dead) has ceiling `workspace` at once, whatever is queued for it.
+  The hub is told with the next status and refuses new full children; the human sends the parent a message, and
+  its next turn confirms again. Two consequences were handled rather than left:
+  - the same question is asked again at the last moment, when a turn is about to be WRITTEN
+    (`SessionHost.turn_gate`, set by the node: `_turn_allowed`). A message handed to a child under a confirmed
+    parent can wait in the child's inbox for a handshake (Codex's, or the settings question); if the parent's
+    process goes meanwhile, the turn is not written and stays where it is;
+  - the node does not stop a parent's process to make room (`_admit`), nor for being idle (`_park_idle`), while a
+    full child of it has a turn, a message, or one queued (`_lends_full`). Without that, a full child could have
+    its own parent stopped to make room for it and then wait for ever.
+- *S3, the question is a handshake.* Round 3 wrote `get_settings` and the first turn together and judged the
+  answer afterwards, so a turn could be delivered, and with no answer even recorded as done, before the session
+  was ended. Now a process started from a merged settings file is `checking` until its answer says the key is in
+  force, and while it is: nothing but the question is written (`_write`), the session's state is `starting`, and
+  the clock is the handshake's (60 seconds, `_hold_to_timeout`), not the turn's. Key not in force: `NOT_SEALED`,
+  the session ends, the waiting message is reported as never delivered. No answer in time: `SEAL_UNVERIFIED`,
+  the same. The process exits first: the message that made it start fails, once, and nothing is started again
+  for it. A process that writes an `init` and a `result` nobody asked for does not stop that clock (a test found
+  that it did: `ready` used to clear it) and nothing of what it wrote is taken for a turn. `sealed_by`, like
+  `confirmed_by`, is the process that answered: the next process is asked again. Sessions with the key as JSON
+  are as they were: asked nothing, their stdin bytes unchanged.
+- *S16, the answer is not kept.* Every line a process writes went to the session's transcript, the answer to
+  `get_settings` included, and that answer is every setting in force: `env`, `apiKeyHelper`, whatever the owner's
+  settings hold. A provider can now say what the transcript keeps of a line (`transcript_line`, asked before the
+  line is written): Claude's gives back every line as it is except a `control_response`, for which it writes one
+  of its own, `{"type": "host", "subtype": "control_response_withheld", "request_id", "answer", "bypass_disabled"}`.
+  The adapter's event carries one bit (`sealed`, `ok`); nothing else of the answer is stored, logged or reported.
+  The question's id is `settings-<first 8 of the session id>-<n>`, one per session and process.
+- *The e2e script.* It used to read the answer out of the transcript. It now checks that the transcript begins
+  with the node's record and holds no `effective`, that the wrapper saw `get_settings` and then the user turn, in
+  that order, and it shows what such a process answers by asking one it starts itself with the same command line.
+- *Tests* (`tests/test_hosted_tree.py`, 111 now): the three that changed with the rules above, and
+  `test_a_full_childs_turn_is_not_written_once_its_parents_process_is_gone`,
+  `test_a_parent_whose_process_a_full_child_waits_on_is_not_stopped_to_make_room`,
+  `test_the_settings_a_process_reports_never_reach_the_transcript_the_hub_or_a_log` and
+  `test_a_board_config_inside_a_checkout_or_a_worktree_is_not_used_for_a_read_only_session`.
+- *Mutations.* Eight, each taken out again by a pytest plugin, each caught by one of those tests: a Codex answer
+  with no sandbox confirming; the word outliving its process; no gate at the write; the parent stopped to make
+  room; the turn written with the question; no limit on the question; the answer kept in the transcript; any
+  config read.
+- *Live* (the tree scenario on the round-4 code, real Claude Code 2.1.322 and Codex 0.171.0: PASS, 62 checks, ten
+  haiku turns and three Codex turns. A first run stopped at a check of the SCRIPT's, after the handshake itself
+  had worked: with the real CLI the transcript begins with Claude's hook events, since a SessionStart hook runs as
+  the process starts, before the node's record of the answer. The check now leaves hook events aside; nothing in
+  the package changed between the two runs.)
+  - T4c, the `workspace` child of the runner with a settings file: written to its process, in order,
+    `['get_settings', 'user']`; its transcript up to the first turn, hook events aside,
+    `['host/control_response_withheld', 'system/init']`; the node's record `{"type": "host", "subtype":
+    "control_response_withheld", "request_id": "settings-b7da6821-1", "answer": "success", "bypass_disabled":
+    true}`; no `control_response` and no source name anywhere in the transcript. The turn then ran as before: its
+    hooks `['SessionStart', 'PreToolUse', 'plugin SessionStart']`, its two files written. A process the script
+    started with the same command line, asked what is in force: permissions `{"allow": ["Bash(*)", "Write",
+    "Edit", "Read"], "disableBypassPermissionsMode": "disable"}`.
+  - T6b, the `defaultMode: bypassPermissions` fixture: the same order of writes and the same record; `init`:
+    `default`; the `touch` refused; such a process, asked: `{"defaultMode": "bypassPermissions",
+    "disableBypassPermissionsMode": "disable"}`, and to `set_permission_mode bypassPermissions`: `bypass_disabled`.
+  - T7 and T7b, the full root: `bypassPermissions`, a child may have at most `full`; after the node restart
+    `show` says "access full (not confirmed by a live process of its own: a child can have at most workspace)" and
+    `start --parent` at full is a 409 ("... it has no process now, or one that has not said so yet ..."); after
+    the root's next turn (a new process, `bypassPermissions`) the full Claude child ran its `touch`, the workspace
+    child was refused it, and the Codex child at `full` got `thread/start` with `danger-full-access` and the
+    answer `{"type": "dangerFullAccess"}`.
+  - The user's `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json`: unchanged (mtime and
+    SHA-256).
+
 **Residual risks / not verified.**
 - A Codex child narrowed to `read-only` by its access word (the live children ran as their runner is configured or
   at `full`), any Codex effort but `low`, and Claude's `--effort` above `low` were not run live.
@@ -3322,18 +3419,21 @@ restart. Now access is decided before launch and `init` is a kill switch.
   the session rather than riding along, so a new harmless option costs a refusal until it is listed. What the
   owner's `[dispatch.env]` passes into the process (an environment variable that makes Claude load something) is
   not looked at: the node owner's configuration.
-- A `full` child held because its parent's process has not confirmed full access shows as an open session with a
-  queued message; `show` of the PARENT says why ("not confirmed"), the child's own view does not. It waits until
-  the parent's next turn, however long that is.
+- A `full` child held because its parent has no live process that confirmed full access shows as an open session
+  with a queued message; `show` of the PARENT says why ("not confirmed"), the child's own view does not. It waits
+  until the parent's next turn, however long that is, and so does a new full child: after the idle limit or a
+  node restart, the human has to send the parent a message first.
 - The merged settings file is a copy made when the node opens the session: an edit of the runner's own file takes
   effect when the session is opened again (a node restart). It holds whatever the owner's settings hold, beside
   the transcript, mode 600.
 - A Claude CLI that does not answer `get_settings` ends every session started from a runner with its own settings
-  file, after its first turn. The key itself rests on Claude honouring `disableBypassPermissionsMode` from
+  file, a minute after its process starts and without a turn. The key itself rests on Claude honouring `disableBypassPermissionsMode` from
   `--settings`; that, and "the last `--settings` wins", were seen on 2.1.322 only.
 - A read-only Claude session has the board's tools only when its runner's own `--mcp-config` names the
-  `agent-comms` server. The shipped `claude-code` runner relies on the user's Claude configuration for it, which
-  the node does not read: a read-only child of that runner has no board tools.
+  `agent-comms` server, in a file outside every checkout and the worktree directory (round 4, S2). The shipped
+  `claude-code` runner relies on the user's Claude configuration for it, which the node does not read: a read-only
+  child of that runner has no board tools. The launcher that config names, and the config itself wherever it
+  lies, are still only as safe as the OS keeps them from a session with a shell (S17).
 - The pin rests on an explicit `--permission-mode` beating every settings file. That was seen for a `--settings`
   file; trusted-project settings were not tried, MANAGED settings are outside the guarantee. The kill switch covers
   a process that reports `bypassPermissions` anyway, but only at the start of a turn, and the process lives for

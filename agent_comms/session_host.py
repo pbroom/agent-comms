@@ -43,8 +43,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import providers, runner_preflight, session_access
-from .dispatch import (DispatchConfig, _signal_group, child_env, probe_process, process_start, render_argv,
-                       spawn_piped, stop_verified, with_writable_roots)
+from .dispatch import (DispatchConfig, _signal_group, _within, child_env, probe_process, process_start,
+                       render_argv, spawn_piped, stop_verified, with_writable_roots)
 from .providers import Event, ProviderSession, validate_model, validate_session_id
 
 log = logging.getLogger("agent_comms.session_host")
@@ -139,18 +139,36 @@ class Session:
     access: str | None = None
     effort: str | None = None
     # How bypass was switched off on its command line (session_access.claude_sealed): None (a `full` launch, or not
-    # Claude), "inline" or "merged" (a settings file this host wrote from the runner's own: then THIS process must
-    # say the key is in force, `sealed`, by the end of its first turn).
+    # Claude), "inline" or "merged" (a settings file this host wrote from the runner's own: then every process of
+    # the session must first say the key is in force, and no turn is written to it before it has: `checking`).
     seal: str | None = None
-    sealed: bool = False
-    # THIS process said it runs with full access (Claude's `init`: bypassPermissions; Codex's answer to thread/start:
-    # dangerFullAccess). False again from the moment another process is started for the session.
-    full_confirmed: bool = False
+    # What a process said is that process's, so each is kept as THE PROCESS that said it and counts only while that
+    # one is the session's live process: `sealed_by` (the key is in force), `confirmed_by` (it runs with full
+    # access: Claude's `init` says bypassPermissions, Codex's answer to thread/start names dangerFullAccess).
+    sealed_by: Any = None
+    confirmed_by: Any = None
+
+    @property
+    def sealed(self) -> bool:
+        return self.child is not None and self.sealed_by is self.child
+
+    @property
+    def checking(self) -> bool:
+        """Its process has been asked whether bypass is switched off in it and has not said so: no turn yet."""
+        return self.seal == "merged" and self.child is not None and not self.sealed
+
+    @property
+    def full_confirmed(self) -> bool:
+        """The session's LIVE process said it runs with full access. Not one that is gone, going down or has
+        exited, and not the one before it: nothing has to be cleared for that, the process is simply another."""
+        return (self.child is not None and self.confirmed_by is self.child and self.stopping_since is None
+                and self.child.poll() is None)
 
     @property
     def ceiling(self) -> str | None:
-        """The most a CHILD of this session may have now. Its own access, except that `full` counts only once its
-        process has said so: what a session was started as is not yet what the CLI accepted."""
+        """The most a CHILD of this session may have now. Its own access, except that `full` counts only while the
+        process that confirmed it is alive: what a session was started as is not yet what the CLI accepted, and
+        what one process accepted says nothing about the next."""
         return "workspace" if self.access == "full" and not self.full_confirmed else self.access
 
     @property
@@ -170,7 +188,8 @@ class Session:
             return "waiting"
         if self.busy:
             return "running" if self.ready else "starting"
-        if self.child is not None and self.stopping_since is None and not self.ready and self.provider.waits_for_ready:
+        if self.child is not None and self.stopping_since is None and (
+                self.checking or (not self.ready and self.provider.waits_for_ready)):
             return "starting"
         return "idle"
 
@@ -241,6 +260,9 @@ class SessionHost:
             raise ValueError("timeout_minutes must be positive")
         self.kill_grace = float(config.kill_grace_seconds if kill_grace_seconds is None else kill_grace_seconds)
         self.sessions: dict[str, Session] = {}
+        # Asked at the moment a turn is about to be written, the last moment there is: False keeps the message in
+        # the session's inbox (its caller's rule: a child session's parent must still be what the child needs).
+        self.turn_gate: Callable[[Session], bool] | None = None
         self._recovered = False
         self._next_message = 0
 
@@ -406,7 +428,7 @@ class SessionHost:
         # the hub). Without a word the template is as configured; a Claude runner that names no permission mode
         # gets the standard one pinned, so that no settings file decides it.
         prep = session_access.prepare(template, access, allow_full=self.config.sessions.allow_full_access, cwd=cwd,
-                                      board_mcp=lambda configs: self._board_mcp(session_id, configs))
+                                      board_mcp=lambda configs: self._board_mcp(session_id, configs, cwd))
         template = prep.template
         if (prep.as_configured and prep.configure != "full"
                 and runner_preflight.scoped(template, project, self.config.claude_tool_projects)):
@@ -476,14 +498,30 @@ class SessionHost:
             except OSError:
                 pass
 
-    def _board_mcp(self, session_id: str, configs: list[str]) -> str | None:
+    def _session_writable(self, path: str, cwd: str) -> bool:
+        """`path` lies where sessions are meant to write: this session's run directory, any directory this machine
+        runs a project in (`[dispatch.worktrees]`, `checkout_roots`), or the directory session and run worktrees
+        are made in. By filesystem identity, symlinks resolved."""
+        places = [cwd, *self.config.worktrees.values(), *self.config.checkout_roots, self.config.worktree_root()]
+        return any(_within(path, place) for place in places if isinstance(place, str) and place)
+
+    def _board_mcp(self, session_id: str, configs: list[str], cwd: str) -> str | None:
         """For a read-only Claude session: a config holding ONLY the board's MCP server, as the runner's own
         `--mcp-config` values define it (each a file, or the JSON itself), written beside the session's transcript
         (mode 600; it names the launcher, never a token). None when the runner names no config with that server:
-        the session then has no MCP server at all. Nothing is looked for in the user's own Claude configuration."""
+        the session then has no MCP server at all. Nothing is looked for in the user's own Claude configuration.
+
+        A config FILE inside a checkout or a worktree is not read (`_session_writable`; a relative path is one in
+        the run directory): that is where other sessions write, and the entry names a command this session would
+        start. Such a runner's read-only child gets no board tools, like one whose runner names no config."""
         entry = None
         for value in configs:
             try:
+                if not value.lstrip().startswith("{") and (not os.path.isabs(value)
+                                                           or self._session_writable(value, cwd)):
+                    log.warning("session %s: the runner's MCP config lies in a checkout or worktree, where sessions "
+                                "write; it is not used for a read-only session", session_id)
+                    continue
                 text = value if value.lstrip().startswith("{") else Path(value).read_text()
                 servers = json.loads(text).get("mcpServers")
             except (OSError, ValueError, AttributeError):
@@ -572,8 +610,11 @@ class SessionHost:
                 self._reap(s, now, out)     # a write that failed stopped it
 
     def _read(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        keep = getattr(s.provider, "transcript_line", None)
         for line in s.child.read_lines():
-            self._tee(s, line)
+            # The transcript keeps what the process wrote, except what the provider says must not be kept (Claude's
+            # answer to `get_settings`: the settings in force, which can hold credentials): its own record instead.
+            self._tee(s, line if keep is None else keep(line))
             if s.ended:
                 continue
             events, replies = s.provider.feed(line)
@@ -600,11 +641,11 @@ class SessionHost:
                     log.warning("session %s: %s", s.session_id, problem)
                     self._end(s, problem, now, out)
                     return
-                s.full_confirmed = confirmed
+                s.confirmed_by = s.child if confirmed else None
             s.ready, s.provider_id = True, ev.provider_id
             if not s.provider.waits_for_ready:
                 s.resume = True     # Claude: `ready` comes with the first turn, and the session exists from then on
-            if not s.busy:
+            if not s.busy and not s.checking:   # (a process still being asked about its settings stays on the clock)
                 s.busy_since = None
             self._save_state()
         elif ev.kind == "turn_started":
@@ -619,17 +660,21 @@ class SessionHost:
                 self._end(s, problem, now, out)
                 return
             if s.access == "full" and ev.mode == "bypassPermissions":
-                s.full_confirmed = True     # Claude took the mode: from now on a child may be `full` under it
+                s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
             if s.in_flight is not None:
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
         elif ev.kind == "sealed":
             # The process's own word on whether bypass is switched off in it (asked when it started, for a session
-            # started from a settings file this host merged: Claude ignores a file it finds invalid, whole).
+            # started from a settings file this host merged: Claude ignores a file it finds invalid, whole). Until
+            # it says yes nothing else is written to it (`checking`); if it says no the session ends, and the
+            # message that was waiting is reported as never delivered.
             if not ev.ok:
                 log.warning("session %s: %s", s.session_id, session_access.NOT_SEALED)
                 self._end(s, session_access.NOT_SEALED, now, out)
                 return
-            s.sealed = True
+            s.sealed_by = s.child
+            if not s.busy:
+                s.busy_since = None     # the check is over; the turn's own clock starts when it is written
         elif ev.kind == "turn_ended":
             if s.in_flight is None:
                 log.warning("session %s: a turn ended that the host did not start", s.session_id)
@@ -641,10 +686,6 @@ class SessionHost:
                                  denials=ev.denials, meta=dict(ev.meta),
                                  detail=self._timeout_detail() if timed_out else ev.detail, text=ev.text))
             self._save_state()
-            if s.seal == "merged" and not s.sealed:
-                # A whole turn, and still no word that the key is in force: not accepted where it may not be.
-                log.warning("session %s: %s", s.session_id, session_access.SEAL_UNVERIFIED)
-                self._end(s, session_access.SEAL_UNVERIFIED, now, out)
         elif ev.kind == "approval_requested":
             s.denials, s.waiting = ev.denials, True
             out.append(HostEvent(s.session_id, "approval_requested", s.in_flight.id if s.in_flight else None,
@@ -671,8 +712,9 @@ class SessionHost:
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
         if not s.ready:
             self._correct_start_mode(s)
-        was_ready = s.ready
+        was_ready, was_checking = s.ready, s.checking
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
+        s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.outbuf.clear()
         close = getattr(child, "close", None)
@@ -687,9 +729,10 @@ class SessionHost:
                 self._fail(s, f"the process exited (code {code}) before the turn ended", out)
             elif s.writing is not None:
                 self._fail(s, f"the process exited (code {code}) before the message was written", out)
-            elif s.inbox and s.provider.waits_for_ready and not was_ready:
-                # It went during its handshake. The message that made it start fails with it: otherwise a process
-                # that can never start (a runner flag Codex refuses) would be started again on every pass.
+            elif s.inbox and ((s.provider.waits_for_ready and not was_ready) or was_checking):
+                # It went during its handshake (or before it answered the question it was asked at its start). The
+                # message that made it start fails with it: otherwise a process that can never start (a runner flag
+                # Codex refuses) would be started again on every pass.
                 self._fail_start(s, f"the process exited (code {code}) before it was ready", out)
             s.busy_since = None
         s.held_since = None
@@ -731,10 +774,16 @@ class SessionHost:
                 self._fail(s, self._timeout_detail(), out)
                 self._stop(s, now)
             return
-        if not s.busy and not s.ready:
+        if not s.busy and (not s.ready or s.checking):
             # A handshake, not a turn. It has its own short limit, so a process that never becomes ready fails the
             # message waiting on it now and not after a whole turn's timeout.
             if now - s.busy_since < self.handshake_seconds:
+                return
+            if s.checking:
+                # It never said whether bypass is switched off in it: not accepted where it may not be. Nothing
+                # was written to it but the question.
+                log.warning("session %s: %s", s.session_id, session_access.SEAL_UNVERIFIED)
+                self._end(s, session_access.SEAL_UNVERIFIED, now, out)
                 return
             self._fail_start(s, f"the agent process was not ready after {self.handshake_seconds:g} seconds", out)
             self._stop(s, now)
@@ -825,13 +874,12 @@ class SessionHost:
             self._end(s, f"could not start: {type(e).__name__}: {e}", now, out)
             return
         s.child, s.ready, s.stopping_since, s.killed = child, False, None, False
-        s.sealed = s.full_confirmed = False     # what an earlier process said does not hold for this one
         try:
             s.proc_start = self.start_of(child.pid)
         except Exception:
             s.proc_start = None
         s.outbuf = bytearray(b"".join(s.provider.on_open()))
-        s.busy_since = now if s.provider.waits_for_ready else None
+        s.busy_since = now if s.provider.waits_for_ready or s.checking else None     # a handshake has its own limit
         try:
             fd = os.open(self.transcript_path(s.session_id),
                          os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -859,7 +907,8 @@ class SessionHost:
             self._spawn(s, now, out)
             if s.child is None:
                 return
-        if not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not self._held(s, now, out):
+        if (not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not s.checking
+                and (self.turn_gate is None or self.turn_gate(s)) and not self._held(s, now, out)):
             s.writing = s.inbox.popleft()
             s.waiting, s.denials, s.busy_since = False, (), now
             if s.provider.waits_for_ready and not s.resume:
@@ -881,7 +930,7 @@ class SessionHost:
                 # handshake the message that made the process start is still in the inbox: it fails here too.
                 s.outbuf.clear()
                 detail = f"could not write to the process: {type(e).__name__}"
-                if s.provider.waits_for_ready and not s.ready:
+                if (s.provider.waits_for_ready and not s.ready) or s.checking:
                     self._fail_start(s, detail, out)
                 else:
                     self._fail(s, detail, out)
@@ -948,6 +997,6 @@ class SessionHost:
             s.child, s.proc_start, s.ready, s.stopping_since, s.killed = None, None, False, None, False
             s.outbuf.clear()
         for s in self.sessions.values():
-            s.sealed = s.full_confirmed = False     # this host is done: what its processes said goes with it
+            s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
         self._save_state()
         return out

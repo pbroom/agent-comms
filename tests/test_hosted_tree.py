@@ -1586,19 +1586,28 @@ def test_a_full_child_waits_after_a_restart_until_its_parents_process_has_confir
     senv.node.hello()
 
 
-def test_full_counts_for_children_only_while_the_parents_current_process_has_confirmed_it(senv):
-    """S1 (round 3). What a session was started as is not yet what its CLI accepted. A root labelled `full` gives
-    its children at most `workspace` until its process reports bypassPermissions; the confirmation is that
-    process's, so it is gone when another process is started for the session."""
-    node = make_node(senv, config=tree_config(senv, runners={"claude-code": BYPASS},
-                                              sessions={"allow_full_access": True}), log_dir=senv.tmp / "c-logs")
+def full_node(env, name, **sessions):
+    node = make_node(env, config=tree_config(env, runners={"claude-code": BYPASS},
+                                             sessions={"allow_full_access": True} | sessions),
+                     log_dir=env.tmp / f"{name}-logs")
     node.hello()
+    return node
+
+
+def test_full_counts_for_children_only_while_the_process_that_confirmed_it_is_alive(senv):
+    """S1 (rounds 3 and 4). What a session was started as is not yet what its CLI accepted. A root labelled `full`
+    gives its children at most `workspace` until its process reports bypassPermissions, and the confirmation is
+    THAT process's: with no process, or a new one that has said nothing, the ceiling is `workspace` again. It is
+    read off the parent's process at the moment a child is considered, so a parent that is started in a pass never
+    lends its earlier process's word to a child in that pass."""
+    node = full_node(senv, "c")
     sid = root(senv, node=node)
     host = node.sessions.host
     assert (host.sessions[sid].access, host.sessions[sid].ceiling) == ("full", "workspace")
     view = show(senv, sid)
     assert (view["access"], view["ceiling"]) == ("full", "workspace")
-    assert cli._fmt_access(view) == "full (not confirmed by its process yet: a child can have at most workspace)"
+    assert cli._fmt_access(view) == ("full (not confirmed by a live process of its own: a child can have at most "
+                                     "workspace)")
     for word in (None, "full"):
         out = child(senv, sid, expect=409, **({"access": word} if word else {}))
         assert "was started as a full-access session, but its process has not confirmed that" in out["message"]
@@ -1611,23 +1620,34 @@ def test_full_counts_for_children_only_while_the_parents_current_process_has_con
     tick(senv, node, times=2)
     answer(senv, kid, node=node)
     assert msg(senv, kid, 1)["state"] == "done"
-    # The parent's process is stopped for idleness: nothing new has been started, the confirmation stands.
+    # The parent's process is stopped (as the idle limit would): the word was that process's, and it is gone.
     assert host.park(sid)
     tick(senv, node, times=2)
-    assert host.sessions[sid].child is None and host.sessions[sid].ceiling == "full"
-    # A new process for the parent: unconfirmed again until IT says so. The child's next message waits.
-    send(senv, sid, "again")
-    tick(senv, node)
-    assert host.sessions[sid].child is not None and host.sessions[sid].ceiling == "workspace"
+    assert host.sessions[sid].child is None and host.sessions[sid].ceiling == "workspace"
     assert show(senv, sid)["ceiling"] == "workspace"
+    assert "has not confirmed" in child(senv, sid, expect=409)["message"]
+    # The parent has no process and a queued message; its full child has a queued message. ONE pass: the parent's
+    # turn goes out (a new process), the child's does not.
     send(senv, kid, "two")
-    tick(senv, node, times=3)
-    assert msg(senv, kid, 2)["state"] == "queued" and show(senv, kid)["state"] != "ended"
-    begin(senv, sid, node)
+    send(senv, sid, "again")
+    kid_proc = proc_of(senv, kid, node)[1]
     tick(senv, node)
-    assert msg(senv, kid, 2)["state"] == "delivered"
+    assert msg(senv, sid, 2)["state"] == "delivered" and msg(senv, kid, 2)["state"] == "queued"
+    assert host.sessions[sid].child is not None and host.sessions[sid].ceiling == "workspace"
+    assert len(written(kid_proc)) == 1 and not host.sessions[kid].inbox, "nothing was handed to the child, let alone written"
+    tick(senv, node, times=3)
+    assert msg(senv, kid, 2)["state"] == "queued" and show(senv, kid)["state"] != "ended", "held, not ended"
+    begin(senv, sid, node)                               # the NEW process says it runs bypassed
+    tick(senv, node)
+    assert msg(senv, kid, 2)["state"] == "delivered" and len(written(kid_proc)) == 2
+    # A process that has exited and is not yet reaped lends nothing either.
+    parent_proc = proc_of(senv, sid, node)[1]
+    assert host.sessions[sid].ceiling == "full"
+    parent_proc.code = 1
+    assert host.sessions[sid].ceiling == "workspace"
+    parent_proc.code = None
     # A parent whose new process turns out NOT to run bypassed is ended (the kill switch), its children with it.
-    proc_of(senv, sid, node)[1].emit(result(sid))
+    parent_proc.emit(result(sid))
     tick(senv, node, times=2)
     assert host.park(sid)
     tick(senv, node, times=2)
@@ -1640,12 +1660,60 @@ def test_full_counts_for_children_only_while_the_parents_current_process_has_con
     senv.node.hello()
 
 
+def test_a_full_childs_turn_is_not_written_once_its_parents_process_is_gone(senv):
+    """S1b (round 4). A message is handed to a child under a parent that allows it, but it can wait in the child's
+    inbox for a handshake. If the parent's process goes in that time, the turn is not written: the host asks again
+    at the moment of writing (`turn_gate`)."""
+    node = full_node(senv, "g")
+    sid = root(senv, node=node)
+    answer(senv, sid, node=node)                         # live, and it said bypassPermissions
+    kid = child(senv, sid, "count", agent="codex", access="full")["session_id"]
+    tick(senv, node)
+    host, proc = node.sessions.host, codex_proc(senv, node)
+    assert [m.id for m in host.sessions[kid].inbox] == ["1"], "handed over: its parent allowed it; Codex is starting"
+    proc_of(senv, sid, node)[1].code = 1                 # the parent's process dies
+    proc.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv, node)
+    proc.emit(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "dangerFullAccess"}}))
+    tick(senv, node, times=3)
+    assert host.sessions[sid].child is None and host.sessions[kid].ready
+    assert not any(m.get("method") == "turn/start" for m in written(proc)), "ready, and still nothing is written"
+    assert msg(senv, kid, 1)["state"] == "queued" and show(senv, kid)["state"] != "ended"
+    send(senv, sid, "again")
+    tick(senv, node)
+    assert not any(m.get("method") == "turn/start" for m in written(proc)), "the parent's new process has said nothing"
+    begin(senv, sid, node)
+    tick(senv, node)
+    assert [m["params"]["input"][0]["text"] for m in written(proc) if m.get("method") == "turn/start"] == ["count"]
+    assert msg(senv, kid, 1)["state"] == "delivered"
+    senv.node.hello()
+
+
+def test_a_parent_whose_process_a_full_child_waits_on_is_not_stopped_to_make_room(senv):
+    """S1b (round 4). With the confirmation tied to the parent's live process, stopping that process to make room
+    for its own full child would hold the child until the parent's next turn. The node stops another idle process
+    instead, though the parent has been idle longest."""
+    node = full_node(senv, "m", max_live=2)
+    sid = root(senv, node=node)
+    answer(senv, sid, node=node)
+    first = child(senv, sid, "one")["session_id"]
+    tick(senv, node)
+    answer(senv, first, node=node)                       # two processes are up, both idle; the parent the longer
+    second = child(senv, sid, "two")["session_id"]
+    tick(senv, node, times=4)
+    parent_proc, first_proc = proc_of(senv, sid, node)[1], proc_of(senv, first, node)[1]
+    assert (parent_proc.terminated, first_proc.terminated) == (0, 1), "the other child made room, not the parent"
+    assert msg(senv, second, 1)["state"] == "delivered" and node.sessions.host.sessions[sid].ceiling == "full"
+    senv.node.hello()
+
+
 def test_codex_confirms_full_access_with_its_answer_to_thread_start(senv):
     """S1 (round 3). The node itself sends `danger-full-access` as the thread's sandbox; Codex's answer names the
     sandbox the thread has, and that is the confirmation (no turn is needed). An answer that names another sandbox
     ends a session started as full; one that names dangerFullAccess ends a session that was not."""
     v = access.verify_codex
-    assert v("full", "dangerFullAccess") == (None, True) and v("full", None) == (None, True)
+    assert v("full", "dangerFullAccess") == (None, True)
+    assert v("full", None) == (None, False), "an answer that names no sandbox confirms nothing (and ends nothing)"
     assert v("full", "workspaceWrite") == (access.CODEX_NOT_FULL.format(sandbox="workspaceWrite"), False)
     assert v("workspace", "workspaceWrite") == (None, False) == v("read-only", "readOnly") == v("workspace", None)
     assert v("workspace", "dangerFullAccess") == (access.CODEX_FULL, False) == v(None, "dangerFullAccess")
@@ -1671,10 +1739,25 @@ def test_codex_confirms_full_access_with_its_answer_to_thread_start(senv):
     assert node.sessions.host.sessions[sid].ceiling == "full" and show(senv, sid)["ceiling"] == "full"
     assert child(senv, sid, agent="claude")["access"] == "full", "a full child, now that Codex has said so"
 
-    # The same root on a restarted node, and this time Codex answers with another sandbox: ended, not run narrower.
+    # The same root on a restarted node, and this time Codex's answer names NO sandbox: the session runs on (the
+    # node itself sent the parameter), but nothing has confirmed it: no child may be full under it.
     again = make_node(senv, config=tree_config(senv, runners={"codex-cli": full_codex},
                                                sessions={"allow_full_access": True}), log_dir=senv.tmp / "cx-logs")
     send(senv, sid, "more")
+    tick(senv, again)
+    proc = codex_proc(senv, again)
+    proc.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv, again)
+    proc.emit(cx.reply(2, {k: v for k, v in cx.THREAD_RESULT.items() if k != "sandbox"}))
+    tick(senv, again, times=2)
+    assert show(senv, sid)["state"] != "ended" and again.sessions.host.sessions[sid].ready
+    assert again.sessions.host.sessions[sid].ceiling == "workspace" and show(senv, sid)["ceiling"] == "workspace"
+    assert "has not confirmed" in child(senv, sid, agent="claude", expect=409)["message"]
+
+    # ... and on a node restarted once more Codex answers with another sandbox: ended, not run narrower.
+    again = make_node(senv, config=tree_config(senv, runners={"codex-cli": full_codex},
+                                               sessions={"allow_full_access": True}), log_dir=senv.tmp / "cx-logs")
+    send(senv, sid, "and more")
     tick(senv, again)
     proc = codex_proc(senv, again)
     proc.emit(cx.reply(1, cx.INIT_RESULT))
@@ -1803,10 +1886,12 @@ def sealed_line(request_id, effective) -> dict:
 
 
 def test_a_session_started_from_a_merged_settings_file_must_say_bypass_is_off(senv, tmp_path):
-    """S3 (round 3). Claude ignores a settings file it finds invalid, whole and silently (seen live: one value of
-    the wrong type beside the key, and the key was not in force). So a process started from a file this node merged
-    is asked what is in force (`get_settings`, answered before any turn: seen live), and the session is ended if
-    the key is not, or if a whole turn passes without an answer. A session given the key as JSON is asked nothing."""
+    """S3 (rounds 3 and 4). Claude ignores a settings file it finds invalid, whole and silently (seen live: one
+    value of the wrong type beside the key, and the key was not in force). So a process started from a file this
+    node merged is asked what is in force (`get_settings`, answered before any turn: seen live) and NOTHING else is
+    written to it until it has said the key is: the question is a handshake. The session is ended if the key is
+    not in force, or if no answer comes within the handshake's limit; no turn is ever written to, or recorded for,
+    a process that has not answered. A session given the key as JSON is asked nothing."""
     p = ClaudeSession()
     p.argv(SHIPPED + SEAL, session_id=UNKNOWN, resume=False, model=None)
     assert p.on_open() == [], "the key as JSON: nothing to ask"
@@ -1817,12 +1902,12 @@ def test_a_session_started_from_a_merged_settings_file_must_say_bypass_is_off(se
     p.argv(SHIPPED + ["--settings", "/x/merged.json"], session_id=UNKNOWN, resume=False, model=None)
     [asked] = p.on_open()
     request = json.loads(asked)
-    assert request == {"type": "control_request", "request_id": "settings-1", "request": {"subtype": "get_settings"}}
+    assert request == {"type": "control_request", "request_id": "settings-9e8d7c6b-1", "request": {"subtype": "get_settings"}}
     assert asked.endswith(b"\n") and asked.count(b"\n") == 1
     off = {"permissions": {"disableBypassPermissionsMode": "disable", "allow": ["Read"]}}
     assert p.feed(json.dumps(sealed_line("another", off)).encode()) == ([], []), "not the answer to its question"
-    assert p.feed(json.dumps(sealed_line("settings-1", off)).encode()) == ([Event("sealed", ok=True)], [])
-    assert p.feed(json.dumps(sealed_line("settings-1", off)).encode()) == ([], []), "answered once"
+    assert p.feed(json.dumps(sealed_line("settings-9e8d7c6b-1", off)).encode()) == ([Event("sealed", ok=True)], [])
+    assert p.feed(json.dumps(sealed_line("settings-9e8d7c6b-1", off)).encode()) == ([], []), "answered once"
     for effective in ({}, {"permissions": {}}, {"permissions": {"disableBypassPermissionsMode": "enable"}}, None, "x"):
         p.argv(SHIPPED + ["--settings", "/x/merged.json"], session_id=UNKNOWN, resume=False, model=None)
         rid = json.loads(p.on_open()[0])["request_id"]
@@ -1837,50 +1922,172 @@ def test_a_session_started_from_a_merged_settings_file_must_say_bypass_is_off(se
     runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--settings", str(own)]
     node = make_node(senv, config=tree_config(senv, runners={"claude-code": runner}), log_dir=senv.tmp / "m-logs")
 
+    host = node.sessions.host
+
     def opened(project):
         sid = start(senv, project=project)["session_id"]
         tick(senv, node)
         call, proc = proc_of(senv, sid, node)
-        first, turn = written(proc)
-        assert first["request"] == {"subtype": "get_settings"} and turn["type"] == "user", "asked before the turn"
-        assert node.sessions.host.sessions[sid].seal == "merged"
+        [first] = written(proc)
+        assert first["request"] == {"subtype": "get_settings"}, "the question, alone: the turn waits for the answer"
+        assert host.sessions[sid].seal == "merged" and host.sessions[sid].checking
+        assert show(senv, sid)["state"] == "starting" and msg(senv, sid, 1)["state"] == "queued"
+        tick(senv, node, times=2)
+        assert len(written(proc)) == 1 and msg(senv, sid, 1)["state"] == "queued", "and it goes on waiting"
         return sid, proc, first["request_id"]
 
-    # It says the key is in force: the session goes on, turn after turn, and is asked once per process.
+    # It says the key is in force: now the turn is written. Later turns of the same process need no new answer.
     sid, proc, rid = opened(PROJECT)
-    proc.emit(sealed_line(rid, off), began(sid), result(sid))
+    proc.emit(sealed_line(rid, off))
+    tick(senv, node)
+    assert [x.get("type") for x in written(proc)] == ["control_request", "user"] and not host.sessions[sid].checking
+    assert msg(senv, sid, 1)["state"] == "delivered"
+    proc.emit(began(sid), result(sid))
     tick(senv, node, times=2)
     assert show(senv, sid)["state"] == "idle" and msg(senv, sid, 1)["state"] == "done"
     send(senv, sid, "again")
     tick(senv, node)
     proc.emit(began(sid), result(sid))
     tick(senv, node, times=2)
-    assert show(senv, sid)["state"] == "idle" and len(written(proc)) == 3
-    # It says the key is NOT in force (the merged file was ignored): ended at once, before its turn has got anywhere.
+    assert show(senv, sid)["state"] == "idle" and [x.get("type") for x in written(proc)] == [
+        "control_request", "user", "user"]
+    # A NEW process of the same session is asked again, and waits again.
+    assert host.park(sid)
+    tick(senv, node, times=2)
+    send(senv, sid, "after a rest")
+    tick(senv, node, times=2)
+    fresh = proc_of(senv, sid, node)[1]
+    assert fresh is not proc and [x.get("type") for x in written(fresh)] == ["control_request"]
+    fresh.emit(sealed_line(written(fresh)[0]["request_id"], off))
+    tick(senv, node)
+    assert [x.get("type") for x in written(fresh)] == ["control_request", "user"]
+    # It says the key is NOT in force (the merged file was ignored): ended at once. Its turn was never written.
     sid, proc, rid = opened(P2)
     proc.emit(sealed_line(rid, {"model": "haiku"}))
     tick(senv, node, times=3)
     assert show(senv, sid)["state"] == "ended" and show(senv, sid)["error"] == access.NOT_SEALED[:300]
-    assert msg(senv, sid, 1)["state"] == "failed" and proc.terminated == 1
-    # It never says: the first turn's result is taken, and the session is ended with the reason.
+    assert msg(senv, sid, 1)["state"] == "failed" and msg(senv, sid, 1)["delivered_at"] is None
+    assert len(written(proc)) == 1 and proc.terminated == 1
+    # It never says, and writes what looks like a whole turn instead: nothing of that is taken for a turn (none was
+    # written), and when the handshake's limit is up the session is ended.
     sid, proc, rid = opened(P3)
     proc.emit(began(sid), result(sid, text="done"))
+    tick(senv, node, times=2)
+    assert show(senv, sid)["state"] == "starting" and msg(senv, sid, 1)["state"] == "queued"
+    senv.clock.advance(58)
+    tick(senv, node)
+    assert show(senv, sid)["state"] == "starting", "the limit is the handshake's (60 seconds), not the turn's"
+    senv.clock.advance(3)
     tick(senv, node, times=3)
     assert show(senv, sid)["state"] == "ended" and show(senv, sid)["error"] == access.SEAL_UNVERIFIED[:300]
-    assert msg(senv, sid, 1)["state"] == "done", "the turn it did is on record"
+    failed = msg(senv, sid, 1)
+    assert failed["state"] == "failed" and failed["delivered_at"] is None and show(senv, sid)["turns"] == 0, \
+        "no turn was written, delivered or recorded as done"
+    assert len(written(proc)) == 1 and proc.terminated == 1
     # Its process dies on the question (a CLI that cannot take it): the message fails, once, and nothing is started
     # again for it. The next message asks the next process the same.
+    node.hello()                                         # (a minute has passed: the node says it is still there)
     sid, proc, rid = opened(P3)
     started = len(node.session_spawner.calls)
     proc.code = 1
     tick(senv, node, times=4)
     failed = msg(senv, sid, 1)
-    assert failed["state"] == "failed" and "the process exited (code 1)" in json.dumps(failed), failed
+    assert failed["state"] == "failed" and "the process exited (code 1) before it was ready" in json.dumps(failed)
     assert len(node.session_spawner.calls) == started and show(senv, sid)["state"] == "idle"
     send(senv, sid, "again")
     tick(senv, node)
     assert len(node.session_spawner.calls) == started + 1
-    assert [x.get("type") for x in written(node.session_spawner.children[-1])] == ["control_request", "user"]
+    assert [x.get("type") for x in written(node.session_spawner.children[-1])] == ["control_request"]
+
+
+def test_the_settings_a_process_reports_never_reach_the_transcript_the_hub_or_a_log(senv, tmp_path, caplog):
+    """S16 (round 4). The answer to `get_settings` is every setting in force, and settings can hold credentials
+    (`env`). Every line a process writes goes to the session's transcript; this one must not. The adapter takes the
+    one bit out of it, and the transcript gets a line of the adapter's own in its place."""
+    secret = "SECRET-TOKEN-7f3a-9c21"
+    own = tmp_path / "own.json"
+    own.write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--settings", str(own)]
+    node = make_node(senv, config=tree_config(senv, runners={"claude-code": runner}), log_dir=senv.tmp / "s16-logs")
+    spy = node.sessions.client = Spy(node.sessions.client)
+    sid = start(senv)["session_id"]
+    tick(senv, node)
+    proc = proc_of(senv, sid, node)[1]
+    rid = written(proc)[0]["request_id"]
+    said = sealed_line(rid, {"permissions": {"disableBypassPermissionsMode": "disable", "allow": ["Read"]},
+                             "env": {"ANTHROPIC_API_KEY": secret}, "apiKeyHelper": f"echo {secret}"})
+    said["response"]["response"]["sources"] = [{"source": "userSettings", "settings": {"env": {"KEY": secret}}}]
+    proc.emit(said)
+    tick(senv, node)
+    proc.emit(began(sid), {"type": "assistant", "session_id": sid, "message": {"content": [
+        {"type": "text", "text": "a control_response is a kind of line"}]}}, result(sid, text="done"))
+    tick(senv, node, times=3)
+    assert msg(senv, sid, 1)["state"] == "done" and show(senv, sid)["state"] == "idle"
+    transcript = (senv.tmp / "s16-logs" / "sessions" / f"{sid}.jsonl").read_text()
+    lines = [json.loads(x) for x in transcript.splitlines()]
+    assert lines[0] == {"type": "host", "subtype": "control_response_withheld", "request_id": rid,
+                        "answer": "success", "bypass_disabled": True}, "the adapter's own record of the answer"
+    assert [x.get("type") for x in lines[1:]] == ["system", "assistant", "result"], "everything else as it was written"
+    assert lines[2]["message"]["content"][0]["text"] == "a control_response is a kind of line"
+    for needle in (secret, "ANTHROPIC_API_KEY", "apiKeyHelper", "effective", "userSettings"):
+        assert needle not in transcript, needle
+    # ... nor anywhere else: no file under the hub's and the node's directories, no report, no view, no log line.
+    for path in senv.tmp.rglob("*"):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes(), path
+    assert secret not in json.dumps(spy.posts) and secret not in json.dumps(show(senv, sid))
+    assert secret not in caplog.text and "ANTHROPIC_API_KEY" not in caplog.text
+    # The record says what the answer was worth, also when it is not the one hoped for.
+    keep = ClaudeSession.transcript_line
+    plain = json.dumps(began(sid)).encode()
+    assert keep(plain) is plain and keep(b"not json control_response") == b"not json control_response"
+    refused = {"type": "control_response", "response": {"subtype": "error", "request_id": "settings-1",
+                                                        "error": f"no: {secret}"}}
+    assert json.loads(keep(json.dumps(refused).encode())) == {
+        "type": "host", "subtype": "control_response_withheld", "request_id": "settings-1", "answer": "error",
+        "bypass_disabled": False}
+    odd = {"type": "control_response", "response": {"subtype": secret, "request_id": {"x": secret}, "response": secret}}
+    assert secret.encode() not in keep(json.dumps(odd).encode())
+
+
+def test_a_board_config_inside_a_checkout_or_a_worktree_is_not_used_for_a_read_only_session(senv, tmp_path):
+    """S2 (round 4). A read-only session's one MCP server is the board's, as the runner's own `--mcp-config`
+    defines it: a command this session starts. A config FILE where sessions write (the run directory, any project
+    directory of this machine, the worktree directory) could have been written by another session, so it is not
+    read; such a runner's read-only child has no board tools, like one whose runner names no config."""
+    worktrees = tmp_path / "wt"
+    (worktrees / "repo" / "session-x").mkdir(parents=True)
+    safe, inside = tmp_path / "ok.mcp.json", senv.work / "board.mcp.json"
+    in_worktree, link = worktrees / "repo" / "session-x" / "board.mcp.json", tmp_path / "link.mcp.json"
+    for path in (safe, inside, in_worktree):
+        path.write_text(json.dumps({"mcpServers": {"agent-comms": BOARD_ENTRY}}))
+    link.symlink_to(inside)
+    for i, (path, used) in enumerate(((safe, True), (inside, False), (in_worktree, False), (link, False))):
+        runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--mcp-config", str(path),
+                  "--allowedTools=mcp__agent-comms"]
+        host = host_for(senv, f"mcp-{i}", runners={"claude-code": runner}, worktree_dir=str(worktrees))
+        opened = host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT, access="read-only")
+        argv = host._argv(opened)
+        assert opened.access == "read-only" and "--strict-mcp-config" in argv and str(path) not in argv
+        if used:
+            assert json.loads(Path(value_after(argv, "--mcp-config")).read_text()) == {
+                "mcpServers": {"agent-comms": BOARD_ENTRY}}
+        else:
+            assert "--mcp-config" not in argv, f"{path}: where sessions write, so not read"
+            assert not list(host.sessions_dir.glob("*.mcp.json")) if host.sessions_dir.exists() else True
+        # The same runner as its owner configured it (a workspace session) keeps its own config.
+        ws = host_for(senv, f"mcp-ws-{i}", runners={"claude-code": runner}, worktree_dir=str(worktrees))
+        assert value_after(ws._argv(ws.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT)),
+                           "--mcp-config") == str(path)
+    host = host_for(senv, "mcp-direct", worktree_dir=str(worktrees))
+    assert host._board_mcp(UNKNOWN, ["board.mcp.json"], str(senv.work)) is None, "a relative path is the run directory's"
+    assert host._board_mcp(UNKNOWN, [str(inside), str(safe)], str(senv.work)).endswith(f"{UNKNOWN}.mcp.json")
+    assert host._board_mcp(UNKNOWN, [json.dumps({"mcpServers": {"agent-comms": BOARD_ENTRY}})], str(senv.work)), \
+        "the JSON itself is the runner's own argument"
+    assert host._session_writable(str(safe), str(senv.work)) is False
+    (tmp_path / "elsewhere").mkdir()
+    assert host._session_writable(str(tmp_path / "elsewhere" / "x.json"), str(tmp_path / "elsewhere")), \
+        "a child's own run directory (its worktree) counts too"
 
 
 def test_a_runner_that_names_its_own_directory_is_held_against_where_the_parent_runs(senv, tmp_path):

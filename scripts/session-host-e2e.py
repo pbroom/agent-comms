@@ -86,8 +86,10 @@ T4c. A settings file does not reach a read-only child. The temp checkout has a `
     (`--plugin-dir`, in the temp directory) whose SessionStart command hook writes a log: it ran for the workspace
     child and not for the read-only one, which is started without the runner's plugin options.
     Bypass is switched off in both (`permissions.disableBypassPermissionsMode`): the workspace child is started
-    from a settings file its node wrote (the runner's own settings and that key, mode 600), and its process, asked
-    what is in force, said the key is.
+    from a settings file its node wrote (the runner's own settings and that key, mode 600). Its process was asked
+    what is in force FIRST and alone (`get_settings`), said the key is, and only then was the turn written to it;
+    the transcript keeps the node's one-line record of the answer and not the answer, which is every setting in
+    force. (What such a process answers is shown by asking one this script starts itself.)
 T5. `board session list` shows the six under their parent; `show` of the parent lists them.
 T6. `close` of the parent ends all six; no process is left; the worktree that holds a file stays, and `show` says
     where it is; the Codex child's worktree, which holds nothing of its own, is removed.
@@ -99,9 +101,10 @@ T6b. A mode from a settings file never takes effect. A second temp checkout has 
     `workspace` one. (Were the process to report `bypassPermissions` after all, the host would end it: that is a
     deterministic test, tests/test_hosted_tree.py.) And it cannot be PUT into that mode: the session is started
     from a settings file its node wrote, the fixture plus `permissions.disableBypassPermissionsMode = "disable"`;
-    its process, asked what is in force, names both the fixture's `defaultMode` and that key; and a process this
-    script starts itself with the very same command line (as the wrapper recorded it), sent a
-    `set_permission_mode` request for `bypassPermissions`, answers with the error `bypass_disabled`.
+    its process was asked what is in force before the turn was written and said the key is; and a process this
+    script starts itself with the very same command line (as the wrapper recorded it) names both the fixture's
+    `defaultMode` and that key when asked, and answers a `set_permission_mode` request for `bypassPermissions`
+    with the error `bypass_disabled`.
 T6c. The node is restarted with `allow_full_access = true`.
 T7. Full access: a root of the bypass runner is `full`, and once its process has said so (`bypassPermissions`, in
     its `init`) a child may be `full` under it.
@@ -1141,27 +1144,58 @@ max_live = 8
             return None
         return next((argv for argv in reversed(starts) if sid in argv), None)
 
-    def said_in_force(self, sid: str) -> dict | None:
-        """What the session's Claude process answered when its node asked which settings are in force
-        (`get_settings`, asked when the process was started from a settings file the node wrote): the `permissions`
-        of `effective`, from its transcript on the node. None: it was not asked, or did not answer."""
+    def settings_check(self, sid: str) -> tuple[dict | None, list[str], bool]:
+        """What the node kept of its question to this session's process (`get_settings`, asked when a process is
+        started from a settings file the node wrote, and answered before any turn is written to it): (the node's
+        own record of the answer in the session's transcript, the kinds of the transcript's lines up to the first
+        turn's `init` with Claude's hook events left out (a SessionStart hook runs, and says so, as the process
+        starts), whether the answer ITSELF is anywhere in the transcript). The answer is every setting in force,
+        which can hold credentials: only the record may be there."""
+        record, kinds, raw = None, [], False
         for path in self.node_home.rglob(f"{sid}.jsonl"):
-            for line in path.read_text().splitlines():
+            text = path.read_text()
+            raw = raw or '"flagSettings"' in text       # a source's name: only the answer has it
+            for line in text.splitlines():
                 try:
                     ev = json.loads(line)
                 except ValueError:
                     continue
-                answer = ev.get("response") if isinstance(ev, dict) and ev.get("type") == "control_response" else None
-                inner = answer.get("response") if isinstance(answer, dict) else None
-                if isinstance(inner, dict) and isinstance(inner.get("effective"), dict):
-                    return inner["effective"].get("permissions") or {}
-        return None
+                if not isinstance(ev, dict):
+                    continue
+                raw = raw or ev.get("type") == "control_response"
+                kinds.append(f"{ev.get('type')}/{ev.get('subtype')}" if ev.get("subtype") else str(ev.get("type")))
+                if ev.get("type") == "host" and ev.get("subtype") == "control_response_withheld" and record is None:
+                    record = ev
+        before = kinds[:kinds.index("system/init") + 1] if "system/init" in kinds else kinds
+        return record, [k for k in before if not k.startswith("system/hook_")], raw
+
+    def first_writes(self, sid: str) -> list[str]:
+        """The kinds of the first lines written to this session's (last) process, from the wrapper's stdin log: the
+        lines after the last `get_settings` question whose answer the node's record for this session names."""
+        record = self.settings_check(sid)[0] or {}
+        lines = [json.loads(x) for x in self.stdin_log.read_text().splitlines()]
+        kinds = [x.get("request", {}).get("subtype") if x.get("type") == "control_request" else x.get("type")
+                 for x in lines]
+        asked = [i for i, x in enumerate(lines) if x.get("type") == "control_request"
+                 and x.get("request_id") == record.get("request_id")]
+        return kinds[asked[-1]:asked[-1] + 2] if asked else []
+
+    def in_force(self, sid: str, cwd: Path) -> dict:
+        """The `permissions` in force in a process started with this session's command line, asked by this script
+        (`ask`): what the node's own question was answered with, which the node does not keep."""
+        answer = self.ask(sid, cwd, {"subtype": "get_settings"})
+        inner = answer.get("response") if isinstance(answer.get("response"), dict) else {}
+        return (inner.get("effective") or {}).get("permissions") or {}
 
     def try_bypass(self, sid: str, cwd: Path) -> dict:
-        """An explicit attempt to put a session into bypassPermissions: a process started by this script with the
-        very command line the node started this session's process with (only the session id is another), sent ONE
-        line, a `set_permission_mode` request for that mode, and nothing else: no turn, no model. Returns Claude's
-        answer (the `response` of its `control_response`)."""
+        """An explicit attempt to put a session into bypassPermissions (`ask`): a `set_permission_mode` request for
+        that mode. Returns Claude's answer."""
+        return self.ask(sid, cwd, {"subtype": "set_permission_mode", "mode": "bypassPermissions"})
+
+    def ask(self, sid: str, cwd: Path, request: dict) -> dict:
+        """A process started by this script with the very command line the node started this session's process
+        with (only the session id is another), sent ONE line, a control request, and nothing else: no turn, no
+        model. Returns Claude's answer (the `response` of its `control_response`)."""
         import uuid
 
         argv = [a for a in self.started_with(sid) or []]
@@ -1175,9 +1209,8 @@ max_live = 8
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         found, buf, deadline = None, b"", time.monotonic() + 90
         try:
-            proc.stdin.write(json.dumps({
-                "type": "control_request", "request_id": "e2e-bypass",
-                "request": {"subtype": "set_permission_mode", "mode": "bypassPermissions"}}).encode() + b"\n")
+            proc.stdin.write(json.dumps({"type": "control_request", "request_id": "e2e-bypass",
+                                         "request": request}).encode() + b"\n")
             proc.stdin.flush()      # ... and stdin stays open until the answer is there
             while found is None and time.monotonic() < deadline:
                 if not select.select([proc.stdout], [], [], 0.5)[0]:
@@ -1211,7 +1244,8 @@ max_live = 8
                 proc.wait(10)
         if found is None:
             err = proc.stderr.read().decode("utf-8", "replace")
-            raise SystemExit(f"FAIL: no answer to the set_permission_mode request (exit {proc.returncode}): {err[-400:]}")
+            raise SystemExit(f"FAIL: no answer to the {request.get('subtype')} request (exit {proc.returncode}): "
+                             f"{err[-400:]}")
         return found
 
     def tree_scenario(self) -> None:
@@ -1365,19 +1399,31 @@ max_live = 8
                    "and the plugin's SessionStart hook, each ran a command for the workspace child")
         argv = self.started_with(ctl["session_id"]) or []
         merged = Path(argv[argv.index("--settings") + 1]) if "--settings" in argv else Path("/nonexistent")
-        in_force = self.said_in_force(ctl["session_id"])
+        record, kinds, raw = self.settings_check(ctl["session_id"])
+        writes = self.first_writes(ctl["session_id"])
+        in_force = self.in_force(ctl["session_id"], self.project)
         print(f"  it was started with --settings {merged} (mode {oct(merged.stat().st_mode & 0o777)}): the fixture "
-              f"and permissions.{NO_BYPASS} = {json.loads(merged.read_text())['permissions'].get(NO_BYPASS)!r}; asked "
-              f"what is in force, its process answered permissions {json.dumps(in_force)}")
+              f"and permissions.{NO_BYPASS} = {json.loads(merged.read_text())['permissions'].get(NO_BYPASS)!r}")
+        print(f"  written to its process, in order: {writes}; its transcript up to the first turn (hook events "
+              f"aside): {kinds}; the node's record of the answer: {json.dumps(record)}")
+        print(f"  the same command line, asked by this script what is in force, answers permissions "
+              f"{json.dumps(in_force)}")
         self.check(argv.count("--settings") == 1 and merged != fixture and self.node_home in merged.parents
                    and (merged.stat().st_mode & 0o777) == 0o600
                    and json.loads(merged.read_text()) == loaded | {"permissions": loaded["permissions"] | {
                        NO_BYPASS: "disable"}} and json.loads(fixture.read_text()) == loaded,
                    "bypass is switched off in it too: Claude takes one --settings, so its node wrote a file (mode "
                    "600) with the runner's settings and the key; the fixture itself is untouched")
-        self.check(isinstance(in_force, dict) and in_force.get(NO_BYPASS) == "disable"
+        self.check(writes == ["get_settings", "user"] and isinstance(record, dict)
+                   and record.get("bypass_disabled") is True and kinds[-1:] == ["system/init"]
+                   and "host/control_response_withheld" in kinds[:-1],
+                   "its process was asked first and alone whether the key is in force, said yes, and only then was "
+                   "the turn written to it")
+        self.check(not raw, "the answer itself (every setting in force) is not in the session's transcript: only "
+                            "the node's one-line record of it")
+        self.check(in_force.get(NO_BYPASS) == "disable"
                    and set(loaded["permissions"]["allow"]) <= set(in_force.get("allow") or []),
-                   "... and its process says both are in force: the fixture's grants and the key")
+                   "... and such a process says both are in force: the fixture's grants and the key")
         gro, data, _ = self.spawn_child(sid, both("readonly-write.txt", "readonly-touch.txt"), "--agent", GRANT_AGENT,
                                         "--access", "read-only", "--role", "review", *model)
         mode, tools = self.init_facts(gro["session_id"])
@@ -1472,18 +1518,26 @@ max_live = 8
                    "turn lists Bash as denied")
         argv = self.started_with(pinned) or []
         merged = Path(argv[argv.index("--settings") + 1]) if "--settings" in argv else Path("/nonexistent")
-        in_force = self.said_in_force(pinned)
+        record, kinds, raw = self.settings_check(pinned)
+        writes = self.first_writes(pinned)
+        in_force = self.in_force(pinned, self.project_mode)
         print(f"  started with --permission-mode {argv[argv.index('--permission-mode') + 1]} and --settings {merged}: "
               f"{merged.read_text()}")
-        print(f"  asked what is in force, its process answered permissions {json.dumps(in_force)}")
+        print(f"  written to its process, in order: {writes}; the node's record of the answer: {json.dumps(record)}")
+        print(f"  the same command line, asked by this script what is in force, answers permissions "
+              f"{json.dumps(in_force)}")
         self.check(argv.count("--settings") == 1 and merged != fixture and self.node_home in merged.parents
                    and json.loads(merged.read_text()) == {"permissions": {"defaultMode": "bypassPermissions",
                                                                           NO_BYPASS: "disable"}},
                    "bypass is switched off for it: its node started it from a file with the fixture's settings and "
                    f"permissions.{NO_BYPASS} = \"disable\"")
-        self.check(isinstance(in_force, dict) and in_force.get(NO_BYPASS) == "disable"
-                   and in_force.get("defaultMode") == "bypassPermissions",
-                   "its process says both are in force: the fixture's defaultMode of bypassPermissions, and the key")
+        self.check(writes == ["get_settings", "user"] and isinstance(record, dict)
+                   and record.get("bypass_disabled") is True and not raw,
+                   "its process was asked first and alone whether the key is in force and said yes before the turn "
+                   "was written; the transcript keeps the node's record, not the answer")
+        self.check(in_force.get(NO_BYPASS) == "disable" and in_force.get("defaultMode") == "bypassPermissions",
+                   "such a process says both are in force: the fixture's defaultMode of bypassPermissions, and the "
+                   "key")
         answer = self.try_bypass(pinned, self.project_mode)
         print(f"  the same command line, sent a set_permission_mode request for bypassPermissions, answers: "
               f"{json.dumps(answer)}")
