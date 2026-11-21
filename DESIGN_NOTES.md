@@ -3268,6 +3268,12 @@ restart. Now access is decided before launch and `init` is a kill switch.
 - *S15.* The hello's access words are checked to be strings from the three words BEFORE the list is made a set: an
   object or an array in it is a 400. `dirs` is validated the same way (runner keys the hello offers, absolute
   paths, no control characters).
+- *The e2e script under a time limit.* While this round was being built, a test run whose end-to-end script hung
+  (the stand-in was half-changed) was killed by `subprocess.run(timeout=180)`, and its temp hub, node and five
+  session processes went on running until they were found and stopped by hand. The script now turns SIGTERM into
+  its ordinary failure path (everything stopped, the temp directory removed; tried mid-run: nothing left), and
+  `test_the_end_to_end_script_passes_with_the_stand_in` stops a run that exceeds 300 seconds with SIGTERM before
+  it kills it. The whole script takes about 80 seconds with the stand-ins on an idle machine.
 - *Live* (the tree scenario on the round-3 code, real Claude Code 2.1.322 and Codex 0.171.0, once: PASS, 59 checks;
   ten haiku turns and three Codex turns; the spikes named above ran in scratch directories, two of them with a
   private `CLAUDE_CONFIG_DIR` or `CODEX_HOME` and no turn at all).

@@ -1672,7 +1672,15 @@ def main() -> int:
         print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
+
+    def terminated(signum, frame):
+        # Whoever runs this script (a test with a time limit) can stop it with SIGTERM and still have the hub, the
+        # node and every session process stopped and the temp directory removed (`finally`, below). Once only.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit("FAIL: terminated (SIGTERM) before the run was over")
+
     try:
+        signal.signal(signal.SIGTERM, terminated)
         config_before, claude_before = None, run.claude_settings() if run.real else None
         if (codex or tree) and run.real_codex:
             run.fresh_git_checkout()
