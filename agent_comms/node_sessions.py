@@ -61,6 +61,8 @@ MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 LOST = "the node restarted while this turn was in flight; it was not replayed"
+FRESH_START = (". Before that the agent refused to resume this session's conversation: the next message starts a NEW "
+               "one, without the earlier turns")
 
 
 class SessionRunner:
@@ -343,7 +345,9 @@ class SessionRunner:
                 # reported with every status) or the last host's state file. That a message was handed over, or
                 # even written, proves nothing: Claude refuses `--resume` for a conversation that does not exist
                 # just as it refuses `--session-id` for one that does. A wrong guess heals in the host after one
-                # refused start (session_host._correct_start_mode).
+                # refused start (session_host._correct_start_mode). For a provider with an id of its own (Codex) the
+                # host's own record overrules this flag either way (`SessionHost.open`): a recorded id is resumed,
+                # and a recorded fresh start is not, even when the hub (which may not have heard) says resume.
                 resume = view.get("resume") is True or left.get("resume") is True
                 try:
                     s = self.host.open(sid, agent=view.get("agent"), project=view.get("project"),
@@ -365,7 +369,10 @@ class SessionRunner:
                     # Handed to a host that no longer has it, and no result on its way: the turn was lost.
                     self.handed[sid] = max(self.handed.get(sid, 0), n)
                     self._save_handed()
-                    self._add(sid, {"kind": "turn_ended", "message": n, "ok": False, "detail": LOST,
+                    # If the host found its own record that the provider refused to resume this session (the node
+                    # died before that failure reached the hub), the human is told here what follows from it.
+                    self._add(sid, {"kind": "turn_ended", "message": n, "ok": False,
+                                    "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
             self.queue[sid] = queue
         for sid, s in self.host.sessions.items():
@@ -394,7 +401,9 @@ class SessionRunner:
         if len(live) < self.max_live:
             return True
         if not any(x.child is not None and x.stopping_since is not None for x in live):
-            idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended]
+            # (Not one whose provider runs a turn of its own in it: by the host's books it is idle, but it is working.)
+            idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended
+                    and not self.host.holding(x)]
             if idle:
                 self.host.park(min(idle, key=lambda x: self.last_busy.get(x.session_id, 0.0)).session_id)
         return False

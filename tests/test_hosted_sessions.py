@@ -27,7 +27,7 @@ from agent_comms.dispatch import DispatchConfig
 from agent_comms.node import SELF_STOP_SECONDS, Node, _Local, shut_down
 from agent_comms.node_sessions import HANDED_FILE, LOST, SEQ_FILE, SessionRunner
 from agent_comms.providers.claude import ClaudeSession
-from agent_comms.session_host import SessionHost
+from agent_comms.session_host import PROVIDER_FILE, SessionHost
 
 from conftest import PROJECT, make_env
 from test_dispatch import FakeChild, FakeProcs, FakeSpawner
@@ -1709,6 +1709,74 @@ def test_a_codex_thread_that_is_gone_fails_one_message_with_the_reason_and_the_h
     assert written(fresh)[2]["method"] == "thread/start"
     codex_handshake(cenv, fresh, node=node, thread=cx.CHILD)
     assert show(cenv, sid)["provider_id"] == cx.CHILD and msg(cenv, sid, 3)["state"] == "delivered"
+
+
+def test_a_refused_resume_recorded_before_a_crash_starts_a_new_thread_at_restart_whatever_the_hub_says(cenv):
+    """The node records that Codex refused the resume, fails the message, and dies before the hub hears any of it.
+    The hub still says `resume`. The node's own record overrules that: the next message starts the new thread, with
+    no second failed message on the way, and the one lost message says what happened."""
+    sid = start(cenv, "first", agent="codex")["session_id"]
+    tick(cenv)
+    [old] = children(cenv)
+    codex_handshake(cenv, old)
+    codex_turn(cenv, old, "one")
+    cenv.node.sessions.shutdown()
+    logs = cenv.tmp / "laptop-logs"
+    listed = lambda: cenv.laptop.get("/api/nodes/sessions").json()["sessions"][0]
+
+    node = make_node(cenv, config=codex_config(cenv), log_dir=logs)
+    node.sessions.recover()
+    send(cenv, sid, "second")
+    tick(cenv, node)
+    [refused] = children(cenv, node)
+    refused.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, node)
+    node.sessions.client = NoReports(node.sessions.client)      # from here on nothing this node reports arrives
+    refused.emit(cx.reply(2, error=cx.NO_ROLLOUT))
+    tick(cenv, node, times=2)
+    assert json.loads((logs / PROVIDER_FILE).read_text()) == {sid: None}, "the fresh start is on the node's record"
+    assert listed()["resume"] is True and msg(cenv, sid, 2)["state"] == "queued", "the hub heard nothing of it"
+
+    again = make_node(cenv, config=codex_config(cenv), log_dir=logs)       # the node process died and came back
+    again.sessions.recover()
+    tick(cenv, again)
+    m = msg(cenv, sid, 2)
+    assert m["state"] == "failed" and m["detail"].startswith(LOST) and "starts a NEW one" in m["detail"], "loudly"
+    assert children(cenv, again) == [] and listed()["resume"] is False
+    send(cenv, sid, "third")
+    tick(cenv, again)
+    [fresh] = children(cenv, again)
+    fresh.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(cenv, again)
+    assert written(fresh)[2]["method"] == "thread/start", "not the refused resume again, and not a 'no record' failure"
+    codex_handshake(cenv, fresh, node=again, thread=cx.CHILD)
+    assert [m["state"] for m in show(cenv, sid)["messages"]] == ["done", "failed", "delivered"], "one failure, no more"
+    assert json.loads((logs / PROVIDER_FILE).read_text()) == {sid: cx.CHILD}, "the new thread's id replaced the mark"
+    assert show(cenv, sid)["provider_id"] == cx.CHILD and listed()["resume"] is True
+
+
+def test_a_session_whose_codex_runs_a_turn_of_its_own_is_neither_idle_stopped_nor_evicted_for_room(tmp_path):
+    """By the host's books such a process is idle. Stopping it would cut a turn that is running."""
+    env = session_env(tmp_path, dispatch=CODEX_GRANT, config=lambda env: codex_config(env, max_live=1, idle_hours=1))
+    a = start(env, "first", agent="codex")["session_id"]
+    tick(env)
+    [codex] = children(env)
+    codex_handshake(env, codex)
+    codex_turn(env, codex, "one")
+    codex.emit(cx.own_turn("turn/started"))             # Codex goes on by itself
+    tick(env)
+    env.clock.advance(3600 + 1)                         # past idle_hours
+    tick(env, times=2)
+    assert codex.terminated == 0 and env.node.sessions.host.park(a) is False, "not stopped for being idle"
+    env.node.hello()                                    # (the node's own loop says hello; an hour has passed)
+    b = start(env, "hello", project=P2)["session_id"]   # a Claude session wants the one process slot
+    tick(env, times=2)
+    assert codex.terminated == 0 and len(children(env)) == 1 and msg(env, b, 1)["state"] == "queued", \
+        "nor stopped to make room: the other session's message waits"
+    codex.emit(cx.own_turn("turn/completed", status="completed"))
+    tick(env, times=3)
+    assert codex.terminated == 1, "its own turn is over: now it is idle, and makes room"
+    assert len(children(env)) == 2 and msg(env, b, 1)["state"] == "delivered"
 
 
 def test_a_codex_agent_cannot_be_hosted_on_a_node_that_did_not_turn_codex_on(tmp_path):

@@ -506,6 +506,22 @@ def test_a_turn_codex_begins_in_the_sessions_thread_holds_the_next_message_until
     assert p.feed(line(completed()))[0][0].text == "the answer", "the held turn's message left nothing behind"
 
 
+@pytest.mark.parametrize("params", [
+    {}, {"turn": None}, {"turn": "junk"}, {"turn": []}, {"turn": 7}, {"turn": {}}, {"turn": {"id": None}},
+    {"turn": {"id": 7, "status": "completed"}}, {"turn": {"status": "completed"}}, {"status": "idle"},
+    {"status": None}, {"status": ["idle"]}, {"turn": {"id": ["x"]}}])
+def test_a_malformed_notification_between_turns_is_ignored_and_never_raises(params):
+    """An exception in `feed` ends the whole session (the host's pass catches it and closes the session)."""
+    for method in ("turn/completed", "turn/started", "thread/status/changed", "item/completed"):
+        p = ready()         # idle: no turn of its own running
+        assert p.feed(line({"method": method, "params": {"threadId": THREAD, **params}})) == ([], [])
+        assert p.holds_turns() is False
+        p.feed(own_turn("turn/started"))    # ... and with one running: a malformed line neither ends nor renames it
+        assert p.feed(line({"method": method, "params": {"threadId": THREAD, **params}})) == ([], [])
+        assert p.holds_turns() is True
+        assert p.feed(own_turn("turn/completed", status="completed")) == ([], []) and p.holds_turns() is False
+
+
 def test_the_thread_going_idle_or_a_new_process_also_ends_the_hold_and_other_threads_never_start_one():
     p = ready()
     p.feed(own_turn("turn/started"))

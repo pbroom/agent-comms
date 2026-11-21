@@ -955,7 +955,8 @@ def test_a_provider_session_that_is_gone_fails_one_message_loudly_and_the_next_s
     assert (ev.kind, ev.message_id, ev.ok, ev.delivered) == ("turn_ended", lost, False, False)
     assert "NEW thread" in ev.detail, "never silently"
     assert (s.resume, s.provider_id) == (False, None) and not s.ended
-    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {}, "its id is forgotten on disk too"
+    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: None}, \
+        "its id is forgotten on disk too, and a fresh start is on record in its place"
     assert host.tick() == [] and len(henv.spawner.calls) == 2, "the lost message is not written again"
     third = host.send(SID, "third")
     host.tick()
@@ -1034,16 +1035,25 @@ def test_a_resume_the_provider_refuses_is_on_record_before_its_failure_is_report
     assert (ev.message_id, ev.ok) == (lost, False) and "NEW thread" in ev.detail
     assert s2.child is stubborn and s2.stopping_since is not None, "the process has not even gone yet"
     assert (s2.resume, s2.provider_id) == (False, None)
-    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {}
+    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: None}, "a fresh start, on this machine's record"
     assert json.loads((henv.log_dir / STATE_FILE).read_text())[SID]["resume"] is False
 
-    third = make_host(henv, provider_for=lambda template: HandshakeProvider)     # a restart at this very moment
-    left = third.recover()[SID]
-    s3 = third.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=left["resume"])
-    assert (s3.resume, s3.provider.adopted) == (False, [None])
-    third.send(SID, "third")
+    # A restart at this very moment. The hub never heard of the refusal and still says "resume": the local record
+    # overrules it, so the next message does not walk into the same refused resume (nor into a "no record" failure).
+    third = make_host(henv, provider_for=lambda template: HandshakeProvider)
+    assert third.recover()[SID]["resume"] is False
+    s3 = third.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=True)
+    assert (s3.resume, s3.fresh_start, s3.provider.adopted) == (False, True, [None])
+    mid = third.send(SID, "third")
     third.tick()
     assert henv.spawner.calls[-1]["argv"] == ["codex", "app-server", "new", SID]
+    henv.spawner.children[-1].emit(b"hello")
+    assert kinds(third.tick()) == [("delivered", mid)], "no failed message on the way to the new session"
+    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: "thread-1"}, \
+        "the new session's id takes the mark's place: from here on it is the one to resume"
+    assert (s3.resume, s3.fresh_start) == (True, False)
+    fourth = make_host(henv, provider_for=lambda template: HandshakeProvider)
+    assert fourth.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=False).resume is True
 
 
 # ------------------------------------------------------------ the Codex adapter behind the host (fake pipes)
@@ -1202,7 +1212,7 @@ def test_a_codex_thread_that_is_gone_fails_one_message_loudly_then_a_new_thread_
     assert (ev.kind, ev.message_id, ev.ok, ev.delivered) == ("turn_ended", lost, False, False)
     assert cx.THREAD in ev.detail and "NEW thread" in ev.detail and child.terminated == 1
     assert (s.resume, s.provider_id) == (False, None)
-    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {}
+    assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: None}
 
     third = host.send(SID, "third")
     host.tick()

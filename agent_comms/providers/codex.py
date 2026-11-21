@@ -390,12 +390,15 @@ class CodexSession:
         """This thread, with no message's turn in flight: Codex may begin a turn by itself (it goes on with a goal,
         runs a queued prompt). Nothing of it is reported; only that it is running is kept (`holds_turns`), until its
         own end or the thread saying it is idle."""
-        turn = params.get("turn")
-        tid = turn.get("id") if isinstance(turn, dict) else None
-        if method == "turn/started" and isinstance(tid, str):
-            self._own_turn = tid
-        elif method == "turn/completed" and tid == self._own_turn and turn.get("status") != "inProgress":
-            self._own_turn = None
+        if method in ("turn/started", "turn/completed"):
+            turn = params.get("turn")
+            tid = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(tid, str):
+                return          # no turn object, or one without an id: it says nothing (and must not raise)
+            if method == "turn/started":
+                self._own_turn = tid
+            elif tid == self._own_turn and turn.get("status") != "inProgress":
+                self._own_turn = None
         elif method == "thread/status/changed":
             status = params.get("status")
             if isinstance(status, dict) and status.get("type") == "idle":

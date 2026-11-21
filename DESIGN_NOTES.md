@@ -2738,7 +2738,13 @@ thread, gives Codex's reason, and ends "The next message starts a NEW thread, wi
 start is on record BEFORE that failure is reported: when the host reads `start_failed` it asks the adapter
 (`session_exists`, False) and clears `resume`, the state file's flag and the id's record at once, where the first
 version waited until the process had been reaped (a node that restarted in between tried the same resume again).
-So: one failed message, loudly, then a new thread; never a silent switch. A refused `thread/start` fails that
+So: one failed message, loudly, then a new thread; never a silent switch. Review round 2 closed the last gap: the
+node could die after recording the refusal and before the hub heard of it, and the hub's stale `resume` then sent
+the next message into a second failure ("no record"). The fresh start is therefore a record of its own: the
+session's entry in `node-session-providers.json` with no id (JSON null, `_record_fresh_start`). `open` lets it
+overrule the caller's `resume`, the first turn written to the new thread replaces it with that thread's id, and
+the message that was lost in the crash is reported with what follows from it ("... Before that the agent refused
+to resume this session's conversation: the next message starts a NEW one"). A refused `thread/start` fails that
 message with Codex's reason and changes nothing. A resume that answers with another thread id, or a start without a
 usable id, is `fatal` for the session.
 
@@ -2764,7 +2770,10 @@ prompt). A `turn/start` written during it would be steered into it and answered 
 `holds_turns()` is True until that turn's `turn/completed` (or the thread reports `idle`), and the host keeps the
 next message in its inbox, unwritten and undelivered, for at most the turn timeout; past that the message fails
 ("the agent was busy with a turn of its own for N minutes") and the process is stopped. Nothing of such a turn is
-reported. Not seen live: no automatic turn was provoked.
+reported. Not seen live: no automatic turn was provoked. Round 2: such a process is not idle either, so `park()`
+refuses it and the node leaves it out when it looks for an idle process to stop for room (`SessionHost.holding`);
+and a same-thread notification without a usable turn object is ignored instead of raising (an exception in `feed`
+ends the session).
 
 **Proof.**
 - `tests/test_providers_codex.py`: the adapter from recorded strings (handshake, start vs resume, turn, text, the
@@ -2803,9 +2812,8 @@ reported. Not seen live: no automatic turn was provoked.
 - A crash after the first `turn/start` was written but before Codex recorded anything costs one loudly failed
   message at the next start (the resume is refused), where it used to start a new thread quietly. Chosen: the
   other error loses a conversation without a word.
-- If the node dies after the host recorded a fresh start and before the hub heard of the failed message, the hub
-  still says `resume`; the next message then fails once more ("this node has no record of the Codex thread") before
-  the new thread starts. Loud both times.
+- A session the hub says to resume for which this node has NO record at all (its `node-session-providers.json` was
+  lost) fails one message ("this node has no record of the Codex thread") and then starts a new thread.
 - A thread lives in the node machine's Codex home; the hub cannot move a session, and deleting
   `~/.codex/sessions` loses hosted conversations (loudly, as above). The spike and the real run left about fifteen
   small threads there.

@@ -121,6 +121,7 @@ class Session:
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
     held_since: float | None = None     # since when the next message waits for a turn of the provider's own
+    fresh_start: bool = False           # the provider refused to resume its session: the next process starts a new one
     interrupted_at: float | None = None
     stopping_since: float | None = None
     killed: bool = False
@@ -221,22 +222,37 @@ class SessionHost:
         except (OSError, ValueError):
             return {}
         return {k: v for k, v in data.items() if isinstance(k, str) and providers.SESSION_ID_RE.fullmatch(k)
-                and providers.valid_provider_id(v)} if isinstance(data, dict) else {}
+                and (v is None or providers.valid_provider_id(v))} if isinstance(data, dict) else {}
 
     def _record_provider_id(self, session_id: str, provider_id: str | None) -> None:
         """Keep (or, with None, drop) the provider's id for a session. Only an id that is not the session id itself
-        is worth a record. A record that cannot be written costs the conversation at the next restart, not now."""
+        is worth a record. A record that cannot be written costs the conversation at the next restart, not now.
+        Recording an id also replaces a fresh-start mark (below): the new session is the one to resume from now on."""
         ids = self._provider_ids()
         keep = providers.valid_provider_id(provider_id) if provider_id != session_id else None
-        if ids.get(session_id) == keep:
-            return
         if keep is None:
+            if session_id not in ids:
+                return
             del ids[session_id]
+        elif ids.get(session_id) == keep:
+            return
         else:
             ids[session_id] = keep
         self._write_provider_ids(ids)
 
-    def _write_provider_ids(self, ids: dict[str, str]) -> None:
+    def _record_fresh_start(self, session_id: str) -> None:
+        """The provider refused to resume its session for this one: the next process must start a NEW one, whatever
+        anybody else still believes. Kept as the session's entry with no id (JSON null) until the new session's id
+        takes its place. `open` reads it after a restart and lets it overrule the caller's `resume`: the hub may
+        never have heard of the refusal (the node died before its report), and would send the session back into the
+        same refused resume."""
+        ids = self._provider_ids()
+        if session_id in ids and ids[session_id] is None:
+            return
+        ids[session_id] = None
+        self._write_provider_ids(ids)
+
+    def _write_provider_ids(self, ids: dict[str, str | None]) -> None:
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             path = self.log_dir / PROVIDER_FILE
@@ -320,10 +336,13 @@ class SessionHost:
             # provider's session (`_write`), so its being there says a turn may be in that session, whatever the
             # caller's `resume` says: a node that crashed before it could report the turn must not start a NEW
             # conversation and silently lose that one.
-            s.provider_id = self._provider_ids().get(session_id)
+            # An entry with no id is the other decision made here (`_record_fresh_start`): the provider refused to
+            # resume, so a new session is started, even if the caller (the hub, which may not have heard) says resume.
+            ids = self._provider_ids()
+            s.provider_id = ids.get(session_id)
             adopt(s.provider_id)
-            if s.provider_id is not None:
-                s.resume = True
+            if session_id in ids:
+                s.resume, s.fresh_start = s.provider_id is not None, s.provider_id is None
         self._argv(s)       # now, so a runner that cannot be used is refused here and not at the first message
         self.sessions[session_id] = s
         return s
@@ -514,10 +533,11 @@ class SessionHost:
             log.warning("session %s: its process said the session %s; the next one %s", s.session_id,
                         "already exists" if exists else "does not exist", "resumes it" if exists else "creates it")
             s.resume = exists
-            if not exists and s.provider_id is not None:
-                # The provider's own session is gone: its id is forgotten here too, so nothing resumes it again.
-                s.provider_id = None
-                self._record_provider_id(s.session_id, None)
+            if not exists and s.provider.waits_for_ready:
+                # The provider's own session (it issued the id) is not to be resumed again: its id is forgotten, and
+                # the fresh start is put on record in its place, where a restarted host finds it.
+                s.provider_id, s.fresh_start = None, True
+                self._record_fresh_start(s.session_id)
 
     def _timeout_detail(self) -> str:
         return f"timed out after {self.timeout_minutes:g} minutes"
@@ -564,11 +584,17 @@ class SessionHost:
             s.writing = s.inbox.popleft()
         self._fail(s, detail, out)
 
+    @staticmethod
+    def holding(s: Session) -> bool:
+        """The session's provider is running something of its own in it (`holds_turns`): a turn nobody here started.
+        Its process is then not idle, whatever the host's own books say."""
+        holds = getattr(s.provider, "holds_turns", None)
+        return s.child is not None and holds is not None and bool(holds())
+
     def _held(self, s: Session, now: float, out: list[HostEvent]) -> bool:
         """The provider's session is busy with something of its own (`holds_turns`): the next message waits, for at
         most the turn timeout. Past that the message fails and the process is stopped (the next one resumes)."""
-        holds = getattr(s.provider, "holds_turns", None)
-        if holds is None or not holds():
+        if not self.holding(s):
             s.held_since = None
             return False
         if s.held_since is None:
@@ -659,7 +685,7 @@ class SessionHost:
                 # its bytes may be in the pipe the provider may have recorded the turn, so that the session is to be
                 # RESUMED is on record first: the flag and the id (PROVIDER_FILE, which `open` trusts after a
                 # restart). If the provider never got the turn, the resume is refused and that is said out loud.
-                s.resume = True
+                s.resume, s.fresh_start = True, False
                 self._record_provider_id(s.session_id, s.provider_id)
             for data in s.provider.turn(s.writing.text):
                 s.outbuf += data
@@ -689,9 +715,10 @@ class SessionHost:
     def park(self, session_id: str) -> bool:
         """Stop an idle session's process (an idle limit, or room for another session). The session stays: its next
         message starts a process that resumes it. False, and nothing is touched, when it has a turn or a message
-        waiting, no process, or one already going down: nothing running is interrupted."""
+        waiting, no process, or one already going down, or when its provider is running a turn of its own in it:
+        nothing running is interrupted."""
         s = self._session(session_id)
-        if s.child is None or s.ended or s.busy or s.inbox or s.stopping_since is not None:
+        if s.child is None or s.ended or s.busy or s.inbox or s.stopping_since is not None or self.holding(s):
             return False
         self._stop(s, self.clock())
         return True
