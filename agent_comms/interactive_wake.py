@@ -19,7 +19,8 @@ Records (`board_state`)
 
 The offer: a state machine (every transition is ONE write transaction; `now` is read inside it)
 - *States.* NONE (no `offer`), and an offer {id, nonce, at, entries}, which is STANDING or STALE. It STANDS while all
-  of these hold (`_stands`): the feature is on; the board is not paused; `now - at < ACK_SECONDS`; its nonce is the
+  of these hold (`_stands`): the feature is on (the live setting, read inside the transaction); the board is not
+  paused; `now - at < ACK_SECONDS`; its nonce is the
   waiter's current nonce; the waiter is the one of its pair to wake (`_chosen`: connected, armed last among the
   connected waiters of the pair, and the agent has no hosted root session in the project). Otherwise it is STALE.
   An offer is ISSUED once its text and id were handed to a process (O2). An issued offer's `entries` never change:
@@ -32,12 +33,17 @@ The offer: a state machine (every transition is ONE write transaction; `now` is 
   inside: it stands, and its posts still qualify. If one does not: an offer not issued yet just loses that post
   (none left: NONE); an issued one is taken back (O4), and the rest wait for a new offer with a new id.
 - *O3 acknowledge* STANDING -> NONE, delivered (`_ack`, a call with `ack`). Re-checked inside, before anything
-  changes: the id is the offer's, the caller's nonce is the offer's and the waiter's current one, and the offer
-  stands (the deadline, the pause, a hosted root, the waiter still chosen). Accepted: the human's new posts lift
+  changes: the id is the offer's, the caller's nonce is the offer's and the waiter's current one, the offer stands
+  (the setting, the deadline, the pause, a hosted root, the waiter still chosen), and every post of its batch still
+  qualifies (another session may have read past one since the hand-over). Accepted: the human's new posts lift
   their threads first (hosted_wake._lift), then the wake is charged once (`sent`, and +1 for each thread of its
-  entries, no other), its posts are delivered on the waiter and on the pair, and the offer is gone. Otherwise
-  nothing changes and the answer says why: "superseded" (that process was replaced) or "rejected" (`board wait`
-  then goes on waiting with the same nonce).
+  entries, no other), its posts are delivered on the waiter and on the pair, the offer is gone, and the id is kept
+  as the waiter's last acknowledged one (`acked`: id, nonce, time). Otherwise the answer says why: "off",
+  "superseded" (that process was replaced) or "rejected" (`board wait` then goes on waiting with the same nonce);
+  nothing changes, except that a batch that no longer qualifies whole is taken back (O4: its id must not be
+  acknowledged for fewer posts).
+- *O3' replay* (`_ack`): the same nonce sending the same id again within REPLAY_SECONDS of its acceptance (its
+  reply was lost or unreadable) is answered "acked" again, and nothing is charged or changed.
 - *O4 take back* STALE (or STANDING, below) -> NONE (`_take_back`). Its posts go back to `pending` (except the
   claimed ones), nothing is charged. Made by: `_advance` for any offer of the pair that no longer stands; a nonce
   take-over (before the waiter is rebound to another project); `_hand` (above); `claim` of a post of an issued
@@ -104,6 +110,7 @@ IDLE = {"state": "idle"}
 SUPERSEDED = {"state": "superseded"}
 ACKED = {"state": "acked"}
 REJECTED = {"state": "rejected"}
+REPLAY_SECONDS = 60.0            # the last accepted ack id is answered "acked" again for this long (its reply was lost)
 
 
 def enabled(board: Board) -> bool:
@@ -151,12 +158,16 @@ def _clean(raw: Any) -> dict | None:
     if not (isinstance(o, dict) and isinstance(o.get("id"), str) and isinstance(o.get("nonce"), str)
             and _num(o.get("at")) and isinstance(o.get("entries"), dict)):
         o = None
+    a = raw.get("acked")
+    if not (isinstance(a, dict) and isinstance(a.get("id"), str) and isinstance(a.get("nonce"), str)
+            and _num(a.get("at"))):
+        a = None
     return w | t | {
         "mark": raw["mark"], "post": raw["post"] if type(raw.get("post")) is int else None,
         "sealed": [i for i in raw.get("sealed") or [] if type(i) is int] if isinstance(raw.get("sealed"), list) else [],
         "pending": raw["pending"] if isinstance(raw.get("pending"), dict) else {},
         "claimed": _times(raw.get("claimed")), "delivered": _times(raw.get("delivered")),
-        "read": _times(raw.get("read")), "offer": o,
+        "read": _times(raw.get("read")), "offer": o, "acked": a,
         "retired": [x for x in raw.get("retired") or [] if isinstance(x, str)] if isinstance(raw.get("retired"),
                                                                                              list) else []}
 
@@ -215,7 +226,7 @@ def _new(c, p: Principal, body: dict, now: float) -> dict:
     return {"agent": p.name, "client": body["client"], "client_session_id": body["client_session_id"],
             "project": body["projects"][0], "nonce": body["nonce"], "started_at": now, "armed_at": now, "seen": now,
             "mark": top, "post": top_id, "sealed": [], "pending": {}, "claimed": {}, "delivered": {}, "read": {},
-            "offer": None, "retired": []}
+            "offer": None, "acked": None, "retired": []}
 
 
 def _present(rec: dict, now: float) -> bool:
@@ -242,9 +253,9 @@ def _chosen(conn, key: str, rec: dict, now: float, recs: dict | None = None) -> 
 
 
 def _stands(board: Board, c, key: str, rec: dict, now: float, recs: dict | None = None) -> bool:
-    """The state machine's STANDING (module docstring), on what is stored now. The caller has checked the feature."""
+    """The state machine's STANDING (module docstring), on what is stored now and the setting as it is now."""
     o = rec["offer"]
-    return (o is not None and now - o["at"] < ACK_SECONDS and o["nonce"] == rec["nonce"]
+    return (o is not None and now - o["at"] < ACK_SECONDS and o["nonce"] == rec["nonce"] and enabled(board)
             and not board.is_paused() and _chosen(c, key, rec, now, recs))
 
 
@@ -313,7 +324,7 @@ def _advance(board: Board, c, key: str, rec: dict, p: Principal, cfg, now: float
                 _save(c, k, r, now)
     if _hosted_root(c, rec["agent"], rec["project"]):
         rec["pending"] = {}     # the hosted session's posts: they never wake a waiter, also once it has ended
-    elif rec["pending"] and not any(r["offer"] is not None for r in recs.values()):
+    elif rec["pending"] and enabled(board) and not any(r["offer"] is not None for r in recs.values()):
         sent = hosted_wake._recent(pair["sent"], now, hosted_wake.HOUR)
         if (_chosen(c, key, rec, now, recs) and len(sent) < cfg.max_wakes_per_hour
                 and not (sent and now - max(sent) < cfg.wake_min_interval_seconds)):
@@ -358,16 +369,28 @@ def _hand(board: Board, c, key: str, rec: dict, p: Principal, now: float) -> dic
     return {"state": "wake", "text": hosted_wake.wake_text(rec["agent"], list(o["entries"].values())), "id": o["id"]}
 
 
-def _ack(board: Board, key: str, body: dict) -> dict:
-    """O3, all of it inside one write transaction with the clock read there."""
+def _ack(board: Board, p: Principal, key: str, body: dict) -> dict:
+    """O3 (and O3'), all of it inside one write transaction with the clock and the setting read there."""
     with db.write_tx(board.conn) as c:
         now = board.now()
+        if not enabled(board):
+            return OFF          # off: no ack is answered "acked", not even a replay
         rec = _load(c, key)
+        a = rec["acked"] if rec is not None else None
+        if a and a["id"] == body["ack"] and a["nonce"] == body["nonce"] and now - a["at"] < REPLAY_SECONDS:
+            return ACKED        # O3': the reply to this very ack was lost; nothing is charged again
         if rec is not None and body["nonce"] in rec["retired"]:
             return SUPERSEDED
         o = rec["offer"] if rec is not None else None
         if (o is None or o["id"] != body["ack"] or o["nonce"] != body["nonce"] or rec["nonce"] != body["nonce"]
                 or not _stands(board, c, key, rec, now)):
+            return REJECTED
+        keep = hosted_wake._qualifying(board, p, rec["project"], [int(k) for k in o["entries"]], rec)
+        if set(keep) != set(o["entries"]):
+            # Read past (or otherwise out) since the hand-over: this id no longer names a batch that may wake.
+            _take_back(c, rec)
+            rec["pending"] = {k: e for k, e in rec["pending"].items() if k in keep or k not in o["entries"]}
+            _save(c, key, rec, now)
             return REJECTED
         pair = _pair(c, rec["agent"], rec["project"])
         hosted_wake._lift(c, pair, max(pair["sent"], default=None))     # the human's new posts first
@@ -376,7 +399,7 @@ def _ack(board: Board, key: str, body: dict) -> dict:
             hosted_wake._thread(c, pair, tid)["count"] += 1
         for k in o["entries"]:
             rec["delivered"][k] = pair["delivered"][k] = now
-        rec["offer"] = None
+        rec["offer"], rec["acked"] = None, {"id": o["id"], "nonce": o["nonce"], "at": now}
         _save(c, key, rec, now)
         _save_pair(c, pair, now)
     log.info("waiter %s: wake delivered", key)
@@ -394,7 +417,7 @@ def poll(board: Board, p: Principal, body: Any) -> dict:
     body = _checked(body)
     key, conn = _key(p.name, body["client_session_id"]), board.conn
     if body["ack"] is not None:
-        return _ack(board, key, body)
+        return _ack(board, p, key, body)
     seen_at = board.now()
     rec = _load(conn, key)
     if rec is not None and body["nonce"] in rec["retired"]:

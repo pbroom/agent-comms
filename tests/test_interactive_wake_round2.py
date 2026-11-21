@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from agent_comms import db, hosted, hosted_wake, interactive_wake as iw, waiter
+from agent_comms.core import LimitExceeded
 
 from conftest import PROJECT
 from test_hosted_sessions import P2, client, senv  # noqa: F401
@@ -221,28 +222,32 @@ def test_s19_end_to_end_an_offer_that_expires_in_transit_is_offered_again(senv):
 # ------------------------------------------------------------ the state machine, driven at random
 
 
-@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 6])
 def test_randomized_offers_keep_their_invariants(senv, seed):
-    """Interleaved arms, re-arms, project changes, posts, human posts, pauses, dispatcher passes with reservations,
-    acks in time and late, reads and a hosted root that comes and goes. After every step: at most one standing offer
-    per pair; no post delivered to two conversations; no ack accepted while paused or beside a hosted root; each
-    accepted wake charged once, for its own threads; every hold ends at its request's first-offer deadline unless the
-    post was read after delivery."""
+    """Interleaved arms, re-arms, project changes, posts, human posts, pauses, the setting turned off and on,
+    dispatcher passes with reservations, acks in time and late, replayed acks, reads (filtered, and another session
+    reading past posts with its cursor) and a hosted root that comes and goes. After every step: at most one standing
+    offer per pair; every hold ends at its request's first-offer deadline unless the post was read after delivery.
+    At every accepted ack: not paused, not off, no hosted root there; no post delivered to two conversations; every
+    post of the batch still unread; each accepted wake charged once, for its own threads. A replayed ack is answered
+    as the first was and charges nothing: an acknowledged batch wakes the client exactly once."""
     rnd = random.Random(seed)
     # Limits loose enough that many wakes happen, with a per-thread maximum the run reaches now and then.
-    on(senv, wake_min_interval_seconds=2, max_wakes_per_hour=1000, max_wakes_without_human=3)
+    sessions = {"wake_min_interval_seconds": 2, "max_wakes_per_hour": 1000, "max_wakes_without_human": 3}
+    on(senv, **sessions)
     projects = [PROJECT, P2]
     threads = {PROJECT: [senv.thread(), senv.thread()],
                P2: [senv.board.create_thread(senv.p["human"], senv.sid["human"], f"t{i}", P2)["id"] for i in range(2)]}
     convs = {c: {"nonce": None, "project": PROJECT, "n": 0} for c in (ONE, TWO, THREE)}
-    readers = {}
-    issued: list[tuple] = []                     # (conv, nonce, project, offer id, threads)
+    readers, others = {}, {}
+    issued: list[tuple] = []                     # (conv, nonce, project, offer id, threads, post keys)
+    accepted: dict[str, tuple] = {}              # offer id -> (conv, nonce, project, when)
     delivered_to: dict[str, str] = {}
     expected = {(pr, t): 0 for pr in projects for t in threads[pr]}
     first_offer: dict[str, float] = {}
     posts: list[tuple[int, str]] = []
-    paused, root = False, None
-    seen = {"issued": 0, "acked": 0, "rejected": 0, "held": 0}
+    flags = {"paused": False, "root": None, "off": False}
+    seen = {"issued": 0, "acked": 0, "rejected": 0, "replayed": 0, "held": 0}
 
     def new_nonce(c):
         convs[c]["n"] += 1
@@ -253,11 +258,25 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         if v["nonce"] is None:
             new_nonce(c)
         out = call(senv, c, v["nonce"], (v["project"],))
+        assert out["state"] != "wake" or not flags["off"]
         if out["state"] == "wake":
             seen["issued"] += 1
             r = rec(senv, c)
             issued.append((c, v["nonce"], v["project"], out["id"],
                            sorted({e[0] for e in r["offer"]["entries"].values()}), list(r["offer"]["entries"])))
+
+    def unchanged(project, before) -> None:
+        after = iw._pair(senv.board.conn, "claude", project)
+        assert (after["sent"], after["threads"]) == (before["sent"], before["threads"]), "a replay charged again"
+
+    def unread(keys) -> bool:
+        for k in keys:
+            row = senv.board.conn.execute("SELECT thread_id, seq FROM posts WHERE id = ?", (int(k),)).fetchone()
+            cursor = senv.board.conn.execute("SELECT COALESCE(MAX(last_seq), 0) FROM cursors WHERE agent = 'claude' "
+                                             "AND thread_id = ?", (row["thread_id"],)).fetchone()[0]
+            if row["seq"] <= cursor:
+                return False
+        return True
 
     def do_ack(late):
         if not issued:
@@ -265,13 +284,20 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         c, nonce, project, wake_id, batch, keys = issued.pop(rnd.randrange(len(issued)))
         if late:
             senv.clock.advance(iw.ACK_SECONDS)
-        pair_before = iw._pair(senv.board.conn, "claude", project)
+        before = iw._pair(senv.board.conn, "claude", project)
+        was_unread = unread(keys)
         out = call(senv, c, nonce, (project,), ack=wake_id)
         if out["state"] != "acked":
             seen["rejected"] += 1
             return
+        if wake_id in accepted:                 # the same id issued twice, acknowledged again: a replay
+            seen["replayed"] += 1
+            unchanged(project, before)
+            return
         seen["acked"] += 1
-        assert not paused and root != project, "accepted while paused or beside a hosted root"
+        accepted[wake_id] = (c, nonce, project, senv.clock())
+        assert not flags["paused"] and not flags["off"] and flags["root"] != project, "accepted when it may not be"
+        assert was_unread, "accepted for a post another session had read past"
         for k in keys:
             assert delivered_to.setdefault(k, c) == c, f"post {k} delivered to two conversations"
         for t in batch:
@@ -282,12 +308,34 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
             if t in batch:
                 assert got == expected[(project, t)], (t, got, expected[(project, t)])
             else:
-                assert got <= (pair_before["threads"].get(str(t)) or {}).get("count", 0), "charged outside its batch"
+                assert got <= (before["threads"].get(str(t)) or {}).get("count", 0), "charged outside its batch"
 
-    for step in range(300):
+    def replay():
+        if not accepted:
+            return
+        wake_id = rnd.choice(list(accepted))
+        c, nonce, project, when = accepted[wake_id]
+        before = iw._pair(senv.board.conn, "claude", project)
+        r = rec(senv, c)
+        out = call(senv, c, nonce, (project,), ack=wake_id)
+        if flags["off"]:
+            assert out == {"state": "off"}, "nothing is answered acked while off"
+        elif r is not None and (r["acked"] or {}).get("id") == wake_id and senv.clock() - when < iw.REPLAY_SECONDS:
+            assert out == {"state": "acked"}, "the same answer as the first time"
+            seen["replayed"] += 1
+        else:
+            assert out["state"] != "acked"
+        unchanged(project, before)
+
+    for step in range(400):
         op = rnd.choices(["look", "rearm", "move", "post", "human", "pause", "tick", "ack", "late", "root", "read",
-                          "time"], weights=[8, 2, 1, 5, 1, 1, 3, 6, 1, 1, 2, 3])[0]
+                          "cursor", "replay", "flip", "time"],
+                         weights=[8, 2, 1, 5, 1, 1, 3, 6, 1, 1, 2, 1, 2, 1, 3])[0]
         c = rnd.choice(list(convs))
+        if flags["paused"] and rnd.random() < 0.25:     # a pause lasts a few steps
+            op = "pause"
+        if flags["off"] and rnd.random() < 0.3:         # and so does the setting being off
+            op = "flip"
         if op == "look":
             look(c)
         elif op == "rearm":
@@ -297,43 +345,66 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
             new_nonce(c)
             convs[c]["project"] = rnd.choice(projects)
             look(c)
-        elif op == "post" and not paused:           # agents cannot post while paused; the human can
+        elif op == "post" and not flags["paused"]:          # agents cannot post while paused; the human can
             pr = rnd.choice(projects)
-            posts.append((ask(senv, rnd.choice(threads[pr]), as_=rnd.choice(["codex", "grok"]))["id"], pr))
+            t = rnd.choice(threads[pr])
+            try:
+                posts.append((ask(senv, t, as_=rnd.choice(["codex", "grok"]))["id"], pr))
+            except LimitExceeded:                   # the board's own cap: the human steps into the thread
+                senv.post("human", t, "human", to=[])
+                expected[(pr, t)] = 0
         elif op == "human":
             pr = rnd.choice(projects)
             t = rnd.choice(threads[pr])
             senv.post("human", t, "human", to=[])
             expected[(pr, t)] = 0
-        elif op == "pause" or (paused and rnd.random() < 0.25):     # a pause lasts a few steps
-            paused = not paused
-            senv.board.set_paused(senv.p["human"], paused)
+        elif op == "pause":
+            flags["paused"] = not flags["paused"]
+            senv.board.set_paused(senv.p["human"], flags["paused"])
+        elif op == "flip":
+            flags["off"] = not flags["off"]
+            if flags["off"]:
+                senv.settings.dispatch = {**senv.settings.dispatch, "sessions": sessions}
+            else:
+                on(senv, **sessions)
         elif op == "tick":
             iw.tick(senv.board)
+            if flags["off"]:                        # the pass dropped every record: the pairs start again
+                expected = {key: 0 for key in expected}
             if posts and rnd.random() < 0.5:
                 pid, pr = rnd.choice(posts)
                 with db.write_tx(senv.board.conn):
                     hosted_wake.reserve(senv.board, "claude", pr, pid, senv.clock())
         elif op in ("ack", "late"):
             do_ack(op == "late")
+        elif op == "replay":
+            replay()
         elif op == "root":
-            if root is None:
-                root = rnd.choice(projects)
-                hosted_root(senv, root)
+            if flags["root"] is None:
+                flags["root"] = rnd.choice(projects)
+                hosted_root(senv, flags["root"])
             else:
-                hosted_root(senv, root, present=False)
-                root = None
-        elif op == "read" and not paused:
+                hosted_root(senv, flags["root"], present=False)
+                flags["root"] = None
+        elif op == "read" and not flags["paused"]:
             v = convs[c]
             key = (c, v["project"])
             if key not in readers:
                 readers[key] = senv.board.register_session(senv.p["claude"], v["project"],
                                                            client=("claude-code", c))["session_id"]
             senv.board.read_updates(senv.p["claude"], readers[key], only="addressed")
+        elif op == "cursor" and not flags["paused"]:
+            pr = rnd.choice(projects)              # another session of the agent reads everything and acknowledges
+            if pr not in others:
+                others[pr] = senv.board.register_session(senv.p["claude"], pr)["session_id"]
+            out = senv.board.read_updates(senv.p["claude"], others[pr])
+            if out.get("ack_through"):
+                senv.board.ack(senv.p["claude"], others[pr], out["ack_through"])
         elif op == "time":
             senv.clock.advance(rnd.choice([1, 1, 2, 3, 8, 25]))
         seen["held"] += check(senv, projects, first_offer, posts)
-    assert seen["issued"] >= 10 and seen["acked"] >= 3 and seen["rejected"] >= 1 and seen["held"], \
+    assert (seen["issued"] >= 10 and seen["acked"] >= 3 and seen["rejected"] >= 1 and seen["replayed"] >= 1
+            and seen["held"]), \
         ("the run exercised too little", seen)
 
 

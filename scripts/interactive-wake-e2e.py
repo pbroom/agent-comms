@@ -96,6 +96,7 @@ class Run:
         self.env |= {"AGENT_COMMS_HOME": str(self.home), "AGENT_COMMS_TOKEN_DIR": str(self.tmp / "tokens"),
                      "PYTHONUNBUFFERED": "1"}
         self.failures: list[str] = []
+        self.ok = False         # set only when every step ran to its end: anything else keeps the logs
 
     # ------------------------------------------------------------ set-up
 
@@ -417,7 +418,7 @@ wake = true
             except subprocess.TimeoutExpired:
                 print(f"  still running after SIGTERM: pid {p.pid}")
         left = [p.pid for p in self.procs if p.poll() is None]
-        if self.args.keep or self.failures:
+        if self.args.keep or self.failures or not self.ok:
             print(f"kept {self.tmp}")       # asked for, or something failed: the logs are what explain it
         else:
             import shutil
@@ -445,6 +446,7 @@ def main() -> int:
         run.stand_in()
         if args.claude_bin:
             run.real()
+        run.ok = True
     except SystemExit as e:             # a step that timed out or a process that exited early
         run.failures.append(str(e) or "stopped")
     finally:

@@ -4064,3 +4064,44 @@ old head failing.
 thread's stored count can still be stale, higher than true until the next look lifts it, by design: the lift is
 lazy. The clock-inside-the-transaction fix is tested by advancing the fake clock as the lock is taken; no real
 lock contention was produced.
+
+### Waking an interactive session: review round 3 (2026-11-21)
+
+Round 3 (on 55b6ed7) left S19 partly open and raised four new points. Each has a test in
+`tests/test_interactive_wake_round3.py`, written first and run against 55b6ed7, where all eight failed. The state
+machine in `interactive_wake.py`'s docstring gains O3' (the replay) and the rule that STANDING includes the live
+setting.
+
+- **S19.** `board wait` now resets its count of rejected acks on every "idle" reply. MAX_REJECTED is reached only by
+  rejections in a row, so isolated rejections over a long session never disarm the hook.
+- **S20.** The waiter keeps its last accepted ack (`acked`: id, nonce, time).
+  - The same nonce sending the same id again within REPLAY_SECONDS (60) is answered "acked" again, and nothing is
+    charged or changed (O3').
+  - `board wait` sends an ack whose 200 reply it cannot read again, with the same id, up to ACK_TRIES (3) times
+    before it waits on.
+  - So a first wake whose reply was garbled after the hub committed it still wakes the session, exactly once. This
+    is tested against the real hub, with the first reply garbled after the commit.
+- **S21.** `_stands` reads the live setting, and O1 checks it, so offering, handing over and acknowledging all see
+  the setting as it is inside their transaction. An ack answered while the setting is off says "off". That includes
+  a replay: nothing is answered "acked" while off.
+- **S22.** O3 re-qualifies the whole batch inside its transaction. If another session read past one of its posts
+  (its cursor moved) since the hand-over, the offer is taken back (O4) and the ack is rejected. The id never wakes
+  the session for a batch that no longer stands, and the read post is not offered again.
+- **S23.** The e2e script keeps its temp directory unless every step ran to its end: an unexpected exception keeps
+  the evidence too.
+
+**The randomized test** (now seeds 1 to 6, 400 steps each, about a second each) gains these moves:
+- replays of accepted acks;
+- the setting turned off and on (a dispatcher pass while off drops every record, and the model starts its pairs
+  again);
+- another session reading everything and moving its cursor, between hand-over and ack;
+- and, when the board's own cap of 12 agent posts per thread since the last human post is hit, a human post in
+  that thread.
+
+The invariants it adds:
+- an accepted ack was for a batch none of whose posts had been read past;
+- no ack is accepted, and no wake handed over, while the setting is off;
+- a replay is answered as the first ack was (within the window, the record still there) and charges nothing. So an
+  acknowledged batch wakes the client exactly once.
+
+It also asserts that each run exercised replays.

@@ -46,6 +46,7 @@ RETRY_SECONDS = 120.0       # after the first call: give up once the hub has bee
 DEFAULT_MAX_SECONDS = 86340.0   # the installed hook's timeout is 86400 (README "Waking a session you opened")
 WATCH_SECONDS = 1.0
 MAX_REJECTED = 5            # acknowledgements in a row the hub rejected before this process gives up
+ACK_TRIES = 3               # sends of one ack whose reply could not be read (the hub answers a replay "acked" again)
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MANAGED = "AGENT_COMMS_MANAGED"     # set by dispatch.child_env for every launched run and hosted session
 _NAME = r"[a-z][a-z0-9_-]{0,31}"
@@ -196,6 +197,8 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
             continue
         failing_since, failures = None, 0
         state = answer.get("state") if isinstance(answer, dict) else None
+        if state == "idle":
+            rejected = 0        # the cap is on rejections in a row, not over a long session
         if state == "wake":
             woken = _woken(client, body, answer, stderr)
             if woken is not None:
@@ -214,16 +217,19 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any) -> int | None:
     not be delivered at all (no answer, or a 5xx: the hub then takes the wake back after a while and may offer the
     same posts once more). 0 when the hub says this process was superseded or the feature is off, or refuses the
     call (4xx). None (wait on, with the same nonce) when the hub rejects it while the process is still the current
-    one (the offer expired in transit, a pause, a reservation), or answers 200 with something this version cannot
-    read: a reply that was not "acked" is never taken for one."""
+    one (the offer expired in transit, a pause, a reservation, a read past one of its posts). A 200 that cannot be
+    read is never taken for "acked": the same ack is sent again (the hub answers a replay of an ack it accepted
+    "acked" again, charging nothing), up to ACK_TRIES sends, and after that the process waits on."""
     text, wake_id = answer.get("text"), answer.get("id")
     if not (isinstance(text, str) and WAKE_RE.fullmatch(text) and isinstance(wake_id, str)):
         return 0
-    try:
-        r = client.post("/api/wait", json=body | {"ack": wake_id, "wait": 0}, timeout=5)
-    except Exception:
-        r = None        # not delivered: woken all the same
-    if r is not None and r.status_code < 500:
+    for _ in range(ACK_TRIES):
+        try:
+            r = client.post("/api/wait", json=body | {"ack": wake_id, "wait": 0}, timeout=5)
+        except Exception:
+            r = None        # not delivered: woken all the same
+        if r is None or r.status_code >= 500:
+            break
         if r.status_code != 200:
             return 0
         try:
@@ -233,8 +239,13 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any) -> int | None:
         state = reply.get("state") if isinstance(reply, dict) else None
         if state in ("superseded", "off"):
             return 0
-        if state != "acked":
+        if state == "rejected":
             return None
+        if state == "acked":
+            break
+        # unreadable or unknown: ask again with the same id
+    else:
+        return None
     stderr.write(text + "\n")
     stderr.flush()
     return WAKE
