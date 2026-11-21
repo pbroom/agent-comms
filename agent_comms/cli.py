@@ -792,7 +792,8 @@ def _fmt_hosted_detail(s: dict) -> str:
 
     lines = ["session " + _fmt_hosted(s),
              f"  created {iso(s['created_at'])}, updated {iso(s['updated_at'])}"
-             + (f", model {s['model']}" if s.get("model") else "") + (f", pid {s['pid']}" if s.get("pid") else "")]
+             + (f", model {s['model']}" if s.get("model") else "") + (f", pid {s['pid']}" if s.get("pid") else "")
+             + (f", {s['runtime']} id {s['provider_id']}" if s.get("provider_id") else "")]
     if s.get("error"):
         lines.append(f"  ended: {s['error']}")
     last = s.get("last_result")

@@ -2586,3 +2586,244 @@ work was needed, and the session said it had not loaded the request-progress too
 - The wake limits are per session; nothing caps the number of sessions an agent can be woken in across projects.
 - Not exercised against the live board or a real second machine; the dashboard shows neither sessions nor wakes
   (the Needs-you item is the only UI).
+
+## Session host: Codex adapter (2026-11-21)
+
+**Report.** Step 2, PR 1: Codex can be hosted the way Claude is. `board session start <project> <msg> --agent codex
+--wait` starts `codex app-server` on the node, a message to the idle session starts a turn at once, one to a busy
+session is its next turn, the conversation survives a node restart, and the reply text comes back. Off unless the
+node says `[dispatch.sessions] codex = true` (strictly parsed, shipped `false`): without it `providers.provider_for`
+offers no adapter for a Codex runner and everything is as it was. No parent/child sessions and no agent-callable
+tools yet (next PR).
+
+**Shape.** `providers/codex.py` is the second `ProviderSession`. The seam grew by these, all optional for an
+adapter: the event `start_failed` (this PROCESS cannot serve the session: the host fails the message waiting on its
+handshake with the reason and stops the process; the session stays), `adopt(provider_id)` (the provider's own id
+for the session, handed back when a session is opened again; Claude ignores it), `runs_in(cwd)` (the directory the
+host starts the process in), `holds_turns()` (the provider is busy with something of its own: the next message
+waits), and `session_exists` may now answer
+from the adapter's own protocol state as well as from stderr. `provider_for(template, codex=...)` carries the gate;
+`SessionHost` binds it from its config, so an injected `provider_for` still takes just the template.
+
+**Protocol as observed** (codex-cli 0.171.0, `codex app-server generate-json-schema` first, then live; the schema's
+names matched the plan except where noted):
+- *Framing.* Stdio, one JSON object per line each way. No `jsonrpc` field in anything the server writes; one on a
+  request is tolerated. A line that is not one whole message (not JSON, empty, an object split over two lines) is
+  dropped with an ERROR line on stderr and no answer. Nothing is written before the first request. A request `id`
+  may be 0: the server's own requests start there.
+- *Handshake.* `initialize {clientInfo, capabilities: {optOutNotificationMethods}}` -> `{userAgent, codexHome,
+  platformFamily, platformOs}`; any request before it is refused `-32600 "Not initialized"`, a second one `"Already
+  initialized"`. Then the notification `initialized` (the server answered `model/list` without it; the adapter
+  sends it all the same). With the delta methods opted out no delta notification arrived. `--listen stdio://` may
+  be given explicitly (the adapter does). An unknown method is `-32600 "Invalid request: unknown variant ..."`.
+- *Thread.* `thread/start {model, sandbox, approvalPolicy}` (it also takes `cwd` and `developerInstructions`, which
+  the adapter no longer sends: see "No `cwd` on `thread/start`" below) -> `{thread: {id, ...},
+  model, cwd, sandbox, approvalPolicy, ...}` and a `thread/started` notification (its id is under `params.thread`,
+  not `params.threadId`). The id is a lower-case UUID (v7) and equals `thread.sessionId`. Without `cwd` the
+  process's own directory is used; a `cwd` that does not exist is accepted. An unknown `sandbox` or
+  `approvalPolicy` value is refused at once (`-32600`, the valid ones listed); an unknown MODEL is accepted here.
+- *Turn.* `turn/start {threadId, input: [{type: "text", text}]}` -> `{turn: {id, status: "inProgress"}}`, then
+  `thread/status/changed` (active), `turn/started`, `item/started`/`item/completed` per item (`userMessage`,
+  `reasoning`, `agentMessage`, `commandExecution`, `mcpToolCall`, `collabAgentToolCall`, `subAgentActivity`),
+  `thread/tokenUsage/updated`, `thread/status/changed` (idle) and `turn/completed {threadId, turn: {id, status,
+  error, items, durationMs}}`. `turn.items` holds only the final `agentMessage` (`itemsView: "summary"`).
+- *Reply text.* Every answer was an `agentMessage` with `phase: "final_answer"`; a `phase: "commentary"` message
+  ("I'll run that command once.") came before a tool call. The reply is the turn's LAST `final_answer`; without
+  one, the last message whose phase is not `commentary` (for a model that sets none: not seen, gpt-6-luna always
+  set it); else the summary in `turn/completed`; commentary is never the reply. Capped by `cap_reply`.
+- *Failure.* Unknown model: the turn starts and ends `status: "failed"` with `turn.error {message: "The '...' model
+  is not supported when using Codex with a ChatGPT account.", codexErrorInfo: "modelNotFound"}`, after an `error`
+  notification (`willRetry: false`) and `thread/status/changed` (systemError). Unknown effort: the same shape,
+  `codexErrorInfo: "other"`, the message the API's JSON error. The thread takes the next turn normally. The
+  adapter reports `ok=False`, the message as `detail`, and `meta {status, duration_ms, error_info}`.
+- *Interrupt.* `turn/interrupt {threadId, turnId}` -> `{}` and `turn/completed` with `status: "interrupted"`
+  within 0.03 s; the process stays. With no turn active: `-32600 "no active turn to interrupt"`.
+- *`turn/start` while a turn is active* is NOT an error: it answers with the ACTIVE turn's id and the text is
+  added to that turn as another user message (steering). The host never does this; if it ever did, the active
+  turn's end would end the message.
+- *Other threads.* A sub-agent (asked for explicitly; gpt-6-luna used `collabAgentToolCall`) has its own thread, and
+  its `turn/started`, `item/completed` (an `agentMessage` with `final_answer` of its own), `thread/status/changed`,
+  `thread/tokenUsage/updated`, `warning` and `turn/completed` arrive on this connection with ITS `threadId`; no
+  `thread/started` came for it. So the adapter reads a notification only when `params.threadId` is the session's
+  thread and a turn is open, matches `item/completed` on `turnId` and `turn/completed` on the turn's id, and drops
+  the rest unread. Notifications without a thread (`account/*`, `configWarning`, `remoteControl/*`) mean nothing.
+- *Approvals.* With `approvalPolicy: "never"` the server sent NO request in any turn. What a refusal looks like
+  depends on who refuses: a command the SANDBOX refuses (read-only: `touch`; workspace-write: a path outside the
+  roots) leaves no trace in the events at all, not even a `commandExecution` item (twice of twice), while a
+  command that ran has one; the model just sees "Operation not permitted". An MCP tool that needs approval is an
+  `mcpToolCall` item with `status: "failed"` and `error.message: "MCP tool call requires approval, but approval
+  policy is never"`. Under `approvalPolicy: "untrusted"` the server asks: `{id: 0, method:
+  "item/commandExecution/requestApproval", params: {threadId, turnId, itemId, command, cwd, availableDecisions}}`;
+  answered `{decision: "decline"}` (though `availableDecisions` did not list it) it wrote `serverRequest/resolved`
+  and the item with `status: "declined"`, nothing ran, and the turn completed.
+- *`-c` overrides apply under app-server.* `config/read` showed them; `sandbox_workspace_write.writable_roots` let
+  a workspace-write thread write in the extra root and not beside it (`thread/start` echoes the roots);
+  `mcp_servers.<s>.tools.<t>.approval_mode="approve"` turned the refused MCP call above into a completed one;
+  `mcp_servers.<s>.enabled=false` disables a server from config.toml (not a plugin's: that needs `--disable
+  plugins`). `--strict-config` with an unknown key in config.toml exits 1 before any line.
+- *Resume.* After SIGTERM mid-turn (exit code 0 within 0.04 s, no `turn/completed`; the rollout records the turn
+  as aborted) a new process's `thread/resume {threadId, excludeTurns: true}` answered in 0.15 s with the same id,
+  `status: idle`, no turns; nothing was replayed, and the next turn knew both the first turn's word and one from
+  the cut turn's message. A thread that never had a turn has NO rollout file, and resuming it fails exactly like an
+  id Codex never issued: `-32600 "no rollout found for thread id <id>"`. Something that is not a UUID:
+  `"invalid session id: ..."`. `turn/start` for a thread this process has not loaded: `"thread not found: <id>"`.
+  Stdin EOF while idle: exit 0 after 0.2 s (the host stops with SIGTERM and does not rely on it).
+
+**The command.** From the node's own `codex exec` runner for the agent, as `ClaudeSession.argv` derives from the
+Claude one (`providers.codex.session_command`): `codex app-server <kept> --listen stdio://`. Kept: every
+`-c`/`--config` pair in any spelling, `--enable`/`--disable <feature>`, `--strict-config`. Turned into `thread/start`
+parameters: `-m/--model` (the hub's override, validated by `validate_model`, wins) and `-s/--sandbox` (else `-c
+sandbox_mode`, else `read-only` as `codex exec` has it). Dropped: `exec`, `{prompt}`, `--skip-git-repo-check`,
+`--json`, `--color`, and `--cd` (below). Refused, by flag name and never by value: everything else (a profile,
+`--add-dir`, `--ephemeral`, images, an output file, a second positional), and with its own message anything that
+turns the sandbox or approvals off (`--dangerously-bypass-approvals-and-sandbox`, `--approve-for-me`,
+`danger-full-access` by flag or `-c`). `approvalPolicy` is always `never`. `with_writable_roots` already adds the
+Codex `-c` override. Nothing executable crosses the wire: the hub still sends agent, project and model only.
+
+**No `cwd` on `thread/start`, no instructions of ours** (review round 1). The first version sent the run directory
+as `cwd` and a fixed `developerInstructions` note. Both are gone:
+- *`cwd`.* A `thread/start` that names a `cwd` makes the 0.171.0 app-server record that directory as TRUSTED in the
+  user's config.toml, and a trusted checkout's own `.codex` config is loaded, which can start host processes
+  (reviewer, from `app-server/src/request_processors/thread_processor.rs`). Seen live in a TEMPORARY Codex home
+  (`CODEX_HOME`, nothing of the user's), each time in a fresh `git init` directory: `thread/start` with `cwd` and
+  `workspace-write` wrote `[projects."<dir>"] trust_level = "trusted"`; with `read-only` it wrote nothing;
+  `thread/start` WITHOUT `cwd` wrote nothing under either sandbox and the thread's directory was the process's own;
+  `thread/resume` wrote nothing with or without `cwd` under either sandbox. `codex exec` leaves `cwd` out of its
+  own `thread/start`. So the session's process is started in the node's run directory (the host always did:
+  `spawner(..., cwd=)`) and `thread/start` names none. `--cd` in the runner may therefore only say that directory
+  (`{project}`, or the same path): anything else is refused at `open`, since it could no longer be honoured. The
+  host tells the adapter the directory (`runs_in`), and `SessionHost._argv` is back to what it was (the pre-rendering
+  of `{project}` is gone).
+- *`thread/resume` does name it.* Without `cwd` a resumed thread goes on in the directory it was CREATED in
+  (seen live: process in another directory, thread still in the old one), which after a `[dispatch.worktrees]`
+  change is an old checkout. The adapter sends the directory the node resolves now.
+- *`developerInstructions`* on `thread/start` replaces the owner's configured `developer_instructions` (reviewer,
+  from `core/src/config/mod.rs`). Nothing is injected: `approvalPolicy: never` and the refusals above already keep
+  the session unattended. A runner's own `-c developer_instructions=...` is passed on like any other override.
+
+**Denials** (names only, as for Claude; the turn then leaves the session `waiting`): a server request is answered
+at once with its refusal and reported by kind (`commandExecution`, `fileChange`, `permissions`, `mcpElicitation`,
+`requestUserInput`; the legacy `execCommandApproval`/`applyPatchApproval` too); an item with `status: "declined"`
+by its type; a failed `mcpToolCall` whose error says it needs approval as `mcp__<server>__<tool>`. A request that is
+not an approval (`account/chatgptAuthTokens/refresh`, `attestation/generate`, anything unknown) gets a JSON-RPC
+error, `item/tool/call` an unsuccessful result, so the process never waits on this side. Never a command, a path or
+an argument. A sub-agent's request is refused the same way. `approval_requested` is not used: nothing is left
+unanswered.
+
+**The thread id** is Codex's, so it must outlive the process. The host records it in
+`data/node-logs/node-session-providers.json` (mode 600; dropped when the session is forgotten, and pruned to the
+sessions the hub lists) and hands it to the adapter when the session is opened (`adopt`). The node also reports it
+(`provider_id` in the status of a report, only when it is not the session id, so a Claude session's reports are byte
+for byte what they were) and the hub keeps it on the session record and shows it to the human (`board session
+show`). The hub NEVER sends it back to a node: a thread id from the hub would let the hub point a session at any
+Codex conversation on that machine. A hub from before the field refuses such a report (422, `extra="forbid"`): hubs
+are upgraded before nodes. (The first version retried without the id and then stopped sending it; review round 1
+took that out, since one 422 for any other reason would have suppressed the id for good.)
+
+**When is there something to resume** (review round 1). For Claude `ready` arrives with the first turn, and the
+session exists from then on. For Codex `ready` only means an id was issued: Codex keeps nothing of a thread until a
+turn has started in it. The first version set `resume` when `turn_started` was read. That left a window: Codex
+records the turn, the node dies before it reads `turn/started`, both flags (the hub's and the state file's) still
+say "nothing to resume", and the restart starts a NEW thread without a word. Now the host puts it on record BEFORE
+the first `turn/start` is written (`SessionHost._write`): `resume` is set and the thread id goes into
+`node-session-providers.json` then, and not at `ready`. `open` trusts that record over whatever the caller says: a
+recorded id is resumed. A thread that only got an id (no turn written) has no record and is simply started anew.
+If the turn never reached Codex after all, the resume is refused and that is said (below). The lost turn itself is
+reported failed as ever and never written again.
+
+**Start-mode correction, the Codex way** (review round 1). ANY refused `thread/resume` gives the thread up, not only
+"no rollout found for thread id" (a refusal that does not go away would otherwise fail every later message the same
+way); so does a session opened with `resume` and no id on record. It is `start_failed` with a detail that names the
+thread, gives Codex's reason, and ends "The next message starts a NEW thread, without the earlier turns". The fresh
+start is on record BEFORE that failure is reported: when the host reads `start_failed` it asks the adapter
+(`session_exists`, False) and clears `resume`, the state file's flag and the id's record at once, where the first
+version waited until the process had been reaped (a node that restarted in between tried the same resume again).
+So: one failed message, loudly, then a new thread; never a silent switch. Review round 2 closed the last gap: the
+node could die after recording the refusal and before the hub heard of it, and the hub's stale `resume` then sent
+the next message into a second failure ("no record"). The fresh start is therefore a record of its own: the
+session's entry in `node-session-providers.json` with no id (JSON null, `_record_fresh_start`). `open` lets it
+overrule the caller's `resume`, the first turn written to the new thread replaces it with that thread's id, and
+the message that was lost in the crash is reported with what follows from it ("... Before that the agent refused
+to resume this session's conversation: the next message starts a NEW one"). A refused `thread/start` fails that
+message with Codex's reason and changes nothing. A resume that answers with another thread id, or a start without a
+usable id, is `fatal` for the session.
+
+**Handshake timeout.** A provider with `waits_for_ready` used to inherit the turn timeout for its handshake (30
+minutes). It now has `handshake_seconds` (constructor argument, default 60): the message waiting on it fails with
+"the agent process was not ready after 60 seconds", the process is stopped, the next message starts another. Found
+on the way: a process that EXITED during its handshake failed nothing, so its message stayed in the inbox and a new
+process was started on every pass, for ever (reachable with a runner flag Codex refuses, e.g. `--strict-config`
+against a config with an unknown key). It now fails the message that started it ("the process exited (code N)
+before it was ready"). Review round 1 found the same loop one path over: a pipe that breaks while `initialize` is
+written stopped the process from the host's side, so neither the write path (no turn to fail) nor the reap (the
+host had stopped it) settled the message. Every handshake failure now goes through `_fail_start` (refused, timed
+out, exited, not writable), which takes the message out of the inbox and fails it, once.
+
+**Turn ids** (review round 1). The answer to a `turn/start` is matched to the request of the turn in flight, and
+that request is retired when its turn ends. Before, a turn named by its `turn/started` could end while the answer
+to its request was still on its way; that answer then named the NEXT turn with the old id, whose end was ignored
+and whose interrupt named the wrong turn. The answer is also what names a turn when a `turn/started` came first.
+
+**A turn Codex begins by itself** (review round 1). Between messages the adapter now watches its own thread: a
+`turn/started` there that no message started is a turn of Codex's own (it goes on with a goal, runs a queued
+prompt). A `turn/start` written during it would be steered into it and answered with its result (above), so
+`holds_turns()` is True until that turn's `turn/completed` (or the thread reports `idle`), and the host keeps the
+next message in its inbox, unwritten and undelivered, for at most the turn timeout; past that the message fails
+("the agent was busy with a turn of its own for N minutes") and the process is stopped. Nothing of such a turn is
+reported. Not seen live: no automatic turn was provoked. Round 2: such a process is not idle either, so `park()`
+refuses it and the node leaves it out when it looks for an idle process to stop for room (`SessionHost.holding`);
+and a same-thread notification without a usable turn object is ignored instead of raising (an exception in `feed`
+ends the session).
+
+**Proof.**
+- `tests/test_providers_codex.py`: the adapter from recorded strings (handshake, start vs resume, turn, text, the
+  three ends, approval -> decline + denial, other threads, unknown lines, argv derivation and refusals, the gate).
+- `tests/test_session_host.py`: the host with the fake handshake provider and with the real adapter over fake pipes
+  (nothing but `initialize` before ready, handshake timeout, in-band interrupt, restart adopts the recorded id, a
+  thread that is gone), and `tests/stand_in_codex.py` through real pipes. `tests/test_hosted_sessions.py`: the same
+  through the hub and a node (the record, the restart, the gate, a node that died before its first report).
+- `tests/stand_in_codex.py`: a stand-in app-server speaking these lines, with threads on disk so another process
+  can resume them, a sub-agent's thread and a commentary message in every turn, and an approval request on demand.
+- `scripts/session-host-e2e.py` runs a Codex session first (`--codex-bin PATH`, default the stand-in; `--only`):
+  start `--wait`, send to idle, a long turn with a queued send behind it, the node stopped and started again and a
+  turn that proves the thread was kept, close. Stand-in: written 0.16 s after the send, the queued turn 0.00 s
+  after the long one ended, 0.49 s from the send to the write across a new process and its handshake. Real Codex
+  (0.171.0, gpt-6-luna at low effort, read-only sandbox, plugins and apps off, every configured MCP server
+  disabled by `-c` after asking `codex mcp list --json`; five small turns): first message written 1.00 s after the
+  start (process start and handshake included), 0.13 s to an idle session, the queued turn 0.00 s after a 12 s
+  turn ended, and after the node restart 0.90 s to the write and the reply "lantern", the word given in turn 1.
+  Its transcript: five `turn/completed`, all `completed`; five `final_answer` messages; no server request.
+  After review round 1 the real run uses a fresh `git init` checkout and the workspace-write sandbox (the case in
+  which a `cwd` would record trust) and compares the user's `~/.codex/config.toml` before and after: `thread/start`
+  was `{sandbox, approvalPolicy, model}` and nothing else, Codex reported the checkout as the thread's directory,
+  the resume named it, and the file's mtime (to the nanosecond) and SHA-256 were unchanged; 1.24 s to the first
+  write, 0.21 s to an idle session, 0.78 s across the restart, reply "lantern".
+
+**Residual risks / not verified.**
+- A sandbox refusal is invisible in the events (above), so `show` lists no denial for it; only what Codex asks for
+  or reports is listed.
+- The reply rule for a model that sets no `phase`, several `final_answer` messages in one turn, and
+  `partial_answer` were not seen. `item/permissions/requestApproval`, `mcpServer/elicitation/request`,
+  `item/tool/requestUserInput`, `item/fileChange/requestApproval` and the two legacy approvals are answered from
+  the schema only; only the command approval was exercised live.
+- The trust findings are 0.171.0's, in a temporary Codex home with fresh `git init` directories. A later version
+  could record trust on another request; the real-Codex e2e compares the user's config.toml (mtime and SHA-256)
+  before and after its run, in a fresh git checkout under workspace-write, and fails if it changed.
+- A crash after the first `turn/start` was written but before Codex recorded anything costs one loudly failed
+  message at the next start (the resume is refused), where it used to start a new thread quietly. Chosen: the
+  other error loses a conversation without a word.
+- A session the hub says to resume for which this node has NO record at all (its `node-session-providers.json` was
+  lost) fails one message ("this node has no record of the Codex thread") and then starts a new thread.
+- A thread lives in the node machine's Codex home; the hub cannot move a session, and deleting
+  `~/.codex/sessions` loses hosted conversations (loudly, as above). The spike and the real run left about fifteen
+  small threads there.
+- The dispatcher's Codex additions are not applied to a session: no inbox narrowing (`with_codex_inbox_mcp`), no
+  headless or signed-in browser, no check that the runner approves every board tool (a missing approval shows as
+  a denied `mcp__agent-comms__<tool>`). A hosted Codex session starts whatever MCP servers that machine's Codex
+  configuration names.
+- `[dispatch.sessions] codex` is the node's switch only; the hub places a Codex session on any hosting node that
+  has a runner for the agent, and a node without the switch ends it with the reason.
+- Codex's own automatic turns in a hosted thread (a goal, a queued prompt) are held against from the protocol's
+  shape only (above); none was seen live. One that starts in the instant between the host's check and its write
+  would still take the message.
+- Not run on the second Mac or against the live hub and node; nothing was deployed or enabled.
