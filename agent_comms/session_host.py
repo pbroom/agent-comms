@@ -94,12 +94,18 @@ class HostEvent:
     detail: str = ""
     undelivered: tuple[str, ...] = ()
     text: str = ""
+    # `turn_ended` only: the provider TOOK the turn and ended it itself, as its adapter says (providers.Event.answered:
+    # a success or an error of its own; not Codex refusing to start it). False: the provider did not take it, or the
+    # host gave up on it (the process went, a timeout with no answer, a write that failed), and whether the provider
+    # ever read it is not known. Never read off `ok`.
+    answered: bool = False
 
 
 @dataclass
 class _Message:
     id: str
     text: str
+    kind: str = "user"      # providers.TURN_KINDS: whose turn it is, passed on to the provider with the text
 
 
 @dataclass
@@ -561,19 +567,22 @@ class SessionHost:
             return None
         return self._private_json(session_id, "mcp", {"mcpServers": {session_access.BOARD_SERVER: entry}})
 
-    def send(self, session_id: str, text: str, *, message_id: str | None = None) -> str:
-        """Queue a message for the session (first in, first out). Returns its id."""
+    def send(self, session_id: str, text: str, *, message_id: str | None = None, kind: str = "user") -> str:
+        """Queue a message for the session (first in, first out). Returns its id. `kind` (providers.TURN_KINDS):
+        whose turn it is, for the provider (`turn`)."""
         s = self._session(session_id)
         if s.ended:
             raise ValueError("session has ended")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("message text is empty")
+        if kind not in providers.TURN_KINDS:
+            raise ValueError("unknown message kind")
         if message_id is None:
             self._next_message += 1
             message_id = f"m{self._next_message}"
         if not isinstance(message_id, str) or not 0 < len(message_id) <= MESSAGE_ID_MAX:
             raise ValueError("message id must be a short string")
-        s.inbox.append(_Message(message_id, text))
+        s.inbox.append(_Message(message_id, text, kind))
         return message_id
 
     def state(self, session_id: str) -> str:
@@ -713,7 +722,8 @@ class SessionHost:
             s.denials, s.waiting = ev.denials, bool(ev.denials)
             out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=bool(ev.ok) and not timed_out,
                                  denials=ev.denials, meta=dict(ev.meta),
-                                 detail=self._timeout_detail() if timed_out else ev.detail, text=ev.text))
+                                 detail=self._timeout_detail() if timed_out else ev.detail, text=ev.text,
+                                 answered=bool(ev.answered)))     # the adapter's word: the provider took the turn
             self._save_state()
         elif ev.kind == "approval_requested":
             s.denials, s.waiting = ev.denials, True
@@ -947,7 +957,7 @@ class SessionHost:
                 # restart). If the provider never got the turn, the resume is refused and that is said out loud.
                 s.resume, s.fresh_start = True, False
                 self._record_provider_id(s.session_id, s.provider_id)
-            for data in s.provider.turn(s.writing.text):
+            for data in s.provider.turn(s.writing.text, kind=s.writing.kind):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
         if s.writing is not None and self.turn_gate is not None and not self.turn_gate(s):

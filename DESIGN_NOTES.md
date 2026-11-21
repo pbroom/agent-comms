@@ -3550,3 +3550,225 @@ was first reproduced by a test that failed, then fixed.
   first message must not be kind `user`, and an INTERACTIVE session as parent has no hosted record: `parent`/`root`
   then need a non-hosted root (or a record made for it), and its access ceiling has to come from the grant, since
   no node reports one.
+
+## Session host: result delivery (2026-11-21)
+
+**Report.** Step 2, PR 3: when a child session finishes a turn, or ends, its result goes back to its parent as the
+parent's next turn, with text the hub writes. Nobody polls. Turns still start only from the human (`board session
+start --parent`, `board session send <child>`); nothing agent-callable is added. Off unless the hub says
+`[dispatch.sessions.spawn] enabled = true` (the same switch as children): with it off no result is recorded,
+delivered or claimed and wakes are not held for one, and a hub that never had it on writes nothing new (no
+`host.result.`/`host.outbox.` key, no `results` in `show`, no new field on a message). Almost all of it is on the
+hub: a result turn is an ordinary message to the node (kind `child`, text from the hub), handed over, written and
+reported like any other, under the node's own record that it never writes a message twice
+(`node-session-handed.json`); the node only passes the message's kind on to the provider seam (round 1, S6). Update
+the hub before its nodes.
+
+**Records** (`hosted_results.py`, `board_state`, no schema change). `host.outbox.<parent id>` holds the parent's
+counter; `host.result.<parent id>.<k>` one result: the child (id, name, agent, title), the child's message number,
+`outcome` (`completed` | `failed` | `timed_out` | `withdrawn` | `ended`), the node's `detail` and `denials`, the
+child's reply (`text`, capped as every reply), `state` (`pending` | `queued` | `delivered` | `claimed` |
+`undelivered`), `carrier` (the parent's message that carries it) and `why` (for `undelivered`). Keyed by the DIRECT
+parent (owner's decision 1): a result goes exactly one level up. A turn of a parent that is itself a child, the one
+that carried its own children's results included, is in turn a result for ITS parent, so nothing here assumes a
+parent is a root or a child has no children (children of children are planned, with a depth cap and tree-wide
+budgets). Limits that are per tree stay keyed by root (`max_children`); nothing here is per tree.
+
+**When a result is made**, inside the transaction that settles it: a child's message settles in `hosted._apply`
+(`turn_ended`) or `hosted._settle` (node lost), or the child ends in `hosted._end` (after the cascade). `_end`,
+`_apply` and `hosted_tree.end_orphans` take a `results` flag, passed where the board's settings are at hand. Outcome:
+ok is `completed`; not delivered (the node says the message never reached the process, or the hub never saw it
+delivered) is `withdrawn`; a detail starting "timed out after" (the host's own wording) is `timed_out`; else
+`failed`. When the HUB ends a child (`_end`), each message it fails is a result first (the turn in flight `failed`,
+one not yet delivered `withdrawn`), then the end; a node's late report on such a message finds it settled and
+changes nothing. Not made: anything failed or ended about a child its parent's ending is closing, which its record
+says (`stop: "parent"`, set by the cascade); a completed turn of such a child is kept `undelivered`. Each result
+records what started the child's turn (`started_by`: `human` for a `user` message), so that the next PR can give a
+parent only the results of work it started without a migration.
+
+**Delivery** (`due`, `deliver`, inside `hosted_wake.listing`). Only when the parent's node asks for its sessions,
+and in the very write transaction that shows the node the answer: after the wakes waiting there were checked again
+(one may step back behind the results), child sessions still on, the parent open, not being closed, on that node,
+with no turn in flight and nothing queued. So the turn is made on what is stored at the moment it is shown (review
+round 1, S1). The waiting results become ONE message of kind `child` (`hosted.KINDS` gains it), oldest first, at
+most `BATCH_MAX` (10) results and `MESSAGE_MAX_BYTES` (64 KB) of text; the rest wait for the next. Each result is
+then `queued` with its `carrier`; it is `delivered` only when the parent's provider says that turn started
+(`turn_started`, which Claude's `init` and Codex's `turn/started` give for every turn) or itself ends it, with a
+success or an error of its own (`answered` in the node's report, round 2), and its text is dropped then. Written to stdin is not read (round 1, S2). A failure in this code rolls back to its own
+savepoint and never fails the node's fetch. While the node is away nothing is made into a turn, so a message of the
+human's sent meanwhile goes first. The node's long-poll re-reads every 0.25 s, so a result made while the node waits
+there is a turn at once.
+
+**Order: the human, then results, then wakes.** The human: results wait while anything is queued. Wakes
+(`hosted_wake.py`, two rules): `_advance` queues no wake while results are `pending` for the session, and `_recheck`
+treats waiting results like a message of the human's behind a wake that was never shown to the node: the wake is
+settled `BEHIND_RESULTS`, uncounted, its posts back in `pending`. A wake already shown stays the node's, as before.
+The previous PR asked whether `_free`, `_next_queued`, `_unsettled` and `_fallback` must learn the new kind: they
+need not. A `child` message is only queued when nothing is queued, and no wake is queued while results wait, so a
+wake and a carrier never wait together and `_fallback`'s case (a wake first, a message of the human's behind) is
+unchanged.
+
+**Delivered once when confirmed; at most one marked repeat; never lost silently** (the guarantee since review
+round 1). A result is in one carrier at a time. A carrier whose start its provider confirmed delivers its results,
+and they are never sent again. A carrier that settles without that confirmation (written and the process went; the
+node restarted with it handed over, `LOST`; the node could not write it) puts its results back to `pending` ONCE,
+with `attempts` naming it: the next result turn carries them again, each line saying "This may repeat result <k>,
+sent earlier in message <n>", so a parent can recognise a duplicate by the stable result id. A second unconfirmed
+carrier (`MAX_ATTEMPTS` 2), or a parent that ends or is being closed, makes them `undelivered`. Those keep the
+child's reply: `show` of the parent lists the latest 20 results AND every undelivered one besides (`results`), and
+`board session show` prints them under "results from its children" with the reason and the reply. At most
+`MAX_WAITING` (50) results are pending per parent, counting those in a turn that may still give them back (round
+2, S9; one more is stored `undelivered`); delivered and claimed records
+go after a day; beyond `MAX_KEPT` (200) records the oldest settled ones go, delivered and claimed before undelivered,
+and each undelivered one that goes is counted on the outbox (`dropped`: count and time), which `show` reports as
+`results_dropped`. The records go with the parent's own when it is pruned.
+
+**The text** (`render`, all the server's). A fixed header (results from child sessions this session started,
+written by the server and not the human, untrusted data and no instruction, and how the markers work); per result
+one line, `Result i of n (result <k>): child session <name> (id <uuid>, agent <name>, titled "<title>"), for its
+message <n>: <phrase>.`, `<k>` being the result's stable id, and for a repeat the sentence above. The name is
+written only in the hub's own form (`<role>-<n>`, the role from a fixed list), the id and
+agent only when they pass their rules; the title and the node's detail are JSON strings (`ensure_ascii`: one line).
+Then the tools refused, by name, and the reply between `<<<child-output T>>>` and `<<<end child-output T>>>`, with a
+random 16-hex token `T` made for that turn and checked not to occur in any text of the batch. "Outcome and reason,
+server-written": the outcome phrase is the server's; the reason as the node reported it is shown quoted and labelled
+untrusted, because a provider's error text can reach it.
+
+**Claim** (`claim`, `claim_wait`; no route and no tool yet). Takes the oldest `pending` result of a parent
+(optionally of one child and one of its messages) and marks it `claimed`, in one write transaction; it is then never
+a turn, and a result already `queued` is never claimable. `claim_wait` polls `claim` (hosted._poll) for up to 45 s
+and cancels nothing when the time runs out. It checks no caller, like `create_child`: the next PR's spawn-with-wait
+tool must, after its grant check. A waiting caller is mid-turn by construction, so its results are still `pending`
+(nothing becomes a turn while a turn is in flight).
+
+**The seam for other parents** (owner's decision 2). `target(conn, child)` is the one place that says where a child's
+results go: today `{"kind": "hosted", "parent": id, "session": record}`. An interactive parent (the next PR) gets a
+kind of its own there; storage, the outcome rules and `claim` stay as they are, and only `deliver` (the hosted
+delivery) makes hosted turns. Board wakes still go to roots only.
+
+**Provenance reaches the provider seam, and stops there** (round 1, S6). The node passes a message's kind to the host
+(`SessionHost.send(..., kind=)`, checked against `providers.TURN_KINDS`), and the host to the adapter
+(`ProviderSession.turn(text, kind="user")`, additive). Neither provider's input has a role for it today: Claude's
+stream-json input takes a user message, Codex's `turn/start` takes user input items. Both adapters therefore write
+the text alone, and no pseudo-role is made up; what the model reads is text, and the server's header is what marks
+child output as not the human's. An adapter can use the kind once its provider offers a place for it.
+
+**Departures from the plan, and why.**
+- *The outbox is keyed by the direct parent, not `host.spawn.<root>`* (decision 1), and it is one record per result
+  plus a counter rather than one outbox record, so a claim and a delivery each touch only their own records.
+- *No `task` kind.* Every child turn in this PR starts from a message of the human's (`user`), and every settled
+  child turn is a result, whoever started it. The kind for an agent's message to its child belongs with the tool
+  that sends one (PR 4).
+- *Results become a turn at the node's fetch, not in `_apply`'s transaction.* Made in the report's transaction, a
+  carrier would be queued ahead of a message the human sends while the node is away; at the fetch, the order is
+  decided when the turn can really be handed over. Recording stays in the transaction that settles the child's turn.
+- *An unconfirmed carrier is sent once more, marked* (above, since review round 1); the plan did not say.
+- *Outcomes* are `completed | failed | timed_out | withdrawn | ended`. The plan's `cancelled` has no source yet (no
+  cancel tool), and its `needs_permission` is a `completed` or `failed` turn with `denials`, which the line lists.
+- *Every child end is a result*, a close of the child by the human included; the plan named only turns.
+
+**Changes to existing behaviour, with child sessions on.** A parent now takes turns it did not take before (one per
+batch of its children's results). Tests of #89 that count a parent's turns or need its process idle either let the
+parent take that turn (`answer`) or take the result first (`claimed`, which uses `claim`); one counts the child's own
+process starts instead of all. A child that a rolled-back node orphans (`end_orphans`, `_settle`) is a result for its
+parent too. Also in this PR, from #89's last review: a message held in a full child's inbox, because the parent's
+process went during the child's handshake, no longer counts as node activity once the child's process is idle
+(`SessionRunner._held_inbox`); the parent's next turn brings the short cadence back and the turn goes.
+
+**Tests** (`tests/test_hosted_results.py`, mutation-checked: each rule removed in a copy of the tree makes a test
+fail). The turn and its header; nothing an agent wrote in the server's lines; the human first; results before a
+wake, and a queued wake stepping back; coalescing and the count and size caps; every outcome; node-lost and closed
+children; the cascade sends nothing and what waited is kept; late and repeated reports; a carrier the node refused;
+a node restart mid-delivery; a hub restart with pending and queued results; claim and claim_wait; the direct parent;
+the bounded outbox; spawn switched off, and never on; no route or tool; `board session show`. The e2e's T9 and T9b,
+with the stand-ins and with real Claude Code and Codex children.
+
+### Result delivery: review round 1 (2026-11-21)
+
+Each item was reproduced first: the new tests were run against the reviewed head (279acff) and failed for the
+reason given (S1, S3, S4, S5, S6), and each fix was then removed on its own in a copy of the new tree and made a test
+fail (S2 and the repeat rule, whose tests fail on 279acff earlier, on the new line format).
+- *S1 (a turn committed before the listing).* The carrier was made in its own transaction before
+  `hosted_wake.listing`: a message the human sent in between was shown behind it, and a carrier made just before child
+  sessions were switched off was shown all the same. Now `listing` takes `due` and `deliver`, and the carrier is made
+  inside its write transaction, after the wake re-check, with everything checked again there (spawn, the parent's
+  queue and in-flight turn). Test: `test_the_turn_is_made_in_the_transaction_that_shows_it`.
+- *S2 (the reply erased on write).* The `delivered` event (bytes in stdin) made the results `delivered` and dropped
+  the reply; a process that went before reading left nothing to recover. Now only the provider's `turn_started`
+  (recorded on the carrier as `started_at`) or a turn it ended with a result confirms delivery; until then the reply
+  is kept. Tests: the header test (kept after the write, dropped after `turn_started`) and the repeat tests.
+- *Design change on top of S2: one marked repeat.* An unconfirmed carrier no longer ends its results as
+  `undelivered`; they go back to `pending` once and are sent again marked as a possible repeat, with the result id.
+  A second unconfirmed carrier, or a parent that ends meanwhile, makes them `undelivered`. Tests: a confirmed start
+  and the process dying in it (no repeat), an unknown arrival (one marked repeat), two failures (undelivered), a node
+  restart between the write and the confirmation, a parent that ends while a repeat waits.
+- *S3 (hidden undelivered results).* `show` listed the latest 20, so an undelivered batch could sit behind newer
+  results, and the 200-record limit could drop undelivered ones silently. Now every undelivered result is listed
+  besides the latest 20, retention drops delivered and claimed records first, and each undelivered one it drops is
+  counted (`results_dropped`, also printed by `board session show`). Test:
+  `test_show_lists_every_undelivered_result_and_says_when_retention_dropped_one`.
+- *S4 (the hub's end hid the cut turn).* `hosted._end` failed a child's turn in flight but recorded only `ended`.
+  Now `_end` hands `ended` the messages it failed, as they were, and each is a result first (`failed` for the one in
+  flight, `withdrawn` for one not yet delivered), then the end; a node's late report finds the message settled. Test:
+  `test_a_child_the_hub_closes_mid_turn_tells_its_parent_of_that_turn_first`; the rolled-back-node test of #89 now
+  also sees the lost turn.
+- *S5 (suppression by wording).* The cascade was recognised by reason text: a node back with sessions off ended
+  cascaded children with another reason and the parent was told, and a child's own failure worded like the cascade's
+  was dropped. Now the record decides: `stop: "parent"`, which `hosted_tree.cascade` sets. Test:
+  `test_the_cascade_is_known_from_the_record_not_from_a_reasons_wording`.
+- *S6 (kind dropped at the node).* As above ("Provenance reaches the provider seam"). Test:
+  `test_the_turns_kind_reaches_the_provider_with_its_text`; a kind the host does not know is refused.
+- *S7 (a source scan for callers).* Removed. The check is behavioural: agent and node tokens get 403 on the human's
+  routes, the gateway passes none of them, no MCP tool is about results, and the node is shown a result only as the
+  parent's own `child` message.
+- *For the next PR (no change here):* every child turn is a result today, the ones the human sends the child
+  included. A result records `started_by`, so that "a parent gets results only for work it started" can be applied
+  later without a migration.
+
+### Result delivery: review round 2 (2026-11-21)
+
+All three reproduced first with tests that failed on the reviewed head (f5c2bbc), then each fix was removed on its
+own in a copy of the new tree and made a test fail.
+- *S2, still open: confirmation was read off `ok`.* A provider can end a turn with a terminal error of its own and
+  no start report (Claude writes a `result` with `is_error` and no `init` before it); the hub took `ok: false` as
+  "not confirmed" and queued a repeat of results the provider had. Now the seam says it: `HostEvent.answered` is
+  True for a `turn_ended` the provider itself produced, success or error, and False for one the host made (the
+  process went, a timeout with no answer, a write that failed, the turn withdrawn). The node reports it
+  (`answered` in each `turn_ended`, `HostedEventIn` takes it as a strict boolean), and the hub confirms a result turn
+  by `turn_started` or `answered`, never by `ok`. A node from before the field sends none, which counts as not
+  known: at worst one marked repeat, and both providers report the start of every turn anyway. Tests:
+  `test_a_turn_the_provider_ended_with_an_error_of_its_own_is_confirmed_without_a_start_report`,
+  `test_the_host_says_whether_the_provider_answered_a_turn`.
+- *S8: a late confirmation was ignored.* After `_settle` gave a result turn up for lost (its node silent), a
+  `turn_started` (or an `answered` end) for it that reached the hub was dropped with every event for a settled
+  message, and the hub sent a repeat it had confirmation for. Now `_apply` hands such a word for a settled `child`
+  message to `hosted_results.confirmed_late`: results that turn carried and that wait to go again (or were kept
+  undelivered after it) are `delivered`, and that turn leaves their `attempts`; the message itself stays settled. A
+  result already put into a later turn stays there, a marked repeat. Test:
+  `test_a_late_start_report_for_a_turn_settled_as_lost_confirms_its_results`.
+- *S9: a failed turn could take the backlog past the cap.* `MAX_WAITING` counted pending results only, so a failed
+  turn of 10 could bring 50 back to 60. Now a result in a turn whose start is not confirmed, and from which it would
+  come back (`attempts` below `MAX_ATTEMPTS`), holds its place (`_holds_a_place`). Test:
+  `test_results_that_can_come_back_count_against_the_cap`.
+
+### Result delivery: review round 3 (2026-11-21)
+
+- *S10: a refused start counted as an answer.* Round 2 had the host set `answered` for every `turn_ended` that came
+  from an adapter. But the Codex adapter also makes a `turn_ended` from the JSON-RPC error answer to `turn/start`:
+  Codex refused to start the turn, and the hub took that as confirmation, marked the result delivered and dropped
+  the reply. Reproduced first: the Codex stand-in (new `reject` text) and the hub test failed on ea266ae. Now the
+  adapter says it: `providers.Event.answered`, False unless the adapter sets it, and the host passes on exactly
+  that (`HostEvent.answered = ev.answered`). The seam's docstring lists every end of a turn and what it means, after
+  an audit of both adapters:
+  - Claude: its one `turn_ended` is the `result` line of the turn, success or error: `answered`.
+  - Codex: `turn/completed` for the turn in flight is `answered` when the turn was accepted, its id named by the
+    answer to `turn/start` or by `turn/started`, whatever the status (completed, failed, interrupted after the
+    host's timeout); one that nothing named is not. The error answer to `turn/start` is not.
+  - Ends the host makes are never answered: a handshake that fails (`start_failed`, or a process that exits before
+    it is ready), a process that exits before any event of the turn, a timeout the host ends by stopping the
+    process, a failed write, a turn withdrawn while it was being written.
+  Tests: each path through real pipes with the stand-ins (new texts `reject` for Codex and `crash` for both:
+  `test_real_pipes_each_way_a_claude_turn_ends_says_whether_the_provider_took_it` and the Codex one, the
+  handshake failure included); both adapters from strings; and the hub outcome,
+  `test_a_codex_parent_that_refuses_to_start_the_result_turn_gets_it_once_more_marked` (the result goes back once,
+  its reply kept, and the next result turn says it may repeat it).

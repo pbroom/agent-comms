@@ -74,6 +74,7 @@ class HostedEventIn(Body):
     meta: dict[str, Any] = {}
     detail: str = ""
     text: str = ""
+    answered: StrictBool = False    # turn_ended: the provider itself ended the turn (session_host.HostEvent.answered)
 
 
 class NodeSessionReportIn(Body):

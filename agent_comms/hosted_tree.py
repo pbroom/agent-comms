@@ -156,12 +156,13 @@ def orphaned(conn, r: Any) -> bool:
     return is_child(r) and r.get("state") != "ended" and not node_supports(conn, r["node"])
 
 
-def end_orphans(c, node: str, by: str, now: float) -> None:
+def end_orphans(c, node: str, by: str, now: float, results: bool = False) -> None:
     """Inside the transaction of a hello from `node` that does not declare the child protocol: its children that
-    have not ended are ended here, each unsettled message failed with the reason."""
+    have not ended are ended here, each unsettled message failed with the reason. `results`: each end is a result
+    for the child's parent (hosted_results.py)."""
     for r in hosted._sessions(c):
         if r.get("node") == node and orphaned(c, r):
-            hosted._end(c, r, ORPHANED, by, now)
+            hosted._end(c, r, ORPHANED, by, now, results=results)
             _put(c, hosted.SESSION_PREFIX + r["session_id"], r, by, now)
 
 

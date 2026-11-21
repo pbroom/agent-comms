@@ -209,8 +209,9 @@ class ClaudeSession:
                            "answer": kind if kind in ("success", "error") else None,
                            "bypass_disabled": _bypass_off(answer)}).encode()
 
-    def turn(self, text: str) -> list[bytes]:
-        # json.dumps escapes every line break inside the text: one turn is exactly one line.
+    def turn(self, text: str, kind: str = "user") -> list[bytes]:
+        # json.dumps escapes every line break inside the text: one turn is exactly one line. `kind` has no place in
+        # Claude's stream-json input (a user message is the one kind of turn it takes): the text is all it gets.
         return [json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"]
 
     def interrupt(self) -> list[bytes] | None:
@@ -251,8 +252,9 @@ class ClaudeSession:
                                    tools=named)], []
         if kind == "result":
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
+            # Claude's own end of the turn, a success or an error: it took the turn (Event.answered).
             return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),
-                          text=cap_reply(ev.get("result")))], []
+                          text=cap_reply(ev.get("result")), answered=True)], []
         if kind == "control_response":
             answer = ev.get("response")
             if self._asked is None or not isinstance(answer, dict) or answer.get("request_id") != self._asked:

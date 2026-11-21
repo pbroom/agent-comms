@@ -893,12 +893,39 @@ def _fmt_hosted_detail(s: dict) -> str:
                      + (f" (tools denied: {', '.join(last['denials'])})" if last.get("denials") else ""))
     for m in s.get("messages", []):
         lines.append(f"  message {m['n']} [{m['state']}]" + (" (wake: a board post addressed to the agent)"
-                                                              if m.get("kind") == "wake" else "")
+                                                              if m.get("kind") == "wake" else
+                                                              " (results of its child sessions)"
+                                                              if m.get("kind") == "child" else "")
                      + (f" {m['detail']}" if m.get("detail") else ""))
+    if s.get("results") or s.get("results_dropped"):
+        lines.append("  results from its children:")
+        lines += ["    " + line for x in s.get("results", []) for line in _fmt_result(x)]
+    if s.get("results_dropped"):
+        from .core import iso
+        lines.append(f"    ({s['results_dropped']['count']} undelivered result(s) were dropped by the retention "
+                     f"limit, the last at {iso(s['results_dropped']['last_at'])})")
     lines.append(f"  transcript: {s['transcript']}")
     if s.get("reply") is not None:
         lines += [f"reply to message {s['reply_for']}:", s["reply"]]
     return "\n".join(lines)
+
+
+def _fmt_result(x: dict) -> list[str]:
+    """One result a child session sent its parent (hosted_results.py): where it stands, whose it is, its outcome.
+    One that will never be a turn comes with the child's reply, which is kept for you."""
+    where = {"queued": f"in message {x.get('carrier')}, its start not confirmed yet",
+             "delivered": f"delivered in message {x.get('carrier')}",
+             "claimed": "claimed by a caller that waited for it"}.get(x["state"], x["state"])
+    head = (f"result {x['n']} [{where}] {x.get('name') or 'child'} {x['child']}"
+            + (f" message {x['message']}" if x.get("message") is not None else "") + f": {x['outcome']}"
+            + (f" ({x['detail']})" if x.get("detail") else "")
+            + (f"; sent before in message(s) {', '.join(str(a) for a in x['attempts'])}, not confirmed"
+               if x.get("attempts") else ""))
+    out = [head]
+    if x["state"] == "undelivered":
+        out.append(f"  not delivered: {x.get('why') or 'no reason given'}")
+        out += ["  | " + line for line in (x.get("text") or "(no output)").splitlines()]
+    return out
 
 
 def _session_cmd(a, out, settings: Settings, token: str) -> None:

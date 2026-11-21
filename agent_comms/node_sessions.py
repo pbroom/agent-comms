@@ -219,7 +219,8 @@ class SessionRunner:
             d["message"] = int(e.message_id)
         if e.kind == "turn_ended":
             d |= {"ok": bool(e.ok), "delivered": bool(e.delivered), "detail": e.detail[:300],
-                  "denials": list(e.denials), "meta": dict(e.meta), "text": e.text}
+                  "denials": list(e.denials), "meta": dict(e.meta), "text": e.text,
+                  "answered": bool(e.answered)}     # the provider itself ended it (HostEvent.answered)
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
@@ -323,8 +324,15 @@ class SessionRunner:
         is work enough to bring the short cadence back for it."""
         return bool(self.pending or any(q and not self._waits_on_parent(sid) for sid, q in self.queue.items())
                     or any(self.reported.get(sid) != st for sid, st in self.status.items())
-                    or any(s.busy or s.inbox or s.ended or (s.child is not None and s.stopping_since is not None)
-                           for s in self.host.sessions.values()))
+                    or any(s.busy or (s.inbox and not self._held_inbox(sid, s)) or s.ended
+                           or (s.child is not None and s.stopping_since is not None)
+                           for sid, s in self.host.sessions.items()))
+
+    def _held_inbox(self, sid: str, s) -> bool:
+        """A message already handed to a child waits in its inbox only for the parent (its parent's process went
+        while the child's was in its handshake): the child's process is up and past its handshake, so it has
+        nothing to say meanwhile, and the parent's next turn is the work that brings the short cadence back."""
+        return self._waits_on_parent(sid) and s.child is not None and s.state == "idle"
 
     def pass_once(self, wait: float | None = None) -> bool:
         """One pass: report, fetch the hub's list (waiting there when nothing has work), reconcile, hand over the next
@@ -664,7 +672,10 @@ class SessionRunner:
             self.handed[sid] = m["n"]
             self._save_handed()         # on disk first: after a crash this message is lost, never written twice
             try:
-                self.host.send(sid, m["text"], message_id=str(m["n"]))
+                # Its kind goes with it to the provider (`turn`): whose turn it is, which the text alone does not say.
+                # A kind this node does not know (a newer hub) is refused, never passed off as the human's.
+                kind = m.get("kind") if m.get("kind") is not None else "user"
+                self.host.send(sid, m["text"], message_id=str(m["n"]), kind=kind)
             except ValueError as e:
                 self._add(sid, {"kind": "turn_ended", "message": m["n"], "ok": False, "delivered": False,
                                 "detail": f"the node refused the message: {e}"[:300]})
