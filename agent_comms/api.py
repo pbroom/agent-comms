@@ -114,6 +114,15 @@ class HostedMessageIn(Body):
     message: str
 
 
+class WaitIn(Body):
+    """An open call of a session the human opened himself (interactive_wake.py): `board wait`, run by its hook."""
+    client_session_id: str
+    projects: list[str]
+    nonce: str
+    client: str = "claude-code"
+    wait: float = 0
+
+
 class RequestRouteIn(Body):
     session_id: int | None = None
     recipient: str
@@ -863,6 +872,13 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
                              body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
                              access=body.access, worktree=body.worktree, ceiling=body.ceiling,
                              checkout=body.checkout)
+
+    # A session the human opened himself waits here to be woken (interactive_wake.py): any agent, for its own
+    # conversation. Off unless [dispatch.sessions.interactive] wake = true; then it answers {"state": "off"}.
+    @app.post("/api/wait")
+    async def wake_wait(request: Request, body: WaitIn, p: Principal = P):
+        from . import interactive_wake
+        return await interactive_wake.wait(board, p, body.model_dump(), waiter_gone(request))
 
     # Hosted sessions, the human's side: only the human starts, messages, reads or closes one (hosted.py checks on
     # every call; a node identity never gets past `principal`). The reply text is returned here and nowhere else.

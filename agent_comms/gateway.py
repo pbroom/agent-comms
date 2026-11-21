@@ -64,6 +64,7 @@ API_ROUTES = [(m, re.compile(p)) for m, p in (
     ("GET", r"/api/tasks"), ("POST", r"/api/tasks"), ("GET", rf"/api/tasks/{_ID}"),
     ("POST", rf"/api/tasks/{_ID}/(claim|renew|release|transition)"),
     ("GET", r"/api/grants"), ("GET", r"/api/brief"),
+    ("POST", r"/api/wait"),      # `board wait`: a session the human opened waits to be woken (interactive_wake.py)
     ("POST", r"/api/nodes/hello"), ("GET", r"/api/nodes/assignments"), ("POST", r"/api/nodes/runs/[A-Za-z0-9_-][A-Za-z0-9_.:-]*"),
     # Hosted sessions, the node's side only (hosted.py). /api/hosted-sessions is the human's and never passes.
     ("GET", r"/api/nodes/sessions"), ("POST", rf"/api/nodes/sessions/{_UUID}"),

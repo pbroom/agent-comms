@@ -3794,3 +3794,104 @@ Both reproduced first with tests that failed on 07bf749.
   names the likely cause (a hub older than the node). A hub of this version and a node that sends no `answered`:
   not known, as before. Tests: `test_a_node_sends_answered_only_to_a_hub_that_lists_it`,
   `test_a_report_without_answered_counts_as_not_known`, `test_a_report_a_hub_refuses_as_malformed_is_said_loudly`.
+
+## Waking an interactive session (2026-11-21)
+
+**Report.** A session the human opened himself (terminal, Claude desktop app) saw new posts only when he told it to
+look; the channel push (above) needs a development flag at launch and does not work in the desktop app. This change
+wakes such a session the way a hosted session is woken (Session host (PR 3)), off by default
+(`[dispatch.sessions.interactive] wake`). The hub cannot reach a process it did not start, so the session keeps a
+call open to it instead: a Claude Code command hook with `"asyncRewake": true` on `Stop` and `SessionStart` runs
+`integrations/claude-code/wait.sh` (`board wait`, `agent_comms/waiter.py`), which long-polls `POST /api/wait`
+(`agent_comms/interactive_wake.py`). Exit 2 wakes the idle session and shows it the hook's stderr; anything else
+wakes nothing. Ruled out before this change, and not used: the per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`,
+undocumented; a plain line was not delivered), plain `async` hooks (they do not wake an idle session), and a blocking
+`Stop` hook (it keeps the turn busy).
+
+**What Claude Code does with such a hook** (Claude Code 2.1.322, `claude -p --input-format stream-json`, a temp
+settings file, haiku; the spike scripts are not in the repo):
+- *`SessionStart` works too.* A `SessionStart` hook with `asyncRewake` runs in the background (a user turn sent at
+  once was answered at 1.9 s while the hook slept 20 s) and its exit 2 at 20 s woke the idle session. With no input
+  at all, its exit 2 at 6 s started the session's first turn. So a session that has not taken a turn is covered.
+- *The timeout is enforced, and a long one is honoured.* A hook with `timeout: 5` that slept 30 s got SIGTERM at
+  5 s, and so did its child process (the hook runs in its own process group and the signal reaches the group);
+  nothing was woken. A hook with `timeout: 3600` that slept 660 s woke the session at 668 s, past the 600 s
+  default. `timeout: 86400` and `timeout: 3000000` were accepted (each hook ran and woke the session after 5 s);
+  their expiry was not waited for. Nothing re-arms after an expiry until the next `Stop` or `SessionStart`.
+- *The session's end ends the hook.* SIGTERM to Claude: the hook and its child got SIGTERM and Claude exited. EOF on
+  Claude's stdin with the hook still running: Claude did not exit (it waited for the hook); the SIGTERM 24 s later
+  ended both. The docs say `-p` mode cancels background hooks at teardown. A crash of Claude (no chance to signal)
+  was not tried; `board wait` covers it by watching `CLAUDE_PID`, which Claude sets in every hook's environment.
+- *A wake during a turn.* An exit 2 that came while a second, user-sent turn was running was taken as its own turn
+  right after it. A `Stop` hook keeps running when the next turn starts; every turn's end starts another.
+- The hook's stdin carried `session_id`, `cwd`, `hook_event_name` (and `source` on `SessionStart`).
+
+So the shipped hook has `timeout: 86400`, `board wait --max-seconds` defaults to 60 s less (it ends itself rather
+than being ended), it exits 0 on SIGTERM, SIGHUP and SIGINT, and a watcher thread exits as soon as the `CLAUDE_PID`
+process is gone (the parent process when that is unset).
+
+**The hub's side reuses the hosted wake.** A waiter's record (`wake.waiter.<agent>.<conversation uuid>` in
+`board_state`) is hosted_wake's record plus the waiter's fields, and the decision runs hosted_wake's own helpers:
+`_look` (new posts by id above the marks, sealed ones counted on unseal, managed continuations and reserved posts
+left out), `_lift` (a new post of the human's lifts a thread's stop), `_qualifying` (re-checked at queue and at
+hand-over: still eligible, not acknowledged by any session of the agent, not reserved), `_thread`, `_uncount` and
+`wake_text`. The pieces that differ are small and in the new module:
+- *Presence.* A waiter is connected while its call is open: each look writes `seen` (at most every 5 s when nothing
+  changed) and a waiter seen within 20 s counts. The record outlives the `board wait` process, so the limits and the
+  read marks carry over from one turn's hook to the next; it is dropped 2 days after it was last seen.
+- *Supersede.* Each `board wait` process sends a new random nonce. A call with a new nonce for the same conversation
+  takes the record over (`armed_at` = now); the old nonce is remembered and its calls are answered "superseded".
+- *Whom.* Of the connected waiters of an agent in a project, only the one armed last is woken: the session whose
+  turn ended most recently (a turn's end re-arms it). A post another waiter of the agent was woken for is dropped
+  from the others. While the agent has a hosted root session in the project, no waiter there is woken and their
+  pending posts are dropped: those are the hosted session's.
+- *Limits.* The interval and the hourly maximum hold the posts until they pass. The per-thread maximum stops the
+  thread until the human posts there. No Needs-you item is posted: its text and options (`board session close`) are
+  the hosted session's, and the human is at this session anyway. The hourly maximum therefore sets no stop: posts
+  go when the hour has room.
+- *The project.* The client sends what `board brief` would use (the hook cwd's checkout, its main repository and
+  their logical forms); the hub takes the first that some thread is in.
+- *Queued, then handed.* A pass (the open call's own look, or each dispatcher pass right after `hosted_wake.tick`)
+  records the decided wake in `queued` and marks its posts `woken`, so `hosted.holds` sees it before the dispatcher
+  decides; the open call hands it over after `_qualifying` again (none left: dropped and uncounted). A wake the
+  dispatcher queued for a waiter that has gone meanwhile is handed to that conversation's next `board wait`.
+
+**The dispatcher's side** goes through the hooks it already has, so delivery.py and dispatch.py ask nothing new:
+`hosted_wake.holds` ends by asking `interactive_wake.holds` (the same rule on a waiter's record: within the grace,
+or a read mark or delivery receipt after the wake by a board session that is the agent's in the project, not a
+dispatched run's, and not one recorded for another conversation); `hosted_wake.reserve` also calls
+`interactive_wake.claim`; `Board.read_updates` calls `interactive_wake.handed` beside `hosted_wake.handed`. Without
+waiter records each is one key-range read and no write.
+
+**Off is off.** The route answers `{"state": "off"}` before it reads or writes any board state; the dispatcher's pass reads one key
+range and writes nothing when there is no record (and drops records left from when it was on); `holds`, `claim` and
+`handed` find no record. With it on and no `board wait` running, the same.
+
+**Content.** The wake text is hosted_wake's (counts, thread ids, agent names re-checked against the name rule, and
+the fixed note). `board wait` writes it only when it matches `agent-comms: ` plus one line of printable ASCII, and
+`wait.sh` passes on an exit 2 only with such a line: an exit 2 from `uv`, from argparse or from a broken install
+would otherwise wake the session with that text, and each such turn's end would start the hook that wakes it
+again.
+
+**Provider-neutral.** The hub knows a waiter as (agent, client, conversation id) and an open call; nothing there is
+Claude's. A Codex equivalent can run on the node and use `codex queue --thread <id> --message <text>` where Claude
+uses the hook's exit code, against the same route (`client: "codex"` is accepted already).
+
+**Checked.** `tests/test_interactive_wake.py` (real hub routes, a fake clock, a fake hub for `board wait`, the hook
+script with a stand-in `board.sh`, the installer against a temporary HOME and CLAUDE_CONFIG_DIR).
+`scripts/interactive-wake-e2e.py`: stand-in steps through the real wait.sh and a real hub, and with `--claude-bin` a
+real haiku session in stream-json mode with exactly the installed hooks and the temp board as its only MCP server:
+woken from `SessionStart` before any turn, again from `Stop` after the wake turn, each time calling
+`board_read_updates`, and nothing left polling after SIGTERM.
+
+**Not covered, or not verified.**
+- The Claude desktop app and the terminal interface were not driven; the desktop app runs Claude Code in stream-json
+  mode, which was. The coordinator checks the desktop app at deploy time.
+- Cloud sessions are out of scope. Codex sessions the human opened are a separate change.
+- A session armed more than a day ago without a turn since, or started before `--wake`, is not woken.
+- A hub answer lost on the way (the wake was recorded, the process never saw it) is a lost wake; the dispatcher's
+  grace runs out as for an unread one.
+- Two sessions of the agent in one project that both read are one reader to `holds` (as for hosted sessions);
+  a board session whose conversation id is recorded and differs is not counted, but sessions through a remote hub
+  record none.
+- No dashboard view of waiters.

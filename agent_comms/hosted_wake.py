@@ -689,7 +689,8 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         from . import delivery
         if delivery.read_since(conn, post_id, agent, at, lambda sid: _own_reader(conn, sid, agent, r["project"])):
             return True
-    return False
+    from . import interactive_wake      # a session the human opened himself, woken the same way (its own records)
+    return interactive_wake.holds(conn, agent, project, post_id, now)
 
 
 def _own_reader(conn, session_id: Any, agent: str, project: str) -> bool:
@@ -781,6 +782,8 @@ def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:
                 rec[table].pop(str(post_id), None)
             rec["claimed"][str(post_id)] = now
             _save(conn, r["session_id"], rec, now)
+    from . import interactive_wake
+    interactive_wake.claim(conn, agent, project, post_id, now)
     return True
 
 
