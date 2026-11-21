@@ -589,7 +589,8 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     such a config outside your checkouts. Of the runner's other options only
     those known to load nothing are kept (the model, the prompts, output options, `--restricted`, `--bare`,
     `--safe-mode`); a runner with any option outside that list cannot be started at `read-only` at all, and
-    `start --parent ... --access read-only` says so. Codex with the `read-only` sandbox.
+    `start --parent ... --access read-only` says so. Codex with the `read-only` sandbox (a sandboxed shell that
+    can read but not write; a child whose thread turns out to have a wider sandbox is ended).
   - `workspace`: the runner as the node configured it (what a hosted session always got, `claude_tool_projects`
     scoping included), with the permission mode pinned if it names none.
   - `full`: Claude with `--permission-mode bypassPermissions` (the runner's deny rules still hold); Codex with the
@@ -645,16 +646,20 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
 - **What these guarantees assume.** That the files the node trusts are not changed by a session: its own code and
   settings, a runner's settings file and MCP config, your Claude and Codex configuration and plugins. The node
   does not sandbox Claude at the OS level. A session with a shell or with full access runs as the node's OS user
-  and can change anything that user can write, those files included. `read-only` is the only word that takes
-  the shell and the write tools away, and what it promises holds against anything the hub sends and against the
-  session's own command line; against OTHER sessions it holds only as far as they cannot rewrite those files.
+  and can change anything that user can write, those files included. For Claude, `read-only` is the only word
+  that takes the shell and the write tools away. A Codex `read-only` child is different: it keeps a shell, run
+  inside Codex's read-only sandbox, which can read the disk (it cannot write), and there is no extra deny on the
+  token directory or `~/.ssh` for it, as for any Codex session here. What `read-only` promises holds against
+  anything the hub sends and against the session's own command line; against OTHER sessions it holds only as
+  far as they cannot rewrite those files.
   Managed Claude settings are protected only where the OS protects them. Hooks from your managed settings and
   from plugins you installed at user level run in every session, a read-only one included.
 - **Versions.** Children need a node that says it hosts them (this version's does, in its hello and on every
   fetch). Its hello also says, for each runner, the access words a child of it can really be started at there (a
   Codex runner only with `codex = true`; `full` only with `allow_full_access`; nothing for a runner its session
   host refuses): `start --parent` is refused for anything else, and a node rolled back to an earlier version is
-  listed no child. A Codex runner whose `--cd` names a directory of its own can be a session in that directory
+  listed no child, and the children it had are ended by the hub (a turn in flight there is lost). A Codex runner
+  whose `--cd` names a directory of its own can be a session in that directory
   only: a child of it must share the parent's checkout, and that checkout must be the directory; otherwise
   `start --parent` is refused. Update the hub before its nodes: an older hub refuses the newer node's hello and
   reports.

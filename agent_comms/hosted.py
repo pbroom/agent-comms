@@ -352,6 +352,9 @@ def _lost(conn, r: dict, now: float) -> bool:
     host and its reports on this session."""
     if r.get("state") == "ended" or not (r.get("stop") or r.get("in_flight") is not None):
         return False
+    from . import hosted_tree
+    if hosted_tree.orphaned(conn, r):
+        return True     # a child on a node that hosts no children: that node's hellos say nothing about it
     seen = _node_seen(conn, r["node"])
     return not seen or now - max(seen, float(r.get("node_reported_at") or 0)) > nodes.NODE_LOST_SECONDS
 
@@ -361,12 +364,19 @@ def _settle(board: Board, r: dict) -> dict:
     has a turn in flight, and one being closed is closed. The node stops its own turns well before that
     (node_sessions.py), so the failed turn is not still running somewhere."""
     now = board.now()
-    if not _lost(board.conn, r, now):
+    from . import hosted_tree
+    if not hosted_tree.orphaned(board.conn, r) and not _lost(board.conn, r, now):
         return r
     with db.write_tx(board.conn) as c:
         # Decided again inside the transaction, on what is stored now: a node that reconnected and reported a
         # freshly delivered turn between the check above and here must not have that turn failed under it.
         r = _session(c, r["session_id"])
+        if hosted_tree.orphaned(c, r):
+            # A child whose node hosts no child sessions (any more): nobody there will run it, report on it or end
+            # it. Ended here, its turn in flight failed as lost. (The node's next hello does the same.)
+            _end(c, r, hosted_tree.ORPHANED, "hub", now)
+            _put(c, SESSION_PREFIX + r["session_id"], r, "hub", now)
+            return r
         if not _lost(c, r, now):
             return r
         if r.get("stop"):

@@ -496,6 +496,30 @@ class SessionHost:
         os.replace(tmp, path)
         return str(path)
 
+    def keep_private_files(self, session_ids) -> None:
+        """Remove the files this host made for sessions that are neither named here (the hub no longer lists them)
+        nor open: `<session id>.<kind>.json` for the PRIVATE_FILES kinds, and nothing else in the directory. A
+        session's files go with it when it is forgotten (`forget`), but one that was closed while this machine's
+        node was down is never opened again, and a merged settings file can hold the runner's credentials. Looked
+        at when the set of sessions changes (so also once when the node starts)."""
+        wanted = frozenset(session_ids) | frozenset(self.sessions)
+        if wanted == getattr(self, "_private_kept_for", None):
+            return
+        self._private_kept_for = wanted
+        try:
+            names = os.listdir(self.sessions_dir)
+        except OSError:
+            return
+        for name in names:
+            sid, _, rest = name.partition(".")
+            if (rest in {f"{kind}.json" for kind in self.PRIVATE_FILES} and providers.SESSION_ID_RE.fullmatch(sid)
+                    and sid not in wanted):
+                try:
+                    (self.sessions_dir / name).unlink()
+                    log.info("removed %s: its session is gone", name)
+                except OSError as e:
+                    log.warning("could not remove %s (%s)", name, e)
+
     def _drop_files(self, session_id: str) -> None:
         for kind in self.PRIVATE_FILES:
             try:
@@ -641,7 +665,7 @@ class SessionHost:
             if getattr(s.provider, "reports_sandbox", False):
                 # Codex: the answer to thread/start (or resume) names the thread's sandbox. It ends a session
                 # whose sandbox is not what it was started as, and is what confirms a full one for its children.
-                problem, confirmed = session_access.verify_codex(s.access, ev.mode)
+                problem, confirmed = session_access.verify_codex(s.access, ev.mode, s.asked)
                 if problem is not None:
                     log.warning("session %s: %s", s.session_id, problem)
                     self._end(s, problem, now, out)

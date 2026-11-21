@@ -117,6 +117,8 @@ CODEX_NOT_FULL = ("it was started as a full-access session, but Codex reports th
                   "the session was ended rather than run narrower than asked")
 CODEX_FULL = ("Codex reports the sandbox dangerFullAccess for its thread although it was not started as a full-access "
               "session: the session was ended")
+CODEX_WIDER = ("Codex reports the sandbox {sandbox} for its thread, which is wider than the {launched} access it was "
+               "started at: the session was ended")
 
 BOARD_SERVER = "agent-comms"                    # the board's MCP server, as every runner and config here names it
 # Everything a read-only Claude session has: these built-in tools (a hard list, `--tools`) and the board's.
@@ -408,19 +410,28 @@ def claude_launch(template: list[str], cwd: str | None = None,
 CODEX_SANDBOX_WORDS = {"readOnly": "read-only", "workspaceWrite": "workspace", "dangerFullAccess": "full"}
 
 
-def verify_codex(launched: str | None, sandbox: Any) -> tuple[str | None, bool]:
+def verify_codex(launched: str | None, sandbox: Any, asked: str | None = None) -> tuple[str | None, bool]:
     """What Codex said the thread's sandbox is, in its answer to `thread/start` or `thread/resume` (its `type`:
     readOnly, workspaceWrite, dangerFullAccess), held against the session: (why it must be ended or None, whether
     full access is confirmed). Only an answer that NAMES `dangerFullAccess` confirms. A full launch whose answer
     names no sandbox at all runs on (the node itself sent the parameter, and nothing says it was not taken), but
-    it is not confirmed: no child may be `full` under it. One whose answer names another sandbox is ended."""
+    it is not confirmed: no child may be `full` under it. One whose answer names another sandbox is ended. `asked`:
+    the access word the session was opened with (None: a session of its own)."""
     if launched == "full":
         if sandbox is None:
             return None, False
         if sandbox == "dangerFullAccess":
             return None, True
         return CODEX_NOT_FULL.format(sandbox=str(sandbox)[:40]), False
-    return (CODEX_FULL if sandbox == "dangerFullAccess" else None), False
+    if sandbox == "dangerFullAccess":
+        return CODEX_FULL, False
+    # A session ASKED for at a word (a child) is held to it like a Claude one: a sandbox wider than what it was
+    # started at ends it (read-only < workspace < full). One with no word of its own (a root) runs as its runner
+    # says, and is held to "full or not" only, as it always was.
+    said = CODEX_SANDBOX_WORDS.get(sandbox) if isinstance(sandbox, str) else None
+    if asked is not None and said is not None and launched in RANK and RANK[said] > RANK[launched]:
+        return CODEX_WIDER.format(sandbox=sandbox, launched=launched), False
+    return None, False
 
 
 def verify(asked: str | None, launched: str | None, mode: Any, tools: Any = ()) -> str | None:

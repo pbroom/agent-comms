@@ -41,6 +41,9 @@ REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 OFF = ("child sessions are off: the hub's settings need [dispatch.sessions.spawn] enabled = true before a session "
        "can be started under another")
 PARENT_ENDED = "its parent session ended"
+ORPHANED = ("its node no longer hosts child sessions (its latest hello is from a version of agent-comms before them, "
+            "or one it was rolled back to), so it can neither run nor end this one: the hub ended it. A turn that "
+            "was in flight there was lost and is not replayed")
 # What a child's record holds beyond a root's, as the human sees it.
 CHILD_FIELDS = ("name", "child_no", "title", "role", "isolation", "effort", "request_id", "granted", "worktree",
                 "worktree_removed_at")
@@ -143,6 +146,23 @@ def node_supports(conn, node: str) -> bool:
     info = _get(conn, nodes.NODE_PREFIX + node)
     hosting = info.get("session_host") if isinstance(info, dict) else None
     return isinstance(hosting, dict) and type(hosting.get("tree")) is int and hosting["tree"] >= 1
+
+
+def orphaned(conn, r: Any) -> bool:
+    """A child that has not ended, on a node whose latest hello does not say it hosts child sessions. Such a node
+    is listed no child (hosted._listed), so it will never report on this one or end it; its hellos say only that an
+    ordinary session host is there. The hub settles the child itself (`end_orphans`, hosted._settle), and until it
+    has, the child counts as lost (hosted._lost): nothing of it keeps a project busy."""
+    return is_child(r) and r.get("state") != "ended" and not node_supports(conn, r["node"])
+
+
+def end_orphans(c, node: str, by: str, now: float) -> None:
+    """Inside the transaction of a hello from `node` that does not declare the child protocol: its children that
+    have not ended are ended here, each unsettled message failed with the reason."""
+    for r in hosted._sessions(c):
+        if r.get("node") == node and orphaned(c, r):
+            hosted._end(c, r, ORPHANED, by, now)
+            _put(c, hosted.SESSION_PREFIX + r["session_id"], r, by, now)
 
 
 def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[str, dict] | None) -> None:

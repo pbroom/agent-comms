@@ -3013,7 +3013,7 @@ through `session_access.prepare`; `Session.access`/`.effort`. `node_sessions.py`
 view, roots-only uniqueness, a root's tree fields, `show`'s children, the cascade in `close` and `_end`, the
 listing's extra keys, `report`'s `access`/`worktree` and the `worktree_removed` event.
 
-**Proof.** `tests/test_hosted_tree.py` (115 tests after review round 5, fakes; real git where a worktree is made): the gate and that a
+**Proof.** `tests/test_hosted_tree.py` (121 tests after the PR review, fakes; real git where a worktree is made): the gate and that a
 session is byte for byte what it was with it off; every creation rule; access ordering and each word's argv or
 thread parameters for Claude and Codex; `full` with and without the node's setting; shared and worktree
 directories, the busy-directory rule, safe removal and the hourly second look; the cascade three ways; roots-only
@@ -3445,6 +3445,50 @@ merged as #88: the branch's diff against main is this PR alone).
   child at `full`). The three fixes of this round are about a pipe that takes a turn in pieces, an answer cut
   short and a node with every slot pinned: none of them arises in that run, and each is shown by its test only.
   The user's `~/.codex/config.toml`, `~/.claude/settings.json` and `settings.local.json`: unchanged.
+
+**PR review** (2026-11-21; #89 at 0d9d079: two findings of the GitHub bot, five of the independent reviewer). Each
+was first reproduced by a test that failed, then fixed.
+- *B1, a child on a node that was rolled back.* A node whose latest hello does not declare the child protocol is
+  listed no child, so it can never report a child's lost turn or end it; yet its ordinary hellos counted as "the
+  child's node is there" (`hosted._lost`), so a delivered message never settled and a shared child kept its
+  project busy for the dispatcher (`hosted_wake.turn_projects`) until the human closed it. Now such a child is
+  `orphaned` (hosted_tree): it counts as lost at once, and the hub ends it, every unsettled message failed with
+  `ORPHANED`, in the transaction of that node's hello (`end_orphans`) and, should a read come first, in
+  `hosted._settle`. It is still never sent to the node.
+- *B2, the worktree of a child the hub ended itself.* The node marks a session the hub no longer lists as
+  `dropped` (report nothing more) and closes it; `_drop_worktree` ran while the mark was set, so its
+  `worktree_removed` event was swallowed, and the worktree's record was gone with it: the hub went on saying the
+  worktree was there. The mark is lifted before the worktree is looked at. The hub already took that one event for
+  an ended session.
+- *R1, an access word on an entry with no parent.* The parent and ceiling checks run for an entry that names a
+  parent; the word was passed to `host.open` either way. On a node with `allow_full_access`, an entry `{"access":
+  "full"}` with no parent opened the shipped Claude runner in `bypassPermissions`. This hub never sends that, but
+  the node is where it is enforced: `_tree_open` refuses a word on an entry whose `parent` is not a session id
+  (`ROOT_ACCESS`; the session ends with the reason and nothing is started). A root runs as its runner says.
+- *R2, a Codex sandbox wider than asked.* `verify_codex` told full from not full only. A session ASKED for at a
+  word is now ended when the answer to `thread/start` names a sandbox wider than what it was started at
+  (`CODEX_WIDER`; read-only < workspace < full), as the Claude kill switch does. A root, which has no word of its
+  own, is held to what it was before.
+- *R3, private files of sessions that are gone.* `<id>.settings.json` (the runner's settings, credentials
+  possibly) and `<id>.mcp.json` went with the session when it was forgotten on the node; a session closed while
+  its node was down is never opened there again, and its files stayed. `SessionHost.keep_private_files`, called on
+  every reconcile and doing its work when the set of sessions has changed (so also at the node's first fetch),
+  removes those two kinds for every session id the hub does not list and that is not open here, and nothing else.
+- *R4, a held child is not activity.* A full child that waits for its parent has a message queued at the hub,
+  possibly for hours, and that kept `active()` true: a tick every 0.2 seconds and a fetch every second. A queue
+  that only waits on its session's parent (`_waits_on_parent`) no longer counts. The parent's own turn does, and
+  the child's message is handed over in the pass in which the parent's process confirms.
+- *R5, what `read-only` means for Codex* (README). Only for Claude does the word take the shell and the write
+  tools away. A Codex read-only child keeps a shell inside Codex's read-only sandbox, with read access to the
+  disk and no extra deny on the token directory or `~/.ssh`, as Codex sessions here always had.
+- *Tests added:* `test_a_child_whose_node_was_rolled_back_is_settled_by_the_hub`,
+  `test_the_hub_hears_that_a_worktree_is_gone_also_for_a_child_it_ended_itself`,
+  `test_a_node_refuses_an_access_word_on_a_session_that_has_no_parent`,
+  `test_a_codex_child_whose_thread_has_a_wider_sandbox_than_it_was_started_at_is_ended`,
+  `test_private_files_of_sessions_the_hub_no_longer_lists_are_removed`,
+  `test_a_child_that_only_waits_for_its_parent_does_not_keep_the_node_busy`. Run after it: the full suite, the
+  stand-in e2e, and the tree scenario once more with the real CLIs (PASS, 62 checks; the user's Codex and Claude
+  configuration files unchanged).
 
 **Residual risks / not verified.**
 - A Codex child narrowed to `read-only` by its access word (the live children ran as their runner is configured or

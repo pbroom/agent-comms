@@ -2618,3 +2618,195 @@ def test_an_empty_parent_id_is_refused_when_the_arguments_are_parsed(clienv, cap
     assert e.value.code == 2 and "--parent" in capsys.readouterr().err
     assert len(clienv.requests) == before, "nothing was sent"
 
+
+# ------------------------------------------------------------ PR review (#89)
+
+
+def test_a_child_whose_node_was_rolled_back_is_settled_by_the_hub(senv):
+    """B1. A node whose latest hello no longer says it hosts child sessions is listed no child, so it can neither
+    report a child's lost turn nor end the child; and its ordinary hellos used to count as "the child's node is
+    there", so the turn never settled and a shared child kept its project busy for the dispatcher. The hub settles
+    such children itself: the turn fails as lost, the child is ended, the project is free."""
+    sid = root(senv)
+    answer(senv, sid)
+    kid = child(senv, sid, "work")["session_id"]
+    idle = child(senv, sid, "wait", access="read-only")["session_id"]
+    tick(senv)
+    begin(senv, kid)                                     # its turn is running, in the shared checkout
+    answer(senv, idle)
+    assert msg(senv, kid, 1)["state"] == "delivered" and hosted_wake.turn_projects(senv.board, senv.clock()) == {PROJECT}
+    hello = {"projects": [PROJECT, P2, P3], "runners": ["claude-code", "codex-cli"], "sessions": {"max_live": 4}}
+    assert senv.laptop.post("/api/nodes/hello", json=hello).status_code == 200      # rolled back: no session_host
+    assert [x["session_id"] for x in senv.laptop.get("/api/nodes/sessions").json()["sessions"]] == [sid]
+    assert hosted_wake.turn_projects(senv.board, senv.clock()) == set(), "the project is the dispatcher's again"
+    for x in (kid, idle):
+        view = show(senv, x)
+        assert view["state"] == "ended" and view["error"] == hosted_tree.ORPHANED[:300], x
+    failed = msg(senv, kid, 1)
+    assert failed["state"] == "failed" and "no longer hosts child sessions" in failed["detail"]
+    assert show(senv, sid)["state"] != "ended", "its parent, an ordinary session to that node, goes on"
+    # The same when the hub only finds out on a read (the hello's own settling is taken out here).
+    senv.node.hello()
+    late = child(senv, sid, "more")["session_id"]
+    tick(senv)
+    begin(senv, late)
+    with db.write_tx(senv.board.conn) as c:
+        info = nodes._get(c, nodes.NODE_PREFIX + "laptop")
+        info.pop("session_host")
+        nodes._put(c, nodes.NODE_PREFIX + "laptop", info, "laptop", senv.clock())
+    assert hosted_wake.turn_projects(senv.board, senv.clock()) == set()
+    assert show(senv, late)["state"] == "ended" and msg(senv, late, 1)["state"] == "failed"
+    senv.node.hello()
+
+
+def test_the_hub_hears_that_a_worktree_is_gone_also_for_a_child_it_ended_itself(wtenv):
+    """B2. The hub ended the child while its node was away. Back, the node closes what the hub no longer lists
+    and removes the child's worktree; but it marked the session as dropped ("report nothing more"), and that also
+    swallowed the one thing still worth saying: the worktree is gone."""
+    sid = root(wtenv)
+    kid = child(wtenv, sid, "a", isolation="worktree")["session_id"]
+    tick(wtenv)
+    path = show(wtenv, kid)["worktree"]
+    assert os.path.isdir(path)
+    wtenv.clock.advance(nodes.NODE_STALE_SECONDS + 1)
+    assert wtenv.human.post(f"/api/hosted-sessions/{kid}/close").status_code == 200
+    assert show(wtenv, kid)["state"] == "ended" and show(wtenv, kid)["worktree_removed_at"] is None
+    wtenv.node.hello()
+    tick(wtenv, times=4)
+    assert not os.path.exists(path), "the node removed it"
+    view = show(wtenv, kid)
+    assert view["worktree_removed_at"] is not None, "... and the hub knows"
+    assert "(removed by its node after the session ended)" in cli._fmt_hosted_detail(view)
+    assert kid not in wtenv.node.sessions.dropped and show(wtenv, sid)["state"] != "ended"
+
+
+def test_a_node_refuses_an_access_word_on_a_session_that_has_no_parent(senv):
+    """R1. The parent and ceiling checks are for an entry that names a parent; the access word was applied either
+    way. This hub never sends one for a root, but the node is where it is enforced: an entry with a word and no
+    parent is refused. A root runs as its own runner says."""
+    from agent_comms.node_sessions import ROOT_ACCESS
+
+    node = full_node(senv, "r1")
+    for word in ("full", "workspace", "read-only"):
+        sid = start(senv)["session_id"]
+        runner = node.sessions
+        for malformed in ({"access": word}, {"access": word, "parent": None}, {"access": word, "parent": 7}):
+            data = runner._sync(0)
+            [entry] = [x for x in data["sessions"] if x["session_id"] == sid]
+            entry.pop("parent", None)
+            entry |= malformed
+            runner._reconcile(data)
+            assert sid not in runner.host.sessions, (word, malformed)
+            runner.ending.discard(sid)
+            runner.pending = []
+        tick(senv, node, times=2)                        # the hub's own entry: no word, so it opens
+        assert node.sessions.host.sessions[sid].access == "full" and not node.session_spawner.calls[:0]
+        data = runner._sync(0)
+        assert [x for x in data["sessions"] if x["session_id"] == sid][0]["access"] is None
+        assert senv.human.post(f"/api/hosted-sessions/{sid}/close").status_code == 200
+        tick(senv, node, times=3)
+    # What the node says when it refuses: the session ends with the reason, and nothing was started.
+    plain = make_node(senv, config=tree_config(senv, sessions={"allow_full_access": True}), log_dir=senv.tmp / "r1b")
+    plain.hello()
+    sid = start(senv)["session_id"]
+    data = plain.sessions._sync(0)
+    data["sessions"][0]["access"] = "full"
+    plain.sessions._reconcile(data)
+    assert [(x, e["kind"], e["detail"]) for x, e in plain.sessions.pending] == [
+        (sid, "ended", f"this node cannot host the session: ValueError: {ROOT_ACCESS}"[:300])]
+    assert plain.session_spawner.calls == [] and sid not in plain.sessions.host.sessions
+    senv.node.hello()
+
+
+def test_a_codex_child_whose_thread_has_a_wider_sandbox_than_it_was_started_at_is_ended(senv):
+    """R2. Codex's answer to thread/start names the sandbox the thread has. For a session started at an access
+    word, a sandbox wider than that word ends it (read-only < workspace < full), as Claude's kill switch does. A
+    session with no word of its own (a root) is held to what it always was: full or not full."""
+    v = access.verify_codex
+    wider = access.CODEX_WIDER
+    assert v("read-only", "workspaceWrite", "read-only") == (wider.format(sandbox="workspaceWrite", launched="read-only"), False)
+    assert v("read-only", "dangerFullAccess", "read-only")[0] is not None
+    assert v("workspace", "dangerFullAccess", "workspace")[0] is not None
+    assert v("read-only", "readOnly", "read-only") == (None, False) == v("workspace", "readOnly", "workspace")
+    assert v("workspace", "workspaceWrite", "workspace") == (None, False) == v("read-only", None, "read-only")
+    assert v("full", "dangerFullAccess", "full") == (None, True)
+    assert v("read-only", "workspaceWrite") == (None, False), "a root: as before"
+    assert v("read-only", "externalSandbox", "read-only") == (None, False), "a sandbox this code has no word for"
+    sid = root(senv)
+    answer(senv, sid)
+    kid = child(senv, sid, "count", agent="codex", access="read-only")["session_id"]
+    tick(senv)
+    proc = codex_proc(senv)
+    proc.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv)
+    assert written(proc)[2]["params"]["sandbox"] == "read-only"
+    proc.emit(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "workspaceWrite"}}))
+    tick(senv, times=3)
+    view = show(senv, kid)
+    assert view["state"] == "ended" and view["error"] == wider.format(sandbox="workspaceWrite", launched="read-only")
+    assert msg(senv, kid, 1)["state"] == "failed" and msg(senv, kid, 1)["delivered_at"] is None
+    assert not any(m.get("method") == "turn/start" for m in written(proc)), "its turn was never written"
+
+
+def test_private_files_of_sessions_the_hub_no_longer_lists_are_removed(senv, tmp_path):
+    """R3. `<id>.settings.json` holds the runner's settings (credentials, possibly) and `<id>.mcp.json` the board's
+    launcher. They went with the session when it was forgotten here; a session closed while its node was down is
+    never opened again, so its copies stayed for good. Now the node removes those of every session the hub does
+    not list for it. Never a file of a listed or open session, never anything but those two kinds."""
+    own = tmp_path / "own.json"
+    own.write_text(json.dumps({"permissions": {"allow": ["Read"]}, "env": {"KEY": "value"}}))
+    runner = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--settings", str(own)]
+    config = lambda: tree_config(senv, runners={"claude-code": runner})    # noqa: E731
+    node = make_node(senv, config=config(), log_dir=senv.tmp / "r3-logs")
+    node.hello()
+    gone, kept = start(senv)["session_id"], start(senv, project=P2)["session_id"]
+    tick(senv, node)
+    sessions = senv.tmp / "r3-logs" / "sessions"
+    assert {x.name for x in sessions.glob("*.settings.json")} == {f"{gone}.settings.json", f"{kept}.settings.json"}
+    senv.clock.advance(nodes.NODE_STALE_SECONDS + 1)      # the node is down; the human closes one session
+    assert senv.human.post(f"/api/hosted-sessions/{gone}/close").status_code == 200
+    assert show(senv, gone)["state"] == "ended"
+    (sessions / f"{gone}.mcp.json").write_text("{}")      # (as a read-only session of it would have had)
+    bystanders = [sessions / f"{gone}.jsonl", sessions / f"{gone}.stderr.log", sessions / "notes.settings.json",
+                  sessions / f"{UNKNOWN}.other.json", sessions / f"x{gone}.settings.json"]
+    for path in bystanders:
+        path.write_text("kept")
+    back = make_node(senv, config=config(), log_dir=senv.tmp / "r3-logs")      # the node starts again
+    back.hello()
+    tick(senv, back)
+    assert not (sessions / f"{gone}.settings.json").exists() and not (sessions / f"{gone}.mcp.json").exists()
+    assert (sessions / f"{kept}.settings.json").exists(), "a session the hub lists keeps its file"
+    assert all(path.exists() for path in bystanders), "and nothing else is touched"
+    assert (own.read_text(), kept in back.sessions.host.sessions) == (json.dumps(
+        {"permissions": {"allow": ["Read"]}, "env": {"KEY": "value"}}), True)
+    senv.node.hello()
+
+
+def test_a_child_that_only_waits_for_its_parent_does_not_keep_the_node_busy(senv):
+    """R4. A held full child has a message queued at the hub, for as long as its parent has no turn: hours,
+    possibly. That used to count as work, so the node ticked five times a second and fetched every second all that
+    time. A child that only waits is not activity; the parent's own turn is, and brings the child's with it."""
+    node = full_node(senv, "r4")
+    sid = root(senv, node=node)
+    answer(senv, sid, node=node)
+    kid = child(senv, sid, "one")["session_id"]
+    tick(senv, node)
+    answer(senv, kid, node=node)
+    runner, host = node.sessions, node.sessions.host
+    assert host.park(sid)                                # the parent's process is stopped (the idle limit)
+    tick(senv, node, times=3)
+    send(senv, kid, "two")
+    tick(senv, node, times=3)
+    assert msg(senv, kid, 2)["state"] == "queued" and [m["n"] for m in runner.queue[kid]] == [2]
+    assert not runner.active(), "held: nothing to do until the parent has a turn"
+    send(senv, sid, "again")
+    tick(senv, node)
+    assert runner.active()
+    begin(senv, sid, node)
+    tick(senv, node)
+    assert msg(senv, kid, 2)["state"] == "delivered", "and then promptly"
+    # A queued message that is NOT held is work, as ever.
+    other = child(senv, sid, "three", access="read-only")["session_id"]
+    runner._reconcile(runner._sync(0))
+    assert runner.queue[other] and runner.active()
+    senv.node.hello()

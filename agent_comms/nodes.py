@@ -161,6 +161,11 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         info["session_host"] = hosting
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
+        if hosting is None:
+            # A node that does not (or no longer) host child sessions is listed none, so it can never report on one
+            # or end it: the hub ends those it had there, in this transaction (hosted_tree.end_orphans).
+            from . import hosted_tree
+            hosted_tree.end_orphans(c, p.name, "hub", now)
         # Ended runs are kept a day for the record, then dropped so polls never scan the whole history.
         c.execute("""DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ?
                      AND json_valid(value) AND json_extract(value, '$.state') = 'ended'""",
