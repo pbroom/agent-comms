@@ -422,7 +422,10 @@ What to know:
 - **Permissions** are the runner's, as for a dispatched run, with nobody to ask: a tool that would prompt is denied
   and listed (`show` says which). A runner with `--dangerously-skip-permissions` or `--permission-mode
   bypassPermissions` is not hosted unless the node says `allow_full_access = true` ("Parent and child sessions"
-  below), and a session that ends up in that mode through a settings file is ended when its turn starts.
+  below). Every hosted Claude session is started with an explicit `--permission-mode`: a runner that names one keeps
+  it, and a runner that names none gets `manual`, the CLI's standard mode, so that a settings file's `defaultMode`
+  cannot choose for it (that is the one thing ever added to such a runner's command line; the shipped runners all
+  name a mode, so theirs is unchanged). A session whose process reports `bypassPermissions` anyway is ended.
   Otherwise the runner is hosted exactly as written. A project in `claude_tool_projects` gets the scoped tools, as
   a run does.
 - **A lost turn is not retried.** A turn that timed out (`[dispatch] timeout_minutes`), whose process died, or whose
@@ -552,20 +555,22 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   removed once the session has ended and holds nothing unique (nothing uncommitted, untracked or ignored, and its
   HEAD on a branch or remote ref); otherwise it stays and `show` says where it is. Ignored files count: a build
   output or a local `.env` in it is still yours.
-- **Access** is one word. For a child it is ENFORCED: the node turns the word you asked for into flags from its
-  own runner for that agent (the hub sends nothing executable). For a session you start without `--parent` it is
-  OBSERVED: that session runs its runner exactly as you configured it, and its access is a label read off what its
-  process reports (below).
-  - `read-only`, asked for with `--access read-only`: Claude with a hard list of built-in tools, `--tools=Read,Grep,Glob`, so that nothing that writes
-    or runs a command exists in the session whatever a settings file allows (`--allowedTools` only adds approvals:
-    a `Bash(*)` or `Write` grant in your settings stays in force under `dontAsk`); in `dontAsk` mode, given
-    explicitly; with no MCP server but the board's (`--strict-mcp-config` and a config holding only the
-    `agent-comms` server from the runner's own `--mcp-config`; a runner that names none gets no MCP server, so no
-    board tools); reads inside its directory allowed, and Edit, Write, NotebookEdit, Bash, the token directory and
-    `~/.ssh` denied beside the runner's own deny rules. No shell means no `git log` either. Codex with the
-    `read-only` sandbox.
+- **Access** is one word, and it is decided BEFORE a session's process is started, from its command line: the
+  node computes it there and reports it when it opens the session. For a child the node first turns the word you
+  asked for into flags from its own runner for that agent (the hub sends nothing executable). A session you start
+  without `--parent` runs its runner as you configured it.
+  - `read-only`, asked for with `--access read-only`: Claude with a hard list of built-in tools,
+    `--tools=Read,Grep,Glob`, so that nothing that writes or runs a command exists in the session (`--allowedTools`
+    only adds approvals: a `Bash(*)` or `Write` grant in a settings file stays in force under `dontAsk`); with NO
+    Claude settings at all (`--setting-sources=`, and a runner's `--settings` is dropped), because a settings file
+    also brings hooks, and a command hook runs whatever tools the session has; in `dontAsk` mode, given explicitly;
+    with no MCP server but the board's (`--strict-mcp-config` and a config holding only the `agent-comms` server
+    from the runner's own `--mcp-config`); reads inside its directory allowed, and Edit, Write, NotebookEdit, Bash,
+    the token directory and `~/.ssh` denied beside the runner's own deny rules. No shell means no `git log` either.
+    A runner that names no MCP config of its own (the shipped `claude-code` runner) gives a read-only child NO board
+    tools: a child reports to its parent, and fewer tools is the safer default. Codex with the `read-only` sandbox.
   - `workspace`: the runner as the node configured it (what a hosted session always got, `claude_tool_projects`
-    scoping included). Nothing is added to it.
+    scoping included), with the permission mode pinned if it names none.
   - `full`: Claude with `--permission-mode bypassPermissions` (the runner's deny rules still hold); Codex with the
     `danger-full-access` sandbox. Only on a node whose board.local.toml says:
 
@@ -574,36 +579,36 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
     allow_full_access = true
     ```
 
-    Without it a request for `full` ends that session with the reason; it is never run narrower instead. The same
-    setting decides whether a runner that bypasses permission checks can be hosted at all: with it, such a session
-    is `full`; without it, it is refused as before.
+    Without it a request for `full` is refused when you ask (the node says which words it can start each runner
+    at); it is never run narrower instead. The same setting decides whether a runner that bypasses permission
+    checks can be hosted at all: with it, such a session is `full`; without it, it is refused as before.
 
-  A session you start without `--parent` runs its runner as you configured it: nothing is added to its command
-  line, also when the runner calls itself read-only (the triage runner keeps its `git log`). Its access, as `show`
-  prints it, is a label: Claude reporting `bypassPermissions` is `full`; `dontAsk` with no built-in tool beyond
-  Read, Grep and Glob is `read-only`; anything else is `workspace`. So a triage runner that allows `git log` has a
-  shell and is labelled `workspace`, which is what it is. A child's access defaults to its parent's label and may
-  be narrower; above it is refused. So a `full` child needs a `full` parent, and a child asked for at `read-only`
-  gets the hard limits above whatever its runner calls itself. A Claude runner that bypasses permission checks can
-  be asked for at `full` or `read-only`, not `workspace`.
+  A session you start without `--parent` has the access its command line gives, and `show` prints it as soon as
+  its node has opened it: a runner that selects bypass (`--permission-mode bypassPermissions`,
+  `--dangerously-skip-permissions`) is `full`; `dontAsk` with a `--tools` list within Read, Grep and Glob is
+  `read-only`; anything else is `workspace`. So a triage runner that allows `git log` has a shell and is
+  `workspace`, which is what it is, and it keeps its command line. A child's access defaults to its parent's and
+  may be narrower; above it is refused. So a `full` child needs a `full` parent, and a child asked for at
+  `read-only` gets the hard limits above whatever its runner calls itself. A Claude runner that bypasses permission
+  checks can be asked for at `full` or `read-only`, not `workspace`. `--allow-dangerously-skip-permissions` alone
+  is not full access (it selects nothing).
 
-  **What a Claude session really runs with is checked.** Flags are a request; a settings file can decide otherwise
-  (`"defaultMode": "bypassPermissions"` in a file the runner loads puts a session with no bypass flag into that
-  mode). Claude says, at the start of every turn, which permission mode it is in and which tools it has, and the
-  node holds that against the session: one that runs with permission checks bypassed on a node without
-  `allow_full_access`, or that was asked for at less than `full`, is ended with the reason, and so is a child asked
-  for at `read-only` that is not in `dontAsk` or has a tool beyond its list, and one asked for at `full` that is
-  not bypassed. Nothing is run narrower instead. A session's access as `show` prints it is that reported one, so
-  it is known once its first turn has started, and no child can be started under it before. `--allow-dangerously-skip-permissions` alone is
-  not full access (it selects nothing).
+  **What the process then says can only end the session.** Claude names, at the start of every turn, the
+  permission mode it is in and the tools it has. A session that reports `bypassPermissions` without having been
+  started as `full`, one started as `full` that is not bypassed, and a child asked for at `read-only` that is not in
+  `dontAsk` or has a tool beyond its list, are ended with the reason; so is a child asked for at `read-only` or
+  `full` whose process reports no mode at all. Nothing is run narrower instead, and nothing a process says changes
+  what a session's access is taken to be.
 
   **A child runs only under its parent as the parent is on the node now.** If you edit a runner and restart the
-  node, a child whose access is above what its parent then has there is ended instead of resumed, and no child is
-  opened or given a turn while its parent is not open on the node.
+  node, a child whose access is above what its parent's command line then gives is ended instead of resumed, and no
+  child is opened or given a turn while its parent is not open on the node. This holds from the moment the node is
+  up: nothing has to wait for the parent's process to say anything.
 - **Versions.** Children need a node that says it hosts them (this version's does, in its hello and on every
-  fetch) and that can host the child's runner as a session (a Codex child needs `codex = true` there): otherwise
-  `start --parent` is refused, and a node rolled back to an earlier version is listed no child. Update the hub
-  before its nodes: an older hub refuses the newer node's hello.
+  fetch). Its hello also says, for each runner, the access words a child of it can really be started at there (a
+  Codex runner only with `codex = true`; `full` only with `allow_full_access`; nothing for a runner its session
+  host refuses): `start --parent` is refused for anything else, and a node rolled back to an earlier version is
+  listed no child. Update the hub before its nodes: an older hub refuses the newer node's hello.
 - **Limits.** A child cannot have children. At most `max_children` children of one session that have not ended.
   The node's `max_live` counts children too: set it to at least 1 + the children you want live at once (a child
   that cannot get a process waits, and an idle one is stopped to make room, as for any session). "One session per
@@ -612,8 +617,9 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   parent alone.
 - **The board.** A post never wakes a child: wakes go to sessions started without `--parent`. A child of the same
   agent signs in to the board as that agent, and the board cannot yet tell its sign-in from its parent's, so while
-  such a child is around (or was, since the wake) a read of a request does not count as the parent having it: after
-  `wake_grace_seconds` the dispatcher handles that request as it would without a hosted session.
+  such a child is around in the project (or was, since the wake; under whichever session it was started) a read of
+  a request does not count as the parent having it, whenever the read was made: after `wake_grace_seconds` the
+  dispatcher handles that request as it would without a hosted session.
 - **With the dispatcher.** A child in the shared checkout counts like its parent: while its turn runs, a dispatched
   run for that project waits. A child in its own worktree keeps nothing busy.
 
@@ -621,8 +627,8 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
 stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),
 the wake included, and then parent and child sessions (`--only tree` runs just that: a read-only child that cannot
 write, a child in its own worktree, a Codex child under a Claude parent, the cascade, and a `full` child doing what
-a `workspace` one is refused, a settings file whose grants do not widen a read-only child, and one whose
-`defaultMode` gets a session ended). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
+a `workspace` one is refused, a settings file whose grants and command hooks do not reach a read-only child, and
+one whose `defaultMode` of `bypassPermissions` never takes effect). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
 board's MCP tools and nothing else: it checks that a woken session really calls `board_read_updates` (the hub's
 delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)",
 "Session host (PR 3)" and "Session host: parent and child sessions".
