@@ -355,7 +355,6 @@ def test_s13_sigterm_to_the_hook_script_alone_ends_board_wait(tmp_path):
         deadline = time.monotonic() + 10
         while not (tmp_path / "pid").exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        child = int((tmp_path / "pid").read_text())
         p.send_signal(signal.SIGTERM)       # the script only, not its group
         assert p.wait(5) == 0
         deadline = time.monotonic() + 5
@@ -363,13 +362,18 @@ def test_s13_sigterm_to_the_hook_script_alone_ends_board_wait(tmp_path):
             time.sleep(0.05)
         assert (tmp_path / "ended").exists(), "board wait was ended too"
     finally:
+        # Whatever failed above, leave nothing running: the stand-in first (the old wrapper waited on it), then the
+        # script, by SIGTERM.
+        try:
+            os.kill(int((tmp_path / "pid").read_text()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
         if p.poll() is None:
             p.terminate()
-            p.wait(5)
-        try:
-            os.kill(child, signal.SIGTERM)
-        except (OSError, UnboundLocalError):
-            pass
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 # ------------------------------------------------------------ helpers
