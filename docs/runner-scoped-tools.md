@@ -29,11 +29,20 @@ profile rejects conflicting settings/session/directory overrides instead of
 silently replacing them. Existing broader permissions outside the runner argv
 are not revoked by this feature.
 
-The run goes straight to its work prompt; there is no separate tool-preflight run. The prompt tells the agent
-that a denied tool is a blocker: it marks the request `blocked`, naming the tool, and stops, and the request then
-reaches the human. A run that ends without settling its request is retried a bounded number of times (README
-"Dispatcher") and then blocked. Completed work still requires the normal request-specific evidence; human clicks are
-not agent pickup.
+The run goes straight to its work prompt; there is no separate tool-preflight run. The prompt ends with the
+command forms it can use (`runner_preflight.tools_notice`, built on the node from the run's own scoped command line):
+the git commands, new branches as `codex/<name>`, `uv run pytest ...` or `pytest ...`, and the read-only `gh`
+commands, opening with "other commands may be refused without asking". That plain text is used only for a runner
+whose options are all known not to restrict tools; any other accepted option (a deny rule, `--tools`,
+`--restricted`, a plugin, or one this code does not know) gets the same list with a warning that any of these forms
+may also be refused; its rule text is never copied in. A runner's own `--settings` is refused, as above. The
+prompt also tells it that a denied tool is a blocker: it marks the request `blocked`, naming the tool, and stops,
+and the request then reaches the human. A hosted session in such a project gets the same text through
+`--append-system-prompt` (a resumed session keeps the text it was started with until it is compacted: start a new
+session after an upgrade or a rule change), but says in its reply which command was refused (its task has no
+request post). A session asked for at `read-only` and a runner that declares itself read-only are not scoped. A run
+that ends without settling its request is retried a bounded number of times (README "Dispatcher") and then
+blocked. Completed work still requires the normal request-specific evidence; human clicks are not agent pickup.
 
 Implementation follows installed `claude --help` and the native permission rules:
 https://code.claude.com/docs/en/permissions (deny/ask rules precede allow rules).

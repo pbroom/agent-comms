@@ -291,7 +291,7 @@ class Node:
             from . import runner_preflight
             if runner_preflight.scoped(template, project, self.config.claude_tool_projects):
                 template = runner_preflight.scoped_template(template)
-                prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
+                prompt += " " + runner_preflight.dispatched_instruction(template)
             signed_in = r.get("browser_access")
             if signed_in is not None:
                 # Signed-in browser work: this machine's own [dispatch.runner_access] must still say this runner holds
