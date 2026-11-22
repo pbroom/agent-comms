@@ -3574,8 +3574,8 @@ child's reply (`text`, capped as every reply), `state` (`pending` | `queued` | `
 `undelivered`), `carrier` (the parent's message that carries it) and `why` (for `undelivered`). Keyed by the DIRECT
 parent (owner's decision 1): a result goes exactly one level up. A turn of a parent that is itself a child, the one
 that carried its own children's results included, is in turn a result for ITS parent, so nothing here assumes a
-parent is a root or a child has no children (children of children are planned, with a depth cap and tree-wide
-budgets). Limits that are per tree stay keyed by root (`max_children`); nothing here is per tree.
+parent is a root or a child has no children (children of children: "Session host: deeper trees"). `max_children`
+is per parent; nothing here is per tree.
 
 **When a result is made**, inside the transaction that settles it: a child's message settles in `hosted._apply`
 (`turn_ended`) or `hosted._settle` (node lost), or the child ends in `hosted._end` (after the cascade). `_end`,
@@ -5070,7 +5070,7 @@ it needs none), the ceiling against the child's access and the node's offers now
 takes no new task: `ABOVE_NOW`), the turn limit.
 
 **Depth and the allowance.** `max_depth` is 1 in this version (the setting accepts nothing else); a child's call is
-refused with "depth limit". The rules for more are built and tested through a test-only override (`deeper`): depth
+refused with "depth limit". (Since then 1 to 4, shipped 2: "Session host: deeper trees".) The rules for more are built and tested through a test-only override (`deeper`): depth
 is the parent's plus one, the root the parent's root, `create_child` takes a child parent, the cascade runs for
 every session, the node opens sessions parent before child at any depth, results go to the direct parent, limits
 count per grant. The allowance (`may_spawn` default true, `share` default none) is on the child record.
@@ -5800,8 +5800,8 @@ caught).
   server does not see AGENT_COMMS_MANAGED, and is an interactive caller unless the getsid guard catches it, bounded
   by the grant).
 - `hosted_wake._occupied` (wakes, result turns) still maps node runs through the hub's settings (S11 note).
-- Deeper trees ran only through the test-only override; a node reports no confirmed `full` for a child that is a
-  parent (such a grandchild is held to `workspace`).
+- Deeper trees ran only through the test-only override (shipped since: "Session host: deeper trees"); a node
+  reports no confirmed `full` for a child that is a parent (such a grandchild is held to `workspace`).
 - Queued messages survive a revoked or narrowed grant; the dashboard shows no trees, grants or budgets.
 
 ### Spawn tools: follow-ups
@@ -5819,3 +5819,379 @@ caught).
   records are pruned.
 - A Codex dispatched run: forward AGENT_COMMS_MANAGED to its board server (`env_vars`), so the environment check
   covers it as it covers Claude's, not only its registered board session.
+
+## Session host: deeper trees (2026-11-22)
+
+**Report.** A child session may start children of its own. `[dispatch.sessions.spawn] max_depth` now accepts 1 to 4
+(levels below a root) and ships as 2: a root, its children, and their children. The test-only override is gone;
+the tests run at the shipped value, or set it in the board's settings. Nothing new in the node protocol, the trust
+model, the stated limits a to e, or shutdown and `recover()`. No sixth tool: a parent already changed its child's
+allowance through `board_session_send` (`may_spawn`, `spawn_share`, from PR #94); that is the parent's switch.
+
+**The rules, at every level** (owner decisions). Each is pinned at depth 2 or more in `tests/test_deeper_trees.py`.
+- *Identity.* A hosted child at any level is known by its own binding and reaches only the children it started
+  itself (`_own_children`: `spawned_by.session`). Its binding is listed while a grant covers its agent and project,
+  or while it has live children it started. Held already;
+  `test_identity_a_grandchild_is_known_by_its_own_binding_and_reaches_only_its_own_children`.
+- *Access.* The narrowest of what was asked, every session above (`_chain_ceiling` walks the chain), the grant and
+  the node's offers; checked again inside the one deciding transaction (`final`). A grant that narrows while the
+  transaction runs starts nothing wider, and a wider descendant takes no new task (`ABOVE_NOW`). Held already;
+  `test_access_a_grandchild_never_exceeds_any_session_above_it`,
+  `test_access_a_grant_that_narrows_inside_the_deciding_transaction_gives_a_wider_grandchild_nothing`.
+- *Budget.* The grant's budget (agent and project) counts every session the agent started, at every level and under
+  every root, hosted or interactive. A child of ANOTHER agent starts helpers under that agent's grant and budget:
+  without a grant for it, it is told it cannot. `max_children` is each parent's own (the code always counted per
+  parent; the docs said "per root" and now say per parent). A retry with the same request id is scoped to its starter
+  at every level. Held already;
+  `test_budget_counts_every_descendant_at_every_level_and_root_and_max_children_is_each_parents`,
+  `test_a_childs_helpers_count_against_its_own_agents_grant`,
+  `test_a_retry_with_the_same_request_id_is_scoped_to_its_starter_at_every_level`.
+- *Allowance.* On by default within the depth cap. The human (`board session allow`) and the parent
+  (`board_session_send`) change it while the child runs; no process restarts. CHANGED: off for a session is off for
+  its whole subtree while it is off (`_off_above`, in `_check_allowance`, so also inside the deciding transaction);
+  `capabilities` says so (`allowance.off_above`, and OFF_ABOVE in `why_not`). CHANGED: a parent widens a child's
+  allowance only up to its own (`_not_above_own`, round 1 D1): the RESULT (the stored allowance with the call's
+  arguments applied) is never wider than the parent's own effective allowance, and nothing is widened while the
+  parent or one above it is off. "Wider" (`_wider`): `may_spawn` true over false; `share` none (no share of its own:
+  only the grant's limits) over any number, a larger number over a smaller one. A change that widens nothing
+  (narrowing) needs nothing. A child's default allowance is on, with its starter's own share. Roots have the
+  grant's allowance (on, no share).
+  `test_allowance_off_for_a_session_is_off_for_its_whole_subtree_and_a_parent_gives_no_more_than_its_own`,
+  `test_r1_d1_a_parent_never_leaves_its_child_an_allowance_wider_than_its_own_effective_one` (a table).
+- *Results and turns.* A result goes to the direct parent only (`hosted_results.target`), as that parent's next turn.
+  So a grandchild's result is the child's turn, and the child's reply to that turn is a result for the root
+  (`started_by: child`). Nothing skips a level. `claim` and "a waiter whose result another call took is told so"
+  are per parent. The order (the human's message, then child results, then wakes) is per session, so it holds at every
+  level. Child turns are counted per grant across the tree: every downward message (a spawn, a send) is charged, and
+  an upward turn (a result) is not, so a chain that keeps going needs a charged message at each round and stops at
+  `max_turns_without_human`. Held already;
+  `test_results_go_up_level_by_level_each_as_the_next_turn_of_the_direct_parent`,
+  `test_order_the_humans_message_then_child_results_at_a_middle_level`,
+  `test_claims_are_per_parent_and_a_waiter_at_a_middle_level_is_told_when_another_call_took_it`,
+  `test_turns_are_counted_across_the_tree_so_a_deep_chain_cannot_go_on_without_the_human`.
+- *The frame.* CHANGED: the server's line after the header always says where the child stands, true at the moment
+  it is written (round 1, D5). Below the last level: it may start helpers, how deep it is and how many levels remain
+  below it, the targets it could start on its OWN node within what it could give (with a targets list, only those
+  cheaper than or equal to its own; "prefer the cheapest that can do the work" either way), and the budget left
+  after the start that made it. At the last level, with no grant for its own agent, with no budget left, or with no
+  target on its node: "You cannot start helper sessions of your own: <why>. Do the work yourself." It is advice: the
+  tools decide at each call, and it can go stale (a budget frees, a grant ends); `board_session_capabilities` says
+  what holds now. The task markers and their token are unchanged.
+  `test_the_frame_tells_each_level_what_remains_below_it`,
+  `test_r1_d5_the_frame_is_true_when_written_the_budget_after_this_start_and_targets_on_the_childs_node`,
+  `test_a_childs_own_spawn_call_is_refused_at_the_depth_limit` (max_depth 1).
+- *Audit.* One post per spawn and per end at every level, in the tree's one thread. CHANGED: each line names the
+  depth, the direct parent and the root.
+  `test_audit_one_post_per_spawn_and_end_at_every_level_naming_the_direct_parent_and_the_root`.
+- *Recursion.* A child may start the same agent and model as itself. That is bounded by `max_depth` and the budget
+  like any other start; the e2e tree run does exactly that (a `claude-spawner` root starts a `claude-spawner` child).
+
+**The cascade.** CHANGED: `hosted_tree.cascade` marks the WHOLE subtree in the transaction in which a session ends
+or is marked for closing, every level under the one above it. Before, it marked the direct children only, and the
+next level was marked when the node confirmed the child's end, so a grandchild could run on, and start a session of
+its own, while its parent waited for its node. What happens, in order, inside that one transaction:
+1. The session itself: marked `stop: close` (the human, or its starter with `cancel close=true`), or ended
+   (`hosted._end`: its node said so, or the hub ended it).
+2. Each live child, oldest first: on a node that is connected, marked `stop: parent`; on a node that is away (or
+   hosts no children), ended at once (`hosted._end`, which cascades by itself).
+3. Then that child's own children, the same way, and so on down.
+From then on nothing can be started under any of them (a session being closed takes no child), and their results
+and ends tell nobody (`stop: parent`). The node closes every marked session on its next listing, parents before
+children (`_reconcile` sorts by depth), reports each end, and the hub frees each slot as before (`holds_slot`:
+the node's own `ended`, or a listing applied after the end, or its bound). The node's group registry
+(`node_groups.Groups`) and the hub's hold mean what they meant: one process group per session, a stopping group
+blocks its checkout until gone. A grant revoke or expiry ends nothing (as at depth 1): no new spawn or message, while
+status and cancel keep working for each level's own children (a session with live children keeps its binding). Node
+loss: a turn in flight fails as lost (`_settle`), and closing a tree whose node is away ends every level at once.
+Tests: `test_cascade_closing_the_root_marks_the_whole_subtree_in_one_transaction`,
+`test_cascade_a_parent_that_ends_by_itself_and_one_its_starter_closes_take_their_subtrees`,
+`test_cascade_on_a_node_that_is_away_ends_every_level_at_once`,
+`test_a_revoked_grant_ends_nothing_and_each_level_still_sees_and_stops_its_own`.
+
+**Capacity (`max_live`) and starvation.** Can every slot be held by parents that wait for children that cannot
+start? Not for long, and nothing new was needed. A parent waits for its children in one of two ways:
+- *Between turns* (the usual way: a result comes as the parent's next turn). Its process is idle, so `_admit`
+  stops it (the longest idle first) to give the child a slot, and the result turn starts it again (resumed). An idle
+  process is stoppable, except the parent of a `full` child, whose live process vouches for that child's turns (a
+  grandchild is never `full`: a child's `full` counts as `workspace`, so only a root's child is). For it, the hold
+  (its final form, review round 4; it replaces what rounds 1 to 3 said): **the parent of a full child is KEPT
+  (never stopped) while that child or any session under it is at work on the node (a turn in flight, or a message
+  handed over), and SPARED (the idle timer leaves it; `_admit` stops it only when nothing else can be stopped)
+  while the hub's listing says the child's subtree is open: a session under it the hub has not recorded as ended, a
+  result for it or anywhere under it not settled (pending, or in a turn whose start its provider has not confirmed;
+  settled: delivered once that turn started, claimed, or kept undelivered), or a message for it or anywhere under it
+  queued or written and not settled (`hosted_tree.subtree_open`, the listing's `subtree_open`); it is never stopped
+  to make room for a session in that subtree; and nothing is placed under a full child on a node that does not
+  say it holds (session protocol 3, asked again inside the creation's transaction), nor kept there once its node
+  says less.** Why one flag is enough: whatever
+  can become the full child's next turn starts as something open in its subtree, and the hub turns each open thing
+  into the next one in a single write (a session's turn end into a result, in the transaction that takes the
+  report; its end into the results of its end and of the turn it cut, in `_end`; a result into a queued turn, in
+  the listing), so the flag never drops between them, and a session the node still runs is one the hub has not
+  recorded as ended. The cost, accepted: the parent is not idle-parked while the full child has any live
+  descendant, even an idle one.
+- *Inside a turn* (a tool call with `wait`). The turn is in flight, so its process is never stopped. But each wait
+  ends after at most 45 s (`WAIT_MAX`), and the turn itself ends at the runner's time limit at the latest; then the
+  process is idle and the case above applies.
+So with every slot held by parents in turns that wait on children, progress resumes when the first of those waits
+ends. Proved with `max_live = 1`: a root, a child and a grandchild finish, never more than one process up, the idle
+parent stopped and resumed for each result turn, and a busy parent's child waiting until that turn is over
+(`test_capacity_one_slot_runs_a_whole_tree_idle_parents_are_stopped_and_resumed_for_their_results`). A wait spent
+on a child that cannot start is wasted time (up to 45 s per call), not a deadlock. With a full-access middle level
+(max_live 2 and 3; 1 is refused for a full child):
+`test_r1_d3_capacity_with_a_full_access_middle_level_the_tree_finishes`, and the reproduction
+`test_r1_d3_a_full_childs_parent_is_kept_while_what_is_under_that_child_can_still_bring_it_a_result`.
+What is left is the case S18 (review round 5 of the tree work) accepted at depth 1: when every slot is held and
+nothing but a spared parent can be stopped, the spare gives way, and the full child then takes its next turn after
+its parent's next turn (a message of the human's to the parent). A strict guarantee would need a new mechanism (a
+turn of the parent made by the server only to re-confirm full access, which costs a model turn, since Claude says
+its mode only when a turn starts) or a rule that a full child starts no children; neither is built.
+
+**Placement and isolation.** A child of a hosted session runs on its parent's node, at every level; so does a child of
+an interactive root's child, whatever node is seen most recently. One run per checkout holds for a grandchild's task
+and for a result turn of its parent (round 1, D2: a result turn is now held by the same node-and-checkout identity and
+dispatcher claims as an agent's task, and reserved in the listing's transaction). A grandchild may have a worktree of
+its own. CLARIFIED: `shared` means the project's checkout on the node, the one the root runs in, at every level, also
+under a child that has a worktree of its own (the node already did this; the hub's `_checkout_busy` already counted it
+so). CHANGED: a runner that names its own directory is held against the root's checkout
+(`hosted_tree.shared_checkout`), since a child reports none; before, a grandchild of such a runner was refused as "not
+known yet" for good. In an interactive root's tree it is refused plainly. Tests:
+`test_placement_a_grandchild_of_an_interactive_root_runs_on_its_parents_node`,
+`test_isolation_a_grandchild_may_have_a_worktree_and_shared_is_the_projects_checkout_at_every_level`,
+`test_one_run_per_checkout_holds_a_grandchilds_task_and_a_result_turn_of_its_parent`,
+`test_a_runner_that_names_its_own_directory_is_held_against_the_roots_checkout_at_every_level`.
+
+**Self-stop and the start gate** (review rounds 10 to 12, `node_sessions.py`) look at no depth: a grandchild's turn
+is stopped at the deadline, and nothing of it starts again until contact is back and a listing fetched since has been
+applied. `test_self_stop_and_the_start_gate_hold_for_a_grandchild_as_for_any_session`.
+
+**Mutation check** (scratchpad `mutations.py`, kept out of the repo; round 1 below: 40): 26 rules, each taken out of a
+copy of the tree, each made a test of `tests/test_deeper_trees.py`, `test_hosted_spawn.py` or `test_hosted_tree.py`
+fail. Two first came back uncaught and were then pinned: the chain ceiling's walk above the parent (now tested with a
+root whose node reports a narrower access after its child was made), and the request-id scope, which two checks hold
+at once (the parent, and the starter session under it): taking out either alone changes nothing, taking out both is
+caught.
+
+**End to end** (`scripts/session-host-e2e.py --only tree`, T11): a root starts a child of the same agent, which
+starts a read-only Claude grandchild; the frames, the results level by level, the audit lines and the cascade. With
+stand-ins the script makes each call from that session's own board server; with the real CLIs each level calls
+`board_session_spawn` itself. Each run requires the path it takes (round 1, D6): the real CLIs `claimed` at both
+levels and the root's reply exactly `plum`; the stand-ins `delivered` at both levels, then the waiting path
+(`claimed`) deterministically. Runs: review round 1, below.
+
+**Known limits.**
+- A node reports no confirmed `full` for a session that is itself a child, so nothing below depth 1 is `full`.
+- A child of another agent needs a grant for that agent to start helpers; its starts count against that agent's
+  budget, not the root's. The human's message to a root resets the turn count of the root's agent only.
+- Off above is read at each call: a child turned off while its subtree runs stops new starts and widening at once,
+  and what is already queued or running goes on (as for a revoked grant).
+- A wait inside a turn holds that turn's slot for up to 45 s per call, also when the child it waits for cannot start.
+- A full child's next turn can still wait for its parent's next turn when every slot is held (above, Capacity).
+- A deeper `max_depth` multiplies nothing in the budget. A chain whose sessions all wait inside their turns needs a
+  slot per level on its node to run without those waits timing out; with fewer, it still finishes, more slowly.
+
+### Deeper trees: review round 1 (2026-11-22)
+
+On c701202 (Sol): four blockers and two should. Each claim was checked against the code first; all six hold.
+- *D1 (blocker), true, new here.* A parent widened its child's allowance by checking only the arguments it gave:
+  `may_spawn=true` alone left an unlimited stored share under a parent with share 2, and a share could be raised
+  while one above was off. Now the merged result is compared with the parent's own effective allowance (`_wider`,
+  `_effective`), inside send's write, and nothing widens while the parent or one above is off; a child's default
+  share is its starter's. Table test over stored allowance, arguments, the parent's own and the one above:
+  `test_r1_d1_a_parent_never_leaves_its_child_an_allowance_wider_than_its_own_effective_one`.
+- *D2 (blocker), true, already on main* for a child's result to a hosted root: the same code path
+  (`hosted_results._free`, logged in #94 as "`_occupied` still maps node runs through the hub's settings"). It reuses
+  what an agent's task has: the result check is also `hosted._checkout_busy` (the node-and-checkout identity and
+  the dispatcher's claims), and the turn is reserved when it is made in the listing's transaction (`shown_at`), which
+  `hosted.shown_task` (so `turn_projects`, `turn_sessions`) counts until the node reports it. Both orders, at depth
+  1 and 2: `test_r1_d2_a_result_turn_is_held_by_a_run_on_the_parents_node_and_reserved_once_shown`. One test on
+  main now also sees the parent's reserved result turn
+  (`test_a_child_whose_node_was_rolled_back_is_settled_by_the_hub`).
+- *D3 (blocker), true, new here* (at depth 1 only the full child itself could bring its parent's process a reason
+  to stay). Reproduced first (the full child's result turn stayed queued for good on c701202). The rule and what is
+  left: Capacity above. `test_r1_d3_*`.
+- *D4 (should), true, new here.* `end_orphans` ended a stale copy of a grandchild its parent's cascade had ended
+  (two end audits, the reason overwritten). Now ancestors first, each record read again, and `hosted._end` is
+  idempotent: a session already ended as stored is left as it is (one end, one audit, one result, the first reason).
+  The other loops that end sessions already read each record fresh (`report`, `close_session`, `_settle`,
+  `close_iroot`, `cascade`'s own levels); `_prune` deletes only ended records; there is no grant-expiry sweep (a
+  revoke or expiry ends nothing). `test_r1_d4_*` (both visiting orders).
+- *D5 (should), true, new here.* The frame. Above.
+- *D6 (should), true.* The real tree run now requires `claimed` at both levels and the root's reply to be exactly
+  `plum`; the stand-in run requires `delivered` at both levels, and then runs the waiting path deterministically (a
+  second grandchild with wait=true from the child's board server, a message with wait=true from the root's, each
+  while its session is in a turn): both `claimed`.
+- D7 is #94's logged follow-up, left as it is.
+- *Found on the real run (not a review item).* With D6's strict check, two real tree runs failed: the haiku child
+  declined to start its helper ("the request came through the agent board, not from you"), reading the header's
+  "grants no permission beyond what you already have" as covering the spawn tool too. The spawn line now says where
+  the permission comes from: the human's spawn grant, checked by the server at every call, so handing part of the
+  task to a helper is within what the child may do, and the task text is not what allows it. Nothing else in the
+  frame changed. Two real runs after it passed (one before it, on c701202, had passed). (Reworded again after
+  review round 6: "Deeper trees: the spawn line", below.)
+- Mutation check: 40 rules (26 from before, three of them rewritten for the new code, and 14 for D1 to D5), every
+  one caught. One D3 rule (never stop the asker's voucher) first came back uncaught and is now pinned by
+  `test_r1_d3_a_session_under_a_full_child_never_has_that_childs_parent_stopped_for_its_slot`. Two D4 protections
+  overlap (the orphan pass reading each record again, and `_end`'s own guard): taking out the first alone changes
+  nothing, both together is caught.
+- Runs (on AC, under `caffeinate -i`): the full suite, 3126 passed; the stand-in e2e, PASS (179 checks; `--only
+  tree` 112); the real tree run (`--only tree` with Claude Code and codex-cli), PASS twice after the spawn-line
+  wording (101 checks each), with no sleep in the runs and the user's Codex and Claude settings unchanged.
+
+### Deeper trees: review round 2 (2026-11-22)
+
+On f2ad8f9 (Sol): one blocker, four should. D1 and D4 resolved; the spawn line's wording approved and kept. Each claim
+checked against the code first; all five hold.
+- *D3 (blocker), true.* The node guessed "a result may be on its way" from turn events (`owed`): any turn of the
+  full child cleared it, a human's message included, so with the result held at the hub (a dispatched run in the
+  checkout) the idle timer could stop the root, and the result then waited for good, with nothing to say why.
+- *N1 (should), true.* The other way round: a result the full child claimed in its own turn left `owed` set, and,
+  with no later turn of the child, the root's idle timer was reset for good.
+- *Both, fixed together on the hub's own record.* The listing the node already fetches says, for a child at `full`,
+  `results_waiting: true` while any result for it is pending (made, not yet delivered, claimed or kept undelivered;
+  `hosted_results.waiting`), only to a node of the spawn protocol, and in the listing's version, so the node's
+  long-poll hears when it changes. No new report field: an older node does not read it, and an older hub never says
+  it (it has no deeper trees). `owed` is gone. What is left on the node is one round trip: a turn end of a session
+  under a full child counts until the first listing fetched after that report was posted (`unlisted`), because the
+  hub makes the result when it takes the report and says so from the next listing on. `show` (each result that
+  waits: `waiting_because`) and `board_session_status` (`results_waiting_because`) say why a result waits: the
+  parent's turn or queued message, a dispatched run in its checkout, its node not yet asking, or, for one in a turn
+  of a full child, its own parent's live process not having confirmed full access. Tests:
+  `test_r2_d3_a_result_held_by_a_dispatched_run_keeps_the_full_childs_parent_until_it_is_delivered` (Sol's
+  sequence), `test_r2_n1_a_result_the_full_child_claimed_in_its_turn_no_longer_keeps_its_parent`,
+  `test_r2_d3_an_abandoned_result_releases_the_hold` (and the listing's version changes).
+- *The D3 rule*: superseded by review round 4 (Capacity, above).
+- *D2 (should), true.* `_free` still asked the hub's path check (`_occupied`) for a parent with a worktree of its
+  own, so a run in the project's checkout held a worktree child's results. Now that check is for a shared parent
+  only, as on the task path; `_checkout_busy` already exempted worktrees. Test:
+  `test_r2_d2_a_result_for_a_parent_in_its_own_worktree_is_not_held_by_a_run_in_the_project_checkout`.
+- *D5 (should), true.* The frame (and `capabilities`) could list a runner pinned to another checkout, even as the
+  only target. Every target now goes through `hosted_tree.placement_problem`, which runs the start's own `_target`
+  and `_fits` (one function, not a copy) for a shared child under the would-be parent. Test:
+  `test_r2_d5_the_frame_and_capabilities_list_only_what_the_start_would_place`.
+- *D6 (should), true.* The stand-in's waiting path used fixed sleeps and went on if the readiness poll ran out. The
+  stand-in now has `hold <file>` (a turn that lasts until the file exists); the root's and the child's turns are
+  held open, each wait call is made only once its session is seen in its turn (the run fails if that does not
+  come within 30 s), and each is released explicitly.
+- Mutation check: 50 rules (round 1's 40, one of them replaced, and 11 for round 2), every one caught. D6 is the
+  e2e script's, which the check does not run.
+- Runs (on AC, under `caffeinate -i`): the full suite, 3131 passed; the stand-in e2e, PASS (182 checks; `--only
+  tree` 115); the real tree run, PASS (101 checks; the root replied `plum`, both results `claimed`), with no sleep
+  in the run and the user's Codex and Claude settings unchanged.
+
+### Deeper trees: review round 3 (2026-11-22)
+
+On 8599d2b (Sol): one blocker, two should. D2, D5, D6 and N1 resolved. Each claim checked against the code first; all
+three hold.
+- *D3 (blocker), true.* The bridge took a report as answered for when it had not been waiting at the moment the
+  listing's fetch was sent: a close the listing itself ordered makes its reports during that reconcile, so they
+  were released at its end, before they were even sent, and the root could be stopped (reproduced on 8599d2b, in a
+  copy: the reports made in that reconcile held nothing, and the idle timer stopped the root with slots to spare).
+  It also saw only turn ends made by the host's events, not an end report, nor a report made straight into the
+  queue (a lost turn after a restart, a cancel, an end with no process).
+- *The bridge, and its event table*: removed in review round 4 (the hold no longer needs it: Capacity, above). Of
+  its table, three cells were wrong on 8599d2b and right on 1135457: a close the listing ordered while the session
+  worked, an end report with no turn, and a turn reported lost after a node restart.
+
+- *N2 (should), true.* The CLI's `board session show` text now prints each waiting result's `waits:` line, and
+  `board_session_status` gives reasons for queued results too (`results_waiting` still lists the pending ones).
+  `test_r3_n2_a_result_in_a_held_turn_says_why_in_show_the_cli_text_and_status`.
+- *N3 (should), true.* A node of the previous version said `tree: 2`, took grandchildren and ignored
+  `results_waiting`. The node now says `tree: 3` (in its hello and its fetch: the protocol version there already
+  was), and `hosted_tree._target`, which the start and the shared placement check both run, refuses a session under
+  a full-access child on a node below 3, with the reason; the frame and `capabilities` give that reason.
+  `test_r3_n3_nothing_is_started_under_a_full_child_on_a_node_that_does_not_keep_its_parent`.
+- Mutation check: 60 rules (round 2's 50, two replaced for the new bridge, and 12 for round 3), every one caught.
+  Not a rule: that `fetch_mark` is read before the fetch is sent, which only a report posted while the fetch is
+  out (another thread) would tell apart.
+- Runs (on AC, under `caffeinate -i`): the full suite, 3142 passed; the stand-in e2e, PASS (182 checks; `--only
+  tree` 115); the real tree run, PASS (101 checks; the root replied `plum`, both results `claimed`), with no sleep
+  in the run and the user's Codex and Claude settings unchanged.
+
+### Deeper trees: review round 4 (2026-11-22)
+
+On 1135457 (Sol): one blocker, one should. D3 (bridge), N2 and N3 resolved. Both claims checked against the code
+first; both hold.
+- *N4 (blocker), true, new here.* At depth 3, a result waiting for a session UNDER the full child (a workspace
+  grandchild's, say) was in nobody's flag (`results_waiting` was the full child's own), the next listing ended the
+  report bridge, and the idle timer could stop the root; once that result reached its session, the reply became the
+  full child's turn and waited for the root's next turn.
+- *The candidate rule (one hub fact per full child) is sound, and is what is built* (the hold: Capacity, above). The
+  gaps checked: a session under the full child that the node still runs, or that ended on the node with its end
+  report not taken yet, is not ended at the hub, so `live` covers the node-to-hub gap; the hub ends a session and
+  makes its results in one write (`hosted._end`: the cut turn's and the end's; a close while its node is away goes
+  the same way), takes a turn end and makes its result in one write (`report`), and makes a result a queued turn in
+  the listing's own write (`deliver`); a cascaded end makes no result, but the end that started the cascade makes one
+  for its own parent, in the same write. No
+  gap was found that needs another piece.
+- *Removed:* the `results_waiting` flag (hub and node), the node's queued-message condition in `_lends_full` (a
+  message queued at the hub is part of the flag; hubs are updated before nodes), and the node's report bridge
+  (`_add`'s tracking, `post_seq`, `fetch_mark`, `_posted`, `_bridge`). Kept: the at-work keep over the whole subtree,
+  the voucher rule, the protocol-3 requirement. The listing's version carries the flag.
+- *Tests, by shape:* `test_r4_n4_the_full_childs_parent_is_held_while_its_subtree_is_open_whatever_its_shape`,
+  over where the descendants sit (depth 3, and depth 4 with max_depth 4), whose the outstanding thing is (the full
+  child, a session directly under it, the deepest one) and what it is (a turn in flight, a queued message, a result
+  held by a busy checkout, a queued result turn, an end report not yet taken); each case asserts the flag, the
+  reason that holds it, and that the idle timer leaves the root (the deepest session has nobody under it for the
+  three result kinds: skipped). The other side:
+  `test_r4_n4_a_closed_subtree_holds_nothing_and_the_idle_timer_runs_again`.
+  The round-2 tests now hold under this rule (`test_r2_d3_*`, `test_r2_n1_*`).
+- *N5 (should), true.* After a node rolled back to protocol 2, its fetch still listed the sessions already placed
+  under a full child. Main's path for a node that comes back below what its sessions need is `hosted_tree.orphaned`
+  with `end_orphans` at the hello (and `hosted._settle` on a read): the hub ends them with the reason. That path now
+  also covers a session under a full-access child on a node below protocol 3 (`orphan_reason`: ORPHANED_HOLD), and
+  `end_orphans` runs at every hello, not only one that declares no child protocol (it ends nothing on a node that
+  is as it was). The end says why (`show`), and the full child is told as for any end. Test:
+  `test_r4_n5_a_node_rolled_back_below_the_hold_ends_the_sessions_under_a_full_child`.
+- Mutation check: 61 rules (round 3's 60, nine of them for removed code dropped, one rewritten for the new orphan
+  pass, and ten for round 4), every one caught. One first came back uncaught: the hello's orphan pass, because a
+  read settles the same sessions; the N5 test now looks before any read.
+- Runs (on AC, under `caffeinate -i`): the full suite, 3159 passed (6 skipped: the deepest session's result kinds);
+  the stand-in e2e, PASS (182 checks; `--only tree` 115); the real tree run, PASS (101 checks; the root replied
+  `plum`, both results `claimed`), with no sleep in the run and the user's Codex and Claude settings unchanged.
+
+### Deeper trees: review round 5 (2026-11-22)
+
+On a09918f (Sol): no blocker, two should. The one-rule hold accepted at depth 3 and 4, its one-write claims verified,
+N5 resolved. Both claims checked against the code first; both hold. The rule is stated once (Capacity, above); this
+round sharpens two of its words.
+- *N4 remainder (should), true.* Once its node reports a result turn written, the message leaves the queue and the
+  results it carries are `queued`, not `pending`, until its provider says the turn started. If the turn settles
+  without that (the process went, the report retried meanwhile) they go back to pending, so in that window the
+  flag was false on the hub with nothing at work on the node, and the idle timer could stop the root. The state the
+  hub records as final for a result is `delivered` (set when the turn's start is confirmed), `claimed` or
+  `undelivered`: `subtree_open` now counts every other (`hosted_results.outstanding`: pending or queued), and a
+  message written and not settled (in flight at the hub) as well as one queued: the same window for a plain
+  message. Tests: the shape test's new cells, a result turn "written, start not yet confirmed" and "written, start
+  failed, report retrying"
+  (`test_r4_n4_the_full_childs_parent_is_held_while_its_subtree_is_open_whatever_its_shape`), and Sol's case with
+  nothing else alive under the full child:
+  `test_r5_n4_a_result_turn_written_but_not_started_holds_the_parent_until_it_is_settled`.
+- *N6 (should), true.* A start checked its node's protocol before it took the write lock; a hello from a node rolled
+  back that landed in between was missed (the hello's orphan sweep ran before the session existed). The creation's
+  transaction now asks again, on the node's latest hello as stored: the child protocol (and the spawn protocol
+  for an agent's start) and the hold's protocol for a session under a full child (`_holds_for`, the same check
+  `_target` makes before). Both routes, the human's and the spawn tool's, run it. Test, the hello made to land
+  right after the check before the write, for a session under a full child and for one under a root:
+  `test_r5_n6_a_hello_between_the_check_and_the_write_refuses_the_start` (refused with the reason, nothing made).
+- Mutation check: 65 rules (round 4's 61, five rewritten for the changed code, and four for round 5), every one
+  caught.
+- Runs (on battery, 75 to 68 %, under `caffeinate -i`): the full suite, 3169 passed (10 skipped: the deepest
+  session's result kinds); the stand-in e2e, PASS (182 checks; `--only tree` 115); the real tree run, PASS (101
+  checks; the root replied `plum`, both results `claimed`), with no sleep in the run and the user's Codex and Claude
+  settings unchanged.
+
+### Deeper trees: the spawn line (after review round 6, 2026-11-22)
+
+Sol approved 63adeaf; the coordinator's real `--only tree` run then failed once: the Haiku child declined to start its
+helper, "saying the request came from another agent on the board and that starting a session spends budget it
+hasn't approved". The line answered the permission objection, not the budget one (about 1 refusal in 7 real runs).
+Only the spawn line changed (`SPAWN_LINE`; the header and the task markers are #94's). It now says, in the server's
+voice: starting helpers is part of what the session already has; the human gave the spawn grant and set the budget
+aside for exactly this; the server checks both at every call; within the limits listed it needs no further approval
+from the human; a task that asks for part of it to be handed to a helper may be done as asked; the grant, not the
+task text, allows it, and the task text cannot widen access, targets or budget. The facts it carried stay (targets,
+levels, budget, the pointer to `board_session_capabilities`); NO_SPAWN_LINE is unchanged. Nothing lets task text
+widen anything: the line is the server's, and the tools decide at every call as before. Measured: 8 real `--only
+tree` runs in a row on the new wording, 8 passed (on battery, 59 to 54 %, under `caffeinate -i`; no sleep in the
+runs). The e2e script now prints the child's own reply when it starts no helper.

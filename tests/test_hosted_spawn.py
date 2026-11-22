@@ -6,7 +6,6 @@ feature switched off. Real hub routes and the node's SessionRunner with fake pro
 test_hosted_results; the MCP tools through the real MCP server in memory. Never a real agent CLI."""
 
 import asyncio
-import dataclasses
 import json
 import os
 import re
@@ -59,13 +58,6 @@ def interactive(env, project=PROJECT, sid=None) -> hs.Ident:
 def _no_codex_home_of_the_users(tmp_path, monkeypatch):
     """A Codex session with a binding reads its Codex configuration (session_host.codex_config_of): never the user's."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-
-
-@pytest.fixture
-def deeper(monkeypatch):
-    """A test-only override: trees two levels deep (the setting itself is capped at 1 in this version)."""
-    real = hosted_tree.spawn_config
-    monkeypatch.setattr(hosted_tree, "spawn_config", lambda board: dataclasses.replace(real(board), max_depth=2))
 
 
 def spawn(env, ident, task="look at the diff", agent="claude", who="claude", **kw) -> dict:
@@ -143,8 +135,10 @@ def test_a_hosted_session_starts_a_child_with_a_task_the_hub_frames_and_gets_its
     assert head == hs.TASK_HEADER.format(what="A task", who=f"hosted session {sid} (agent claude)",
                                          who_cap="That session", token=token)
     assert "not the human" in head and "untrusted data" in head
-    assert rest == f"<<<task {token}>>>\nCount the TODOs in src/\n<<<end task {token}>>>", \
-        "no line about starting sessions of its own: the depth limit is 1"
+    line, rest = rest.split("\n", 1)
+    assert line.startswith("You may start helper sessions of your own") and "depth 1 of at most 2" in line, \
+        "the shipped depth is 2: a child may start helpers, theirs may not"
+    assert rest == f"<<<task {token}>>>\nCount the TODOs in src/\n<<<end task {token}>>>"
     answer(senv, kid, "There are 4")
     [res] = results_of(senv, sid)
     assert (res["state"], res["outcome"], res["started_by"], res["child"]) == ("pending", "completed", "parent", kid)
@@ -601,15 +595,20 @@ def test_a_retry_id_finds_only_a_child_the_same_starter_made(senv):
 
 
 def test_a_childs_own_spawn_call_is_refused_at_the_depth_limit(senv):
+    with_spawn(senv, max_depth=1)
     sid = a_root(senv)
     grant(senv)
     kid = spawn(senv, bound(senv, sid))["child"]["id"]
     tick(senv)
+    [text] = kid_turns(senv, kid)
+    assert text.split("\n")[1] == hs.NO_SPAWN_LINE.format(why=hs.LAST_LEVEL.format(depth=1, max_depth=1)), \
+        "at the last level the frame says plainly that it cannot"
     ik = bound(senv, kid)
     with pytest.raises(Conflict, match="depth limit"):
         spawn(senv, ik)
     caps = hs.capabilities(senv.board, senv.p["claude"], ik)
     assert caps["caller"]["depth"] == 1 and any("depth limit" in w for w in caps["why_not"])
+    assert caps["limits"]["levels_below_you"] == 0
 
 
 def test_status_shows_only_the_outcome_of_the_turns_the_caller_started(senv):
@@ -775,7 +774,7 @@ def test_a_limit_the_write_transaction_finds_still_raises_its_item(senv, monkeyp
 # ------------------------------------------------------------ the allowance, and what a child is told
 
 
-def test_children_may_spawn_by_default_and_the_parent_or_the_human_can_change_that_while_they_run(senv, deeper):
+def test_children_may_spawn_by_default_and_the_parent_or_the_human_can_change_that_while_they_run(senv):
     with_spawn(senv, max_live_children=10)
     sid = a_root(senv)
     grant(senv)
@@ -790,8 +789,8 @@ def test_children_may_spawn_by_default_and_the_parent_or_the_human_can_change_th
     r = stored(senv, grandchild["id"])
     assert (r["parent"], r["root"], r["depth"]) == (kid, sid, 2), "under its parent, in the same tree"
     tick(senv)
-    assert all(not ln.startswith("You may start helper sessions") for ln in kid_turns(senv, grandchild["id"])[0]
-               .split("\n")), "at the depth limit the line is left out"
+    assert kid_turns(senv, grandchild["id"])[0].split("\n")[1] == hs.NO_SPAWN_LINE.format(
+        why=hs.LAST_LEVEL.format(depth=2, max_depth=2)), "at the depth limit the frame says it cannot"
     with pytest.raises(Conflict, match="depth limit"):
         spawn(senv, bound(senv, grandchild["id"]))
     hs.send(senv.board, senv.p["claude"], bound(senv, sid), kid, may_spawn=False)
@@ -820,7 +819,8 @@ def test_the_task_is_framed_by_the_server_and_nothing_agent_written_is_unescaped
     token = TASK.search(text).group(1)
     lines = text.split("\n")
     start_, end_ = lines.index(f"<<<task {token}>>>"), lines.index(f"<<<end task {token}>>>")
-    assert lines[:start_] == [lines[0]] and lines[end_ + 1:] == [] and "\n".join(lines[start_ + 1:end_]) == evil
+    assert lines[:start_] == lines[:2] and lines[1].startswith("You may start helper sessions") \
+        and lines[end_ + 1:] == [] and "\n".join(lines[start_ + 1:end_]) == evil, "two server lines, then the task"
     assert token not in evil
     tokens = iter(["0" * 16, "1" * 16])        # the first token the server draws is in the text: it draws again
     monkeypatch.setattr(hs.secrets, "token_hex", lambda n: next(tokens))
@@ -1251,7 +1251,7 @@ def test_a_node_forgets_which_report_fields_its_hub_takes_whenever_a_hub_call_fa
     assert "answered" in runner.hub_features
 
 
-def test_results_of_a_deeper_tree_go_to_the_direct_parent_and_the_limits_are_the_grants(senv, deeper):
+def test_results_of_a_deeper_tree_go_to_the_direct_parent_and_the_limits_are_the_grants(senv):
     with_spawn(senv, max_live_children=2)
     sid = a_root(senv)
     grant(senv)
@@ -1276,15 +1276,19 @@ def test_the_spawn_settings_ship_off_with_the_plans_limits_and_are_parsed_strict
     from agent_comms.dispatch import DispatchConfig
     shipped = DispatchConfig.load(Path(__file__).resolve().parents[1] / "board.toml", local=False).sessions.spawn
     assert (shipped.enabled, shipped.max_depth, shipped.max_live_children, shipped.max_spawns_per_hour,
-            shipped.max_turns_without_human, shipped.targets) == (False, 1, 5, 12, 40, [])
-    for bad in ({"max_depth": 0}, {"max_depth": 2}, {"max_live_children": True}, {"targets": "claude"},
+            shipped.max_turns_without_human, shipped.targets) == (False, 2, 5, 12, 40, [])
+    assert dispatch_mod.SpawnConfig().max_depth == 2, "the default is the shipped value"
+    for n in (1, 2, 3, 4):
+        assert DispatchConfig.from_dict({"sessions": {"spawn": {"max_depth": n}}}).sessions.spawn.max_depth == n
+    for bad in ({"max_depth": 0}, {"max_depth": 5}, {"max_depth": True}, {"max_depth": 2.0},
+                {"max_live_children": True}, {"targets": "claude"},
                 {"targets": ["Claude"]}, {"targets": ["a", "a"]}, {"max_spawns_per_hour": 0},
                 {"max_live_per_tree": 3}):
         with pytest.raises(ValueError):
             DispatchConfig.from_dict({"sessions": {"spawn": bad}})
 
 
-def test_a_targets_list_limits_what_may_be_started_and_a_child_only_what_is_no_dearer_than_itself(senv, deeper):
+def test_a_targets_list_limits_what_may_be_started_and_a_child_only_what_is_no_dearer_than_itself(senv):
     with_spawn(senv, max_live_children=10, targets=["claude/haiku", "claude"])
     sid = a_root(senv)
     grant(senv)
@@ -1294,7 +1298,8 @@ def test_a_targets_list_limits_what_may_be_started_and_a_child_only_what_is_no_d
     cheap = spawn(senv, ident, model="haiku")["child"]["id"]
     dear = spawn(senv, ident)["child"]["id"]
     tick(senv)
-    assert "): targets claude/haiku; within" in kid_turns(senv, cheap)[0].split("\n")[1], "only itself"
+    assert "): targets claude/haiku (cheapest first: only those cheaper than or equal to your own;" in \
+        kid_turns(senv, cheap)[0].split("\n")[1], "only itself"
     with pytest.raises(Conflict, match="cheaper than or equal"):
         spawn(senv, bound(senv, cheap))
     spawn(senv, bound(senv, cheap), model="haiku")

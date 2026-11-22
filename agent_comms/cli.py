@@ -977,6 +977,8 @@ def _fmt_result(x: dict) -> list[str]:
             + (f"; sent before in message(s) {', '.join(str(a) for a in x['attempts'])}, not confirmed"
                if x.get("attempts") else ""))
     out = [head]
+    if x.get("waiting_because"):
+        out.append(f"  waits: {x['waiting_because']}")       # the hub's words (hosted_results.waiting_because)
     if x["state"] == "undelivered":
         out.append(f"  not delivered: {x.get('why') or 'no reason given'}")
         out += ["  | " + line for line in (x.get("text") or "(no output)").splitlines()]

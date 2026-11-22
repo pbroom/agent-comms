@@ -151,6 +151,11 @@ class SessionRunner:
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
+        # The full children whose subtree the hub's listing says is open (`subtree_open`, hosted_tree.subtree_open:
+        # a session under it the hub has not recorded as ended, a result anywhere in it not yet delivered, claimed or
+        # kept undelivered, or a message queued at the hub for it or under it). Such a child's next turn may come,
+        # and needs its parent's live process: its parent is spared meanwhile (`_lends_full`). The hub's own record.
+        self.subtree_open: set[str] = set()
         self.worktrees: dict[str, dict] = self._load_worktrees()
         self.swept = float("-inf")
         self.max_live, self.idle_seconds = config.sessions.max_live, config.sessions.idle_hours * 3600
@@ -392,7 +397,7 @@ class SessionRunner:
         return True
 
     def _sync(self, wait: float) -> dict:
-        params: dict[str, Any] = {"wait": wait, "tree": 2,     # it speaks the child-session protocol, spawn included
+        params: dict[str, Any] = {"wait": wait, "tree": 3,     # the child-session protocol, spawn and the hold included
                                   # how long it may take to stop a session's process after the hub last heard from it
                                   # (`shutdown_bound`), stated before any work is listed to it; and the listing it last
                                   # applied (hosted.may_still_run)
@@ -526,6 +531,10 @@ class SessionRunner:
                     self._ended_without_process(sid, why)
                 continue
             parent = view.get("parent") if isinstance(view.get("parent"), str) else None
+            if view.get("subtree_open") is True:
+                self.subtree_open.add(sid)
+            else:
+                self.subtree_open.discard(sid)
             if parent is not None:
                 self.parent_of[sid] = parent
                 if self._parent_problem(parent, None) is not None:     # before anything is opened or made for it
@@ -599,6 +608,7 @@ class SessionRunner:
         for sid in [x for x in self.queue if x not in listed]:
             del self.queue[sid]
         self.ending &= set(listed)
+        self.subtree_open &= set(listed)
         self.pending = [(sid, e) for sid, e in self.pending if sid not in self.dropped]
         if set(self.handed) - set(listed):
             self.handed = {sid: n for sid, n in self.handed.items() if sid in listed}
@@ -751,17 +761,43 @@ class SessionRunner:
         parent = self.host.sessions.get(parent_id)
         return parent is not None and not parent.ended and not self._awaits_parent(parent_id, s)
 
+    def _under(self, sid: str) -> list[str]:
+        """The sessions below `sid` on this node, as the hub listed them (children, theirs, and so on)."""
+        out, level = [], [sid]
+        while level:
+            level = [kid for kid, pid in self.parent_of.items() if pid in level and kid not in out]
+            out += level
+        return out
+
+    def _full_above(self, sid: str) -> str | None:
+        """The `full` child at or above `sid` (deeper trees: only a root's child can be full) whose parent's live
+        process vouches for it, or None."""
+        cur, hops = sid, 0
+        while cur in self.parent_of and hops < 10:
+            s = self.host.sessions.get(cur)
+            if s is not None and not s.ended and s.access == "full":
+                return cur
+            cur, hops = self.parent_of[cur], hops + 1
+        return None
+
     def _lends_full(self, sid: str, waiting: bool = True) -> bool:
-        """This session's live process is what lets a `full` child of it take turns, and such a child is at work
-        (a turn in flight, or a message already handed to it) or, with `waiting`, has one queued at the hub.
-        Stopping that process would hold the child until the parent's next turn."""
+        """This session's live process is what lets a `full` child of it take turns. KEPT (True whatever `waiting`
+        says) while that child or a session under it is at work here (a turn in flight, or a message handed to it);
+        with `waiting`, SPARED while the hub's listing says the child's subtree is open (`subtree_open`: anything
+        under it not ended, or a result or a message for it or under it not yet settled), for whatever comes of it is
+        that child's next turn. Stopping that process would hold the child until the parent's next turn."""
         parent = self.host.sessions.get(sid)
         if parent is None or parent.ceiling != "full":
             return False
         for kid, pid in self.parent_of.items():
             k = self.host.sessions.get(kid)
-            if (pid == sid and k is not None and not k.ended and k.access == "full"
-                    and (k.busy or k.inbox or (waiting and self.queue.get(kid)))):
+            if pid != sid or k is None or k.ended or k.access != "full":
+                continue
+            for x in [kid] + self._under(kid):
+                d = self.host.sessions.get(x)
+                if d is not None and not d.ended and (d.busy or d.inbox):
+                    return True
+            if waiting and kid in self.subtree_open:
                 return True
         return False
 
@@ -792,7 +828,10 @@ class SessionRunner:
             return True
         if not any(x.child is not None and x.stopping_since is not None for x in live):
             # (Not one whose provider runs a turn of its own in it: by the host's books it is idle, but it is working.)
-            own = self.parent_of.get(s.session_id) if s.access == "full" else None
+            # Never the process that vouches for the asker: the parent of the full child it is, or is under (its
+            # results are that child's turns, which need that parent's live process).
+            top = self._full_above(s.session_id)
+            own = self.parent_of.get(top) if top is not None else None
             idle = [x for x in live if x.child is not None and not x.busy and not x.inbox and not x.ended
                     and not self.host.holding(x) and x.session_id != own
                     and not self._lends_full(x.session_id, waiting=False)]
