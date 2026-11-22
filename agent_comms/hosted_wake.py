@@ -36,7 +36,7 @@ then queues one `wake` message, the only message kind that does not come from th
   then the dispatcher's for good: no wake is queued or handed for it, and no hosted session holds it again.
 - *Roots only.* A child session (hosted_tree.py) has no watcher record and is never woken, and nothing a child reads
   on the board counts as its root having read it: a board session registered with a hosted session's binding
-  (hosted_spawn.board_binding) counts for that session alone (`_credited`, the `mine` mark), and one with no binding
+  (hosted_spawn.board_binding) counts for that session alone (the `mine` mark), and one with no binding
   is held to the old rule (`_shadowed`: not while a child of the agent is around).
 - *After results.* While results of its child sessions wait for a session (hosted_results.py), no wake is queued
   for it, and one queued before they came steps back behind them when the node would be shown it (`_recheck`).
@@ -61,7 +61,7 @@ HUB = "hub"                     # who wrote a wake message and these records
 HOUR = 3600.0
 MAX_PENDING = 200               # posts waiting for one session; the oldest are dropped beyond this
 MAX_SEALED = 200                # sealed posts remembered so that their unsealing counts
-KEEP_WOKEN_SECONDS = 7 * 86400  # how long "a wake covered this post" is remembered (for `holds` with a receipt)
+KEEP_WOKEN_SECONDS = 7 * 86400  # how long "a wake covered this post" is remembered (for `holds` with a read mark)
 MAX_WOKEN = 500
 ALERT_RETRY_SECONDS = 60        # a Needs-you item that could not be posted is tried again after this long
 MARKER_KIND = "wake_limit"      # autorecover.POST_PREFIX marker of the Needs-you item
@@ -646,7 +646,7 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
                 rec["pending"][k] = keep[k]
         elif m.get("handed_at") is None:
             # Shown to the node now: the grace period counts from here. `woken` keeps the time the wake was queued,
-            # so that a read between then and now (a mark or a dated receipt) still counts as after the wake.
+            # so that a read between then and now (a `read` or `mine` mark) still counts as after the wake.
             rec["handed"][k] = now
     if defer:
         _uncount(rec, m)
@@ -682,8 +682,15 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     that has not ended, on a node seen within nodes.NODE_STALE_SECONDS, and either a wake covering the post was
     queued or handed less than `wake_grace_seconds` ago, or the board showed the post, at or after that wake was
     queued, to a board session that can be the hosted one: a session of the agent registered in this project that is
-    not a dispatched run's (`_own_reader`). Shown means the record's `read` mark (any view, `handed`) or a delivery
-    receipt of such a session. A session that was never woken for the post, or was woken and was not shown it,
+    not a dispatched run's (`_own_reader`). Shown means only the record's `read` or `mine` mark. `handed` writes it
+    right after the read (any view), looking the reader's session up again then, so the mark reflects the project the
+    session is registered in at that moment: the read's project, except when the session is re-registered between the
+    read and `handed` (DESIGN_NOTES "S30 for hosted sessions: follow-ups", A). A delivery receipt is no evidence (as
+    interactive_wake.read_after_delivery, S30): it names the board session, not the project that session was
+    registered in when it read. Both read paths that write receipts also call `handed`; a mark that `handed` failed to
+    write is lost, so that read supplies no hosted read evidence (follow-up B). The wake's grace, an earlier mark or
+    the interactive fallback below can still hold the request.
+    A session that was never woken for the post, or was woken and was not shown it,
     holds nothing once the grace has passed; and a post the dispatcher reserved a run for is the dispatcher's
     (`reserve`): whatever that run or anybody else reads afterwards, no hosted session holds it."""
     conn = getattr(board_or_conn, "conn", board_or_conn)
@@ -705,16 +712,14 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
             # A read by a board session that carries no binding cannot be told apart from a child's of the same
             # agent: while such a child has been around since the wake, it is not taken for the root's.
             return True
-        from . import delivery
-        if delivery.read_since(conn, post_id, agent, at, lambda sid: _credited(conn, sid, r, at)):
-            return True
     from . import interactive_wake      # a session the human opened himself, woken the same way (its own records)
     return interactive_wake.holds(board_or_conn, agent, project, post_id, now)     # off for a bare connection
 
 
 def _credited(conn, session_id: Any, r: dict, since: float) -> bool:
-    """A read by this board session counts as the hosted root `r` having the post: it is the agent's, registered in
-    r's project and not a dispatched run's (`_own_reader`), and either BOUND to r (registered from r's own process,
+    """(Not called by `holds` since S30 for hosted sessions: a receipt is no hold evidence. Kept for its tests until
+    follow-up C.) A read by this board session would count as the hosted root `r` having the post: it is the agent's,
+    registered in r's project and not a dispatched run's (`_own_reader`), and either BOUND to r (registered from r's own process,
     hosted_spawn.board_binding) or, carrying no binding at all, not possibly a child's (`_shadowed`). One bound to
     another hosted session (a child, of whichever root) never counts."""
     if not _own_reader(conn, session_id, r.get("agent"), r.get("project")):
@@ -753,7 +758,7 @@ def _shadowed(conn, r: dict, since: float) -> bool:
     """Some CHILD session of this root's agent in this root's project has been alive at or after `since` (to this
     day), whichever root it was started under. Asked only of a board session that carries NO binding
     (hosted_spawn.board_binding: with child sessions on, every hosted session's own board server registers bound
-    to it, so a child's read is the child's and a root's own read is the root's, `_credited`). Such an unbound
+    to it, so a child's read is the child's and a root's own read is the root's, the `mine` mark of `handed`). Such an unbound
     session signs in with the same identity as a child of the agent, and nothing in its row says which process
     opened it: registered in the project it passes `_own_reader` exactly as the root's own board session does. So
     while such a child was around, an unbound read is not taken for the root's: a child's read must never keep the

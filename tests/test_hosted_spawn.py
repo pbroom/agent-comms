@@ -1020,11 +1020,12 @@ def test_a_bound_board_session_is_its_own_sessions_reader_whatever_children_are_
     assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), \
         "the root's own read counts, with a child of the agent around (no _shadowed refusal for a bound reader)"
     senv.board.read_updates(senv.p["claude"], root_reader)      # unfiltered: its own delivery receipt
-    with hosted.db.write_tx(senv.board.conn) as c:              # without the mark, the receipt alone
-        rec = hosted_wake._load(c, sid)
+    with hosted.db.write_tx(senv.board.conn) as c:              # a read whose mark was lost (`handed` failed to
+        rec = hosted_wake._load(c, sid)                         # write it), with the receipt committed before
         rec.pop("mine")
         hosted_wake._save(c, sid, rec, now())
-    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "its receipt counts as well"
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), \
+        "a read whose mark was lost holds nothing: the receipt alone is no read evidence (S30 hosted, follow-up B)"
     unbound = senv.session("claude")
     assert not hosted_wake._credited(senv.board.conn, unbound, stored(senv, sid), 0), \
         "a reader with no binding is still held to the old rule while such a child is around"
