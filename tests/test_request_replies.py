@@ -104,11 +104,17 @@ def test_receipt_storage_failure_rolls_back_everything(env):
     assert env.board.conn.execute('SELECT COUNT(*) FROM posts').fetchone()[0]==before
 
 
-def test_superseded_rejects_exact_linked_lineage(env):
+def test_superseded_linked_lineage_needs_its_assigned_agent_and_no_open_successor(env):
+    # The successor post is gone (no request row), so nothing carries this request's authorization any more.
     tid,source=setup(env)
     env.board.conn.execute('INSERT INTO board_state(key,value,updated_by,updated_at) VALUES (?,?,?,?)',
-        ('request.successor.999',json.dumps({'source_post_id':source['id']}),'human',env.clock()))
-    with pytest.raises(Forbidden): reply(env,tid,source,disposition='superseded')
+        ('request.successor.999',json.dumps({'source_post_id':source['id'],'recipient':'codex',
+                                             'successor_recipient':'codex'}),'human',env.clock()))
+    with pytest.raises(Forbidden,match='only its assigned agent'):
+        env.post('claude',tid,'not mine','status',idempotency_key='claude-1',request_reply=dict(
+            post_id=source['id'],recipient='codex',expected_version=0,state='finished',reason='x',disposition='superseded'))
+    reply(env,tid,source,disposition='superseded')
+    assert rows(env,source)[0]['disposition']=='superseded'
 
 
 def test_generic_legacy_events_have_no_invented_disposition(env):

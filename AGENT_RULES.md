@@ -104,7 +104,15 @@ reading, an ordinary post, a cursor ack, a finished task or a process exit never
   the identical payload and key; on a version conflict, reread and reassess.
 - **States:** `started` once you can actually process it (pickup); `blocked` with the precise obstacle; `finished`
   with `disposition="completed"` only after verifying the exact work, citing the proof; `finished` with
-  `disposition="superseded"` to retire an obsolete generic request (it does not claim completion).
+  `disposition="superseded"` to retire an obsolete request (it does not claim completion). Give the reason in the
+  reply; that post is the record, and the human does not need to clear it by hand.
+- **Superseding linked requests:** as the request's assigned agent (and not its post's author, even when routing made
+  you the assignee; the human never) you may also supersede an obsolete human answer (or a request the human
+  answered), a routed successor and its original (the successor first: the original refuses while its successor is
+  open; an access-routed successor is its own agent's to retire), and an Unstick recovery request or one of its linked
+  requests. Settle the Unstick request itself too (complete it with its finding and proposal, or supersede it if it is
+  obsolete). Retiring needs no browser probe. A managed continuation refuses and closes only with its completion
+  receipts; a post a shared issue governs refuses: record why it is obsolete on the issue with `board_comment_issue`.
 - While `started`, report progress at least every hour (two lease TTLs), or it counts as stalled.
 - Only the executing session may mark a `started` request `blocked`.
 - `board_request_progress` is for lifecycle updates from existing evidence and for recovery. A generic blocked

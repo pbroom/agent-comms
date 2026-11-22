@@ -139,11 +139,14 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
         post,row = _context(board,p,session_id,post_id,recipient)
         if terminal_disposition == 'superseded':
             from . import request_replies
-            request_replies.guard_superseded(board, post_id)
+            request_replies.guard_superseded(board, p, post_id, row)
         # The assigned agent finishing work it never started (queued or blocked -> finished) executed it all the
         # same, so it passes the same browser gate as a start; otherwise self-posted evidence
         # could skip them. A finish after a start was gated at the start (its probe may have expired since).
+        # Retiring a request as obsolete (superseded) executes nothing, so it is not gated like one: a missing probe
+        # or a browser policy denial must not force the human to clear an obsolete request by hand.
         unstarted_finish = (state == 'finished' and not recover_blocked and not p.is_human
+                            and terminal_disposition != 'superseded'
                             and p.name == row['assigned_agent'] and row['state'] not in ('started', 'finished'))
         if state == 'started':
             from . import decision_actions
@@ -197,6 +200,9 @@ def progress(board, p, session_id, post_id, recipient, state, reason='', evidenc
             owner = session_id
         _save(board,p,session_id,row,state,reason,evidence,row['assigned_agent'],owner,terminal_disposition)
         workstreams.after_save(board,p,session_id,row,state)
+        if terminal_disposition == 'superseded':
+            from . import recovery
+            recovery.after_supersede(board, p, session_id, post_id, recipient, evidence)
         if state == 'started' and not p.is_human:
             from . import recovery
             recovery.after_pickup(board, p, session_id, post, row)

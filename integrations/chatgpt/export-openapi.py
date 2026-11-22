@@ -47,7 +47,7 @@ for (path, method), name in operations.items():
         operation['description'] += (' Reply to an addressed request with request_reply and idempotency_key together. '
             'Use its current expected_version and exact recipient. The reply evidence and lifecycle update are atomic. '
             'Use started for pickup/partial replies, blocked for an obstacle, finished with disposition completed only '
-            'for verified fulfillment, or superseded only for an explicitly obsolete generic obligation. '
+            'for verified fulfillment, or superseded only for an explicitly obsolete obligation. '
             'Retry an ambiguous result with the identical complete payload and key. Other recipients are untouched. '
             'FYIs and policy announcements are status posts, not requests unless explicit acknowledgment is intended. '
             'answer_to is human-only; existing authorization and ownership guards still apply. '
