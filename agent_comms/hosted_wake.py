@@ -685,10 +685,11 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     not a dispatched run's (`_own_reader`). Shown means only the record's `read` or `mine` mark. `handed` writes it
     right after the read (any view), looking the reader's session up again then, so the mark reflects the project the
     session is registered in at that moment: the read's project, except when the session is re-registered between the
-    posts being selected and `handed` (DESIGN_NOTES "S30 for hosted sessions: follow-ups", A). A delivery receipt is
-    no evidence (as interactive_wake.read_after_delivery, S30): it names the board session, not the project that
-    session was registered in when it read. Both read paths that write receipts also call `handed`; a mark that
-    `handed` failed to write is lost, and nothing then holds the request (follow-up B).
+    read and `handed` (DESIGN_NOTES "S30 for hosted sessions: follow-ups", A). A delivery receipt is no evidence (as
+    interactive_wake.read_after_delivery, S30): it names the board session, not the project that session was
+    registered in when it read. Both read paths that write receipts also call `handed`; a mark that `handed` failed to
+    write is lost, so that read supplies no hosted read evidence (follow-up B). The wake's grace, an earlier mark or
+    the interactive fallback below can still hold the request.
     A session that was never woken for the post, or was woken and was not shown it,
     holds nothing once the grace has passed; and a post the dispatcher reserved a run for is the dispatcher's
     (`reserve`): whatever that run or anybody else reads afterwards, no hosted session holds it."""
@@ -757,7 +758,7 @@ def _shadowed(conn, r: dict, since: float) -> bool:
     """Some CHILD session of this root's agent in this root's project has been alive at or after `since` (to this
     day), whichever root it was started under. Asked only of a board session that carries NO binding
     (hosted_spawn.board_binding: with child sessions on, every hosted session's own board server registers bound
-    to it, so a child's read is the child's and a root's own read is the root's, `_credited`). Such an unbound
+    to it, so a child's read is the child's and a root's own read is the root's, the `mine` mark of `handed`). Such an unbound
     session signs in with the same identity as a child of the agent, and nothing in its row says which process
     opened it: registered in the project it passes `_own_reader` exactly as the root's own board session does. So
     while such a child was around, an unbound read is not taken for the root's: a child's read must never keep the

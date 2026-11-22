@@ -4371,19 +4371,31 @@ in another project, then re-register). Pinned by
 
 **S30 for hosted sessions: follow-ups** (from the branch's review; not done on it):
 
-- **A. Re-registering inside one read.** `Board._read_updates_once` and the post_ids view (core.py) select posts
-  with the reader's session row, then `delivery.record`, then `hosted_wake.handed` (via `_own_reader`) and
-  `interactive_wake.handed` look the session's project up again. A re-register into the request's project in between
+- **A. Re-registering inside one read.** Both read paths in core.py look the reader's session up first and then
+  look its project up again for the marks. `Board._read_updates_once` selects posts using that session row (its
+  project and cursors). The post_ids view only validates the session (`_session`) and selects the posts by id,
+  without using its project. Then `delivery.record` runs, and then `hosted_wake.handed` (via `_own_reader`) and
+  `interactive_wake.handed` read the session's project again. A re-register into the request's project in between
   makes `handed` write a mark for a read made elsewhere, and `reserve` refuses after the grace. Proposed fix: capture
-  the project and reader identity when the posts are selected and pass that snapshot to all recorders.
-- **B. A lost mark holds nothing.** `delivery.record` commits first; `hosted_wake.handed` swallows its exceptions and
-  only logs, so if its write fails the post is still returned with no mark. Before this branch the same-project
-  receipt still held the request; now the dispatcher may reserve it after the grace and start a run beside a session
-  that did read it. This head trades that for closing the cross-project hole. Judgment: the old failure is worse.
-  It is silent and lasts as long as the session stays live, keeping a request away from any run while the session
-  that "has" it was never shown it in this project. A lost mark needs a failed write after a committed one, and it
-  costs at most one duplicate run that the request lifecycle (claims, request_reply) makes visible. Proposed fix: write
-  the mark in the same transaction as the receipt, or record the read's project on the receipt and count it.
+  the project and reader identity when the read is made and pass that snapshot to all recorders.
+- **B. A lost mark is no read evidence.** `delivery.record` commits first. `hosted_wake.handed` swallows its
+  exceptions and only logs, so if its write fails the post is still returned with no mark. That read then supplies no
+  hosted read evidence. The wake's grace, an earlier mark, or the interactive fallback (`interactive_wake.holds`) can
+  still hold the request, but past the grace with none of those, nothing does. Before this branch the same-project
+  receipt still held it; now the dispatcher may reserve it and start a run beside a session that did read it. If that
+  run ends without settling the request, the normal requeue policy (requeue.py, `MAX_RETRIES` = 2 within
+  `WINDOW_SECONDS` = 24 hours, under `auto_recover_stalled_work`) can relaunch it up to twice more. The request
+  lifecycle records the launches and the request's state, but it cannot show that the original session was doing the
+  same work.
+  How reachable it is: ordinary writer contention waits out a 30-second busy timeout (db.py), so the split needs a
+  lock held longer than that, disk or I/O trouble, or another database error between the two writes. A later eligible
+  reread can still write the mark before the dispatcher reserves the request.
+  This head trades that for closing the cross-project hole. Judgment: the old failure is worse. It is silent and lasts
+  as long as the session stays live, keeping a request away from any run while the session that "has" it was never
+  shown it in this project. The new one needs a failed write after a committed one, and its launches are recorded.
+  Proposed fix: write the mark in the same transaction as the receipt. That prevents the split, but a rollback then
+  loses all evidence, receipt included, while the read still returns the post. Or record the read's project on the
+  receipt and count it.
 - **C. Dead code.** `hosted_wake._credited` now has only test callers (tests/test_hosted_spawn.py), and
   `delivery.read_since` has none. `_credited` is the only reader of `hosted_spawn.provenance_changed` and its
   `changed_at` marker. Remove them together, or reuse them for B's receipt-with-project fix.
