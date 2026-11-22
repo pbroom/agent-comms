@@ -509,7 +509,9 @@ def _evict(c, agent: str, now: float) -> None:
 
 async def wait(board: Board, p: Principal, body: Any, gone: Callable[[], Any] | None = None) -> dict:
     """`poll`, again every POLL_SECONDS for up to `wait` seconds (at most WAIT_MAX) until it is not "idle". The
-    deadline is wall time, not the board's clock (hosted._poll's rule); `gone` ends the wait early when it can tell."""
+    deadline is wall time, not the board's clock (hosted._poll's rule); `gone` ends the wait early when it can tell,
+    checked before each sleep and again after it: a caller gone meanwhile gets no further `poll` (no heartbeat, no
+    offer). It cannot always tell (a proxy may hold the connection), so the ack and WAIT_MAX stay the safety net."""
     import anyio
     from anyio import to_thread
 
@@ -518,6 +520,8 @@ async def wait(board: Board, p: Principal, body: Any, gone: Callable[[], Any] | 
     out = await to_thread.run_sync(poll, board, p, body)
     while out == IDLE and time.monotonic() < deadline and not (gone is not None and await gone()):
         await anyio.sleep(max(0.0, min(POLL_SECONDS, deadline - time.monotonic())))
+        if gone is not None and await gone():
+            break
         out = await to_thread.run_sync(poll, board, p, body)
     return out
 

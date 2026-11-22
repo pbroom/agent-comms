@@ -3994,7 +3994,7 @@ that window can be marked handed (`handed_at`) into the dead response. It stays 
 next fetch, so it is probably not lost, but its grace runs from that hand-over. I did not trace that path to the
 end.
 
-*Not fixed here.* Replacing the decorator with a pure ASGI middleware would fix both routes. It touches every
+*Not fixed here* (fixed since: "Long-poll disconnects" below). Replacing the decorator with a pure ASGI middleware would fix both routes. It touches every
 route, so it is not a one-line change. The `stopping` check keeps a hub restart from being held up by such waits.
 
 **Not verified.** The node-route cost above is read from the code, not run. A crash of Claude (SIGKILL) is still
@@ -4435,3 +4435,113 @@ target and atomically replaces the target, which keeps its permissions.
 - **S34.** `claude_hooks.main` now resolves the settings file's real path once, before reading, and reads and
   atomically replaces that same path. A link retargeted between the two steps leaves the new target untouched
   (`test_s34_a_settings_link_retargeted_between_the_read_and_the_write_is_written_where_it_was_read`).
+
+## Long-poll disconnects (2026-11-21)
+
+The hub's long-polls (`GET /api/nodes/sessions`, `POST /api/wait`, and the human's
+`GET /api/hosted-sessions/{id}/messages/{n}`) now end when their caller hangs up. Before, a dead call went on
+looking for the rest of its wait ("The long-poll blind spot, measured", above).
+
+**The cause and the change.** The localhost check was an `@app.middleware("http")` function, so it ran inside
+Starlette's BaseHTTPMiddleware. That wraps `receive` in a task group. `request.is_disconnected()` reads `receive`
+inside an already cancelled scope, so behind the wrapper the read was cancelled before the server's disconnect
+could arrive, every time. It is now `api.LocalhostOnly`, a plain ASGI class in the same place in the stack. It
+makes exactly the same checks (`api.is_local`, the old function's lines unchanged) and sends the same 403. It passes
+`receive` and `send` through untouched, and it passes non-HTTP scopes (lifespan) as before.
+
+**The loops.** `hosted._poll` and `interactive_wake.wait` checked `gone` only before each sleep. A caller that left
+during the sleep still got one more look, and that look could hand something into the dead response: a node's
+listing marks a due wake `handed_at`, and a `poll` makes an offer. Both loops now check again after the sleep and
+stop without a look. They return the last answer, which nobody reads, and nothing is written after the hang-up is
+seen.
+
+**The gateway.** The gateway waits in `httpx.send` for the board's response headers. A long-poll sends those only
+at its end, and nothing in the gateway watched its own caller meanwhile. So a caller that hung up on the gateway
+left the board's wait running until it answered (at most NODE_WAIT_MAX or WAIT_MAX, 25 s). For a request that can
+long-poll (`gateway._can_wait`, below), the gateway now also waits on its own `receive`. The body is read by then,
+so the next message can only be the disconnect. On a disconnect it cancels the upstream request, which closes that
+connection, and the board sees the hang-up as above. Every other request is forwarded as before.
+
+**Measured** with the probe described above: in-process uvicorn (and the gateway in front of it, for the second
+row of each route), curl killed with SIGKILL 3 s into a 20 s wait, looks counted over the next 22 s. The probe
+script was not committed.
+
+| Route | Path | main (cb25b57) | this change |
+|---|---|---|---|
+| `/api/nodes/sessions` | direct | 69 looks, the last 17.0 s after the kill | 0 |
+| `/api/nodes/sessions` | through the gateway | 69 looks, the last 17.0 s after the kill | 0 |
+| `/api/wait` | direct | 18 looks, the last 17.0 s after the kill | 0 |
+| `/api/wait` | through the gateway | 18 looks, the last 17.0 s after the kill | 0 |
+
+**Kept, on purpose.** The hub sees a hang-up only when the TCP connection is actually closed. It cannot see one when
+something in between holds the connection open, or when the caller's machine drops off the network without
+closing it (sleep, Wi-Fi gone): then the call runs to its cap. `tailscale serve`, in front of the gateway, is
+expected to close its upstream connection when its client goes (Go's reverse proxy cancels the request then); that
+is not verified here. So `/api/wait` keeps its acknowledgement protocol and its 25 s cap (WAIT_MAX), and a node's
+fetch keeps NODE_WAIT_MAX. A wake offered into a call nobody reads is still taken back after ACK_SECONDS, and a
+node's wake is still listed again on its next fetch.
+
+**Equivalence of the check.** `test_the_localhost_check_answers_every_case_as_the_old_middleware_did` runs 288
+requests through both the new app and one with a verbatim copy of the old middleware installed the old way,
+and compares status, headers and body byte for byte. The requests cover 13 client addresses × 20 Host values,
+eight routes (including `/mcp` with the lifespan running) × allowed / refused client / refused host, a doubled
+Host header in both orders, and a websocket scope. The same matrix was also run against main's own code
+(cb25b57, extracted with `git archive`): every response is identical except `/api/whoami`'s
+`loaded_source_fingerprint`, which hashes the source files and so differs whenever the source does.
+
+**Tests** (`tests/test_longpoll_disconnect.py`). These drive the app through ASGI with an `http.disconnect`
+delivered mid-wait (a harness checked against uvicorn: behind the old middleware both never report the
+disconnect, and without it both do). For each route: no look after the hang-up, the call ends at its next look,
+a wake that comes due after the hang-up is not handed into the dead call, and the next call gets it (for a node,
+with `handed_at` set at that fetch, so its grace starts then). A call whose caller stays still waits and returns
+the wake. The same checks run on a real uvicorn server with the client's socket closed, and through the gateway.
+On main the four disconnect tests fail: a look after the hang-up, and the wake handed into the dead call.
+
+**Review round 1** (on 390e8d0: one should, four nits, all taken; each fix has a test, written first and failing
+on 390e8d0):
+- *S1.* The race also covered acknowledgements, which go to the same route: an ack whose caller hung up was
+  cancelled on its way to the board, and the same posts could then be offered again. Now only a request that can
+  wait is raced. `_can_wait` decides from what the gateway already holds: the node's query (`wait` > 0), or
+  `board wait`'s JSON body, already buffered, with a numeric `wait` > 0 and no `ack`. I chose the body over a new
+  header so that no client has to change and an old `board wait` is covered too. Any other shape (no or zero wait,
+  an `ack`, not JSON) is forwarded the old way. (Round 2, S7, aligned this rule with the board's.) Tests: a table
+  of such requests (13 since round 2), each still answered by the board after its caller hung up; long-poll
+  shapes (6 since round 2) are still dropped (499); and an ack
+  through the gateway to the real hub, with its caller gone, is committed (the offer is cleared, the posts are
+  delivered).
+- *S2.* The board's response could stay open in two cases: the gateway's task was cancelled after `send` resolved,
+  or sending the response start downstream failed before the stream had started. Now `_Forward` owns the response
+  from the moment it is handed over and closes it in a `finally` however forwarding ends, and `_unless_gone`
+  closes a response it got but does not hand back. Tests run in memory, with an upstream that records closes.
+- *S3.* A `receive` that raised before the disconnect counted as a hang-up (499 to a live hook). Now the watcher
+  then waits for the board's answer alone.
+- *S4.* The README said a dead call is offered nothing more. In fact the dispatcher may still make an offer for up
+  to PRESENT_SECONDS (20 s) after the last heartbeat. It now says that the call stops polling and stops refreshing
+  its heartbeat.
+- *S5.* The two connected-caller tests against the hub alone repeated existing coverage. They are replaced by a
+  connected caller on each route going through the gateway's race: it waits and gets its wake.
+- waiter.py's docstring said the hub cannot see a caller hang up; it now says the hub may not see one.
+
+**Review round 2** (on bca27a5: approved, with three nits, all taken; each fix has a test, written first and
+failing on bca27a5):
+- *S2, still open.* When the gateway's task was cancelled while the upstream send was pending, the send was
+  cancelled but not awaited. A transport that finished the send despite the cancellation left its response open.
+  `_unless_gone` now awaits a cancelled send before it looks for an unclaimed response, and closes whatever the
+  send produced. It never awaits once it has handed the response over, so a cancellation cannot land between the
+  hand-over and `_Forward`. Test: a stubborn in-memory transport, with the gateway's task cancelled and,
+  separately, the caller hanging up.
+- *S6.* Forwarding could start a second `receive()` while the cancelled watcher was still unwinding. Behind a
+  server that refuses overlapping reads, a live response was then cut off after its headers. The watcher is now
+  awaited before the response is handed over. Test: a harness receiver that raises on an overlapping read; the
+  whole body arrives.
+- *S7.* `_can_wait` differed from the board in two ways. A node fetch without `seen` (or with one the board refuses)
+  is answered at once by the board, but was raced. A `board wait` body with `wait` "10" or true is held open by the
+  board (pydantic coerces both), but was not raced. The gateway now requires a `seen` that matches hosted._SEEN for
+  a node long-poll, and reads `wait` with pydantic's own float coercion (`TypeAdapter(float)`, the type of
+  `api.WaitIn.wait` and of the node route's `wait` query). An `ack` still never races.
+  `test_the_gateway_races_exactly_the_requests_the_hub_holds_open` asks the real hub whether each of 33 shapes
+  waits (it times the answer) and checks that `_can_wait` agrees. Every other field in those requests is valid,
+  and only `wait`, `ack` and `seen` vary, including repeated query parameters (the last one counts at both ends).
+  A second test pins the field type and the `seen` pattern to the hub's, so the two cannot drift silently. Out of
+  scope on purpose: a body the board refuses for another reason (a bad nonce, an extra field) may still be raced.
+  It is answered at once either way, so nothing is held or lost.

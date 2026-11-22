@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import StrictBool, StrictInt, BaseModel, ConfigDict
+from starlette.requests import HTTPConnection
 
 from . import capabilities, requests, attention, board_settings, dispatch, human_actions, issues, resolve, summary, unstick, weblogin, workstreams
 from .config import Settings
@@ -334,6 +335,35 @@ class AckIn(Body):
     session_id: int | None = None
 
 
+def is_local(request: HTTPConnection) -> bool:
+    client = request.client.host if request.client else ""
+    try:
+        loopback = client == "testclient" or ipaddress.ip_address(client).is_loopback
+    except ValueError:
+        loopback = False
+    # Host check defeats DNS rebinding from a browser tab; bearer tokens are still required on top.
+    host = request.headers.get("host", "")
+    hostname = host[1:].split("]")[0] if host.startswith("[") else host.split(":")[0]
+    return loopback and hostname in LOCAL_HOSTNAMES
+
+
+class LocalhostOnly:
+    """Every HTTP request must come from a loopback address and name a local Host, or it is answered 403 here.
+    Plain ASGI, not `@app.middleware("http")` (Starlette's BaseHTTPMiddleware) as before: behind that a route's
+    `request.is_disconnected()` never turned true, so a long-poll went on after its caller had hung up (DESIGN_NOTES
+    "Long-poll disconnects"). Here receive and send pass through untouched. Other scopes (lifespan) pass, as before."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and not is_local(HTTPConnection(scope)):
+            response = JSONResponse({"error": "forbidden", "message": "agent-comms only serves localhost"}, 403)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 def create_app(board: Board | None = None, settings: Settings | None = None, *,
                mcp_instructions: str = INSTRUCTIONS) -> FastAPI:
     settings = settings or (board.s if board else Settings.load())
@@ -349,20 +379,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     app = FastAPI(title="agent-comms", lifespan=lifespan, docs_url="/api/docs", redoc_url=None,
                   openapi_url="/api/openapi.json")
     app.state.board = board
-
-    @app.middleware("http")
-    async def localhost_only(request: Request, call_next):
-        client = request.client.host if request.client else ""
-        try:
-            loopback = client == "testclient" or ipaddress.ip_address(client).is_loopback
-        except ValueError:
-            loopback = False
-        # Host check defeats DNS rebinding from a browser tab; bearer tokens are still required on top.
-        host = request.headers.get("host", "")
-        hostname = host[1:].split("]")[0] if host.startswith("[") else host.split(":")[0]
-        if not loopback or hostname not in LOCAL_HOSTNAMES:
-            return JSONResponse({"error": "forbidden", "message": "agent-comms only serves localhost"}, 403)
-        return await call_next(request)
+    app.add_middleware(LocalhostOnly)
 
     @app.exception_handler(BoardError)
     async def board_error(_: Request, e: BoardError):

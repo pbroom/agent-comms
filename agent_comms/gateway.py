@@ -23,6 +23,9 @@ What passes (fail closed, as integrations/chatgpt/gateway.py):
 - No browser: a request carrying an Origin header is refused (server-to-server only). The raw path must equal the
   decoded path, so encoded tricks (`/%6dcp`) cannot reach another route.
 - Only the headers in HEADERS go upstream and only those in RESPONSE_HEADERS come back (no cookies).
+- A long-poll (`_can_wait`: a node's fetch or `board wait`'s call with a positive wait, never an acknowledgement)
+  whose caller hangs up before the board answers is dropped upstream at once, so the board's wait ends too
+  (DESIGN_NOTES "Long-poll disconnects"). Any other request is forwarded to its end, as before.
 
 The upstream board still does every authorization check; the gateway only narrows what can reach it.
 """
@@ -36,8 +39,8 @@ import re
 import time
 
 import httpx
+from pydantic import TypeAdapter, ValidationError
 from starlette.applications import Starlette
-from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -85,6 +88,92 @@ def allowed(method: str, path: str) -> bool:
 
 def _digest(bearer: str) -> str:
     return hashlib.sha256(bearer.encode()).hexdigest()
+
+
+_FLOAT = TypeAdapter(float)             # how the board reads `wait` (api.WaitIn.wait, a node fetch's `wait: float`)
+_SEEN = re.compile(r"[0-9a-f]{1,64}")   # a version the board's node route accepts (hosted._SEEN)
+
+
+def _positive(wait) -> bool:
+    try:
+        return _FLOAT.validate_python(wait) > 0     # nan is not; the board answers a nan wait at once too
+    except ValidationError:
+        return False
+
+
+def _can_wait(method: str, path: str, query, body: bytes) -> bool:
+    """Whether the board may hold this request open (a long-poll), read only from what the gateway already has, by
+    the board's own rules (tests check each shape against the board): a node's fetch with a positive `wait` and a
+    valid `seen` (without one the board answers at once), or `board wait`'s buffered JSON body with a positive `wait`
+    (coerced as the board coerces it: "10" and true count) and no `ack`. An acknowledgement never waits (the board
+    answers an ack at once, whatever its wait), and must reach the board even when its caller has gone: any other
+    shape goes the old way."""
+    if (method, path) == ("GET", "/api/nodes/sessions"):
+        seen = query.get("seen")
+        return seen is not None and _SEEN.fullmatch(seen) is not None and _positive(query.get("wait", 0))
+    if (method, path) == ("POST", "/api/wait"):
+        try:
+            message = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return isinstance(message, dict) and message.get("ack") is None and _positive(message.get("wait", 0))
+    return False
+
+
+async def _unless_gone(request: Request, pending):
+    """`pending` (the upstream response), or None when the caller hangs up first: then the upstream request is
+    cancelled, which closes its connection. The body is read by now, so the next message is the disconnect. A
+    receive that fails before it is seen is no hang-up: then this waits for the board's answer alone. Nothing is
+    left running when this returns: the watcher has ended (so forwarding never reads beside it), a cancelled send
+    has been awaited, and a response that arrived but is not handed back (the caller went, or this task was
+    cancelled) is closed here."""
+    async def hung_up() -> None:
+        try:
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+        except Exception:
+            await asyncio.Event().wait()    # until cancelled, once the board has answered
+    sending, watching = asyncio.ensure_future(pending), asyncio.ensure_future(hung_up())
+    handed = False
+    try:
+        await asyncio.wait({sending, watching}, return_when=asyncio.FIRST_COMPLETED)
+        watching.cancel()
+        await asyncio.gather(watching, return_exceptions=True)
+        if sending.done():
+            handed = True       # no await after this: from here on the caller owns the response
+            return sending.result()
+        return None             # the caller hung up first: `finally` cancels the send and awaits it
+    finally:
+        watching.cancel()
+        if not sending.done():
+            sending.cancel()
+        if not (sending.done() and watching.done()):    # never once handed: both are done then, so no await here
+            await asyncio.gather(sending, watching, return_exceptions=True)
+        if not handed and sending.done() and not sending.cancelled() and sending.exception() is None:
+            await sending.result().aclose()
+
+
+class _Forward(StreamingResponse):
+    """The board's response passed on to the caller. It owns that response from here: however the forwarding
+    ends (all sent, an upstream error, the caller gone, the task cancelled), the board's response is closed."""
+
+    def __init__(self, upstream: httpx.Response) -> None:
+        self.upstream = upstream
+        super().__init__(self._chunks(), status_code=upstream.status_code,
+                         headers={k: v for k, v in upstream.headers.items() if k in RESPONSE_HEADERS})
+
+    async def _chunks(self):
+        try:
+            async for chunk in self.upstream.aiter_bytes():
+                yield chunk
+        except httpx.HTTPError:
+            return
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.upstream.aclose()
 
 
 def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=time.monotonic) -> Starlette:
@@ -171,7 +260,14 @@ def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=ti
         url = upstream + raw + ("?" + request.url.query if request.url.query else "")
         c = client()
         try:
-            response = await c.send(c.build_request(request.method, url, headers=headers, content=body), stream=True)
+            if _can_wait(request.method, raw, request.query_params, body):
+                response = await _unless_gone(request, c.send(c.build_request(request.method, url, headers=headers,
+                                                                              content=body), stream=True))
+                if response is None:
+                    return JSONResponse({"error": "caller_gone"}, 499)     # nobody reads it
+            else:
+                response = await c.send(c.build_request(request.method, url, headers=headers, content=body),
+                                        stream=True)
         except (httpx.HTTPError, ValueError):
             return JSONResponse({"error": "upstream_unavailable"}, 502)
         opened = response.headers.get("mcp-session-id")
@@ -181,19 +277,7 @@ def create_app(upstream: str = "http://127.0.0.1:8787", transport=None, clock=ti
                 sessions.popitem(last=False)
         if raw == "/mcp" and session is not None and request.method == "DELETE" and response.status_code < 300:
             sessions.pop(session, None)
-
-        async def stream():
-            try:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-            except httpx.HTTPError:
-                return
-            finally:
-                await response.aclose()
-
-        return StreamingResponse(stream(), status_code=response.status_code,
-                                 headers={k: v for k, v in response.headers.items() if k in RESPONSE_HEADERS},
-                                 background=BackgroundTask(response.aclose))
+        return _Forward(response)
 
     async def health(request: Request):
         return JSONResponse({"ok": True})
