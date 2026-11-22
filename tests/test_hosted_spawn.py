@@ -3183,6 +3183,175 @@ def test_r12_s38_a_fetch_sent_before_the_latch_does_not_open_the_gate(tmp_path):
     assert _started(env, waiting) and runner.latched_at is None, "the next fetch, sent after the latch, does"
 
 
+# ------------------------------------------------------------ after the independent review (PR #94)
+
+
+def _posts(env) -> int:
+    return env.board.conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+
+
+@pytest.mark.parametrize("how", ["environment", "board_session"])
+def test_after_review_a_dispatched_run_is_refused_by_all_five_spawn_tools(senv, monkeypatch, how):
+    """Item 1: a dispatched run acts on board requests (untrusted): every spawn tool refuses it, known by its own
+    environment (AGENT_COMMS_MANAGED=1 without a binding) or by the board session it registered for its run.
+    `capabilities` answers (may_spawn false, why_not) as for any other refusal. It spends no budget, touches no
+    child and leaves no audit line."""
+    from mcp import Client
+    grant(senv)
+    kid = spawn(senv, interactive(senv))["child"]["id"]        # an interactive root's child, for send/status/cancel
+    hs.flush(senv.board)                                        # (its audit line is out)
+    before = (_posts(senv), hs._usage(senv.board.conn, "claude", PROJECT, senv.clock()), stored(senv, kid))
+    monkeypatch.setenv("AGENT_COMMS_TOKEN", senv.tokens["claude"])
+    monkeypatch.delenv(hs.HOSTED_ENV, raising=False)
+    monkeypatch.delenv(hs.KEY_ENV, raising=False)
+    if how == "environment":
+        monkeypatch.setenv(hs.MANAGED_ENV, "1")
+    else:
+        monkeypatch.delenv(hs.MANAGED_ENV, raising=False)
+
+    async def as_the_run():
+        async with Client(build_mcp(senv.board, "stdio")) as c:
+            reg = await c.call_tool("board_register", {"project": PROJECT})
+            board_sid = json.loads(reg.content[0].text)["session_id"]
+            if how == "board_session":      # registered for a dispatched run (core.register_session's dispatch_run_id)
+                with hosted.db.write_tx(senv.board.conn) as w:
+                    w.execute("UPDATE sessions SET dispatch_run_id = 'run-1' WHERE id = ?", (board_sid,))
+            return [await c.call_tool(name, args) for name, args in (
+                ("board_session_capabilities", {}),
+                ("board_session_spawn", {"task": "start one more"}),
+                ("board_session_send", {"child": kid, "message": "more"}),
+                ("board_session_status", {"child": kid}),
+                ("board_session_cancel", {"child": kid, "close": True}))]
+
+    caps, *refused = asyncio.run(as_the_run())
+    out = json.loads(caps.content[0].text)
+    assert not caps.is_error and out["may_spawn"] is False and hs.DISPATCHED in out["why_not"]
+    for r in refused:
+        assert r.is_error and hs.DISPATCHED in r.content[0].text, r.content[0].text
+    hs.flush(senv.board)
+    assert (_posts(senv), hs._usage(senv.board.conn, "claude", PROJECT, senv.clock()), stored(senv, kid)) == before, \
+        "no budget spent, no child touched, no audit line"
+
+
+def test_after_review_the_remote_bridge_says_a_process_is_managed_and_the_hub_refuses_it(senv):
+    """Over the remote bridge: what the bridge sends for a managed process without a binding (Ident.headers), the
+    gateway forwards, and the hub reads back (Ident.from_headers): refused like the stdio server."""
+    grant(senv)
+    sent = hs.Ident.from_environ({hs.MANAGED_ENV: "1"}, 4242).headers()
+    assert sent.get(hs.H_MANAGED) == "1" and hs.H_MANAGED in gateway.HEADERS
+    who = hs.Ident.from_headers(sent, project=PROJECT)
+    with pytest.raises(Forbidden, match="a process the board launched"):
+        spawn(senv, who)
+    assert hs.capabilities(senv.board, senv.p["claude"], who)["may_spawn"] is False
+
+
+def test_after_review_a_hosted_session_and_an_interactive_root_are_still_callers(senv):
+    """A hosted session's process is managed too, and its binding makes it hosted; a session the human opened has
+    neither, and is the interactive root."""
+    sid = a_root(senv)
+    grant(senv)
+    env = {hs.MANAGED_ENV: "1", hs.HOSTED_ENV: sid, hs.KEY_ENV: hs.bind_key(senv.board.conn, sid)}
+    hosted_child = spawn(senv, hs.Ident.from_environ(env, None))["child"]
+    assert stored(senv, hosted_child["id"])["spawned_by"]["kind"] == "hosted"
+    own = spawn(senv, hs.Ident.from_environ({}, None, project=PROJECT))["child"]
+    assert stored(senv, own["id"])["spawned_by"]["kind"] == "interactive"
+
+
+@pytest.mark.parametrize("limit", ["max_live_children", "max_spawns_per_hour", "max_turns_without_human"])
+def test_after_review_a_spawn_that_took_the_last_unit_can_be_retried_for_its_handle(senv, limit):
+    """Item 2 (Codex review, P2): the spawn that used the last unit of a limit is retried with the same request_id:
+    the same child comes back (created false), and nothing is charged, posted or sent again."""
+    with_spawn(senv, **{limit: 1})
+    grant(senv)
+    ident = interactive(senv)
+    first = spawn(senv, ident, request_id="job-1")
+    assert first["created"] is True
+    with pytest.raises(hs.LimitReached):
+        spawn(senv, ident, request_id="job-2")          # (the limit is reached: a new id is refused)
+    hs.flush(senv.board)
+    before = (_posts(senv), hs._usage(senv.board.conn, "claude", PROJECT, senv.clock()),
+              len(senv.board.conn.execute("SELECT key FROM board_state WHERE key LIKE ?",
+                                          (hosted.SESSION_PREFIX + "%",)).fetchall()))
+    again = spawn(senv, ident, request_id="job-1")
+    assert again["created"] is False and again["child"]["id"] == first["child"]["id"]
+    assert again["message"] == {"n": 1, "state": first["message"]["state"]}
+    hs.flush(senv.board)
+    after = (_posts(senv), hs._usage(senv.board.conn, "claude", PROJECT, senv.clock()),
+             len(senv.board.conn.execute("SELECT key FROM board_state WHERE key LIKE ?",
+                                         (hosted.SESSION_PREFIX + "%",)).fetchall()))
+    assert after == before, "nothing charged, posted or started"
+    assert len(results_of(senv, first["child"]["parent"])) == 0 and stored(senv, first["child"]["id"])["queued"] <= 1
+
+
+def test_after_review_a_retry_id_is_the_starters_own_and_an_ended_or_ungranted_child_still_answers_it(senv):
+    """The same request_id from another starter (another agent's root, another project's root, a hosted session)
+    starts a child of its own; a retry after the child ended returns its handle as it is; and after the grant was
+    revoked the caller's own child is still returned, nothing new started."""
+    sid = a_root(senv)
+    g = grant(senv, agents=("claude", "codex"))
+    grant(senv, project=P2)
+    mine = spawn(senv, interactive(senv), request_id="same")["child"]["id"]
+    for other in (lambda: spawn(senv, interactive(senv), request_id="same", who="codex", agent="codex"),
+                  lambda: spawn(senv, interactive(senv, project=P2), request_id="same"),
+                  lambda: spawn(senv, bound(senv, sid), request_id="same")):
+        out = other()
+        assert out["created"] is True and out["child"]["id"] != mine
+    revoke(senv, g)
+    out = spawn(senv, interactive(senv), request_id="same")
+    assert out["created"] is False and out["child"]["id"] == mine, "revoked: the own child's handle, nothing new"
+    hs.cancel(senv.board, senv.p["claude"], interactive(senv), mine, close=True)
+    tick(senv, times=3)                                 # (its node closes it and reports the end)
+    assert stored(senv, mine)["state"] == "ended"
+    out = spawn(senv, interactive(senv), request_id="same")
+    assert out["created"] is False and out["child"]["id"] == mine and out["child"]["state"] == "ended"
+    with pytest.raises(Forbidden):
+        spawn(senv, interactive(senv), request_id="new")     # (and anything new still needs the grant)
+
+
+def test_after_review_the_async_spawn_tools_read_the_database_off_the_event_loop(senv, monkeypatch):
+    """Item 3: who is calling (`ident`: the token's principal and the board session's project, both read from the
+    database) and the note of a result another call took (`not_taken`) run in a worker thread in the async tools
+    (spawn, send, status), never on the event loop's thread."""
+    from mcp import Client
+    from agent_comms import hosted_results
+    monkeypatch.setattr(hs, "WAIT_MAX", 0.2)
+    grant(senv)
+    monkeypatch.setenv("AGENT_COMMS_TOKEN", senv.tokens["claude"])
+    for name in (hs.HOSTED_ENV, hs.KEY_ENV, hs.MANAGED_ENV):
+        monkeypatch.delenv(name, raising=False)
+    where = []
+
+    def on_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def recording(module, attr, label):
+        real = getattr(module, attr)
+
+        def wrapped(*a, **kw):
+            where.append((label, on_loop()))
+            return real(*a, **kw)
+        monkeypatch.setattr(module, attr, wrapped)
+    recording(hs, "session_project", "ident")
+    recording(hosted_results, "claimed", "not_taken")
+    recording(senv.board, "authenticate", "principal")
+
+    async def as_process():
+        async with Client(build_mcp(senv.board, "stdio")) as c:
+            await c.call_tool("board_register", {"project": PROJECT})
+            out = await c.call_tool("board_session_spawn", {"task": "look", "wait": True})
+            kid = json.loads(out.content[0].text)["child"]["id"]
+            await c.call_tool("board_session_send", {"child": kid, "message": "more", "wait": True})
+            await c.call_tool("board_session_status", {"child": kid})
+
+    asyncio.run(as_process())
+    assert {label for label, _ in where} >= {"ident", "not_taken", "principal"}, where
+    assert not [w for w in where if w[1]], f"read on the event loop: {where}"
+
+
 # ------------------------------------------------------------ rebase onto PR #93 (waking a Codex thread you opened)
 
 

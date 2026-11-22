@@ -963,7 +963,11 @@ max_turns_without_human = 40        # its children's turns there since you last 
   with an agent's token is that agent's ONE interactive root for the project (the project of its board session, or
   `project` in the call; its board session counts only if it is that agent's, and if bound, under that binding;
   over the remote bridge the registered board session goes with every later call): a session you opened yourself
-  (Claude Code, the Codex app, a terminal), a board configured by URL, or any process holding the token. No tool takes the caller's session as an argument. As best effort, a
+  (Claude Code, the Codex app, a terminal), a board configured by URL, or any process holding the token. No tool takes the caller's session as an argument. A
+  dispatched run is never a caller: it acts on board requests, which are untrusted, so every spawn tool refuses a
+  process the board launched that has no binding (`AGENT_COMMS_MANAGED=1`, which the dispatcher and the node put in
+  every run's environment, passed on by the remote bridge) and a connection whose board session was registered for
+  a dispatched run (`capabilities` says so in `why_not`). As best effort, a
   board server that can be seen to run inside a hosted session's process without its binding is refused.
 - **Hosted-only.** `--hosted-only` on a grant refuses every caller without a verified binding: only hosted sessions
   may start children in that project. Without it, interactive callers may too (`capabilities` says which applies).

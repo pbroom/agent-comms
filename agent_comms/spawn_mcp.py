@@ -84,7 +84,7 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
                                   request_id: str | None = None, wait: bool = False, project: str | None = None,
                                   ctx: Context = None) -> dict:
         p = await threaded(lambda: principal(ctx))
-        who = ident(ctx)
+        who = await threaded(lambda: ident(ctx))        # (it reads the database: never on the event loop)
         out = await threaded(lambda: hosted_spawn.spawn(
             board, p, who, task=task, agent=child_agent, model=model, effort=effort, title=title, role=role,
             access=access, isolation=isolation, request_id=request_id, project=project))
@@ -93,7 +93,8 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
             out["result"] = await take(out["child"]["parent"], p.name, out["child"]["id"], out["message"]["n"],
                                        hosted_spawn.WAIT_MAX)
             if out["result"] is None:
-                not_taken(out, out["child"]["parent"], out["child"]["id"], out["message"]["n"])
+                await threaded(lambda: not_taken(out, out["child"]["parent"], out["child"]["id"],
+                                                 out["message"]["n"]))
         return out
 
     @mcp.tool(description=(
@@ -106,7 +107,7 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
                                  spawn_share: int | None = None, wait: bool = False, project: str | None = None,
                                  ctx: Context = None) -> dict:
         p = await threaded(lambda: principal(ctx))
-        who = ident(ctx)
+        who = await threaded(lambda: ident(ctx))        # (it reads the database: never on the event loop)
         out = await threaded(lambda: hosted_spawn.send(board, p, who, child, message=message, may_spawn=may_spawn,
                                                        spawn_share=spawn_share, project=project))
         out["result"] = None
@@ -114,7 +115,8 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
             out["result"] = await take(out["child"]["parent"], p.name, out["child"]["id"], out["message"]["n"],
                                        hosted_spawn.WAIT_MAX)
             if out["result"] is None:
-                not_taken(out, out["child"]["parent"], out["child"]["id"], out["message"]["n"])
+                await threaded(lambda: not_taken(out, out["child"]["parent"], out["child"]["id"],
+                                                 out["message"]["n"]))
         return out
 
     @mcp.tool(description=(
@@ -125,7 +127,7 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
     async def board_session_status(child: str | None = None, wait_seconds: int = 0, take_result: bool = False,
                                    project: str | None = None, ctx: Context = None) -> dict:
         p = await threaded(lambda: principal(ctx))
-        who = ident(ctx)
+        who = await threaded(lambda: ident(ctx))        # (it reads the database: never on the event loop)
         result = None
         if wait_seconds or take_result:
             if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, int) or wait_seconds < 0:

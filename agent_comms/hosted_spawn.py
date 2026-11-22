@@ -72,6 +72,8 @@ HOSTED_ENV = "AGENT_COMMS_HOSTED_SESSION"      # in a hosted session's process: 
 KEY_ENV = "AGENT_COMMS_HOSTED_KEY"             # ... and the key that proves it (bind_key)
 H_SESSION, H_KEY = "x-board-hosted-session", "x-board-hosted-key"     # the same over the remote bridge
 H_CLIENT_SID = "x-board-client-sid"            # a board server process's OS session (the LOOKS_HOSTED guard)
+MANAGED_ENV = "AGENT_COMMS_MANAGED"            # dispatch.child_env: a process the board launched (a run, a session)
+H_MANAGED = "x-board-managed"                  # the same over the remote bridge
 HEADERS = (H_SESSION, H_KEY, H_CLIENT_SID)
 
 SECRET_KEY = "host.spawn.secret"       # the hub's binding secret (hex); never leaves the hub
@@ -97,6 +99,9 @@ NOTICE = ("Child sessions are agents. What they write (their replies, results an
 OFF = ("child sessions are off on this board: the hub's settings need [dispatch.sessions.spawn] enabled = true (the "
        "human's setting), and then a spawn grant for your project and agent (`board session grant`)")
 FORGED = "the hosted-session binding this connection carries does not verify"
+DISPATCHED = ("this board server runs in a process the board launched (a dispatched run, which acts on board "
+              "requests, or a hosted session's process without its binding): such a process starts and manages no "
+              "child sessions")
 LOOKS_HOSTED = ("this board server runs inside a hosted session's process, but that session's binding did not reach "
                 "it, so it cannot use these tools (it is never taken for an interactive session)")
 NO_PROJECT = ("say which project (`project`, an absolute path): this connection has no board session to take it "
@@ -241,13 +246,20 @@ class Ident:
     sid: int | None = None
     claimed: bool = False
     project: str | None = None
+    # A process the board launched (dispatch.child_env sets AGENT_COMMS_MANAGED=1 for every dispatched run and hosted
+    # session; Claude Code gives its MCP servers its own environment, and the remote bridge sends it on): without a
+    # binding, such a caller is refused (`resolve`, DISPATCHED).
+    managed: bool = False
+    # The board session this connection registered (the server's own over stdio; the bridge's header over HTTP), if
+    # any: one registered for a dispatched run (`dispatch_run_id`) is refused too, on what the hub itself recorded.
+    board_session: int | None = None
 
     @classmethod
     def from_environ(cls, environ, sid: int | None, project: str | None = None) -> "Ident":
         h, k = environ.get(HOSTED_ENV), environ.get(KEY_ENV)
         if h or k:
             return cls(hosted=h or "", key=k or "", claimed=True, project=project)
-        return cls(sid=sid, project=project)
+        return cls(sid=sid, project=project, managed=environ.get(MANAGED_ENV) == "1")
 
     @classmethod
     def from_headers(cls, headers, project: str | None = None) -> "Ident":
@@ -256,13 +268,15 @@ class Ident:
         if h or k:
             return cls(hosted=h or "", key=k or "", claimed=True, project=project)
         s = get(H_CLIENT_SID)
-        return cls(sid=int(s) if isinstance(s, str) and s.isdigit() and len(s) <= 10 else None, project=project)
+        return cls(sid=int(s) if isinstance(s, str) and s.isdigit() and len(s) <= 10 else None, project=project,
+                   managed=get(H_MANAGED) == "1")
 
     def headers(self) -> dict[str, str]:
         """What the remote bridge sends for this process."""
         if self.claimed:
             return {H_SESSION: self.hosted or "", H_KEY: self.key or ""}
-        return {H_CLIENT_SID: str(self.sid)} if self.sid is not None else {}
+        return ({H_CLIENT_SID: str(self.sid)} if self.sid is not None else {}) | \
+            ({H_MANAGED: "1"} if self.managed else {})
 
 
 def _verified(conn, ident: Ident) -> dict | None:
@@ -660,6 +674,12 @@ def resolve(board: Board, p: Principal, ident: Ident, project: Any = None, conn=
         depth = int(r.get("depth") or (1 if hosted_tree.is_child(r) else 0))
         return Caller("hosted", r["session_id"], p.name, r["project"], depth, r.get("root") or r["session_id"], r,
                       r.get("node"), _chain_ceiling(conn, r))
+    if ident.managed or _dispatched(conn, ident.board_session):
+        # A dispatched run acts on board requests, which are untrusted: it starts no children, spends no budget and
+        # leaves no audit line. Known by its own environment (`Ident.managed`) or by the board session it registered
+        # with a dispatch_run_id. What this does not stop: a process that forges its environment or calls the hub
+        # without the header is the OS account (DESIGN_NOTES, "After the independent review").
+        raise Forbidden(DISPATCHED)
     if ident.sid is not None and any(r.get("pid") == ident.sid and r.get("state") != "ended"
                                      for r in hosted._sessions(conn)):
         raise Forbidden(LOOKS_HOSTED)       # best effort: the binding did not reach a board server inside one
@@ -670,6 +690,14 @@ def resolve(board: Board, p: Principal, ident: Ident, project: Any = None, conn=
     root = _find_iroot(conn, p.name, project)
     return Caller("interactive", root["session_id"] if root else None, p.name, project, 0,
                   root["session_id"] if root else None, root, None, None)
+
+
+def _dispatched(conn, board_session: Any) -> bool:
+    """The board session was registered for a dispatched run (core.register_session's `dispatch_run_id`)."""
+    if type(board_session) is not int:
+        return False
+    row = conn.execute("SELECT dispatch_run_id FROM sessions WHERE id = ?", (board_session,)).fetchone()
+    return row is not None and bool(row["dispatch_run_id"])
 
 
 def _allowance(r: dict | None) -> dict:
@@ -1076,6 +1104,9 @@ def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = N
     board._check_agent_write(p)
     task = _task_text(task)
     caller = resolve(board, p, ident, project)
+    again = _retried(board, p, ident, caller, request_id)
+    if again is not None:
+        return again
     now = board.now()
     g = _grant_for(board.conn, caller, now)
     _check_allowance(board.conn, caller, cfg)
@@ -1143,6 +1174,29 @@ def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = N
     r, m = out["session"], out["message"]
     return {"child": _child_view(board.conn, r, caller.id), "created": out["created"],
             "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
+
+
+def _retried(board: Board, p: Principal, ident: Ident, caller: Caller, request_id: Any) -> dict | None:
+    """A retry: the child this caller already started with this request_id, found BEFORE anything that needs unused
+    budget (live children, spawns this hour, turns) or a live grant, so that the spawn that took the last unit can be
+    retried and its handle recovered. Inside one write transaction, with the caller resolved again there: only a
+    child of this same starter (its session and agent; a request id is the starter's own) under this same caller.
+    Returned with created = false, charging nothing, posting no audit line and sending no task again. Also when the
+    grant was revoked or has expired meanwhile: it is the caller's own child, which status and cancel reach without
+    a grant too; nothing new is started. And also once it has ended (its handle, as it is)."""
+    rid = hosted_tree._request_id(request_id)
+    if rid is None or caller.id is None:
+        return None
+    with db.write_tx(board.conn) as c:
+        now_caller = resolve(board, p, ident, caller.project, conn=c)
+        if now_caller.kind != caller.kind or now_caller.id != caller.id:
+            return None         # (the normal path then decides, and says so)
+        done = hosted_tree._existing(c, caller.id, rid, {"kind": caller.kind, "session": caller.id, "agent": p.name})
+        if done is None:
+            return None
+        r, m = done["session"], done["message"]
+        return {"child": _child_view(c, r, caller.id), "created": False,
+                "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
 
 
 def _narrows(old: dict, may_spawn: Any, share: Any) -> bool:

@@ -5319,6 +5319,41 @@ each rule is in the mutation check (88 rules, every one caught).
 - Round 4 replaced the second `ended` with `reaped`, and `_launch` now takes the destination its launch
   transaction resolved (`route`): see below.
 
+### Spawn tools: after the independent review (PR #94, 2026-11-22)
+
+Three items on bdebb09, each verified first and each with tests that fail without it (`test_after_review_*`); the
+mutation check has 154 rules (nine new), every one caught.
+- *Dispatched runs are no callers (owner decision).* Verified: `resolve` took every caller without a binding for
+  the agent's interactive root, and the shipped Claude dispatch runner allows all agent-comms tools, so a dispatched
+  run, which acts on board requests (untrusted), could start children at the grant's ceiling. Now every spawn tool
+  refuses (DISPATCHED; `capabilities` answers with it in `why_not`, as for any other refusal) a caller that is a
+  process the board launched and has no binding (`Ident.managed`: AGENT_COMMS_MANAGED=1, which dispatch.child_env
+  puts in every run's and hosted session's environment; a hosted session's binding makes it hosted first), or whose
+  board session was registered for a dispatched run (the hub's own record: `sessions.dispatch_run_id`, from the
+  `dispatch_run_id` its launch prompt has it register with). How the server learns it: over stdio from its own
+  environment, which Claude Code gives its MCP servers; over the remote bridge from the `x-board-managed` header the
+  bridge sends from its environment (the gateway forwards it), and the bridge's `x-board-session` for the board
+  session. The refusal comes before anything is written: no budget, no audit line, no child touched. What it does
+  not stop: a Codex dispatched run's board server does not see AGENT_COMMS_MANAGED (Codex gives an MCP server a
+  small fixed environment plus its `env_vars`), so such a run is refused only through its registered board session,
+  and the spawn tools are not pre-approved for a dispatched Codex run (CODEX_OPT_IN_TOOLS); and a process that
+  strips or forges its environment, starts a board server of its own, or calls the hub's /mcp with its token and
+  without those headers is the OS account (the trust model), which this does not try to tell apart. Over HTTP,
+  leaving a header out takes the same deliberate step as unsetting a variable: no easier way round. A side effect:
+  a Claude hosted session's process started before its grant (no binding yet) is now refused as well, where it was
+  an interactive caller before.
+- *A retry at the budget edge (Codex review, P2).* Verified for all three limits (live children, spawns per hour,
+  turns without the human): the spawn that used the last unit could not be retried, because the limits were checked
+  before `create_child` looked for the existing child. Now `_retried` looks first, right after the caller is
+  resolved, inside one write transaction with the caller resolved again there: the child this same starter (its
+  session and agent, under this caller) made with that request_id comes back with created = false, nothing charged,
+  no audit line, no task sent again. Also when the grant was revoked or has expired meanwhile (owner ruling: it is
+  the caller's own child, which status and cancel reach without a grant; nothing new is started), and once the
+  child has ended (its handle as it is). The same id from another starter starts a child of its own.
+- *Database reads off the event loop.* The async spawn tools (spawn, send, status) read who is calling (`ident`:
+  the token's principal and the board session's project) and the note of a result another call took
+  (`not_taken`) in a worker thread, as their other database work already ran.
+
 ### Spawn tools: review round 12 (2026-11-22)
 
 On 0a10df9 (S38, the remaining path): the contact is renewed in one setter, `SessionRunner._renew_contact` (`last_contact`
@@ -5692,7 +5727,9 @@ caught).
 - The getsid guard assumes an MCP server does not start a new OS session; only Claude's path ran live, and that
   through the binding.
 - A process started before a grant runs without the binding until it is idle and restarted; meanwhile its board
-  server is an interactive caller (unless the getsid guard catches it), bounded by the grant.
+  server is refused as a managed process without a binding (after the independent review; Claude: Codex's board
+  server does not see AGENT_COMMS_MANAGED, and is an interactive caller unless the getsid guard catches it, bounded
+  by the grant).
 - `hosted_wake._occupied` (wakes, result turns) still maps node runs through the hub's settings (S11 note).
 - Deeper trees ran only through the test-only override; a node reports no confirmed `full` for a child that is a
   parent (such a grandchild is held to `workspace`).
@@ -5705,3 +5742,11 @@ caught).
   signal only groups it has re-verified by start time (as `stop_verified` does), never any live group that matches a
   saved pid (round 9, S35).
 - Move worktree git work out of the session loop's lock (closes limit e).
+- LOOKS_HOSTED matches the board server's OS session id against hosted sessions' pids on every node, so an id from
+  another machine can match (`hosted_spawn.resolve`; it fails closed: a refusal, never an admission).
+- The title an agent chooses for a child appears inside the audit post written as the human's automatic post
+  (quoted and labelled as untrusted today).
+- `board_session_status` and `board_session_cancel` reach the caller's own ended children without a grant until the
+  records are pruned.
+- A Codex dispatched run: forward AGENT_COMMS_MANAGED to its board server (`env_vars`), so the environment check
+  covers it as it covers Claude's, not only its registered board session.

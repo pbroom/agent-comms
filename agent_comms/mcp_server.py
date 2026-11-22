@@ -99,6 +99,13 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
             return os.getcwd() if transport == "stdio" else None
         return hosted_spawn.session_project(board.conn, sid, base, agent) if agent else None
 
+    def own_board_session(ctx: Context | None) -> int | None:
+        """The board session this connection registered: the server's own (stdio), or the bridge's header (HTTP)."""
+        if transport == "stdio":
+            return state["session_id"]
+        h = ctx.headers.get("x-board-session") if ctx is not None and ctx.headers else None
+        return int(h) if h and h.isdigit() and len(h) <= 18 else None
+
     def ident(ctx: Context | None):
         from . import hosted_spawn
         if transport == "stdio":
@@ -109,7 +116,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
             agent = principal(ctx).name
         except ToolError:
             agent = None
-        return dataclasses.replace(base, project=own_project(ctx, base, agent))
+        return dataclasses.replace(base, project=own_project(ctx, base, agent), board_session=own_board_session(ctx))
 
     def principal(ctx: Context | None) -> Principal:
         token = None

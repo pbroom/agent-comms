@@ -155,8 +155,9 @@ CODEX_PREAPPROVED_TOOLS = (
     "board_browser_reconnect", "board_browser_status",
 )
 # Never pre-approved for a dispatched run: selective closeout is opt-in (an interactive session asks the human). The
-# spawn tools too (hosted_spawn.py): a dispatched run is no caller they take (it has no binding), and a hosted Codex
-# session that is to start child sessions gets them approved in its own runner, one -c override each.
+# spawn tools too: a dispatched run is refused by all of them (hosted_spawn.resolve, DISPATCHED: a managed process
+# without a binding, or a board session registered with a dispatch_run_id), and a hosted Codex session that is to
+# start child sessions gets them approved in its own runner, one -c override each.
 CODEX_OPT_IN_TOOLS = ("board_resolve_attention", "board_session_capabilities", "board_session_spawn",
                       "board_session_send", "board_session_status", "board_session_cancel")
 CODEX_SERVER = "agent-comms"
