@@ -1189,6 +1189,65 @@ def test_a_dispatched_codex_run_without_a_stdio_board_server_gets_nothing(denv, 
     assert call["argv"][:-1] == [call["cwd"] if x == "{project}" else x for x in runner[:-1]]
 
 
+def test_a_dispatched_codex_run_with_a_delimiter_gets_the_key_before_it(denv, tmp_path, monkeypatch):
+    """After `--` Codex reads everything as the prompt: the key goes just before it, after the runner's options."""
+    _codex_home(tmp_path, monkeypatch)
+    runner = ["codex", "exec", "--cd", "{project}"] + APPROVALS + ["--", "{prompt}"]
+    argv = _launch(denv, runner)["argv"]
+    i = argv.index(MANAGED_OVERRIDE)
+    assert argv[i - 1] == "-c" and argv[i + 1] == "--" and argv.count("--") == 1
+
+
+def test_a_dispatched_codex_run_with_options_after_the_prompt_gets_the_key_last(denv, tmp_path, monkeypatch):
+    """A runner `-c` after {prompt} (Codex reads it there) would replace a key placed before it: the key goes last."""
+    _codex_home(tmp_path, monkeypatch)
+    own = 'mcp_servers.agent-comms.env.AGENT_COMMS_MANAGED="0"'
+    runner = ["codex", "exec", "--cd", "{project}"] + APPROVALS + ["{prompt}", "-c", own]
+    argv = _launch(denv, runner)["argv"]
+    assert argv[-2:] == ["-c", MANAGED_OVERRIDE] and argv.index(own) < argv.index(MANAGED_OVERRIDE)
+
+
+PROFILE_ONLY = '[mcp_servers.agent-comms]\ncommand = "bash"\n'
+
+
+@pytest.mark.parametrize("flags,added", [
+    (["--profile", "work"], True), (["--profile=work"], True), (["-p", "work"], True), (["-pwork"], True),
+    (["-p=work"], True),
+    (["--ignore-user-config", "--profile", "work"], False),   # Codex skips both user layers: no entry at all
+    (["--ignore-user-config", "-pwork"], False),
+    ([], False),                                              # no profile selected
+    (["--profile", "other"], False),
+], ids=["profile", "profile=", "-p", "-pwork", "-p=work", "ignore+profile", "ignore+-pwork", "none", "other"])
+def test_a_board_server_defined_only_in_a_profile_follows_codex_profile_selection(denv, tmp_path, monkeypatch, flags,
+                                                                                  added):
+    _codex_home(tmp_path, monkeypatch, "")
+    (tmp_path / "home" / ".codex" / "work.config.toml").write_text(PROFILE_ONLY)
+    argv = _launch(denv, ["codex", "exec"] + flags + ["--cd", "{project}"] + APPROVALS + ["{prompt}"])["argv"]
+    assert (MANAGED_OVERRIDE in argv) is added
+
+
+def test_a_profile_layer_wins_over_the_user_config(denv, tmp_path, monkeypatch):
+    """The selected profile's file is over config.toml: a profile that makes the board server a URL one gets nothing."""
+    _codex_home(tmp_path, monkeypatch)
+    (tmp_path / "home" / ".codex" / "work.config.toml").write_text(
+        '[mcp_servers.agent-comms]\nurl = "https://board.invalid/mcp"\n')
+    argv = _launch(denv, ["codex", "exec", "-pwork", "--cd", "{project}"] + APPROVALS + ["{prompt}"])["argv"]
+    assert MANAGED_OVERRIDE not in argv
+
+
+def test_a_quoted_dotted_override_names_another_server(tmp_path, monkeypatch):
+    """Codex splits a `-c` key on dots literally and keeps quotes in a name: `mcp_servers."agent-comms".command`
+    defines the server `"agent-comms"`, not the board server, so the key is not added for it."""
+    env = _codex_home(tmp_path, monkeypatch, "")
+    quoted = ["codex", "exec", "-c", 'mcp_servers."agent-comms".command="bash"', "{prompt}"]
+    assert dispatch.with_managed_env(quoted, env) == quoted
+    assert dispatch.codex_board_server(quoted, env) is None
+    plain = ["codex", "exec", "-c", 'mcp_servers.agent-comms.command="bash"', "{prompt}"]
+    assert MANAGED_OVERRIDE in dispatch.with_managed_env(plain, env)
+    after = ["codex", "exec", "{prompt}", "--", "-c", 'mcp_servers.agent-comms.command="bash"']
+    assert dispatch.codex_board_server(after, env) is None, "nothing after `--` is an option"
+
+
 def test_a_claude_run_gets_no_codex_override(denv, tmp_path, monkeypatch):
     _codex_home(tmp_path, monkeypatch)
     allow(denv, agents=["claude"])

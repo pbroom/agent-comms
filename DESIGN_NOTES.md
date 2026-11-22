@@ -5825,6 +5825,12 @@ caught).
   Claude's. Only when the dispatcher can see that server (`codex_board_server`: the system, user and profile config
   and the runner's `-c` values) with a `command` and no `url`; a server defined only in a trusted checkout's own
   `.codex/config.toml`, or a URL one, gets nothing (a warning), and the run is refused once it registers.
+- The dispatcher's other Codex additions (`with_headless_browser`, used for both browsers, and `with_codex_inbox_mcp`)
+  still go just before {prompt}: after a runner's `--` (Codex then reads them as the prompt), and before a runner's
+  own `-c` placed after {prompt}. `with_managed_env` places its key after the last option and before `--`.
+- `with_codex_inbox_mcp` (`_codex_config_files`) still selects the profile as before: not from `-pX` or `-p=X`,
+  the profile's file also under --ignore-user-config, and `profiles.<name>` tables; `codex_board_server` follows
+  Codex's selection.
 
 ## Session host: deeper trees (2026-11-22)
 
