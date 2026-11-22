@@ -5826,8 +5826,17 @@ caught).
 
 **Report.** A child session may start children of its own. `[dispatch.sessions.spawn] max_depth` now accepts 1 to 4
 (levels below a root) and ships as 2: a root, its children, and their children. The test-only override is gone;
-the tests run at the shipped value, or set it in the board's settings. Nothing new in the node protocol, the trust
-model, the stated limits a to e, or shutdown and `recover()`. No sixth tool: a parent already changed its child's
+the tests run at the shipped value, or set it in the board's settings. CHANGED in the node protocol, the hold:
+session protocol 3 (`tree: 3` in the node's hello and fetch; `hosted_tree.HOLD_PROTOCOL`) says the node keeps a
+full-access child's parent up while that child or a session under it is at work there, and spares it while the
+listing's `subtree_open` flag is set (stopped only as a last resort; see "Capacity" below). The hub sets the flag
+(`hosted_tree.subtree_open`) only on a full-access child's entry, in the listing for its own node, with spawning on
+and `tree` 2 or more; opening or closing it changes the listing's version, so it wakes the long-poll. CHANGED,
+compatibility: nothing is started under a full-access child on a node below protocol 3 (`_holds_for`, asked again
+inside the creation's transaction), and a session already there whose node's hello drops below 3 is ended at that
+hello or when a read settles it, with ORPHANED_HOLD (`hosted_tree.orphan_reason`) as its reason when the node still
+hosts the child protocol it needs (else the plain orphan reason; a session a cascade ended first keeps its first
+reason). Nothing new in the trust model, the stated limits a to e, or shutdown and `recover()`. No sixth tool: a parent already changed its child's
 allowance through `board_session_send` (`may_spawn`, `spawn_share`, from PR #94); that is the parent's switch.
 
 **The rules, at every level** (owner decisions). Each is pinned at depth 2 or more in `tests/test_deeper_trees.py`.
