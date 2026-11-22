@@ -62,7 +62,7 @@ from typing import Any
 
 from . import db, hosted, hosted_results, hosted_tree, nodes, session_access
 from .config import NAME_RE
-from .core import Board, Conflict, Forbidden, Invalid, NotFound, Principal
+from .core import Board, BoardError, Conflict, Forbidden, Invalid, NotFound, Principal
 from .nodes import _get, _put
 from .providers import MODEL_RE, SESSION_ID_RE, validate_model
 
@@ -595,15 +595,19 @@ def _find_iroot(conn, agent: str, project: str) -> dict | None:
 
 def _make_iroot(board: Board, agent: str, project: str) -> dict:
     with db.write_tx(board.conn) as c:
-        now = board.now()       # read under the write lock
-        r = _find_iroot(c, agent, project)
-        if r is None:
-            rid = str(uuid.uuid4())
-            r = {"session_id": rid, "kind": "interactive", "agent": agent, "project": project, "state": "open",
-                 "stop": None, "root": rid, "depth": 0, "child_counts": {}, "created_at": now, "updated_at": now,
-                 "ended_at": None}
-            _put(c, IROOT_PREFIX + rid, r, HUB, now)
-        return r
+        return _make_iroot_in(c, agent, project, board.now())       # (the clock read under the write lock)
+
+
+def _make_iroot_in(c, agent: str, project: str, now: float) -> dict:
+    """Inside a write transaction: the agent's interactive root for the project, made if there is none."""
+    r = _find_iroot(c, agent, project)
+    if r is None:
+        rid = str(uuid.uuid4())
+        r = {"session_id": rid, "kind": "interactive", "agent": agent, "project": project, "state": "open",
+             "stop": None, "root": rid, "depth": 0, "child_counts": {}, "created_at": now, "updated_at": now,
+             "ended_at": None}
+        _put(c, IROOT_PREFIX + rid, r, HUB, now)
+    return r
 
 
 def put_iroot(c, r: dict, by: str, now: float) -> None:
@@ -694,6 +698,14 @@ def resolve(board: Board, p: Principal, ident: Ident, project: Any = None, conn=
     root = _find_iroot(conn, p.name, project)
     return Caller("interactive", root["session_id"] if root else None, p.name, project, 0,
                   root["session_id"] if root else None, root, None, None)
+
+
+def dispatched_after_register(conn, board_session: int, agent: str, dispatch_run_id: Any, already: bool) -> bool:
+    """What board_register answers (`dispatched`), and the one rule the stdio server and the remote bridge latch on
+    for their lives: the connection is a dispatched run's once it registered for a run, or registered or resumed a
+    board session that has one (its own: register refuses a session that is not; `_dispatched` checks the agent
+    too), or was one already. Only ever about the caller's own connection and board session."""
+    return bool(already or dispatch_run_id is not None or _dispatched(conn, board_session, agent))
 
 
 def _dispatched(conn, board_session: Any, agent: str) -> bool:
@@ -1104,17 +1116,70 @@ def _revalidate(c, board: Board, p: Principal, ident: Ident, caller: Caller, cfg
 def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = None, model: Any = None,
           effort: Any = None, title: Any = None, role: Any = None, access: Any = None, isolation: Any = None,
           request_id: Any = None, project: Any = None) -> dict:
-    """Start a child session with a task. Returns {"child", "message", "created"}."""
+    """Start a child session with a task. Returns {"child", "message", "created"}.
+
+    ONE write transaction decides everything, in this order (`_spawn_in`): the caller, resolved (who it is, and a
+    dispatched run refused: never a starter); the starter's request id, looked up (an existing child of this starter
+    under this caller wins, and is returned with created = false: nothing charged, posted or sent, whatever has
+    changed since, a revoked or expired grant, a limit reached, spawning switched off); then the gate (spawning on,
+    the board not paused) and the call's arguments; the grant; the caller's allowance, the target and the access it
+    may give; the limits; the create (`create_child`, in the same transaction, with its own checks of the parent and
+    the node). No refusal is decided outside it. The fast path before it (`_retried`) only ever returns an existing
+    child, never refuses. A limit's Needs-you item is asked for after the transaction, once it has refused."""
+    hit = _retried(board, p, ident, project, request_id)
+    if hit is not None:
+        return hit
+    try:
+        with db.write_tx(board.conn) as c:
+            out = _spawn_in(c, board, p, ident, task=task, agent=agent, model=model, effort=effort, title=title,
+                            role=role, access=access, isolation=isolation, request_id=request_id, project=project)
+    except LimitReached as e:
+        _intend_alert(board, e.caller, e.reached)
+        raise
+    flush(board)
+    return out
+
+
+def _handle(c, p: Principal, caller: Caller, rid: str | None) -> dict | None:
+    """The child this starter (its session and agent; a request id is the starter's own) already made under this
+    caller with this request id, as a handle with created = false; None if there is none."""
+    if rid is None or caller.id is None:
+        return None
+    done = hosted_tree._existing(c, caller.id, rid, {"kind": caller.kind, "session": caller.id, "agent": p.name})
+    if done is None:
+        return None
+    r, m = done["session"], done["message"]
+    return {"child": _child_view(c, r, caller.id), "created": False,
+            "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
+
+
+def _retried(board: Board, p: Principal, ident: Ident, project: Any, request_id: Any) -> dict | None:
+    """The fast path: a retry whose child is already there gets its handle at once. It only ever returns an existing
+    child: whatever it cannot settle (an id it cannot read, a caller it cannot resolve) is left to the deciding
+    transaction, which looks again (`_spawn_in`)."""
+    try:
+        rid = hosted_tree._request_id(request_id)
+        if rid is None:
+            return None
+        return _handle(board.conn, p, resolve(board, p, ident, project), rid)
+    except BoardError:
+        return None
+
+
+def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any, model: Any, effort: Any,
+              title: Any, role: Any, access: Any, isolation: Any, request_id: Any, project: Any) -> dict:
+    """`spawn`'s one deciding transaction (its order is there)."""
+    now = board.now()       # read under the write lock
+    caller = resolve(board, p, ident, project, conn=c)
+    rid = hosted_tree._request_id(request_id)       # (the id must be readable to be looked up)
+    hit = _handle(c, p, caller, rid)
+    if hit is not None:
+        return hit
     cfg = _gate(board)
     board._check_agent_write(p)
     task = _task_text(task)
-    caller = resolve(board, p, ident, project)
-    again = _retried(board, p, ident, caller, request_id)
-    if again is not None:
-        return again
-    now = board.now()
-    g = _grant_for(board.conn, caller, now)
-    _check_allowance(board.conn, caller, cfg)
+    g = _grant_for(c, caller, now)
+    _check_allowance(c, caller, cfg)
     try:
         model = validate_model(model)
         access = session_access.level(access)
@@ -1136,31 +1201,19 @@ def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = N
     if access is None:
         # The highest word within the ceiling that the node the child would run on can start it at; with none,
         # the ceiling itself, which the node refuses with its reason.
-        offers = [w for w in hosted_tree._offers(board.conn, node, agent, runtime) if session_access.within(w, ceiling)] \
+        offers = [w for w in hosted_tree._offers(c, node, agent, runtime) if session_access.within(w, ceiling)] \
             if node else []
         access = _highest(offers) or ceiling
     try:
-        # The limits, in one transaction with the lookup of this starter's request id: a concurrent identical call
-        # that made the child (and spent the last unit) since the first look is found here, not refused.
-        again = _retried(board, p, ident, caller, request_id, limits=cfg)
+        _check_limits(c, caller, cfg, now)
     except LimitReached as e:
-        _intend_alert(board, caller, e.reached)
+        e.caller = caller       # (for `spawn`'s Needs-you intent, after this transaction)
         raise
-    if again is not None:
-        return again
     if caller.kind == "interactive" and caller.id is None:
-        root = _make_iroot(board, p.name, caller.project)
+        root = _make_iroot_in(c, p.name, caller.project, now)
         caller.id, caller.root, caller.record = root["session_id"], root["session_id"], root
     text = render_task(_who(caller), task, _spawn_line(board, caller, agent, model, caller.depth + 1, cfg))
     spawned_by = {"kind": caller.kind, "session": caller.id, "agent": p.name}
-
-    def check(c) -> None:       # inside create_child's write transaction: everything again, on what is stored now
-        t = board.now()
-        again, grant = _revalidate(c, board, p, ident, caller, cfg, t)
-        _check_allowance(c, again, cfg)
-        if not session_access.within(access, _ceiling(again, grant)):
-            raise Conflict(f"access {access} is above what you may give a child now ({_ceiling(again, grant)})")
-        _check_limits(c, again, cfg, t)
 
     def hook(c, r: dict, m: dict, t: float) -> None:
         b = _budget(c, caller.agent, caller.project)
@@ -1171,50 +1224,13 @@ def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = N
         tr["audit"] = list(tr.get("audit") or []) + [_audit_spawn(caller, r)]
         _put(c, TREE_PREFIX + tr["root"], tr, HUB, t)
 
-    try:
-        out = hosted_tree.create_child(
-            board, p.name, caller.id, text, agent=agent, model=model, effort=effort, title=title, role=role,
-            isolation=isolation, access=access, request_id=request_id, allowed=allowed, spawn=cfg, kind="task",
-            spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", check=check, hook=hook)
-    except LimitReached as e:
-        _intend_alert(board, caller, e.reached)
-        raise
-    flush(board)
+    out = hosted_tree.create_child(
+        board, p.name, caller.id, text, agent=agent, model=model, effort=effort, title=title, role=role,
+        isolation=isolation, access=access, request_id=rid, allowed=allowed, spawn=cfg, kind="task",
+        spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", hook=hook, tx=c)
     r, m = out["session"], out["message"]
-    return {"child": _child_view(board.conn, r, caller.id), "created": out["created"],
+    return {"child": _child_view(c, r, caller.id), "created": out["created"],
             "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
-
-
-def _retried(board: Board, p: Principal, ident: Ident, caller: Caller, request_id: Any, limits=None) -> dict | None:
-    """A retry: the child this caller already started with this request_id, found BEFORE anything that needs unused
-    budget (live children, spawns this hour, turns) or a live grant, so that the spawn that took the last unit can be
-    retried and its handle recovered. Inside one write transaction, with the caller resolved again there: only a
-    child of this same starter (its session and agent; a request id is the starter's own) under this same caller.
-    Returned with created = false, charging nothing, posting no audit line and sending no task again. Also when the
-    grant was revoked or has expired meanwhile: it is the caller's own child, which status and cancel reach without
-    a grant too; nothing new is started. And also once it has ended (its handle, as it is).
-    `limits`: then, in the same transaction, the limits are checked (LimitReached) when no such child is there: a
-    refusal is decided only on a lookup that saw every child committed before it. (`create_child` does the same in
-    its own transaction: its lookup comes before `check`.)"""
-    rid = hosted_tree._request_id(request_id)
-    if rid is None and limits is None:
-        return None
-    with db.write_tx(board.conn) as c:
-        # The caller resolved again here: the same one (an interactive root made meanwhile, by the call that made
-        # the child, counts as the same).
-        now_caller = resolve(board, p, ident, caller.project, conn=c) if rid is not None else None
-        if (now_caller is not None and now_caller.id is not None and now_caller.kind == caller.kind
-                and caller.id in (None, now_caller.id)):
-            done = hosted_tree._existing(c, now_caller.id, rid,
-                                         {"kind": caller.kind, "session": now_caller.id, "agent": p.name})
-            if done is not None:
-                r, m = done["session"], done["message"]
-                return {"child": _child_view(c, r, now_caller.id), "created": False,
-                        "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None,
-                        "notice": NOTICE}
-        if limits is not None:
-            _check_limits(c, caller, limits, board.now())
-    return None
 
 
 def _narrows(old: dict, may_spawn: Any, share: Any) -> bool:

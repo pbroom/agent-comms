@@ -220,9 +220,12 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                                        hosted_spawn.bind_in_register(c, p, sid, who, board.now(), on))))
         if transport == "stdio":
             state["session_id"] = out["session_id"]
-        if dispatch_run_id is not None or hosted_spawn._dispatched(board.conn, out["session_id"], p.name):
-            # Registered for a dispatched run (or resumed a board session that was): this connection stays a
-            # dispatched run's for its life, whatever it registers later.
+        # The hub's own answer: is this connection a dispatched run's (hosted_spawn.dispatched_after_register)? The
+        # stdio server and the remote bridge latch on exactly this value, for their lives (remote.Bridge._registered).
+        already = state["dispatched"] if transport == "stdio" else mcp_session(ctx) in state["dispatched_mcp"]
+        out["dispatched"] = hosted_spawn.dispatched_after_register(board.conn, out["session_id"], p.name,
+                                                                   dispatch_run_id, already)
+        if out["dispatched"]:
             if transport == "stdio":
                 state["dispatched"] = True
             elif mcp_session(ctx) is not None:

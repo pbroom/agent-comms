@@ -505,25 +505,24 @@ def test_a_grant_revoked_mid_task_stops_new_work_but_lets_running_children_finis
 
 
 def test_a_grant_that_goes_between_the_check_and_the_write_is_caught_in_the_write(senv, monkeypatch):
-    """S4: the grant, the caller and the allowance are read again inside the write transaction."""
+    """S4: the grant, the caller and the allowance are read inside the write transaction (for a spawn, the one
+    that decides it: round 15, S42), so a revoke just before it is caught."""
     sid = a_root(senv)
     ident = bound(senv, sid)
     g = grant(senv)
     kid = spawn(senv, ident)["child"]["id"]
-    real = hs._check_allowance
-    calls = []
+    real = hs._retried
 
-    def revoke_after_the_first_check(conn, caller, cfg):
-        real(conn, caller, cfg)
-        calls.append(1)
-        if len(calls) == 1:
-            revoke(senv, g)
+    def revoke_after_the_fast_path(*a, **kw):
+        out = real(*a, **kw)
+        revoke(senv, g)
+        return out
 
-    monkeypatch.setattr(hs, "_check_allowance", revoke_after_the_first_check)
+    monkeypatch.setattr(hs, "_retried", revoke_after_the_fast_path)
     with pytest.raises(Forbidden, match="no live spawn grant"):
         spawn(senv, ident)
     assert [c["id"] for c in hs.status(senv.board, senv.p["claude"], ident)["children"]] == [kid], "nothing made"
-    monkeypatch.setattr(hs, "_check_allowance", real)
+    monkeypatch.setattr(hs, "_retried", real)
     g = grant(senv)
     real_settle = hosted._settle
 
@@ -757,19 +756,17 @@ def test_a_limit_the_write_transaction_finds_still_raises_its_item(senv, monkeyp
     sid = a_root(senv)
     ident = bound(senv, sid)
     grant(senv)
-    real = hs._check_limits
+    real = hs._retried
     calls = []
 
-    def first_passes(*a, **kw):
+    def another_spawn_takes_the_room(*a, **kw):
         calls.append(1)
+        out = real(*a, **kw)
         if len(calls) == 1:
-            return None         # the check before the transaction saw room; another spawn took it meanwhile
-        return real(*a, **kw)
+            spawn(senv, ident)      # (its own fast path is the second call here)
+        return out
 
-    with hosted.db.write_tx(senv.board.conn):
-        pass
-    spawn(senv, ident)
-    monkeypatch.setattr(hs, "_check_limits", first_passes)
+    monkeypatch.setattr(hs, "_retried", another_spawn_takes_the_room)
     with pytest.raises(Conflict, match="limit"):
         spawn(senv, ident)
     assert budget(senv)["alert"] is not None and len(needs_you(senv)) == 1, "the item the refusal promised"
@@ -1410,14 +1407,15 @@ def test_r2_s17_a_turn_charged_after_a_reset_always_counts_whatever_the_timestam
     ident = bound(senv, sid)
     spawn(senv, ident)                                  # 1
     arm = _write_tx_hook(monkeypatch, lambda: send(senv, sid, "carry on"))
-    real = hosted_tree.node_spawns
+    real = hs._retried
 
-    def node_spawns(conn, node):
-        arm()       # create_child's write transaction is next
-        return real(conn, node)
-    monkeypatch.setattr(hosted_tree, "node_spawns", node_spawns)
+    def fast_path(*a, **kw):
+        out = real(*a, **kw)
+        arm()       # the spawn's deciding write transaction is next
+        return out
+    monkeypatch.setattr(hs, "_retried", fast_path)
     kid = spawn(senv, ident)["child"]["id"]              # the reset commits first: this one is 1 after it
-    monkeypatch.setattr(hosted_tree, "node_spawns", real)
+    monkeypatch.setattr(hs, "_retried", real)
     assert hs._usage(senv.board.conn, "claude", PROJECT, senv.clock())["turns"] == 1
     hs.send(senv.board, senv.p["claude"], ident, kid, message="two")       # same clock reading throughout: 2
     with pytest.raises(Conflict, match="since the human last messaged"):
@@ -1444,14 +1442,7 @@ def test_r2_s9_a_limit_reached_with_the_parents_cap_is_the_limit_with_its_item(s
     grant(senv)
     ident = bound(senv, sid)
     spawn(senv, ident)                                  # the grant's live limit and the parent's cap, both reached
-    real, calls = hs._check_limits, []
-
-    def first_passes(conn, *a, **kw):                   # the check before the transaction saw room (a concurrent
-        calls.append(1)                                 # spawn filled it after)
-        if len(calls) > 1:
-            return real(conn, *a, **kw)
-    monkeypatch.setattr(hs, "_check_limits", first_passes)
-    with pytest.raises(hs.LimitReached):
+    with pytest.raises(hs.LimitReached):                # (the limits come before the create's own cap)
         spawn(senv, ident)
     assert budget(senv)["alert"] is not None, "the limit, not the per-parent cap, and its Needs-you item"
 
@@ -3442,14 +3433,14 @@ def test_r14_s40_two_identical_calls_at_the_budget_edge_end_as_one_child_and_one
     real = hs._retried
     state = {"forced": False, "first": None}
 
-    def interleaved(board, p, ident_, caller, request_id, limits=None):
-        if not state["forced"] and limits is None and request_id == "job":
+    def interleaved(board, p, ident_, project, request_id):
+        if not state["forced"] and request_id == "job":
             state["forced"] = True
-            out = real(board, p, ident_, caller, request_id, limits)
+            out = real(board, p, ident_, project, request_id)
             assert out is None, "(the second call's first look misses)"
             state["first"] = spawn(senv, ident, request_id="job")       # the first call, all the way through
             return out
-        return real(board, p, ident_, caller, request_id, limits)
+        return real(board, p, ident_, project, request_id)
     monkeypatch.setattr(hs, "_retried", interleaved)
     hs.flush(senv.board)
     before = (_posts(senv), hs._budget(senv.board.conn, "claude", PROJECT))
@@ -3494,6 +3485,132 @@ def test_r14_s41_another_agents_board_session_named_in_the_header_says_nothing(s
     assert not hs._dispatched(senv.board.conn, dispatched, "claude") and hs._dispatched(senv.board.conn, dispatched,
                                                                                         "codex"), \
         "(and the check itself reads only the caller's own board session)"
+
+
+@pytest.mark.parametrize("then", ["revoked", "expired", "hosted_only"])
+def test_r15_s42_the_grant_changing_after_the_first_look_still_returns_the_starters_own_child(senv, monkeypatch, then):
+    """S42: two identical calls; the second's first look misses, the first one then makes the child, and the grant
+    is revoked, expires, or is replaced by a hosted-only one, all before the second's deciding transaction: that
+    transaction looks the request id up before the grant (one transaction decides a spawn), so the second gets the
+    handle (created false), and nothing is charged, posted or sent."""
+    g = grant(senv)
+    ident = interactive(senv)
+    real = hs._retried
+    state = {"first": None, "forced": False}
+
+    def interleaved(board, p, ident_, project, request_id):
+        out = real(board, p, ident_, project, request_id)
+        if not state["forced"] and request_id == "job":
+            state["forced"] = True
+            assert out is None, "(the second call's first look misses)"
+            state["first"] = spawn(senv, ident, request_id="job")       # the first call, all the way through
+            if then == "revoked":
+                revoke(senv, g)
+            elif then == "expired":
+                senv.clock.advance(3601)
+            else:
+                revoke(senv, g)
+                grant(senv, hosted_only=True)
+            hs.flush(senv.board)
+            state["before"] = (_posts(senv), len(hs._budget(senv.board.conn, "claude", PROJECT)["spawned"]))
+        return out
+    monkeypatch.setattr(hs, "_retried", interleaved)
+    second = spawn(senv, ident, request_id="job")
+    first = state["first"]
+    assert first["created"] is True and second["created"] is False and second["child"]["id"] == first["child"]["id"]
+    hs.flush(senv.board)
+    posts_before, spawned_before = state["before"]
+    assert len(hs._budget(senv.board.conn, "claude", PROJECT)["spawned"]) == spawned_before, "nothing charged"
+    assert _posts(senv) == posts_before, "no audit line"
+    assert stored(senv, first["child"]["id"])["next_n"] == 2, "no task sent again"
+    monkeypatch.setattr(hs, "_retried", real)
+    with pytest.raises(Forbidden):
+        spawn(senv, ident, request_id="another")        # (anything new is still refused without a grant)
+
+
+def _bridge(senv, tc):
+    from agent_comms import remote
+    out: list = []
+    b = remote.Bridge("http://127.0.0.1:8787", senv.tokens["claude"], out.append, client=tc)
+    b.client.headers.pop(hs.H_CLIENT_SID, None)
+    b.client.headers.pop(hs.H_MANAGED, None)            # (a server that sees no AGENT_COMMS_MANAGED: a Codex run's)
+    _mcp_open(b)
+    n = iter(range(100, 1000))
+
+    def call(name, args):
+        b.handle({"jsonrpc": "2.0", "id": next(n), "method": "tools/call", "params": {"name": name, "arguments": args}})
+        return out[-1]["result"]
+    return b, call
+
+
+def test_r15_s39_a_bridge_that_resumed_a_dispatched_session_stays_dispatched_across_a_reconnect(senv):
+    """S39 (round 15): the bridge resumes a dispatch-bound board session WITHOUT the run id; the hub's answer says
+    dispatched and the bridge latches on that; it registers an ordinary session and reconnects (a new MCP session,
+    which the hub knows nothing of): every spawn tool still refuses it."""
+    grant(senv)
+    kid = spawn(senv, interactive(senv))["child"]["id"]
+    run = _a_dispatch_run(senv)
+    bound_to_run = senv.board.register_session(senv.p["claude"], PROJECT, dispatch_run_id=run)["session_id"]
+    with TestClient(senv.app, base_url="http://127.0.0.1:8787") as tc:
+        b, call = _bridge(senv, tc)
+        res = call("board_register", {"project": PROJECT, "resume_session_id": bound_to_run})
+        assert not res.get("isError") and json.loads(res["content"][0]["text"])["dispatched"] is True
+        assert b.client.headers.get(hs.H_MANAGED) == "1", "latched on the hub's answer"
+        res = call("board_register", {"project": P2})
+        assert json.loads(res["content"][0]["text"])["dispatched"] is True, "the connection already is one"
+        old = b.session
+        b._open()                                       # it reconnects: a new MCP session
+        assert b.session != old
+        caps = json.loads(call("board_session_capabilities", {})["content"][0]["text"])
+        assert hs.DISPATCHED in caps["why_not"]
+        for name, args in SPAWN_CALLS(kid):
+            res = call(name, args)
+            assert res.get("isError") and hs.DISPATCHED in res["content"][0]["text"], (name, res)
+
+
+def test_r15_s39_a_stdio_server_that_resumed_a_dispatched_session_stays_dispatched(senv, monkeypatch):
+    """S39 (round 15), the same over stdio: resume the dispatch-bound board session without the run id, register an
+    ordinary one: every spawn tool refuses."""
+    from mcp import Client
+    grant(senv)
+    kid = spawn(senv, interactive(senv))["child"]["id"]
+    run = _a_dispatch_run(senv)
+    bound_to_run = senv.board.register_session(senv.p["claude"], PROJECT, dispatch_run_id=run)["session_id"]
+    monkeypatch.setenv("AGENT_COMMS_TOKEN", senv.tokens["claude"])
+    for name in (hs.HOSTED_ENV, hs.KEY_ENV, hs.MANAGED_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+    async def as_the_run():
+        async with Client(build_mcp(senv.board, "stdio")) as c:
+            res = await c.call_tool("board_register", {"project": PROJECT, "resume_session_id": bound_to_run})
+            assert json.loads(res.content[0].text)["dispatched"] is True
+            await c.call_tool("board_register", {"project": P2})
+            caps = json.loads((await c.call_tool("board_session_capabilities", {})).content[0].text)
+            return caps, [await c.call_tool(name, args) for name, args in SPAWN_CALLS(kid)]
+
+    caps, out = asyncio.run(as_the_run())
+    assert hs.DISPATCHED in caps["why_not"]
+    for r in out:
+        assert r.is_error and hs.DISPATCHED in r.content[0].text, r.content[0].text
+
+
+def test_r15_s39_an_ordinary_bridge_is_never_latched(senv):
+    """A bridge that registers, resumes and registers again, never for a run: the hub says not dispatched every
+    time, the bridge sends no such header, and the spawn tools take it as the interactive root."""
+    grant(senv)
+    with TestClient(senv.app, base_url="http://127.0.0.1:8787") as tc:
+        b, call = _bridge(senv, tc)
+        first = json.loads(call("board_register", {"project": PROJECT})["content"][0]["text"])
+        again = json.loads(call("board_register", {"project": PROJECT,
+                                                   "resume_session_id": first["session_id"]})["content"][0]["text"])
+        other = json.loads(call("board_register", {"project": P2})["content"][0]["text"])
+        assert first["dispatched"] is again["dispatched"] is other["dispatched"] is False
+        b._open()
+        assert hs.H_MANAGED not in b.client.headers
+        res = call("board_session_spawn", {"task": "look", "project": PROJECT})
+        assert not res.get("isError"), res
+        assert stored(senv, json.loads(res["content"][0]["text"])["child"]["id"])["spawned_by"]["kind"] == \
+            "interactive"
 
 
 # ------------------------------------------------------------ rebase onto PR #93 (waking a Codex thread you opened)

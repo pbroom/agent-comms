@@ -144,13 +144,14 @@ class Bridge:
             sid = body.get("session_id") if isinstance(body, dict) else None
             if type(sid) is int and sid > 0:
                 self.client.headers["x-board-session"] = str(sid)
-                args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-                if args.get("dispatch_run_id") is not None:
-                    # It registered for a dispatched run: from now on, for this bridge's life, it says it is a
-                    # process the board launched (hosted_spawn.H_MANAGED), whatever it registers later. (Only a
-                    # restriction: the call's own argument may say so, never take it back.)
-                    from .hosted_spawn import H_MANAGED
-                    self.client.headers[H_MANAGED] = "1"
+            if isinstance(body, dict) and body.get("dispatched") is True:
+                # The hub says this connection is a dispatched run's (hosted_spawn.dispatched_after_register: it
+                # registered for a run, or registered or resumed a board session that has one): from now on, for this
+                # bridge's life and across its reconnects (the header stays on its client), it says it is a process
+                # the board launched (hosted_spawn.H_MANAGED), whatever it registers later. The hub's answer is what
+                # counts, never what the call passed; and it is only ever a restriction.
+                from .hosted_spawn import H_MANAGED
+                self.client.headers[H_MANAGED] = "1"
 
     def handle(self, message: dict) -> None:
         msg_id, method = message.get("id"), message.get("method")

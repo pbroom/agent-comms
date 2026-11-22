@@ -5323,7 +5323,7 @@ each rule is in the mutation check (88 rules, every one caught).
 
 Three items on bdebb09, each verified first and each with tests that fail without it (`test_after_review_*`); the
 mutation check has 154 rules (nine new), every one caught. Then Sol's review of 4a9921f (round 14, below): 162
-rules.
+rules; of 2f02fb5 (round 15): 164.
 - *Dispatched runs are no callers (owner decision).* Verified: `resolve` took every caller without a binding for
   the agent's interactive root, and the shipped Claude dispatch runner allows all agent-comms tools, so a dispatched
   run, which acts on board requests (untrusted), could start children at the grant's ceiling. Now every spawn tool
@@ -5376,6 +5376,27 @@ rules.
   ordinary one, an id nobody has, and an own board session bound to a hosted session the caller does not prove to
   be, all give the same answer as no header:
   `test_r14_s41_another_agents_board_session_named_in_the_header_says_nothing`.
+- *Round 15 (Sol, on 2f02fb5).* S39, the remaining path: board_register (a new registration or a resume) now
+  answers `dispatched`, the hub's own verdict for the connection (`hosted_spawn.dispatched_after_register`: it
+  registered for a run, or registered or resumed a board session of its own that has one, or the connection already
+  was one), and both the stdio server and the remote bridge latch on that answer, never on what the call passed; the
+  bridge keeps `x-board-managed: 1` on its client for its life, across reconnects (a new MCP session the hub knows
+  nothing of). The answer is only ever about the caller's own board session (register refuses a session that is not;
+  `_dispatched` checks the agent). Tests: `test_r15_s39_a_bridge_that_resumed_a_dispatched_session_stays_dispatched_across_a_reconnect`,
+  `test_r15_s39_a_stdio_server_that_resumed_a_dispatched_session_stays_dispatched`,
+  `test_r15_s39_an_ordinary_bridge_is_never_latched`. S42, made structural: ONE write transaction decides a spawn
+  (`_spawn_in`), in this order: the caller resolved (the caller-identity refusals, DISPATCHED among them: a caller
+  that is never a starter); the request id read and the starter's own existing child looked up (it wins, created
+  false, nothing charged, posted or sent, whatever changed since); the gate (spawning on, the board not paused) and
+  the arguments; the grant (`hosted_only` included); the allowance, the target and the access; the limits; the create
+  (`create_child` runs inside the same transaction, `tx`, with its own checks of the parent, the node and the
+  per-parent cap; the interactive root is made there too). No refusal is decided outside it; the fast path before
+  it (`_retried`) only ever returns an existing child. Only the limit's Needs-you intent is recorded after it, once
+  it has refused. Test, the first call completing and the grant then revoked, expired or replaced by a hosted-only
+  one, between the second call's first look and its transaction:
+  `test_r15_s42_the_grant_changing_after_the_first_look_still_returns_the_starters_own_child`; the round 14 limit
+  tests pass unchanged in substance (their hook is now the fast path), and four earlier race tests that forced a
+  window between a check before the write and the write itself now force it before the one transaction.
 
 ### Spawn tools: review round 12 (2026-11-22)
 

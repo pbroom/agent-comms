@@ -27,6 +27,7 @@ true`; with it off no child can be created and nothing else changes.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import uuid
@@ -301,7 +302,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
                  effort: Any = None, title: Any = None, role: Any = None, isolation: Any = None, access: Any = None,
                  request_id: Any = None, allowed: dict[str, dict] | None = None, spawn: Any = None,
                  kind: str = "user", spawned_by: dict | None = None, ceiling: str | None = None,
-                 interactive: bool = False, check=None, hook=None) -> dict:
+                 interactive: bool = False, check=None, hook=None, tx=None) -> dict:
     """Start a session under `parent_id` with its first message. Returns {"session": its record, "message": its
     first message's record, "created": False when (parent, request_id) had made it already}. `by` is recorded as
     who created it; whether `by` MAY is the caller's to have decided (see the module text). `agent`: default the
@@ -312,7 +313,9 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
     parent is an interactive root, hosted_spawn.iroot: the child is placed on a node of its own and its access is
     held to `ceiling`), and `check(c)` / `hook(c, child, message, now)`, run inside the write transaction (the tree's
     limits, its counters and its audit queue). Depth: a child's is its parent's plus one, at most
-    [dispatch.sessions.spawn] max_depth, and its root is its parent's root."""
+    [dispatch.sessions.spawn] max_depth, and its root is its parent's root. `tx`: a write transaction of the
+    caller's own (on `board.conn`), in which all of this then runs, reads included (hosted_spawn.spawn decides a
+    spawn in one)."""
     spawn = spawn if spawn is not None else spawn_config(board)
     if not spawn.enabled:
         raise Conflict(OFF)
@@ -344,7 +347,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         raise Conflict(f"node {parent['node']} runs a version of agent-comms from before agent-started child sessions "
                        "(it would not give the child its binding, or stop a turn its starter cancels). Update it and "
                        "start `board node` again")
-    with db.write_tx(board.conn) as c:
+    with (contextlib.nullcontext(tx) if tx is not None else db.write_tx(board.conn)) as c:
         now = board.now()       # read under the write lock
         parent = _parent(c, parent_id, interactive) | ({"node": node} if interactive else {})
         pid = parent["session_id"]
