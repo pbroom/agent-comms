@@ -5323,7 +5323,8 @@ each rule is in the mutation check (88 rules, every one caught).
 
 Three items on bdebb09, each verified first and each with tests that fail without it (`test_after_review_*`); the
 mutation check has 154 rules (nine new), every one caught. Then Sol's review of 4a9921f (round 14, below): 162
-rules; of 2f02fb5 (round 15): 164; of ff15048 (round 16): 166.
+rules; of 2f02fb5 (round 15): 164; of ff15048 (round 16): 166; after the independent re-check of 516f22a:
+172.
 - *Dispatched runs are no callers (owner decision).* Verified: `resolve` took every caller without a binding for
   the agent's interactive root, and the shipped Claude dispatch runner allows all agent-comms tools, so a dispatched
   run, which acts on board requests (untrusted), could start children at the grant's ceiling. Now every spawn tool
@@ -5409,6 +5410,18 @@ rules; of 2f02fb5 (round 15): 164; of ff15048 (round 16): 166.
   enqueue: refused, nothing created, queued, charged or posted. `send`'s own test of a grant expiring while it
   waits for the lock (`test_r2_s4_a_grant_that_expires_while_send_waits_for_the_lock_is_not_honoured`) is
   unchanged and passes; spawn had none before.
+- *The independent re-check of 516f22a (blocker, a regression of the consolidation).* Its recheck before the
+  enqueue only asked that SOME grant be live: with a workspace grant expiring inside the transaction and a
+  read-only one still live, a child was made at workspace. The final check (`final`, `create_child`'s `check`) now
+  restores, condition by condition, what bdebb09's in-write `check` had: a fresh clock reading; the caller resolved
+  again and the same one (`_revalidate`); a live grant for it, the one in force NOW (hosted-only ones only for a
+  hosted caller); the allowance; the child's access within THAT grant's ceiling; the limits (a refusal there is the
+  limit, with its Needs-you item). The budget and the audit line belong to the agent and the project, not to a
+  grant record, so they are the same whichever grant is in force; the child's access is held to the grant in force
+  at the enqueue. Tests: `test_after_review_recheck_the_wider_grant_gone_inside_the_transaction_leaves_the_narrower_ceiling`
+  (expired, and revoked), `test_after_review_recheck_only_a_hosted_only_grant_left_refuses_an_interactive_caller`,
+  `test_after_review_recheck_the_caller_its_allowance_and_the_limits_are_checked_again_before_the_enqueue` (an
+  ended caller, no allowance, the hour's last start taken), `test_after_review_recheck_the_plain_case_still_starts_the_child`.
 
 ### Spawn tools: review round 12 (2026-11-22)
 

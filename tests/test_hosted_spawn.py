@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from agent_comms import (gateway, hosted, hosted_results, hosted_spawn as hs, hosted_tree, hosted_wake, node_sessions,
                          session_host)
-from agent_comms.core import Board, Conflict, Forbidden, Invalid, NotFound
+from agent_comms.core import Board, BoardError, Conflict, Forbidden, Invalid, NotFound
 from agent_comms import dispatch as dispatch_mod
 from agent_comms.mcp_server import build_mcp
 
@@ -3650,6 +3650,107 @@ def test_r16_s43_a_grant_that_expires_inside_the_deciding_transaction_starts_not
     assert (keys(), _posts(senv), hs._budget(senv.board.conn, "claude", PROJECT)) == before, \
         "nothing created, queued, charged or posted"
     assert hs._find_iroot(senv.board.conn, "claude", PROJECT) is None
+
+
+def _inside_the_transaction(senv, monkeypatch, change) -> None:
+    """`change(c)` runs inside the spawn's one deciding transaction, after the first grant check and the child's
+    own checks, right before the final check (it is `create_child`'s `_fits`), on that transaction's connection."""
+    real = hosted_tree._fits
+
+    def late(c, *a, **kw):
+        change(c)
+        return real(c, *a, **kw)
+    monkeypatch.setattr(hosted_tree, "_fits", late)
+
+
+def _nothing_left(senv, run):
+    """`run()` is refused; nothing is created, queued, charged or posted, and no interactive root is left."""
+    hs.flush(senv.board)
+    keys = lambda: senv.board.conn.execute("SELECT COUNT(*) FROM board_state").fetchone()[0]    # noqa: E731
+    before = (keys(), _posts(senv), hs._budget(senv.board.conn, "claude", PROJECT))
+    with pytest.raises(BoardError) as e:
+        run()
+    if not isinstance(e.value, hs.LimitReached):        # (a limit asks for its Needs-you item: that is a write)
+        hs.flush(senv.board)
+        assert (keys(), _posts(senv), hs._budget(senv.board.conn, "claude", PROJECT)) == before
+    assert not [r for r in hosted._sessions(senv.board.conn) if r.get("request_id") == "edge"], "no child"
+    return e.value
+
+
+@pytest.mark.parametrize("how", ["expires", "revoked"])
+def test_after_review_recheck_the_wider_grant_gone_inside_the_transaction_leaves_the_narrower_ceiling(
+        senv, monkeypatch, how):
+    """The independent re-check of 516f22a: two grants, workspace and read-only; the workspace one expires (or is
+    revoked) inside the deciding transaction: the final check takes the grant in force then, and the child's
+    workspace access is above ITS ceiling: refused, nothing created, queued, charged or posted, no root left."""
+    wide = grant(senv, access="workspace", hours=1)
+    grant(senv, access="read-only", hours=2)
+    ident = interactive(senv)
+    senv.clock.advance(3600 - 5)
+    senv.node.hello()
+
+    def change(c):
+        if how == "expires":
+            senv.clock.advance(10)
+        else:
+            g = hs._get(c, hs.GRANT_PREFIX + str(wide["id"]))
+            hs._put(c, hs.GRANT_PREFIX + str(wide["id"]), g | {"revoked_at": senv.clock(), "revoked_by": "human"},
+                    "human", senv.clock())
+    _inside_the_transaction(senv, monkeypatch, change)
+    err = _nothing_left(senv, lambda: spawn(senv, ident, request_id="edge"))
+    assert "access workspace is above what you may give a child now (read-only)" in err.message
+    assert hs._find_iroot(senv.board.conn, "claude", PROJECT) is None
+
+
+def test_after_review_recheck_only_a_hosted_only_grant_left_refuses_an_interactive_caller(senv, monkeypatch):
+    """The grant that let an interactive caller start expires inside the transaction and only a hosted-only one is
+    left: the final check finds no grant for an interactive caller: refused."""
+    grant(senv, access="workspace", hours=1)
+    grant(senv, access="workspace", hours=2, hosted_only=True)
+    ident = interactive(senv)
+    senv.clock.advance(3600 - 5)
+    senv.node.hello()
+    _inside_the_transaction(senv, monkeypatch, lambda c: senv.clock.advance(10))
+    err = _nothing_left(senv, lambda: spawn(senv, ident, request_id="edge"))
+    assert isinstance(err, Forbidden)
+    assert hs._find_iroot(senv.board.conn, "claude", PROJECT) is None
+
+
+@pytest.mark.parametrize("what", ["caller_ended", "allowance", "limit"])
+def test_after_review_recheck_the_caller_its_allowance_and_the_limits_are_checked_again_before_the_enqueue(
+        senv, monkeypatch, what):
+    """The rest of the pre-consolidation final check, restored: the caller resolved again (a hosted caller that
+    ended), its allowance (no more spawning), the limits (the hour's last start taken), each changed inside the
+    transaction after the first checks: refused before anything is enqueued or charged."""
+    with_spawn(senv, max_spawns_per_hour=2, max_live_children=10)
+    sid = a_root(senv)
+    grant(senv)
+    ident = bound(senv, sid)
+
+    def change(c):
+        r = hs._get(c, hosted.SESSION_PREFIX + sid)
+        if what == "caller_ended":
+            hs._put(c, hosted.SESSION_PREFIX + sid, r | {"state": "ended", "ended_at": senv.clock()}, "hub",
+                    senv.clock())
+        elif what == "allowance":
+            hs._put(c, hosted.SESSION_PREFIX + sid, r | {"allowance": {"may_spawn": False, "share": None}}, "hub",
+                    senv.clock())
+        else:
+            b = hs._budget(c, "claude", PROJECT)
+            b["spawned"] += [senv.clock(), senv.clock()]
+            hs._save_budget(c, b, senv.clock())
+    _inside_the_transaction(senv, monkeypatch, change)
+    err = _nothing_left(senv, lambda: spawn(senv, ident, request_id="edge"))
+    want = {"caller_ended": "has ended", "allowance": hs.NOT_ALLOWED, "limit": "within the past hour"}[what]
+    assert want in err.message, err.message
+    assert isinstance(err, hs.LimitReached) is (what == "limit")
+
+
+def test_after_review_recheck_the_plain_case_still_starts_the_child(senv):
+    grant(senv, access="workspace")
+    grant(senv, access="read-only")
+    out = spawn(senv, interactive(senv), request_id="edge")
+    assert out["created"] is True and stored(senv, out["child"]["id"])["access"] == "workspace"
 
 
 # ------------------------------------------------------------ rebase onto PR #93 (waking a Codex thread you opened)

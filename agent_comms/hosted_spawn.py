@@ -1169,9 +1169,10 @@ def _retried(board: Board, p: Principal, ident: Ident, project: Any, request_id:
 def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any, model: Any, effort: Any,
               title: Any, role: Any, access: Any, isolation: Any, request_id: Any, project: Any) -> dict:
     """`spawn`'s one deciding transaction (its order is there). Every decision that compares against the time reads
-    the clock afresh, under the write lock, where it is made (the grant's expiry, the hour's window); and the grant
-    is checked once more, with a fresh reading, right before the child is enqueued and charged (`create_child`'s
-    `check`). `now`, read on entry (also under the lock), only stamps the interactive root it may make."""
+    the clock afresh, under the write lock, where it is made (the grant's expiry, the hour's window); and everything
+    that came from the grant is checked once more, on a fresh reading and the grant in force then, right before the
+    child is enqueued and charged (`final`, `create_child`'s `check`). `now`, read on entry (also under the lock),
+    only stamps the interactive root it may make."""
     now = board.now()       # read under the write lock: for the records made here, nothing decided from it
     caller = resolve(board, p, ident, project, conn=c)
     rid = hosted_tree._request_id(request_id)       # (the id must be readable to be looked up)
@@ -1218,6 +1219,24 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
     text = render_task(_who(caller), task, _spawn_line(board, caller, agent, model, caller.depth + 1, cfg))
     spawned_by = {"kind": caller.kind, "session": caller.id, "agent": p.name}
 
+    def final(c2) -> None:
+        """After the child's own checks, right before it is enqueued and charged: everything that came from the
+        grant again, on a fresh reading and the grant in force NOW (it may have expired, or another one be the live
+        one, while this transaction ran), as before the consolidation: the caller resolved again, the same one; a
+        live grant for it (hosted-only ones only for a hosted caller); the allowance; the child's access within
+        the ceiling of THAT grant; the limits. (The budget and the audit line belong to the agent and the project,
+        not to a grant record: the same whichever grant is in force.)"""
+        t = board.now()
+        again, fresh = _revalidate(c2, board, p, ident, caller, cfg, t)
+        _check_allowance(c2, again, cfg)
+        if not session_access.within(access, _ceiling(again, fresh)):
+            raise Conflict(f"access {access} is above what you may give a child now ({_ceiling(again, fresh)})")
+        try:
+            _check_limits(c2, again, cfg, t)
+        except LimitReached as e:
+            e.caller = again        # (for `spawn`'s Needs-you intent, after this transaction)
+            raise
+
     def hook(c, r: dict, m: dict, t: float) -> None:
         b = _budget(c, caller.agent, caller.project)
         b["spawned"].append(t)
@@ -1231,9 +1250,7 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
         board, p.name, caller.id, text, agent=agent, model=model, effort=effort, title=title, role=role,
         isolation=isolation, access=access, request_id=rid, allowed=allowed, spawn=cfg, kind="task",
         spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", hook=hook, tx=c,
-        # The grant once more, with a fresh reading, after the child's own checks and right before it is enqueued
-        # and charged: it may have expired while this transaction ran.
-        check=lambda c2: _grant_for(c2, caller, board.now()))
+        check=final)
     r, m = out["session"], out["message"]
     return {"child": _child_view(c, r, caller.id), "created": out["created"],
             "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
