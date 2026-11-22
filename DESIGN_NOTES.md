@@ -4545,3 +4545,423 @@ failing on bca27a5):
   A second test pins the field type and the `seen` pattern to the hub's, so the two cannot drift silently. Out of
   scope on purpose: a body the board refuses for another reason (a bad nonce, an extra field) may still be raced.
   It is answered at once either way, so nothing is held or lost.
+
+## Waking a Codex thread you opened (2026-11-22)
+
+The Codex counterpart of "Waking an interactive session". The hub's side is unchanged: one waiter per (agent,
+conversation), the offer state machine, limits per agent and project, the dispatcher's hold and hosted-root precedence.
+`client: "codex"` was already accepted. What differs is how the waiter starts and how the wake reaches the thread.
+
+**Spike findings (Codex CLI 0.171.0, private CODEX_HOME and HOME, a local stand-in for the model API; scripts under the
+session scratchpad, not in the repository).**
+- *Hook input and events.* Hooks come from `$CODEX_HOME/hooks.json`, a file beside config.toml with the Claude-like
+  shape `{"hooks": {"<Event>": [{"hooks": [{"type": "command", "command", "timeout", "async"}]}]}}`, or from `[hooks]`
+  in config.toml. The hook's stdin has `session_id`, which is the thread id, plus `cwd`, `hook_event_name`,
+  `transcript_path`, `model` and `permission_mode`. SessionStart adds `source` (`startup`, `resume`); Stop adds
+  `turn_id` and `last_assistant_message`; SessionEnd adds `reason`.
+  - SessionStart, UserPromptSubmit, Stop and SessionEnd all fire in `codex exec`, in the TUI and in an app-server thread
+    (the desktop app's mode).
+  - SessionStart fires at a thread's first turn, not at `thread/start` or `thread/resume`, so a thread that has had no
+    turn has no waiter.
+  - The command runs as `$SHELL -lc '<command>'` in a new session (its own process group). Its environment is the Codex
+    process's, so `AGENT_COMMS_MANAGED` set by child_env reaches it.
+  - Timeouts default to 600 s with no maximum, except SessionEnd and Interrupt (1 s default, 3 s cap).
+- *Trust.* An untrusted hook does not run. Trust is the hook's definition hash, stored under a key of file, event, group
+  index and handler index (`[hooks.state."<key>"] trusted_hash` in the user's config.toml). The TUI asks at start
+  ("Trust all and continue", "Review hooks", "Continue without trusting"). `codex exec` has
+  `--dangerously-bypass-hook-trust`. The app-server lists hooks with their `currentHash` and `trustStatus`
+  (`hooks/list`).
+- *Background processes.* A hook that exits successfully may leave detached children: Codex kills the hook's process
+  group only when the hook times out or is aborted. An `"async": true` hook does not block its turn or later turns, and
+  the TUI shows no "Running hook" status for one. It shares a per-thread limit of 8 concurrent async hooks.
+  - When a thread shuts down gracefully, Codex kills the group of every still-running async hook. That covers app-server
+    stdin closing, SIGTERM, and the TUI's daemon unloading the thread.
+  - A SIGKILLed app-server leaves the hook's processes orphaned.
+- *Liveness.* SessionEnd fires (reason `other`) on app-server stdin close and on SIGTERM, but not on SIGKILL.
+  - The TUI runs its threads in a managed app-server daemon per CODEX_HOME (`codex app-server --listen unix://
+    --managed-daemon`), so the TUI's hooks run under the daemon, not the TUI.
+  - Ctrl-C on an idle TUI disconnects with "Any running work continues". The daemon keeps the thread for
+    `thread_unload_delay_secs` (default 60) after its last client leaves, then unloads it, which fires SessionEnd and
+    kills the async hooks.
+  - A wake queued in that window started a turn in the daemon with no TUI attached.
+- *`codex queue`.*
+  - It uses the local daemon if one runs, else an in-process app server. It never started a daemon, and it did not write
+    config.toml.
+  - An idle thread held by `codex app-server` started a turn from the queued text in about 4 to 10 s (the app-server's
+    poll); a TUI thread in the daemon took it in 0.2 s. A busy thread took it after the turn.
+  - After an interrupted turn the queue was not drained until the next user turn, and the queued text then reached the
+    model.
+  - A thread not loaded anywhere took it when resumed.
+  - The model receives it as an ordinary `role: user` message.
+  - The desktop app's bundled Codex (0.171.0-alpha.13, `--help` only) has `codex queue`.
+
+**The choice: an async hook is the waiter.** The brief allowed a detached child, or a hook that only registers the
+thread so that `board node` queues the wake. Detached children work, but an `"async": true` SessionStart and Stop hook
+can be the waiter itself, as `board wait` is for Claude Code. Codex then owns its lifetime: it kills the hook's process
+group when it unloads the thread and at the hook's timeout. A detached child would need its own SessionEnd handling and
+would outlive the thread. The node route would add a hub-to-node path for a step the hook can take itself. So the hook
+route needs no change on the hub or the node.
+
+**As built.**
+- `codex_hooks.py` (`install.sh --wake`/`--remove-wake`) edits only `$CODEX_HOME/hooks.json`; config.toml is never
+  touched.
+  - It adds an async SessionStart and Stop hook running `AGENT_COMMS_HOME='<dir>' AGENT_COMMS_AGENT='<name>' bash
+    '<checkout>/integrations/codex/wait.sh'`, with timeout 86400.
+  - Because Codex keys trust by position and hash, a re-run with the same command does not write the file. A changed
+    command replaces ours in place, and a new hook is appended at the end of the event's list, so no other hook moves.
+  - `remove` takes out only ours. (Corrected in review round 1, S5: every group now stays in place, also an emptied
+    one, so nothing moves; this first version dropped emptied groups and moved later hooks up.)
+  - The file is resolved once (written through a symlink), written atomically with its mode kept, and refused when it is
+    not a JSON object.
+- `integrations/codex/wait.sh` exits at once under `AGENT_COMMS_MANAGED=1`, else runs `board wait --client codex`.
+  It always exits 0. (Corrected in review round 1, S2 and S6: this first version found the Codex ancestor with `ps
+  -o comm`, which is argv[0] on macOS, and passed its pid and that name on; `board wait` now finds and verifies the
+  Codex process itself, see procinfo.py.)
+- `board wait --client codex` is waiter.py's loop with `client: "codex"`, and it watches the Codex process that ran
+  the hook (pid and start time), never `CLAUDE_PID`, which a Codex started from a Claude Code session inherits.
+  - It has no start-up grace: Codex's queue is durable, so there is no race to wait out.
+  - On an acknowledgement the hub answered "acked" it runs `<codex> queue --thread <id> --message <wake text>`, with
+    no `-c` (`codex_queue`), then exits 0. The turn the wake starts ends with a Stop hook that waits again.
+  - `<codex>` is the binary of the Codex process that ran the hook, so the queue is written by the build that reads
+    it. (Corrected in review round 1, S2: there is no PATH fallback any more, and the binary is verified first.)
+- *A failed queue call after the acknowledgement* is not given back: the wake is charged and its posts are delivered, so
+  they are not offered again. A request among them is held only for its grace, after which the dispatcher can take it,
+  and the posts wait for the thread's next board read. A `codex queue` that ran and failed, or did not return within 30
+  s, is not retried, because it may have queued the message already and a retry could wake the thread twice.
+- The wake text is unchanged (hosted_wake.wake_text). As a Codex user message it still reads right: it starts with
+  "agent-comms:", says it is an automatic wake written by the board server and not a message from the human, and carries
+  counts, thread ids and agent names only.
+
+**Limits.**
+- A thread with no turn yet is not covered.
+- An interrupted thread takes the wake only with the human's next message.
+- A thread not loaded takes it when next resumed. A queue call can race an unload: the waiter is killed just after its
+  acknowledgement, or the thread unloads between the acknowledgement and the queue.
+- The desktop app's mode wakes within about 10 s.
+- In the CLI, a wake within about 60 s of leaving the thread starts a background turn in the daemon.
+- In the thread's history the wake looks like a message the human sent.
+- An async waiter occupies one of the thread's 8 async-hook slots.
+
+**Checked and not checked.**
+- `tests/test_interactive_wake_codex.py` covers the client, `codex_queue`, wait.sh (with a symlinked binary named
+  `codex` as the hook's parent), codex_hooks and the hub's side for a `codex` waiter.
+- `scripts/interactive-wake-codex-e2e.py` runs real `codex app-server` 0.171.0 and `codex queue` with a stand-in model:
+  - hooks.json as installed, trusted from `hooks/list`, and listed as async and untrusted first;
+  - no waiter before the first turn;
+  - an idle thread woken with exactly the wake text as its user message, and calling board_register and
+    board_read_updates through the board's MCP server;
+  - a busy thread whose wake is queued during the turn and runs after it;
+  - no `board wait` and no daemon left after the app-server closes, and the real config files unchanged.
+- No real model was used: a private CODEX_HOME has no account, and the human's credentials are not copied.
+- The TUI was driven only in the spike, through a pseudo-terminal: hooks under the daemon, wake in 0.2 s, Ctrl-C
+  detaching, the 60 s unload.
+- The desktop app itself was not run: how it shows a queued message and how it lets the human trust hooks are to be
+  checked at deploy time.
+
+### Waking a Codex thread you opened: review round 1 (2026-11-22)
+
+Round 1 (on fde92b8) found 2 blockers, 3 shoulds and 3 nits, all accepted. The model API stays a stand-in in the e2e.
+The real-model and desktop-app checks are made at deploy time with the owner. Tests are in
+`tests/test_interactive_wake_codex.py`. Each one failed on fde92b8 or reproduces its finding there.
+- S3, S4 (installer), S5 and S8 were run against fde92b8's codex_hooks.py and installers: six tests failed.
+- S1 was reproduced against fde92b8's waiter: two wakes were queued for the same posts.
+- S2 and S6: fde92b8's own wait.sh test asserted that the name `ps` reported was passed on and run.
+
+- **S1 (blocker): queue only on an explicit "acked".** The Codex client (`_codex_woken`) no longer takes an ambiguous
+  acknowledgement as delivered. Ambiguous means a transport error, a 5xx, or an unreadable or unknown 200. A queued
+  message cannot be taken back, and the hub re-offers the same posts when it never committed the acknowledgement, which
+  would queue a second wake. It re-sends the SAME id with back-off for up to 30 s (`ACK_SECONDS_CODEX`, inside the hub's
+  60 s replay window, where O3' answers "acked" again and charges nothing). Without an "acked" it queues nothing and
+  goes back to polling. Claude's `_woken` is unchanged: there, losing a wake is worse and an extra exit 2 is harmless.
+  The reverse case is also unchanged: "acked", then `codex queue` fails, is still charged and not re-offered.
+  Rebased onto main after #92 ("Long-poll disconnects"): the gateway cancels a long-poll's upstream request when its
+  caller hangs up, but never races a body with an `ack` (`gateway._can_wait`), so each re-sent acknowledgement
+  (`{"ack": <id>, "wait": 0}`) reaches the hub (`test_s1_a_retried_codex_ack_is_never_raced_by_the_gateway`).
+- **S2 (blocker): run only the Codex process's own, verified binary.** `ps -o comm` is argv[0] on macOS, which any
+  launcher chooses. The new `procinfo.py` asks the OS instead:
+  - macOS, through libproc (checked to work for a hardened-runtime `codex` of the same user): `proc_pidpath` for the
+    image path, `PROC_PIDTBSDINFO` for the parent and start time, and the device and inode of the region mapped from the
+    executable (`PROC_PIDREGIONPATHINFO`);
+  - Linux: `/proc/<pid>/exe` and `/proc/<pid>/stat`.
+  - `board wait` finds the nearest ancestor whose real executable is named `codex`. Right before running `codex queue`
+    it resolves that path, refuses it inside the hook's directory, any git worktree of it, the main checkout or a
+    temporary directory, and refuses it unless the file there is still the image the process runs (same device and
+    inode).
+  - There is no PATH fallback. A binary that fails these checks is not run, and the wake counts as "queue failed", with
+    one line on the hook's stderr.
+  - When no Codex process can be identified at the start, the hook does not wait at all, so nothing is ever charged for
+    it.
+  - Left open: the window between the check and the exec. macOS has no fexecve, so a file swapped in that instant is not
+    caught.
+- **S3: the same board and agent as the MCP server.** `install.sh --wake` reads the board MCP server it configured
+  (`codex mcp get agent-comms --json`, read-only) and refuses unless that server uses the same board home and signs in
+  with the same token as the hooks' agent (one agent has one token).
+  - It also refuses a server it cannot check: not the stdio one, or one whose token comes from the launch environment.
+  - Test: `install.sh --wake --agent helper` is refused while the server signs in as codex.
+- **S4: the installers' token check only reads.** Both installers used `board brief`, which opens the board database,
+  initialises its schema and rewrites the registry mirror. The Claude installer did it in both its main path and
+  `--wake`. Both now run `agent_comms/token_check.py`. It reads the token file and the settings, then either agents.toml
+  (the token's SHA-256 must be the agent's) or the hub's `GET /api/whoami`. A test checks that no board file is created
+  or rewritten.
+- **S5: every group keeps its place.** `add` deletes no group, also not an empty one. It puts ours in the event's last
+  group when that is empty (as `remove` leaves it), else appends a group. `remove` takes out our handlers and leaves
+  every group, event list and the `hooks` object in place. The trade-off is that an emptied group stays in the file:
+  Codex runs nothing for it, and the next `add` reuses it. Tests compare the user's groups, positions and values
+  (canonical JSON) before and after.
+  - Not done: byte-level preservation of the file's layout. It is written as two-space-indented JSON, so a file laid out
+    differently changes layout, not content, the first time it is edited.
+- **S6: watch the real Codex process, by pid and start time.** On Linux `ps` gave a bare name, so the script fell back
+  to watching the launcher shell, and a pid alone may be reused. `_watch_proc` watches the procinfo process and leaves
+  when the pid is gone or now has a different start time.
+- **S7: the busy-turn check in the e2e.** It now takes the `queued` trace event made after the second post and checks it
+  precedes the slow turn's completion: 16.1 s before it, in the run on this code.
+- **S8: never a config file.** `codex_hooks` refuses a hooks path whose resolved target is not a `.json` file or is the
+  config.toml beside it. An empty config.toml behind a `hooks.json` link is left alone.
+
+### Waking a Codex thread you opened: review round 2 (2026-11-22)
+
+Round 2 (on 51e7998) resolved S1, S4, S6, S7 and S8 and kept S2, S3 and S5 open; it added S9 and S10. All were accepted,
+with one ruling on S2. The new tests are in `tests/test_interactive_wake_codex.py`.
+- Against 51e7998's procinfo.py and token_check.py, the case-variant, Data-alias, writable-binary and S10 tests fail.
+  The symlinked-parent test passes there too: realpath already handled that case, so it is an extra guard.
+- On 51e7998, S3 and S5 were reproduced with its own modules: a user handler moved from index 1 to 0 when ours was
+  removed; an env-forwarded token file was accepted; the Codex waiter took `AGENT_COMMS_TOKEN` from its environment.
+- On 51e7998, the installer held the MCP JSON in a shell variable (S9).
+
+- **S2 (blocker): places are compared by identity.** `procinfo.refused` no longer compares path strings. A case variant
+  or a `/System/Volumes/Data` alias names the same directory under another spelling, before and after realpath. Now the
+  identity (device and inode) of each refused root is taken once: the hook's directory, every git worktree of its
+  checkout, its main repository, and the temporary directories. Each ancestor directory of the executable, up to the
+  root, is compared against them by identity. Two cheap conditions were added from the ruling:
+  - the executable must not be group- or world-writable;
+  - no ancestor directory may be world-writable without the sticky bit.
+  - Tests: a case variant, a Data-volume alias, a symlinked parent, a writable binary, and an open directory (with and
+    without the sticky bit).
+- **What the guard promises, and what it does not (the ruling).** The binary run for `codex queue` is the image of the
+  Codex process that is already running this thread with the owner's rights, and it is checked to still be that same
+  file (same device and inode as the running image). Running it again gives a session nothing that process does not
+  already have. The refuse-list is defence in depth against a Codex that was itself started from a place a sandboxed
+  turn, another user or a stray script could write.
+  - It is not an allowlist of approved install locations.
+  - It does not protect against a Codex the owner started from a compromised install.
+  - It does not close the instant between the check and the exec (macOS has no fexecve).
+  - It does not cover writable directories that are only group-writable (`/Applications` and `/opt/homebrew/bin` are
+    admin-group-writable by design).
+- **S3: one token source, the one that was checked.** The installer accepts only a token source the waiter can share.
+  - It refuses a token or token file the server takes from the environment Codex starts in (`env_vars`:
+    AGENT_COMMS_CODEX_TOKEN, AGENT_COMMS_CODEX_TOKEN_FILE, AGENT_COMMS_TOKEN).
+  - It refuses a token written into the server's env, and a token file that is not an absolute path.
+  - Otherwise the file is AGENT_COMMS_CODEX_TOKEN_FILE, or the default `~/.config/agent-comms/codex.token`. That file
+    must sign in as the hooks' agent (token_check, against agents.toml or the hub).
+  - `check-mcp` prints that file's real path, and only that. `add` writes it into the hook's command line as wait.sh's
+    argument (an argument, so nothing in the environment can stand in for it). `board wait --client codex --token-file`
+    reads its token from exactly that file and ignores `AGENT_COMMS_TOKEN`. Without a recorded file it does not wait.
+  - Tests: refused sources; the waiter's Authorization header comes from the recorded file even with `AGENT_COMMS_TOKEN`
+    set; the installer records the file.
+- **S5: no other handler ever moves.** Our handler always lives in a group with nothing else in it.
+  - `add` writes it in place in the group that holds it; else into a trailing `{"hooks": []}`; else into a new group at
+    the end. A second copy alone in another group is emptied where it is.
+  - `remove` empties our group and leaves it in place.
+  - A group holding ours together with other handlers is refused by `add`, and by `remove` unless ours come after every
+    other handler there (taking those out moves nothing). The message says to move it by hand.
+  - Tests check the (event, group index, handler index) of every handler that is not ours across add, re-add, replace,
+    remove and add again. They also cover the shared-group refusals and the emptied duplicate.
+- **S9: no credential through shell tracing.** The installer pipes `codex mcp get agent-comms --json` straight into the
+  checker's stdin; the JSON is never in a variable or an argument. The checker prints only the token file's path.
+  Tracing is switched off (`set +x`) for that block, inherited or not.
+  - The Claude installer had a related case: it writes `$AGENT_COMMS_CLAUDE_TOKEN` into the token file, which `set -x`
+    would echo. Tracing is now off before it.
+  - Test: `bash -x install.sh --wake` with `SHELLOPTS=xtrace` and a literal token in the MCP configuration. It is
+    refused, and the token appears nowhere in the output.
+- **S10: nothing from an unchecked response.** `token_check` validates the hub's who-am-i answer (a dict whose `name`
+  matches the agent-name pattern and whose `is_human` is false) before it uses any of it. A mismatch is reported without
+  echoing a response value; local-board messages no longer echo token-derived values either.
+  - Test: a hub that reflects the bearer token in `name` (or elsewhere) never gets it into a message.
+
+### Waking a Codex thread you opened: review round 3 (2026-11-22)
+
+Round 3 (on fae65ed) resolved S5, S9 and S10, and the allowlist part of S2 by the owner's decision. It left S3 and one
+case of S2 open, and added S11; all were accepted. Each new test in `tests/test_interactive_wake_codex.py` fails on
+fae65ed: six of six, run against its token_check, codex_hooks, procinfo, waiter and remote modules.
+
+- **S11 (blocker): nothing is sent until it is established as a token.** The preflight used to send the contents of
+  whatever file the MCP configuration named as a bearer credential. A path pointing at an unrelated private file would
+  have handed that file's contents to the hub. `token_check.check` now establishes the file locally first, for both
+  installers:
+  - Where this machine has the board's agents.toml with that agent, the token's SHA-256 is compared there and the token
+    is sent nowhere, even when a hub is also named.
+  - Otherwise (a machine that only reaches a hub), the file must be `<agent>.token` in the agent-comms token directory
+    (compared by identity), a regular file of the user's with mode 600 or stricter, holding exactly one token of the
+    form `config.new_token` mints (`ac_` and 43 URL-safe base64 characters). Only then is it sent, and only to the hub
+    URL of the same checked settings.
+  - Every refusal message leaves out the file's contents.
+  - Tests: an unrelated secret named as the token file is never sent, through `check` and through `check_mcp`, and the
+    HTTP stub records no request. A file with the right name and place but the wrong format is refused unsent. A
+    board-local check sends nothing.
+- **S3: the same hub for both clients.** The installer used to compare board homes but accept a hub override the MCP
+  server alone had. Now:
+  - The Codex waiter takes its hub from the board's settings alone (board.toml and board.local.toml of the board home
+    its hook line names) and ignores an `AGENT_COMMS_HUB` inherited from Codex (`remote.hub_url(settings, environ={})`).
+  - `check-mcp` resolves the MCP server's hub the same way, from its own `AGENT_COMMS_HUB` if set, else the board's, and
+    refuses unless the two are the same URL. It also refuses a server that forwards `AGENT_COMMS_HUB` from the
+    environment.
+  - Nothing new is recorded in the hook line: the board home it already pins decides the hub.
+  - Tests: an MCP-only hub is refused; a forwarded hub is refused; the same hub spelled with a trailing slash is
+    accepted; the waiter calls the board's hub even with `AGENT_COMMS_HUB` set.
+- **S2: the checkout's top is a refused root.** With a separate git directory, `git worktree list` can name the metadata
+  directory as the main worktree, and the hook may run from a subdirectory. `git rev-parse --show-toplevel`, run from
+  the hook's directory, is now among the refused roots, compared by identity. Test: a `--separate-git-dir` checkout, the
+  hook in a subdirectory, and a binary elsewhere in the checkout is refused.
+
+### Waking a Codex thread you opened: review round 4 (2026-11-22)
+
+Round 4 (on daba418) resolved S2 and S11 and left two should-fix items, S3 and the new S12. Each new test in
+`tests/test_interactive_wake_codex.py` fails on daba418: five of five, against its codex_hooks.py, token_check.py and
+both installers.
+
+- **S3: every setting that can change the board, hub, agent or token.**
+  - *`env_vars`, in both forms.* Codex 0.171 accepts `env_vars` entries as a bare name ("NAME") or as a table `{name =
+    "NAME", source = "..."}`. That is `McpServerEnvVar::Name` and `McpServerEnvVar::Config` in codex_config, read from
+    `core/src/config/edit/document_helpers.rs` and the config tests, since the config crate is not in the sparse
+    checkout. `codex_hooks.env_var_names` reads both, and refuses any other shape.
+  - *Forwarding.* Only the HARMLESS names may be forwarded. Any other `AGENT_COMMS_*` name is refused, including one
+    added later.
+  - *Literal values.* A literal `env` value must be HARMLESS, or VERIFIED and equal to what the hooks will use. A
+    literal `HOME` must be the installer's.
+  - *Coverage.* A test greps `agent_comms/*.py` and `integrations/codex/*` for every `AGENT_COMMS_*` name and fails
+    until each is in HARMLESS, VERIFIED or REFUSED and has its row below.
+  - Tests: the object form and the string form of a forwarded `AGENT_COMMS_HUB` and `AGENT_COMMS_HOME`; an unknown name,
+    forwarded or written; each harmless name in both forms; literal agent, token directory and HOME mismatches;
+    malformed entries.
+- **The table (agent_comms/codex_hooks.py: HARMLESS, VERIFIED, REFUSED).** Every name the board MCP server (`stdio.sh`,
+  `stdio.py`, `board mcp`) or the `board` code it runs reads:
+  - `AGENT_COMMS_HOME`: selects the board (settings, registry, database, hub). Forwarded: refused. Written: verified,
+    must be the hooks' board home.
+  - `AGENT_COMMS_HUB`: selects the hub. Forwarded: refused. Written: verified, must be the hub the board's settings name
+    (the waiter ignores an inherited one).
+  - `AGENT_COMMS_CODEX_TOKEN_FILE`: the server's token file. Forwarded: refused. Written: verified, must be absolute; it
+    becomes the hooks' token file and is checked by token_check.
+  - `AGENT_COMMS_TOKEN_DIR`: where agent token files live (`board mcp --agent`, token_check). Forwarded: refused.
+    Written: verified, must be the installer's token directory (by identity).
+  - `AGENT_COMMS_AGENT`: an agent name (hook scripts, `board mcp` configuration). Forwarded: refused. Written: verified,
+    must be the hooks' agent.
+  - `AGENT_COMMS_TOKEN`: the token itself (what stdio.py hands the server). Refused, forwarded or written: the hooks
+    cannot share it.
+  - `AGENT_COMMS_CODEX_TOKEN`: the token itself, for stdio.py. Refused, forwarded or written.
+  - `AGENT_COMMS_TOKEN_FILE`: the human's token file. Refused, forwarded or written.
+  - `AGENT_COMMS_MANAGED`: the waiter's "never wait" flag (child_env). Harmless.
+  - `AGENT_COMMS_CHANNEL`: turns MCP channel notifications on. Harmless.
+  - `AGENT_COMMS_ALLOW_MIGRATE`: lets a checkout migrate its own local database. No board, hub or identity: harmless.
+  - `AGENT_COMMS_WAIT_TRACE`: board wait's trace file. Harmless.
+  - Any other `AGENT_COMMS_*` name: refused, forwarded or written.
+- **S12: the token check decides, not the shell.** Both installers exited when `agents.toml` was absent, before the
+  hub-only validation could run, and they hard-coded the registry's file name. Both now leave it to `token_check`:
+  - the board's registry (`settings.agents_path`) when it is there;
+  - else the hub, after the round 3 local checks;
+  - else a clear refusal: nothing can verify the token, no hub is named and there is no registry.
+  - Tests run both installers on a hub-only temp home (no agents.toml, a hub named in board.toml, a stub hub on
+    loopback). The token passes the local checks, is verified with exactly one who-am-i request, and no registry or
+    database is created. With neither a registry nor a hub, both refuse, without the token in the message.
+- **The same shape elsewhere.** The integrations were searched for other places that check for the registry themselves:
+  there are none in the installers or hook scripts (the remaining mentions are in docs and other clients' notes). The
+  waiter's environment was checked against the same table. It uses the recorded token file, the board's settings for the
+  hub, and the board home and agent pinned in its hook line, so none of the variables it inherits can change its board,
+  hub, agent or token.
+
+**Round 5 (on 3069a01), S3: nothing relative, nothing unchecked.** A literal relative `AGENT_COMMS_HOME` could still
+pass. The installer resolved it from its own working directory, while Codex can start the server from another one, so a
+wake could be charged on one board while the thread's tools read another. Both new tests fail on 3069a01.
+- Every path-valued literal the server resolves must be absolute, with no `~` (which follows the server's HOME):
+  `AGENT_COMMS_HOME`, `AGENT_COMMS_TOKEN_DIR`, `AGENT_COMMS_CODEX_TOKEN_FILE` and `HOME`. Only then is each compared
+  with what the hooks use.
+- The server entry must be exactly what install.sh writes: command `bash` (or `/bin/bash`), one argument that is an
+  absolute path ending in `/integrations/codex/stdio.sh`, and `cwd` absent or absolute.
+  - A relative script path, or a relative `cwd`, is resolved by Codex when it starts the server, so a different wrapper
+    with other defaults for board or token could run.
+  - Another command (`board mcp --agent ...`, or someone's own script) reads its token from places this check does not
+    model, so it is refused.
+  - An absolute `cwd` changes nothing stdio.sh resolves: it finds its checkout from its own path, and the board home and
+    token file it reads are pinned as absolute paths.
+- Tests: each path-valued literal, relative and `~`-relative, is refused even when the installer's own directory would
+  resolve it to the right place. Relative and other server entries are refused: a relative script, a different command,
+  extra arguments, another script, a relative `cwd`. An absolute `cwd` is accepted.
+
+### Waking a Codex thread you opened: PR review (#93, 2026-11-22)
+
+Sol approved round 6, and the independent reviewer said OK to merge with three non-blocking findings, fixed here. Each
+new behaviour test fails on 5acd611 (five of five, against its waiter.py and codex_hooks.py). Two positive tests pass on
+both, as they should: the owner's entry shape, and the installer's own entry.
+
+- **F1: a refused binary used to be found only after the hub had charged the wake.** The refuse rules depend almost only
+  on where the binary is, which does not change during a thread. Yet `procinfo.runnable` was first called after the
+  acknowledgement, so in such setups every wake was consumed and dropped, turn after turn. The reviewer's probe: a Codex
+  in the repo's `node_modules/.bin`, the ack sent, no queue. The cases are:
+  - a pinned `@openai/codex` run with `npx`;
+  - a group-writable binary;
+  - a thread opened at an ancestor of the install, such as home with an nvm install;
+  - an in-place upgrade under a long-lived app-server.
+
+Now the binary is checked three times:
+  - Before arming. Refused means the hook does not wait at all, with one line on stderr, so nothing is ever charged.
+  - Just before the acknowledgement. Refused means the wake is not acknowledged: the hub takes the offer back at its own
+    deadline, and the process stops waiting.
+  - Right before the exec, as before. This can only fail when the file changed since, and then the wake is charged and
+    not queued.
+
+The README gains a limit line for these setups.
+  - Tests: refused at arming means no `/api/wait` call at all; refused between arming and the offer means no
+    acknowledgement; the reviewer's scenario with a real executable in `node_modules/.bin` and the real
+    `procinfo.runnable` makes no call; refused only at the exec means charged, not run.
+- **F2: refused until classified, for every setting.** `check-mcp` used to classify only AGENT_COMMS_* names and HOME.
+  Now `env` and `env_vars` may name only AGENT_COMMS_* names as classified in round 4, plus OTHER_NAMES:
+  - `PATH`: how bash and uv are found; Codex passes it to MCP servers by default anyway.
+  - `HOME`: checked, it must be the installer's.
+
+Everything else is refused, literal or forwarded, in both forms: `BASH_ENV` (sourced by bash before stdio.sh, so it can
+export any AGENT_COMMS_* value), `PYTHONPATH`, `UV_PROJECT_ENVIRONMENT`, and any other name.
+  - The script must be this install's own `integrations/codex/stdio.sh`, compared by file identity and required to
+    exist. Another checkout's copy, or a path to a file that does not exist, is refused; a symlink to ours is accepted.
+  - The owner's real entry shape passes: command bash, one absolute stdio.sh argument, no env.
+  - The installer's own `codex mcp add ... -- bash stdio.sh` output, read back with `codex mcp get --json` in a private
+    CODEX_HOME, passes its own check.
+- **F3: README.** It now says the acknowledgement retry gives "offered again" only when the hub never recorded the
+  acknowledgement; if the hub did record it and every answer was lost, or a newer hook took over, the wake is charged
+  and not queued. "Where it was checked" now says Linux was not run.
+- **Test gaps the reviewer named.** Arming with a binary `procinfo.runnable` refuses is covered by F1's tests. The
+  wait.sh unit test now passes its token-file argument and checks it reaches `board wait --token-file`.
+- **Does Codex 0.171 give a stdio MCP server its own full environment? No.** The crate that builds that environment is
+  not in the sparse checkout, so this was measured instead (spike s9 in the session scratchpad, private CODEX_HOME). A
+  probe server recorded its environment. It had a default allowlist (HOME, LANG, PATH, TMPDIR, USER, SHLVL and a few
+  Xcode toolchain variables) plus the entry's `env` value and its `env_vars` name. `AGENT_COMMS_HUB`,
+  `AGENT_COMMS_CODEX_TOKEN` and a marker variable set in the app-server's own environment did not reach it. So an
+  AGENT_COMMS_* variable in Codex's environment reaches neither the server nor, through the board home, hub and token
+  the hook line pins, what the waiter uses. There is no gap to close there.
+- **Can a trusted project's `.codex/config.toml` override `mcp_servers.agent-comms`? Yes.** In the same spike, a trusted
+  project's `.codex/config.toml` naming another `command` for the server replaced it for a thread in that project. Codex
+  merged it field by field with the user's entry: the user's `env` and `env_vars` still applied. The installer checks
+  the server as the user's own configuration has it (`codex mcp get` from where the installer runs), and cannot promise
+  anything about a project's override. The hooks would then wait and be charged as the agent while that thread's board
+  tools run whatever the project named. This is documented as a limit in the README, next to the F1 limit. Closing it
+  would need the waiter to check the server as Codex resolves it for the thread's own directory; that is not done here.
+
+**Sol's check of 9f3ae5c (S13, S14) and the reviewer's doc note.** All four new tests fail on 9f3ae5c, run against its
+stdio.sh, wait.sh, procinfo.py and waiter.py.
+- **S13: a symlinked launcher.** The installer accepted a symlink to this install's stdio.sh (same file), but bash keeps
+  the path it was given in `BASH_SOURCE[0]`. The launcher then looked for stdio.py beside the symlink and the MCP server
+  did not start, although the wake install succeeded.
+  - stdio.sh now resolves its real file through any chain of symlinks (`readlink` in a loop, then `cd -P`) before it
+    locates stdio.py and the checkout. wait.sh does the same for the checkout.
+  - The installer keeps accepting a symlink, because the launcher now works through one.
+  - Tests: stdio.sh, started through a symlink and through a chain of relative ones, runs stdio.py (which then refuses
+    at once for lack of a token, showing it was found). wait.sh, started through a symlink, passes its real checkout to
+    `uv run --project`.
+- **S14: the pre-acknowledgement check is fast.** It used to run three git probes with 5 s timeouts, and on a slow
+  checkout it could finish after the hub's 10 s offer deadline.
+  - `procinfo.roots` takes the refused roots' identities once at arming. The check just before an acknowledgement reuses
+    them (`known_roots`), so it needs only stat calls: the same-image check and the identity comparison.
+  - Arming and the exec still check in full.
+  - Tests: `runnable` with known roots runs no subprocess (subprocess.run is stubbed to fail). The waiter's three checks
+    are, in order: full, with the arming roots, full.
+- **The reviewer's doc note.** The project-override limit has its own README bullet, outside "Where wakes do not work"
+  (wakes do work there), and says the consequence: the hooks still wait and are charged as the agent, while that
+  thread's board tools may act as someone else.

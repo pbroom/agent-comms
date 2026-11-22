@@ -336,11 +336,15 @@ def agent_mcp_config(name: str) -> dict:
 
 def load_agent_token(name: str) -> str:
     """Read ~/.config/agent-comms/<name>.token, refusing files others could read or swap."""
-    import stat
-
     if not NAME_RE.match(name):
         raise ValueError("invalid agent name")
-    path = agent_token_file(name)
+    return read_token_file(agent_token_file(name))
+
+
+def read_token_file(path: Path) -> str:
+    """The token in `path` (a regular file owned by you, mode 600 or stricter, one token), else ValueError."""
+    import stat
+
     try:
         meta = path.lstat()
     except OSError as e:

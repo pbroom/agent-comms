@@ -27,6 +27,19 @@ The agent is `--agent` (the hook passes $AGENT_COMMS_AGENT, as the other hooks d
 logical form of the path when $PWD shows one), whether or not a thread is there yet, unless `--project` is given.
 The hub is [server] hub (or AGENT_COMMS_HUB) when this machine is not the hub, else the local
 `board serve`. A paused board is not a reason to stop: nothing wakes while it is paused, and the wait goes on.
+
+`--client codex` (integrations/codex/wait.sh, an `"async": true` SessionStart and Stop hook in $CODEX_HOME/hooks.json,
+DESIGN_NOTES "Waking a Codex thread you opened"): the same wait for the Codex thread the hook's `session_id` names (it
+is the thread id), with one different last step. Codex has no rewake: an async hook's exit code starts no turn. So
+once the hub answers the acknowledgement "acked" (only then: `_codex_woken`), this process runs `<codex> queue
+--thread <id> --message <wake text>`, which puts the text in the thread's durable queue; the Codex process that has
+the thread loaded starts a turn from it when the thread is idle (a busy thread takes it after the turn; an
+interrupted one, at the human's next turn; one not loaded, when it is next resumed). `<codex>` is the executable of
+the Codex process that ran the hook, as the OS reports it (procinfo: never a name a process chose, never a PATH
+lookup), verified right before it runs; so the queue is written by the same build that reads it. It then exits 0,
+as it does in every case: the turn the wake starts ends with a Stop hook that waits again. It does not wait at all
+when that Codex process cannot be identified; it ends when that process (pid and start time) is gone, and Codex
+itself kills the hook's process group when the thread is unloaded, and at the hook's timeout.
 """
 from __future__ import annotations
 
@@ -58,6 +71,8 @@ STARTUP_GRACE = 10.0
 # answer, grace begun and ended, wake written, exit), with wall-clock times. For measuring (scripts/interactive-wake-
 # e2e.py --trace), never needed to run.
 TRACE = "AGENT_COMMS_WAIT_TRACE"
+CLIENTS = ("claude-code", "codex")      # interactive_wake.CLIENTS
+QUEUE_SECONDS = 30.0        # one `codex queue` call (it writes a row in Codex's state database and returns)
 
 
 def _tracer(environ: dict) -> Callable[..., None]:
@@ -128,9 +143,34 @@ def _watch(environ: dict, leave: Callable[[], None]) -> None:
     threading.Thread(target=loop, daemon=True).start()
 
 
-def _hub(settings: Any) -> str:
+def _watch_proc(proc: Any, leave: Callable[[], None]) -> None:
+    """End this process (exit 0) as soon as the Codex process that ran the hook is gone: its pid and start time, as
+    the OS reports them (procinfo; a pid alone may be reused, and an inherited CLAUDE_PID is never looked at)."""
+    from . import procinfo
+
+    def loop() -> None:
+        while procinfo.alive(proc):
+            time.sleep(WATCH_SECONDS)
+        leave()
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def _say(stderr: Any, trace: Callable[..., None], line: str) -> None:
+    """One plain line for the human (a Codex hook's stderr is kept with the hook's run) and the trace."""
+    trace("note", line=line)
+    try:
+        stderr.write(line + "\n")
+        stderr.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _hub(settings: Any, environ: Any = None) -> str:
+    """The hub to call. `environ` {} (the Codex client, review round 3 of the Codex wake, S3): the board's settings
+    alone, never an AGENT_COMMS_HUB inherited from the Codex process, so the waiter reaches the hub install.sh checked
+    the thread's board MCP server against."""
     from . import remote
-    hub = remote.hub_url(settings)
+    hub = remote.hub_url(settings, environ)
     if hub:
         return hub
     host = f"[{settings.host}]" if ":" in settings.host else settings.host
@@ -140,14 +180,25 @@ def _hub(settings: Any) -> str:
 def run(agent: str, projects: list[str] | None = None, max_seconds: float = DEFAULT_MAX_SECONDS, *,
         stdin: Any = None, stderr: Any = None, environ: dict | None = None, client: Any = None,
         sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-        watch: bool = True) -> int:
-    """The exit code (WAKE or 0). Never raises: whatever goes wrong, the session is not woken."""
+        watch: bool = True, kind: str = "claude-code", codex: Any = None,
+        queue: Callable[..., bool] | None = None, target: Callable[..., tuple] | None = None,
+        token_file: str | None = None) -> int:
+    """The exit code (WAKE or 0; always 0 for `kind` "codex", which queues the wake instead). Never raises: whatever
+    goes wrong, the session is not woken. For "codex": `codex` is the Codex process that ran the hook (a
+    procinfo.Proc; found with procinfo.codex_ancestor when not given), `target(codex, cwd, environ)` the binary to
+    run for it (procinfo.runnable) and `queue(path, thread, text, environ, trace)` the queue call (codex_queue);
+    tests pass stand-ins. `token_file` (required for "codex"): the token file install.sh checked against the board
+    MCP server of this Codex home (codex_hooks.check_mcp); the Codex waiter reads its token from there and from
+    nothing in its environment (review round 2, S3)."""
     environ = os.environ if environ is None else environ
     trace = _tracer(environ)
-    trace("start")
+    trace("start", client=kind)
+    if kind not in CLIENTS:
+        return 0
     try:
         code = _run(agent, projects, max_seconds, sys.stdin if stdin is None else stdin,
-                    sys.stderr if stderr is None else stderr, environ, client, sleep, clock, watch, trace)
+                    sys.stderr if stderr is None else stderr, environ, client, sleep, clock, watch, trace,
+                    kind, codex, queue or codex_queue, target, token_file)
     except Exception as e:
         trace("error", error=type(e).__name__)
         code = 0
@@ -180,8 +231,10 @@ def project_of(cwd: str, environ: dict | None = None) -> str:
     return main.rstrip("/") or "/"
 
 
-def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, clock, watch, trace=None) -> int:
+def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, clock, watch, trace=None,
+         kind="claude-code", codex_proc=None, queue=None, target=None, token_file=None) -> int:
     trace = trace or (lambda *a, **k: None)
+    codex = kind == "codex"
     started = clock()       # the hook process's start, as near as this process can tell
     if environ.get(MANAGED) == "1":
         return 0            # a dispatched run or hosted session: never the interactive session's waiter
@@ -190,21 +243,51 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
     trace("hook", hook_event=hook.get("hook_event_name"), session_id=sid)
     if not isinstance(sid, str) or not UUID_RE.fullmatch(sid):
         return 0
+    if codex and client is None and not token_file:
+        _say(stderr, trace, "agent-comms: not waiting: no token file recorded for this hook (run install.sh --wake "
+                            "again)")
+        return 0
+    if codex:
+        from . import procinfo
+        codex_proc = codex_proc or procinfo.codex_ancestor()
+        if codex_proc is None:
+            # Nothing could queue a wake for this thread: do not wait, so that nothing is ever charged for it.
+            _say(stderr, trace, "agent-comms: not waiting: the Codex process that ran this hook cannot be identified")
+            return 0
+        target = target or procinfo.runnable
+        # The binary it would run is checked before anything is armed (PR review F1): the rules depend almost only
+        # on where the binary is, which does not change during a thread, so a binary refused now would be refused
+        # after every acknowledgement, and each wake would be charged and dropped. Refused: do not wait at all.
+        early_cwd = hook.get("cwd") if isinstance(hook.get("cwd"), str) and hook["cwd"].startswith("/") \
+            else os.getcwd()
+        path, why = target(codex_proc, early_cwd, environ)
+        if path is None:
+            _say(stderr, trace, f"agent-comms: not waiting: wakes cannot use this Codex binary ({why})")
+            return 0
+        # The refused roots' identities, taken once (S14): the check just before an acknowledgement reuses them, so it
+        # runs no git probe and finishes well inside the hub's offer deadline. Arming and the exec check in full.
+        known_roots = procinfo.roots(early_cwd, environ)
     if watch:
         leave = lambda *_: (trace("leave"), os._exit(0))    # noqa: E731  silent, whatever the main thread does
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(sig, leave)
-        _watch(environ, leave)
+        if codex:
+            _watch_proc(codex_proc, leave)
+        else:
+            _watch(environ, leave)
     cwd = hook.get("cwd") if isinstance(hook.get("cwd"), str) and hook["cwd"].startswith("/") else os.getcwd()
     projects = list(dict.fromkeys(projects or [project_of(cwd, environ)]))[:8]
     import httpx
     if client is None:
-        from .config import Settings, load_agent_token
-        token = environ.get("AGENT_COMMS_TOKEN") or load_agent_token(agent)
-        client = httpx.Client(base_url=_hub(Settings.load()), trust_env=False,
+        from .config import Settings, load_agent_token, read_token_file
+        from pathlib import Path
+        # The Codex waiter uses exactly the token source the installer checked, never one from its environment.
+        token = read_token_file(Path(token_file)) if codex else (environ.get("AGENT_COMMS_TOKEN")
+                                                                 or load_agent_token(agent))
+        client = httpx.Client(base_url=_hub(Settings.load(), {} if codex else None), trust_env=False,
                               timeout=httpx.Timeout(CALL_SECONDS + 20, connect=5),
                               headers={"Authorization": "Bearer " + token})
-    body = {"client_session_id": sid, "projects": projects, "nonce": secrets.token_hex(16), "client": "claude-code"}
+    body = {"client_session_id": sid, "projects": projects, "nonce": secrets.token_hex(16), "client": kind}
     deadline, reached, failing_since, failures, rejected = clock() + max_seconds, False, None, 0, 0
     traced_first = False
     while (left := deadline - clock()) >= 1:
@@ -240,10 +323,22 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
             # The start-up grace of a SessionStart hook, but never past this command's own deadline (S32): the ack
             # is committed by then, so at the deadline the wake is written rather than lost.
             not_before = (min(started + STARTUP_GRACE, deadline)
-                          if hook.get("hook_event_name") == "SessionStart" else None)
-            woken = _woken(client, body, answer, stderr, not_before, clock, sleep, trace)
+                          if hook.get("hook_event_name") == "SessionStart" and not codex else None)
+            if codex:
+                # Codex's queue is durable and drained by the process that has the thread: no start-up race to
+                # wait out (DESIGN_NOTES "Waking a Codex thread you opened").
+                woken = _codex_woken(client, body, answer, clock, sleep, trace,
+                                     lambda text: _deliver(codex_proc, cwd, sid, text, environ, stderr, trace,
+                                                           queue, target),
+                                     lambda: target(codex_proc, cwd, environ, known_roots=known_roots)[1] or None)
+            else:
+                woken = _woken(client, body, answer, stderr, not_before, clock, sleep, trace)
+            if woken == REFUSED:
+                _say(stderr, trace, "agent-comms: wake not acknowledged: this Codex binary can no longer be used for "
+                                    "wakes; not waiting any more")
+                return 0
             if woken is not None:
-                return woken
+                return 0 if codex else woken
             rejected += 1
             if rejected >= MAX_REJECTED:
                 return 0    # the hub keeps refusing what it offers: give up rather than spin
@@ -305,3 +400,104 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float
     stderr.flush()
     trace("wake_written")
     return WAKE
+
+
+REFUSED = -1                # _codex_woken: the binary was refused before the acknowledgement (nothing was sent)
+ACK_SECONDS_CODEX = 30.0     # how long the Codex client re-sends one acknowledgement whose outcome it could not read
+#                             (inside the hub's REPLAY_SECONDS, which answers a replay of an accepted one "acked")
+
+
+def _codex_woken(client: Any, body: dict, answer: dict, clock: Callable[[], float], sleep: Callable[[float], None],
+                 trace: Callable[..., None], deliver: Callable[[str], Any],
+                 refused: Callable[[], str | None] = lambda: None) -> int | None:
+    """The Codex client's acknowledgement (review round 1, S1). Unlike Claude's (`_woken`: a wake whose
+    acknowledgement could not be delivered is written anyway, since losing a wake is worse there and an extra exit
+    2 is harmless), a Codex wake is queued ONLY on an explicit "acked": a queued message cannot be taken back, and
+    the hub re-offers the same posts when it never committed the acknowledgement, which would queue a second wake.
+    An outcome it cannot read (no answer, a 5xx, an unreadable or unknown 200) sends the SAME id again, with back-off,
+    for up to ACK_SECONDS_CODEX: the hub answers a replay of an acknowledgement it accepted "acked" again and charges
+    nothing (interactive_wake O3'), and one it never accepted "rejected" once the offer ran out. WAKE once delivered
+    to `deliver` (whatever that managed); 0 when superseded, off or refused (4xx); None (wait on, same nonce) when
+    rejected or when no answer was ever read, so nothing is queued."""
+    text, wake_id = answer.get("text"), answer.get("id")
+    if not (isinstance(text, str) and WAKE_RE.fullmatch(text) and isinstance(wake_id, str)):
+        return 0
+    trace("offer", id=wake_id)
+    why = refused()
+    if why:
+        # Checked again just before the acknowledgement (PR review F1): refused now, it is not acknowledged, so
+        # nothing is charged; the hub takes the offer back at its own deadline, and this process stops waiting.
+        trace("not_acked", id=wake_id, why=why)
+        return REFUSED
+    until, tries = clock() + ACK_SECONDS_CODEX, 0
+    while True:
+        tries += 1
+        trace("ack_sent", id=wake_id, n=tries)
+        try:
+            r = client.post("/api/wait", json=body | {"ack": wake_id, "wait": 0}, timeout=5)
+        except Exception:
+            r = None
+        trace("ack_answer", status=getattr(r, "status_code", None))
+        state = None
+        if r is not None and r.status_code == 200:
+            try:
+                reply = r.json()
+            except ValueError:
+                reply = None
+            state = reply.get("state") if isinstance(reply, dict) else None
+        elif r is not None and r.status_code < 500:
+            return 0
+        if state in ("superseded", "off"):
+            return 0
+        if state == "rejected":
+            return None
+        if state == "acked":
+            deliver(text)
+            return WAKE
+        pause = min(2.0 ** tries, 8.0)
+        if clock() + pause > until:
+            trace("ack_unconfirmed", id=wake_id)
+            return None         # never confirmed: nothing queued, and the hub takes the offer back
+        sleep(pause)
+
+
+def _deliver(proc: Any, cwd: str, thread: str, text: str, environ: dict, stderr: Any, trace: Callable[..., None],
+             queue: Callable[..., bool], target: Callable[..., tuple]) -> bool:
+    """After an accepted acknowledgement: run the Codex binary of the process that ran the hook, verified right now
+    (procinfo.runnable), else nothing. Either way the wake is already charged and its posts delivered."""
+    path, why = target(proc, cwd, environ)
+    if path is None:
+        _say(stderr, trace, f"agent-comms: wake not queued: {why}")
+        return False
+    ok = queue(path, thread, text, environ, trace)
+    if not ok:
+        _say(stderr, trace, "agent-comms: wake not queued: `codex queue` failed")
+    return ok
+
+
+def codex_queue(path: str, thread: str, text: str, environ: dict,
+                trace: Callable[..., None] = lambda *a, **k: None, run: Callable[..., Any] | None = None) -> bool:
+    """Put the wake in the Codex thread's queue: `<path> queue --thread <thread> --message <text>`, no other
+    argument (no -c: queued messages use the thread's own model and settings, and `codex queue` refuses some
+    overrides when a daemon is up). `path` is the binary of the Codex process that ran the hook, resolved and
+    verified by procinfo.runnable; nothing else is ever run (no PATH lookup). True when it exited 0.
+
+    Called only after the hub accepted the acknowledgement, so the wake is already charged and its posts delivered:
+    a failure here is not given back to the hub, and the posts are not offered again. They wait for the thread's
+    next board read, and a request among them is held only until its grace ends, after which the dispatcher can
+    take it. It is never tried twice: a `codex queue` that ran and failed, or did not finish in QUEUE_SECONDS, may
+    have queued the message already, and a second call would wake the thread twice."""
+    import subprocess
+    run = run or subprocess.run
+    try:
+        r = run([path, "queue", "--thread", thread, "--message", text], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=QUEUE_SECONDS, env=dict(environ))
+    except subprocess.TimeoutExpired:
+        trace("queue_timeout", exe=path)
+        return False
+    except OSError as e:
+        trace("queue_unstartable", exe=path, error=type(e).__name__)
+        return False
+    ok = r.returncode == 0
+    trace("queued" if ok else "queue_failed", exe=path, code=r.returncode)
+    return ok

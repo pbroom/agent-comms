@@ -43,12 +43,15 @@ if [[ "$wake" == remove ]]; then
   echo "Removed the agent-comms wake hooks from $claude_settings (if they were there)."
   exit 0
 fi
-[[ -f "$home/agents.toml" ]] || { echo "No agents.toml in $home; run board init there or pass --home." >&2; exit 1; }
+# Whether this board's registry or its hub can verify the token is token_check's decision (review round 4 of the
+# Codex wake, S12): a machine that only reaches a hub has no agents.toml.
 if [[ "$wake" == add ]]; then
   [[ "$agent" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || { echo "Not an agent name: $agent" >&2; exit 1; }
   [[ "$home$here" != *"'"* ]] || { echo "Paths with a single quote are not supported." >&2; exit 1; }
-  # Fails loudly if the token does not authenticate against this board home (or its hub).
-  AGENT_COMMS_HOME="$home" bash "$here/board.sh" brief --agent "$agent" --project / >/dev/null
+  # Fails loudly if the token does not authenticate against this board home (or its hub). Read-only
+  # (agent_comms/token_check.py): `board brief` would open and initialise the board database.
+  AGENT_COMMS_HOME="$home" uv run --quiet --frozen --no-dev --project "$here/../.." \
+    python -I -m agent_comms.token_check --agent "$agent" || exit 1
   hooks add --home "$home" --agent "$agent"
   cat <<MSG
 Added the agent-comms wake hooks (Stop and SessionStart, asyncRewake, agent '$agent') to $claude_settings.
@@ -61,13 +64,15 @@ command -v claude >/dev/null
 
 token_dir="$HOME/.config/agent-comms"
 token_file="$token_dir/$agent.token"
+{ set +x; } 2>/dev/null     # no tracing, inherited or not: the next lines handle the token itself
 if [[ ! -f "$token_file" && -n "${AGENT_COMMS_CLAUDE_TOKEN:-}" ]]; then
   mkdir -p "$token_dir" && chmod 700 "$token_dir"
   (umask 077 && printf '%s\n' "$AGENT_COMMS_CLAUDE_TOKEN" > "$token_file")
 fi
 [[ -f "$token_file" ]] || { echo "Missing $token_file (mode 600) holding the '$agent' token." >&2; exit 1; }
-# Fails loudly if the token does not authenticate against this board home.
-AGENT_COMMS_HOME="$home" bash "$here/board.sh" brief --agent "$agent" --project / >/dev/null
+# Fails loudly if the token does not authenticate against this board home. Read-only (agent_comms/token_check.py).
+AGENT_COMMS_HOME="$home" uv run --quiet --frozen --no-dev --project "$here/../.." \
+  python -I -m agent_comms.token_check --agent "$agent" || exit 1
 
 skill_dir="$HOME/.claude/skills/agent-comms"
 if [[ -e "$skill_dir" ]] && ! diff -q "$here/skill/SKILL.md" "$skill_dir/SKILL.md" >/dev/null 2>&1; then
