@@ -117,10 +117,8 @@ def _read(path: Path) -> dict:
 
 
 def _write(path: Path, data: dict) -> None:
-    """Replace the settings file atomically. A symlinked settings file (a dotfiles setup) is written through: the
-    temporary file goes beside the link's target and replaces the target, so the link stays a link and the target
-    keeps its permissions (PR review F3b)."""
-    path = Path(os.path.realpath(path))
+    """Replace the settings file atomically: the temporary file goes beside `path` and replaces it, keeping its
+    permissions. `path` is the real path `main` resolved once, before reading (PR review F3b, S34)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".agent-comms-")
@@ -144,7 +142,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--agent", help="the agent the hook waits as (add)")
     ap.add_argument("--timeout", type=int, default=TIMEOUT)
     a = ap.parse_args(argv)
-    path = Path(a.settings)
+    # A symlinked settings file (a dotfiles setup) is written through to its target, so the link stays a link. Its
+    # real path is resolved once, here, and that same path is read and then replaced: a link retargeted meanwhile
+    # never gets the old target's settings written over the new one.
+    path = Path(os.path.realpath(a.settings))
     try:
         before = _read(path)
         if a.action == "add":

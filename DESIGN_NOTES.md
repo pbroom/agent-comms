@@ -4378,9 +4378,9 @@ dispatcher off it until the record was pruned: 2 days, or 7 while another conver
 project. Both rules this mirrors are bounded. `hosted_wake.holds` goes through `_matching` (not ended, node seen
 recently). The dispatcher's `_policy_held` holds only for a session with a receipt whose `last_seen` is within
 `live_minutes`.
-- Now the pair records which board sessions read each delivered post (`readers`, the latest 8 per post), next to the
-  first read time (`read`). `handed` adds a reader whenever a session that qualifies is shown the post, not only on the
-  first read. After the deadline, `read_after_delivery` holds only while one of those readers is still the agent's in
+- Now the pair records which board sessions read each delivered post (`readers`; first kept as the latest 8 per post,
+  see S33 below), next to the first read time (`read`). `handed` adds a reader whenever a session that qualifies is
+  shown the post, not only on the first read. After the deadline, `read_after_delivery` holds only while one of those readers is still the agent's in
   the project, not a dispatched run's, and was seen within the hub's `[dispatch] live_minutes` (`live_seconds`, default
   2 minutes).
 - A session that read the post and went quiet holds nothing at the next dispatcher pass. Another live session of the
@@ -4424,3 +4424,14 @@ dotfiles setup) into a regular file. It now writes through `os.path.realpath`. T
 target and atomically replaces the target, which keeps its permissions.
 `test_f3b_the_installer_writes_through_a_symlinked_settings_file` checks this with a symlinked file in a temp home, for
 `add` and `remove`, and checks that no temporary file is left.
+
+**S33 and S34 (the check of that commit).**
+- **S33.** Keeping only the latest 8 readers let eight later reads, by other sessions of the agent in the project,
+  evict a reader that was still live, and the hold dropped beside it. Now a reader that can still hold the post (the
+  agent's, in the project, not a dispatched run's, seen within `live_minutes`) is never dropped for a new one. Each
+  write of the list prunes only readers that no longer can; the list keeps the post's own retention, with a hard cap
+  of 64 whose overflow drops the least recently seen. The randomized test's model prunes the same way
+  (`test_s33_later_readers_never_evict_a_reader_that_is_still_live`).
+- **S34.** `claude_hooks.main` now resolves the settings file's real path once, before reading, and reads and
+  atomically replaces that same path. A link retargeted between the two steps leaves the new target untouched
+  (`test_s34_a_settings_link_retargeted_between_the_read_and_the_write_is_written_where_it_was_read`).

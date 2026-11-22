@@ -156,3 +156,53 @@ def test_f3b_the_installer_writes_through_a_symlinked_settings_file(tmp_path):
     assert [p.name for p in dotfiles.iterdir()] == ["claude-settings.json"], "no temp file left beside the target"
     assert claude_hooks.main(["remove", "--settings", str(link), "--script", script]) == 0
     assert link.is_symlink() and "hooks" not in json.loads(real.read_text())
+
+
+# ------------------------------------------------------------ S33, S34 (the check of the PR review's commit)
+
+
+def test_s33_later_readers_never_evict_a_reader_that_is_still_live(senv):
+    """A live reader, then more other board sessions of the agent in the project than the old list kept read the
+    post and go quiet: the first reader is still among the post's readers, so the hold stands while it is live and
+    ends once it is not."""
+    on(senv)
+    tid = senv.thread()
+    wait(senv)
+    post = ask(senv, tid)
+    assert woke(senv) is not None
+    first = senv.session("claude")
+    senv.board.read_updates(senv.p["claude"], first, only="addressed")
+    for _ in range(8):
+        other = senv.session("claude")
+        senv.board.read_updates(senv.p["claude"], other, only="addressed")
+    senv.clock.advance(GRACE + 1)
+    senv.board.heartbeat(senv.p["claude"], first)
+    assert holds(senv, post), "the first reader is live: it still has the request"
+    assert first in iw._pair(senv.board.conn, "claude", PROJECT)["readers"][str(post["id"])]
+    senv.clock.advance(LIVE + 1)
+    assert not holds(senv, post), "and once it is not live, nothing holds it"
+
+
+def test_s34_a_settings_link_retargeted_between_the_read_and_the_write_is_written_where_it_was_read(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    old, new = tmp_path / "old.json", tmp_path / "new.json"
+    old.write_text(json.dumps({"theme": "dark"}))
+    new.write_text(json.dumps({"theme": "light"}))
+    link = home / ".claude" / "settings.json"
+    link.symlink_to(old)
+    real_read = claude_hooks._read
+
+    def read_then_retarget(path):
+        data = real_read(path)
+        link.unlink()
+        link.symlink_to(new)                             # retargeted by someone else meanwhile
+        return data
+
+    monkeypatch.setattr(claude_hooks, "_read", read_then_retarget)
+    script = "/opt/agent-comms/integrations/claude-code/wait.sh"
+    assert claude_hooks.main(["add", "--settings", str(link), "--script", script, "--home", str(tmp_path / "board"),
+                              "--agent", "claude"]) == 0
+    assert "hooks" in json.loads(old.read_text()), "written to the file it was read from"
+    assert json.loads(new.read_text()) == {"theme": "light"}, "the new target is untouched"

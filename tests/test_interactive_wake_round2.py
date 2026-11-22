@@ -267,7 +267,11 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         for d in out["posts"]:
             k = str(d["id"])
             if where.get(d["id"]) == project and k in model["delivered"] and conv in (None, delivered_to.get(k)):
-                model["readers"].setdefault(k, set()).add(sid)
+                got = model["readers"].setdefault(k, set())
+                if sid not in got:                  # a new reader: those that can no longer hold it are pruned (S33)
+                    now = senv.clock()
+                    got -= {s for s in got if model["seen"][s][1] != project or model["seen"][s][0] < now - LIVE}
+                    got.add(sid)
 
     def new_nonce(c):
         convs[c]["n"] += 1

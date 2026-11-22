@@ -134,7 +134,7 @@ SUPERSEDED = {"state": "superseded"}
 ACKED = {"state": "acked"}
 REJECTED = {"state": "rejected"}
 REPLAY_SECONDS = 60.0            # the last accepted ack id is answered "acked" again for this long (its reply was lost)
-MAX_READERS = 8                  # board sessions kept per delivered post as its readers (the latest)
+MAX_READERS = 64                 # a hard cap on a delivered post's readers (overflow: the least recently seen go)
 LIVE_MINUTES = 2.0               # [dispatch] live_minutes when the hub's value is missing or not a positive number
 
 
@@ -604,6 +604,20 @@ def _delivery(conn, agent: str, project: str, k: str) -> tuple[float | None, dic
     return (min(ats) if ats else None), pair, recs
 
 
+def _eligible_readers(conn, agent: str, project: str, sessions: list[int], since: float) -> list[int]:
+    """Of a post's readers, those that can still hold it: the agent's, registered in the project, not a dispatched
+    run's, seen at or after `since`; least recently seen first. A reader that still can is never dropped for a new
+    one (S33): only those that no longer can are pruned, here on every write of the list, and the list keeps the
+    post's own retention. Past MAX_READERS, which only that many live sessions reading one post reach, the least
+    recently seen go."""
+    seen = {}
+    for sid in dict.fromkeys(sessions):
+        row = conn.execute("SELECT last_seen FROM sessions WHERE id = ?", (sid,)).fetchone()
+        if row is not None and row["last_seen"] >= since and hosted_wake._own_reader(conn, sid, agent, project):
+            seen[sid] = row["last_seen"]
+    return sorted(seen, key=lambda s: seen[s])[-MAX_READERS:]
+
+
 def read_after_delivery(conn, agent: str, project: str, post_id: int, now: float, window: float) -> bool:
     """A board session that can be the own session of a waiter the post was delivered to was shown it after that
     delivery, and is live: one of the post's readers on the pair, which `handed` records only for a reader registered
@@ -707,14 +721,16 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
         with db.write_tx(board.conn) as c:
             if not enabled(board):
                 return          # turned off while this read waited for the lock: no read mark
-            now = board.now()
+            now, window = board.now(), live_seconds(board)
             pair = _pair(c, p.name, project)
             marked = [k for k in todo if not hosted_wake._shadowed(c, pair, _delivery(c, p.name, project, k)[0])]
             for k in marked:
                 if pair["read"].get(k, -1.0) < _delivery(c, p.name, project, k)[0]:
                     pair["read"][k] = now
                 # Who read it: `holds` after the deadline asks whether one of them is still live (PR review F1).
-                pair["readers"][k] = [s for s in pair["readers"].get(k, []) if s != session_id] + [session_id]
+                pair["readers"][k] = _eligible_readers(
+                    c, p.name, project, [s for s in pair["readers"].get(k, []) if s != session_id] + [session_id],
+                    now - window)
             for key, rec in _records(c, p.name, project).items():
                 mine = [k for k in marked if k in rec["delivered"] and rec["read"].get(k, -1.0) < rec["delivered"][k]
                         and _reader(c, session_id, p.name, rec)]
