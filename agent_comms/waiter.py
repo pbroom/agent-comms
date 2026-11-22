@@ -10,7 +10,8 @@ with the hook's JSON on stdin (`session_id`, `cwd`, `hook_event_name`). This pro
   it acknowledges the wake (`ack`; the hub cannot see a caller hang up, and takes back a wake nobody acknowledged):
   it exits 2 when the hub accepts the acknowledgement, or when the acknowledgement could not be delivered at all
   (then the hub may offer the same posts once more); it waits on with the same nonce when the hub rejects it while
-  this is still the current process, or answers in a way it cannot read (see `_woken`);
+  this is still the current process, or answers in a way it cannot read (see `_woken`). A SessionStart hook's
+  process writes the wake no sooner than STARTUP_GRACE after it started (see there); a Stop hook's at once;
 - exits 0, silently, in every other case: the hub says the feature is off, or that a newer process of the same
   conversation took over (the hook ran again); the hub cannot be reached when it first calls (once a call may have
   reached it, a restart or a dropped connection is retried for RETRY_SECONDS with the same nonce); the process was
@@ -47,6 +48,11 @@ DEFAULT_MAX_SECONDS = 86340.0   # the installed hook's timeout is 86400 (README 
 WATCH_SECONDS = 1.0
 MAX_REJECTED = 5            # acknowledgements in a row the hub rejected before this process gives up
 ACK_TRIES = 3               # sends of one ack whose reply could not be read (the hub answers a replay "acked" again)
+# A SessionStart hook's wake is written no sooner than this long after the hook started (the Stop hook's at once).
+# Observed on Claude Code 2.1.322 (DESIGN_NOTES "Known Claude Code behaviour"): a SessionStart asyncRewake hook that
+# exited 2 within about two seconds of launch was reported as a hook result but started no turn. Waiting out this
+# start-up window avoids that; the hub's O5 (a delivered wake nobody read comes back) recovers if it happens anyway.
+STARTUP_GRACE = 10.0
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MANAGED = "AGENT_COMMS_MANAGED"     # set by dispatch.child_env for every launched run and hosted session
 _NAME = r"[a-z][a-z0-9_-]{0,31}"
@@ -151,6 +157,7 @@ def project_of(cwd: str, environ: dict | None = None) -> str:
 
 
 def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, clock, watch) -> int:
+    started = clock()       # the hook process's start, as near as this process can tell
     if environ.get(MANAGED) == "1":
         return 0            # a dispatched run or hosted session: never the interactive session's waiter
     hook = _hook_input(stdin)
@@ -200,7 +207,8 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
         if state == "idle":
             rejected = 0        # the cap is on rejections in a row, not over a long session
         if state == "wake":
-            woken = _woken(client, body, answer, stderr)
+            not_before = started + STARTUP_GRACE if hook.get("hook_event_name") == "SessionStart" else None
+            woken = _woken(client, body, answer, stderr, not_before, clock, sleep)
             if woken is not None:
                 return woken
             rejected += 1
@@ -212,7 +220,8 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
     return 0
 
 
-def _woken(client: Any, body: dict, answer: dict, stderr: Any) -> int | None:
+def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float | None = None,
+           clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> int | None:
     """Acknowledge the wake, then wake the session (WAKE): when the hub accepts the acknowledgement, or when it could
     not be delivered at all (no answer, or a 5xx: the hub then takes the wake back after a while and may offer the
     same posts once more). 0 when the hub says this process was superseded or the feature is off, or refuses the
@@ -246,6 +255,11 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any) -> int | None:
         # unreadable or unknown: ask again with the same id
     else:
         return None
+    # Acknowledged at once (the hub's deadline stands); the wake itself waits out the start-up grace of a
+    # SessionStart hook. SIGTERM, SIGHUP, SIGINT or the Claude process going away still end this process (exit 0)
+    # meanwhile; the hub then returns the wake nobody read (O5).
+    while not_before is not None and (left := not_before - clock()) > 0:
+        sleep(min(left, 1.0))
     stderr.write(text + "\n")
     stderr.flush()
     return WAKE

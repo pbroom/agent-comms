@@ -118,6 +118,8 @@ def test_s24_a_replaced_process_replaying_its_accepted_ack_is_answered_acked_onc
     assert len(pair(senv)["sent"]) == 1 and pair(senv)["threads"][str(tid)]["count"] == 1, "charged once"
     assert call(senv, conv=TWO, nonce=NA, ack=out["id"])["state"] != "acked", "never for another conversation"
     assert call(senv, nonce=NB, ack=out["id"])["state"] != "acked", "nor for another process of this one"
+    reader = senv.board.register_session(senv.p["claude"], PROJECT)["session_id"]
+    senv.board.read_updates(senv.p["claude"], reader, only="addressed")      # the woken session reads it
     for _ in range(3):
         senv.clock.advance(31)
         assert call(senv, nonce=NB) == {"state": "idle"}, "the newer process is not offered those posts again"

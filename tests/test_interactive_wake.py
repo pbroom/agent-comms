@@ -221,9 +221,11 @@ def test_the_hourly_maximum_holds_posts_until_the_hour_has_room(senv):
     on(senv, max_wakes_per_hour=2, wake_min_interval_seconds=0)
     tid = senv.thread()
     wait(senv)
+    reader = senv.session("claude")             # the woken session reads what it was woken for
     for _ in range(2):
         ask(senv, tid)
         assert woke(senv) is not None
+        senv.board.read_updates(senv.p["claude"], reader, only="addressed")
         senv.clock.advance(60)
     ask(senv, tid)
     assert woke(senv) is None and len(rec(senv)["pending"]) == 1

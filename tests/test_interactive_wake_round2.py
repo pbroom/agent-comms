@@ -242,12 +242,13 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
     readers, others = {}, {}
     issued: list[tuple] = []                     # (conv, nonce, project, offer id, threads, post keys)
     accepted: dict[str, tuple] = {}              # offer id -> (conv, nonce, project, when)
-    delivered_to: dict[str, str] = {}
+    deliveries: dict[str, list[str]] = {}       # post -> the conversations it was delivered to, in order
+    came_back: set[str] = set()                # posts O5 returned (once each)
     expected = {(pr, t): 0 for pr in projects for t in threads[pr]}
     first_offer: dict[str, float] = {}
     posts: list[tuple[int, str]] = []
     flags = {"paused": False, "root": None, "off": False}
-    seen = {"issued": 0, "acked": 0, "rejected": 0, "replayed": 0, "held": 0}
+    seen = {"issued": 0, "acked": 0, "rejected": 0, "replayed": 0, "held": 0, "returned": 0}
 
     def new_nonce(c):
         convs[c]["n"] += 1
@@ -262,8 +263,7 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         if out["state"] == "wake":
             seen["issued"] += 1
             r = rec(senv, c)
-            issued.append((c, v["nonce"], v["project"], out["id"],
-                           sorted({e[0] for e in r["offer"]["entries"].values()}), list(r["offer"]["entries"])))
+            issued.append((c, v["nonce"], v["project"], out["id"], dict(r["offer"]["entries"])))
 
     def unchanged(project, before) -> None:
         after = iw._pair(senv.board.conn, "claude", project)
@@ -281,7 +281,8 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
     def do_ack(late):
         if not issued:
             return
-        c, nonce, project, wake_id, batch, keys = issued.pop(rnd.randrange(len(issued)))
+        c, nonce, project, wake_id, entries = issued.pop(rnd.randrange(len(issued)))
+        keys = list(entries)
         if late:
             senv.clock.advance(iw.ACK_SECONDS)
         before = iw._pair(senv.board.conn, "claude", project)
@@ -299,9 +300,15 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         assert not flags["paused"] and not flags["off"] and flags["root"] != project, "accepted when it may not be"
         assert was_unread, "accepted for a post another session had read past"
         for k in keys:
-            assert delivered_to.setdefault(k, c) == c, f"post {k} delivered to two conversations"
+            got = deliveries.setdefault(k, [])
+            assert not got or (k in came_back and len(got) == 1), f"post {k} delivered again without coming back"
+            got.append(c)
+        # Charged for the threads of the posts delivered for the first time (O5's returned ones are not charged).
+        batch = sorted({e[0] for k, e in entries.items() if k not in before["returned"]})
         for t in batch:
             expected[(project, t)] += 1
+        if not batch:
+            unchanged(project, before)
         pair = iw._pair(senv.board.conn, "claude", project)
         for t in threads[project]:
             got = (pair["threads"].get(str(t)) or {}).get("count", 0)
@@ -328,9 +335,10 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         unchanged(project, before)
 
     for step in range(400):
+        delivered_before = {pr: dict(iw._pair(senv.board.conn, "claude", pr)["delivered"]) for pr in projects}
         op = rnd.choices(["look", "rearm", "move", "post", "human", "pause", "tick", "ack", "late", "root", "read",
-                          "cursor", "replay", "flip", "time"],
-                         weights=[8, 2, 1, 5, 1, 1, 3, 6, 1, 1, 2, 1, 2, 1, 3])[0]
+                          "cursor", "replay", "flip", "time", "unread"],
+                         weights=[8, 2, 1, 5, 1, 1, 3, 6, 1, 1, 2, 1, 2, 1, 3, 3])[0]
         c = rnd.choice(list(convs))
         if flags["paused"] and rnd.random() < 0.25:     # a pause lasts a few steps
             op = "pause"
@@ -400,16 +408,41 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
             out = senv.board.read_updates(senv.p["claude"], others[pr])
             if out.get("ack_through"):
                 senv.board.ack(senv.p["claude"], others[pr], out["ack_through"])
+        elif op == "unread":                        # a delivered wake nobody acts on: time passes, no read,
+            senv.clock.advance(iw.UNREAD_SECONDS + 1)   # and a waiter's next look
+            look(c)
         elif op == "time":
             senv.clock.advance(rnd.choice([1, 1, 2, 3, 8, 25]))
+        returned_now = returns(senv, projects, delivered_before)
+        for k, pr in returned_now:
+            assert k not in came_back, f"post {k} came back twice"
+            assert unread([k]) and not iw.read_after_delivery(senv.board.conn, "claude", pr, int(k)), \
+                f"post {k} came back although it was read"
+            came_back.add(k)
+            seen["returned"] += 1
         seen["held"] += check(senv, projects, first_offer, posts)
     assert (seen["issued"] >= 10 and seen["acked"] >= 3 and seen["rejected"] >= 1 and seen["replayed"] >= 1
-            and seen["held"]), \
+            and seen["held"] and seen["returned"] >= 1), \
         ("the run exercised too little", seen)
+
+
+def returns(env, projects, delivered_before) -> list[tuple[str, str]]:
+    """The posts O5 returned during the last step: they left a pair's `delivered` set and wait in `returning` (or
+    were offered at once). A post that left with its pair (the setting off and a pass's clean-up) is not one."""
+    out = []
+    for pr in projects:
+        raw = iw._get(env.board.conn, iw._pair_key("claude", pr))
+        if raw is None:
+            continue
+        pair = iw._pair(env.board.conn, "claude", pr)
+        out += [(k, pr) for k in delivered_before[pr] if k not in pair["delivered"] and k in pair["returned"]]
+    return out
 
 
 def check(env, projects, first_offer, posts) -> int:
     conn, now = env.board.conn, env.clock()
+    offered = [k for r in iw._records(conn, "claude").values() for k in (r["offer"] or {}).get("entries", {})]
+    assert len(offered) == len(set(offered)), "a post offered to two conversations at once"
     for pr in projects:
         recs = iw._records(conn, "claude", pr)
         standing = [k for k, r in recs.items() if r["offer"] and iw._stands(env.board, conn, k, r, now, recs)]

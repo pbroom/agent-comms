@@ -31,11 +31,14 @@ Real step (--claude-bin): `claude -p --input-format stream-json --output-format 
 directory. The settings file has exactly the hooks `install.sh --wake` adds (claude_hooks.add): SessionStart and
 Stop, asyncRewake, wait.sh. The only MCP server is this checkout's `board mcp` on the temp hub, signed in as
 `claude`; only its tools are allowed. No message is ever sent to the session.
-R1. The session opens and its SessionStart hook waits. The poster posts a request addressed to `claude`: the idle
-    session, which has not taken a turn, takes one within --max-real-wake and calls board_read_updates, and the hub
-    notes it was shown the post.
+R1. The session opens and its SessionStart hook waits. The poster posts a request addressed to `claude` right
+    away: the hook acknowledges the wake at once but writes it only once waiter.STARTUP_GRACE has passed since it
+    started (M1); the idle session, which has not taken a turn, then takes one within --max-real-wake and calls
+    board_read_updates, and the hub notes it was shown the post.
 R2. When that turn ends, its Stop hook waits again (a newer process of the same conversation). A second request: a
     second turn, board_read_updates again.
+If a hook exits 2 and no turn follows within MISSED_TURN_SECONDS (Claude Code's start-up race, DESIGN_NOTES "Known
+Claude Code behaviour"), the run fails at once saying exactly that, and keeps its logs.
 R3. The session is ended with SIGTERM: no `board wait` of it is left, and once the hub's side of its last open call
     has run out (at most waiter.CALL_SECONDS) nothing polls for it any more.
 """
@@ -66,6 +69,7 @@ WAIT_SH = ROOT / "integrations" / "claude-code" / "wait.sh"
 BODY_WORDS = ("zebra", "quartz", "lantern")
 MARKER = "E2E-WAKE-MARKER-91b2"
 INTERVAL = 2                    # the hub's wake_min_interval_seconds for this run
+MISSED_TURN_SECONDS = 30        # a hook's exit 2 with no turn this long after it: Claude Code's start-up race
 
 
 def free_port() -> int:
@@ -340,6 +344,23 @@ wake = true
         def results() -> int:
             return sum(1 for _, e in events if e.get("type") == "result")
 
+        def hook_wakes() -> list[tuple[float, str]]:
+            """When a hook exited 2 (Claude's hook_response with exit_code 2), and which hook."""
+            return [(t, str(e.get("hook_event"))) for t, e in events
+                    if e.get("type") == "system" and e.get("subtype") == "hook_response" and e.get("exit_code") == 2]
+
+        def missed_turn() -> str | None:
+            """Claude Code's start-up race (DESIGN_NOTES "Known Claude Code behaviour"): a hook exited 2 and no turn
+            followed within MISSED_TURN_SECONDS. Said as exactly that, with the times, if it ever happens again."""
+            for t, hook in hook_wakes():
+                turn = ("assistant", "result")
+                after = [e for u, e in events if u > t and (
+                    e.get("type") in turn or (e.get("type"), e.get("subtype")) == ("system", "init"))]
+                if not after and time.monotonic() - t >= MISSED_TURN_SECONDS:
+                    return (f"the {hook} hook exited 2 (the wake text on its stderr) {time.monotonic() - t:.0f} s ago "
+                            f"and no turn followed within {MISSED_TURN_SECONDS} s (Claude Code took no turn)")
+            return None
+
         def reads(after: float) -> list[dict]:
             return [b for t, e in events if t >= after and e.get("type") == "assistant"
                     for b in (e.get("message") or {}).get("content") or []
@@ -360,9 +381,13 @@ wake = true
                     time.sleep(INTERVAL)
                 t0 = time.monotonic()
                 post = self.post()
+                def done() -> bool:
+                    missed = missed_turn()
+                    if missed:
+                        raise SystemExit(f"{step}: {missed}")
+                    return results() > before and bool(reads(t0))
                 try:
-                    self.until(f"{step}: a turn and a board_read_updates call",
-                               lambda: results() > before and reads(t0), self.args.max_real_wake)
+                    self.until(f"{step}: a turn and a board_read_updates call", done, self.args.max_real_wake)
                 except SystemExit:
                     # Say which half failed: no wake (the hub's record) or a turn without the call (the model).
                     r = self.record(conv) or {}
@@ -371,6 +396,15 @@ wake = true
                           f"pending {list((r.get('pending') or {}))}; transcript in {self.tmp / 'logs'}")
                     raise
                 took = time.monotonic() - t0
+                if step == "R1":
+                    # M1: the SessionStart hook's wake was written no sooner than waiter.STARTUP_GRACE after Claude
+                    # started the hook, although the post came right after it armed.
+                    started = next(u for u, e in events if e.get("subtype") == "hook_started"
+                                   and e.get("hook_event") == "SessionStart")
+                    exited = next(u for u, hook in hook_wakes() if hook == "SessionStart")
+                    self.check(exited - started >= waiter.STARTUP_GRACE - 0.5,
+                               f"R1 the SessionStart wake came {exited - started:.1f} s after the hook started "
+                               f"(the start-up grace is {waiter.STARTUP_GRACE:.0f} s)")
                 self.check(True, f"{step} woken with no input: board_read_updates {took:.1f} s after the post "
                                  f"({json.dumps(reads(t0)[0].get('input'))})")
                 rec = self.record(conv) or {}

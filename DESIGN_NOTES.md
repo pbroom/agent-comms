@@ -4144,3 +4144,74 @@ rulings, not with the proposed fix. It expects `acked` for a replay whenever the
 and the window holds, whatever the current nonce and whether or not the board is paused, and it asserts nothing is
 charged. Writing these tests turned up no double wake and no wake of a different conversation through the replay
 path: a replay is looked up on the conversation's own record and needs the nonce that made the ack.
+
+### Known Claude Code behaviour: a start-up wake that starts no turn (2026-11-21)
+
+Observed on Claude Code 2.1.322, twice in ten real runs of `scripts/interactive-wake-e2e.py`. A SessionStart
+asyncRewake hook exited 2 within about two seconds of launch. Claude Code reported it as a hook result but started
+no turn.
+
+The evidence is kept in this session's scratchpad (`failed-r1-evidence/`), for the second case:
+- The hub offered and acknowledged the wake.
+- `claude.jsonl` shows `hook_started` (SessionStart:startup), then `hook_response` with `exit_code: 2` and exactly
+  the wake text on stderr.
+- Then nothing for 120 s: no `system init`, no message, no result.
+
+Twelve spike sessions did not reproduce it: hooks exiting 2 after 0, 1, 6 or 8 s, with and without a slow stdio
+MCP server starting at the same time. It is intermittent, and its cause inside Claude Code is unknown. We design
+around it:
+- **M1** keeps a SessionStart hook's wake out of the window. `board wait` acknowledges the wake at once, so the
+  hub's ack deadline stands, but writes it and exits 2 only once `waiter.STARTUP_GRACE` (10 s) has passed since the
+  hook process started. A wake offered later is written at once. The Stop hook is unchanged. While it waits out the
+  grace, SIGTERM, SIGHUP, SIGINT or the Claude process going away still end it with exit 0.
+- **M2**, the state machine's O5, recovers if a wake starts no turn anyway. A delivered post that no session that
+  can be the waiter's own reads within `interactive_wake.UNREAD_SECONDS` (90 s) comes back once and uncharged. It
+  goes to the next waiter that arms for that agent and project, normally the same conversation's next hook.
+
+What the user sees in the worst case: the post waits for the session's next turn, when its Stop hook arms and
+is offered it again, or, for a request the dispatcher could run, for the request's grace to end.
+
+### Waking an interactive session: M1 and M2 (2026-11-21)
+
+- **M1** (`waiter.py`): `hook_event_name` from the hook's stdin tells a SessionStart hook from a Stop hook. Only a
+  SessionStart hook waits out STARTUP_GRACE, counted from when `board wait` started; the hook started a moment
+  before that.
+- **M2** (`interactive_wake.py`, O5 in the docstring):
+  - *How a post comes back.* `_return_unread`, run in `_advance` (any waiter's look in the pair, or a dispatcher
+    pass), finds the pair's delivered posts that are UNREAD_SECONDS old, were never returned before and are not
+    claimed. It marks every one of them `returned`: it is looked at once, whatever it finds. Those that still
+    qualify (nobody read past them) and that `read_after_delivery` says were not read leave `delivered` and wait
+    in `returning`.
+  - *Where it goes.* O1 adds them to the offer of the next waiter chosen in the pair.
+  - *Charging.* The acknowledgement that delivers them again charges nothing for them: no `sent` entry and no
+    thread count, unless the same batch also has new posts, which are charged for their own threads only.
+  - *The dispatcher.* Its hold is not extended: it still ends at the request's first-offer deadline.
+  - *Faster pick-up.* The poll's no-write fast path, and the dispatcher pass's skip, now also look for a pair with
+    a return due or with returned posts waiting, so a return is never held up by them.
+- **A bug the randomized run found while M2 was added: read evidence lost when a waiter moved project.** The read
+  evidence was kept only on each waiter's record and looked up among the waiters currently in the project. So a
+  read by a waiter that had since moved to another project was invisible. O5 then returned a read post, and `holds`
+  after its deadline missed the read; the `holds` half was a gap in earlier heads too. Seed 6 hit it: a
+  conversation read its post in /work/second, moved to /work/repo and moved back, and on the way back the post
+  came back.
+  - *The fix.* A read is now marked on the pair of the reader's project too (`read`, with the conversations each
+    post was delivered to, `delivered_to`), and `read_after_delivery` looks at every waiter record of the agent,
+    whatever project it is in now.
+  - *The test.* `test_m2_a_read_by_a_waiter_that_moved_on_to_another_project_still_counts` fails against a copy
+    with only the old evidence lookup put back.
+- **Tests.** `tests/test_interactive_wake_m1m2.py`, 10 tests:
+  - M1, with a fake clock: acknowledged at once and written after the grace; written at once after the grace and
+    for a Stop hook. In subprocesses: exit 0 on SIGTERM, and when the Claude process goes, during the grace.
+  - M2: a post comes back once and uncharged; a post read meanwhile, or read past by another session, never comes
+    back; the hold is not extended; a returned post goes to the next waiter that arms, to one at a time; and the
+    moved-waiter case above.
+- **The randomized test** gains a move: a delivered wake nobody acts on, then a waiter's next look. It also gains
+  these invariants:
+  - a post comes back at most once, and only if it was not read;
+  - a post is delivered a second time only after it came back, and never a third time;
+  - a returned post is not charged again;
+  - no post is in two offers at once.
+  Each run must see at least one return.
+- **The e2e script.** R1 now checks that the SessionStart wake came no sooner than the grace after the hook
+  started, although the post came right after it armed. And if a hook exits 2 with no turn within 30 s, the run
+  fails at once saying exactly that, and keeps its logs.

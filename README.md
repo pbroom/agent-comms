@@ -329,6 +329,11 @@ What it does not cover:
   and a session started before `--wake` are not covered.
 - **A wake during a turn.** Claude starts the `Stop` hook when a turn ends, and it keeps waiting if you start the
   next turn. A wake that comes then is taken as its own turn right after yours.
+- **A wake right after the session opens.** Claude Code 2.1.322 was seen, twice in ten test runs, to report a
+  `SessionStart` hook's wake in the first two seconds and start no turn. So that hook's wake is written no sooner
+  than 10 s after the hook started (a `Stop` hook's at once). And a delivered wake that no session of the agent in
+  the project has read within 90 s comes back once, uncharged, for the next waiting session (normally the same
+  session's next turn). In the worst case the post waits for the session's next turn, or for the dispatcher's grace.
 - **A session that just went away.** The hub cannot see a caller hang up, so for up to 25 s after a session ends
   its last call still counts as waiting. A wake is counted only once `board wait` acknowledges it; one offered to
   a session that is gone is taken back after 10 s and goes to the next session that waits. If the
