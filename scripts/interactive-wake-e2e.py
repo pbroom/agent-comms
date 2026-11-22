@@ -70,6 +70,7 @@ BODY_WORDS = ("zebra", "quartz", "lantern")
 MARKER = "E2E-WAKE-MARKER-91b2"
 INTERVAL = 2                    # the hub's wake_min_interval_seconds for this run
 MISSED_TURN_SECONDS = 30        # a hook's exit 2 with no turn this long after it: Claude Code's start-up race
+PROBE_SECONDS = 60              # --probe-on-miss: how long the probe frame's answer is waited for
 
 
 def free_port() -> int:
@@ -411,6 +412,8 @@ wake = true
                     print(f"  {step} diagnosis: turns finished {results()} (before the post {before}); waiter "
                           f"offer {json.dumps(r.get('offer'))}, delivered {json.dumps(r.get('delivered'))}, "
                           f"pending {list((r.get('pending') or {}))}; transcript in {self.tmp / 'logs'}")
+                    if self.args.probe_on_miss and missed_turn():
+                        self.probe(claude, events, step)
                     raise
                 took = time.monotonic() - t0
                 if step == "R1":
@@ -454,6 +457,34 @@ wake = true
                  for b in (e.get("message") or {}).get("content") or [] if isinstance(b, dict)]
         print("  the session's replies:", json.dumps([t for t in texts if t])[:600])
 
+    def probe(self, claude, events, step) -> None:
+        """After a missed turn, the same process gets one ordinary user frame with a unique marker. It answers and
+        the wake never shows: the wake was discarded, or never queued (as from a synchronous hook). The wake text
+        shows with or after it: it was queued and not drained. Nothing within PROBE_SECONDS: stuck in start-up."""
+        marker = f"probe-{uuid.uuid4().hex[:8]}"
+        sent = time.monotonic()
+        frame = {"type": "user", "message": {"role": "user", "content": f"Reply with the single word: {marker}"}}
+        claude.stdin.write(json.dumps(frame) + "\n")
+        claude.stdin.flush()
+        deadline = sent + PROBE_SECONDS
+        while time.monotonic() < deadline:
+            later = [e for t, e in events if t >= sent]
+            if any(e.get("type") == "result" for e in later):
+                break
+            time.sleep(0.5)
+        later = [e for t, e in events if t >= sent]
+        text = json.dumps(later)
+        answered = marker in text
+        wake = "new post(s) addressed to" in text or "board_read_updates" in text
+        verdict = ("stuck in start-up: no answer to the probe" if not answered and not wake else
+                   "the wake was queued and not drained: it showed with or after the probe" if wake else
+                   "the wake was discarded or never queued: the probe was answered and the wake never showed")
+        took = time.monotonic() - sent
+        print(f"  {step} probe ({marker}, {took:.1f} s): {verdict}")
+        (self.tmp / "logs" / "probe.json").write_text(json.dumps(
+            {"marker": marker, "answered": answered, "wake_seen": wake, "seconds": round(took, 1),
+             "verdict": verdict}))
+
     # ------------------------------------------------------------ the end
 
     def cleanup(self) -> None:
@@ -492,6 +523,9 @@ def main() -> int:
     ap.add_argument("--r1-post-delay", type=float, default=0.0, metavar="SECONDS",
                     help="real step: make R1's post this long after Claude started (default: right after it arms)")
     ap.add_argument("--skip-stand-in", action="store_true", help="run only the real step (with --claude-bin)")
+    ap.add_argument("--probe-on-miss", action="store_true",
+                    help="real step: after a missed turn, write one user frame to the same Claude process and say "
+                         "whether it answered and whether the wake then showed (logs/probe.json)")
     ap.add_argument("--old-hook-shape", action="store_true",
                     help='real step, for comparison: the SessionStart hook as earlier versions wrote it, '
                          '"asyncRewake" without "async"')
