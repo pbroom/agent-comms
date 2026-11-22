@@ -678,3 +678,27 @@ def test_s31_ownership_is_per_event_a_five_key_stop_hook_is_not_ours(tmp_path):
     assert got["SessionStart"] == [{"hooks": [five]}], "under SessionStart the five-key shape is ours"
     assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
     assert json.loads(f.read_text()) == {"hooks": {"Stop": [{"hooks": [five]}]}}
+
+
+def test_a_hosted_root_waiting_behind_its_childrens_results_still_takes_precedence(senv):
+    """Main's result delivery (hosted_results.py): a hosted root's wakes wait while results of its children are
+    pending. The root still exists, so an interactive waiter of the agent in the project is not woken meanwhile (its
+    precedence rule is the root's existence, whatever the root's queue holds), and the post stays the hosted
+    session's."""
+    from agent_comms import db, hosted_results
+    on(senv)
+    tid = senv.thread()
+    wait(senv)
+    root = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"
+    with db.write_tx(senv.board.conn) as c:
+        hosted._put(c, hosted.SESSION_PREFIX + root, {"session_id": root, "agent": "claude", "project": PROJECT,
+                                                       "state": "idle", "node": "laptop"}, "test", senv.clock())
+        hosted._put(c, f"{hosted_results.RESULT_PREFIX}{root}.1", {"n": 1, "parent": root, "state": "pending"},
+                    "test", senv.clock())
+    post = ask(senv, tid)
+    for _ in range(3):
+        senv.clock.advance(31)
+        assert woke(senv, nonce=NB) is None, "not woken beside a hosted root, results pending or not"
+    iw.tick(senv.board)
+    assert rec(senv)["pending"] == {} and rec(senv)["offer"] is None
+    assert not iw.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "no interactive hold either"
