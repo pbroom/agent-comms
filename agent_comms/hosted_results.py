@@ -26,7 +26,9 @@ delivered or claimed, and wakes are not held for one.
 - *When it becomes a turn* (`due`, `deliver`). In the very transaction that shows the parent's node its sessions
   (hosted_wake.listing), after a wake that waited there has stepped back: so the turn is made and shown at once, on
   what is stored then. Only for a parent with no turn in flight and nothing queued: a message of the human's that is
-  waiting goes first. A wake is never queued while results wait (hosted_wake.py): results go before wakes. The
+  waiting goes first. And not while a dispatched run uses the directory the parent works in (hosted_wake._occupied:
+  one run per checkout, both ways round, as for a wake); the results wait and go once the run is over. A wake is
+  never queued while results wait (hosted_wake.py): results go before wakes. The
   waiting results go together as ONE `child` message, oldest first, within MESSAGE_MAX_BYTES and BATCH_MAX results;
   the rest go with the next one.
 - *Delivered once when confirmed, at most one marked repeat, never silently lost.* A result's text is kept until the
@@ -335,12 +337,17 @@ def render(results: list[dict], token: str | None = None) -> str:
 # ---------------------------------------------------------------- results become a turn
 
 
-def _free(r: Any, node: str | None) -> bool:
+def _free(r: Any, node: str | None, board: Board | None = None) -> bool:
     """A hosted parent that can take results as its next turn now: open, not being closed, on this node, with no
-    turn in flight and nothing queued (a message of the human's that waits goes first)."""
-    return (isinstance(r, dict) and r.get("state") != "ended" and not r.get("stop")
+    turn in flight and nothing queued (a message of the human's that waits goes first), and, with `board`, its
+    checkout not in use by a dispatched run (hosted_wake._occupied: one run per checkout, both ways round, as for a
+    wake; a result turn is an automatic turn too, and only the human's own message is exempt)."""
+    if not (isinstance(r, dict) and r.get("state") != "ended" and not r.get("stop")
             and (node is None or r.get("node") == node)
-            and r.get("in_flight") is None and not int(r.get("queued") or 0))
+            and r.get("in_flight") is None and not int(r.get("queued") or 0)):
+        return False
+    from . import hosted_wake
+    return board is None or not hosted_wake._occupied(board, r)
 
 
 def _pending_parents(conn) -> list[str]:
@@ -367,7 +374,7 @@ def due(board: Board, conn, node: str) -> bool:
         return False
     try:
         for pid in _pending_parents(conn):
-            if _free(_get(conn, hosted.SESSION_PREFIX + pid), node):
+            if _free(_get(conn, hosted.SESSION_PREFIX + pid), node, board):     # (a busy checkout: not now)
                 return True
     except Exception:
         _complain("hosted sessions: could not look for a child session's results")
@@ -378,14 +385,15 @@ def deliver(board: Board, c, node: str, now: float) -> None:
     """Inside the write transaction that is about to show this node its sessions (hosted_wake.listing, after its
     wakes were checked again): every free parent there with waiting results gets them as its next message, so the
     message is shown in the transaction that made it. Decided on what is stored now: child sessions on, nothing of
-    the human's queued, no wake ahead. A failure here undoes only its own writes and never fails the node's fetch."""
+    the human's queued, no wake ahead, no dispatched run in the parent's checkout. A failure here undoes only its
+    own writes and never fails the node's fetch."""
     if not enabled(board):
         return
     c.execute("SAVEPOINT hosted_results")
     try:
         for pid in _pending_parents(c):
             r = _get(c, hosted.SESSION_PREFIX + pid)
-            if _free(r, node):
+            if _free(r, node, board):
                 _deliver(c, r, now)
         c.execute("RELEASE hosted_results")
     except Exception:

@@ -63,6 +63,7 @@ SHOW_MESSAGES = 20                 # the most recent messages `show` lists
 KEEP_ENDED_SECONDS = 7 * 86400     # an ended session's record is kept this long
 KEEP_SETTLED_SECONDS = 86400       # a settled message's record, in a session that goes on
 NODE_WAIT_MAX = 25                 # seconds one long-poll of a node may wait
+NODE_REPORT_FEATURES = ("answered",)    # report fields this hub takes beyond the first ones (`_listed`)
 HUMAN_WAIT_MAX = 30                # ... and one of the human's CLI
 WAIT_POLL_SECONDS = 0.25           # how often a waiting call re-reads the database
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -477,7 +478,10 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
                    | hosted_tree.node_extra(r, spawn and tree))
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] for m in msgs]])
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
-    return {"node": p.name, "sessions": out, "version": version}
+    # What this hub takes in a node's reports beyond what every hub took: a node sends such a field only to a hub
+    # that names it here, so a newer node's reports reach an older hub exactly as before (its strict model refuses an
+    # unknown field, and the report would be lost).
+    return {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
 
 
 def _events(events: Any) -> list[dict]:

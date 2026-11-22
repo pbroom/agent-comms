@@ -2486,7 +2486,9 @@ be going (hub-local or on a node) is recorded with the run directory a run for t
 on the hub's settings), no wake is queued, and one queued just before is not shown to the node: it steps back like
 one the human's message caught up with. The posts stay in `pending` and go when the directory is free. A run in its
 own parallel worktree has another directory and does not block. This is about automatic turns only: a message the
-human sends is the human's call.
+human sends is the human's call. A child session's results are an automatic turn as well (hosted_results.py, since
+the result-delivery PR's review): while such a run uses the parent's checkout, the results wait and no write
+transaction is taken for them on the node's polls; they become the parent's turn once the run is over.
 
 **The dispatcher** (`hosted.holds(board_or_conn, agent, project, post_id, now)`). True when a session of the agent
 in that project has not ended and is not being closed, its node was seen within `NODE_STALE_SECONDS`, the dispatcher
@@ -3772,3 +3774,23 @@ own in a copy of the new tree and made a test fail.
   handshake failure included); both adapters from strings; and the hub outcome,
   `test_a_codex_parent_that_refuses_to_start_the_result_turn_gets_it_once_more_marked` (the result goes back once,
   its reply kept, and the next result turn says it may repeat it).
+
+### Result delivery: PR review (#90, 2026-11-21)
+
+Both reproduced first with tests that failed on 07bf749.
+- *F1 (blocker): result turns ignored "one run per checkout".* `_free` and `deliver` never asked
+  `hosted_wake._occupied`, so with a dispatched run in an idle parent's checkout a child's result still became the
+  parent's turn, beside the run. Now `_free(r, node, board)` treats an occupied checkout as not free, in `due` (so a
+  fetch takes no write transaction for those results while the run lasts) and in `deliver`. The results wait and go
+  at the first fetch after the run's record is no longer active. A child in its own worktree still takes its turns;
+  the human's own message to the parent is not held; a wake still waits behind the results. Written down next to
+  the rule ("One run per checkout, both ways round") and in README. Test:
+  `test_no_result_turn_is_made_while_a_dispatched_run_uses_the_parents_checkout`.
+- *F2 (hardening): a newer node lost every turn end at an older hub.* The node always sent `answered`; a hub from
+  before it refuses an unknown field (422) and the node dropped such a report quietly. Now the hub names the report
+  fields it takes in its answer to the node's fetch (`features`, `hosted.NODE_REPORT_FEATURES`, today
+  `["answered"]`), and the node sends an optional field only to a hub that named it (`SessionRunner._for_hub`): an
+  older hub gets the reports it always got. A report refused as malformed is one error line in the node's log that
+  names the likely cause (a hub older than the node). A hub of this version and a node that sends no `answered`:
+  not known, as before. Tests: `test_a_node_sends_answered_only_to_a_hub_that_lists_it`,
+  `test_a_report_without_answered_counts_as_not_known`, `test_a_report_a_hub_refuses_as_malformed_is_said_loudly`.

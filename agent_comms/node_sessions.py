@@ -127,6 +127,7 @@ class SessionRunner:
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
         self.version: str | None = None
+        self.hub_features: set[str] = set()           # report fields the hub named as taken (its listing's `features`)
         self.last_sync = float("-inf")
         self.retry_at = float("-inf")
         self.fresh = False                            # the last hub call was a fetch that succeeded: `queue` is current
@@ -227,6 +228,13 @@ class SessionRunner:
             d["detail"] = e.detail[:300]
         return d
 
+    OPTIONAL_FIELDS = ("answered",)     # sent only to a hub whose listing names them (hosted.NODE_REPORT_FEATURES)
+
+    def _for_hub(self, event: dict) -> dict:
+        """The event as this hub takes it: without a field it has not named in its listing's `features`."""
+        drop = [k for k in self.OPTIONAL_FIELDS if k in event and k not in self.hub_features]
+        return {k: v for k, v in event.items() if k not in drop} if drop else event
+
     def _emit(self, events: list[HostEvent]) -> None:
         for e in events:
             if e.kind == "ended":
@@ -276,7 +284,9 @@ class SessionRunner:
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
         for sid in order:
             events = [e for s, e in self.pending if s == sid][:MAX_BATCH]
-            body: dict[str, Any] = {"events": events, "seq": self._stamp()}
+            # A field the hub has not named as one it takes (its listing's `features`) is not sent: a hub from
+            # before it refuses the whole report, and its turn ends would be lost.
+            body: dict[str, Any] = {"events": [self._for_hub(e) for e in events], "seq": self._stamp()}
             status = self.status.get(sid)
             if status is not None:
                 body |= {"state": status[0], "pid": status[1], "resume": status[2]}
@@ -293,7 +303,14 @@ class SessionRunner:
                 if code not in (400, 404, 422):
                     log.warning("could not report session %s: %s", sid, e)
                     return False
-                log.warning("hub refused the report for session %s (%s); dropping it", sid, code)
+                if code == 422:
+                    # The hub could not read the report at all: most likely it is older than this node (update the
+                    # hub before its nodes). Said once per report, at error level, as it costs the turn ends in it.
+                    log.error("the hub refused the report for session %s as malformed (422), so the %d event(s) in "
+                              "it are lost: the hub is probably older than this node. Update the hub to this "
+                              "version (hubs before nodes)", sid, len(events))
+                else:
+                    log.warning("hub refused the report for session %s (%s); dropping it", sid, code)
             if status is not None:
                 self.reported[sid] = status
                 self.sent[sid] = body["seq"]
@@ -486,6 +503,8 @@ class SessionRunner:
             for sid in [x for x in self.worktrees if x not in listed and x not in self.host.sessions]:
                 self._drop_worktree(sid)
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
+        named = data.get("features")
+        self.hub_features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 

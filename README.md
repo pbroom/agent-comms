@@ -533,8 +533,9 @@ also one you send just after a wake was queued.
   approval, delivery policy, retries, limits), and from then on the request is the dispatcher's. An open session
   holds no checkout: only while one of its turns is running does a dispatched run for the same project wait, as it
   would behind another run. The same the other way round: while a dispatched run is using that checkout, a post
-  does not wake the session; it does when the run is over (your own `board session send` is not held back). A run
-  in its own parallel worktree does not count. With no hosted session, nothing about the dispatcher changes.
+  does not wake the session; it does when the run is over (your own `board session send` is not held back), and
+  the results of its child sessions wait the same way ("A child's results reach its parent", below). A run in its
+  own parallel worktree does not count. With no hosted session, nothing about the dispatcher changes.
 
 #### Parent and child sessions
 
@@ -666,7 +667,9 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   whose `--cd` names a directory of its own can be a session in that directory
   only: a child of it must share the parent's checkout, and that checkout must be the directory; otherwise
   `start --parent` is refused. Update the hub before its nodes: an older hub refuses the newer node's hello and
-  reports.
+  reports. A report field newer than the hub is the exception: the hub names the ones it takes in its answer to
+  the node's fetch, and the node sends only those (so this version's node reports to an older hub exactly as
+  before). A report the hub cannot read at all is one error line in the node's log, naming that cause.
 - **Limits.** A child cannot have children. At most `max_children` children of one session that have not ended.
   The node's `max_live` counts children too: set it to at least 1 + the children you want live at once (a child
   that cannot get a process waits, and an idle one is stopped to make room, as for any session). "One session per
@@ -698,7 +701,9 @@ polls and nobody copies anything across. That holds for a turn you started with 
   closing is not.
 - **Order.** Your messages first, then results, then board wakes. Results wait while the parent has a turn running
   or a message of yours queued; a wake is not queued while results wait, and one queued before them steps back
-  (`show` lists it as not sent, and its posts go with the next wake).
+  (`show` lists it as not sent, and its posts go with the next wake). Like a wake, results also wait while a
+  dispatched run is using the parent's checkout, and go once the run is over (a child in its own worktree still
+  takes its turns meanwhile; your own messages to the parent are never held).
 - **Several at once** go together as one turn, oldest first, up to 10 results and 64 KB; the rest follow as the
   next one.
 - **Delivered once when confirmed, at most one marked repeat, never silently lost.** A result is kept on the hub,

@@ -22,7 +22,7 @@ from conftest import PROJECT
 from test_hosted_sessions import (NoReports, P2, clienv, client, make_node, msg, send, show, start,  # noqa: F401
                                   tick, written)
 from test_hosted_tree import (TREE, _reports_follow_the_command_line, answer, begin, child, claimed,  # noqa: F401
-                              proc_of, root, senv, stored)
+                              proc_of, root, senv, stored, wtenv)
 from test_hosted_wake import ask
 
 TOKEN = re.compile(r"<<<child-output ([0-9a-f]{16})>>>")
@@ -249,6 +249,58 @@ def test_the_turn_is_made_in_the_transaction_that_shows_it(senv, monkeypatch):
     senv.settings.dispatch = TREE
     tick(senv)
     assert kinds(senv, sid) == ["user", "user", "child"] and outputs(turns_of(senv, sid)[-1]) == ["child says"]
+
+
+def occupy(env, status="running") -> None:
+    """A dispatched run's record, using the directory a run for the project uses (what dispatch.occupied_run_dirs
+    reads, hub-local runs and node runs alike)."""
+    run = {"run_id": "busy-run", "agent": "codex", "status": status, "started_at": env.clock(), "pid": None,
+           "cwd": hosted_wake._run_dir(env.board, PROJECT)}
+    with hosted.db.write_tx(env.board.conn) as c:
+        hosted_results._put(c, "dispatch.run.busy-run", run, "test", env.clock())
+
+
+def test_no_result_turn_is_made_while_a_dispatched_run_uses_the_parents_checkout(wtenv):
+    """PR review, F1. One run per checkout, both ways round, holds for result turns as it does for wakes: a result
+    turn is an automatic turn, so it waits while a dispatched run uses the directory the parent works in, and goes as
+    soon as the run is over. The human's own message is not held; a wake waits behind the results as ever."""
+    env = wtenv
+    sid = root(env)
+    answer(env, sid)
+    kid = child(env, sid, "task", isolation="worktree")["session_id"]
+    tick(env)
+    occupy(env)
+    assert hosted_wake._occupied(env.board, stored(env, sid))
+    answer(env, kid, "done in its own worktree")      # the child works elsewhere: its turn is not held
+    tick(env, times=2)
+    assert kinds(env, sid) == ["user"] and states(env, sid) == ["pending"], "the result waits"
+    assert not hosted_results.due(env.board, env.board.conn, "laptop"), "and no fetch takes the write lock for it"
+    # Another parent's results, in a project the run does not use, make the fetch deliver: theirs go, these wait.
+    other = root(env, project=P2)
+    answer(env, other)
+    other_kid = child(env, other, "elsewhere")["session_id"]
+    tick(env)
+    answer(env, other_kid, "from the other project")
+    tick(env)
+    assert kinds(env, other) == ["user", "child"] and kinds(env, sid) == ["user"]
+    answer(env, other)
+    ask(env, env.thread())
+    hosted_wake.tick(env.board)
+    tick(env)
+    assert kinds(env, sid) == ["user"], "no wake either"
+    send(env, sid, "mine")                              # the human's own message is the human's call: it goes
+    tick(env)
+    assert turns_of(env, sid)[-1] == "mine"
+    answer(env, sid)
+    tick(env, times=2)
+    assert kinds(env, sid) == ["user", "user"] and states(env, sid) == ["pending"]
+    occupy(env, status="done")                          # the run is over
+    tick(env)
+    assert kinds(env, sid) == ["user", "user", "child"]
+    assert outputs(turns_of(env, sid)[-1]) == ["done in its own worktree"]
+    answer(env, sid)
+    tick(env)
+    assert kinds(env, sid) == ["user", "user", "child", "wake"], "then the wake that waited behind them"
 
 
 def test_results_go_before_a_wake(senv):
@@ -606,6 +658,74 @@ def test_the_host_says_whether_the_provider_answered_a_turn(senv):
     proc_of(senv, kid)[1].code = 1                    # the process goes with the next turn in flight
     tick(senv, times=2)
     assert [(e.ok, e.answered) for e in events] == [(False, True), (False, False)]
+
+
+class OldHub:
+    """The node's client as a hub from before `answered` would answer: its session listing names no `features`,
+    and a report with a field it does not know is refused whole (422), as that hub's HostedEventIn did."""
+
+    def __init__(self, inner, hides_features=True):
+        self.inner, self.posts, self.hides = inner, [], hides_features
+
+    def request(self, method, path, **kw):
+        import httpx
+        if method == "POST" and path.startswith("/api/nodes/sessions/"):
+            self.posts.append(kw.get("json"))
+            if any("answered" in e for e in (kw.get("json") or {}).get("events", [])):
+                return httpx.Response(422, json={"detail": "extra fields not permitted"},
+                                      request=httpx.Request(method, "http://hub" + path))
+        r = self.inner.request(method, path, **kw)
+        if self.hides and method == "GET" and path == "/api/nodes/sessions" and r.status_code == 200:
+            data = r.json()
+            data.pop("features", None)
+            return httpx.Response(200, json=data, request=httpx.Request(method, "http://hub" + path))
+        return r
+
+
+def test_a_node_sends_answered_only_to_a_hub_that_lists_it(senv):
+    """PR review, F2. A node of this version talking to a hub from before `answered` must report as before: that
+    hub refuses a report with a field it does not know, and every turn end would be lost. The hub names what it
+    takes in its session listing (`features`), and the node sends `answered` only to a hub that names it."""
+    assert "answered" in fetch(senv)["features"]
+    runner = senv.node.sessions
+    runner.client = old = OldHub(runner.client)
+    sid = start(senv, "first")["session_id"]
+    tick(senv)
+    answer(senv, sid, "done")
+    assert msg(senv, sid, 1)["state"] == "done" and show(senv, sid)["reply"] == "done", "the turn end was taken"
+    ends = [e for body in old.posts for e in body["events"] if e["kind"] == "turn_ended"]
+    assert ends and not any("answered" in e for e in ends), "and sent as before"
+    from test_hosted_tree import Spy
+    runner.client = spy = Spy(old.inner)                # the hub is updated: its next answer names the feature
+    send(senv, sid, "again")
+    tick(senv)
+    answer(senv, sid, "done again")
+    ends = [e for _, body in spy.posts if body for e in body["events"] if e["kind"] == "turn_ended"]
+    assert ends and all(e.get("answered") is True for e in ends)
+
+
+def test_a_report_without_answered_counts_as_not_known(senv):
+    """F2, the other direction: a node that sends no `answered` (one from before it) confirms a result turn only by
+    its start report; an end alone sends the results once more, marked."""
+    sid, [kid] = a_tree(senv)
+    answer(senv, kid, "the answer")
+    fetch(senv)
+    report(senv, sid, {"kind": "turn_ended", "message": 2, "ok": True, "text": "fine"})      # no `answered`
+    [res] = results(senv, sid)
+    assert (res["state"], res["attempts"]) == ("pending", [2])
+
+
+def test_a_report_a_hub_refuses_as_malformed_is_said_loudly(senv, caplog):
+    """F2: a dropped 422 report is one clear line in the node's log, naming the likely cause."""
+    import logging
+    runner = senv.node.sessions
+    runner.client = OldHub(runner.client, hides_features=False)    # it names the field, and refuses it all the same
+    sid = start(senv, "first")["session_id"]
+    tick(senv)
+    with caplog.at_level(logging.ERROR, logger="agent_comms.node_sessions"):
+        answer(senv, sid, "done")
+    [line] = [r for r in caplog.records if r.levelno == logging.ERROR and "422" in r.getMessage()]
+    assert "older than this node" in line.getMessage() and sid in line.getMessage()
 
 
 def test_a_late_start_report_for_a_turn_settled_as_lost_confirms_its_results(senv):
