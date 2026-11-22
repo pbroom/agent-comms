@@ -5824,7 +5824,11 @@ caught).
 
 **Report.** A child session may start children of its own. `[dispatch.sessions.spawn] max_depth` now accepts 1 to 4
 (levels below a root) and ships as 2: a root, its children, and their children. The test-only override is gone;
-the tests run at the shipped value, or set it in the board's settings. Nothing new in the node protocol, the trust
+the tests run at the shipped value, or set it in the board's settings. CHANGED in the node protocol: session
+protocol 3 (`tree: 3` in the node's hello and fetch; `hosted_tree.HOLD_PROTOCOL`): the node keeps a full-access
+child's parent up while the child's subtree is open; the listing's `subtree_open` flag (`hosted_tree.subtree_open`),
+sent for a full-access child whose subtree is open; and ORPHANED_HOLD (`hosted_tree.orphan_reason`): the hub ends a
+session under a full-access child once its node's hello says protocol 2 or earlier. Nothing new in the trust
 model, the stated limits a to e, or shutdown and `recover()`. No sixth tool: a parent already changed its child's
 allowance through `board_session_send` (`may_spawn`, `spawn_share`, from PR #94); that is the parent's switch.
 
