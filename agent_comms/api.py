@@ -125,6 +125,20 @@ class WaitIn(Body):
     ack: str | None = None      # the id of the wake this process was offered: it has it
 
 
+class SpawnGrantIn(Body):
+    """The human lets agents start child sessions in a project (hosted_spawn.create_grant)."""
+    project: str
+    agents: list[str]
+    access: str
+    hours: float
+    hosted_only: StrictBool = False     # only sessions known by their binding (hosted sessions) may start children
+
+
+class AllowanceIn(Body):
+    may_spawn: StrictBool | None = None
+    share: StrictInt | None = None
+
+
 class RequestRouteIn(Body):
     session_id: int | None = None
     recipient: str
@@ -433,13 +447,22 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     def sid(p: Principal, request: Request, given: int | None) -> int:
         if given is not None:
-            return given
+            return guarded(p, request, given)
         h = request.headers.get("x-board-session")
         if h and h.isdigit():
-            return int(h)
+            return guarded(p, request, int(h))
         if p.is_human:
             return board.human_session(p)
         raise Invalid("session_id is required (body field or X-Board-Session header); POST /api/sessions first")
+
+    def guarded(p: Principal, request: Request, session_id: int) -> int:
+        # A board session registered with a hosted session's binding is that session's alone, here as over MCP: its
+        # use needs the same binding, verified (hosted_spawn.check_board_session).
+        if not p.is_human:
+            from . import hosted_spawn
+            hosted_spawn.check_board_session(board.conn, session_id, hosted_spawn.Ident.from_headers(request.headers),
+                                             p.name)
+        return session_id
 
     P = Depends(principal)
 
@@ -546,12 +569,20 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     # ---------------------------------------------------------------- sessions
     @app.post("/api/sessions")
-    def register(body: SessionIn, p: Principal = P):
-        return board.register_session(p, body.project, body.worktree, body.resume_session_id, dispatch_run_id=body.dispatch_run_id)
+    def register(body: SessionIn, request: Request, p: Principal = P):
+        from . import hosted_spawn
+        who, on = hosted_spawn.Ident.from_headers(request.headers), hosted_spawn.enabled(board)
+        rid = body.resume_session_id
+        # As over MCP, in register's own transaction: no resuming another hosted session's board session; a
+        # connection that proves to be a hosted session binds this one to it.
+        return board.register_session(
+            p, body.project, body.worktree, rid, dispatch_run_id=body.dispatch_run_id,
+            on_session=lambda c, s: (hosted_spawn.check_resume(c, rid, who, p.name) if rid is not None
+                                     else None, hosted_spawn.bind_in_register(c, p, s, who, board.now(), on)))
 
     @app.post("/api/sessions/{session_id}/heartbeat")
-    def heartbeat(session_id: int, p: Principal = P):
-        return board.heartbeat(p, session_id)
+    def heartbeat(session_id: int, request: Request, p: Principal = P):
+        return board.heartbeat(p, guarded(p, request, session_id))
 
     # ---------------------------------------------------------------- threads
     @app.get("/api/threads")
@@ -877,19 +908,30 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     @app.get("/api/nodes/sessions")
     async def node_sessions(request: Request, wait: float = 0, seen: str | None = None, tree: int = 0,
-                            p: Principal = P):
+                            applied: str | None = None, bound: float | None = None, p: Principal = P):
         # async: wait > 0 long-polls without holding a worker thread (as /api/updates does)
         # tree: the node says it speaks the child-session protocol; without it no child session is listed to it.
         from . import hosted
-        return await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request), tree=tree >= 1)
+        # tree 2: it also speaks the spawn protocol (bindings, interactive children, cancel: hosted_tree.node_spawns)
+        # applied: the version of the listing its session loop last applied; bound: how long it may take to stop a
+        # session's process after the hub last heard from it (hosted.may_still_run).
+        out = await hosted.node_sessions_wait(board, p, wait, seen, waiter_gone(request),
+                                              tree=max(0, min(int(tree), 1000)), applied=applied, bound=bound)
+        if tree >= 2:
+            # A successful call of the session loop (hosted.last_able). A database write: in a worker thread, as
+            # the listing's own reads are (hosted._poll), never on the event loop.
+            await run_in_threadpool(hosted.note_contact, board, p)
+        return out
 
     @app.post("/api/nodes/sessions/{session_id}")
     def node_session_report(session_id: str, body: NodeSessionReportIn, p: Principal = P):
         from . import hosted
-        return hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
-                             body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
-                             access=body.access, worktree=body.worktree, ceiling=body.ceiling,
-                             checkout=body.checkout)
+        out = hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
+                            body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
+                            access=body.access, worktree=body.worktree, ceiling=body.ceiling,
+                            checkout=body.checkout)
+        hosted.note_contact(board, p)           # whatever path it took: a successful call of the session loop
+        return out
 
     # A session the human opened himself waits here to be woken (interactive_wake.py): any agent, for its own
     # conversation. Off unless [dispatch.sessions.interactive] wake = true; then it answers {"state": "off"}.
@@ -944,8 +986,34 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
 
     @app.post("/api/hosted-sessions/{session_id}/close")
     def hosted_close(session_id: str, p: Principal = P):
-        from . import hosted
+        from . import hosted, hosted_spawn
+        board._require_human(p, "close a hosted session")
+        if hosted_spawn.is_iroot(board.conn, session_id):
+            return hosted_spawn.close_iroot(board, p, session_id)   # an interactive session's tree of children
         return hosted.close(board, p, session_id)
+
+    # Agent-started child sessions (hosted_spawn.py): the human's grant and allowances. Human only; the gateway
+    # passes none of these routes.
+    @app.post("/api/hosted-sessions/{session_id}/allowance")
+    def hosted_allowance(session_id: str, body: AllowanceIn, p: Principal = P):
+        from . import hosted_spawn
+        return hosted_spawn.set_allowance(board, p, session_id, body.may_spawn, body.share)
+
+    @app.get("/api/spawn-grants")
+    def spawn_grants(all: bool = False, p: Principal = P):
+        from . import hosted_spawn
+        return hosted_spawn.list_grants(board, p, include_inactive=all)
+
+    @app.post("/api/spawn-grants")
+    def spawn_grant(body: SpawnGrantIn, p: Principal = P):
+        from . import hosted_spawn
+        return hosted_spawn.create_grant(board, p, body.project, body.agents, body.access, body.hours,
+                                         hosted_only=body.hosted_only)
+
+    @app.post("/api/spawn-grants/{grant_id}/revoke")
+    def spawn_grant_revoke(grant_id: int, p: Principal = P):
+        from . import hosted_spawn
+        return hosted_spawn.revoke_grant(board, p, grant_id)
 
     @app.post("/api/sessions/capabilities")
     def register_capabilities(body: CapabilitiesIn, request: Request, p: Principal = P):

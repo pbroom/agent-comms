@@ -5,6 +5,7 @@ tests at the end, which run the stand-in script (stand_in_claude.py) through rea
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -175,7 +176,9 @@ def test_only_the_human_can_start_message_read_or_close_a_hosted_session(senv):
 
 def test_no_mcp_tool_reaches_hosted_sessions():
     source = (ROOT / "agent_comms" / "mcp_server.py").read_text()
-    assert "hosted" not in source and "host.session" not in source and "host.msg" not in source
+    # Only the spawn tools' module (hosted_spawn: an agent's own children, behind its grant) is reached from there.
+    assert set(re.findall(r"\bhosted\w*", source)) <= {"hosted_spawn"}
+    assert "host.session" not in source and "host.msg" not in source
 
 
 def test_only_a_node_speaks_the_session_protocol_and_only_for_its_own_sessions(senv):

@@ -154,8 +154,12 @@ CODEX_PREAPPROVED_TOOLS = (
     "board_bind_browser_request", "board_browser_begin_probe", "board_browser_probe", "board_browser_failure",
     "board_browser_reconnect", "board_browser_status",
 )
-# Never pre-approved for a dispatched run: selective closeout is opt-in (an interactive session asks the human).
-CODEX_OPT_IN_TOOLS = ("board_resolve_attention",)
+# Never pre-approved for a dispatched run: selective closeout is opt-in (an interactive session asks the human). The
+# spawn tools too: a dispatched run is refused by all of them (hosted_spawn.resolve, DISPATCHED: a managed process
+# without a binding, or a board session registered with a dispatch_run_id), and a hosted Codex session that is to
+# start child sessions gets them approved in its own runner, one -c override each.
+CODEX_OPT_IN_TOOLS = ("board_resolve_attention", "board_session_capabilities", "board_session_spawn",
+                      "board_session_send", "board_session_status", "board_session_cancel")
 CODEX_SERVER = "agent-comms"
 
 
@@ -811,6 +815,38 @@ SCALARS = ("live_minutes", "poll_seconds", "timeout_minutes", "kill_grace_second
            "max_runs_per_agent", "undelivered_alert_minutes")
 WORKTREE_PRUNE_SECONDS = 3600
 HOSTED_HOLDS = "hosted"     # reserve_dispatch_launch's reason when a hosted session took the request meanwhile
+CHECKOUT_BUSY = "checkout"  # ... and when an agent's task for a hosted session took the run directory meanwhile
+# One run per checkout, both ways round, decided in the launch transaction (`_launch_check`): a reserved launch leaves
+# this claim on its project's checkout, which a hosted session's automatic turn respects (hosted._checkout_busy) until
+# the run's own record (which `_launch` writes right after) covers it. Expires by itself: the safe side is the wait.
+CLAIM_PREFIX = "dispatch.checkout_claim."
+CLAIM_SECONDS = 120.0
+
+
+def _claim_key(project: str) -> str:
+    return CLAIM_PREFIX + hashlib.sha256(project.encode()).hexdigest()[:16]
+
+
+def checkout_claims(conn, now: float) -> list[dict]:
+    """The launches reserved within the past CLAIM_SECONDS whose run may not be on record yet, each as a run record
+    would say where it runs (`node`, and `cwd`: the project path on a node, the run directory on the hub), so that
+    hosted._checkout_busy holds them to the same node-and-checkout identity as a recorded run. A claim is released
+    once the run's record covers it or the launch failed (`Dispatcher._release_claim`); expiry is only for one a
+    stopped dispatcher abandoned. An unreadable claim holds every checkout of its key's project (the safe side)."""
+    out = []
+    for key, value in conn.execute("SELECT key, value FROM board_state WHERE key >= ? AND key < ?",
+                                   (CLAIM_PREFIX, CLAIM_PREFIX[:-1] + chr(ord(CLAIM_PREFIX[-1]) + 1))).fetchall():
+        try:
+            v = json.loads(value)
+        except (TypeError, ValueError):
+            v = None
+        if not isinstance(v, dict):
+            out.append({"cwd": None, "node": None, "unreadable": True})
+            continue
+        if float(v.get("at") or 0) > now - CLAIM_SECONDS and isinstance(v.get("cwd"), str) and v["cwd"]:
+            out.append({"cwd": v["cwd"], "node": v.get("node") if isinstance(v.get("node"), str) else None,
+                        "project": v.get("project")})
+    return out
 
 
 @dataclass
@@ -820,6 +856,16 @@ class SpawnConfig:
 
     enabled: bool = False
     max_children: int = 5       # children of one root session that have not ended, at most
+    # Agent-callable spawn tools (hosted_spawn.py), also read on the hub. Every limit is per GRANT: for one agent in
+    # one project, across all its roots (hosted or interactive), so neither depth nor a fresh root multiplies them.
+    max_depth: int = 1                  # levels below a root; 1: a child's own spawn call is refused ("depth limit")
+    max_live_children: int = 5          # child sessions the agent started in the project that have not ended
+    max_spawns_per_hour: int = 12       # child sessions it started there within the past hour
+    max_turns_without_human: int = 40   # its child sessions' turns there since the human last messaged one of its
+                                        # roots there or answered the limit's item
+    # Optional: the targets an agent may start, cheapest first, each "agent" or "agent/model". Empty: any agent the
+    # node offers, any model. A child may start only targets at or before its own place in this list.
+    targets: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: Any) -> "SpawnConfig":
@@ -827,15 +873,25 @@ class SpawnConfig:
         if not isinstance(d, dict):
             raise ValueError(f"{where} must be a table")
         c = cls()
+        # max_depth: 1 in this version (deeper trees are built and tested, behind a test-only override)
+        bounds = {"max_children": 50, "max_depth": 1, "max_live_children": 50, "max_spawns_per_hour": 1000,
+                  "max_turns_without_human": 10000}
         for k, v in d.items():
             if k == "enabled":
                 if not isinstance(v, bool):
                     raise ValueError(f"{where} enabled must be true or false")
                 c.enabled = v
-            elif k == "max_children":
-                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 50:
-                    raise ValueError(f"{where} max_children must be a whole number from 1 to 50")
-                c.max_children = v
+            elif k in bounds:
+                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= bounds[k]:
+                    raise ValueError(f"{where} {k} must be a whole number from 1 to {bounds[k]}")
+                setattr(c, k, v)
+            elif k == "targets":
+                import re
+                if (not isinstance(v, list) or len(v) > 50 or any(
+                        not isinstance(t, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}(/[A-Za-z0-9][A-Za-z0-9._:-]{0,99})?",
+                                                                   t) for t in v) or len(set(v)) != len(v)):
+                    raise ValueError(f'{where} targets must be a list of distinct "agent" or "agent/model" names')
+                c.targets = list(v)
             else:
                 raise ValueError(f"unknown setting {where} {k}")
         return c
@@ -1853,6 +1909,99 @@ class Dispatcher:
             log.exception("could not tell whether a hosted session has request %s", item.get("post_id"))
             return False
 
+    def _destination(self, agent: str, project: str, thread_id: int, item: dict, inbox: bool) -> str | None:
+        """The node this launch will run on (None: here), decided once, inside the launch transaction, with the
+        routing calls `_launch` makes: a node when this machine has no run directory for the project, the node
+        holding a signed-in browser for signed-in work, a node that can attach a headless browser for browser-bound
+        work. Their answers are kept on the item (`route`), and `_launch` takes them from there instead of asking
+        again: the run starts on the node and checkout this transaction checked and claimed, never on another one
+        a later answer would have named."""
+        if inbox or item.get("managed"):
+            return None
+        cwd = self.config.run_dir(project)
+        route: dict[str, Any] = {"inputs": self._route_inputs(agent, thread_id, item),
+                                 "base": self._remote_node(agent, project, cwd), "where": None, "capable": None}
+        node = route["base"]
+        signed_in, headless = route["inputs"]
+        if signed_in:
+            route["where"] = self._signed_in_route(agent, project, signed_in)
+            node = None if route["where"] in (None, "local") else route["where"]
+        if node is not None:
+            route["capable"] = (self._remote_node(agent, project, cwd, headless_browser=True)
+                                if headless and not signed_in else None)
+            node = route["capable"] or node
+        route["node"] = node
+        item["route"] = route
+        return node
+
+    def _route_inputs(self, agent: str, thread_id: int, item: dict) -> list:
+        """What a launch's destination is computed from that can change while the request is queued: its signed-in
+        browser origins and its headless-browser origins (an authorised requirement added later changes them)."""
+        ids = [item["post_id"]] if item.get("post_id") else []
+        return [list(self._signed_in_origins(agent, thread_id, ids)), list(self._headless_origins(agent, thread_id, ids))]
+
+    def _launch_check(self, agent: str, item: dict, now: float, project: str, run_dir: str, thread_id: int = 0,
+                      inbox: bool = False) -> dict:
+        """The `check` for reserve_dispatch_launch, inside the reservation's own write transaction. First, one run per
+        checkout (S11), by the node-and-checkout identity hosted._checkout_busy uses: the launch's destination is
+        resolved first (`_destination`); a run on a node is refused (CHECKOUT_BUSY) while a hosted session on that
+        node and in that project has a turn, or an agent's task reserved and shown to the node
+        (hosted_wake.turn_sessions); a run here, while one does in a project whose run directory here is this one.
+        When it is free, the checkout is claimed for this launch in the same transaction (CLAIM_PREFIX: its node and
+        directory as its run record will have them), so that no task is reserved there before the run is on record;
+        `_release_claim` lets it go once the record covers it or the launch failed. Then the hosted hold
+        (`_hosted_recheck`)."""
+        hosted_check = self._hosted_recheck(agent, item, now).get("check")
+        from . import hosted_wake
+        key = self._dir_key(run_dir)
+
+        def check() -> str | None:
+            t = self.board.now()
+            dest = self._destination(agent, project, thread_id, item, inbox) if isinstance(project, str) else None
+            try:
+                turns = hosted_wake.turn_sessions(self.board, t)
+            except Exception:
+                # As `_busy_dirs`: a failing hosted pass never stops the dispatcher, which then decides as without
+                # hosted sessions.
+                log.exception("could not read the hosted sessions' turns in the launch transaction")
+                turns = []
+            if dest is not None:
+                if any(r.get("node") == dest and os.path.normpath(r["project"]) == os.path.normpath(project)
+                       for r in turns):
+                    return CHECKOUT_BUSY
+            elif key is not None and key in {self._dir_key(self.config.run_dir(r["project"])) for r in turns}:
+                return CHECKOUT_BUSY
+            refused = hosted_check() if hosted_check is not None else None
+            if refused:
+                return refused
+            if isinstance(item.get("route"), dict):
+                item["route"]["run_dir"] = run_dir      # the directory checked here: the one a local run uses
+            if isinstance(project, str):        # (an inbox delivery has no project: a private directory of its own)
+                claim = item["checkout_claim"] = secrets.token_hex(8)   # this launch's, for `_release_claim`
+                nodes._put(self.board.conn, _claim_key(project),
+                           {"project": project, "node": dest, "cwd": project if dest is not None else run_dir,
+                            "launch": claim, "at": t}, "dispatcher", t)
+            return None
+        return {"check": check}
+
+    def _release_claim(self, project: Any, agent: str, item: dict) -> None:
+        """The launch's claim on its checkout (`_launch_check`) is let go: its run is on record now (it holds the
+        checkout itself from here, and lets it go when it ends), or the launch failed. Only this launch's claim."""
+        claim = item.pop("checkout_claim", None)
+        if not isinstance(project, str) or claim is None:
+            return
+        try:
+            with db.write_tx(self.board.conn) as c:
+                row = c.execute("SELECT value FROM board_state WHERE key = ?", (_claim_key(project),)).fetchone()
+                try:
+                    v = json.loads(row[0]) if row else None
+                except (TypeError, ValueError):
+                    v = None
+                if isinstance(v, dict) and v.get("launch") == claim:
+                    c.execute("DELETE FROM board_state WHERE key = ?", (_claim_key(project),))
+        except Exception:
+            log.exception("could not release the checkout claim of a launch of %s (it expires by itself)", agent)
+
     def _hosted_recheck(self, agent: str, item: dict, now: float) -> dict:
         """The `check` for reserve_dispatch_launch, as keyword arguments: inside the reservation's own write
         transaction, the hold is asked again, and a launch that is reserved takes the request away from any wake
@@ -2073,8 +2222,11 @@ class Dispatcher:
                 del pending[key]
                 changed = True
                 continue
-            res = self.board.reserve_dispatch_launch(self.human, rule["id"], agent, fence=self._fence(),
-                                                     **self._hosted_recheck(agent, item, now))
+            res = self.board.reserve_dispatch_launch(
+                self.human, rule["id"], agent, fence=self._fence(),
+                **self._launch_check(agent, item, now, rule["project"],
+                                     self._run_dir_for(agent, rule["project"], thread_id, item, inbox),
+                                     thread_id=thread_id, inbox=inbox))
             if not res["ok"]:
                 if res["reason"] == "fenced":
                     log.warning("another dispatcher owns this board now; this one stops launching")
@@ -2082,8 +2234,8 @@ class Dispatcher:
                     break
                 if res["reason"] == "paused":
                     break  # temporary: everything stays pending until the human unpauses
-                if res["reason"] == HOSTED_HOLDS:
-                    continue  # a hosted session was woken for it since the gate above: wait, as the gate would
+                if res["reason"] in (HOSTED_HOLDS, CHECKOUT_BUSY):
+                    continue  # a hosted session was woken for it, or took the checkout, since the gate above: wait
                 rules = self.board.active_dispatch_rules(self.human)
                 if self._rule_for(rules, item) is None:  # permanent, and no other approval covers it
                     log.info("not launching %s for thread %s: rule %s is %s", agent, thread_id, rule["id"],
@@ -2102,6 +2254,10 @@ class Dispatcher:
                 if item.get('managed') and not self._attempted(item['post_id'], agent):
                     pending[key] = item  # reservation lost a race; retain the undelivered assignment
                 log.exception("launch of %s for thread %s failed", agent, thread_id)
+            finally:
+                self._release_claim(rule["project"], agent, item)   # its run record holds the checkout now, or none
+            if item.pop("requeue", False):
+                pending[key] = item     # its requirements changed after the reservation: a fresh one next pass
             rules = self.board.active_dispatch_rules(self.human)
         if changed:
             self._save(**{self.PENDING_KEY: pending})
@@ -2616,8 +2772,21 @@ class Dispatcher:
         return run_id
 
     def _launch(self, agent: str, rule: dict, item: dict, now: float, left: int) -> None:
-        """Start a run whose launch is already reserved (`left` launches remain). A failure refunds it."""
+        """Start a run whose launch is already reserved (`left` launches remain). A failure refunds it. It starts where
+        its launch transaction reserved (`route`, `_destination`) and nowhere else: no routing input is read again.
+        If what that destination was computed from has changed since (an authorised browser requirement added while
+        the request was queued, `_route_inputs`), it does not start: the launch is refunded, its claim released and
+        the trigger requeued (`requeue`) for a fresh reservation."""
         thread_id = item["thread_id"]
+        reserved = item.get("route")
+        if isinstance(reserved, dict) and reserved.get("inputs") != self._route_inputs(agent, thread_id, item):
+            item.pop("route", None)
+            self._release_claim(rule.get("project"), agent, item)
+            self.board.refund_dispatch_launch(self.human, rule['id'], budget_day=item.get('budget_day'))
+            item["requeue"] = True
+            log.info("not launching %s for thread %s: its requirements changed since its checkout was reserved; it "
+                     "waits for a new reservation", agent, thread_id)
+            return
         run_id = self._run_id(item["seq"], agent)
         inbox = rule.get('kind') == 'inbox_delivery'
         project = self.board._thread_row(thread_id)['project'] if inbox else rule['project']
@@ -2660,12 +2829,17 @@ class Dispatcher:
                 browser_blocker = self._headless_blocker(agent, thread_id, record['request_ids'])
                 if browser_blocker:
                     raise Conflict(browser_blocker)
-            node = None if inbox or item.get('managed') else self._remote_node(agent, project, cwd)
-            signed_in = [] if inbox else self._signed_in_origins(agent, thread_id, record["request_ids"])
+            # Where it runs was decided in the launch transaction, which checked and claimed that node's checkout
+            # (`_destination`, `route`): the same answers, never asked again.
+            route = item.pop("route", None) or {}
+            node = (None if inbox or item.get('managed') else
+                    route["base"] if "base" in route else self._remote_node(agent, project, cwd))
+            signed_in = ([] if inbox else route["inputs"][0] if "inputs" in route
+                         else self._signed_in_origins(agent, thread_id, record["request_ids"]))
             if signed_in:
                 # Signed-in browser work runs where a runner declares that sign-in (access.py), even when this machine
                 # has the checkout: the run goes where the access is.
-                where = self._signed_in_route(agent, project, signed_in)
+                where = route["where"] if "where" in route else self._signed_in_route(agent, project, signed_in)
                 if where is None:
                     raise Conflict("no runner holding a signed-in browser for " + ", ".join(signed_in) + " has room")
                 if item.get('managed') and where != "local":
@@ -2677,9 +2851,11 @@ class Dispatcher:
             if node is not None:
                 # Browser-bound work goes to a node that attaches its own scoped headless browser, limited to the
                 # origins bound and not denied here. With none bound, the run gets no browser server at all.
-                origins = self._headless_origins(agent, thread_id, record["request_ids"])
+                origins = (route["inputs"][1] if "inputs" in route
+                           else self._headless_origins(agent, thread_id, record["request_ids"]))
                 browser = None
-                capable = (self._remote_node(agent, project, cwd, headless_browser=True)
+                capable = (route["capable"] if "capable" in route else
+                           self._remote_node(agent, project, cwd, headless_browser=True)
                            if origins and not signed_in else None)
                 if capable is not None:
                     node, browser = capable, {"origins": origins}
@@ -2699,7 +2875,8 @@ class Dispatcher:
                 child = nodes.RemoteChild(self.board, run_id)
                 cwd = project
             if node is None:
-                planned = cwd if inbox else self._run_dir_for(agent, project, thread_id, item, inbox)
+                planned = (cwd if inbox else route["run_dir"] if "run_dir" in route
+                           else self._run_dir_for(agent, project, thread_id, item, inbox))
                 if planned != cwd:
                     cwd = ensure_run_worktree(cwd, planned)
                     record |= {"cwd": cwd, "run_worktree": cwd}
@@ -2720,7 +2897,8 @@ class Dispatcher:
                     raise FileNotFoundError(f"run directory {cwd!r} does not exist")
                 browser = None
                 if not inbox and self.config.headless_browser_for(agent, self._runtime(agent)):
-                    origins = self._headless_origins(agent, thread_id, record["request_ids"])
+                    origins = (route["inputs"][1] if "inputs" in route
+                               else self._headless_origins(agent, thread_id, record["request_ids"]))
                     if origins:   # nothing bound: no browser server at all
                         out_dir = self.log_dir / f"{run_id}-browser"
                         out_dir.mkdir(mode=0o700)   # fresh per run; never reused

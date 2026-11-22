@@ -316,8 +316,35 @@ def main(argv: list[str] | None = None) -> None:
     x = ssub.add_parser("list", help="hosted sessions")
     x.add_argument("--all", action="store_true", help="include ended sessions")
     raw(x)
-    x = ssub.add_parser("close", help="end a session: its process is stopped, queued messages are dropped")
+    x = ssub.add_parser("close", help="end a session: its process is stopped, queued messages are dropped (an "
+                                      "interactive session's tree id closes every child in it)")
     x.add_argument("session_id")
+    raw(x)
+    # Agent-started child sessions (README "Agents start child sessions"): the human's grant, and what a child may
+    # start. Human only.
+    x = ssub.add_parser("grant", help="let agents start child sessions in a project, up to an access level, for a "
+                                      "while (needs [dispatch.sessions.spawn] enabled = true on the hub)")
+    x.add_argument("project", help="the project's path as the board knows it")
+    x.add_argument("--agent", dest="agents", metavar="NAME", action="append", required=True,
+                   help="an agent that may start sessions there (repeat for more)")
+    x.add_argument("--access", choices=("read-only", "workspace", "full"), required=True,
+                   help="the most a child may have (also never above the session that starts it)")
+    x.add_argument("--hours", type=float, default=8.0, help="how long the grant lasts (default 8, at most 720)")
+    x.add_argument("--hosted-only", action="store_true", help="only hosted sessions (known by the binding their node "
+                   "gives them) may start children; never a caller without one (an interactive session)")
+    raw(x)
+    x = ssub.add_parser("grants", help="spawn grants (live ones; --all includes revoked and expired)")
+    x.add_argument("--all", action="store_true")
+    raw(x)
+    x = ssub.add_parser("revoke", help="revoke a spawn grant at once: no new child session or message under it")
+    x.add_argument("grant_id", type=int)
+    raw(x)
+    x = ssub.add_parser("allow", help="change what a child session may start itself, while it runs")
+    x.add_argument("session_id")
+    g = x.add_mutually_exclusive_group()
+    g.add_argument("--spawn", dest="may_spawn", action="store_true", default=None, help="it may start sessions")
+    g.add_argument("--no-spawn", dest="may_spawn", action="store_false", help="it may not")
+    x.add_argument("--share", type=int, metavar="N", help="at most N sessions in all (-1: no share of its own)")
     raw(x)
 
     a = ap.parse_args(argv)
@@ -856,7 +883,18 @@ def _fmt_child(s: dict) -> str:
             + (f", effort {s['effort']}" if s.get("effort") else "")
             + f", access {_fmt_access(s)}, {s.get('isolation') or 'shared'}{where}, turns {s['turns']}, "
             f"queued {s['queued']}"
-            + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else ""))
+            + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else "")
+            + (f", started by {s['spawned_by'].get('agent')}"
+               + (" (interactive)" if s["spawned_by"].get("kind") == "interactive" else "")
+               if isinstance(s.get("spawned_by"), dict) else ""))
+
+
+def _fmt_grant(g: dict) -> str:
+    from .core import iso
+
+    state = "live" if g.get("live") else "revoked" if g.get("revoked_at") else "expired"
+    return (f"grant {g['id']} [{state}]: {', '.join(g['agents'])} may start child sessions in {g['project']} up to "
+            f"{g['access']} access, until {iso(g['expires_at'])}" + (", hosted sessions only" if g.get("hosted_only") else ""))
 
 
 def _fmt_hosted_tree(sessions: list[dict]) -> str:
@@ -953,6 +991,25 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
     if a.session_cmd == "list":
         r = _api(settings, token, "GET", "/api/hosted-sessions" + ("?all=true" if a.all else ""))
         return out(r, _fmt_hosted_tree(r["sessions"]) or "(no hosted sessions)")
+    if a.session_cmd == "grant":
+        r = _api(settings, token, "POST", "/api/spawn-grants",
+                 {"project": os.path.abspath(os.path.expanduser(a.project)), "agents": a.agents, "access": a.access,
+                  "hours": a.hours, "hosted_only": a.hosted_only})
+        return out(r, "spawn " + _fmt_grant(r))
+    if a.session_cmd == "grants":
+        r = _api(settings, token, "GET", "/api/spawn-grants" + ("?all=true" if a.all else ""))
+        return out(r, "\n".join(_fmt_grant(g) for g in r["grants"]) or "(no spawn grants)")
+    if a.session_cmd == "revoke":
+        r = _api(settings, token, "POST", f"/api/spawn-grants/{a.grant_id}/revoke")
+        return out(r, "revoked " + _fmt_grant(r))
+    if a.session_cmd == "allow":
+        if a.may_spawn is None and a.share is None:
+            raise SystemExit("error: give --spawn, --no-spawn or --share N")
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{quote(a.session_id, safe='')}/allowance",
+                 {k: v for k, v in (("may_spawn", a.may_spawn), ("share", a.share)) if v is not None})
+        al = r["allowance"]
+        return out(r, f"session {r['session_id']}: may {'' if al['may_spawn'] else 'not '}start sessions"
+                      + (f", at most {al['share']} in all" if al.get("share") is not None else ""))
     sid = quote(a.session_id, safe="") if a.session_cmd != "start" else ""
     if a.session_cmd == "show":
         r = _api(settings, token, "GET", f"/api/hosted-sessions/{sid}")

@@ -294,7 +294,10 @@ def test_a_stopped_group_that_outlives_its_leader_holds_the_next_start_until_it_
     assert value_after(henv.spawner.calls[1]["argv"], "--resume") == SID
 
 
-def test_a_process_that_exits_by_itself_is_not_held_for_its_group(henv):
+def test_a_process_that_exits_by_itself_is_held_until_its_group_is_gone(henv):
+    """Spawn review round 5, S6 (this replaces the old rule that such a process was not held for its group): its
+    turn fails at once, as on any exit of its own, but its group is stopped as the stop path stops one, and nothing
+    starts beside it (nor is it let go of) until the whole group is gone."""
     s = open_session(henv)
     first = henv.host.send(SID, "first")
     queued = henv.host.send(SID, "queued")
@@ -302,8 +305,15 @@ def test_a_process_that_exits_by_itself_is_not_held_for_its_group(henv):
     [child] = henv.spawner.children
     henv.groups.add(child.pid)
     child.code = 1
-    assert kinds(henv.host.tick()) == [("turn_ended", first), ("delivered", queued)]
-    assert child.killed == 0 and len(henv.spawner.calls) == 2 and not s.dormant
+    assert kinds(henv.host.tick()) == [("turn_ended", first)], "its turn is over: the leader is gone"
+    assert child.terminated == 1 and s.child is child and len(henv.spawner.calls) == 1, \
+        "its group is signalled, and nothing starts beside what is left of it"
+    henv.clock.advance(henv.host.kill_grace)
+    henv.host.tick()
+    assert child.killed == 1 and s.child is child and len(henv.spawner.calls) == 1
+    henv.groups.discard(child.pid)              # the group is gone
+    assert kinds(henv.host.tick()) == [("delivered", queued)]
+    assert len(henv.spawner.calls) == 2 and not s.dormant
 
 
 def test_stop_all_kills_a_group_whose_leader_exited_but_which_still_has_members(henv):

@@ -186,7 +186,11 @@ VERIFIED = frozenset({              # allowed as a literal `env` value, checked 
 # Refused in any form: a token in the configuration or environment (the hooks cannot share it), the human's token
 # file, and every name not listed in HARMLESS or VERIFIED. REFUSED names the known ones (a test checks that every
 # AGENT_COMMS_* name the code reads is in one of the three sets).
-REFUSED = frozenset({"AGENT_COMMS_TOKEN", "AGENT_COMMS_CODEX_TOKEN", "AGENT_COMMS_TOKEN_FILE"})
+REFUSED = frozenset({"AGENT_COMMS_TOKEN", "AGENT_COMMS_CODEX_TOKEN", "AGENT_COMMS_TOKEN_FILE",
+                     # a hosted session's binding (hosted_spawn: the node sets it for a hosted Codex session through
+                     # `-c mcp_servers.agent-comms.env_vars=[...]`, never a user's configuration): an interactive
+                     # thread's board tools must not carry one
+                     "AGENT_COMMS_HOSTED_SESSION", "AGENT_COMMS_HOSTED_KEY"})
 # Names outside agent-comms the server's `env` or `env_vars` may name (PR review F2: refused until classified, as for
 # AGENT_COMMS_*). Anything else is refused: BASH_ENV (bash sources it before stdio.sh, and it can export any
 # AGENT_COMMS_* value), PYTHONPATH (another agent_comms package), UV_PROJECT_ENVIRONMENT, and the rest.

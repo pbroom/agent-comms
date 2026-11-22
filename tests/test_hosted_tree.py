@@ -5,6 +5,7 @@ real agent CLI."""
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -893,7 +894,8 @@ def test_the_node_opens_each_child_at_its_access_and_reports_what_it_really_has(
     begin(senv, ro, tools=("Read", "Grep", "Glob", "mcp__agent-comms__board_post"))
     begin(senv, ws)
     assert [show(senv, x)["state"] for x in (ro, ws)] == ["running", "running"], "and their processes agree"
-    assert all(set(body) <= {"events", "seq", "state", "pid", "resume", "provider_id", "access", "ceiling", "checkout"}
+    assert all(set(body) <= {"events", "seq", "state", "pid", "resume", "provider_id", "access", "ceiling", "checkout",
+                             "shutdown_bound"}     # (spawn review round 5, S25: how long the node may take to stop one)
                for _, body in spy.posts), "words, and where the root runs"
     roots = [body for path, body in spy.posts if path.endswith(sid) and "state" in body]
     assert all(b["ceiling"] == "workspace" and b["checkout"] == str(senv.work) for b in roots)
@@ -1302,7 +1304,10 @@ def test_no_mcp_tool_and_no_gateway_route_reaches_child_sessions():
     from agent_comms import gateway
 
     source = (ROOT / "agent_comms" / "mcp_server.py").read_text()
-    assert "hosted" not in source and "session_access" not in source and "host.session" not in source
+    # The board tools reach hosted sessions only through hosted_spawn, which checks who is calling (an agent's own
+    # children only: tests/test_hosted_spawn.py); nothing else of the session host is imported there.
+    assert set(re.findall(r"\bhosted\w*", source)) <= {"hosted_spawn"}
+    assert "session_access" not in source and "host.session" not in source
     for method in ("GET", "POST", "PUT", "DELETE"):
         assert not gateway.allowed(method, f"/api/hosted-sessions/{UNKNOWN}/children")
 
@@ -2344,7 +2349,7 @@ def test_a_runner_that_names_its_own_directory_is_held_against_where_the_parent_
     node = make_node(senv, config=config, log_dir=senv.tmp / "b-logs")
     node.hello()
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 1, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 2, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]},
                                     "dirs": {"codex-cli": str(here)}}
     sid = start(senv)["session_id"]
@@ -2422,14 +2427,14 @@ def test_a_node_that_does_not_declare_the_child_protocol_is_listed_no_child(senv
                              "status_seq"}, "... and that as before there were trees"
     declared = {x["session_id"]: x for x in senv.laptop.get("/api/nodes/sessions", params={"tree": 1}).json()["sessions"]}
     assert set(declared) == {sid, kid} and declared[kid]["parent"] == sid and declared[sid]["access"] is None
-    assert spy.gets and all(params.get("tree") == 1 for _, params in spy.gets), "this node says so every time"
+    assert spy.gets and all(params.get("tree") == 2 for _, params in spy.gets), "this node says so every time"
     assert msg(senv, kid, 1)["state"] == "queued"
 
 
 def test_children_need_a_node_whose_latest_hello_declares_the_protocol(senv):
     """S5. Creation requires current support, and a child whose node no longer has it is not left closing for ever."""
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 1, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 2, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]}}
     sid = root(senv)
     kid = child(senv, sid)["session_id"]

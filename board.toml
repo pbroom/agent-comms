@@ -211,6 +211,16 @@ allow_full_access = false
 [dispatch.sessions.spawn]
 enabled = false
 max_children = 5            # children of one session that have not ended, at most
+# Agents start child sessions themselves (README "Agents start child sessions"): the board tools
+# board_session_capabilities | spawn | send | status | cancel. They need `enabled` above AND a grant the human gives
+# per project (`board session grant <project> --agent A --access W --hours H [--hosted-only]`). These limits count per
+# GRANT (one agent in one project, across all its sessions), so neither depth nor a fresh session multiplies them; at
+# one, the call is refused and you get one Needs-you item.
+max_depth = 1                     # 1 (the only value in this version): a child's own spawn call is refused
+max_live_children = 5             # child sessions the agent started in the project that have not ended
+max_spawns_per_hour = 12          # child sessions it started there within the past hour
+max_turns_without_human = 40      # its children's turns there since you last messaged one of its sessions there
+# targets = ["claude/haiku", "codex", "claude"]   # optional: agent names (/model) agents may start, cheapest first
 
 # Waking a session you opened yourself (README "Waking a session you opened"): a Claude Code session with the wake
 # hooks (integrations/claude-code/install.sh --wake) waits at the hub when a turn ends, and a post addressed to its

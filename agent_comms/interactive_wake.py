@@ -583,17 +583,24 @@ def tick(board: Board) -> None:
 def _reader(conn, session_id: Any, agent: str, rec: dict) -> bool:
     """A board session that can be this waiter's own: hosted_wake._own_reader (the agent's, registered in the
     project, not a dispatched run's), and not one that recorded another conversation as its own."""
-    if not hosted_wake._own_reader(conn, session_id, agent, rec["project"]):
+    if not hosted_wake._own_reader(conn, session_id, agent, rec["project"]) or _bound(conn, session_id):
         return False
     row = conn.execute("SELECT client_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
     return row is None or row["client_session_id"] in (None, rec["client_session_id"])
+
+
+def _bound(conn, session_id: Any) -> bool:
+    """A board session registered from a hosted session's own process (hosted_spawn.board_binding: a child's, or a
+    hosted root's): what it reads is that hosted session's, never a waiter's."""
+    from . import hosted_spawn
+    return hosted_spawn.board_binding(conn, session_id) is not None
 
 
 def _pair_reader(conn, session_id: Any, agent: str, project: str, convs: set[str]) -> bool:
     """A board session that can be the own session of a waiter the post was delivered to: hosted_wake._own_reader
     (the agent's, registered in the pair's project, not a dispatched run's), and not one that recorded a conversation
     other than those."""
-    if not hosted_wake._own_reader(conn, session_id, agent, project):
+    if not hosted_wake._own_reader(conn, session_id, agent, project) or _bound(conn, session_id):
         return False
     row = conn.execute("SELECT client_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
     return row is None or row["client_session_id"] is None or row["client_session_id"] in convs
@@ -637,7 +644,7 @@ def read_after_delivery(conn, agent: str, project: str, post_id: int, now: float
         return False
     if pair["read"].get(k, -1.0) < at:
         return False
-    return any(hosted_wake._own_reader(conn, sid, agent, project) and conn.execute(
+    return any(hosted_wake._own_reader(conn, sid, agent, project) and not _bound(conn, sid) and conn.execute(
         "SELECT 1 FROM sessions WHERE id = ? AND last_seen >= ?", (sid, now - window)).fetchone() is not None
         for sid in pair["readers"].get(k, []))
 

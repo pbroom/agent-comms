@@ -67,6 +67,14 @@ class Bridge:
         self.hub, self.write = hub, write
         self.client = client or httpx.Client(timeout=httpx.Timeout(330, connect=5), trust_env=False)
         self.client.headers["Authorization"] = "Bearer " + token
+        # What this process says about itself to the spawn tools (hosted_spawn.Ident): a hosted session's binding
+        # from its environment, or else its OS session (best effort: hosted_spawn.LOOKS_HOSTED). Nothing the model chose.
+        from .hosted_spawn import Ident
+        try:
+            sid = os.getsid(0)
+        except OSError:
+            sid = None
+        self.client.headers.update(Ident.from_environ(os.environ, sid).headers())
         self.session: str | None = None
         self.version: str | None = None
         self.init: dict | None = None          # the client's initialize request
@@ -115,6 +123,36 @@ class Bridge:
         if self.initialized is not None:
             self._post(self.initialized, self.session)
 
+    def _registered(self, message: dict, out: list) -> None:
+        """A successful board_register: its board session id goes with every later request (X-Board-Session), as a
+        stdio board server remembers it. So the hub's tools take this connection's own board session by default (the
+        spawn tools its project, mcp_server.ident, which checks that the session is this agent's and, if it is
+        bound, this binding's). Only the hub's answer to this very call is read, never anything the model wrote."""
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if message.get("method") != "tools/call" or params.get("name") != "board_register":
+            return
+        for m in out:
+            res = m.get("result") if isinstance(m, dict) and m.get("id") == message.get("id") else None
+            if not isinstance(res, dict) or res.get("isError"):
+                continue
+            body = res.get("structuredContent")
+            if not isinstance(body, dict):
+                try:
+                    body = json.loads(res["content"][0]["text"])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    body = None
+            sid = body.get("session_id") if isinstance(body, dict) else None
+            if type(sid) is int and sid > 0:
+                self.client.headers["x-board-session"] = str(sid)
+            if isinstance(body, dict) and body.get("dispatched") is True:
+                # The hub says this connection is a dispatched run's (hosted_spawn.dispatched_after_register: it
+                # registered for a run, or registered or resumed a board session that has one): from now on, for this
+                # bridge's life and across its reconnects (the header stays on its client), it says it is a process
+                # the board launched (hosted_spawn.H_MANAGED), whatever it registers later. The hub's answer is what
+                # counts, never what the call passed; and it is only ever a restriction.
+                from .hosted_spawn import H_MANAGED
+                self.client.headers[H_MANAGED] = "1"
+
     def handle(self, message: dict) -> None:
         msg_id, method = message.get("id"), message.get("method")
         if method is None:
@@ -155,6 +193,7 @@ class Bridge:
                     self.write(_error(msg_id, f"agent-comms hub {self.hub} sent a reply that could not be read; the "
                                               "call may have run, so check the board before retrying"))
                 return
+            self._registered(message, out)      # first: the client's next call may follow the answer at once
             for m in out:
                 self.write(m)
             if msg_id is not None and not any(isinstance(m, dict) and m.get("id") == msg_id and "method" not in m

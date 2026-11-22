@@ -37,6 +37,7 @@ import logging
 import os
 import signal
 import time
+import itertools
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -156,6 +157,19 @@ class Session:
     # access: Claude's `init` says bypassPermissions, Codex's answer to thread/start names dangerFullAccess).
     sealed_by: Any = None
     confirmed_by: Any = None
+    # The key that proves a process is this session's (hosted_spawn.bind_key), from the hub with child sessions on:
+    # every process of the session gets it in its environment (BIND_ENV), which the board's MCP server inherits.
+    # `proc_bind`: the binding the LIVE process was started with. A turn is written only to a process started with
+    # the binding the session has now (`unbound`, `_write`): one given or withdrawn since restarts the process first.
+    bind: str | None = None
+    proc_bind: str | None = None
+    linger_logged: float = float("-inf")     # when a group that outlived its SIGKILL was last said in the log
+    group_token: Any = None                  # its live process's entry in the node's registry (node_groups)
+
+    @property
+    def unbound(self) -> bool:
+        """Its live process was started with another binding than the session has now (given, or withdrawn)."""
+        return self.child is not None and self.proc_bind != self.bind
 
     @property
     def sealed(self) -> bool:
@@ -204,6 +218,109 @@ class Session:
 
 
 DRY_RUN_ID = "00000000-0000-4000-8000-000000000000"
+BINDING_CHANGED = ("the session's binding changed while this turn was being written to its process, so it was not "
+                   "delivered (the process was stopped; send the message again)")
+# The environment variables of a session's binding (hosted_spawn.HOSTED_ENV, KEY_ENV), named here so that the node
+# does not import the hub's module.
+BIND_ENV = ("AGENT_COMMS_HOSTED_SESSION", "AGENT_COMMS_HOSTED_KEY")
+
+
+def _toml_item(v: Any) -> str | None:
+    """One entry of an `env_vars` list as TOML (a name, or a table of strings), or None when it is neither."""
+    if isinstance(v, str):
+        return json.dumps(v)
+    if isinstance(v, dict) and all(isinstance(k, str) and k.replace("_", "").isalnum() and isinstance(x, str)
+                                   for k, x in v.items()):
+        return "{" + ", ".join(f"{k} = {json.dumps(x)}" for k, x in v.items()) + "}"
+    return None
+
+
+def bound_template(template: list[str], bind: str | None, codex_config: dict | None = None) -> list[str]:
+    """A Codex runner of a session with a binding: Codex starts an MCP server with a small fixed environment, not
+    its own, so it is told to pass the two binding variables on to the board's server: `-c
+    mcp_servers.agent-comms.env_vars=[...]`, the list in force for that server with the two names added. In force:
+    the runner's own last `-c` of that key, else the user's Codex configuration (`codex_config`, its config.toml,
+    read only). Seen with codex-cli 0.171.0 (`codex mcp get --json` in a private CODEX_HOME): such a `-c` replaces
+    that one key of a server the TOML defines and keeps the rest; a `-c` for a server Codex has no entry for makes an
+    entry with no transport, and Codex refuses to start ("invalid transport"). So the server's entry is first
+    resolved as Codex would use it (`_effective_server`: config.toml with the runner's `-c` values over it), and the
+    list is added only to a stdio server (`command`, no `url`): never to a URL server, also not one a runner's `-c`
+    names for something else (a tool's approval), and never to a server that is not there. Without
+    it the session's board server has no binding, and the spawn tools refuse it as hosted (never taking it for
+    anything else when it can be seen inside the session: hosted_spawn.LOOKS_HOSTED). A Claude runner needs nothing:
+    Claude Code gives an MCP server its own environment."""
+    if bind is None or not template or os.path.basename(template[0]) != "codex":
+        return template
+    entry = _effective_server(template, codex_config)
+    if entry is None or not isinstance(entry.get("command"), str) or "url" in entry:
+        return template         # no such server, one this host cannot read, or not a stdio one: nothing to pass on
+    current: Any = entry.get("env_vars", [])
+    if not isinstance(current, list):
+        return template
+    names = {v if isinstance(v, str) else v.get("name") for v in current if isinstance(v, (str, dict))}
+    merged = list(current) + [n for n in BIND_ENV if n not in names]
+    items = [_toml_item(v) for v in merged]
+    if any(x is None for x in items):
+        return template
+    return [*template, "-c", f"mcp_servers.{session_access.BOARD_SERVER}.env_vars=[{', '.join(items)}]"]
+
+
+def _effective_server(template: list[str], codex_config: dict | None) -> dict | None:
+    """The board server's entry as Codex would use it: the user's config.toml entry (read only), with the runner's
+    own `-c mcp_servers.agent-comms...` values (in every form the Codex adapter takes) applied over it in order, as Codex applies them (a value it cannot read
+    as TOML is a string). None when there is no such server, or when this host cannot tell what it is (a value it
+    cannot place). Its transport is then known: `command` (stdio) or `url` (HTTP), whatever key a `-c` set (a tool's
+    approval, say)."""
+    import copy
+    import tomllib
+    servers = (codex_config or {}).get("mcp_servers") if isinstance(codex_config, dict) else None
+    base = servers.get(session_access.BOARD_SERVER) if isinstance(servers, dict) else None
+    entry: Any = copy.deepcopy(base) if isinstance(base, dict) else None
+    name = f"mcp_servers.{session_access.BOARD_SERVER}"
+    from .providers.codex import config_values
+    try:
+        given = config_values(template)     # the adapter's own reading: `-c k=v`, `-ck=v`, `--config=k=v`, ...
+    except ValueError:
+        return None                         # a runner the adapter refuses anyway: nothing is added to it
+    for value in given:
+        key, sep, raw = value.partition("=")
+        key = key.strip()
+        if not sep or not (key == name or key.startswith(name + ".")):
+            continue
+        try:
+            val = tomllib.loads("x = " + raw)["x"]
+        except (tomllib.TOMLDecodeError, KeyError):
+            val = raw
+        path = [p for p in key[len(name):].split(".") if p]
+        if not path:
+            if not isinstance(val, dict):
+                return None
+            entry = copy.deepcopy(val)
+            continue
+        entry = entry if isinstance(entry, dict) else {}
+        cur = entry
+        for part in path[:-1]:
+            nxt = cur.get(part)
+            if not isinstance(nxt, dict):
+                nxt = cur[part] = {}
+            cur = nxt
+        cur[path[-1]] = val
+    return entry if isinstance(entry, dict) else None
+
+
+def codex_config_of(env: dict[str, str]) -> dict | None:
+    """The Codex configuration a process with this environment would load (CODEX_HOME, else ~/.codex), read only:
+    what `bound_template` merges with. None when there is none, or it cannot be read."""
+    import tomllib
+    home = env.get("CODEX_HOME") or (os.path.join(env["HOME"], ".codex") if env.get("HOME") else None)
+    if not home:
+        return None
+    try:
+        with open(os.path.join(home, "config.toml"), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def runner_dir(template: list[str]) -> str | None:
@@ -274,6 +391,18 @@ class SessionHost:
         # inbox; False once it is on its way withdraws it (TURN_WITHDRAWN). Its caller's rule: a child session's
         # parent must still be what the child needs.
         self.turn_gate: Callable[[Session], bool] | None = None
+        # Every process group this host starts, and every one it stops, is in the node's one registry (node_groups:
+        # nothing starts in a directory holding a group being stopped). node.Node shares it with its dispatched runs.
+        from .node_groups import Groups
+        self.groups = Groups()
+        self._group_seq = itertools.count(1)
+        # Asked at the moment a session's process would be started, for every start (node_sessions sets it: a slot
+        # within max_live). False: the message waits in the inbox and the start is asked again on a later pass.
+        self.admit: Callable[[Session], bool] | None = None
+        # Asked before every process start and every new turn written to a process (node_sessions sets it: not while
+        # the node is past its self-stop deadline, until a listing fetched since has been applied). False: nothing
+        # starts and no turn is taken from the inbox; the messages wait there, and nothing is failed.
+        self.may_start: Callable[[], bool] | None = None
         self._recovered = False
         self._next_message = 0
 
@@ -401,7 +530,7 @@ class SessionHost:
 
     def open(self, session_id: str, *, agent: str, project: str, runtime: str | None = None, model: str | None = None,
              resume: bool = False, thread_id: int = 0, access: str | None = None, effort: str | None = None,
-             cwd: str | None = None) -> Session:
+             cwd: str | None = None, bind: str | None = None) -> Session:
         """Register a session. Nothing starts until it has a message. `resume`: the provider already has this session
         (an earlier host ran it). `access`: the access word it is to run at (session_access; None: as its runner has
         it), `effort`: one of session_access.EFFORTS, `cwd`: its run directory when that is not the project's
@@ -426,15 +555,19 @@ class SessionHost:
             cwd = checkout
         elif not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
             raise FileNotFoundError("the session's own run directory does not exist")
+        if bind is not None and (not isinstance(bind, str) or len(bind) != 64
+                                 or any(ch not in "0123456789abcdef" for ch in bind)):
+            raise ValueError("a session's binding key must be 64 hex characters")
         try:
-            return self._open(session_id, agent, runtime, project, cwd, template, factory, model, thread_id, resume,
-                              access, effort)
+            s = self._open(session_id, agent, runtime, project, cwd, template, factory, model, thread_id, resume,
+                           access, effort, bind)
         except Exception:
             self._drop_files(session_id)        # what was written for a session that is not opened after all
             raise
+        return s
 
     def _open(self, session_id, agent, runtime, project, cwd, template, factory, model, thread_id, resume, access,
-              effort) -> Session:
+              effort, bind=None) -> Session:
         # The access word becomes flags here, from this machine's runner and settings (nothing executable came from
         # the hub). Without a word the template is as configured; a Claude runner that names no permission mode
         # gets the standard one pinned, so that no settings file decides it.
@@ -458,7 +591,7 @@ class SessionHost:
                 template, cwd, write=lambda data: self._private_json(session_id, "settings", data))
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
                     thread_id=int(thread_id), resume=bool(resume), asked=access, access=label, effort=effort,
-                    seal=seal)
+                    seal=seal, bind=bind)
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
             runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
@@ -620,6 +753,17 @@ class SessionHost:
             self.recover()
         out: list[HostEvent] = []
         now = self.clock()
+        # Every exit first: a leader that went by itself leaving members of its group is registered as stopping
+        # (`_reap`) before this pass starts any process, so nothing it starts goes beside such a group.
+        for s in list(self.sessions.values()):
+            if s.child is not None and s.stopping_since is None:
+                try:
+                    self._read(s, now, out)
+                    self._reap(s, now, out)
+                except Exception as e:
+                    log.exception("session %s failed", s.session_id)
+                    if not s.ended:
+                        self._end(s, f"host error: {type(e).__name__}", now, out)
         for s in list(self.sessions.values()):
             try:
                 self._pass(s, now, out)
@@ -636,11 +780,10 @@ class SessionHost:
         if s.child is not None and s.stopping_since is None and not s.ended:
             self._hold_to_timeout(s, now, out)
         if s.child is not None and s.stopping_since is not None:
-            if not s.killed and now - s.stopping_since >= self.kill_grace:
-                s.killed = True
-                s.child.kill()
+            self._kill_if_due(s, now)
             self._reap(s, now, out)
             if s.child is not None:
+                self._lingering(s, now)
                 return      # still going down: nothing new starts beside it
         if not s.ended:
             self._write(s, now, out)
@@ -743,16 +886,33 @@ class SessionHost:
             self._stop(s, now)
 
     def _reap(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """The process is let go of only once its whole process group is gone, however its leader ended: stopped by
+        the host (a close, a timeout, a withdrawn turn, a failed write), or on its own (it exited, or crashed). A
+        leader that exits on its own while members of its group are left is treated as an exit at once (its work
+        fails as below), and its group is then stopped the way the stop path stops one (SIGTERM, SIGKILL after the
+        grace): the handle is kept until the group is gone, and so is its entry in the node's registry (node_groups):
+        nothing this node starts goes into that directory meanwhile, a session's process or a dispatched run."""
         code = s.child.poll()
         if code is None:
             return
-        if s.stopping_since is not None and self.group_alive(s.child.pid):
-            return      # the host stopped it and its leader is gone, but not its group: nothing starts beside that
+        if self.group_alive(s.child.pid):
+            if s.stopping_since is None:
+                # It went by itself, leaving members of its group behind (a tool it started, say).
+                self._read(s, now, out)
+                if not s.ready:
+                    self._correct_start_mode(s)
+                self._went_by_itself(s, code, s.ready, s.checking, out)
+                log.warning("session %s: its process exited (code %s) and left members of its group: stopping them",
+                            s.session_id, code)
+                self._stop(s, now)
+            return      # its leader is gone, but not its group: nothing starts beside that, nothing is reported reaped
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
         if not s.ready:
             self._correct_start_mode(s)
         was_ready, was_checking = s.ready, s.checking
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
+        self.groups.gone(s.group_token)      # the whole group is gone
+        s.group_token = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.outbuf.clear()
@@ -762,20 +922,40 @@ class SessionHost:
         if s.transcript_fd is not None:
             os.close(s.transcript_fd)
             s.transcript_fd = None
-        if not stopped and not s.ended:
-            # It went by itself. The turn it had is lost; the next message starts a fresh process.
-            if s.in_flight is not None:
-                self._fail(s, f"the process exited (code {code}) before the turn ended", out)
-            elif s.writing is not None:
-                self._fail(s, f"the process exited (code {code}) before the message was written", out)
-            elif s.inbox and ((s.provider.waits_for_ready and not was_ready) or was_checking):
-                # It went during its handshake (or before it answered the question it was asked at its start). The
-                # message that made it start fails with it: otherwise a process that can never start (a runner flag
-                # Codex refuses) would be started again on every pass.
-                self._fail_start(s, f"the process exited (code {code}) before it was ready", out)
-            s.busy_since = None
+        if not stopped:
+            self._went_by_itself(s, code, was_ready, was_checking, out)
         s.held_since = None
         self._save_state()
+
+    LINGER_LOG_SECONDS = 60.0       # how often a process group that outlives its SIGKILL is said again
+
+    def _lingering(self, s: Session, now: float) -> None:
+        """A process group that is still there well after its SIGKILL (a member in uninterruptible sleep, say) keeps
+        this session's next process, and any run this node would start in its directory, waiting. That shows here, in
+        the node's log, not on the hub (an owner decision, review round 6): one line, repeated at intervals."""
+        if not s.killed or now - (s.stopping_since or now) < 2 * self.kill_grace:
+            return
+        if now - s.linger_logged >= self.LINGER_LOG_SECONDS:
+            s.linger_logged = now
+            log.warning("session %s: its process group (pid %s) in %s is still there %.0f s after it was stopped and "
+                        "killed; nothing starts in that directory on this node until it is gone", s.session_id,
+                        getattr(s.child, "pid", None), s.cwd, now - (s.stopping_since or now))
+
+    def _went_by_itself(self, s: Session, code: int, was_ready: bool, was_checking: bool,
+                        out: list[HostEvent]) -> None:
+        """Its process went by itself. The turn it had is lost; the next message starts a fresh process."""
+        if s.ended:
+            return
+        if s.in_flight is not None:
+            self._fail(s, f"the process exited (code {code}) before the turn ended", out)
+        elif s.writing is not None:
+            self._fail(s, f"the process exited (code {code}) before the message was written", out)
+        elif s.inbox and ((s.provider.waits_for_ready and not was_ready) or was_checking):
+            # It went during its handshake (or before it answered the question it was asked at its start). The
+            # message that made it start fails with it: otherwise a process that can never start (a runner flag
+            # Codex refuses) would be started again on every pass.
+            self._fail_start(s, f"the process exited (code {code}) before it was ready", out)
+        s.busy_since = None
 
     def _correct_start_mode(self, s: Session) -> None:
         """A process that went without ever confirming the session may have said why (stderr): the session it was told
@@ -878,6 +1058,7 @@ class SessionHost:
     def _stop(self, s: Session, now: float) -> None:
         if s.child is not None and s.stopping_since is None:
             s.stopping_since = now
+            self.groups.stopping(s.group_token)     # from now on nothing starts in its directory until it is gone
             # The whole process group (PopenChild). Not once all of it is known to be gone (a caller may have
             # stopped it already, node.shut_down): its id could be another group's by now.
             if s.child.poll() is None or self.group_alive(s.child.pid):
@@ -894,8 +1075,38 @@ class SessionHost:
     # ------------------------------------------------------------ starting and writing
 
     def _argv(self, s: Session) -> list[str]:
-        argv = s.provider.argv(s.template, session_id=s.session_id, resume=s.resume, model=s.model)
+        codex = s.bind is not None and os.path.basename(s.template[0]) == "codex"
+        argv = s.provider.argv(bound_template(s.template, s.bind, codex_config_of(self._env(s)) if codex else None),
+                               session_id=s.session_id, resume=s.resume, model=s.model)
         return render_argv(argv, prompt="", project=s.cwd, thread_id=s.thread_id)
+
+    def _env(self, s: Session) -> dict[str, str]:
+        """The process's environment: a dispatched run's (dispatch.child_env), and the session's binding when it has
+        one (hosted_spawn: the session id and its key, which the board's MCP server inherits and passes on)."""
+        env = child_env(s.agent, self.config, runtime=s.runtime)
+        if s.bind is not None:
+            env |= {BIND_ENV[0]: s.session_id, BIND_ENV[1]: s.bind}
+        return env
+
+    def cancel(self, session_id: str, message_id: str, detail: str) -> list[HostEvent]:
+        """The session that started this turn cancelled it (hosted_spawn.cancel): a turn in flight, or one being
+        written, fails with `detail` and the process is stopped (the next message starts one that resumes the
+        conversation; a turn half written is never completed); one still in the inbox is dropped, never written.
+        Anything else (the turn is over, or another one) is left alone."""
+        s, out = self._session(session_id), []
+        now = self.clock()
+        if (s.in_flight is not None and s.in_flight.id == message_id) or (
+                s.writing is not None and s.writing.id == message_id):
+            if s.writing is not None:
+                s.outbuf = bytearray()
+            self._fail(s, detail, out)
+            self._stop(s, now)
+            return out
+        for m in list(s.inbox):
+            if m.id == message_id:
+                s.inbox.remove(m)
+                out.append(HostEvent(s.session_id, "turn_ended", m.id, ok=False, delivered=False, detail=detail))
+        return out
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
         try:
@@ -906,13 +1117,20 @@ class SessionHost:
                 s.stderr_from = os.path.getsize(self.sessions_dir / f"{s.session_id}.stderr.log")
             except OSError:
                 s.stderr_from = 0
-            child = self.spawner(argv, cwd=s.cwd, env=child_env(s.agent, self.config, runtime=s.runtime),
-                                 log_path=self.sessions_dir / f"{s.session_id}.stderr.log")
+            token = ("session", s.session_id, next(self._group_seq))
+            started, child = self.groups.start(s.cwd, token, lambda: self.spawner(
+                argv, cwd=s.cwd, env=self._env(s), log_path=self.sessions_dir / f"{s.session_id}.stderr.log"))
+            if not started:
+                # A process group of this node is being stopped in that directory (a session's, or a dispatched
+                # run's): nothing starts beside it. The message waits in the inbox.
+                return
+            s.group_token = token
         except Exception as e:
             log.warning("could not start session %s: %s", s.session_id, e)
             self._end(s, f"could not start: {type(e).__name__}: {e}", now, out)
             return
         s.child, s.ready, s.stopping_since, s.killed = child, False, None, False
+        s.proc_bind = s.bind
         try:
             s.proc_start = self.start_of(child.pid)
         except Exception:
@@ -943,10 +1161,26 @@ class SessionHost:
         if s.child is None:
             if not s.inbox:
                 return
+            if self.may_start is not None and not self.may_start():
+                return      # the node is past its self-stop deadline: nothing starts (node_sessions `_may_start`)
+            if self.groups.blocked(s.cwd):
+                return      # its checkout holds a stopping group: it waits for that first (and stops nobody for a slot)
+            if self.admit is not None and not self.admit(s):
+                return      # no slot now (max_live): it waits, and asks again
             self._spawn(s, now, out)
             if s.child is None:
                 return
+        if not s.busy and s.inbox and s.unbound:
+            # The write boundary for the binding: a message is never written to a process started without the binding
+            # the session has now (or with one it no longer has), also one that came into the inbox during the
+            # process's handshake. The process is stopped (not while its provider runs a turn of its own) and the
+            # message stays in the inbox for the next one, which gets the binding as it is then.
+            if not self.holding(s):
+                log.info("session %s: its process is restarted to take its binding as it is now", s.session_id)
+                self._stop(s, now)
+            return
         if (not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not s.checking
+                and (self.may_start is None or self.may_start())      # ... and no new turn is written
                 and (self.turn_gate is None or self.turn_gate(s)) and not self._held(s, now, out)):
             s.writing = s.inbox.popleft()
             s.waiting, s.denials, s.busy_since = False, (), now
@@ -960,6 +1194,16 @@ class SessionHost:
             for data in s.provider.turn(s.writing.text, kind=s.writing.kind):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
+        if s.writing is not None and s.unbound:
+            # The binding changed between two writes of one turn (a pipe can take a turn in pieces, over several
+            # passes): the rest never goes to the process started with the old one. As for the turn gate below: the
+            # half-written line is not completed, the process is stopped, and the message fails as never delivered
+            # (BINDING_CHANGED), for its sender to send again; it is not replayed, since part of it reached a process.
+            log.warning("session %s: its binding changed while a turn was being written", s.session_id)
+            s.outbuf.clear()
+            self._fail(s, BINDING_CHANGED, out)
+            self._stop(s, now)
+            return
         if s.writing is not None and self.turn_gate is not None and not self.turn_gate(s):
             # The gate is asked before EVERY write of a turn, not only before the first: a pipe may take a turn in
             # pieces, over several passes, and what the session needs can go between two of them. A half-written
@@ -1004,6 +1248,22 @@ class SessionHost:
         self._stop(s, self.clock())
         return True
 
+    def _kill_if_due(self, s: Session, now: float) -> bool:
+        if s.child is not None and s.stopping_since is not None and not s.killed \
+                and now - s.stopping_since >= self.kill_grace:
+            s.killed = True
+            s.child.kill()
+            return True
+        return False
+
+    def kill_due(self) -> list[tuple[str, float]]:
+        """SIGKILL for every process group whose grace after its SIGTERM is over, as a pass does (`_pass`). Called
+        between passes too (node_sessions' deadline watchdog), so that a kill never waits for a pass that is held up
+        by a hub call. Returns (session id, when its kill was due) for each one killed."""
+        now = self.clock()
+        return [(s.session_id, s.stopping_since + self.kill_grace) for s in list(self.sessions.values())
+                if self._kill_if_due(s, now)]
+
     def stop_turns(self, detail: str) -> list[HostEvent]:
         """Give up on every turn in flight: each is reported failed and its process is stopped (the caller lost the
         hub, so nobody could see or stop the turn). Idle processes and the sessions themselves stay."""
@@ -1045,6 +1305,8 @@ class SessionHost:
                 os.close(s.transcript_fd)
                 s.transcript_fd = None
             s.child, s.proc_start, s.ready, s.stopping_since, s.killed = None, None, False, None, False
+            self.groups.gone(s.group_token)
+            s.group_token = None
             s.outbuf.clear()
         for s in self.sessions.values():
             s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
