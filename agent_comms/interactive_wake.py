@@ -15,7 +15,8 @@ Records (`board_state`)
   delivered and was shown afterwards (`delivered`, `read`), the posts the dispatcher claimed, and at most one `offer`.
 - *Pair* `wake.pair.<agent>.<hash of the project>`: the agent's wake limits in the project (`sent`, `threads`:
   hosted_wake._lift's and `_thread`'s fields), the posts delivered to any of its waiters (`delivered`, and to which
-  conversation: `delivered_to`), the reads of them by a session registered in the project (`read`), the requests the
+  conversation: `delivered_to`), the reads of them by a session registered in the project (`read`, the first, and
+  `readers`, the board sessions that read each), the requests the
   dispatcher reserved (`claimed`, also when no waiter is left in the project), and one hold deadline per request
   (`holds`). A new conversation id resets none of it.
 
@@ -75,13 +76,21 @@ Other rules
 - *Limits* (`[dispatch.sessions]`, the hosted numbers, per pair). At a maximum the posts wait: a thread's stop lifts
   when the human posts there, the hourly one when the hour has room. No Needs-you item is posted.
 - *The dispatcher* (`holds`, `claim`, `handed`). A request is held from its first offer until `wake_grace_seconds`
-  later (one deadline per request, kept across take-backs and re-offers), and after that only if a board session
-  that can be the waiter's read it after it was delivered while registered in the post's project (the read mark
-  `handed` records; a delivery receipt alone does not count). A waiter never offered the request holds nothing.
+  later (one deadline per request, kept across take-backs and re-offers), and after that only while a board session
+  that can be the waiter's, and read it after it was delivered while registered in the post's project (the readers
+  `handed` records; a delivery receipt alone does not count), is still live there: seen within the dispatcher's
+  live_minutes, as `_policy_held` requires of its own readers. A waiter never offered the request holds nothing.
 - *Text.* hosted_wake.wake_text: counts, thread ids and agent names only, plus the fixed note.
 - *What it cannot stop.* Any process holding the agent's token can call as a waiter of that agent: the hub cannot
-  tell it from the agent's own session. It can take that agent's wakes and hold a request back for one grace period
-  at most; it cannot reset the pair's limits or wait as another agent.
+  tell it from the agent's own session. It can take that agent's wakes and hold a request back for one grace
+  period, plus as long as a board session it registered in the project, and that read the request, stays live (what
+  a live session of the agent that reads a request already does without this feature); it cannot reset the pair's
+  limits or wait as another agent.
+- *A limitation (PR review F2, left for later).* A waiter's pending posts come from its own marks. A post that
+  waiter A holds back under a limit is never offered while a newer conversation B, armed after that post, is the
+  chosen waiter (B's marks start above it), possibly for a day. It holds nothing, so the dispatcher treats a request
+  among such posts as without the feature, and the prompt check reports it. The fix: merge the pair's pending posts
+  into the chosen waiter at O1.
 """
 from __future__ import annotations
 
@@ -125,11 +134,20 @@ SUPERSEDED = {"state": "superseded"}
 ACKED = {"state": "acked"}
 REJECTED = {"state": "rejected"}
 REPLAY_SECONDS = 60.0            # the last accepted ack id is answered "acked" again for this long (its reply was lost)
+MAX_READERS = 8                  # board sessions kept per delivered post as its readers (the latest)
+LIVE_MINUTES = 2.0               # [dispatch] live_minutes when the hub's value is missing or not a positive number
 
 
 def enabled(board: Board) -> bool:
     """`[dispatch.sessions.interactive] wake` as the hub has it now (a table that does not validate: off)."""
     return bool(hosted_wake.limits(board).interactive.wake)
+
+
+def live_seconds(board: Board) -> float:
+    """`[dispatch] live_minutes` as the hub has it now, in seconds: how recently a board session must have been seen
+    to count as live (the dispatcher's `_live` and `_policy_held` use the same window)."""
+    v = (getattr(board.s, "dispatch", None) or {}).get("live_minutes", LIVE_MINUTES)
+    return 60.0 * (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else LIVE_MINUTES)
 
 
 def _live(board_or_conn: Any) -> tuple[Any, bool]:
@@ -224,6 +242,8 @@ def _pair(conn, agent: str, project: str) -> dict:
             "closing": [], "hour_ack": raw.get("hour_ack") if _num(raw.get("hour_ack")) else None,
             "delivered": _times(raw.get("delivered")), "holds": _times(raw.get("holds")),
             "read": _times(raw.get("read")), "claimed": _times(raw.get("claimed")),
+            "readers": {k: [s for s in v if type(s) is int] for k, v in raw["readers"].items() if isinstance(v, list)}
+            if isinstance(raw.get("readers"), dict) else {},
             "delivered_to": {k: v for k, v in raw["delivered_to"].items() if isinstance(v, str)}
             if isinstance(raw.get("delivered_to"), dict) else {},
             "seen": raw.get("seen") if _num(raw.get("seen")) else 0.0}
@@ -238,6 +258,7 @@ def _save_pair(c, pair: dict, now: float) -> None:
         pair[table] = hosted_wake._recent(pair[table], now, hosted_wake.KEEP_WOKEN_SECONDS, hosted_wake.MAX_WOKEN)
     pair["delivered_to"] = {k: v for k, v in pair["delivered_to"].items()
                             if k in pair["delivered"] or k in pair["read"]}
+    pair["readers"] = {k: v[-MAX_READERS:] for k, v in pair["readers"].items() if k in pair["read"] and v}
     pair["closing"], pair["seen"] = [], now
     _put(c, _pair_key(pair["agent"], pair["project"]), pair, HUB, now)
 
@@ -583,25 +604,31 @@ def _delivery(conn, agent: str, project: str, k: str) -> tuple[float | None, dic
     return (min(ats) if ats else None), pair, recs
 
 
-def read_after_delivery(conn, agent: str, project: str, post_id: int) -> bool:
+def read_after_delivery(conn, agent: str, project: str, post_id: int, now: float, window: float) -> bool:
     """A board session that can be the own session of a waiter the post was delivered to was shown it after that
-    delivery: a read mark (kept on the pair, and on the waiter), which `handed` writes only for a reader registered
-    in the post's project at the time of the read. A delivery receipt alone is no evidence (review round 6, S30):
-    it names the session, not the project the session was registered in when it read, so a session that read in
-    another project and later re-registered here would pass a check made now. Both read paths that write receipts
-    also call `handed`."""
+    delivery, and is live: one of the post's readers on the pair, which `handed` records only for a reader registered
+    in the post's project at the time of the read, is still the agent's in this project, not a dispatched run's, and
+    was seen within `window` (the dispatcher's live_minutes; PR review F1, as `_policy_held` bounds its own
+    read-based hold). A session that read the post and went away holds nothing once it is no longer live; another
+    live session of the agent that did not read it holds nothing either. A delivery receipt alone is no evidence
+    (review round 6, S30): it names the session, not the project the session was registered in when it read. Both
+    read paths that write receipts also call `handed`."""
     k = str(post_id)
-    at, pair, recs = _delivery(conn, agent, project, k)
+    at, pair, _recs = _delivery(conn, agent, project, k)
     if at is None or hosted_wake._shadowed(conn, {"agent": agent, "project": project}, at):
         return False
-    return pair["read"].get(k, -1.0) >= at or any(r["read"].get(k, -1.0) >= r["delivered"][k] for r in recs.values())
+    if pair["read"].get(k, -1.0) < at:
+        return False
+    return any(hosted_wake._own_reader(conn, sid, agent, project) and conn.execute(
+        "SELECT 1 FROM sessions WHERE id = ? AND last_seen >= ?", (sid, now - window)).fetchone() is not None
+        for sid in pair["readers"].get(k, []))
 
 
 def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> bool:
     """A waiter of `agent` in `project` has this request (hosted_wake.holds' rule, on the pair and its waiters):
-    until the deadline its first offer set, or once a board session that can be a waiter's own was shown it after it
-    was delivered. A request the dispatcher reserved, and one no waiter was ever offered, is never held. Off, or
-    without a pair: nothing."""
+    until the deadline its first offer set, and after that only while a board session that can be a waiter's own,
+    and was shown it after it was delivered, stays live (`read_after_delivery`). A request the dispatcher reserved,
+    and one no waiter was ever offered, is never held. Off, or without a pair: nothing."""
     conn, on = _live(board_or_conn)
     if not on or type(post_id) is not int or not isinstance(project, str):
         return False
@@ -613,7 +640,7 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     recs = _records(conn, agent, project)
     if any(k in r["claimed"] for r in recs.values()):
         return False
-    return now < until or read_after_delivery(conn, agent, project, post_id)
+    return now < until or read_after_delivery(conn, agent, project, post_id, now, live_seconds(board_or_conn))
 
 
 def claim(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> None:
@@ -672,8 +699,8 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
             at, pair, recs = _delivery(board.conn, p.name, project, k)
             convs = {r["client_session_id"] for r in recs.values()} | (
                 {pair["delivered_to"][k]} if k in pair["delivered_to"] else set())
-            if at is not None and pair["read"].get(k, -1.0) < at and _pair_reader(board.conn, session_id, p.name,
-                                                                                   project, convs):
+            if at is not None and (pair["read"].get(k, -1.0) < at or session_id not in pair["readers"].get(k, [])) \
+                    and _pair_reader(board.conn, session_id, p.name, project, convs):
                 todo.append(k)
         if not todo:
             return
@@ -684,7 +711,10 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
             pair = _pair(c, p.name, project)
             marked = [k for k in todo if not hosted_wake._shadowed(c, pair, _delivery(c, p.name, project, k)[0])]
             for k in marked:
-                pair["read"][k] = now
+                if pair["read"].get(k, -1.0) < _delivery(c, p.name, project, k)[0]:
+                    pair["read"][k] = now
+                # Who read it: `holds` after the deadline asks whether one of them is still live (PR review F1).
+                pair["readers"][k] = [s for s in pair["readers"].get(k, []) if s != session_id] + [session_id]
             for key, rec in _records(c, p.name, project).items():
                 mine = [k for k in marked if k in rec["delivered"] and rec["read"].get(k, -1.0) < rec["delivered"][k]
                         and _reader(c, session_id, p.name, rec)]

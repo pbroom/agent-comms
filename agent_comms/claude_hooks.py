@@ -117,6 +117,10 @@ def _read(path: Path) -> dict:
 
 
 def _write(path: Path, data: dict) -> None:
+    """Replace the settings file atomically. A symlinked settings file (a dotfiles setup) is written through: the
+    temporary file goes beside the link's target and replaces the target, so the link stays a link and the target
+    keeps its permissions (PR review F3b)."""
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".agent-comms-")

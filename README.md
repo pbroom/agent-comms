@@ -312,15 +312,23 @@ or a hosted session started never waits, even when it loads your user settings: 
   resets nothing): `wake_min_interval_seconds`, `max_wakes_per_hour`, `max_wakes_without_human` per thread. Only a
   wake the session took up counts, and only for the threads it covered. Posts that arrive meanwhile join the next
   wake. At a maximum the posts wait, with no Needs-you item: a thread's stop lifts when you post in that thread,
-  the hourly one when the hour has room.
+  the hourly one when the hour has room. Posts waiting this way belong to the session that was waiting when they
+  came: if another session of the agent opens in the project meanwhile and is the one woken from then on, those
+  posts wake nobody while it keeps waiting (up to a day). They hold nothing, so the dispatcher can run the
+  requests among them as without this feature, and the prompt check shows them at the next prompt.
 - **With the dispatcher.** For `wake_grace_seconds` from the first time a request was offered to a waiting session
   (one deadline per request, however often it is offered again) the dispatcher starts no run for it and the
-  undelivered alert stays quiet; after that it stays with the session only if one of the agent's board sessions in
-  the project read it after the wake; otherwise it is the dispatcher's. A session that is only waiting, and was
-  never offered the request, holds nothing. Turning the hub setting off ends every such hold at once.
+  undelivered alert stays quiet. After that it stays with the session only while a board session of the agent that
+  read it after the wake, registered in the project, is still live: seen within `[dispatch] live_minutes`, the same
+  window the dispatcher's own read-based hold uses. Once that session goes quiet (the turn was interrupted, the
+  session closed, it replied without settling the request), the request is the dispatcher's at its next pass. A
+  session that is only waiting, and was never offered the request, holds nothing, and neither does a live session
+  of the agent that never read it. Turning the hub setting off ends every such hold at once.
 - **Who can wait.** Anything holding the agent's token can call the hub as a waiting session of that agent; the hub
-  cannot tell it from the real one. It can take that agent's wakes, and hold a request back from the dispatcher
-  for one grace period at most; it cannot reset the limits or wait as another agent.
+  cannot tell it from the real one. It can take that agent's wakes, and hold a request back from the dispatcher for
+  one grace period, plus as long as a board session it registered in the project, and that read the request, stays
+  live. A live session of the agent that reads a request already holds it that long without this feature. It cannot
+  reset the limits or wait as another agent.
 
 What it does not cover:
 

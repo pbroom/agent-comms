@@ -3853,13 +3853,16 @@ hand-over: still eligible, not acknowledged by any session of the agent, not res
   the hosted session's, and the human is at this session anyway. The hourly maximum therefore sets no stop: posts
   go when the hour has room.
 - *The project.* The client sends what `board brief` would use (the hook cwd's checkout, its main repository and
-  their logical forms); the hub takes the first that some thread is in.
-- *Queued, offered, acknowledged.* A pass (the open call's own look, or each dispatcher pass right after
-  `hosted_wake.tick`) records the decided wake in `queued` and marks its posts `woken`, so `hosted.holds` sees it
-  before the dispatcher decides; the open call offers it after `_qualifying` again (none left: dropped and
-  uncounted), with an id. `board wait` sends that id back (`ack`) before it exits 2; only then is the wake
-  delivered. An offer not acknowledged within 10 s is taken back: the posts lose their coverage, go back to
-  `pending`, and the wake is not counted, so the conversation's next `board wait`, or another waiting session of the
+  their logical forms); the hub takes the first one sent, whether or not a thread is there yet. (Corrected in the
+  PR review: this first version took the first that some thread was in.)
+- *Offered, acknowledged.* A pass (the open call's own look, or each dispatcher pass right after
+  `hosted_wake.tick`) makes the offer (O1): it records the offer's posts on the waiter and sets each request's hold
+  deadline on the pair, once, so `hosted.holds` sees it before the dispatcher decides. The open call hands it over
+  (O2) after `_qualifying` again (none left: taken back and uncounted), with an id. (Corrected in the PR review: the
+  first version recorded a `queued` wake and marked its posts `woken`; review rounds 2 to 5 replaced that with the
+  offer state machine in interactive_wake.py's docstring, which is the current design.) `board wait` sends that id
+  back (`ack`) before it exits 2; only then is the wake delivered. An offer not acknowledged within 10 s is taken
+  back: the posts lose their coverage, go back to `pending`, and the wake is not counted, so the conversation's next `board wait`, or another waiting session of the
   agent, gets them. Found in the real run: the hub's side of an open call does NOT see its caller hang up (a curl
   killed 3 s into a 40 s wait left the call heartbeating for the rest of it; `request.is_disconnected` never turned
   true behind this app's `@app.middleware("http")`). Without the acknowledgement a wake offered into such a call
@@ -3869,10 +3872,11 @@ hand-over: still eligible, not acknowledged by any session of the agent, not res
 
 **The dispatcher's side** goes through the hooks it already has, so delivery.py and dispatch.py ask nothing new:
 `hosted_wake.holds` ends by asking `interactive_wake.holds` (the same rule on a waiter's record: within the grace,
-or a read mark after the wake by a board session that was the agent's in the post's project when it read, not a
-dispatched run's, and not one recorded for another conversation; a delivery receipt alone does not count, since
-review round 6); `hosted_wake.reserve` also calls `interactive_wake.claim`; `Board.read_updates` calls
-`interactive_wake.handed` beside `hosted_wake.handed`. Without waiter records each is one key-range read and no write.
+or a read after the wake by a board session that was the agent's in the post's project when it read, not a
+dispatched run's, and not one recorded for another conversation, while that session is still live there; a
+delivery receipt alone does not count, since review round 6, and the liveness bound is the PR review's);
+`hosted_wake.reserve` also calls `interactive_wake.claim`; `Board.read_updates` calls `interactive_wake.handed`
+beside `hosted_wake.handed`. Without waiter records each is one key-range read and no write.
 
 **Off is off.** The route answers `{"state": "off"}` before it reads or writes any board state; the dispatcher's pass reads one key
 range and writes nothing when there is no record (and drops records left from when it was on); `holds`, `claim` and
@@ -4360,3 +4364,63 @@ It is unchanged here and could be reviewed separately.
 **Comments.** Two comments in waiter.py still described the removed unread return (O5). They now say what happens
 instead: the post is not offered again, its hold ends at the request's deadline, and the prompt check reports it at the
 next prompt. No other mention of the unread return remains outside the history entries above.
+
+### Waking an interactive session: PR review (#91, 2026-11-21)
+
+The independent review of e3ac38c found one blocker (F1) and three smaller points (F2, F3a, F3b). Tests are in
+`tests/test_interactive_wake_pr_review.py`. The F1 tests and the F3b test fail on e3ac38c; the F2 test pins current
+behaviour, so it passes on both.
+
+**F1 (blocker): a read held the request for days.** Once the grace had passed, an interactive hold rested on a read mark
+alone, with nothing about liveness. Reading is exactly what a wake makes the session do. So a woken session that read
+the request and then did not settle it (an interrupted turn, a closed session, a reply with no lifecycle state) kept the
+dispatcher off it until the record was pruned: 2 days, or 7 while another conversation of the agent kept arming in the
+project. Both rules this mirrors are bounded. `hosted_wake.holds` goes through `_matching` (not ended, node seen
+recently). The dispatcher's `_policy_held` holds only for a session with a receipt whose `last_seen` is within
+`live_minutes`.
+- Now the pair records which board sessions read each delivered post (`readers`, the latest 8 per post), next to the
+  first read time (`read`). `handed` adds a reader whenever a session that qualifies is shown the post, not only on the
+  first read. After the deadline, `read_after_delivery` holds only while one of those readers is still the agent's in
+  the project, not a dispatched run's, and was seen within the hub's `[dispatch] live_minutes` (`live_seconds`, default
+  2 minutes).
+- A session that read the post and went quiet holds nothing at the next dispatcher pass. Another live session of the
+  agent that never read the post holds nothing either.
+- The README's "Who can wait" and the docstring's trust note now give the true bound: a caller with the agent's token
+  can hold a request for the grace, plus as long as a board session it registered in the project, and that read the
+  request, stays live. A live session that reads a request already holds it that long without this feature.
+- Tests:
+  - `test_f1_a_request_the_woken_session_read_goes_to_the_dispatcher_once_the_reader_is_not_live` is the reviewer's
+    probe, through the real Dispatcher with a fake clock and another conversation arming throughout. The launch comes at
+    the first tick after the reader is no longer live.
+  - `test_f1_after_a_full_read_with_a_cursor_ack_too`.
+  - `test_f1_a_reader_that_stays_live_keeps_it_until_it_goes_quiet`: still live at exactly `live_minutes`, launched one
+    second later.
+  - `test_f1_a_live_session_of_the_agent_that_did_not_read_the_post_does_not_keep_the_hold`, through a delivery policy,
+    since a dispatch rule waits for any live session of the agent (main's rule).
+- Two earlier tests now keep their reader live (heartbeats) and pin both directions.
+- The randomized test (now 600 steps per seed) no longer checks holds with the implementation's own
+  `read_after_delivery`. The test keeps its own model of what it did: when each post was delivered, which board sessions
+  were shown it, in which project and for which conversation, when the test last made a call with each session, and
+  which posts the dispatcher reserved. After every step it asserts that `hosted.holds` equals the model's answer, in
+  both directions. New moves: heartbeats, and quiet spells longer than `live_minutes`. Against e3ac38c's rule this fails
+  on all six seeds. `first_offer` is still learned from the records, as the reviewer noted; the deadline assertion
+  beside it checks one deadline per request.
+
+**F2 (documented, not redesigned here).** Each waiter's pending posts come from its own marks. A post that waiter A
+holds back under a limit is never offered while a newer conversation B, armed after that post, is the chosen waiter: B's
+marks start above it. That can last up to a day. Such a post holds nothing, the dispatcher treats a request among such
+posts as without the feature, and the prompt check reports it. The README's limits now say so, and the module docstring
+names the fix for later: merge the pair's pending posts into the chosen waiter at O1.
+`test_f2_a_post_an_unchosen_waiter_holds_back_is_not_offered_to_a_newer_waiter_and_holds_nothing` pins the safety
+properties: never offered to either waiter, no hold, and the dispatcher launches with no hold for it at its gate.
+
+**F3a.** The first "Waking an interactive session" section described the superseded design: the project being "the first
+that some thread is in", and a pass recording a `queued` wake and `woken` marks. Both sentences are corrected in place,
+marked as corrected here. The hub takes the first project the client sends, and a pass makes the offer (O1) and sets the
+hold deadline on the pair.
+
+**F3b.** `claude_hooks._write` replaced the settings file with `os.replace`, which turns a symlinked `settings.json` (a
+dotfiles setup) into a regular file. It now writes through `os.path.realpath`. The temporary file goes beside the link's
+target and atomically replaces the target, which keeps its permissions.
+`test_f3b_the_installer_writes_through_a_symlinked_settings_file` checks this with a symlinked file in a temp home, for
+`add` and `remove`, and checks that no temporary file is left.

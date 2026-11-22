@@ -226,11 +226,14 @@ def test_s19_end_to_end_an_offer_that_expires_in_transit_is_offered_again(senv):
 def test_randomized_offers_keep_their_invariants(senv, seed):
     """Interleaved arms, re-arms, project changes, posts, human posts, pauses, the setting turned off and on,
     dispatcher passes with reservations, acks in time and late, replayed acks, reads (filtered, and another session
-    reading past posts with its cursor) and a hosted root that comes and goes. After every step: at most one standing
-    offer per pair; every hold ends at its request's first-offer deadline unless the post was read after delivery.
-    At every accepted ack: not paused, not off, no hosted root there; no post delivered to two conversations; every
-    post of the batch still unread; each accepted wake charged once, for its own threads. A replayed ack is answered
-    as the first was and charges nothing: an acknowledged batch wakes the client exactly once."""
+    reading past posts with its cursor), heartbeats, quiet spells longer than live_minutes, and a hosted root that
+    comes and goes. After every step: at most one standing offer per pair; and every post is held exactly when the
+    test's own model says so (PR review F1): on, not reserved, offered, and either within its first-offer deadline or
+    read, after it was delivered, by a board session the model saw register in the post's project (of the
+    conversation it was delivered to, or of none) and saw last within live_minutes. At every accepted ack: not
+    paused, not off, no hosted root there; no post delivered to two conversations; every post of the batch still
+    unread; each accepted wake charged once, for its own threads. A replayed ack is answered as the first was and
+    charges nothing: an acknowledged batch wakes the client exactly once."""
     rnd = random.Random(seed)
     # Limits loose enough that many wakes happen, with a per-thread maximum the run reaches now and then.
     sessions = {"wake_min_interval_seconds": 2, "max_wakes_per_hour": 1000, "max_wakes_without_human": 3}
@@ -247,7 +250,24 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
     first_offer: dict[str, float] = {}
     posts: list[tuple[int, str]] = []
     flags = {"paused": False, "root": None, "off": False}
-    seen = {"issued": 0, "acked": 0, "rejected": 0, "replayed": 0, "held": 0}
+    seen = {"issued": 0, "acked": 0, "rejected": 0, "replayed": 0, "held": 0, "read_held": 0, "went_quiet": 0}
+    # The model of reads and liveness, kept from what the test itself did (never read back from the records):
+    # post -> when it was delivered in its pair; post -> the board sessions shown it after that, in its project;
+    # board session -> (when the test last made a call with it, the project it registered in); posts reserved.
+    model = {"delivered": {}, "readers": {}, "seen": {}, "claimed": set(), "off": flags}
+    assert iw.live_seconds(senv.board) == LIVE
+
+    def seen_now(sid, project):
+        model["seen"][sid] = (senv.clock(), project)
+
+    def shown(sid, project, conv, out):
+        if flags["off"]:
+            return                                  # off: no read is noted
+        where = dict(posts)
+        for d in out["posts"]:
+            k = str(d["id"])
+            if where.get(d["id"]) == project and k in model["delivered"] and conv in (None, delivered_to.get(k)):
+                model["readers"].setdefault(k, set()).add(sid)
 
     def new_nonce(c):
         convs[c]["n"] += 1
@@ -301,6 +321,7 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
         for k in keys:
             assert k not in delivered_to, f"post {k} delivered twice (to {delivered_to.get(k)} and to {c})"
             delivered_to[k] = c
+            model["delivered"][k] = senv.clock()
         batch = sorted({e[0] for e in entries.values()})
         for t in batch:
             expected[(project, t)] += 1
@@ -329,10 +350,10 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
             assert out["state"] != "acked"
         unchanged(project, before)
 
-    for step in range(400):
+    for step in range(600):
         op = rnd.choices(["look", "rearm", "move", "post", "human", "pause", "tick", "ack", "late", "root", "read",
-                          "cursor", "replay", "flip", "time"],
-                         weights=[8, 2, 1, 5, 1, 1, 3, 6, 1, 1, 2, 1, 2, 1, 3])[0]
+                          "cursor", "replay", "flip", "time", "beat", "quiet"],
+                         weights=[8, 2, 1, 5, 1, 1, 3, 6, 1, 1, 3, 1, 2, 1, 3, 2, 1])[0]
         c = rnd.choice(list(convs))
         if flags["paused"] and rnd.random() < 0.25:     # a pause lasts a few steps
             op = "pause"
@@ -373,10 +394,14 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
             iw.tick(senv.board)
             if flags["off"]:                        # the pass dropped every record: the pairs start again
                 expected = {key: 0 for key in expected}
+                first_offer.clear()
+                model["delivered"].clear()
+                model["readers"].clear()
             if posts and rnd.random() < 0.5:
                 pid, pr = rnd.choice(posts)
                 with db.write_tx(senv.board.conn):
-                    hosted_wake.reserve(senv.board, "claude", pr, pid, senv.clock())
+                    if hosted_wake.reserve(senv.board, "claude", pr, pid, senv.clock()) and not flags["off"]:
+                        model["claimed"].add(str(pid))      # off, `claim` writes nothing
         elif op in ("ack", "late"):
             do_ack(op == "late")
         elif op == "replay":
@@ -394,23 +419,38 @@ def test_randomized_offers_keep_their_invariants(senv, seed):
             if key not in readers:
                 readers[key] = senv.board.register_session(senv.p["claude"], v["project"],
                                                            client=("claude-code", c))["session_id"]
-            senv.board.read_updates(senv.p["claude"], readers[key], only="addressed")
+            out = senv.board.read_updates(senv.p["claude"], readers[key], only="addressed")
+            seen_now(readers[key], v["project"])
+            shown(readers[key], v["project"], c, out)
         elif op == "cursor" and not flags["paused"]:
             pr = rnd.choice(projects)              # another session of the agent reads everything and acknowledges
             if pr not in others:
                 others[pr] = senv.board.register_session(senv.p["claude"], pr)["session_id"]
             out = senv.board.read_updates(senv.p["claude"], others[pr])
+            seen_now(others[pr], pr)
+            shown(others[pr], pr, None, out)
             if out.get("ack_through"):
                 senv.board.ack(senv.p["claude"], others[pr], out["ack_through"])
+                seen_now(others[pr], pr)
+        elif op == "beat" and model["seen"]:        # a board session that keeps calling (it stays live)
+            sid = rnd.choice(sorted(model["seen"]))
+            senv.board.heartbeat(senv.p["claude"], sid)
+            seen_now(sid, model["seen"][sid][1])
         elif op == "time":
             senv.clock.advance(rnd.choice([1, 1, 2, 3, 8, 25]))
-        seen["held"] += check(senv, projects, first_offer, posts)
+        elif op == "quiet":                         # longer than live_minutes: whoever did not call is not live
+            senv.clock.advance(rnd.choice([LIVE + 1, 2 * LIVE]))
+            seen["went_quiet"] += 1
+        seen["held"] += check(senv, projects, first_offer, posts, model, seen)
     assert (seen["issued"] >= 10 and seen["acked"] >= 3 and seen["rejected"] >= 1 and seen["replayed"] >= 1
-            and seen["held"]), \
+            and seen["held"] and seen["read_held"] and seen["went_quiet"]), \
         ("the run exercised too little", seen)
 
 
-def check(env, projects, first_offer, posts) -> int:
+LIVE = 120.0        # [dispatch] live_minutes = 2, the default the hub's settings leave here
+
+
+def check(env, projects, first_offer, posts, model, seen) -> int:
     conn, now = env.board.conn, env.clock()
     offered = [k for r in iw._records(conn, "claude").values() for k in (r["offer"] or {}).get("entries", {})]
     assert len(offered) == len(set(offered)), "a post offered to two conversations at once"
@@ -427,11 +467,15 @@ def check(env, projects, first_offer, posts) -> int:
     held = 0
     for pid, pr in posts:
         k = str(pid)
-        if hosted.holds(env.board, "claude", pr, pid, now):
-            held += 1
-            until = iw._pair(conn, "claude", pr)["holds"].get(k)
-            assert until is not None
-            assert now < until or iw.read_after_delivery(conn, "claude", pr, pid), "a hold past its deadline"
+        live = [s for s in model["readers"].get(k, ())
+                if model["seen"][s][1] == pr and model["seen"][s][0] >= now - LIVE]
+        within = k in first_offer and now < first_offer[k] + GRACE
+        want = (not model["off"]["off"] and k not in model["claimed"] and k in first_offer and (within or bool(live)))
+        got = hosted.holds(env.board, "claude", pr, pid, now)
+        assert got == want, (f"post {k}: holds {got}, the model {want}", {"within": within, "live readers": live,
+                             "readers": model["readers"].get(k), "claimed": k in model["claimed"]})
+        held += got
+        seen["read_held"] += got and not within
     return held
 
 

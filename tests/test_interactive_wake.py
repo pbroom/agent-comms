@@ -361,7 +361,9 @@ def test_holds_within_the_grace_then_only_with_the_waiters_own_read(senv):
     senv.board.read_updates(senv.p["claude"], mine, only="addressed")
     assert rec(senv)["read"] == {str(post["id"]): senv.clock()} and holds(senv, post)
     senv.clock.advance(3600)
-    assert holds(senv, post)
+    assert not holds(senv, post), "the reader went quiet: no longer live, it holds nothing (PR review F1)"
+    senv.board.heartbeat(senv.p["claude"], mine)
+    assert holds(senv, post), "live again: the session that read it still has it"
 
 
 def test_a_dispatched_runs_read_does_not_count(senv):
@@ -398,12 +400,16 @@ def test_a_waiter_that_read_the_request_keeps_it_from_the_dispatcher(denv):
     on(denv)
     allow(denv)
     wait(denv)
-    denv.post("human", denv.tid, "your turn", "request", to=["claude"])
+    post = denv.post("human", denv.tid, "your turn", "request", to=["claude"])
     assert woke(denv) is not None
-    denv.board.read_updates(denv.p["claude"], denv.session("claude"))       # the woken session reads the board
-    denv.clock.advance(30 * 60)
-    denv.d.tick()
+    reader = denv.session("claude")
+    denv.board.read_updates(denv.p["claude"], reader)                       # the woken session reads the board
+    for _ in range(30):                                                     # and stays live for half an hour
+        denv.clock.advance(60)
+        denv.board.heartbeat(denv.p["claude"], reader)
+        denv.d.tick()
     assert launched(denv) == []
+    assert holds(denv, post), "the interactive hold itself, not only the dispatcher's agent-wide liveness"
 
 
 def test_a_wake_nobody_acknowledged_is_taken_back_and_offered_again(senv):

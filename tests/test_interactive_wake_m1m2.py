@@ -155,6 +155,7 @@ def test_a_read_in_the_posts_project_by_a_waiter_that_moved_on_still_holds(senv)
     senv.board.read_updates(senv.p["claude"], reader, only="addressed")      # woken, it reads the post
     assert call(senv, nonce=NB, projects=(P2,)) == {"state": "idle"}         # then works in another project
     senv.clock.advance(GRACE + 1)
+    senv.board.heartbeat(senv.p["claude"], reader)                           # the reading session is still live
     assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the read still holds it"
 
 
