@@ -30,10 +30,11 @@ from urllib.parse import urlparse
 import httpx
 
 
-def hub_url(settings: Any) -> str | None:
+def hub_url(settings: Any, environ: Any = None) -> str | None:
     """The hub this machine's clients use, or None when the board is local. Plain http only to a loopback or tailnet
-    (100.64.0.0/10) address; anything else must be https, so a bearer token never crosses a network in clear."""
-    url = os.environ.get("AGENT_COMMS_HUB") or getattr(settings, "hub", "") or ""
+    (100.64.0.0/10) address; anything else must be https, so a bearer token never crosses a network in clear.
+    `environ` (default: this process's) supplies AGENT_COMMS_HUB; pass {} to use the board's settings alone."""
+    url = (os.environ if environ is None else environ).get("AGENT_COMMS_HUB") or getattr(settings, "hub", "") or ""
     if not url:
         return None
     u = urlparse(url)

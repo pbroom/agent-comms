@@ -126,6 +126,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--project", action="append", help="repo path (default: the hook cwd's repo and main worktree)")
     s.add_argument("--max-seconds", type=float, default=None,
                    help="give up after this long (default 86340: below the installed hook's 86400 s timeout)")
+    s.add_argument("--token-file", help="(--client codex) the token file install.sh --wake checked; the only token "
+                                        "source the Codex waiter uses")
+    s.add_argument("--client", choices=("claude-code", "codex"), default="claude-code",
+                   help="codex: for an async Codex hook (integrations/codex/wait.sh); the wake is put in the thread's "
+                        "queue with `codex queue` (the binary of the Codex process that ran the hook) instead of exit "
+                        "2, and the exit code is always 0")
     sub.add_parser("init", help="create the human identity and save its token for this CLI")
 
     s = sub.add_parser("create-agent", help="create an agent and print its token ONCE")
@@ -675,7 +681,8 @@ def _run(a, out) -> None:
         return _brief(a, out)
     if a.cmd == "wait":
         from . import waiter
-        raise SystemExit(waiter.run(a.agent, a.project, a.max_seconds or waiter.DEFAULT_MAX_SECONDS))
+        raise SystemExit(waiter.run(a.agent, a.project, a.max_seconds or waiter.DEFAULT_MAX_SECONDS,
+                                    kind=a.client, token_file=a.token_file))
 
     settings = Settings.load()
     if a.cmd == "init":

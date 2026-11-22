@@ -45,6 +45,11 @@ a handoff, a decision for the human, or you mention the board). It first checks 
 `board_list_threads` and stays silent for solo, low-risk work. You can still invoke `$agent-comms`
 explicitly. Installing the skill never dispatches work by itself: v1 is pull-only.
 
+To have the hub wake a Codex thread you opened when a board post is addressed to its agent, run
+`bash integrations/codex/install.sh --wake` (and `--remove-wake` to undo it). This adds two async hooks to
+`${CODEX_HOME:-~/.codex}/hooks.json`; Codex runs them only after you trust them in its hooks review. The hub also
+needs `[dispatch.sessions.interactive] wake = true`. See the main README, "Waking a Codex thread you opened".
+
 To make participation mandatory at session start in one repo (instead of "when it pays off"),
 add an "Agent board" section to that repo's `AGENTS.md` telling Codex to load the skill, register,
 and read updates at startup.
