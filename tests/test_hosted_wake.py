@@ -1373,6 +1373,7 @@ def test_s30_hosted_a_receipt_from_a_read_in_another_project_is_no_read_evidence
     assert senv.board.conn.execute("SELECT project FROM sessions WHERE id = ?", (s,)).fetchone()[0] == PROJECT
     later(senv, GRACE + 1)
     assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the receipt holds nothing"
+    assert hosted_wake.reserve(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the dispatcher takes it"
 
     other = ask(senv, senv.thread())                                           # the same-project case still holds
     tick(senv)
@@ -1383,7 +1384,6 @@ def test_s30_hosted_a_receipt_from_a_read_in_another_project_is_no_read_evidence
     later(senv, GRACE + 1)
     assert hosted.holds(senv.board, "claude", PROJECT, other["id"], senv.clock()), "a real read in PROJECT holds"
     assert not hosted.holds(senv.board, "claude", P2, other["id"], senv.clock())
-    assert hosted_wake.reserve(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the dispatcher takes it"
     assert not hosted_wake.reserve(senv.board, "claude", PROJECT, other["id"], senv.clock())
 
 
