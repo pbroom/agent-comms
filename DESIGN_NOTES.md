@@ -4261,8 +4261,10 @@ round 5. The `Stop` hook is unchanged.
   or wake in any of them, woke the session. These were the worst case: the post made right after the
   SessionStart hook armed. The debug log showed the SessionStart hook (and every Stop hook) backgrounded in each
   one. The hook exited 10.29 to 10.32 s after Claude started; Claude reported it within 10 ms and started its turn
-  within about 30 ms. The twentieth run and the five runs with the post 90 s after start were not made: the Mac
-  went back to battery.
+  within about 30 ms. On the code after review round 5 (M2 removed), 9 of 9 more runs woke: 4 of the worst case, and
+  5 with the post made 90 s after Claude started (there the hook exited 90.48 s after start and the turn followed
+  30 ms later). In every run the SessionStart hook (and every Stop hook) was backgrounded, and no sleep or wake fell
+  in it.
 
 **The worst case, and the fallback.**
 - *Worst case:* a SessionStart wake that starts no turn. It is not offered again. The session's UserPromptSubmit

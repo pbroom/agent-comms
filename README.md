@@ -335,9 +335,9 @@ What it does not cover:
   synchronously in a stream-json session (as the desktop app runs Claude Code) when a flag is set late, and that an
   explicit `"async": true` takes the background path. A second reported case was the Mac sleeping, not this.
   So the `SessionStart` hook `--wake` writes carries both `"async": true` and `"asyncRewake": true` (the `Stop` hook
-  is unchanged), and its wake is written no sooner than 10 s after the hook started. With this configuration, 19 of
-  19 traced test runs on mains power woke the session (the post made right after the hook armed); runs with the post
-  made later are still to do. In the worst case, a delivered wake whose turn Claude Code never starts, the wake is
+  is unchanged), and its wake is written no sooner than 10 s after the hook started. With this configuration, every
+  traced test run on mains power woke the session: 19 of 19 with the post made right after the hook armed, and on
+  the final code 4 of 4 more of those and 5 of 5 with the post made 90 s after the session started. In the worst case, a delivered wake whose turn Claude Code never starts, the wake is
   not offered again: the post is shown at the session's next prompt by the board check the installer prints for
   `UserPromptSubmit` (`prompt-check.sh`, which counts posts addressed to the agent since its last check, whatever
   the wake recorded; add that hook too), and for a request the dispatcher could run, the request's grace applies. If a backgrounded `SessionStart` wake is ever
