@@ -32,7 +32,8 @@ THREAD = "01a20182-773e-7ad2-a06f-2dfad85c09e1"         # a Codex thread id (UUI
 WAKE = hosted_wake.wake_text("codex", [[7, "claude", False, 1]])
 CODEX_BIN = "/Applications/Example.app/Contents/MacOS/codex"
 PROC = procinfo.Proc(4242, 1, 1795300000.5, CODEX_BIN)  # the Codex process that ran the hook, as procinfo finds it
-OK_TARGET = lambda proc, cwd, env: (proc.exe, "")  # noqa: E731  procinfo.runnable's answer for a binary it accepts
+# procinfo.runnable's answer for a binary it accepts
+OK_TARGET = lambda proc, cwd, env, **kw: (proc.exe, "")  # noqa: E731
 
 
 class Queue:
@@ -67,7 +68,7 @@ def run_codex(hub, event="Stop", environ=None, queue=None, thread=THREAD, target
     code = waiter.run("codex", [PROJECT], 600, stdin=io.StringIO(json.dumps(hook)), stderr=err,
                       environ={} if environ is None else environ, client=hub, sleep=sleep, clock=clock,
                       watch=False, kind="codex", codex=PROC, queue=queue,
-                      target=target or (lambda proc, cwd, env: (proc.exe, "")))
+                      target=target or (lambda proc, cwd, env, **kw: (proc.exe, "")))
     return code, err.getvalue(), queue
 
 
@@ -191,8 +192,9 @@ class Turns:
     def __init__(self, ok, why="the file at that path is not the image the Codex process runs"):
         self.ok, self.why, self.calls = ok, why, 0
 
-    def __call__(self, proc, cwd, env):
+    def __call__(self, proc, cwd, env, **kw):
         self.calls += 1
+        self.kwargs = getattr(self, "kwargs", []) + [kw]
         return (proc.exe, "") if self.calls <= self.ok else (None, self.why)
 
 
@@ -381,7 +383,7 @@ def spawned(exe: Path, argv0: str | None = None) -> subprocess.Popen:
 @pytest.fixture
 def no_place_rules(monkeypatch):
     """Lets runnable's image check be tested with binaries in pytest's temporary directory."""
-    monkeypatch.setattr(procinfo, "refused", lambda path, cwd, environ: None)
+    monkeypatch.setattr(procinfo, "refused", lambda path, cwd, environ, known_roots=None: None)
 
 
 def test_info_and_image_are_the_os_view_of_a_process(tmp_path):
@@ -1418,3 +1420,65 @@ def test_pr_f2_the_installers_own_mcp_entry_passes_its_own_check(tmp_path):
                        timeout=60, cwd=str(ROOT))
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == os.path.realpath(f)
+
+
+# ------------------------------------------------------------ PR review (#93), S13 and S14
+
+
+def test_s13_stdio_sh_launched_through_a_symlink_finds_stdio_py(tmp_path):
+    """bash keeps the path it was given in BASH_SOURCE: the launcher resolves its real file first, so a symlink to it
+    from anywhere (also a chain of relative ones) starts stdio.py. Without a token stdio.py refuses at once, which
+    shows it was found and ran."""
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "stdio.sh").symlink_to(STDIO)
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "two.sh").symlink_to("../bin/stdio.sh")
+    uv_cache = subprocess.run(["uv", "cache", "dir"], capture_output=True, text=True).stdout.strip()
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "UV_CACHE_DIR": uv_cache,
+           "AGENT_COMMS_CODEX_TOKEN_FILE": str(tmp_path / "no.token")}
+    for link in (tmp_path / "bin" / "stdio.sh", tmp_path / "other" / "two.sh"):
+        r = subprocess.run(["bash", str(link)], stdin=subprocess.DEVNULL, env=env, capture_output=True, text=True,
+                           timeout=120)
+        assert "cannot load Codex token" in r.stderr and "can't open file" not in r.stderr, (link, r.stderr[-300:])
+
+
+def test_s13_wait_sh_launched_through_a_symlink_finds_its_checkout(tmp_path):
+    bin_dir, rec = fake_uv(tmp_path)
+    (tmp_path / "hooks").mkdir()
+    link = tmp_path / "hooks" / "wait.sh"
+    link.symlink_to(WAIT_SH)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    r = subprocess.run(["bash", str(link), str(tmp_path / "codex.token")], input="{}", env=env, capture_output=True,
+                       text=True, timeout=30)
+    assert r.returncode == 0
+    argv = json.loads(rec.read_text())["argv"]
+    assert argv[argv.index("--project") + 1] == str(ROOT), "the checkout beside the real wait.sh"
+
+
+def test_s14_the_check_before_an_acknowledgement_runs_no_subprocess(tmp_path, monkeypatch):
+    """The refused roots' identities are taken once at arming; with them, runnable needs only stat calls (no git
+    probe that could outlast the hub's 10 s offer deadline)."""
+    exe = binary_copy(tmp_path / "opt" / "bin")
+    p = spawned(exe)
+    try:
+        proc = procinfo.info(p.pid)
+        known = procinfo.roots(str(tmp_path / "work"), {})
+        known = (frozenset(), known[1])            # pytest's tmp_path is itself temporary: no temp rule here
+
+        def no_subprocess(*a, **k):
+            raise AssertionError("a subprocess ran in the pre-acknowledgement check")
+
+        monkeypatch.setattr(procinfo.subprocess, "run", no_subprocess)
+        assert procinfo.runnable(proc, str(tmp_path / "work"), {}, known_roots=known) == (os.path.realpath(exe), "")
+    finally:
+        p.terminate()
+        p.wait()
+
+
+def test_s14_the_waiter_reuses_the_roots_for_the_pre_ack_check_and_checks_in_full_otherwise():
+    hub = Hub({"state": "wake", "text": WAKE, "id": "1" * 16})
+    target = Turns(ok=3)
+    code, _, queue = run_codex(hub, target=target)
+    assert code == 0 and len(queue.calls) == 1
+    assert [sorted(kw) for kw in target.kwargs] == [[], ["known_roots"], []], \
+        "arming in full, the pre-acknowledgement check with the roots taken at arming, the exec in full"

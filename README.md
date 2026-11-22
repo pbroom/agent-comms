@@ -437,9 +437,11 @@ node or the session host started has `AGENT_COMMS_MANAGED=1` and never waits, al
 - **Where wakes do not work.** For a thread whose folder contains the Codex install it runs (for example a thread
   opened in your home folder with a per-user install such as nvm's), for a Codex run from inside the repo (a pinned
   `@openai/codex` started with `npx`), and for a group- or world-writable Codex binary. The hook says so once, on
-  its stderr, and waits for nothing. A trusted project's `.codex/config.toml` can replace the board MCP server
-  (`[mcp_servers.agent-comms]`) for threads in that project: the installer checks the server as your own Codex
-  configuration has it, and cannot promise anything about a project's override.
+  its stderr, and waits for nothing.
+- **A project that overrides the board server.** A trusted project's `.codex/config.toml` can replace the board MCP
+  server (`[mcp_servers.agent-comms]`) for threads in that project. The installer checks the server as your own
+  Codex configuration has it and cannot promise anything about a project's override: in such a thread the hooks
+  still wait and are charged as the agent, while that thread's board tools may act as someone else.
 - **Where it was checked.** With Codex CLI 0.171.0: `codex app-server` (the desktop app's mode) holding a thread,
   the real hooks, trust check, queue and turns, and the board's MCP server (`scripts/interactive-wake-codex-e2e.py`),
   with a stand-in for the model so that no account is needed. The CLI's terminal interface was driven through a

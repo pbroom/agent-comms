@@ -4943,3 +4943,25 @@ export any AGENT_COMMS_* value), `PYTHONPATH`, `UV_PROJECT_ENVIRONMENT`, and any
   anything about a project's override. The hooks would then wait and be charged as the agent while that thread's board
   tools run whatever the project named. This is documented as a limit in the README, next to the F1 limit. Closing it
   would need the waiter to check the server as Codex resolves it for the thread's own directory; that is not done here.
+
+**Sol's check of 9f3ae5c (S13, S14) and the reviewer's doc note.** All four new tests fail on 9f3ae5c, run against its
+stdio.sh, wait.sh, procinfo.py and waiter.py.
+- **S13: a symlinked launcher.** The installer accepted a symlink to this install's stdio.sh (same file), but bash keeps
+  the path it was given in `BASH_SOURCE[0]`. The launcher then looked for stdio.py beside the symlink and the MCP server
+  did not start, although the wake install succeeded.
+  - stdio.sh now resolves its real file through any chain of symlinks (`readlink` in a loop, then `cd -P`) before it
+    locates stdio.py and the checkout. wait.sh does the same for the checkout.
+  - The installer keeps accepting a symlink, because the launcher now works through one.
+  - Tests: stdio.sh, started through a symlink and through a chain of relative ones, runs stdio.py (which then refuses
+    at once for lack of a token, showing it was found). wait.sh, started through a symlink, passes its real checkout to
+    `uv run --project`.
+- **S14: the pre-acknowledgement check is fast.** It used to run three git probes with 5 s timeouts, and on a slow
+  checkout it could finish after the hub's 10 s offer deadline.
+  - `procinfo.roots` takes the refused roots' identities once at arming. The check just before an acknowledgement reuses
+    them (`known_roots`), so it needs only stat calls: the same-image check and the identity comparison.
+  - Arming and the exec still check in full.
+  - Tests: `runnable` with known roots runs no subprocess (subprocess.run is stubbed to fail). The waiter's three checks
+    are, in order: full, with the arming roots, full.
+- **The reviewer's doc note.** The project-override limit has its own README bullet, outside "Where wakes do not work"
+  (wakes do work there), and says the consequence: the hooks still wait and are charged as the agent, while that
+  thread's board tools may act as someone else.

@@ -264,6 +264,9 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
         if path is None:
             _say(stderr, trace, f"agent-comms: not waiting: wakes cannot use this Codex binary ({why})")
             return 0
+        # The refused roots' identities, taken once (S14): the check just before an acknowledgement reuses them, so it
+        # runs no git probe and finishes well inside the hub's offer deadline. Arming and the exec check in full.
+        known_roots = procinfo.roots(early_cwd, environ)
     if watch:
         leave = lambda *_: (trace("leave"), os._exit(0))    # noqa: E731  silent, whatever the main thread does
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -327,7 +330,7 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
                 woken = _codex_woken(client, body, answer, clock, sleep, trace,
                                      lambda text: _deliver(codex_proc, cwd, sid, text, environ, stderr, trace,
                                                            queue, target),
-                                     lambda: target(codex_proc, cwd, environ)[1] or None)
+                                     lambda: target(codex_proc, cwd, environ, known_roots=known_roots)[1] or None)
             else:
                 woken = _woken(client, body, answer, stderr, not_before, clock, sleep, trace)
             if woken == REFUSED:

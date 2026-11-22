@@ -209,7 +209,16 @@ def _ancestors(path: str):
         d = parent
 
 
-def refused(path: str, cwd: str | None, environ: dict) -> str | None:
+def roots(cwd: str | None, environ: dict) -> tuple[frozenset, frozenset]:
+    """The identities of the refused roots: (temporary directories, the hook directory with its checkout's worktrees
+    and main repository). Taken once at arming (S14): the git probes behind them are the only slow part of `refused`,
+    and the pre-acknowledgement check then needs only stat calls."""
+    temp = frozenset(i for i in map(_identity, _temp_dirs(environ)) if i)
+    work = frozenset(i for i in map(_identity, _worktrees(cwd)) if i) if cwd else frozenset()
+    return temp, work
+
+
+def refused(path: str, cwd: str | None, environ: dict, known_roots: tuple | None = None) -> str | None:
     """Why the binary at the resolved `path` may not be run for the waiter, else None (review round 2, S2).
 
     Places are compared by identity (device and inode of each directory), never by spelling: on macOS a case
@@ -229,8 +238,7 @@ def refused(path: str, cwd: str | None, environ: dict) -> str | None:
         return "the binary is gone"
     if st.st_mode & 0o022:
         return "the binary is group- or world-writable"
-    temp = {i for i in map(_identity, _temp_dirs(environ)) if i}
-    work = {i for i in map(_identity, _worktrees(cwd)) if i} if cwd else set()
+    temp, work = known_roots if known_roots is not None else roots(cwd, environ)
     for d, dst in _ancestors(path):
         if dst is None:
             return f"cannot inspect {d}"
@@ -244,12 +252,12 @@ def refused(path: str, cwd: str | None, environ: dict) -> str | None:
     return None
 
 
-def runnable(proc: Proc, cwd: str | None, environ: dict) -> tuple[str | None, str]:
+def runnable(proc: Proc, cwd: str | None, environ: dict, known_roots: tuple | None = None) -> tuple[str | None, str]:
     """(the path to run, "") for the Codex process `proc`, or (None, why not). Checked right before each use."""
     if not alive(proc):
         return None, "the Codex process is gone"
     path = os.path.realpath(proc.exe)
-    why = refused(path, cwd, environ)
+    why = refused(path, cwd, environ, known_roots)
     if why:
         return None, why
     running = image(proc.pid, proc.exe) or image(proc.pid, path)
