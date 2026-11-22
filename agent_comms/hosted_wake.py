@@ -682,8 +682,12 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     that has not ended, on a node seen within nodes.NODE_STALE_SECONDS, and either a wake covering the post was
     queued or handed less than `wake_grace_seconds` ago, or the board showed the post, at or after that wake was
     queued, to a board session that can be the hosted one: a session of the agent registered in this project that is
-    not a dispatched run's (`_own_reader`). Shown means the record's `read` mark (any view, `handed`) or a delivery
-    receipt of such a session. A session that was never woken for the post, or was woken and was not shown it,
+    not a dispatched run's (`_own_reader`). Shown means the record's `read` or `mine` mark, which `handed` writes at
+    the time of the read (any view) and only for a reader registered in the hosted session's project then. A delivery
+    receipt alone is no evidence (as interactive_wake.read_after_delivery, S30): it names the board session, not the
+    project that session was registered in when it read, so a read made in another project before the session
+    re-registered here would pass `_own_reader` now. Both read paths that write receipts also call `handed`.
+    A session that was never woken for the post, or was woken and was not shown it,
     holds nothing once the grace has passed; and a post the dispatcher reserved a run for is the dispatcher's
     (`reserve`): whatever that run or anybody else reads afterwards, no hosted session holds it."""
     conn = getattr(board_or_conn, "conn", board_or_conn)
@@ -704,9 +708,6 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         if isinstance(read, (int, float)) and read >= at and not _shadowed(conn, r, at):
             # A read by a board session that carries no binding cannot be told apart from a child's of the same
             # agent: while such a child has been around since the wake, it is not taken for the root's.
-            return True
-        from . import delivery
-        if delivery.read_since(conn, post_id, agent, at, lambda sid: _credited(conn, sid, r, at)):
             return True
     from . import interactive_wake      # a session the human opened himself, woken the same way (its own records)
     return interactive_wake.holds(board_or_conn, agent, project, post_id, now)     # off for a bare connection

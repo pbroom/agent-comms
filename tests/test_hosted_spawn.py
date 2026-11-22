@@ -1024,7 +1024,8 @@ def test_a_bound_board_session_is_its_own_sessions_reader_whatever_children_are_
         rec = hosted_wake._load(c, sid)
         rec.pop("mine")
         hosted_wake._save(c, sid, rec, now())
-    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "its receipt counts as well"
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), \
+        "a receipt alone is no read evidence (S30, hosted): only the mark `handed` wrote at the read counts"
     unbound = senv.session("claude")
     assert not hosted_wake._credited(senv.board.conn, unbound, stored(senv, sid), 0), \
         "a reader with no binding is still held to the old rule while such a child is around"

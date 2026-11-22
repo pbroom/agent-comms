@@ -498,7 +498,7 @@ def test_holds_within_the_grace_then_only_with_a_read_after_the_wake(senv):
 
     senv.board.read_updates(senv.p["claude"], senv.session("claude"))       # the woken session reads the board
     assert delivery.receipt(senv.board.conn, post["id"], "claude") is not None
-    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "with a receipt"
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now()), "with the read mark that read wrote"
     later(senv, 3600)
     assert hosted.holds(senv.board, "claude", PROJECT, post["id"], now())
     senv.clock.advance(nodes.NODE_STALE_SECONDS + 1)
@@ -1352,6 +1352,39 @@ def test_a_read_by_the_agent_in_another_project_does_not_keep_the_request_with_t
     assert not hosted.holds(denv.board, "claude", PROJECT, post["id"], denv.clock())
     denv.d.tick()
     assert launched(denv) == ["claude-fake"]
+
+
+def test_s30_hosted_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering(senv):
+    """S30 for hosted sessions: a board session of the agent read (unfiltered) while registered in P2, which wrote a
+    delivery receipt for the PROJECT post, then re-registered in PROJECT. The receipt names a session that is in
+    PROJECT now, yet it was not shown the post there: after the grace the hosted session holds nothing and the
+    dispatcher can reserve the request. A real read while registered in PROJECT still holds it."""
+    sid = ready(senv)
+    post = ask(senv, senv.thread())
+    tick(senv)
+    assert str(post["id"]) in record(senv, sid)["woken"]
+    run_turn(senv, sid, text="did not read the board")
+    s = senv.session("claude", P2)
+    out = senv.board.read_updates(senv.p["claude"], s)                         # unfiltered, registered in P2
+    assert post["id"] in [d["id"] for d in out["posts"]], "the P2 session is shown the PROJECT post"
+    assert delivery.receipt(senv.board.conn, post["id"], "claude")["session_id"] == s, "and a receipt is written"
+    assert record(senv, sid)["read"] == {}, "no mark: it was not registered in PROJECT when it read"
+    senv.board.register_session(senv.p["claude"], PROJECT, resume_session_id=s)
+    assert senv.board.conn.execute("SELECT project FROM sessions WHERE id = ?", (s,)).fetchone()[0] == PROJECT
+    later(senv, GRACE + 1)
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the receipt holds nothing"
+
+    other = ask(senv, senv.thread())                                           # the same-project case still holds
+    tick(senv)
+    assert str(other["id"]) in record(senv, sid)["woken"]
+    run_turn(senv, sid, text="did not read the board")
+    shown = senv.board.read_updates(senv.p["claude"], s)                       # now registered in PROJECT
+    assert other["id"] in [d["id"] for d in shown["posts"]]
+    later(senv, GRACE + 1)
+    assert hosted.holds(senv.board, "claude", PROJECT, other["id"], senv.clock()), "a real read in PROJECT holds"
+    assert not hosted.holds(senv.board, "claude", P2, other["id"], senv.clock())
+    assert hosted_wake.reserve(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the dispatcher takes it"
+    assert not hosted_wake.reserve(senv.board, "claude", PROJECT, other["id"], senv.clock())
 
 
 def test_no_wake_is_queued_or_handed_while_a_dispatched_run_uses_the_checkout(denv):

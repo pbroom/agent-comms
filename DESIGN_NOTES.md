@@ -4361,6 +4361,10 @@ read evidence only through `read_after_delivery`). Pinned by
 `test_s30_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering`, which fails on d534333.
 `hosted_wake.holds` (main's code, for hosted sessions) still counts receipts with the same now-registered-project check.
 It is unchanged here and could be reviewed separately.
+Later fixed the same way (2026-11-22): `hosted_wake.holds` no longer counts a delivery receipt. Only the `read` and
+`mine` marks count, which `hosted_wake.handed` writes at the time of the read for a reader registered in the hosted
+session's project. Both read paths that write receipts call it. Pinned by
+`test_s30_hosted_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering`.
 
 **Comments.** Two comments in waiter.py still described the removed unread return (O5). They now say what happens
 instead: the post is not offered again, its hold ends at the request's deadline, and the prompt check reports it at the
