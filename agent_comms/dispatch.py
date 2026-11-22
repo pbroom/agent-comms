@@ -179,18 +179,7 @@ def with_codex_inbox_mcp(template: list[str], env: dict[str, str]) -> list[str]:
     """
     if not uses_codex(template):
         return template
-    codex_home = Path(env.get('CODEX_HOME') or os.path.join(env.get('HOME') or '~','.codex')).expanduser()
-    sources = [Path('/etc/codex/config.toml')]
-    if '--ignore-user-config' not in template:
-        sources.append(codex_home / 'config.toml')
-    profile = None
-    for i,arg in enumerate(template):
-        if arg in ('-p','--profile') and i+1 < len(template):
-            profile = template[i+1]
-        elif arg.startswith('--profile='):
-            profile = arg.partition('=')[2]
-    if profile:
-        sources.append(codex_home / (profile + '.config.toml'))
+    sources, profile = _codex_config_files(template, env)
     names, local = set(), {}
 
     def collect(table, effective=True):
@@ -242,6 +231,110 @@ def with_codex_inbox_mcp(template: list[str], env: dict[str, str]) -> list[str]:
     overrides += ['-c',f'mcp_servers.{CODEX_SERVER}.required=true']
     i = template.index('{prompt}')
     return template[:i] + overrides + template[i:]
+
+
+def _codex_config_files(template: list[str], env: dict[str, str]) -> tuple[list[Path], str | None]:
+    """The Codex config files a run of this runner with this environment loads that the dispatcher can read (system,
+    user unless --ignore-user-config, the selected profile's), and that profile's name. A checkout's own
+    `.codex/config.toml` is not among them: Codex loads it only for a project it trusts."""
+    codex_home = Path(env.get('CODEX_HOME') or os.path.join(env.get('HOME') or '~','.codex')).expanduser()
+    sources = [Path('/etc/codex/config.toml')]
+    if '--ignore-user-config' not in template:
+        sources.append(codex_home / 'config.toml')
+    profile = None
+    for i,arg in enumerate(template):
+        if arg in ('-p','--profile') and i+1 < len(template):
+            profile = template[i+1]
+        elif arg.startswith('--profile='):
+            profile = arg.partition('=')[2]
+    if profile:
+        sources.append(codex_home / (profile + '.config.toml'))
+    return sources, profile
+
+
+def _merged(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merged(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def _codex_options(template: list[str]) -> list[str]:
+    """A Codex runner's argv up to a `--` delimiter: after it everything is positional, so nothing there is an
+    option Codex reads."""
+    return template[:template.index('--')] if '--' in template else template
+
+
+def _codex_profile(template: list[str]) -> str | None:
+    """The profile a Codex runner selects, in every spelling Codex takes: `-p x`, `-px`, `-p=x`, `--profile x`,
+    `--profile=x`. This takes the last flag in the argv. Codex refuses a second profile flag in the same scope (the
+    launch fails there anyway), and with one before `exec` and one after it, the exec-level one wins: the later one
+    in the argv, so this picks the same."""
+    opts, profile = _codex_options(template), None
+    for i, arg in enumerate(opts):
+        if arg in ('-p', '--profile'):
+            profile = opts[i + 1] if i + 1 < len(opts) else None
+        elif arg.startswith('--profile='):
+            profile = arg.partition('=')[2]
+        elif arg.startswith('-p') and len(arg) > 2 and not arg.startswith('--'):
+            profile = arg[2:].removeprefix('=')
+    return profile or None
+
+
+def _set_path(root: dict, path: list[str], value) -> None:
+    cur = root
+    for part in path[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = cur[part] = {}
+        cur = nxt
+    cur[path[-1]] = value
+
+
+def codex_board_server(template: list[str], env: dict[str, str]) -> dict | None:
+    """The board server's (`mcp_servers.agent-comms`) entry as a run of this Codex runner would see it, from what the
+    dispatcher can read, for with_managed_env (the inbox narrowing keeps its own reading, `_codex_config_files`).
+    Layers, later over earlier: /etc/codex/config.toml; unless --ignore-user-config (which skips both user layers),
+    the user's config.toml and the selected profile's `<profile>.config.toml` (`_codex_profile`); then the runner's
+    own `-c`/`--config` overrides before any `--`, in order, as one layer. Each override sets its path literally, as
+    Codex does: the key split on dots, quotes kept as part of a name (so `mcp_servers."agent-comms".x` names another
+    server), and only the value parsed as TOML (else a string); setting a path replaces what an earlier override put
+    there, so a whole-table `mcp_servers={...}` drops the dotted keys before it. A `profiles.<name>` table inside a
+    config file is not read. None when there is no entry or a config file cannot be read."""
+    codex_home = Path(env.get('CODEX_HOME') or os.path.join(env.get('HOME') or '~', '.codex')).expanduser()
+    opts = _codex_options(template)
+    sources = [Path('/etc/codex/config.toml')]
+    if '--ignore-user-config' not in opts:
+        sources.append(codex_home / 'config.toml')
+        profile = _codex_profile(template)
+        if profile:
+            sources.append(codex_home / (profile + '.config.toml'))
+
+    def server(table) -> dict:
+        servers = table.get('mcp_servers') if isinstance(table, dict) else None
+        found = servers.get(CODEX_SERVER) if isinstance(servers, dict) else None
+        return found if isinstance(found, dict) else {}
+    entry: dict = {}
+    try:
+        for path in sources:
+            try:
+                entry = _merged(entry, server(tomllib.loads(path.read_text())))
+            except FileNotFoundError:
+                continue
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    cli: dict = {}
+    for override in _codex_overrides(opts):
+        key, sep, raw = override.partition('=')
+        path = key.strip().split('.')       # segments untrimmed, as Codex: `mcp_servers. x` names " x"
+        if not sep or path[0] != 'mcp_servers' or any(not p for p in path):
+            continue
+        try:
+            value = tomllib.loads('x = ' + raw)['x']
+        except tomllib.TOMLDecodeError:
+            value = raw.strip()
+        _set_path(cli, path, value)
+    return _merged(entry, server(cli)) or None
 
 
 def _codex_overrides(template: list[str]) -> list[str]:
@@ -533,6 +626,39 @@ def with_headless_browser(template: list[str], overrides: list[str]) -> list[str
     """The runner argv with the overrides placed just before the {prompt} element (options precede the prompt)."""
     i = template.index("{prompt}")
     return template[:i] + overrides + template[i:]
+
+
+def with_managed_env(template: list[str], env: dict[str, str]) -> list[str]:
+    """A dispatched Codex run: Codex starts an MCP server with a small fixed environment, not its own, so the board
+    server is given AGENT_COMMS_MANAGED, with the value child_env put in the run's `env`, as a literal of its own
+    (`-c mcp_servers.agent-comms.env.AGENT_COMMS_MANAGED=...`), as Claude's board server inherits it; the spawn tools
+    then refuse the run from its environment, before it registers (hosted_spawn.Ident.managed). One dotted key:
+    Codex merges it into the server's entry and keeps its `env_vars` and other `env` values, and a literal `env`
+    value wins over one the server would inherit. Only for a stdio board server this can see (`codex_board_server`:
+    `command`, no `url`): a `-c` sub-key for a server Codex has no entry for makes it refuse to start ("invalid
+    transport"), and a URL server has no process environment. A board server defined only where this cannot read it
+    (a trusted checkout's own `.codex/config.toml`) gets nothing, and the run is refused once it registers.
+
+    Where: after every option of the runner, so no `-c` of its own (nor with_codex_inbox_mcp's whole-table
+    `mcp_servers={...}`, which drops dotted keys set before it) comes after it and replaces it; and never after a
+    `--` delimiter, where Codex reads it as a prompt. So: just before `--` when the runner has one; else after the
+    last element when the runner itself puts an option after {prompt} (Codex reads options there: the runner's own
+    already rely on it); else just before {prompt}."""
+    value = env.get("AGENT_COMMS_MANAGED")
+    if not uses_codex(template) or value is None:
+        return template
+    entry = codex_board_server(template, env)
+    if entry is None or not isinstance(entry.get("command"), str) or not entry["command"].strip() or "url" in entry:
+        log.warning("a Codex run without a stdio %s server the dispatcher can see: AGENT_COMMS_MANAGED is not "
+                    "passed to its board server", CODEX_SERVER)
+        return template
+    if "--" in template:
+        at = template.index("--")
+    elif any(a.startswith("-") for a in template[template.index("{prompt}") + 1:]):
+        at = len(template)
+    else:
+        at = template.index("{prompt}")
+    return template[:at] + ["-c", f"mcp_servers.{CODEX_SERVER}.env.AGENT_COMMS_MANAGED={_toml(value)}"] + template[at:]
 
 
 # ---------------------------------------------------------------- signed-in browser profiles (access.py)
@@ -2944,6 +3070,7 @@ class Dispatcher:
                         raise Conflict(conflict)
                     template = with_headless_browser(template, signed_in_browser_overrides(
                         self.config.headless_browser, profile, record["signed_in_browser"]["output_dir"]))
+                template = with_managed_env(template, child_env(agent, self.config, runtime=self._runtime(agent)))
                 argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
                 child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
                                      log_path=log_path)

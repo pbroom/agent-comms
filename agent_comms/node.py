@@ -29,7 +29,7 @@ from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
                        signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
-                       with_headless_browser, with_writable_roots)
+                       with_headless_browser, with_managed_env, with_writable_roots)
 from .node_sessions import SessionRunner
 from .session_host import STATE_FILE as SESSION_STATE_FILE, SessionHost
 
@@ -333,6 +333,7 @@ class Node:
                     out_dir.mkdir(mode=0o700)   # fresh per run; never reused
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, origins, str(out_dir)))
+            template = with_managed_env(template, child_env(agent, self.config, runtime=r.get("runtime")))
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             started, child = self.groups.start(cwd, ("run", rid), lambda: self.spawner(

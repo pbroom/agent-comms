@@ -171,7 +171,9 @@ def _write(path: Path, data: dict) -> None:
 # value written into the server's `env` must be the one the hooks will use. Only the names in HARMLESS may be
 # forwarded; any other AGENT_COMMS_* name, also one added later, is refused until it is classified here.
 HARMLESS = frozenset({
-    "AGENT_COMMS_MANAGED",          # the waiter's "never wait" flag (child_env); not read by the server's identity
+    "AGENT_COMMS_MANAGED",          # child_env's "a process the board launched": the waiter's "never wait" flag, and
+                                    # spawn caller resolution reads it (hosted_spawn.Ident.managed: refused without a
+                                    # binding); it only narrows, never names a board, hub, agent or token
     "AGENT_COMMS_CHANNEL",          # turns the MCP channel notifications on
     "AGENT_COMMS_ALLOW_MIGRATE",    # lets a checkout migrate its own local database; no board, hub or identity
     "AGENT_COMMS_WAIT_TRACE",       # board wait's trace file
