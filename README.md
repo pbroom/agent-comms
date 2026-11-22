@@ -423,18 +423,29 @@ node or the session host started has `AGENT_COMMS_MANAGED=1` and never waits, al
   sit under a world-writable folder without the sticky bit. When the Codex process cannot be identified, the hook does
   not wait at all. This only re-runs what is already running your thread; it is a guard against a Codex that was
   itself started from a writable place, not a list of approved installs.
-- **Queued only when acknowledged.** The wake is queued only once the hub has answered the acknowledgement: an
-  answer that is lost is asked for again, and if none comes nothing is queued and the posts are offered again.
-- **If queueing fails** after the hub took the acknowledgement (the binary failed its check, or `codex queue`
-  failed), the wake is counted and its posts count as delivered, so they are not offered again. You see nothing until
-  the thread next reads the board, and a request among them is held only for its grace period, after which the
-  dispatcher can take it. `codex queue` is never run twice for one wake, because a call that ran may already have
-  queued the message.
+- **Queued only when acknowledged.** The wake is queued only once the hub has answered the acknowledgement "acked":
+  an answer that is lost is asked for again for up to 30 s. If no answer comes and the hub never recorded the
+  acknowledgement, nothing is queued and the posts are offered again. If the hub did record it but every answer was
+  lost, or a newer hook for the thread took over meanwhile, the wake is counted and not queued (the same as a failed
+  queue below): a second wake is never risked.
+- **If queueing fails** after the hub took the acknowledgement (the binary was replaced and fails its last check
+  right before it runs, or `codex queue` failed), the wake is counted and its posts count as delivered, so they are
+  not offered again. You see nothing until the thread next reads the board, and a request among them is held only
+  for its grace period, after which the dispatcher can take it. `codex queue` is never run twice for one wake,
+  because a call that ran may already have queued the message. The binary's place and permissions are checked before
+  the hook waits and again before it acknowledges, so a binary that fails those checks never gets a wake charged.
+- **Where wakes do not work.** For a thread whose folder contains the Codex install it runs (for example a thread
+  opened in your home folder with a per-user install such as nvm's), for a Codex run from inside the repo (a pinned
+  `@openai/codex` started with `npx`), and for a group- or world-writable Codex binary. The hook says so once, on
+  its stderr, and waits for nothing. A trusted project's `.codex/config.toml` can replace the board MCP server
+  (`[mcp_servers.agent-comms]`) for threads in that project: the installer checks the server as your own Codex
+  configuration has it, and cannot promise anything about a project's override.
 - **Where it was checked.** With Codex CLI 0.171.0: `codex app-server` (the desktop app's mode) holding a thread,
   the real hooks, trust check, queue and turns, and the board's MCP server (`scripts/interactive-wake-codex-e2e.py`),
   with a stand-in for the model so that no account is needed. The CLI's terminal interface was driven through a
   terminal emulator in a spike. The desktop app itself (its bundled Codex is 0.171.0-alpha.13, which has `codex
-  queue`) and its way of trusting hooks were not checked.
+  queue`) and its way of trusting hooks were not checked, and neither was Linux (its process lookups through `/proc`
+  are written but not run here): only macOS was.
 
 ## Connect Codex CLI
 

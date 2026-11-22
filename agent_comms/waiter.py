@@ -255,6 +255,15 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
             _say(stderr, trace, "agent-comms: not waiting: the Codex process that ran this hook cannot be identified")
             return 0
         target = target or procinfo.runnable
+        # The binary it would run is checked before anything is armed (PR review F1): the rules depend almost only
+        # on where the binary is, which does not change during a thread, so a binary refused now would be refused
+        # after every acknowledgement, and each wake would be charged and dropped. Refused: do not wait at all.
+        early_cwd = hook.get("cwd") if isinstance(hook.get("cwd"), str) and hook["cwd"].startswith("/") \
+            else os.getcwd()
+        path, why = target(codex_proc, early_cwd, environ)
+        if path is None:
+            _say(stderr, trace, f"agent-comms: not waiting: wakes cannot use this Codex binary ({why})")
+            return 0
     if watch:
         leave = lambda *_: (trace("leave"), os._exit(0))    # noqa: E731  silent, whatever the main thread does
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -317,9 +326,14 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
                 # wait out (DESIGN_NOTES "Waking a Codex thread you opened").
                 woken = _codex_woken(client, body, answer, clock, sleep, trace,
                                      lambda text: _deliver(codex_proc, cwd, sid, text, environ, stderr, trace,
-                                                           queue, target))
+                                                           queue, target),
+                                     lambda: target(codex_proc, cwd, environ)[1] or None)
             else:
                 woken = _woken(client, body, answer, stderr, not_before, clock, sleep, trace)
+            if woken == REFUSED:
+                _say(stderr, trace, "agent-comms: wake not acknowledged: this Codex binary can no longer be used for "
+                                    "wakes; not waiting any more")
+                return 0
             if woken is not None:
                 return 0 if codex else woken
             rejected += 1
@@ -385,12 +399,14 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float
     return WAKE
 
 
+REFUSED = -1                # _codex_woken: the binary was refused before the acknowledgement (nothing was sent)
 ACK_SECONDS_CODEX = 30.0     # how long the Codex client re-sends one acknowledgement whose outcome it could not read
 #                             (inside the hub's REPLAY_SECONDS, which answers a replay of an accepted one "acked")
 
 
 def _codex_woken(client: Any, body: dict, answer: dict, clock: Callable[[], float], sleep: Callable[[float], None],
-                 trace: Callable[..., None], deliver: Callable[[str], Any]) -> int | None:
+                 trace: Callable[..., None], deliver: Callable[[str], Any],
+                 refused: Callable[[], str | None] = lambda: None) -> int | None:
     """The Codex client's acknowledgement (review round 1, S1). Unlike Claude's (`_woken`: a wake whose
     acknowledgement could not be delivered is written anyway, since losing a wake is worse there and an extra exit
     2 is harmless), a Codex wake is queued ONLY on an explicit "acked": a queued message cannot be taken back, and
@@ -404,6 +420,12 @@ def _codex_woken(client: Any, body: dict, answer: dict, clock: Callable[[], floa
     if not (isinstance(text, str) and WAKE_RE.fullmatch(text) and isinstance(wake_id, str)):
         return 0
     trace("offer", id=wake_id)
+    why = refused()
+    if why:
+        # Checked again just before the acknowledgement (PR review F1): refused now, it is not acknowledged, so
+        # nothing is charged; the hub takes the offer back at its own deadline, and this process stops waiting.
+        trace("not_acked", id=wake_id, why=why)
+        return REFUSED
     until, tries = clock() + ACK_SECONDS_CODEX, 0
     while True:
         tries += 1

@@ -4885,3 +4885,61 @@ wake could be charged on one board while the thread's tools read another. Both n
 - Tests: each path-valued literal, relative and `~`-relative, is refused even when the installer's own directory would
   resolve it to the right place. Relative and other server entries are refused: a relative script, a different command,
   extra arguments, another script, a relative `cwd`. An absolute `cwd` is accepted.
+
+### Waking a Codex thread you opened: PR review (#93, 2026-11-22)
+
+Sol approved round 6, and the independent reviewer said OK to merge with three non-blocking findings, fixed here. Each
+new behaviour test fails on 5acd611 (five of five, against its waiter.py and codex_hooks.py). Two positive tests pass on
+both, as they should: the owner's entry shape, and the installer's own entry.
+
+- **F1: a refused binary used to be found only after the hub had charged the wake.** The refuse rules depend almost only
+  on where the binary is, which does not change during a thread. Yet `procinfo.runnable` was first called after the
+  acknowledgement, so in such setups every wake was consumed and dropped, turn after turn. The reviewer's probe: a Codex
+  in the repo's `node_modules/.bin`, the ack sent, no queue. The cases are:
+  - a pinned `@openai/codex` run with `npx`;
+  - a group-writable binary;
+  - a thread opened at an ancestor of the install, such as home with an nvm install;
+  - an in-place upgrade under a long-lived app-server.
+
+Now the binary is checked three times:
+  - Before arming. Refused means the hook does not wait at all, with one line on stderr, so nothing is ever charged.
+  - Just before the acknowledgement. Refused means the wake is not acknowledged: the hub takes the offer back at its own
+    deadline, and the process stops waiting.
+  - Right before the exec, as before. This can only fail when the file changed since, and then the wake is charged and
+    not queued.
+
+The README gains a limit line for these setups.
+  - Tests: refused at arming means no `/api/wait` call at all; refused between arming and the offer means no
+    acknowledgement; the reviewer's scenario with a real executable in `node_modules/.bin` and the real
+    `procinfo.runnable` makes no call; refused only at the exec means charged, not run.
+- **F2: refused until classified, for every setting.** `check-mcp` used to classify only AGENT_COMMS_* names and HOME.
+  Now `env` and `env_vars` may name only AGENT_COMMS_* names as classified in round 4, plus OTHER_NAMES:
+  - `PATH`: how bash and uv are found; Codex passes it to MCP servers by default anyway.
+  - `HOME`: checked, it must be the installer's.
+
+Everything else is refused, literal or forwarded, in both forms: `BASH_ENV` (sourced by bash before stdio.sh, so it can
+export any AGENT_COMMS_* value), `PYTHONPATH`, `UV_PROJECT_ENVIRONMENT`, and any other name.
+  - The script must be this install's own `integrations/codex/stdio.sh`, compared by file identity and required to
+    exist. Another checkout's copy, or a path to a file that does not exist, is refused; a symlink to ours is accepted.
+  - The owner's real entry shape passes: command bash, one absolute stdio.sh argument, no env.
+  - The installer's own `codex mcp add ... -- bash stdio.sh` output, read back with `codex mcp get --json` in a private
+    CODEX_HOME, passes its own check.
+- **F3: README.** It now says the acknowledgement retry gives "offered again" only when the hub never recorded the
+  acknowledgement; if the hub did record it and every answer was lost, or a newer hook took over, the wake is charged
+  and not queued. "Where it was checked" now says Linux was not run.
+- **Test gaps the reviewer named.** Arming with a binary `procinfo.runnable` refuses is covered by F1's tests. The
+  wait.sh unit test now passes its token-file argument and checks it reaches `board wait --token-file`.
+- **Does Codex 0.171 give a stdio MCP server its own full environment? No.** The crate that builds that environment is
+  not in the sparse checkout, so this was measured instead (spike s9 in the session scratchpad, private CODEX_HOME). A
+  probe server recorded its environment. It had a default allowlist (HOME, LANG, PATH, TMPDIR, USER, SHLVL and a few
+  Xcode toolchain variables) plus the entry's `env` value and its `env_vars` name. `AGENT_COMMS_HUB`,
+  `AGENT_COMMS_CODEX_TOKEN` and a marker variable set in the app-server's own environment did not reach it. So an
+  AGENT_COMMS_* variable in Codex's environment reaches neither the server nor, through the board home, hub and token
+  the hook line pins, what the waiter uses. There is no gap to close there.
+- **Can a trusted project's `.codex/config.toml` override `mcp_servers.agent-comms`? Yes.** In the same spike, a trusted
+  project's `.codex/config.toml` naming another `command` for the server replaced it for a thread in that project. Codex
+  merged it field by field with the user's entry: the user's `env` and `env_vars` still applied. The installer checks
+  the server as the user's own configuration has it (`codex mcp get` from where the installer runs), and cannot promise
+  anything about a project's override. The hooks would then wait and be charged as the agent while that thread's board
+  tools run whatever the project named. This is documented as a limit in the README, next to the F1 limit. Closing it
+  would need the waiter to check the server as Codex resolves it for the thread's own directory; that is not done here.

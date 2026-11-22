@@ -187,6 +187,14 @@ VERIFIED = frozenset({              # allowed as a literal `env` value, checked 
 # file, and every name not listed in HARMLESS or VERIFIED. REFUSED names the known ones (a test checks that every
 # AGENT_COMMS_* name the code reads is in one of the three sets).
 REFUSED = frozenset({"AGENT_COMMS_TOKEN", "AGENT_COMMS_CODEX_TOKEN", "AGENT_COMMS_TOKEN_FILE"})
+# Names outside agent-comms the server's `env` or `env_vars` may name (PR review F2: refused until classified, as for
+# AGENT_COMMS_*). Anything else is refused: BASH_ENV (bash sources it before stdio.sh, and it can export any
+# AGENT_COMMS_* value), PYTHONPATH (another agent_comms package), UV_PROJECT_ENVIRONMENT, and the rest.
+OTHER_NAMES = frozenset({
+    "PATH",     # how `bash` and `uv` are found; Codex passes the user's PATH to MCP servers by default anyway
+    "HOME",     # checked below: a literal HOME must be the installer's (absolute)
+})
+STDIO = Path(__file__).resolve().parents[1] / "integrations" / "codex" / "stdio.sh"   # this install's server
 
 
 def env_var_names(entries) -> list[str] | None:
@@ -206,6 +214,14 @@ def env_var_names(entries) -> list[str] | None:
         else:
             return None
     return names
+
+
+def _same_file(a: str, b: Path) -> bool:
+    """Both name one existing file (device and inode), whatever the spelling."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def _same_dir(a: str, b: Path) -> bool:
@@ -236,9 +252,8 @@ def check_mcp(server: dict, board_home: str, agent: str, home: str) -> tuple[str
     # paths, nothing it reads depends on the directory it starts in.
     command, args, cwd = transport.get("command"), transport.get("args"), transport.get("cwd")
     if command not in ("bash", "/bin/bash") or not isinstance(args, list) or len(args) != 1 \
-            or not isinstance(args[0], str) or not os.path.isabs(args[0]) \
-            or not args[0].endswith("/integrations/codex/stdio.sh"):
-        return None, "the agent-comms MCP server of this Codex home is not `bash <absolute path to " \
+            or not isinstance(args[0], str) or not os.path.isabs(args[0]) or not _same_file(args[0], STDIO):
+        return None, "the agent-comms MCP server of this Codex home is not `bash <this install's " \
                      "integrations/codex/stdio.sh>` as install.sh sets it up; what it would run cannot be checked"
     if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)):
         return None, "the agent-comms MCP server's cwd is not an absolute path"
@@ -249,6 +264,9 @@ def check_mcp(server: dict, board_home: str, agent: str, home: str) -> tuple[str
     if forwarded is None:
         return None, "the agent-comms MCP server's env_vars has an entry of a form this installer does not know"
     for name in forwarded:
+        if not name.startswith("AGENT_COMMS_") and name not in OTHER_NAMES:
+            return None, f"the agent-comms MCP server takes {name} from the environment Codex starts in; only " \
+                         f"settings this installer knows to be harmless may be"
         if name.startswith("AGENT_COMMS_") and name not in HARMLESS:
             return None, f"the agent-comms MCP server takes {name} from the environment Codex starts in; that can " \
                          f"change which board, hub, agent or token it uses, so the hooks are not added"
@@ -257,6 +275,8 @@ def check_mcp(server: dict, board_home: str, agent: str, home: str) -> tuple[str
         return None, "the agent-comms MCP server runs with another HOME than this installer (or one that is not " \
                      "an absolute path)"
     for name, value in env.items():
+        if not name.startswith("AGENT_COMMS_") and name not in OTHER_NAMES:
+            return None, f"the agent-comms MCP server's configuration sets {name}, which this installer cannot check"
         if not name.startswith("AGENT_COMMS_") or name in HARMLESS:
             continue
         if name in ("AGENT_COMMS_CODEX_TOKEN", "AGENT_COMMS_TOKEN"):

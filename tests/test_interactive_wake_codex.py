@@ -32,6 +32,7 @@ THREAD = "01a20182-773e-7ad2-a06f-2dfad85c09e1"         # a Codex thread id (UUI
 WAKE = hosted_wake.wake_text("codex", [[7, "claude", False, 1]])
 CODEX_BIN = "/Applications/Example.app/Contents/MacOS/codex"
 PROC = procinfo.Proc(4242, 1, 1795300000.5, CODEX_BIN)  # the Codex process that ran the hook, as procinfo finds it
+OK_TARGET = lambda proc, cwd, env: (proc.exe, "")  # noqa: E731  procinfo.runnable's answer for a binary it accepts
 
 
 class Queue:
@@ -184,11 +185,63 @@ def test_no_codex_process_identified_means_no_wait_at_all(monkeypatch):
     assert "cannot be identified" in err.getvalue()
 
 
-def test_a_binary_that_cannot_be_verified_is_not_run_and_the_wake_counts_as_not_queued():
+class Turns:
+    """A target that accepts the binary for the first `ok` checks and refuses it after that."""
+
+    def __init__(self, ok, why="the file at that path is not the image the Codex process runs"):
+        self.ok, self.why, self.calls = ok, why, 0
+
+    def __call__(self, proc, cwd, env):
+        self.calls += 1
+        return (proc.exe, "") if self.calls <= self.ok else (None, self.why)
+
+
+def test_a_binary_refused_only_at_the_exec_is_not_run_and_the_wake_counts_as_not_queued():
+    """Accepted when arming and before the acknowledgement, refused right before the exec (it was replaced in
+    between): nothing is run, the wake is charged, one line on stderr."""
     hub = Hub({"state": "wake", "text": WAKE, "id": "1" * 16})
-    code, err, queue = run_codex(hub, target=lambda proc, cwd, env: (None, "in a temporary directory"))
+    code, err, queue = run_codex(hub, target=Turns(ok=2))
+    assert code == 0 and queue.calls == [] and [b.get("ack") for b in hub.bodies] == [None, "1" * 16]
+    assert err == "agent-comms: wake not queued: the file at that path is not the image the Codex process runs\n"
+
+
+def test_pr_f1_a_binary_refused_when_arming_means_no_wait_at_all():
+    """Nothing is sent to the hub: no wait, no offer, no acknowledgement, so nothing is ever charged."""
+    hub = Hub({"state": "wake", "text": WAKE, "id": "1" * 16})
+    code, err, queue = run_codex(hub, target=Turns(ok=0, why="in the thread's directory or a git worktree of it"))
+    assert (code, hub.bodies, queue.calls) == (0, [], [])
+    assert err == "agent-comms: not waiting: wakes cannot use this Codex binary (in the thread's directory or a git " \
+                  "worktree of it)\n"
+
+
+def test_pr_f1_a_binary_refused_between_arming_and_the_offer_is_not_acknowledged():
+    hub = Hub({"state": "wake", "text": WAKE, "id": "1" * 16}, {"state": "wake", "text": WAKE, "id": "2" * 16})
+    code, err, queue = run_codex(hub, target=Turns(ok=1))
     assert code == 0 and queue.calls == []
-    assert err == "agent-comms: wake not queued: in a temporary directory\n"
+    assert [b.get("ack") for b in hub.bodies] == [None], "offered, never acknowledged: the hub takes it back"
+    assert "wake not acknowledged" in err
+
+
+def test_pr_f1_the_reviewers_scenario_a_codex_inside_the_repo_never_waits(tmp_path, monkeypatch):
+    """A real executable named codex in the repo's node_modules/.bin (a pinned @openai/codex run with npx), running
+    as the hook's Codex process, checked with the real procinfo.runnable: no call to /api/wait at all."""
+    monkeypatch.setattr(procinfo, "_temp_dirs", lambda environ: [])   # pytest's tmp_path is itself temporary
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    exe = binary_copy(repo / "node_modules" / ".bin")
+    p = spawned(exe)
+    try:
+        proc = procinfo.info(p.pid)
+        hub = Hub({"state": "wake", "text": WAKE, "id": "1" * 16})
+        err = io.StringIO()
+        hook = {"session_id": THREAD, "cwd": str(repo), "hook_event_name": "Stop"}
+        code = waiter.run("codex", [PROJECT], 600, stdin=io.StringIO(json.dumps(hook)), stderr=err, environ={},
+                          client=hub, watch=False, kind="codex", codex=proc, queue=Queue())
+        assert code == 0 and hub.bodies == [], "the binary is refused before anything is armed"
+        assert "in the thread's directory or a git worktree of it" in err.getvalue()
+    finally:
+        p.terminate()
+        p.wait()
 
 
 def test_the_codex_client_watches_the_codex_process_by_pid_and_start_time():
@@ -278,11 +331,14 @@ def test_wait_sh_runs_board_wait_for_codex_and_always_exits_0(tmp_path):
     bin_dir, rec = fake_uv(tmp_path)
     env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path), "AGENT_COMMS_AGENT": "codex"}
     hook = json.dumps({"session_id": THREAD, "cwd": str(tmp_path), "hook_event_name": "Stop"})
-    r = subprocess.run(["bash", str(WAIT_SH)], input=hook, env=env, capture_output=True, text=True, timeout=30)
+    token = str(tmp_path / "codex.token")
+    r = subprocess.run(["bash", str(WAIT_SH), token], input=hook, env=env, capture_output=True, text=True,
+                       timeout=30)
     assert r.returncode == 0, "always 0, whatever `board wait` did (here: 3)"
     got = json.loads(rec.read_text())
     assert got["stdin"] == hook, "the hook's JSON reaches board wait"
-    assert got["argv"][-6:] == ["board", "wait", "--client", "codex", "--agent", "codex"]
+    assert got["argv"][-8:] == ["board", "wait", "--client", "codex", "--agent", "codex", "--token-file", token], \
+        "the token file from the hook's own command line"
     assert "--codex-bin" not in got["argv"], "board wait finds the Codex process itself (procinfo), never a name"
     assert r.stdout == "" and r.stderr == "agent-comms: a note\n", "stdout empty (Codex reads it); notes on stderr"
 
@@ -674,12 +730,12 @@ def test_s3_the_codex_waiter_uses_only_the_recorded_token_file(tmp_path, monkeyp
     hook = {"session_id": THREAD, "cwd": str(tmp_path), "hook_event_name": "Stop"}
     env = {"AGENT_COMMS_TOKEN": "ac_from_the_environment", "AGENT_COMMS_HOME": str(board)}
     code = waiter.run("codex", [PROJECT], 60, stdin=io.StringIO(json.dumps(hook)), stderr=io.StringIO(), environ=env,
-                      watch=False, kind="codex", codex=PROC, token_file=str(recorded))
+                      watch=False, kind="codex", codex=PROC, token_file=str(recorded), target=OK_TARGET)
     assert code == 0 and seen == [{"Authorization": "Bearer ac_from_the_recorded_file"}]
     err = io.StringIO()
     seen.clear()
     code = waiter.run("codex", [PROJECT], 60, stdin=io.StringIO(json.dumps(hook)), stderr=err, environ=env,
-                      watch=False, kind="codex", codex=PROC)
+                      watch=False, kind="codex", codex=PROC, target=OK_TARGET)
     assert code == 0 and seen == [] and "no token file recorded" in err.getvalue()
 
 
@@ -1057,7 +1113,7 @@ def test_s3_the_codex_waiter_ignores_an_inherited_hub(tmp_path, monkeypatch):
     hook = {"session_id": THREAD, "cwd": str(tmp_path), "hook_event_name": "Stop"}
     env = {"AGENT_COMMS_HUB": "http://127.0.0.1:8888", "AGENT_COMMS_HOME": str(board)}
     waiter.run("codex", [PROJECT], 60, stdin=io.StringIO(json.dumps(hook)), stderr=io.StringIO(), environ=env,
-               watch=False, kind="codex", codex=PROC, token_file=str(recorded))
+               watch=False, kind="codex", codex=PROC, token_file=str(recorded), target=OK_TARGET)
     assert bases == ["http://127.0.0.1:7777"], "the board's hub, the one install.sh checked the MCP server against"
 
 
@@ -1272,3 +1328,93 @@ def test_s3_only_the_server_entry_install_sh_writes_is_accepted(tmp_path, monkey
         assert path is None and "as install.sh sets it up" in why, change
     path, why = with_transport(cwd="checkout")
     assert path is None and "cwd is not an absolute path" in why
+
+
+# ------------------------------------------------------------ PR review (#93), F2: refused until classified
+
+
+def test_pr_f2_any_other_setting_is_refused_unless_it_is_known(tmp_path, monkeypatch):
+    n = iter(range(100))
+    sub = lambda: tmp_path / f"t{next(n)}"      # noqa: E731
+    for name in ("BASH_ENV", "PYTHONPATH", "UV_PROJECT_ENVIRONMENT", "PYTHONSTARTUP", "SOMETHING_ELSE"):
+        path, why = checked(sub(), monkeypatch, **{name: "/x/y"})
+        assert path is None and f"sets {name}" in why, name
+        for entry in (name, {"name": name}, {"name": name, "source": "local"}):
+            path, why = checked(sub(), monkeypatch, env_vars=[entry])
+            assert path is None and f"takes {name} from the environment" in why, entry
+    assert checked(sub(), monkeypatch, PATH="/usr/bin:/bin")[1] is None
+    assert checked(sub(), monkeypatch, env_vars=["PATH", {"name": "HOME"}])[1] is None
+
+
+def test_pr_f2_the_script_must_be_this_installs_stdio_sh(tmp_path, monkeypatch):
+    other = tmp_path / "other-checkout" / "integrations" / "codex" / "stdio.sh"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(Path(STDIO).read_bytes())
+    link = tmp_path / "link-to-ours.sh"
+    link.symlink_to(STDIO)
+    n = iter(range(10))
+    sub = lambda: tmp_path / f"t{next(n)}"      # noqa: E731
+    for args in ([str(other)], [str(tmp_path / "nowhere" / "integrations" / "codex" / "stdio.sh")]):
+        where = sub()
+        where.mkdir(parents=True)
+        board, toks = a_board(where, monkeypatch, "codex")
+        d = tokens(where, monkeypatch, codex=toks["codex"])
+        server = mcp_server(board, d / "codex.token")
+        server["transport"]["args"] = args
+        path, why = codex_hooks.check_mcp(server, str(board), "codex", str(where))
+        assert path is None and "this install's" in why, args
+    where = sub()
+    where.mkdir(parents=True)
+    board, toks = a_board(where, monkeypatch, "codex")
+    d = tokens(where, monkeypatch, codex=toks["codex"])
+    server = mcp_server(board, d / "codex.token")
+    server["transport"]["args"] = [str(link)]
+    assert codex_hooks.check_mcp(server, str(board), "codex", str(where))[1] is None, "the same file, another name"
+
+
+def test_pr_f2_the_owners_entry_shape_passes(tmp_path, monkeypatch):
+    """command bash, one absolute stdio.sh argument, no env at all: the board at ~/agent-comms and the token in
+    ~/.config/agent-comms/codex.token (stdio.sh's and stdio.py's defaults)."""
+    from agent_comms.config import create_agent
+    home = tmp_path / "home"
+    board = home / "agent-comms"
+    board.mkdir(parents=True)
+    create_agent(board / "agents.toml", "human", "human", is_human=True)
+    tok = create_agent(board / "agents.toml", "codex", "codex-cli")
+    (board / "board.toml").write_text('[server]\ndb_path = "data/board.db"\nagents_path = "agents.toml"\n')
+    monkeypatch.setenv("AGENT_COMMS_HOME", str(board))
+    monkeypatch.delenv("AGENT_COMMS_HUB", raising=False)
+    monkeypatch.setenv("AGENT_COMMS_TOKEN_DIR", str(home / ".config" / "agent-comms"))
+    (home / ".config" / "agent-comms").mkdir(parents=True)
+    f = home / ".config" / "agent-comms" / "codex.token"
+    f.write_text(tok + "\n")
+    f.chmod(0o600)
+    server = {"name": "agent-comms", "transport": {"type": "stdio", "command": "bash", "args": [STDIO], "env": None,
+                                                   "env_vars": [], "cwd": None}}
+    assert codex_hooks.check_mcp(server, str(board), "codex", str(home)) == (os.path.realpath(f), None)
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="needs the Codex CLI (`codex mcp add`, `codex mcp get`)")
+def test_pr_f2_the_installers_own_mcp_entry_passes_its_own_check(tmp_path):
+    """`codex mcp add` as install.sh runs it, in a private CODEX_HOME, then `codex mcp get --json` into check-mcp."""
+    from agent_comms.config import create_agent
+    home, board, codex_home = tmp_path / "home", tmp_path / "board", tmp_path / "codex-home"
+    for d in (home / ".config" / "agent-comms", board, codex_home):
+        d.mkdir(parents=True)
+    create_agent(board / "agents.toml", "human", "human", is_human=True)
+    f = home / ".config" / "agent-comms" / "codex.token"
+    f.write_text(create_agent(board / "agents.toml", "codex", "codex-cli") + "\n")
+    f.chmod(0o600)
+    (board / "board.toml").write_text('[server]\ndb_path = "data/board.db"\nagents_path = "agents.toml"\n')
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_COMMS", "CODEX"))} | {
+        "HOME": str(home), "CODEX_HOME": str(codex_home), "AGENT_COMMS_HOME": str(board)}
+    r = subprocess.run(["codex", "mcp", "add", "agent-comms", "--env", f"AGENT_COMMS_HOME={board}", "--", "bash",
+                        STDIO], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    got = subprocess.run(["codex", "mcp", "get", "agent-comms", "--json"], env=env, capture_output=True, text=True,
+                         timeout=60)
+    r = subprocess.run([sys.executable, "-I", "-m", "agent_comms.codex_hooks", "check-mcp", "--board-home",
+                        str(board), "--agent", "codex"], input=got.stdout, env=env, capture_output=True, text=True,
+                       timeout=60, cwd=str(ROOT))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == os.path.realpath(f)
