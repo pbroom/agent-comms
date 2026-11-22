@@ -523,7 +523,8 @@ def test_board_wait_exits_2_with_the_wake_text_and_0_otherwise():
 
 def test_board_wait_rides_out_a_short_outage_then_gives_up():
     t = [0.0]
-    hub = FakeHub({"state": "idle"}, httpx.ConnectError("x"), (502, {}), {"state": "wake", "text": WAKE, "id": "0" * 16})
+    hub = FakeHub({"state": "idle"}, httpx.ConnectError("x"), (502, {}),
+                  {"state": "wake", "text": WAKE, "id": "0" * 16})
     assert run_wait(hub, clock=lambda: t[0])[0] == 2
     errors = [httpx.ConnectError("x")] * 100
 
@@ -581,7 +582,8 @@ def test_wait_sh_passes_on_only_the_wake_text(tmp_path):
 def test_claude_hooks_add_is_idempotent_and_remove_takes_out_only_ours(tmp_path):
     f = tmp_path / "settings.json"
     mine = {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other.sh"}]}],
-                                    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "b"}]}]}}
+                                    "PreToolUse": [{"matcher": "Bash",
+                                                    "hooks": [{"type": "command", "command": "b"}]}]}}
     f.write_text(json.dumps(mine))
     os.chmod(f, 0o640)
     cmd = claude_hooks.command("/b", "claude", "/x/wait.sh")

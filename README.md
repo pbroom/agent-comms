@@ -329,11 +329,20 @@ What it does not cover:
   and a session started before `--wake` are not covered.
 - **A wake during a turn.** Claude starts the `Stop` hook when a turn ends, and it keeps waiting if you start the
   next turn. A wake that comes then is taken as its own turn right after yours.
-- **A wake right after the session opens.** Claude Code 2.1.322 was seen, twice in ten test runs, to report a
-  `SessionStart` hook's wake in the first two seconds and start no turn. So that hook's wake is written no sooner
-  than 10 s after the hook started (a `Stop` hook's at once). And a delivered wake that no session of the agent in
-  the project has read within 90 s comes back once, uncharged, for the next waiting session (normally the same
-  session's next turn). In the worst case the post waits for the session's next turn, or for the dispatcher's grace.
+- **A wake right after the session opens.** Once, in a test run before the safeguards below, Claude Code 2.1.322
+  reported a `SessionStart` hook's wake about two seconds after launch and started no turn. The cause is not
+  confirmed. Two independent readings of that build say a `SessionStart` hook with `"asyncRewake"` alone can be run
+  synchronously in a stream-json session (as the desktop app runs Claude Code) when a flag is set late, and that an
+  explicit `"async": true` takes the background path. A second reported case was the Mac sleeping, not this.
+  So the `SessionStart` hook `--wake` writes carries both `"async": true` and `"asyncRewake": true` (the `Stop` hook
+  is unchanged), and its wake is written no sooner than 10 s after the hook started. And a delivered wake that no
+  session of the agent in the project has read within 90 s comes back once, uncharged, for the next waiting session
+  (normally the same session's next turn). With this configuration, SOAK_RESULT. In the worst case, a wake that
+  starts no turn, the post waits for the session's next turn (when its `Stop` hook is offered it again), or, for a
+  request the dispatcher could run, for the request's grace to end. If a backgrounded `SessionStart` wake is ever
+  seen to miss its turn, arm on `Stop` only: delete the `SessionStart` entry that runs `wait.sh` from
+  `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (`--wake` would add it back). A session is then wakeable only
+  after its first turn since it opened or resumed.
 - **A session that just went away.** The hub cannot see a caller hang up, so for up to 25 s after a session ends
   its last call still counts as waiting. A wake is counted only once `board wait` acknowledges it; one offered to
   a session that is gone is taken back after 10 s and goes to the next session that waits. If the

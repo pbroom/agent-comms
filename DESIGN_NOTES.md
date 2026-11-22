@@ -4237,3 +4237,36 @@ exited 2 about 2 s after launch, and no turn followed.
 Claude's debug log shows whether a hook was backgrounded: "Hooks: Config-based async hook, backgrounding process
 async_hook_<n>", logged just before "Hooks: SessionStart:startup [...]". A working run logs "Hook SessionStart:startup
 (SessionStart) error: status code 2" when the hook exits, then "[engine] turn 1 start".
+
+### Waking an interactive session: the SessionStart hook's shape (2026-11-21)
+
+**Decision (c).** The `SessionStart` hook carries `"async": true` beside `"asyncRewake": true`
+(`claude_hooks.hook_for`). M1 (the 10 s start-up grace) and M2 (O5, the unread return) stay as built. The `Stop` hook
+is unchanged.
+
+**What is known and what is not.**
+- *One clean missed turn,* before M1. A SessionStart hook exited 2 about 2 s after launch, Claude Code reported
+  the hook's result, and it started no turn. The run predates the debug log, so its cause is unconfirmed.
+- *Two independent readings of the Claude Code 2.1.322 build* say a command hook runs in the background when
+  `async || (asyncRewake && (interactive || hasStreamingInput))`. A SessionStart hook can be spawned before a
+  stream-json session sets its streaming-input flag, and is then run synchronously: its exit 2 is a hook error that
+  wakes nothing. With an explicit `"async": true` the gate is always open, and the build still honours the rewake.
+  By the same reading, the interactive terminal UI always backgrounds the hook. Not verified by us.
+- *The second reported missed turn was the Mac sleeping* (pmset: maintenance sleep, then a lid wake, between the
+  ack and the hook's result).
+- *In 12 traced runs before this change* (5 with the old shape, 5 with both flags, 2 smoke runs), the debug log
+  showed the SessionStart hook backgrounded, and every one woke.
+- *With the configuration as shipped:* SOAK_RESULT.
+
+**The worst case, and the fallback.**
+- *Worst case:* a SessionStart wake that starts no turn. The post comes back after 90 s (O5) for the next waiter,
+  which is that session's `Stop` hook once the human starts a turn there; a request the dispatcher could run goes
+  to it when its grace ends.
+- *Fallback:* if a backgrounded SessionStart wake is ever caught missing its turn, arm on `Stop` only. Delete the
+  SessionStart entry from the settings file, and change `claude_hooks.EVENTS` to `("Stop",)` so that `--wake`
+  writes only that. A session is then wakeable only after its first turn since it opened or resumed.
+
+**Installer.** `claude_hooks` recognises both shapes, the earlier four-key one and the current one with `async`, so
+a re-run of `--wake` replaces an entry an earlier version wrote (once), and `--remove-wake` takes out either. The
+e2e's real step uses exactly what the installer writes; `--old-hook-shape` reproduces the earlier SessionStart entry
+for comparison.

@@ -7,11 +7,11 @@ The hooks are a `Stop` and a `SessionStart` command hook with `"asyncRewake": tr
 SessionStart one also has `"async": true` (`hook_for`). A hook is ours only when it sits under `Stop` or
 `SessionStart` and is exactly one of the shapes this module writes or wrote (`SHAPES`): the keys `type` ("command"),
 `command` (exactly `AGENT_COMMS_HOME='<dir>' AGENT_COMMS_AGENT='<name>' bash '<this script>'`), `asyncRewake` (true),
-`timeout`, and possibly `async` (true). `add` replaces ours (idempotent, and a new agent or board home takes effect); `remove` takes out ours
-and nothing else, and drops only a group, event list or `hooks` object that taking ours out left empty (a group with
-anything beside `hooks`, such as a matcher, is kept). Every other setting and hook is kept as it was, also one whose
-command merely mentions the script. The file is written atomically, with its mode kept (600 when new); a file that
-is not a JSON object is refused and left alone.
+`timeout`, and possibly `async` (true). `add` replaces ours (idempotent, and a new agent or board home takes
+effect); `remove` takes out ours and nothing else, and drops only a group, event list or `hooks` object that taking
+ours out left empty (a group with anything beside `hooks`, such as a matcher, is kept). Every other setting and
+hook is kept as it was, also one whose command merely mentions the script. The file is written atomically, with its
+mode kept (600 when new); a file that is not a JSON object is refused and left alone.
 """
 from __future__ import annotations
 
