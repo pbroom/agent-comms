@@ -256,9 +256,14 @@ def test_superseded_terminal_recovery_retains_evidence_and_lineage_guards(env, b
         env.board.conn.execute('UPDATE posts SET created_at=created_at-20 WHERE id=?', (blocked['evidence']['id'],))
         error = Invalid
     else:
+        # A routed successor of this request is still open: it carries the request's authorization, so the original
+        # cannot be retired under it (DESIGN_NOTES "Superseding linked requests").
+        successor = env.post('human', env.thread(), type='request', to=['codex'])
         env.board.conn.execute('INSERT INTO board_state(key,value,updated_at) VALUES (?,?,?)',
-            ('request.successor.999', json.dumps({'source_post_id': blocked['post']['id']}), env.clock()))
-        error = Forbidden
+            ('request.successor.' + str(successor['id']), json.dumps({'source_post_id': blocked['post']['id'],
+             'recipient': 'codex', 'successor_recipient': 'codex'}), env.clock()))
+        requests.progress(env.board, env.p['human'], env.sid['human'], successor['id'], 'codex', 'queued', 'routed')
+        error = Conflict
     with pytest.raises(error):
         recover(env, blocked, terminal_disposition='superseded')
     assert env.board.get_post(env.p['codex'], blocked['post']['id'])['requests'][0]['state'] == 'blocked'

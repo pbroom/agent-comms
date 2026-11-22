@@ -191,8 +191,11 @@ def after_pickup(board, p, session_id, source, previous):
         matching[0]['picked_up'] = True
         matching[0]['pickup_session'] = session_id
         matching[0]['pickup_version'] = current['version']
-        ready = all(s['picked_up'] for s in link['sources'])
+        # A source its recipient superseded as obsolete (after_supersede) is settled: nothing waits on its pickup.
+        ready = all(s['picked_up'] or s.get('superseded') for s in link['sources'])
         for item in link['sources'] if ready else []:
+            if item.get('superseded'):
+                continue
             raw = board.conn.execute('SELECT sealed FROM posts WHERE id=?', (item['post_id'],)).fetchone()
             if not raw or raw['sealed']:
                 ready = False
@@ -207,14 +210,73 @@ def after_pickup(board, p, session_id, source, previous):
             decision_actions.assert_execution_authorized(board, original['id'], work['assigned_agent'])
         diagnostics = _diagnostic_evidence(board, p, session_id, recovery, current['evidence_post_ids']) if link.get('requires_diagnostics') else []
         if ready and (not link.get('requires_diagnostics') or diagnostics):
-            receipt = board.create_post(p, session_id, thread_id=source['thread_id'], type='status',
-                body=f"Recovery acknowledgement #{recovery['id']}/{row['recipient']} retired after verified pickup of its explicitly linked requests. Their original work remains unfinished until separately evidenced completion.",
+            gone = [f"#{s['post_id']}/{s['recipient']}" for s in link['sources'] if s.get('superseded')]
+            picked = [f"#{s['post_id']}/{s['recipient']}" for s in link['sources'] if not s.get('superseded')]
+            if gone:   # say which linked requests were picked up and which were retired before any pickup
+                body, reason = _mixed_receipt(board, f"#{recovery['id']}/{row['recipient']}", picked, gone)
+            else:
+                body = (f"Recovery acknowledgement #{recovery['id']}/{row['recipient']} retired after verified pickup "
+                        "of its explicitly linked requests. Their original work remains unfinished until separately "
+                        "evidenced completion.")
+                reason = 'Obsolete recovery acknowledgement; verified original request pickup'
+            receipt = board.create_post(p, session_id, thread_id=source['thread_id'], type='status', body=body,
                 refs=[{'kind': 'artifact', 'path': f"board:post/{s['post_id']}"} for s in link['sources']], _in_transaction=True)
-            requests._save(board, p, session_id, row, 'finished', 'Obsolete recovery acknowledgement; verified original request pickup',
+            requests._save(board, p, session_id, row, 'finished', reason,
                            [receipt['id'], *diagnostics], row['assigned_agent'], row['assigned_session'])
             link['retired'] = {'receipt_post_id': receipt['id'], 'session_id': session_id, 'diagnostic_post_ids': diagnostics}
         board.conn.execute('UPDATE board_state SET value=?,updated_by=?,updated_at=? WHERE key=?',
                            (json.dumps(link), p.name, board.now(), record['key']))
+
+
+RECEIPT_LISTED = 5   # linked requests named per group in a mixed retirement receipt; the rest are counted
+
+
+def _mixed_receipt(board, ack, picked, gone):
+    """(receipt body, event reason) for an acknowledgement retired with some sources superseded: counts, plus as many
+    of the first ids (at most RECEIPT_LISTED per group) as fit the configured post body limit. The exact per-source
+    detail stays in the recovery record (each source's picked_up / superseded)."""
+    limit = board.s.body_max_bytes
+
+    def listed(items, n):
+        if n == 0:
+            return ''
+        more = len(items) - n
+        return ' (' + ', '.join(items[:n]) + (f' and {more} more' if more > 0 else '') + ')'
+
+    def texts(n):
+        a, b = listed(picked, min(n, len(picked))), listed(gone, min(n, len(gone)))
+        return ((f"Recovery acknowledgement {ack} retired: verified pickup of {len(picked)} linked request(s){a}; "
+                 f"{len(gone)} superseded as obsolete by their recipient{b}. Their original work remains unfinished "
+                 "until separately evidenced completion."),
+                f"Obsolete recovery acknowledgement; verified pickup of {len(picked)}{a}, {len(gone)} superseded{b}")
+    for n in range(RECEIPT_LISTED, 0, -1):
+        body, reason = texts(n)
+        if len(body.encode()) <= limit:   # the reason says less than the body, so it fits too
+            return body, reason
+    # Counts only: under 256 bytes (the smallest supported limit) even for 100 sources, 32-character agent names and
+    # ten-digit post ids.
+    return texts(0)
+
+
+def after_supersede(board, p, session_id, post_id, recipient, evidence):
+    """Called in the transaction that retires this exact request as obsolete (requests.progress, disposition
+    superseded). Settles the recovery links naming it, so their automatic retirement neither waits on its pickup nor
+    acts for it again: a superseded acknowledgement is marked retired (after_pickup and after_route skip it), and a
+    superseded source counts as settled when its acknowledgement's other sources are picked up. Writes nothing else:
+    no other request row, answer link or attention record changes."""
+    for record in list(board.conn.execute('SELECT key,value FROM board_state WHERE key LIKE ?', (PREFIX + '%',))):
+        link = json.loads(record['value'])
+        changed = False
+        if link['post_id'] == post_id and link['recipient'] == recipient:
+            link['retired'] = {'superseded': True, 'session_id': session_id, 'evidence_post_ids': evidence}
+            changed = True
+        for item in link['sources']:
+            if item['post_id'] == post_id and item['recipient'] == recipient:
+                item['superseded'] = {'session_id': session_id, 'evidence_post_ids': evidence}
+                changed = True
+        if changed:
+            board.conn.execute('UPDATE board_state SET value=?,updated_by=?,updated_at=? WHERE key=?',
+                               (json.dumps(link), p.name, board.now(), record['key']))
 
 
 class RecoveryWait(Conflict):

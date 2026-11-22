@@ -52,7 +52,9 @@ request. board_register lists your open_obligations whether or not they are unre
 recipient and current expected_version, state='started', and a factual reason. Use state='blocked' when blocked.
 When the exact requested work is verified complete, post the evidence with state='finished' and
 disposition='completed'; use disposition='superseded' only for an explicitly obsolete obligation, never to
-claim its unfinished underlying work is complete. Supply completion evidence required by a managed request.
+claim its unfinished underlying work is complete. As its assigned agent this includes an obsolete human answer,
+routed successor (settle the successor before its original) or recovery request; managed continuations and
+shared-issue posts refuse it and name their own path. Supply completion evidence required by a managed request.
 Every request_reply needs an idempotency_key: keep the identical key and payload when retrying an uncertain
 result, and use a new key for a different lifecycle action. Check the returned request_reply source, state and
 version. Ownership, human authorization, project/host gates and task leases still apply. answer_to remains
@@ -288,7 +290,9 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         "pickup, blockage or verified finish, include request_reply={post_id: exact source ID, recipient: original "
         "recipient, expected_version: current request version, state: started|blocked|finished, reason}. "
         "For finished only, disposition is required: completed for verified exact work, superseded only for an "
-        "explicitly obsolete obligation (not its unfinished underlying work). Include completion for managed "
+        "explicitly obsolete obligation (not its unfinished underlying work). The assigned agent may supersede an "
+        "obsolete human answer, routed successor (the successor before its original) or recovery request too; "
+        "managed continuations and shared-issue posts refuse it and name their own path. Include completion for managed "
         "requests when required. Pair request_reply with idempotency_key; retry uncertain results with the "
         "identical key and payload, never invent completion from a reply. The returned request_reply identifies "
         "the source and resulting state/version. answer_to is human-only and does not replace request_reply. "
@@ -478,7 +482,7 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
         return run(lambda: attention.close_attention(board, principal(ctx), session(ctx, session_id),
                                                       post_id, reason, evidence_post_ids))
 
-    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. Optional disposition on finished: completed for verified fulfillment, superseded for an explicitly obsolete generic obligation; linked or managed requests reject superseded. recover_blocked=true narrowly finishes your same-agent generic blocked request from a proven ended dispatcher session: requires exact expected_version and new current-session verification evidence in the same thread; never transfers execution or bypasses managed completion. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
+    @mcp.tool(description="Acknowledge or explicitly finish one original request recipient. Progress grants no permission. Finished and blocked require a reason; cite same-thread evidence when available. Unrelated replies never finish requests. Optional disposition on finished: completed for verified fulfillment, superseded for an explicitly obsolete obligation (its assigned agent only for a human answer, routed successor or recovery request, and a successor before its original); managed continuations and shared-issue posts reject superseded. recover_blocked=true narrowly finishes your same-agent generic blocked request from a proven ended dispatcher session: requires exact expected_version and new current-session verification evidence in the same thread; never transfers execution or bypasses managed completion. Managed continuations require expected_version and the assigned session. Finish requires a live task lease, evidence_post_ids, and completion={descendants:[{ref,head,contains_fix:true,checks:{check_name:{head,status:'passed'}}}]}; the server verifies exact local heads/ancestry; check receipts are your attestations, not independent CI verification." + DATA_WARNING)
     def board_request_progress(post_id: StrictInt, recipient: str,
                                state: Literal["queued", "started", "blocked", "finished"],
                                reason: str = "", evidence_post_ids: list[StrictInt] | None = None,

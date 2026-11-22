@@ -32,21 +32,70 @@ def validate(value, key):
     return dict(value)
 
 
-def guard_superseded(board, post_id):
-    """Generic obsolete asks only; linked execution requires its exact workflow."""
-    if workstreams.get_for_post(board, post_id) is not None:
-        raise Forbidden('managed continuation cannot be superseded through a reply')
+SUCCESSOR_PREFIX = 'request.successor.'
+# The two kinds that still refuse, each naming the path its own workflow offers (DESIGN_NOTES "Superseding linked
+# requests").
+MANAGED_REFUSAL = ("managed continuation cannot be superseded through a reply: its workflow closes it only with "
+                   "disposition='completed' and its completion receipts (every declared descendant contains the fix, "
+                   "required checks passed)")
+ISSUE_REFUSAL = ("cannot be superseded through a reply: its shared issue governs it. Record why it is obsolete on "
+                 "that issue with board_comment_issue for the human; resolving the issue leaves this request open")
+
+
+def _linked(board, post_id):
+    """The post belongs to a human answer, a routed successor hand-off or a recovery acknowledgement."""
+    if board.conn.execute('SELECT 1 FROM answer_links WHERE source_post_id=? OR answer_post_id=?', (post_id,post_id)).fetchone():
+        return True
     for record in board.conn.execute("SELECT key,value FROM board_state WHERE key LIKE 'request.successor.%' OR key LIKE 'request.recovery.%'"):
         link = json.loads(record['value'])
-        if (record['key'] == 'request.successor.' + str(post_id) or link.get('source_post_id') == post_id
+        if (record['key'] == SUCCESSOR_PREFIX + str(post_id) or link.get('source_post_id') == post_id
                 or link.get('post_id') == post_id or any(s.get('post_id') == post_id for s in link.get('sources', []))):
-            raise Forbidden('linked request cannot be superseded through a reply')
-    if board.conn.execute('SELECT 1 FROM answer_links WHERE source_post_id=? OR answer_post_id=?', (post_id,post_id)).fetchone():
-        raise Forbidden('human answer lineage cannot be superseded through a reply')
+            return True
+    return False
+
+
+def open_successor(board, post_id, recipient):
+    """(successor post id, recipient) of a routed hand-off of this exact request that is still open, or None. The
+    successor carries this request's authorization (decision_actions.assert_execution_authorized): retiring the
+    original under it would leave a live request that can never start. Only a durably finished successor row
+    releases the original: an access-routed successor has no stored row until its first update (requests.for_post
+    gives it a virtual queued one), and a closed thread can be reopened."""
+    for record in list(board.conn.execute("SELECT key,value FROM board_state WHERE key LIKE 'request.successor.%'")):
+        link = json.loads(record['value'])
+        if link.get('source_post_id') != post_id or link.get('recipient') != recipient:
+            continue
+        successor = int(record['key'][len(SUCCESSOR_PREFIX):])
+        post = board.conn.execute('SELECT * FROM posts WHERE id=?', (successor,)).fetchone()
+        rows = requests.for_post(board, post) if post is not None else []
+        if any(r['recipient'] == link.get('successor_recipient') and r['state'] != 'finished' for r in rows):
+            return successor, link['successor_recipient']
+    return None
+
+
+def guard_superseded(board, p, post_id, row):
+    """Who may retire this exact request as obsolete (DESIGN_NOTES "Superseding linked requests").
+
+    Generic requests keep the ordinary update rules. Human answer lineage, routed successors and recovery
+    acknowledgements may be superseded by their assigned agent only, and an original only once its routed successor
+    is settled. Managed continuations and shared-issue posts keep their own workflows."""
+    if workstreams.get_for_post(board, post_id) is not None:
+        raise Forbidden(MANAGED_REFUSAL)
     if board.conn.execute('SELECT 1 FROM issue_links WHERE post_id=?', (post_id,)).fetchone():
-        raise Forbidden('issue-linked request cannot be superseded through a reply')
+        raise Forbidden('issue-linked request ' + ISSUE_REFUSAL)
     if board.conn.execute('SELECT 1 FROM issue_answer_links WHERE answer_post_id=?', (post_id,)).fetchone():
-        raise Forbidden('issue answer cannot be superseded through a reply')
+        raise Forbidden('issue answer ' + ISSUE_REFUSAL)
+    if _linked(board, post_id):
+        # Routing (requests.assign) can make the post's author, or in principle the human, the assignee of another
+        # recipient's row; neither retires a linked request (the author would also skip the session ownership check
+        # that requests.progress waives for an author's finish).
+        author = board.conn.execute('SELECT agent FROM posts WHERE id=?', (post_id,)).fetchone()['agent']
+        if p.is_human or p.name == author or p.name != row['assigned_agent']:
+            raise Forbidden('only its assigned agent, not the human or the post\'s author, may supersede a linked '
+                            'request')
+    successor = open_successor(board, post_id, row['recipient'])
+    if successor is not None:
+        raise Conflict(f'request was routed to successor #{successor[0]}/{successor[1]}, which is still open: '
+                       'settle the successor first (it carries this request\'s authorization)')
 
 
 def create(board, p, session_id, request_reply, idempotency_key, post_fields, *, nested=False, answer_recipient=None):
@@ -88,7 +137,7 @@ def create(board, p, session_id, request_reply, idempotency_key, post_fields, *,
         if reply.get('completion') is not None and (reply['state'] != 'finished' or workstreams.get_for_post(board,source['id']) is None):
             raise Invalid('completion is only valid for finishing a managed continuation')
         if reply.get('disposition') == 'superseded':
-            guard_superseded(board, source['id'])
+            guard_superseded(board, p, source['id'], row)
         post = board.create_post(p, session_id, **fields, _in_transaction=True)
         result = requests.progress(board, p, session_id, source['id'], reply['recipient'], reply['state'],
             reason=reply['reason'], evidence_post_ids=[post['id']], expected_version=reply['expected_version'],

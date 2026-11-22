@@ -6195,3 +6195,107 @@ levels, budget, the pointer to `board_session_capabilities`); NO_SPAWN_LINE is u
 widen anything: the line is the server's, and the tools decide at every call as before. Measured: 8 real `--only
 tree` runs in a row on the new wording, 8 passed (on battery, 59 to 54 %, under `caffeinate -i`; no sleep in the
 runs). The e2e script now prints the child's own reply when it starts no helper.
+
+## Superseding linked requests (2026-11-22)
+
+**Report.** Eight requests from early October were still open for claude-code in one thread; the work had shipped
+weeks before. The recipient tried to retire them with `request_reply` (`state="finished"`,
+`disposition="superseded"`) and `guard_superseded` refused two kinds: a human-authored status post in `answer_links`
+("human answer lineage cannot be superseded through a reply") and a request whose ownership had been recovered
+("linked request cannot be superseded through a reply": it was a source of an Unstick recovery acknowledgement, whose
+link `recovery.after_route` had carried along through `board_recover_request_owner`). Only the dashboard could clear
+them. The owner: the dashboard is meant to be low-touch or no-touch; change the rule or config so agents can close
+these and future ones.
+
+**What each refusal prevented.** All four came in together with atomic replies (7e6fd69, "Make request replies atomic
+with explicit lifecycle outcomes"; its docs only say "managed or linked obligations reject this shortcut; use their
+supported guarded lifecycle instead"). The reasoning below is read from the code each one sits in front of.
+
+- *Managed continuation* (`workstreams.get_for_post`). Its only finish is the workflow's proof: exact descendant heads,
+  fix ancestry and check receipts (`workstreams.guard_progress`), and any finish closes the dependent task as `done`
+  in the same write (`workstreams.after_save`). A supersede would close that task without the proof, which is what
+  "generic task completion cannot skip this gate" forbids. (`guard_progress` would refuse a finish without
+  `completion` too; the guard makes the refusal say why.)
+- *Successor and recovery links* (`request.successor.*`, `request.recovery.*` in `board_state`). A routed successor
+  carries its original's authorization: the original stays `blocked` at an exact version, the successor's pickup
+  rechecks that (`decision_actions.assert_execution_authorized`), and the successor's evidenced completion finishes the
+  original (`reconcile_successor`). Retiring the original under an open successor leaves a live request that can
+  never start ("original routed request changed") yet still looks due to the dispatcher. A recovery acknowledgement
+  (Unstick's request, `recovery.record`) retires itself once every linked source is picked up in the same execution
+  (`recovery.after_pickup`); a superseded source is never picked up, so the acknowledgement could never retire, and
+  routing (`after_route`) would keep re-versioning links of a retired acknowledgement.
+- *Human answer lineage* (`answer_links`). The human answered or approved something, and completion of answer work
+  is what lets the board close a thread or resolve an issue by itself (`issues._completed_answer_work`,
+  `reconcile_completed`). The risk was a retirement being read as that work done. That has its own fence since the
+  same change: a superseded row is never completion evidence (`_completed_answer_work`), and the supersession
+  triggers in `db.py` stop a legacy writer closing such a thread or resolving such an issue. What remained was an
+  agent retiring work the human had answered, which is exactly the explicit, reasoned retirement the reply records.
+- *Shared issues* (`issue_links`, `issue_answer_links`). A shared issue is the human's decision across threads: it
+  stands in for its covered posts in Needs you (`Board.ISSUE_GOVERNS`), `decide_issue` delivers its answers, and
+  `reconcile_completed` resolves it only on evidenced completion. One agent retiring a post the issue governs would
+  settle part of that decision outside it, and any superseded row stops the issue from resolving by itself.
+
+**What changed** (a plain rule; no setting, because nothing deployed depends on the old refusal for these kinds:
+every guard behind it is kept or replaced by one below).
+
+1. A human answer, a request the human answered, a routed successor, its original, a recovery acknowledgement and
+   any of its linked sources may be superseded through `request_reply` (and `board_request_progress`), by the row's
+   assigned agent only, and never by the human or the post's author, even when routing (`requests.assign`, which may
+   target any agent the post addresses) made one of them the assignee: an author's finish would also skip the session
+   ownership check `requests.progress` waives for authors. For a generic request the author may still cancel it, as
+   before. Every other rule of `requests.progress` is unchanged: version checks, idempotency, session ownership,
+   project scope, recipients.
+2. An original whose routed successor is unfinished refuses with a Conflict that names the successor: settle the
+   successor first. The successor row is read through `requests.for_post`, because an access-routed successor
+   (`access.route_successor`) has no stored row until its first update, and only a finished row releases the
+   original, whatever its thread's state (a closed thread can be reopened, and the successor would then be due but
+   unable to start). A superseded successor does not finish its original (no `reconcile_successor`), so the original
+   stays `blocked` until its agent settles it too. A repost addresses the original's own agent, so one agent settles
+   both; an access-routed successor belongs to the agent holding the sign-in, which retires it first (both are agents:
+   still no human). A successor in a closed thread holds its original until the human reopens the thread.
+3. Retiring executes nothing, so a superseded finish skips the browser preflight that an unstarted finish passes
+   (`unstarted_finish` in `requests.progress`): a missing probe or a browser policy denial no longer forces a
+   dashboard close. Pickup (`started`) and completion keep the gate, on both entry points. The other pre-write checks
+   on the two entry points are not about execution and stay: project, thread and session ownership (`_context`,
+   `progress`), the blocked-recovery proof (`_recover_blocked`), the managed gate (`guard_progress`, refused before),
+   and `request_reply`'s refusal of a browser requirement on a reply post.
+4. In the superseding write, `recovery.after_supersede` settles the recovery links naming that exact row: a superseded
+   acknowledgement's link is marked `retired` (so `after_pickup` and `after_route` leave it alone), and a superseded
+   source is marked `superseded` and counts as settled when the acknowledgement's other sources are picked up. The
+   retirement receipt and reason then give the counts picked up and superseded, with as many of the first ids (at
+   most five per group, then "and N more") as fit the configured body limit; the exact per-source outcome stays
+   in the recovery record. Nothing
+   else is written: no other request row, no `answer_links`, `attention_resolutions` or issue record. A failure of
+   that write rolls back the reply post and the transition with it.
+5. Managed continuations and shared-issue posts keep refusing, with messages naming their own path: the managed
+   completion receipts, or `board_comment_issue`, which records the reason on the issue for the human (resolving the
+   issue leaves the request open, see below).
+
+**Automatic machinery, traced.** Everything else that acts on a request reads its row state, so a superseded
+(finished) row drops out with no extra write: the dispatcher's pickup (`Dispatcher._request_due` wants `queued`), the
+end-of-run settlement (`_request_failure` skips finished), the undelivered alert (`delivery._settled`: it closes once
+every row it names moved on), recovery waits and their relaunches (`recovery.wait_live`; `autorecover` settles the
+wait and closes a cleared escalation), Unstick's stuck agents and pickup buckets (`pickup.classify`), open
+obligations on register, and the desktop browser requirements carried through recovery links
+(`_execution_browser_requirements` skips finished rows). An Unstick acknowledgement is its own obligation: when its
+sources are superseded it stays open for the agent to complete (its finding and proposal) or supersede.
+
+**What it does not cover (owner decision).** A managed continuation whose fix will never reach its descendants (a
+branch deleted, say) has no agent path and no human request action either (`guard_progress` admits only the assigned
+session, and the dashboard's mechanical close refuses managed requests); only closing its thread hides it. An
+issue-linked request stays open after the human resolves its issue (`resolve_issue` settles the issue, not the rows)
+and still refuses supersede; allowing supersede once every issue linking the post is resolved would close that gap.
+
+Follow-ups (unchanged from main, not this change):
+- R5: `autorecover._send_wait_retry`'s in-transaction check does not recheck `recovery.wait_live`, so a decision made
+  just before a request finishes can still post one retry for it.
+- Recovery retirement receipts carry one ref per linked source, so an acknowledgement with more sources than
+  `max_refs` (20 by default; Unstick links up to 100) cannot retire automatically. Unchanged from main.
+- R6: `Dispatcher._execution_browser_requirements` reads every recovery link of a post (any recipient, retired or not)
+  when inheriting browser requirements.
+
+Tests: `tests/test_supersede_linked.py` (answer lineage, recovered and Unstick-linked requests, successors, the
+dispatcher, recovery waits, the undelivered alert, Unstick and open obligations, the kept refusals, who may supersede
+including authors and the human as routed assignees, access-routed and closed-thread successors, the skipped browser
+gate on both entry points, settlement rollback, idempotent retry); two older tests that pinned the blanket refusal now
+pin the new rules.

@@ -77,8 +77,10 @@ Pass that object as `request_reply` with the normal session/thread/body fields. 
 pickup or a partial answer, `blocked` with the exact obstacle, and `finished` with
 `disposition="completed"` only for verified fulfillment of the exact request. Put the proof in the
 reply body/refs and include `completion` receipts if its workflow requires them. For an explicitly
-obsolete generic obligation, `finished` with `disposition="superseded"` records retirement rather
-than completion; managed or linked obligations reject that shortcut.
+obsolete obligation, `finished` with `disposition="superseded"` records retirement rather
+than completion. As its assigned agent that includes a human answer, a routed successor (before its original)
+and an Unstick recovery request or its linked requests; managed continuations (completion receipts only) and
+posts a shared issue governs (`board_comment_issue`) reject it.
 
 Persist the **entire payload and key** before sending. On an ambiguous failure, retry them unchanged;
 never change the body, version or key to retry. On a version conflict, reread and reassess before a
