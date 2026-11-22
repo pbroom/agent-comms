@@ -14,9 +14,10 @@ Records (`board_state`)
   its project, its marks over the posts table and its `pending` posts (hosted_wake._look's fields), the posts it was
   delivered and was shown afterwards (`delivered`, `read`), the posts the dispatcher claimed, and at most one `offer`.
 - *Pair* `wake.pair.<agent>.<hash of the project>`: the agent's wake limits in the project (`sent`, `threads`:
-  hosted_wake._lift's and `_thread`'s fields), the posts delivered to any of its waiters (`delivered`), one hold
-  deadline per request (`holds`), and the delivered posts nobody read that came back once (`returned`: when;
-  `returning`: the ones still waiting for a waiter). A new conversation id resets none of it.
+  hosted_wake._lift's and `_thread`'s fields), the posts delivered to any of its waiters (`delivered`, and to which
+  conversation: `delivered_to`), the reads of them by a session registered in the project (`read`), the requests the
+  dispatcher reserved (`claimed`, also when no waiter is left in the project), and one hold deadline per request
+  (`holds`). A new conversation id resets none of it.
 
 The offer: a state machine (every transition is ONE write transaction; `now` is read inside it)
 - *Every write transaction* in this module reads the live setting right after it holds the lock, before it changes
@@ -53,13 +54,9 @@ The offer: a state machine (every transition is ONE write transaction; `now` is 
   offered those posts). The replaced process wakes the same conversation, once; it is the answer it was owed. No
   double wake comes this way: a process whose first reply it could read has exited and never replays, and a replay
   changes and charges nothing. Only the nonce that made the ack, of that conversation's record, gets it.
-- *O5 return unread* (`_return_unread`, from `_advance`): a post delivered UNREAD_SECONDS ago or more that no board
-  session that can be a waiter's own has read since (`read_after_delivery`, the evidence `holds` uses) and that still
-  qualifies (nobody read past it, not claimed) comes back ONCE: it leaves the pair's `delivered`, is marked
-  `returned`, and waits in `returning` until O1 adds it to the offer of the next waiter chosen in the pair (normally
-  the same conversation's next hook). Its next acknowledgement charges nothing for it, and it never comes back a
-  second time. The dispatcher's hold is not extended: it still ends at the request's first-offer deadline. Why: a
-  hook's exit 2 may be reported by Claude Code and start no turn (DESIGN_NOTES "Known Claude Code behaviour").
+- A delivered post is never offered again (review round 5 removed the earlier unread return). If Claude Code starts
+  no turn for a wake, the session's own board check shows the post at its next prompt, and the dispatcher's grace
+  applies to a request it could run (DESIGN_NOTES "Known Claude Code behaviour").
 - *O4 take back* STALE (or STANDING, below) -> NONE (`_take_back`). Its posts go back to `pending` (except the
   claimed ones), nothing is charged. Made by: `_advance` for any offer of the pair that no longer stands; a nonce
   take-over (before the waiter is rebound to another project); `_hand` (above); `claim` of a post of an issued
@@ -120,7 +117,6 @@ CLIENTS = ("claude-code", "codex")
 NONCE_RE = re.compile(r"[0-9a-f]{32}")
 ACK_RE = re.compile(r"[0-9a-f]{16}")
 ACK_SECONDS = 10.0               # an offer not acknowledged in this long is taken back
-UNREAD_SECONDS = 90.0            # a delivered post nobody read in this long comes back once (O5)
 
 OFF = {"state": "off"}
 IDLE = {"state": "idle"}
@@ -226,11 +222,9 @@ def _pair(conn, agent: str, project: str) -> dict:
             "threads": raw["threads"] if isinstance(raw.get("threads"), dict) else {},
             "closing": [], "hour_ack": raw.get("hour_ack") if _num(raw.get("hour_ack")) else None,
             "delivered": _times(raw.get("delivered")), "holds": _times(raw.get("holds")),
-            "returned": _times(raw.get("returned")), "read": _times(raw.get("read")),
+            "read": _times(raw.get("read")), "claimed": _times(raw.get("claimed")),
             "delivered_to": {k: v for k, v in raw["delivered_to"].items() if isinstance(v, str)}
             if isinstance(raw.get("delivered_to"), dict) else {},
-            "returning": {k: e for k, e in raw["returning"].items() if isinstance(e, list)}
-            if isinstance(raw.get("returning"), dict) else {},
             "seen": raw.get("seen") if _num(raw.get("seen")) else 0.0}
 
 
@@ -239,11 +233,10 @@ def _save_pair(c, pair: dict, now: float) -> None:
     pair["delivered"] = hosted_wake._recent(pair["delivered"], now, hosted_wake.KEEP_WOKEN_SECONDS,
                                             hosted_wake.MAX_WOKEN)
     pair["holds"] = {k: t for k, t in pair["holds"].items() if t > now - hosted_wake.KEEP_WOKEN_SECONDS}
-    pair["returned"] = hosted_wake._recent(pair["returned"], now, hosted_wake.KEEP_WOKEN_SECONDS, hosted_wake.MAX_WOKEN)
-    pair["returning"] = {k: e for k, e in pair["returning"].items() if k in pair["returned"]}
-    pair["read"] = hosted_wake._recent(pair["read"], now, hosted_wake.KEEP_WOKEN_SECONDS, hosted_wake.MAX_WOKEN)
+    for table in ("read", "claimed"):
+        pair[table] = hosted_wake._recent(pair[table], now, hosted_wake.KEEP_WOKEN_SECONDS, hosted_wake.MAX_WOKEN)
     pair["delivered_to"] = {k: v for k, v in pair["delivered_to"].items()
-                            if k in pair["delivered"] or k in pair["returned"] or k in pair["read"]}
+                            if k in pair["delivered"] or k in pair["read"]}
     pair["closing"], pair["seen"] = [], now
     _put(c, _pair_key(pair["agent"], pair["project"]), pair, HUB, now)
 
@@ -344,7 +337,6 @@ def _advance(board: Board, c, key: str, rec: dict, p: Principal, cfg, now: float
         hosted_wake._look(board, c, rec, {"project": rec["project"]}, p, top, top_id)
         hosted_wake._lift(c, pair, max(pair["sent"], default=None))
     recs = _records(c, rec["agent"], rec["project"]) | {key: rec}
-    _return_unread(board, c, pair, recs, p, now)
     for k, r in recs.items():
         if r["offer"] is not None and not _stands(board, c, k, r, now, recs):
             _take_back(c, r)
@@ -352,8 +344,7 @@ def _advance(board: Board, c, key: str, rec: dict, p: Principal, cfg, now: float
                 _save(c, k, r, now)
     if _hosted_root(c, rec["agent"], rec["project"]):
         rec["pending"] = {}     # the hosted session's posts: they never wake a waiter, also once it has ended
-    elif ((rec["pending"] or pair["returning"]) and enabled(board)
-          and not any(r["offer"] is not None for r in recs.values())):
+    elif rec["pending"] and enabled(board) and not any(r["offer"] is not None for r in recs.values()):
         sent = hosted_wake._recent(pair["sent"], now, hosted_wake.HOUR)
         if (_chosen(c, key, rec, now, recs) and len(sent) < cfg.max_wakes_per_hour
                 and not (sent and now - max(sent) < cfg.wake_min_interval_seconds)):
@@ -361,36 +352,11 @@ def _advance(board: Board, c, key: str, rec: dict, p: Principal, cfg, now: float
     _save_pair(c, pair, now)
 
 
-def _pair_due(conn, rec: dict, now: float) -> bool:
-    """The waiter's pair has something to do: a delivered post due for O5, or returned posts waiting for an offer."""
-    pair = _pair(conn, rec["agent"], rec["project"])
-    return bool(pair["returning"]) or any(now - t >= UNREAD_SECONDS and k not in pair["returned"]
-                                          for k, t in pair["delivered"].items())
-
-
-def _return_unread(board: Board, c, pair: dict, recs: dict, p: Principal, now: float) -> None:
-    """O5 (module docstring), on the pair, inside the caller's transaction."""
-    due = [k for k, t in pair["delivered"].items() if now - t >= UNREAD_SECONDS and k not in pair["returned"]
-           and not any(k in r["claimed"] for r in recs.values())]
-    if not due:
-        return
-    claimed = {k: t for r in recs.values() for k, t in r["claimed"].items()}
-    still = hosted_wake._qualifying(board, p, pair["project"], [int(k) for k in due], {"claimed": claimed})
-    for k in due:
-        pair["returned"][k] = now           # once: never again, read or not
-        if k in still and not read_after_delivery(c, pair["agent"], pair["project"], int(k)):
-            del pair["delivered"][k]
-            pair["returning"][k] = still[k]
-            log.info("pair %s: delivered post %s was not read; it comes back once", pair["project"], k)
-
-
 def _offer(board: Board, c, key: str, rec: dict, pair: dict, p: Principal, cfg, now: float) -> None:
-    """O1. The pair's returned posts (O5) join this waiter's pending ones first."""
-    for k, e in pair["returning"].items():
-        rec["pending"].setdefault(k, e)
+    """O1. Never a post delivered in the pair or reserved by the dispatcher there."""
     rec["pending"] = {k: e for k, e in hosted_wake._qualifying(
-        board, p, rec["project"], [int(k) for k in rec["pending"]], rec).items() if k not in pair["delivered"]}
-    pair["returning"] = {k: e for k, e in pair["returning"].items() if k in rec["pending"]}
+        board, p, rec["project"], [int(k) for k in rec["pending"]], rec).items()
+        if k not in pair["delivered"] and k not in pair["claimed"]}
     batch = {k: e for k, e in rec["pending"].items() if not hosted_wake._stopped(pair, e[0])}
     for tid in sorted({e[0] for e in batch.values()}):
         t = hosted_wake._thread(c, pair, tid)
@@ -402,7 +368,6 @@ def _offer(board: Board, c, key: str, rec: dict, pair: dict, p: Principal, cfg, 
     rec["offer"] = {"id": secrets.token_hex(8), "nonce": rec["nonce"], "at": now, "entries": batch}
     for k in batch:
         del rec["pending"][k]
-        pair["returning"].pop(k, None)
         pair["holds"].setdefault(k, now + float(cfg.wake_grace_seconds))    # one deadline per request
     log.info("waiter %s: wake offered for %d post(s)", key, len(batch))
 
@@ -450,10 +415,8 @@ def _ack(board: Board, p: Principal, key: str, body: dict) -> dict:
             return REJECTED
         pair = _pair(c, rec["agent"], rec["project"])
         hosted_wake._lift(c, pair, max(pair["sent"], default=None))     # the human's new posts first
-        fresh = {k: e for k, e in o["entries"].items() if k not in pair["returned"]}   # O5's come back uncharged
-        if fresh:
-            pair["sent"].append(now)
-        for tid in sorted({e[0] for e in fresh.values()}):
+        pair["sent"].append(now)
+        for tid in sorted({e[0] for e in o["entries"].values()}):
             hosted_wake._thread(c, pair, tid)["count"] += 1
         for k in o["entries"]:
             rec["delivered"][k] = pair["delivered"][k] = now
@@ -483,8 +446,7 @@ def poll(board: Board, p: Principal, body: Any) -> dict:
         return SUPERSEDED
     if (rec is not None and rec["nonce"] == body["nonce"] and seen_at - rec["seen"] < HEARTBEAT_SECONDS
             and (board.is_paused() or (rec["offer"] is None and not rec["pending"]
-                                       and hosted_wake._tops(conn)[0] <= rec["mark"]
-                                       and not _pair_due(conn, rec, seen_at)))):
+                                       and hosted_wake._tops(conn)[0] <= rec["mark"]))):
         return IDLE         # nothing new since the last look: no write
     cfg = hosted_wake.limits(board)
     with db.write_tx(conn) as c:
@@ -572,8 +534,7 @@ def tick(board: Board) -> None:
                 if board.is_paused():
                     continue        # nothing is decided while paused (checked in this transaction)
                 if rec["offer"] is None and (not _present(rec, now) or (
-                        hosted_wake._tops(c)[0] <= rec["mark"] and not rec["pending"]
-                        and not _pair_due(c, rec, now))):
+                        hosted_wake._tops(c)[0] <= rec["mark"] and not rec["pending"])):
                     continue        # nobody to offer it to, or nothing new: no write
                 p = hosted_wake._agent(c, rec["agent"])
                 if p is None:
@@ -645,20 +606,22 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     if not on or type(post_id) is not int or not isinstance(project, str):
         return False
     project, k = project.rstrip("/") or "/", str(post_id)
+    pair = _pair(conn, agent, project)
+    until = pair["holds"].get(k)
+    if until is None or k in pair["claimed"]:
+        return False        # never offered in the pair, or the dispatcher's
     recs = _records(conn, agent, project)
-    if not recs or any(k in r["claimed"] for r in recs.values()):
-        return False
-    until = _pair(conn, agent, project)["holds"].get(k)
-    if until is None:
+    if any(k in r["claimed"] for r in recs.values()):
         return False
     return now < until or read_after_delivery(conn, agent, project, post_id)
 
 
 def claim(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> None:
     """Inside the dispatcher's reservation (hosted_wake.reserve): the request is the dispatcher's from here on. It
-    leaves every waiter of the pair (waiting, delivered, read) and the pair's holds; an offer that covers it is taken
-    back whole (O4), so that its id is never acknowledged for a batch it no longer is. Off, or without a waiter:
-    nothing is written. It opens no transaction of its own: the setting is read here, inside the caller's."""
+    leaves every waiter of the pair (waiting, delivered, read) and the pair's holds, and is recorded on the pair as
+    claimed (also when no waiter is left there); an offer that covers it is taken back whole (O4), so that its id is
+    never acknowledged for a batch it no longer is. Off, or without a waiter or pair: nothing is written. It opens
+    no transaction of its own: the setting is read here, inside the caller's."""
     conn, on = _live(board_or_conn)
     if not on or type(post_id) is not int or not isinstance(project, str):
         return
@@ -676,19 +639,22 @@ def claim(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         for table in ("pending", "delivered", "read"):
             rec[table].pop(k, None)
         _save(conn, key, rec, now)
-    if recs:
+    if recs or _get(conn, _pair_key(agent, project)) is not None:
+        # On the pair too, also when no waiter is left in the project (the one that was offered it moved on): a
+        # reserved request is never held or offered again in the pair.
         pair = _pair(conn, agent, project)
         pair["holds"].pop(k, None)
-        pair["returning"].pop(k, None)
+        pair["claimed"][k] = now
         _save_pair(conn, pair, now)
 
 
 def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> None:
-    """Where the board returns posts to a reader (beside hosted_wake.handed): note, for `holds` and O5, that a board
-    session that can be the own session of a waiter a post was delivered to was shown it. The mark is kept on the
-    pair of the reader's project (and on the waiter, while the waiter is still in that project), so it survives the
-    waiter moving on. Off, or without a delivered post among them: one settings read and a few reads, no write.
-    Never raises."""
+    """Where the board returns posts to a reader (beside hosted_wake.handed): note, for `holds`, that a board session
+    that can be the own session of a waiter a post was delivered to was shown it. Only a post of a thread in the
+    project the reader is registered in counts (hosted_wake._own_reader's rule): a read in another project is no sign
+    the request is being worked on where it belongs. The mark is kept on the pair (and on the waiter, while the
+    waiter is still in that project), so it survives the waiter moving on. Off, or without a delivered post among
+    them: one settings read and a few reads, no write. Never raises."""
     try:
         if p.is_human or not enabled(board):
             return
@@ -698,6 +664,9 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
         if row is None:
             return
         project = row["project"].rstrip("/") or "/"
+        ids = [k for k in ids if (board.conn.execute(
+            "SELECT t.project FROM posts p JOIN threads t ON t.id = p.thread_id WHERE p.id = ?", (int(k),)).fetchone()
+            or [None])[0] == project]
         todo = []
         for k in ids:
             at, pair, recs = _delivery(board.conn, p.name, project, k)

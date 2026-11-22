@@ -335,13 +335,12 @@ What it does not cover:
   synchronously in a stream-json session (as the desktop app runs Claude Code) when a flag is set late, and that an
   explicit `"async": true` takes the background path. A second reported case was the Mac sleeping, not this.
   So the `SessionStart` hook `--wake` writes carries both `"async": true` and `"asyncRewake": true` (the `Stop` hook
-  is unchanged), and its wake is written no sooner than 10 s after the hook started. And a delivered wake that no
-  session of the agent in the project has read within 90 s comes back once, uncharged, for the next waiting session
-  (normally the same session's next turn). With this configuration, 19 of 19 traced test runs on mains power woke
-  the session (the post made right after the hook armed); runs with the post made later are still to do. In the
-  worst case, a wake that
-  starts no turn, the post waits for the session's next turn (when its `Stop` hook is offered it again), or, for a
-  request the dispatcher could run, for the request's grace to end. If a backgrounded `SessionStart` wake is ever
+  is unchanged), and its wake is written no sooner than 10 s after the hook started. With this configuration, 19 of
+  19 traced test runs on mains power woke the session (the post made right after the hook armed); runs with the post
+  made later are still to do. In the worst case, a delivered wake whose turn Claude Code never starts, the wake is
+  not offered again: the post is shown at the session's next prompt by the board check the installer prints for
+  `UserPromptSubmit` (`prompt-check.sh`, which counts posts addressed to the agent since its last check, whatever
+  the wake recorded; add that hook too), and for a request the dispatcher could run, the request's grace applies. If a backgrounded `SessionStart` wake is ever
   seen to miss its turn, arm on `Stop` only: delete the `SessionStart` entry that runs `wait.sh` from
   `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (`--wake` would add it back). A session is then wakeable only
   after its first turn since it opened or resumed.

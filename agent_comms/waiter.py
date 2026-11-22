@@ -236,7 +236,10 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
         if state == "idle":
             rejected = 0        # the cap is on rejections in a row, not over a long session
         if state == "wake":
-            not_before = started + STARTUP_GRACE if hook.get("hook_event_name") == "SessionStart" else None
+            # The start-up grace of a SessionStart hook, but never past this command's own deadline (S32): the ack
+            # is committed by then, so at the deadline the wake is written rather than lost.
+            not_before = (min(started + STARTUP_GRACE, deadline)
+                          if hook.get("hook_event_name") == "SessionStart" else None)
             woken = _woken(client, body, answer, stderr, not_before, clock, sleep, trace)
             if woken is not None:
                 return woken

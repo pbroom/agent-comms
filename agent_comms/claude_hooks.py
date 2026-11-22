@@ -5,7 +5,8 @@
 
 The hooks are a `Stop` and a `SessionStart` command hook with `"asyncRewake": true` running `command()`; the
 SessionStart one also has `"async": true` (`hook_for`). A hook is ours only when it sits under `Stop` or
-`SessionStart` and is exactly one of the shapes this module writes or wrote (`SHAPES`): the keys `type` ("command"),
+`SessionStart` and is exactly one of the shapes this module writes or wrote under that event (`SHAPES`: under Stop
+only the four-key one; under SessionStart that and the five-key one): the keys `type` ("command"),
 `command` (exactly `AGENT_COMMS_HOME='<dir>' AGENT_COMMS_AGENT='<name>' bash '<this script>'`), `asyncRewake` (true),
 `timeout`, and possibly `async` (true). `add` replaces ours (idempotent, and a new agent or board home takes
 effect); `remove` takes out ours and nothing else, and drops only a group, event list or `hooks` object that taking
@@ -34,10 +35,12 @@ def command(home: str, agent: str, script: str) -> str:
     return f"AGENT_COMMS_HOME='{home}' AGENT_COMMS_AGENT='{agent}' bash '{script}'"
 
 
-# The keys of a hook this module writes: SessionStart's now (with "async"), and the earlier shape, which every event
-# had before and Stop still has. Both are recognised, so that --remove-wake and a re-run of --wake clean up an entry an
-# earlier version wrote.
-SHAPES = ({"type", "command", "asyncRewake", "timeout"}, {"type", "command", "async", "asyncRewake", "timeout"})
+# The keys of a hook this module writes, per event (S31: ownership is per event). Stop: the four-key shape, as ever.
+# SessionStart: the five-key one with "async" it writes now, and the four-key one earlier versions wrote there, so
+# that --remove-wake and a re-run of --wake clean up such an entry. A five-key hook under Stop is someone else's.
+FOUR = frozenset({"type", "command", "asyncRewake", "timeout"})
+FIVE = FOUR | {"async"}
+SHAPES = {"Stop": (FOUR,), "SessionStart": (FOUR, FIVE)}
 
 
 def hook_for(event: str, cmd: str, timeout: int = TIMEOUT) -> dict:
@@ -50,8 +53,8 @@ def hook_for(event: str, cmd: str, timeout: int = TIMEOUT) -> dict:
     return {"type": "command", "command": cmd, "asyncRewake": True, "timeout": timeout}
 
 
-def _ours(hook, script: str) -> bool:
-    if not (isinstance(hook, dict) and set(hook) in SHAPES and hook["type"] == "command"
+def _ours(hook, script: str, event: str) -> bool:
+    if not (isinstance(hook, dict) and set(hook) in SHAPES.get(event, ()) and hook["type"] == "command"
             and hook["asyncRewake"] is True and hook.get("async", True) is True
             and isinstance(hook["command"], str) and type(hook["timeout"]) is int):
         return False
@@ -71,11 +74,11 @@ def strip(settings: dict, script: str) -> dict:
         kept, took = [], False
         for g in groups:
             inner = g.get("hooks") if isinstance(g, dict) else None
-            if not isinstance(inner, list) or not any(_ours(h, script) for h in inner):
+            if not isinstance(inner, list) or not any(_ours(h, script, event) for h in inner):
                 kept.append(g)
                 continue
             took = True
-            rest = [h for h in inner if not _ours(h, script)]
+            rest = [h for h in inner if not _ours(h, script, event)]
             if rest or set(g) != {"hooks"}:
                 kept.append(g | {"hooks": rest})
         if took and not kept:
@@ -95,7 +98,7 @@ def add(settings: dict, script: str, cmd: str, timeout: int = TIMEOUT) -> dict:
     for event in EVENTS:
         if not isinstance(hooks.get(event, []), list):
             raise ValueError(f"the settings file's hooks.{event} is not a list")
-    if not _ours(hook_for("Stop", cmd, timeout), script):
+    if not all(_ours(hook_for(event, cmd, timeout), script, event) for event in EVENTS):
         raise ValueError("the command must run the script exactly as command() writes it")
     settings = strip(settings, script)
     hooks = settings.setdefault("hooks", {})

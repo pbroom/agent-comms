@@ -4164,14 +4164,15 @@ around it:
   hub's ack deadline stands, but writes it and exits 2 only once `waiter.STARTUP_GRACE` (10 s) has passed since the
   hook process started. A wake offered later is written at once. The Stop hook is unchanged. While it waits out the
   grace, SIGTERM, SIGHUP, SIGINT or the Claude process going away still end it with exit 0.
-- **M2**, the state machine's O5, recovers if a wake starts no turn anyway. A delivered post that no session that
-  can be the waiter's own reads within `interactive_wake.UNREAD_SECONDS` (90 s) comes back once and uncharged. It
-  goes to the next waiter that arms for that agent and project, normally the same conversation's next hook.
+- **M2** (an unread return) was added and then removed in review round 5; see there.
 
-What the user sees in the worst case: the post waits for the session's next turn, when its Stop hook arms and
-is offered it again, or, for a request the dispatcher could run, for the request's grace to end.
+What the user sees in the worst case: the wake is not offered again. The session's UserPromptSubmit board check
+shows the post at its next prompt, and a request the dispatcher could run goes to it when its grace ends.
 
 ### Waking an interactive session: M1 and M2 (2026-11-21)
+
+(M2, the unread return, was removed in review round 5. What follows records how it was built. The read-evidence
+fix found while it was built stays.)
 
 - **M1** (`waiter.py`): `hook_event_name` from the hook's stdin tells a SessionStart hook from a Stop hook. Only a
   SessionStart hook waits out STARTUP_GRACE, counted from when `board wait` started; the hook started a moment
@@ -4241,8 +4242,8 @@ async_hook_<n>", logged just before "Hooks: SessionStart:startup [...]". A worki
 ### Waking an interactive session: the SessionStart hook's shape (2026-11-21)
 
 **Decision (c).** The `SessionStart` hook carries `"async": true` beside `"asyncRewake": true`
-(`claude_hooks.hook_for`). M1 (the 10 s start-up grace) and M2 (O5, the unread return) stay as built. The `Stop` hook
-is unchanged.
+(`claude_hooks.hook_for`). M1 (the 10 s start-up grace) stays as built; M2 (the unread return) was removed in review
+round 5. The `Stop` hook is unchanged.
 
 **What is known and what is not.**
 - *One clean missed turn,* before M1. A SessionStart hook exited 2 about 2 s after launch, Claude Code reported
@@ -4264,9 +4265,9 @@ is unchanged.
   went back to battery.
 
 **The worst case, and the fallback.**
-- *Worst case:* a SessionStart wake that starts no turn. The post comes back after 90 s (O5) for the next waiter,
-  which is that session's `Stop` hook once the human starts a turn there; a request the dispatcher could run goes
-  to it when its grace ends.
+- *Worst case:* a SessionStart wake that starts no turn. It is not offered again. The session's UserPromptSubmit
+  board check shows the post at its next prompt, and a request the dispatcher could run goes to it when its grace
+  ends.
 - *Fallback:* if a backgrounded SessionStart wake is ever caught missing its turn, arm on `Stop` only. Delete the
   SessionStart entry from the settings file, and change `claude_hooks.EVENTS` to `("Stop",)` so that `--wake`
   writes only that. A session is then wakeable only after its first turn since it opened or resumed.
@@ -4275,3 +4276,64 @@ is unchanged.
 a re-run of `--wake` replaces an entry an earlier version wrote (once), and `--remove-wake` takes out either. The
 e2e's real step uses exactly what the installer writes; `--old-hook-shape` reproduces the earlier SessionStart entry
 for comparison.
+
+### Waking an interactive session: review round 5 (2026-11-21)
+
+Round 5 (on 9510348) found seven points, five of them races in M2, the unread return added since round 4.
+
+**M2 is removed rather than fixed.** M2 existed to recover a delivered wake that nobody acted on. With the explicit
+`async` on the SessionStart hook and M1, that has not happened in 31 traced real runs. When it does happen, M2
+could act only once a later hook arms, that is after the session's next turn. At that point the session's own board
+check on a user prompt already tells it about the posts addressed to it, and the dispatcher's grace covers a
+request with a dispatch rule. So M2 bought very little, and its state (`returning`, `returned`, the uncharged
+re-delivery, the surgery on the pair's delivered set) produced three blockers in one review round.
+
+Removed:
+- transition O5, `returning` and `returned`, UNREAD_SECONDS;
+- the uncharged re-delivery;
+- the fast-path and dispatcher-pass checks for a return due;
+- M2's tests, and the randomized test's unread move with its invariants. "No post delivered to two conversations"
+  is back to its strict form.
+
+The state machine in the docstring is O1–O4 and O3' again.
+
+**The prompt check, verified.**
+- `prompt-check.sh` (UserPromptSubmit) runs `board brief --session-from-stdin`. That keeps a high-water mark per
+  Claude session and counts the posts addressed to the agent above it, through `Board.brief`'s cursor-free view.
+  Nothing there reads the interactive wake's delivery or read marks. So a post the wake delivered and nobody read
+  is still reported at the session's next prompt (`test_a_delivered_wake_the_session_never_acted_on_is_still_
+  reported_by_the_prompt_check`).
+- Caveat: `install.sh` prints that hook (and `session-brief.sh` for SessionStart) for the user to add by hand;
+  `--wake` does not add it. Both are installed on this machine. Without them, the worst case is the dispatcher's
+  grace alone.
+
+**Kept: read evidence that survives a waiter moving project, with S30 fixed.**
+- The pair keeps the read marks, and `read_after_delivery` looks at every waiter record of the agent, so `holds`
+  after its deadline sees a read by a waiter that has since moved on. `holds` now works from the pair: earlier it
+  returned nothing once no waiter was left in the project.
+- **S30.** A read is recorded only for a post whose thread is in the project the reader is registered in. An
+  addressed-only read in the conversation's new project no longer counts for the old project's post, and no longer
+  keeps the dispatcher held past the grace.
+- Tests for both directions:
+  - `test_a_read_in_the_posts_project_by_a_waiter_that_moved_on_still_holds`;
+  - `test_a_read_in_another_project_is_no_read_evidence_for_the_posts_project` (it fails on 9510348).
+
+**S28, without M2.** A reserved request can no longer be offered to a later waiter: a new waiter's marks start
+above it. It could still be held again, though. If the waiter that was offered it had moved to another project,
+`claim` wrote nothing, so the pair's hold and its read evidence survived, and a later waiter plus a read in the
+project revived the hold. `claim` now records the reservation on the pair (`claimed`) whenever the pair exists, also
+with no waiter left. `holds` never holds a claimed post, and O1 never offers one
+(`test_s28_a_reserved_request_is_never_held_or_offered_again_once_its_waiter_moved_on`).
+
+**S29, without M2.** Nothing waits forever at the thread cap. A post at the per-thread maximum waits for the human's
+next post in that thread, which lifts the stop and lets it go; there is no uncharged retry to get stuck
+(`test_s29_a_post_at_the_thread_cap_waits_for_the_humans_post_and_then_goes`).
+
+**S31.** Installer ownership is per event. Under Stop only the four-key shape is ours. Under SessionStart, both the
+earlier four-key one and the current five-key one are. A manually configured five-key Stop hook with the same
+command is left alone by `--wake` and `--remove-wake` (`test_s31_ownership_is_per_event_a_five_key_stop_hook_is_
+not_ours`).
+
+**S32.** A SessionStart `board wait` never waits out the grace past its own `--max-seconds` deadline. If the
+deadline comes first, it writes the wake and exits 2 at the deadline: the ack is already committed, and exiting 0
+would lose the wake (`test_s32_the_grace_never_runs_past_the_commands_own_deadline`).

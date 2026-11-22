@@ -1,6 +1,7 @@
 """Designing around a Claude Code start-up race (DESIGN_NOTES "Known Claude Code behaviour"): M1, a SessionStart
-hook's wake is written no sooner than waiter.STARTUP_GRACE after the hook started; M2 (the state machine's O5), a
-delivered wake nobody read within interactive_wake.UNREAD_SECONDS comes back once, uncharged, to the next waiter."""
+hook's wake is written no sooner than waiter.STARTUP_GRACE after the hook started. And the read evidence and the
+reservations of review round 5 (S28, S29, S30), and the prompt check that covers a delivered wake Claude Code never
+acted on (the unread return, M2, was removed in that round)."""
 
 import io
 import json
@@ -16,7 +17,7 @@ from agent_comms import hosted, hosted_wake, interactive_wake as iw, waiter
 from conftest import PROJECT
 from test_hosted_sessions import senv  # noqa: F401
 from test_hosted_wake import GRACE, ask, text_for
-from test_interactive_wake_round2 import NA, NB, NC, TWO, Hub, ack, call, on, rec, woke
+from test_interactive_wake_round2 import NB, NC, TWO, Hub, call, on, rec, woke
 
 ROOT = Path(__file__).resolve().parents[1]
 WAKE = hosted_wake.wake_text("claude", [[7, "codex", False, 1]])
@@ -132,98 +133,108 @@ def test_m1_claude_gone_during_the_grace_exits_0_with_no_wake():
             p.wait(5)
 
 
-# ------------------------------------------------------------ M2: O5, a delivered wake nobody read comes back
+# ------------------------------------------------------------ read evidence: the reader's project, the waiter's moves
 
 
-def delivered_unread(env, tid):
+def delivered(env, tid):
     call(env)
     post = ask(env, tid)
     assert woke(env) == text_for(env, 1, [tid])
     return post
 
 
-def test_m2_a_wake_nobody_read_comes_back_once_and_is_not_charged_again(senv):
-    on(senv)
-    tid = senv.thread()
-    post = delivered_unread(senv, tid)
-    senv.clock.advance(iw.UNREAD_SECONDS - 1)
-    assert call(senv, nonce=NB) == {"state": "idle"}, "not before UNREAD_SECONDS"
-    senv.clock.advance(1)
-    assert woke(senv, nonce=NB) == text_for(senv, 1, [tid]), "the session's next hook is offered it again"
-    assert len(pair(senv)["sent"]) == 1 and pair(senv)["threads"][str(tid)]["count"] == 1, "not charged again"
-    assert str(post["id"]) in pair(senv)["returned"]
-    senv.clock.advance(iw.UNREAD_SECONDS + 1)
-    for nonce in (NC, "d" * 32):
-        assert call(senv, nonce=nonce) == {"state": "idle"}, "never a second time"
-
-
-def test_m2_a_post_read_meanwhile_never_comes_back(senv):
-    on(senv)
-    tid = senv.thread()
-    delivered_unread(senv, tid)
-    reader = senv.board.register_session(senv.p["claude"], PROJECT)["session_id"]
-    senv.board.read_updates(senv.p["claude"], reader, only="addressed")      # the woken session read it
-    senv.clock.advance(iw.UNREAD_SECONDS + 1)
-    assert call(senv, nonce=NB) == {"state": "idle"}
-
-
-def test_m2_a_post_another_session_read_past_never_comes_back(senv):
-    on(senv)
-    tid = senv.thread()
-    delivered_unread(senv, tid)
-    other = senv.board.register_session(senv.p["claude"], "/somewhere/else")["session_id"]
-    out = senv.board.read_updates(senv.p["claude"], other)
-    senv.board.ack(senv.p["claude"], other, out["ack_through"])              # read and acknowledged elsewhere
-    senv.clock.advance(iw.UNREAD_SECONDS + 1)
-    assert call(senv, nonce=NB) == {"state": "idle"}
-
-
-def test_m2_the_dispatchers_hold_is_not_extended(senv):
-    on(senv)
-    tid = senv.thread()
-    t0 = senv.clock()
-    post = delivered_unread(senv, tid)
-    senv.clock.advance(iw.UNREAD_SECONDS)
-    assert woke(senv, nonce=NB) is not None, "returned and offered again"
-    senv.clock.advance(GRACE - iw.UNREAD_SECONDS - 1)
-    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock())
-    senv.clock.advance(1)
-    assert senv.clock() == t0 + GRACE and not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), \
-        "it still ends at the request's first-offer deadline"
-
-
-def test_m2_the_returned_wake_goes_to_the_next_waiter_that_arms_and_to_one_only(senv):
-    on(senv)
-    tid = senv.thread()
-    call(senv, conv=TWO, nonce=NA)                      # another session of the agent, waiting since before
-    senv.clock.advance(1)
-    call(senv)                                          # armed last
-    ask(senv, tid)
-    assert woke(senv) is not None                       # delivered to CONV; its session took no turn and is gone
-    senv.clock.advance(iw.UNREAD_SECONDS + 1)
-    out = call(senv, conv=TWO, nonce=NB)                # TWO's next hook arms
-    assert out["state"] == "wake" and out["text"] == text_for(senv, 1, [tid])
-    assert call(senv, nonce=NC)["state"] == "idle", "offered to one conversation at a time"
-    assert ack(senv, out, conv=TWO, nonce=NB) == {"state": "acked"}
-    assert len(pair(senv)["sent"]) == 1, "and still charged once"
-    assert rec(senv, TWO)["delivered"]
-
-
-def test_m2_a_read_by_a_waiter_that_moved_on_to_another_project_still_counts(senv):
-    """Found by the randomized run (seed 6): the read evidence of a waiter that moved to another project after it
-    read the post was looked for among the old project's current waiters only, so O5 returned a read post. It is
-    kept on the pair now, and every waiter's record counts wherever it is."""
+def test_a_read_in_the_posts_project_by_a_waiter_that_moved_on_still_holds(senv):
+    """Found by the randomized run (seed 6) while the unread return existed: the read evidence of a waiter that
+    moved to another project after it read its post was looked for among the project's current waiters only. It is
+    kept on the pair, and every waiter's record counts wherever it is now; `holds` after the deadline sees it."""
     from test_hosted_sessions import P2
     on(senv)
     tid = senv.thread()
-    call(senv, conv=TWO, nonce=NA)                      # another session of the agent, waiting in PROJECT
-    senv.clock.advance(1)
-    call(senv)
-    post = ask(senv, tid)
-    assert woke(senv) is not None
+    post = delivered(senv, tid)
     reader = senv.board.register_session(senv.p["claude"], PROJECT, client=("claude-code", CONV))["session_id"]
     senv.board.read_updates(senv.p["claude"], reader, only="addressed")      # woken, it reads the post
     assert call(senv, nonce=NB, projects=(P2,)) == {"state": "idle"}         # then works in another project
     senv.clock.advance(GRACE + 1)
-    assert call(senv, conv=TWO, nonce=NC) == {"state": "idle"}, "a post that was read never comes back"
-    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "and the read still holds it"
+    assert hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the read still holds it"
+
+
+def test_a_read_in_another_project_is_no_read_evidence_for_the_posts_project(senv):
+    """S30: the conversation moved to P2 and its P2 session read (addressed-only) the P1 post: that is no sign the
+    request is worked on in P1, so the hold ends at its deadline as for an unread wake."""
+    from test_hosted_sessions import P2
+    on(senv)
+    tid = senv.thread()
+    post = delivered(senv, tid)
+    assert call(senv, nonce=NB, projects=(P2,)) == {"state": "idle"}         # moved, before reading anything
+    elsewhere = senv.board.register_session(senv.p["claude"], P2, client=("claude-code", CONV))["session_id"]
+    out = senv.board.read_updates(senv.p["claude"], elsewhere, only="addressed")
+    assert post["id"] in [d["id"] for d in out["posts"]], "the P2 session is shown the P1 post"
+    senv.clock.advance(GRACE + 1)
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "and it holds nothing there"
+    assert iw._pair(senv.board.conn, "claude", P2)["read"] == {} and rec(senv)["read"] == {}
+
+
+# ------------------------------------------------------------ S28: a reservation with no waiter left in the pair
+
+
+def test_s28_a_reserved_request_is_never_held_or_offered_again_once_its_waiter_moved_on(senv):
+    from test_hosted_sessions import P2
+    on(senv)
+    tid = senv.thread()
+    post = delivered(senv, tid)
+    assert call(senv, nonce=NB, projects=(P2,)) == {"state": "idle"}         # no waiter left in PROJECT
+    senv.clock.advance(GRACE + 1)
+    assert hosted_wake.reserve(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the dispatcher takes it"
+    assert str(post["id"]) in iw._pair(senv.board.conn, "claude", PROJECT)["claimed"], "recorded on the pair"
+    call(senv, conv=TWO, nonce=NC)                                         # later, a new waiter in PROJECT
+    reader = senv.board.register_session(senv.p["claude"], PROJECT, client=("claude-code", CONV))["session_id"]
+    senv.board.read_updates(senv.p["claude"], reader, only="addressed")      # and a read in PROJECT ...
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "... holds nothing again"
+    senv.clock.advance(31)
+    assert call(senv, conv=TWO, nonce=NC) == {"state": "idle"}, "and it is never offered the reserved request"
+
+
+# ------------------------------------------------------------ S29: a post at the thread cap waits for the human
+
+
+def test_s29_a_post_at_the_thread_cap_waits_for_the_humans_post_and_then_goes(senv):
+    on(senv, max_wakes_without_human=1, wake_min_interval_seconds=0)
+    tid = senv.thread()
+    delivered(senv, tid)
+    reader = senv.session("claude")
+    senv.board.read_updates(senv.p["claude"], reader, only="addressed")
+    ask(senv, tid)
+    for _ in range(3):
+        senv.clock.advance(3600)
+        assert woke(senv, nonce=NB) is None, "at the cap: it waits, however long"
+    senv.post("human", tid, "carry on", to=[])
+    assert woke(senv, nonce=NB) == text_for(senv, 1, [tid]), "the human's post lifts the stop; nothing waits forever"
+
+
+# ------------------------------------------------------------ the prompt check still tells the session
+
+
+def test_a_delivered_wake_the_session_never_acted_on_is_still_reported_by_the_prompt_check(senv):
+    """The worst case without the unread return: Claude Code started no turn for a delivered wake. The session's
+    UserPromptSubmit check (`board brief --session-from-stdin`, Board.brief's cursor-free view above the session's
+    own mark) still counts the post at the next prompt: the interactive wake's delivery and read marks are not
+    looked at there."""
+    on(senv)
+    tid = senv.thread()
+    mark = senv.board.brief(senv.p["claude"], [PROJECT], after_seq=0)["latest_addressed_seq"] or 0
+    post = delivered(senv, tid)
+    b = senv.board.brief(senv.p["claude"], [PROJECT], after_seq=mark)
+    assert b["addressed_after_seq"] == 1 and b["latest_addressed_seq"] == post["seq"]
+
+
+def test_s32_the_grace_never_runs_past_the_commands_own_deadline():
+    """`board wait --max-seconds 2` from a SessionStart hook: the wake is written at the deadline (the ack is
+    committed, so exiting 0 would lose it), not at the ten-second grace."""
+    clock = Clock()
+    hub = Hub({"state": "wake", "text": WAKE, "id": "1" * 16})
+    err = io.StringIO()
+    hook = {"session_id": CONV, "cwd": "/work/repo", "hook_event_name": "SessionStart"}
+    code = waiter.run("claude", [PROJECT], 2, stdin=io.StringIO(json.dumps(hook)), stderr=err, environ={},
+                      client=hub, sleep=clock.sleep, clock=clock, watch=False)
+    assert (code, err.getvalue()) == (2, WAKE + "\n")
+    assert clock.t == 1002.0, "at its two-second deadline"

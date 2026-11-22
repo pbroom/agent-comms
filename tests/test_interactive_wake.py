@@ -661,3 +661,20 @@ def test_claude_hooks_upgrade_an_entry_an_earlier_version_wrote(tmp_path):
     f.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [odd]}]}}))
     assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
     assert json.loads(f.read_text()) == {"hooks": {"SessionStart": [{"hooks": [odd]}]}}
+
+
+def test_s31_ownership_is_per_event_a_five_key_stop_hook_is_not_ours(tmp_path):
+    """The installer writes the five-key shape ("async" too) only under SessionStart. A five-key hook under Stop with
+    the very same command is someone else's: --wake keeps it beside ours, --remove-wake leaves it."""
+    f = tmp_path / "settings.json"
+    cmd = claude_hooks.command("/b", "claude", "/x/wait.sh")
+    five = {"type": "command", "command": cmd, "async": True, "asyncRewake": True, "timeout": 86400}
+    f.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [five]}]}}))
+    add = ["add", "--settings", str(f), "--script", "/x/wait.sh", "--home", "/b", "--agent", "claude"]
+    assert claude_hooks.main(add) == 0
+    got = json.loads(f.read_text())["hooks"]
+    assert got["Stop"][0] == {"hooks": [five]}, "kept"
+    assert got["Stop"][1] == {"hooks": [{k: v for k, v in five.items() if k != "async"}]}, "ours beside it"
+    assert got["SessionStart"] == [{"hooks": [five]}], "under SessionStart the five-key shape is ours"
+    assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
+    assert json.loads(f.read_text()) == {"hooks": {"Stop": [{"hooks": [five]}]}}
