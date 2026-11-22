@@ -3613,6 +3613,45 @@ def test_r15_s39_an_ordinary_bridge_is_never_latched(senv):
             "interactive"
 
 
+@pytest.mark.parametrize("when", ["before_the_grant_check", "before_the_enqueue"])
+def test_r16_s43_a_grant_that_expires_inside_the_deciding_transaction_starts_nothing(senv, monkeypatch, when):
+    """S43: the clock passes the grant's expiry inside the one deciding transaction, (a) after its entry and before
+    the grant is checked, or (b) after that check and before the child is enqueued and charged: refused, and
+    nothing is created, queued, charged or posted (the root it might have made included)."""
+    grant(senv, hours=1)
+    ident = interactive(senv)
+    senv.clock.advance(3600 - 5)                        # five seconds left on the grant
+    senv.node.hello()                                   # (its node is still there)
+    if when == "before_the_grant_check":
+        real = hs._task_text                            # (read after the transaction's entry, before the grant)
+
+        def late(task):
+            senv.clock.advance(10)
+            return real(task)
+        monkeypatch.setattr(hs, "_task_text", late)
+    else:
+        real = hosted_tree._fits                        # (in the create, after the first grant check)
+
+        def late(*a, **kw):
+            senv.clock.advance(10)
+            return real(*a, **kw)
+        monkeypatch.setattr(hosted_tree, "_fits", late)
+    hs.flush(senv.board)
+    keys = lambda: senv.board.conn.execute("SELECT COUNT(*) FROM board_state").fetchone()[0]    # noqa: E731
+    before = (keys(), _posts(senv), hs._budget(senv.board.conn, "claude", PROJECT))
+    limits_checked = []
+    real_limits = hs._check_limits
+    monkeypatch.setattr(hs, "_check_limits", lambda *a, **kw: (limits_checked.append(1), real_limits(*a, **kw))[1])
+    with pytest.raises(Forbidden, match="no live spawn grant"):
+        spawn(senv, ident, request_id="late")
+    assert bool(limits_checked) is (when == "before_the_enqueue"), \
+        "(a) refused at the grant check itself, on a fresh reading; (b) by the recheck right before the enqueue"
+    hs.flush(senv.board)
+    assert (keys(), _posts(senv), hs._budget(senv.board.conn, "claude", PROJECT)) == before, \
+        "nothing created, queued, charged or posted"
+    assert hs._find_iroot(senv.board.conn, "claude", PROJECT) is None
+
+
 # ------------------------------------------------------------ rebase onto PR #93 (waking a Codex thread you opened)
 
 

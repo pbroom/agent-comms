@@ -5323,7 +5323,7 @@ each rule is in the mutation check (88 rules, every one caught).
 
 Three items on bdebb09, each verified first and each with tests that fail without it (`test_after_review_*`); the
 mutation check has 154 rules (nine new), every one caught. Then Sol's review of 4a9921f (round 14, below): 162
-rules; of 2f02fb5 (round 15): 164.
+rules; of 2f02fb5 (round 15): 164; of ff15048 (round 16): 166.
 - *Dispatched runs are no callers (owner decision).* Verified: `resolve` took every caller without a binding for
   the agent's interactive root, and the shipped Claude dispatch runner allows all agent-comms tools, so a dispatched
   run, which acts on board requests (untrusted), could start children at the grant's ceiling. Now every spawn tool
@@ -5397,6 +5397,18 @@ rules; of 2f02fb5 (round 15): 164.
   `test_r15_s42_the_grant_changing_after_the_first_look_still_returns_the_starters_own_child`; the round 14 limit
   tests pass unchanged in substance (their hook is now the fast path), and four earlier race tests that forced a
   window between a check before the write and the write itself now force it before the one transaction.
+- *Round 16 (Sol, on ff15048).* S43 (blocker, a regression of the consolidation): the deciding transaction checked
+  the grant against the time read on its entry. That reading is taken under the write lock (the first statement
+  inside `db.write_tx`, after BEGIN IMMEDIATE), so no lock wait was stale, but the time the transaction itself runs
+  was. Now every decision that compares against the time reads the clock afresh where it is made (the grant, the
+  limits' hour window), and the grant is checked once more, on a fresh reading, right before the child is enqueued
+  and charged (`create_child`'s `check`, after the child's own checks, as before the consolidation). The entry
+  reading only stamps an interactive root made there. The limits' window on an older reading would only count
+  more, never less. Tests: `test_r16_s43_a_grant_that_expires_inside_the_deciding_transaction_starts_nothing`,
+  the clock passing the expiry (a) after the entry and before the grant check, (b) after it and before the
+  enqueue: refused, nothing created, queued, charged or posted. `send`'s own test of a grant expiring while it
+  waits for the lock (`test_r2_s4_a_grant_that_expires_while_send_waits_for_the_lock_is_not_honoured`) is
+  unchanged and passes; spawn had none before.
 
 ### Spawn tools: review round 12 (2026-11-22)
 

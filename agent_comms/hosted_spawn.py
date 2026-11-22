@@ -1168,8 +1168,11 @@ def _retried(board: Board, p: Principal, ident: Ident, project: Any, request_id:
 
 def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any, model: Any, effort: Any,
               title: Any, role: Any, access: Any, isolation: Any, request_id: Any, project: Any) -> dict:
-    """`spawn`'s one deciding transaction (its order is there)."""
-    now = board.now()       # read under the write lock
+    """`spawn`'s one deciding transaction (its order is there). Every decision that compares against the time reads
+    the clock afresh, under the write lock, where it is made (the grant's expiry, the hour's window); and the grant
+    is checked once more, with a fresh reading, right before the child is enqueued and charged (`create_child`'s
+    `check`). `now`, read on entry (also under the lock), only stamps the interactive root it may make."""
+    now = board.now()       # read under the write lock: for the records made here, nothing decided from it
     caller = resolve(board, p, ident, project, conn=c)
     rid = hosted_tree._request_id(request_id)       # (the id must be readable to be looked up)
     hit = _handle(c, p, caller, rid)
@@ -1178,7 +1181,7 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
     cfg = _gate(board)
     board._check_agent_write(p)
     task = _task_text(task)
-    g = _grant_for(c, caller, now)
+    g = _grant_for(c, caller, board.now())
     _check_allowance(c, caller, cfg)
     try:
         model = validate_model(model)
@@ -1205,7 +1208,7 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
             if node else []
         access = _highest(offers) or ceiling
     try:
-        _check_limits(c, caller, cfg, now)
+        _check_limits(c, caller, cfg, board.now())
     except LimitReached as e:
         e.caller = caller       # (for `spawn`'s Needs-you intent, after this transaction)
         raise
@@ -1227,7 +1230,10 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
     out = hosted_tree.create_child(
         board, p.name, caller.id, text, agent=agent, model=model, effort=effort, title=title, role=role,
         isolation=isolation, access=access, request_id=rid, allowed=allowed, spawn=cfg, kind="task",
-        spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", hook=hook, tx=c)
+        spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", hook=hook, tx=c,
+        # The grant once more, with a fresh reading, after the child's own checks and right before it is enqueued
+        # and charged: it may have expired while this transaction ran.
+        check=lambda c2: _grant_for(c2, caller, board.now()))
     r, m = out["session"], out["message"]
     return {"child": _child_view(c, r, caller.id), "created": out["created"],
             "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
