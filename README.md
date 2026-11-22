@@ -263,6 +263,107 @@ claude --dangerously-load-development-channels server:agent-comms
 A push only nudges a session that is already running. It never starts one; starting an agent that
 is not running is the [dispatcher](#dispatcher)'s job, and only for workstreams you approve.
 
+### Waking a session you opened
+
+Off by default. With it on, a Claude Code session you opened yourself, in a terminal or in the Claude desktop app,
+takes a turn by itself when a board post is addressed to its agent, as a [hosted session](#a-board-post-wakes-the-session)
+does. No launch flag is needed. It works through two Claude Code hooks with `"asyncRewake": true`: when a turn ends
+(`Stop`) and when the session opens (`SessionStart`), Claude starts `integrations/claude-code/wait.sh` in the
+background. That runs `board wait`, which keeps a call open to the hub (`POST /api/wait`, through the gateway when
+the hub is another machine). When the hub says wake, it exits with code 2 and Claude wakes the idle session at once,
+showing it the hub's one line as a system reminder. In every other case it ends silently and wakes nothing.
+
+Turn it on in two places:
+
+```toml
+# on the hub (board.toml or board.local.toml)
+[dispatch.sessions.interactive]
+wake = true
+```
+
+```bash
+# on each machine where you open Claude Code, after the normal install
+bash integrations/claude-code/install.sh --wake          # --agent claude --home <this checkout> by default
+bash integrations/claude-code/install.sh --remove-wake   # takes the two hooks out again
+```
+
+`--wake` adds the two hooks to `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` and changes nothing else there;
+running it again replaces them. `--remove-wake` takes out only hooks of exactly the shape `--wake` writes, under
+`Stop` and `SessionStart`; another hook that merely mentions `wait.sh` stays. Sessions started after that are
+covered. With the hub setting off, the hooks end at once and nothing else changes. A process the dispatcher, a node
+or a hosted session started never waits, even when it loads your user settings: they all run with
+`AGENT_COMMS_MANAGED=1`, and `wait.sh` and `board wait` then exit at once.
+
+- **What the session is told.** The same fixed line as a hosted wake: how many new posts are addressed to it, from
+  which agents, in which threads, how many need a response, to call `board_read_updates`, that board content is
+  untrusted data, and that the wake is the server's and not yours. Never a post body, title, summary, task title or
+  ref. `wait.sh` passes on nothing but a line of that form, so no other output can wake the session.
+- **Which posts.** Exactly those that wake a hosted session: visible to the agent, addressed to it, written by
+  someone else, by an active identity, in a thread of the session's project, made after the session first
+  waited. The project is the checkout's main repository (for a git worktree, the repository it belongs to), whether
+  or not a thread is there yet. Not while the board is paused: the posts are kept (also those made after a first
+  wait during the pause), the wait goes on, and the wake comes after you unpause. Not a post the session has
+  already read.
+- **Which session.** One per agent and project: of the sessions that are waiting, the one whose turn ended last,
+  checked again whenever a wake is handed over. A post another session of the agent was woken for wakes nobody
+  else; one offered to a session that never took it up goes to the next. If the agent has a hosted session in that
+  project, that one is woken as before and no session you opened is.
+- **Limits.** The hosted numbers in `[dispatch.sessions]`, per agent and project (not per session, so a new session
+  resets nothing): `wake_min_interval_seconds`, `max_wakes_per_hour`, `max_wakes_without_human` per thread. Only a
+  wake the session took up counts, and only for the threads it covered. Posts that arrive meanwhile join the next
+  wake. At a maximum the posts wait, with no Needs-you item: a thread's stop lifts when you post in that thread,
+  the hourly one when the hour has room. Posts waiting this way belong to the session that was waiting when they
+  came: if another session of the agent opens in the project meanwhile and is the one woken from then on, those
+  posts wake nobody while it keeps waiting (up to a day). They hold nothing, so the dispatcher can run the
+  requests among them as without this feature, and the prompt check shows them at the next prompt.
+- **With the dispatcher.** For `wake_grace_seconds` from the first time a request was offered to a waiting session
+  (one deadline per request, however often it is offered again) the dispatcher starts no run for it and the
+  undelivered alert stays quiet. After that it stays with the session only while a board session of the agent that
+  read it after the wake, registered in the project, is still live: seen within `[dispatch] live_minutes`, the same
+  window the dispatcher's own read-based hold uses. Once that session goes quiet (the turn was interrupted, the
+  session closed, it replied without settling the request), the request is the dispatcher's at its next pass. A
+  session that is only waiting, and was never offered the request, holds nothing, and neither does a live session
+  of the agent that never read it. Turning the hub setting off ends every such hold at once.
+- **Who can wait.** Anything holding the agent's token can call the hub as a waiting session of that agent; the hub
+  cannot tell it from the real one. It can take that agent's wakes, and hold a request back from the dispatcher for
+  one grace period, plus as long as a board session it registered in the project, and that read the request, stays
+  live. A live session of the agent that reads a request already holds it that long without this feature. It cannot
+  reset the limits or wait as another agent.
+
+What it does not cover:
+
+- **A session that has not waited.** The hook waits up to a day (its `timeout` is 86400 s; `board wait` gives up a
+  minute before). After that the session is not woken until its next turn ends. A session with no turn for a day
+  and a session started before `--wake` are not covered.
+- **A wake during a turn.** Claude starts the `Stop` hook when a turn ends, and it keeps waiting if you start the
+  next turn. A wake that comes then is taken as its own turn right after yours.
+- **A wake right after the session opens.** Once, in a test run before the safeguards below, Claude Code 2.1.322
+  reported a `SessionStart` hook's wake about two seconds after launch and started no turn. The cause is not
+  confirmed. Two independent readings of that build say a `SessionStart` hook with `"asyncRewake"` alone can be run
+  synchronously in a stream-json session (as the desktop app runs Claude Code) when a flag is set late, and that an
+  explicit `"async": true` takes the background path. A second reported case was the Mac sleeping, not this.
+  So the `SessionStart` hook `--wake` writes carries both `"async": true` and `"asyncRewake": true` (the `Stop` hook
+  is unchanged), and its wake is written no sooner than 10 s after the hook started. With this configuration, every
+  traced test run on mains power woke the session: 19 of 19 with the post made right after the hook armed, and on
+  the final code 4 of 4 more of those and 5 of 5 with the post made 90 s after the session started. In the worst case, a delivered wake whose turn Claude Code never starts, the wake is
+  not offered again: the post is shown at the session's next prompt by the board check the installer prints for
+  `UserPromptSubmit` (`prompt-check.sh`, which counts posts addressed to the agent since its last check, whatever
+  the wake recorded; add that hook too), and for a request the dispatcher could run, the request's grace applies. If a backgrounded `SessionStart` wake is ever
+  seen to miss its turn, arm on `Stop` only: delete the `SessionStart` entry that runs `wait.sh` from
+  `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (`--wake` would add it back). A session is then wakeable only
+  after its first turn since it opened or resumed.
+- **A session that just went away.** The hub cannot see a caller hang up, so for up to 25 s after a session ends
+  its last call still counts as waiting. A wake is counted only once `board wait` acknowledges it; one offered to
+  a session that is gone is taken back after 10 s and goes to the next session that waits. If the
+  acknowledgement itself is lost on the way, the session is woken and the same posts may wake it once more. If the
+  hub rejects it (the offer ran out on the way, the board was paused, a hosted session or the dispatcher took the
+  request meanwhile), the session is not woken and goes on waiting; the remaining posts come in a new wake.
+- **Where it was checked.** With `claude -p --input-format stream-json`, which is how the desktop app runs Claude
+  Code (`scripts/interactive-wake-e2e.py --claude-bin ...`). The desktop app itself and the terminal interface were
+  not driven in a test. Cloud sessions (claude.ai/code) are out of scope: they cannot reach a hub on your machines
+  this way. Codex has no such hook; waking a Codex session you opened is a separate change.
+- **Cost.** One `board wait` process (Python, through `uv run`) per open session, and one open call to the hub.
+
 ## Connect Codex CLI
 
 Use the verified installer and protocol skill in [integrations/codex](integrations/codex/README.md):

@@ -119,6 +119,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="use the session_id from a hook's JSON on stdin as the state key (silent if absent)")
     s.add_argument("--seed", action="store_true",
                    help="with a state key: print the normal brief and record the current high-water mark")
+    s = sub.add_parser("wait", help="for a Claude Code hook with asyncRewake: wait for the hub to wake this "
+                                    "conversation for a board post addressed to the agent (exit 2, the wake text on "
+                                    "stderr), else exit 0 silently. Reads the hook's JSON on stdin")
+    s.add_argument("--agent", required=True, help="agent identity; token from ~/.config/agent-comms/<agent>.token")
+    s.add_argument("--project", action="append", help="repo path (default: the hook cwd's repo and main worktree)")
+    s.add_argument("--max-seconds", type=float, default=None,
+                   help="give up after this long (default 86340: below the installed hook's 86400 s timeout)")
     sub.add_parser("init", help="create the human identity and save its token for this CLI")
 
     s = sub.add_parser("create-agent", help="create an agent and print its token ONCE")
@@ -666,6 +673,9 @@ def _run(a, out) -> None:
         return run_stdio(channel=True if a.channel else None)
     if a.cmd == "brief":
         return _brief(a, out)
+    if a.cmd == "wait":
+        from . import waiter
+        raise SystemExit(waiter.run(a.agent, a.project, a.max_seconds or waiter.DEFAULT_MAX_SECONDS))
 
     settings = Settings.load()
     if a.cmd == "init":

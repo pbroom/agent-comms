@@ -211,3 +211,10 @@ allow_full_access = false
 [dispatch.sessions.spawn]
 enabled = false
 max_children = 5            # children of one session that have not ended, at most
+
+# Waking a session you opened yourself (README "Waking a session you opened"): a Claude Code session with the wake
+# hooks (integrations/claude-code/install.sh --wake) waits at the hub when a turn ends, and a post addressed to its
+# agent wakes it, as a hosted session is woken, within the wake limits above. Off: the hub answers its wait with
+# "off", the hooks end at once, and nothing else changes. Read on the hub.
+[dispatch.sessions.interactive]
+wake = false

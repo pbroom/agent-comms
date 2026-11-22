@@ -3794,3 +3794,644 @@ Both reproduced first with tests that failed on 07bf749.
   names the likely cause (a hub older than the node). A hub of this version and a node that sends no `answered`:
   not known, as before. Tests: `test_a_node_sends_answered_only_to_a_hub_that_lists_it`,
   `test_a_report_without_answered_counts_as_not_known`, `test_a_report_a_hub_refuses_as_malformed_is_said_loudly`.
+
+## Waking an interactive session (2026-11-21)
+
+(Review rounds 1 and 2, below, changed how limits, holds, offers and the project work; where they differ, the
+latest round is what the code does. The offer's state machine is written out in interactive_wake.py's docstring.)
+
+**Report.** A session the human opened himself (terminal, Claude desktop app) saw new posts only when he told it to
+look; the channel push (above) needs a development flag at launch and does not work in the desktop app. This change
+wakes such a session the way a hosted session is woken (Session host (PR 3)), off by default
+(`[dispatch.sessions.interactive] wake`). The hub cannot reach a process it did not start, so the session keeps a
+call open to it instead: a Claude Code command hook with `"asyncRewake": true` on `Stop` and `SessionStart` runs
+`integrations/claude-code/wait.sh` (`board wait`, `agent_comms/waiter.py`), which long-polls `POST /api/wait`
+(`agent_comms/interactive_wake.py`). Exit 2 wakes the idle session and shows it the hook's stderr; anything else
+wakes nothing. Ruled out before this change, and not used: the per-session inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`,
+undocumented; a plain line was not delivered), plain `async` hooks (they do not wake an idle session), and a blocking
+`Stop` hook (it keeps the turn busy).
+
+**What Claude Code does with such a hook** (Claude Code 2.1.322, `claude -p --input-format stream-json`, a temp
+settings file, haiku; the spike scripts are not in the repo):
+- *`SessionStart` works too.* A `SessionStart` hook with `asyncRewake` runs in the background (a user turn sent at
+  once was answered at 1.9 s while the hook slept 20 s) and its exit 2 at 20 s woke the idle session. With no input
+  at all, its exit 2 at 6 s started the session's first turn. So a session that has not taken a turn is covered.
+- *The timeout is enforced, and a long one is honoured.* A hook with `timeout: 5` that slept 30 s got SIGTERM at
+  5 s, and so did its child process (the hook runs in its own process group and the signal reaches the group);
+  nothing was woken. A hook with `timeout: 3600` that slept 660 s woke the session at 668 s, past the 600 s
+  default. `timeout: 86400` and `timeout: 3000000` were accepted (each hook ran and woke the session after 5 s);
+  their expiry was not waited for. Nothing re-arms after an expiry until the next `Stop` or `SessionStart`.
+- *The session's end ends the hook.* SIGTERM to Claude: the hook and its child got SIGTERM and Claude exited. EOF on
+  Claude's stdin with the hook still running: Claude did not exit (it waited for the hook); the SIGTERM 24 s later
+  ended both. The docs say `-p` mode cancels background hooks at teardown. A crash of Claude (no chance to signal)
+  was not tried; `board wait` covers it by watching `CLAUDE_PID`, which Claude sets in every hook's environment.
+- *A wake during a turn.* An exit 2 that came while a second, user-sent turn was running was taken as its own turn
+  right after it. A `Stop` hook keeps running when the next turn starts; every turn's end starts another.
+- The hook's stdin carried `session_id`, `cwd`, `hook_event_name` (and `source` on `SessionStart`).
+
+So the shipped hook has `timeout: 86400`, `board wait --max-seconds` defaults to 60 s less (it ends itself rather
+than being ended), it exits 0 on SIGTERM, SIGHUP and SIGINT, and a watcher thread exits as soon as the `CLAUDE_PID`
+process is gone (the parent process when that is unset).
+
+**The hub's side reuses the hosted wake.** A waiter's record (`wake.waiter.<agent>.<conversation uuid>` in
+`board_state`) is hosted_wake's record plus the waiter's fields, and the decision runs hosted_wake's own helpers:
+`_look` (new posts by id above the marks, sealed ones counted on unseal, managed continuations and reserved posts
+left out), `_lift` (a new post of the human's lifts a thread's stop), `_qualifying` (re-checked at queue and at
+hand-over: still eligible, not acknowledged by any session of the agent, not reserved), `_thread`, `_uncount` and
+`wake_text`. The pieces that differ are small and in the new module:
+- *Presence.* A waiter is connected while its call is open: each look writes `seen` (at most every 5 s when nothing
+  changed) and a waiter seen within 20 s counts. The record outlives the `board wait` process, so the limits and the
+  read marks carry over from one turn's hook to the next; it is dropped 2 days after it was last seen.
+- *Supersede.* Each `board wait` process sends a new random nonce. A call with a new nonce for the same conversation
+  takes the record over (`armed_at` = now); the old nonce is remembered and its calls are answered "superseded".
+- *Whom.* Of the connected waiters of an agent in a project, only the one armed last is woken: the session whose
+  turn ended most recently (a turn's end re-arms it). A post another waiter of the agent was woken for is dropped
+  from the others. While the agent has a hosted root session in the project, no waiter there is woken and their
+  pending posts are dropped: those are the hosted session's.
+- *Limits.* The interval and the hourly maximum hold the posts until they pass. The per-thread maximum stops the
+  thread until the human posts there. No Needs-you item is posted: its text and options (`board session close`) are
+  the hosted session's, and the human is at this session anyway. The hourly maximum therefore sets no stop: posts
+  go when the hour has room.
+- *The project.* The client sends what `board brief` would use (the hook cwd's checkout, its main repository and
+  their logical forms); the hub takes the first one sent, whether or not a thread is there yet. (Corrected in the
+  PR review: this first version took the first that some thread was in.)
+- *Offered, acknowledged.* A pass (the open call's own look, or each dispatcher pass right after
+  `hosted_wake.tick`) makes the offer (O1): it records the offer's posts on the waiter and sets each request's hold
+  deadline on the pair, once, so `hosted.holds` sees it before the dispatcher decides. The open call hands it over
+  (O2) after `_qualifying` again (none left: taken back and uncounted), with an id. (Corrected in the PR review: the
+  first version recorded a `queued` wake and marked its posts `woken`; review rounds 2 to 5 replaced that with the
+  offer state machine in interactive_wake.py's docstring, which is the current design.) `board wait` sends that id
+  back (`ack`) before it exits 2; only then is the wake delivered. An offer not acknowledged within 10 s is taken
+  back: the posts lose their coverage, go back to `pending`, and the wake is not counted, so the conversation's next `board wait`, or another waiting session of the
+  agent, gets them. Found in the real run: the hub's side of an open call does NOT see its caller hang up (a curl
+  killed 3 s into a 40 s wait left the call heartbeating for the rest of it; `request.is_disconnected` never turned
+  true behind this app's `@app.middleware("http")`). Without the acknowledgement a wake offered into such a call
+  was lost, and `seen` lingered. `board wait` therefore keeps each call to 25 s, which bounds how long a session that
+  has gone still counts as waiting. Whether `hosted.node_sessions_wait` (`waiter_gone`) has the same blind spot was
+  not checked.
+
+**The dispatcher's side** goes through the hooks it already has, so delivery.py and dispatch.py ask nothing new:
+`hosted_wake.holds` ends by asking `interactive_wake.holds` (the same rule on a waiter's record: within the grace,
+or a read after the wake by a board session that was the agent's in the post's project when it read, not a
+dispatched run's, and not one recorded for another conversation, while that session is still live there; a
+delivery receipt alone does not count, since review round 6, and the liveness bound is the PR review's);
+`hosted_wake.reserve` also calls `interactive_wake.claim`; `Board.read_updates` calls `interactive_wake.handed`
+beside `hosted_wake.handed`. Without waiter records each is one key-range read and no write.
+
+**Off is off.** The route answers `{"state": "off"}` before it reads or writes any board state; the dispatcher's pass reads one key
+range and writes nothing when there is no record (and drops records left from when it was on); `holds`, `claim` and
+`handed` find no record. With it on and no `board wait` running, the same.
+
+**Content.** The wake text is hosted_wake's (counts, thread ids, agent names re-checked against the name rule, and
+the fixed note). `board wait` writes it only when it matches `agent-comms: ` plus one line of printable ASCII, and
+`wait.sh` passes on an exit 2 only with such a line: an exit 2 from `uv`, from argparse or from a broken install
+would otherwise wake the session with that text, and each such turn's end would start the hook that wakes it
+again.
+
+**Provider-neutral.** The hub knows a waiter as (agent, client, conversation id) and an open call; nothing there is
+Claude's. A Codex equivalent can run on the node and use `codex queue --thread <id> --message <text>` where Claude
+uses the hook's exit code, against the same route (`client: "codex"` is accepted already).
+
+**Checked.** `tests/test_interactive_wake.py` (real hub routes, a fake clock, a fake hub for `board wait`, the hook
+script with a stand-in `board.sh`, the installer against a temporary HOME and CLAUDE_CONFIG_DIR).
+`scripts/interactive-wake-e2e.py`: stand-in steps through the real wait.sh and a real hub, and with `--claude-bin` a
+real haiku session in stream-json mode with exactly the installed hooks and the temp board as its only MCP server:
+woken from `SessionStart` before any turn, again from `Stop` after the wake turn, each time calling
+`board_read_updates`, and nothing left polling after SIGTERM.
+
+**Not covered, or not verified.**
+- The Claude desktop app and the terminal interface were not driven; the desktop app runs Claude Code in stream-json
+  mode, which was. The coordinator checks the desktop app at deploy time.
+- Cloud sessions are out of scope. Codex sessions the human opened are a separate change.
+- A session armed more than a day ago without a turn since, or started before `--wake`, is not woken.
+- For up to 25 s after a session ends, its last call still counts as waiting; the one armed last may then be a
+  session that is gone, and the wake reaches a live one only after the 10 s take-back (or that call's end).
+- An acknowledgement lost on the way: the session was woken, the hub takes the wake back and may offer the same
+  posts once more (unless the session's read moved its cursor past them).
+- Two sessions of the agent in one project that both read are one reader to `holds` (as for hosted sessions);
+  a board session whose conversation id is recorded and differs is not counted, but sessions through a remote hub
+  record none.
+- No dashboard view of waiters.
+
+### Waking an interactive session: review round 1 (2026-11-21)
+
+Round 1 of review (on 38f21b6) found thirteen points. Each has a test in `tests/test_interactive_wake_round1.py`,
+written first and run against 38f21b6: every one failed there. For S12, the shell half was already shown by the
+earlier suite passing a non-wake text through.
+
+- **S1. What an agent token can do as a waiter.** The coordinator ruled that an agent arming for its own identity
+  is that agent: the hook holds only the agent's own token, and the hub cannot tell a process holding that token
+  from the agent's real session. So that remains possible, and it is said in the README. What could be bounded is
+  bounded:
+  - *The limits are the pair's.* The interval, the hour and the per-thread count now live in one record per agent
+    and project (`wake.pair.<agent>.<hash>`), not per conversation. A new conversation id resets nothing.
+  - *Strict input.* The conversation id must be a lowercase UUID. A project must be absolute, normalized (no `.`,
+    `..` or `//`), printable and at most 1024 characters.
+  - *Holds need an offer.* The dispatcher is held only by a wake actually offered, and only until that request's
+    deadline (S7). A waiter that is merely connected holds nothing.
+- **S2. A wake stuck with a waiter that is not the one to wake.**
+  - A decided wake is now an *offer* bound to the waiter's current nonce. It is taken back whenever it stops
+    standing: past ACK_SECONDS, superseded, its waiter gone (not seen for 20 s) or no longer the one armed last.
+  - Every look at the pair (any waiter's call, each dispatcher pass) checks this. So a wake decided for a process
+    that went away, or for an older waiter after a newer one armed, goes back to the posts' waiting list.
+  - The other waiters keep their pending posts until a wake is acknowledged; only a *delivered* wake removes a post
+    from them.
+  - At most one offer stands per pair at a time.
+- **S3. First call during a pause.** The record, and with it the mark, is made on the first call, paused or not.
+  Decisions wait for the unpause. Posts made while the session waited through the pause wake it after.
+- **S4. Acknowledgements.**
+  - An ack is checked first (`_ack`) and changes nothing unless it is accepted. Accepted means: the offer's id, the
+    calling process's nonce equal to the offer's and to the record's current one, and inside the deadline.
+  - Otherwise the hub answers "rejected" (or "superseded"), with no nonce take-over and no state change.
+  - `board wait` exits 2 only when the ack is answered "acked", or when it could not be delivered at all (an
+    exception or a 5xx: the lost-ack case, after which the hub may offer the same posts once more). Any other answer
+    to the ack is exit 0.
+- **S5. Managed processes.** `dispatch.child_env`, the one function that builds the environment of every process
+  the dispatcher, a node (`node.py`) or the session host (`session_host.py`) starts, now sets
+  `AGENT_COMMS_MANAGED=1`. That is one line in dispatch.py; session_host.py and node.py are untouched.
+  `wait.sh` and `board wait` exit 0 at once when it is set. Tested: `child_env`, a hosted session's spawn
+  environment, a dispatched run's, `board wait`, `wait.sh`, and in the e2e (S7).
+- **S6. Charging.** A wake is charged when it is acknowledged, for the threads of the posts it covered then, and
+  for no other. A thread whose posts left the offer before hand-over is not charged.
+- **S7. One grace per request.** The pair keeps, per request, the deadline set by its first offer (`holds`). Take-
+  backs and re-offers do not move it. After it, the request is held only by a read after an acknowledged wake.
+- **S8. Off is off at once.** `holds`, `claim` and `handed` read the live setting.
+  - A bare connection counts as off. For that reason `hosted_wake.reserve` now accepts the Board, and the dispatcher
+    and delivery.py pass the Board where they passed `board.conn` (three call sites, same connection).
+  - `hosted_wake.holds` passes on what it was given.
+- **S9. The project.** `board wait` binds the hook cwd's main repository (for a worktree, the repository it belongs
+  to; the logical form when $PWD shows one) whether or not a thread is there yet. The hub takes the first project
+  it is sent.
+- **S10. The installer's entries.** `claude_hooks` owns only `Stop` and `SessionStart` hooks of exactly the four
+  keys it writes, with exactly its command shape. It drops a group only if taking its hook out left that group
+  empty and the group had nothing but `hooks`. A hook that merely mentions `wait.sh`, or sits under another
+  event, stays. `add` now takes `--home` and `--agent`, and the command is built in one place (`command()`).
+- **S11. An interrupted first call.** Only a refused connection on the very first call ends `board wait` at once.
+  Anything else (a timeout, a dropped connection, a 5xx) may have reached the hub and armed the process. It is
+  retried with the same nonce within RETRY_SECONDS, like any later failure.
+- **S12. The wake's shape.** `board wait` (`waiter.WAKE_RE`) and `wait.sh` (the same pattern in ERE) pass on only
+  the whole shape of hosted_wake.wake_text, not merely its prefix. That shape is: the counts, an agent name or
+  "you", optional author names and "and N more", thread ids, the optional "needing a response" count, and the fixed
+  sentences and note.
+- **S13. SIGTERM to the hook script alone.** `wait.sh` runs `board wait` as a tracked background child with the
+  hook's stdin passed on explicitly. A trap on TERM, HUP and INT ends the child and exits 0. The e2e (S8) shows the
+  whole chain, board.sh and `uv run` included, ends and nothing polls the hub afterwards.
+
+**The long-poll blind spot, measured.** The probe ran an in-process server on a free port and wrapped each route's
+look function. It killed curl 3 s into a 20 s wait, then counted looks over the next 22 s:
+
+| Route | Middleware as shipped | `localhost_only` middleware removed |
+|---|---|---|
+| `/api/nodes/sessions` (`hosted.node_sessions_wait`) | 67 looks, the last 17 s after the caller was gone | 0 |
+| `/api/wait` | 17 looks, the last 17 s after the caller was gone | 0 |
+
+So the cause is the app's `@app.middleware("http")` (Starlette's BaseHTTPMiddleware): behind it,
+`request.is_disconnected()` never sees the disconnect. That affects `waiter_gone` too.
+
+*Cost for a node.* A node whose process dies or restarts mid-wait leaves its old fetch running for up to
+NODE_WAIT_MAX (25 s): four database reads a second, each through `hosted_wake.listing`. A wake that comes due in
+that window can be marked handed (`handed_at`) into the dead response. It stays queued and is listed to the node's
+next fetch, so it is probably not lost, but its grace runs from that hand-over. I did not trace that path to the
+end.
+
+*Not fixed here.* Replacing the decorator with a pure ASGI middleware would fix both routes. It touches every
+route, so it is not a one-line change. The `stopping` check keeps a hub restart from being held up by such waits.
+
+**Not verified.** The node-route cost above is read from the code, not run. A crash of Claude (SIGKILL) is still
+covered only by the `CLAUDE_PID` watch, tested with a stand-in parent.
+
+### Waking an interactive session: review round 2 (2026-11-21)
+
+Round 2 (on f05a3c3) found that S4 was still open and raised six new points, all in the offer and acknowledgement
+logic. That is the second round to find races there, so the logic is now written out first, as a state machine in
+`interactive_wake.py`'s docstring, and the code follows it one transition at a time:
+- *States.* NONE, and an offer that STANDS or is STALE. An offer is ISSUED once its text has gone to a process.
+- *Transitions.* O1 offer, O2 hand-over, O3 acknowledge, O4 take back. Each is one write transaction, with the
+  clock read inside it.
+- *STANDING* is one predicate, `_stands`: feature on, not paused, inside the deadline, the waiter's current nonce,
+  and the waiter is the one to wake (connected, armed last, no hosted root). O2 and O3 re-check it inside their
+  transaction, and O1 checks its own conditions there.
+
+Each finding has a test in `tests/test_interactive_wake_round2.py`, written first and run against f05a3c3. Two
+fixes were already in place there: S19's end-to-end hub path passed, because S19's fault is client-side and the
+client test failed; and two guard parameters of the S4 reply test passed. Every other targeted test failed.
+
+- **S4.** The ack reads the clock inside its write transaction, so an ack that waited for the lock past the
+  deadline is rejected. On the client, a reply to the ack that arrives but cannot be read (not JSON, not an object,
+  an unknown state) is no longer taken for "could not be delivered". It never wakes the session; `board wait` waits
+  on with the same nonce.
+- **S14.** The ack re-checks, inside its transaction, that the offer still stands, pause and hosted root included.
+  The dispatcher's pass checks the pause inside each offer transaction too.
+- **S15.** A nonce take-over takes the old offer back (O4) before it rebinds the waiter to another project and sets
+  the new mark there. The new process never receives the old project's wake.
+- **S16.** An issued offer's batch never changes. A reservation (`claim`) of one of its posts, or a post that stops
+  qualifying at hand-over, takes it back whole. The id the client holds is then rejected, and the remaining posts
+  come again under a new id with their own text. An offer not issued yet may simply lose the post.
+- **S17.** The pair keeps the posts delivered to any of its waiters (`delivered`, pruned with the usual retention).
+  O1 de-duplicates against it, not against the other waiter records, so a waiter that moved or was evicted does not
+  free its posts for a second conversation.
+- **S18.** O3 runs `hosted_wake._lift` on the pair before it charges the wake, in the same transaction. A human post
+  between offer and ack resets the thread first, and the charge then stands.
+- **S19.** The hub answers a failed ack "superseded" (that process was replaced) or "rejected" (anything else,
+  while the process is still current). `board wait` goes on waiting with the same nonce after "rejected", and
+  after an unreadable 200. It gives up after MAX_REJECTED (5) rejections in a row rather than spin. "superseded",
+  "off" and a 4xx still end it.
+
+**The randomized test** (`test_randomized_offers_keep_their_invariants`, seeds 1 to 4, 300 steps each, about a
+second) drives the hub through the real routes with a fake clock. Its moves are interleaved and random:
+- arm, re-arm with a new nonce, and move a conversation to the other project (three conversations, two projects);
+- agent posts, and human posts;
+- pause and unpause;
+- dispatcher passes, with random reservations through `hosted_wake.reserve`;
+- acks in time and late;
+- reads from a conversation's own board session, and time steps;
+- a hosted root that comes and goes.
+
+After every step it checks:
+- at most one standing offer per pair;
+- every hold deadline is that request's first offer plus the grace;
+- a held request is inside its deadline or was read after delivery.
+
+At every accepted ack it checks:
+- the board is not paused and no hosted root is in that project;
+- no post was delivered to two conversations;
+- every thread of the batch has exactly the count the test expects: acknowledged wakes containing it since the
+  human's last post there;
+- no thread outside the batch went up.
+
+It also asserts that each run did enough to mean something: at least 10 offers issued, 3 accepted, 1 rejected, and
+some holds. The limits are loosened for it, an interval of 2 s and a per-thread maximum of 3, so that many wakes
+happen. It needs the new module's helpers, so it cannot run against f05a3c3; the targeted tests are what show the
+old head failing.
+
+**Not verified.** The randomized test checks counts only at the moment of each accepted ack. Between acks a
+thread's stored count can still be stale, higher than true until the next look lifts it, by design: the lift is
+lazy. The clock-inside-the-transaction fix is tested by advancing the fake clock as the lock is taken; no real
+lock contention was produced.
+
+### Waking an interactive session: review round 3 (2026-11-21)
+
+Round 3 (on 55b6ed7) left S19 partly open and raised four new points. Each has a test in
+`tests/test_interactive_wake_round3.py`, written first and run against 55b6ed7, where all eight failed. The state
+machine in `interactive_wake.py`'s docstring gains O3' (the replay) and the rule that STANDING includes the live
+setting.
+
+- **S19.** `board wait` now resets its count of rejected acks on every "idle" reply. MAX_REJECTED is reached only by
+  rejections in a row, so isolated rejections over a long session never disarm the hook.
+- **S20.** The waiter keeps its last accepted ack (`acked`: id, nonce, time).
+  - The same nonce sending the same id again within REPLAY_SECONDS (60) is answered "acked" again, and nothing is
+    charged or changed (O3').
+  - `board wait` sends an ack whose 200 reply it cannot read again, with the same id, up to ACK_TRIES (3) times
+    before it waits on.
+  - So a first wake whose reply was garbled after the hub committed it still wakes the session, exactly once. This
+    is tested against the real hub, with the first reply garbled after the commit.
+- **S21.** `_stands` reads the live setting, and O1 checks it, so offering, handing over and acknowledging all see
+  the setting as it is inside their transaction. An ack answered while the setting is off says "off". That includes
+  a replay: nothing is answered "acked" while off.
+- **S22.** O3 re-qualifies the whole batch inside its transaction. If another session read past one of its posts
+  (its cursor moved) since the hand-over, the offer is taken back (O4) and the ack is rejected. The id never wakes
+  the session for a batch that no longer stands, and the read post is not offered again.
+- **S23.** The e2e script keeps its temp directory unless every step ran to its end: an unexpected exception keeps
+  the evidence too.
+
+**The randomized test** (now seeds 1 to 6, 400 steps each, about a second each) gains these moves:
+- replays of accepted acks;
+- the setting turned off and on (a dispatcher pass while off drops every record, and the model starts its pairs
+  again);
+- another session reading everything and moving its cursor, between hand-over and ack;
+- and, when the board's own cap of 12 agent posts per thread since the last human post is hit, a human post in
+  that thread.
+
+The invariants it adds:
+- an accepted ack was for a batch none of whose posts had been read past;
+- no ack is accepted, and no wake handed over, while the setting is off;
+- a replay is answered as the first ack was (within the window, the record still there) and charges nothing. So an
+  acknowledged batch wakes the client exactly once.
+
+It also asserts that each run exercised replays.
+
+### Waking an interactive session: review round 4 (2026-11-21)
+
+Round 4 (on 122a659) narrowed S21 and S23 and raised S24 and S25, which the coordinator declined. Tests are in
+`tests/test_interactive_wake_round4.py`.
+
+- **S21.** Every write transaction in `interactive_wake.py` now reads the live setting right after it holds the
+  lock, before it changes anything: poll, ack, the dispatcher's pass (its offers and its clean-ups), and the read
+  marks in `handed`. `claim` opens no transaction of its own; it runs inside the dispatcher's reservation and reads
+  the setting there.
+  - The open shape was a first poll turned off while it waited for the lock: it created both records and answered
+    `idle`. It now answers `off` and writes nothing.
+  - The tests turn the setting off as each transaction starts. On 122a659 the poll and read-mark paths failed. The
+    dispatcher's offer path already passed, because round 3's setting check in O1 runs inside that transaction.
+- **S23.** The e2e script records surviving processes as a failure before it decides whether to delete its temp
+  directory, so a survivor keeps the logs. This failed on 122a659.
+- **S24 (declined).** A replaced hook can replay its accepted ack and get `acked`. The reviewer's proposed fix was
+  to confirm a replay only for the waiter's current nonce. The ruling keeps the replay valid for the nonce that
+  made the accepted ack, also after a newer process took the conversation over, because the hub has already
+  committed that ack: its posts are delivered and the wake is charged. Refusing the replay would leave nobody woken
+  for a charged wake, since the newer process is never offered those posts. That is the lost wake S20 was raised to
+  prevent. The replaced process wakes the same conversation, once. A double wake cannot come this way: a process
+  whose first reply it could read has already exited and never replays, and a replay changes and charges nothing.
+- **S25 (declined).** A replay can wake while the board is paused, if the ack was accepted before the pause. The
+  same reasoning holds: the replay only repeats the answer the process was owed, within the 60 s window, at the
+  moment a session that got its reply normally would have woken. Deferring it past the window would lose the wake.
+
+The behaviour is written down in the state machine's docstring next to O3', and pinned by one test each:
+- `test_s24_...`: a replay after a take-over is answered `acked`, charged once, never for another conversation or
+  another process of the same one; the newer process is idle, is not offered those posts again, and is woken for
+  new posts as usual.
+- `test_s25_...`: a replay just after the pause began is answered `acked`; while paused, no new offer is made,
+  handed over or acknowledged; after the unpause the waiting post comes under a new id.
+
+Both pass on 122a659, as pins of existing behaviour should. The randomized test's model already agrees with the
+rulings, not with the proposed fix. It expects `acked` for a replay whenever the waiter's last accepted id matches
+and the window holds, whatever the current nonce and whether or not the board is paused, and it asserts nothing is
+charged. Writing these tests turned up no double wake and no wake of a different conversation through the replay
+path: a replay is looked up on the conversation's own record and needs the nonce that made the ack.
+
+### Known Claude Code behaviour: a start-up wake that starts no turn (2026-11-21)
+
+Observed on Claude Code 2.1.322, twice in ten real runs of `scripts/interactive-wake-e2e.py`. A SessionStart
+asyncRewake hook exited 2 within about two seconds of launch. Claude Code reported it as a hook result but started
+no turn.
+
+The evidence is kept in this session's scratchpad (`failed-r1-evidence/`), for the second case:
+- The hub offered and acknowledged the wake.
+- `claude.jsonl` shows `hook_started` (SessionStart:startup), then `hook_response` with `exit_code: 2` and exactly
+  the wake text on stderr.
+- Then nothing for 120 s: no `system init`, no message, no result.
+
+Twelve spike sessions did not reproduce it: hooks exiting 2 after 0, 1, 6 or 8 s, with and without a slow stdio
+MCP server starting at the same time. It is intermittent, and its cause inside Claude Code is unknown. We design
+around it:
+- **M1** keeps a SessionStart hook's wake out of the window. `board wait` acknowledges the wake at once, so the
+  hub's ack deadline stands, but writes it and exits 2 only once `waiter.STARTUP_GRACE` (10 s) has passed since the
+  hook process started. A wake offered later is written at once. The Stop hook is unchanged. While it waits out the
+  grace, SIGTERM, SIGHUP, SIGINT or the Claude process going away still end it with exit 0.
+- **M2** (an unread return) was added and then removed in review round 5; see there.
+
+What the user sees in the worst case: the wake is not offered again. The session's UserPromptSubmit board check
+shows the post at its next prompt, and a request the dispatcher could run goes to it when its grace ends.
+
+### Waking an interactive session: M1 and M2 (2026-11-21)
+
+(M2, the unread return, was removed in review round 5. What follows records how it was built. The read-evidence
+fix found while it was built stays.)
+
+- **M1** (`waiter.py`): `hook_event_name` from the hook's stdin tells a SessionStart hook from a Stop hook. Only a
+  SessionStart hook waits out STARTUP_GRACE, counted from when `board wait` started; the hook started a moment
+  before that.
+- **M2** (`interactive_wake.py`, O5 in the docstring):
+  - *How a post comes back.* `_return_unread`, run in `_advance` (any waiter's look in the pair, or a dispatcher
+    pass), finds the pair's delivered posts that are UNREAD_SECONDS old, were never returned before and are not
+    claimed. It marks every one of them `returned`: it is looked at once, whatever it finds. Those that still
+    qualify (nobody read past them) and that `read_after_delivery` says were not read leave `delivered` and wait
+    in `returning`.
+  - *Where it goes.* O1 adds them to the offer of the next waiter chosen in the pair.
+  - *Charging.* The acknowledgement that delivers them again charges nothing for them: no `sent` entry and no
+    thread count, unless the same batch also has new posts, which are charged for their own threads only.
+  - *The dispatcher.* Its hold is not extended: it still ends at the request's first-offer deadline.
+  - *Faster pick-up.* The poll's no-write fast path, and the dispatcher pass's skip, now also look for a pair with
+    a return due or with returned posts waiting, so a return is never held up by them.
+- **A bug the randomized run found while M2 was added: read evidence lost when a waiter moved project.** The read
+  evidence was kept only on each waiter's record and looked up among the waiters currently in the project. So a
+  read by a waiter that had since moved to another project was invisible. O5 then returned a read post, and `holds`
+  after its deadline missed the read; the `holds` half was a gap in earlier heads too. Seed 6 hit it: a
+  conversation read its post in /work/second, moved to /work/repo and moved back, and on the way back the post
+  came back.
+  - *The fix.* A read is now marked on the pair of the reader's project too (`read`, with the conversations each
+    post was delivered to, `delivered_to`), and `read_after_delivery` looks at every waiter record of the agent,
+    whatever project it is in now.
+  - *The test.* `test_m2_a_read_by_a_waiter_that_moved_on_to_another_project_still_counts` fails against a copy
+    with only the old evidence lookup put back.
+- **Tests.** `tests/test_interactive_wake_m1m2.py`, 10 tests:
+  - M1, with a fake clock: acknowledged at once and written after the grace; written at once after the grace and
+    for a Stop hook. In subprocesses: exit 0 on SIGTERM, and when the Claude process goes, during the grace.
+  - M2: a post comes back once and uncharged; a post read meanwhile, or read past by another session, never comes
+    back; the hold is not extended; a returned post goes to the next waiter that arms, to one at a time; and the
+    moved-waiter case above.
+- **The randomized test** gains a move: a delivered wake nobody acts on, then a waiter's next look. It also gains
+  these invariants:
+  - a post comes back at most once, and only if it was not read;
+  - a post is delivered a second time only after it came back, and never a third time;
+  - a returned post is not charged again;
+  - no post is in two offers at once.
+  Each run must see at least one return.
+- **The e2e script.** R1 now checks that the SessionStart wake came no sooner than the grace after the hook
+  started, although the post came right after it armed. And if a hook exits 2 with no turn within 30 s, the run
+  fails at once saying exactly that, and keeps its logs.
+
+### Waking an interactive session: measuring the start-up wake (2026-11-21)
+
+**A correction to the record above.** The second missed turn, the run after M1 in which the hook's result reached
+the transcript about 84 s after launch, overlapped a sleep of the Mac. `pmset -g log` has "Entering Sleep state due
+to 'Maintenance Sleep'" at 19:58:05 and "Wake ... due to ... lid" at 19:59:21. That falls between the hub's ack
+(19:58:01) and the `hook_response` line (19:59:23). `time.monotonic()` on this Mac does not advance during sleep. So
+the 84 s says nothing about M1 or about Claude Code. The first missed turn (18:57) overlapped no sleep: its hook
+exited 2 about 2 s after launch, and no turn followed.
+
+**Instrumentation, off by default.**
+- `AGENT_COMMS_WAIT_TRACE=<file>` makes `board wait` and `wait.sh` append one JSON line per step, with wall-clock
+  times: start, hook input, the first answer from the hub, offer, ack sent and its answer, grace begun and ended,
+  wake written, the exit code, a signal.
+- `scripts/interactive-wake-e2e.py --trace` sets it for the real session, starts Claude with `--debug-file`, and
+  writes to `logs/` the receive time of every stream-json event and Claude's process start time.
+- `--r1-post-delay`, `--skip-stand-in` and `--session-start-async` (an experiment: "async": true beside
+  "asyncRewake" on the SessionStart hook) shape the runs.
+
+Claude's debug log shows whether a hook was backgrounded: "Hooks: Config-based async hook, backgrounding process
+async_hook_<n>", logged just before "Hooks: SessionStart:startup [...]". A working run logs "Hook SessionStart:startup
+(SessionStart) error: status code 2" when the hook exits, then "[engine] turn 1 start".
+
+### Waking an interactive session: the SessionStart hook's shape (2026-11-21)
+
+**Decision (c).** The `SessionStart` hook carries `"async": true` beside `"asyncRewake": true`
+(`claude_hooks.hook_for`). M1 (the 10 s start-up grace) stays as built; M2 (the unread return) was removed in review
+round 5. The `Stop` hook is unchanged.
+
+**What is known and what is not.**
+- *One clean missed turn,* before M1. A SessionStart hook exited 2 about 2 s after launch, Claude Code reported
+  the hook's result, and it started no turn. The run predates the debug log, so its cause is unconfirmed.
+- *Two independent readings of the Claude Code 2.1.322 build* say a command hook runs in the background when
+  `async || (asyncRewake && (interactive || hasStreamingInput))`. A SessionStart hook can be spawned before a
+  stream-json session sets its streaming-input flag, and is then run synchronously: its exit 2 is a hook error that
+  wakes nothing. With an explicit `"async": true` the gate is always open, and the build still honours the rewake.
+  By the same reading, the interactive terminal UI always backgrounds the hook. Not verified by us.
+- *The second reported missed turn was the Mac sleeping* (pmset: maintenance sleep, then a lid wake, between the
+  ack and the hook's result).
+- *In 12 traced runs before this change* (5 with the old shape, 5 with both flags, 2 smoke runs), the debug log
+  showed the SessionStart hook backgrounded, and every one woke.
+- *With the configuration as shipped:* 19 of 19 traced runs on mains power, under `caffeinate -i`, with no sleep
+  or wake in any of them, woke the session. These were the worst case: the post made right after the
+  SessionStart hook armed. The debug log showed the SessionStart hook (and every Stop hook) backgrounded in each
+  one. The hook exited 10.29 to 10.32 s after Claude started; Claude reported it within 10 ms and started its turn
+  within about 30 ms. On the code after review round 5 (M2 removed), 9 of 9 more runs woke: 4 of the worst case, and
+  5 with the post made 90 s after Claude started (there the hook exited 90.48 s after start and the turn followed
+  30 ms later). In every run the SessionStart hook (and every Stop hook) was backgrounded, and no sleep or wake fell
+  in it.
+
+**The worst case, and the fallback.**
+- *Worst case:* a SessionStart wake that starts no turn. It is not offered again. The session's UserPromptSubmit
+  board check shows the post at its next prompt, and a request the dispatcher could run goes to it when its grace
+  ends.
+- *Fallback:* if a backgrounded SessionStart wake is ever caught missing its turn, arm on `Stop` only. Delete the
+  SessionStart entry from the settings file, and change `claude_hooks.EVENTS` to `("Stop",)` so that `--wake`
+  writes only that. A session is then wakeable only after its first turn since it opened or resumed.
+
+**Installer.** `claude_hooks` recognises both shapes, the earlier four-key one and the current one with `async`, so
+a re-run of `--wake` replaces an entry an earlier version wrote (once), and `--remove-wake` takes out either. The
+e2e's real step uses exactly what the installer writes; `--old-hook-shape` reproduces the earlier SessionStart entry
+for comparison.
+
+### Waking an interactive session: review round 5 (2026-11-21)
+
+Round 5 (on 9510348) found seven points, five of them races in M2, the unread return added since round 4.
+
+**M2 is removed rather than fixed.** M2 existed to recover a delivered wake that nobody acted on. With the explicit
+`async` on the SessionStart hook and M1, that has not happened in 31 traced real runs. When it does happen, M2
+could act only once a later hook arms, that is after the session's next turn. At that point the session's own board
+check on a user prompt already tells it about the posts addressed to it, and the dispatcher's grace covers a
+request with a dispatch rule. So M2 bought very little, and its state (`returning`, `returned`, the uncharged
+re-delivery, the surgery on the pair's delivered set) produced three blockers in one review round.
+
+Removed:
+- transition O5, `returning` and `returned`, UNREAD_SECONDS;
+- the uncharged re-delivery;
+- the fast-path and dispatcher-pass checks for a return due;
+- M2's tests, and the randomized test's unread move with its invariants. "No post delivered to two conversations"
+  is back to its strict form.
+
+The state machine in the docstring is O1–O4 and O3' again.
+
+**The prompt check, verified.**
+- `prompt-check.sh` (UserPromptSubmit) runs `board brief --session-from-stdin`. That keeps a high-water mark per
+  Claude session and counts the posts addressed to the agent above it, through `Board.brief`'s cursor-free view.
+  Nothing there reads the interactive wake's delivery or read marks. So a post the wake delivered and nobody read
+  is still reported at the session's next prompt (`test_a_delivered_wake_the_session_never_acted_on_is_still_
+  reported_by_the_prompt_check`).
+- Caveat: `install.sh` prints that hook (and `session-brief.sh` for SessionStart) for the user to add by hand;
+  `--wake` does not add it. Both are installed on this machine. Without them, the worst case is the dispatcher's
+  grace alone.
+
+**Kept: read evidence that survives a waiter moving project, with S30 fixed.**
+- The pair keeps the read marks, and `read_after_delivery` looks at every waiter record of the agent, so `holds`
+  after its deadline sees a read by a waiter that has since moved on. `holds` now works from the pair: earlier it
+  returned nothing once no waiter was left in the project.
+- **S30.** A read is recorded only for a post whose thread is in the project the reader is registered in. An
+  addressed-only read in the conversation's new project no longer counts for the old project's post, and no longer
+  keeps the dispatcher held past the grace.
+- Tests for both directions:
+  - `test_a_read_in_the_posts_project_by_a_waiter_that_moved_on_still_holds`;
+  - `test_a_read_in_another_project_is_no_read_evidence_for_the_posts_project` (it fails on 9510348).
+
+**S28, without M2.** A reserved request can no longer be offered to a later waiter: a new waiter's marks start
+above it. It could still be held again, though. If the waiter that was offered it had moved to another project,
+`claim` wrote nothing, so the pair's hold and its read evidence survived, and a later waiter plus a read in the
+project revived the hold. `claim` now records the reservation on the pair (`claimed`) whenever the pair exists, also
+with no waiter left. `holds` never holds a claimed post, and O1 never offers one
+(`test_s28_a_reserved_request_is_never_held_or_offered_again_once_its_waiter_moved_on`).
+
+**S29, without M2.** Nothing waits forever at the thread cap. A post at the per-thread maximum waits for the human's
+next post in that thread, which lifts the stop and lets it go; there is no uncharged retry to get stuck
+(`test_s29_a_post_at_the_thread_cap_waits_for_the_humans_post_and_then_goes`).
+
+**S31.** Installer ownership is per event. Under Stop only the four-key shape is ours. Under SessionStart, both the
+earlier four-key one and the current five-key one are. A manually configured five-key Stop hook with the same
+command is left alone by `--wake` and `--remove-wake` (`test_s31_ownership_is_per_event_a_five_key_stop_hook_is_
+not_ours`).
+
+**S32.** A SessionStart `board wait` never waits out the grace past its own `--max-seconds` deadline. If the
+deadline comes first, it writes the wake and exits 2 at the deadline: the ack is already committed, and exiting 0
+would lose the wake (`test_s32_the_grace_never_runs_past_the_commands_own_deadline`).
+
+### Waking an interactive session: review round 6 (2026-11-21)
+
+Round 6 (on d534333, rebased onto main 71cfa82) left one point open. The owner settled S26, S27 and S29; S28, S31 and
+S32 were resolved.
+
+**S30, the receipt path.** `read_after_delivery` still counted a delivery receipt. It checked the reader against the
+project the board session is registered in now. A receipt names only the session, not the project the session was in
+when it read. So a conversation's session could read unfiltered while registered in another project, which writes a
+receipt for the post, then re-register in the post's project. That read then passed the check: the request stayed held
+past the grace and the dispatcher could not reserve it. Now only the project-qualified read mark counts for an
+interactive hold. `handed` writes that mark at the time of the read, for a reader registered in the post's thread's
+project, and both read paths that write receipts call it. No other interactive path counts a receipt (`holds` reaches
+read evidence only through `read_after_delivery`). Pinned by
+`test_s30_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering`, which fails on d534333.
+`hosted_wake.holds` (main's code, for hosted sessions) still counts receipts with the same now-registered-project check.
+It is unchanged here and could be reviewed separately.
+
+**Comments.** Two comments in waiter.py still described the removed unread return (O5). They now say what happens
+instead: the post is not offered again, its hold ends at the request's deadline, and the prompt check reports it at the
+next prompt. No other mention of the unread return remains outside the history entries above.
+
+### Waking an interactive session: PR review (#91, 2026-11-21)
+
+The independent review of e3ac38c found one blocker (F1) and three smaller points (F2, F3a, F3b). Tests are in
+`tests/test_interactive_wake_pr_review.py`. The F1 tests and the F3b test fail on e3ac38c; the F2 test pins current
+behaviour, so it passes on both.
+
+**F1 (blocker): a read held the request for days.** Once the grace had passed, an interactive hold rested on a read mark
+alone, with nothing about liveness. Reading is exactly what a wake makes the session do. So a woken session that read
+the request and then did not settle it (an interrupted turn, a closed session, a reply with no lifecycle state) kept the
+dispatcher off it until the record was pruned: 2 days, or 7 while another conversation of the agent kept arming in the
+project. Both rules this mirrors are bounded. `hosted_wake.holds` goes through `_matching` (not ended, node seen
+recently). The dispatcher's `_policy_held` holds only for a session with a receipt whose `last_seen` is within
+`live_minutes`.
+- Now the pair records which board sessions read each delivered post (`readers`; first kept as the latest 8 per post,
+  see S33 below), next to the first read time (`read`). `handed` adds a reader whenever a session that qualifies is
+  shown the post, not only on the first read. After the deadline, `read_after_delivery` holds only while one of those readers is still the agent's in
+  the project, not a dispatched run's, and was seen within the hub's `[dispatch] live_minutes` (`live_seconds`, default
+  2 minutes).
+- A session that read the post and went quiet holds nothing at the next dispatcher pass. Another live session of the
+  agent that never read the post holds nothing either.
+- The README's "Who can wait" and the docstring's trust note now give the true bound: a caller with the agent's token
+  can hold a request for the grace, plus as long as a board session it registered in the project, and that read the
+  request, stays live. A live session that reads a request already holds it that long without this feature.
+- Tests:
+  - `test_f1_a_request_the_woken_session_read_goes_to_the_dispatcher_once_the_reader_is_not_live` is the reviewer's
+    probe, through the real Dispatcher with a fake clock and another conversation arming throughout. The launch comes at
+    the first tick after the reader is no longer live.
+  - `test_f1_after_a_full_read_with_a_cursor_ack_too`.
+  - `test_f1_a_reader_that_stays_live_keeps_it_until_it_goes_quiet`: still live at exactly `live_minutes`, launched one
+    second later.
+  - `test_f1_a_live_session_of_the_agent_that_did_not_read_the_post_does_not_keep_the_hold`, through a delivery policy,
+    since a dispatch rule waits for any live session of the agent (main's rule).
+- Two earlier tests now keep their reader live (heartbeats) and pin both directions.
+- The randomized test (now 600 steps per seed) no longer checks holds with the implementation's own
+  `read_after_delivery`. The test keeps its own model of what it did: when each post was delivered, which board sessions
+  were shown it, in which project and for which conversation, when the test last made a call with each session, and
+  which posts the dispatcher reserved. After every step it asserts that `hosted.holds` equals the model's answer, in
+  both directions. New moves: heartbeats, and quiet spells longer than `live_minutes`. Against e3ac38c's rule this fails
+  on all six seeds. `first_offer` is still learned from the records, as the reviewer noted; the deadline assertion
+  beside it checks one deadline per request.
+
+**F2 (documented, not redesigned here).** Each waiter's pending posts come from its own marks. A post that waiter A
+holds back under a limit is never offered while a newer conversation B, armed after that post, is the chosen waiter: B's
+marks start above it. That can last up to a day. Such a post holds nothing, the dispatcher treats a request among such
+posts as without the feature, and the prompt check reports it. The README's limits now say so, and the module docstring
+names the fix for later: merge the pair's pending posts into the chosen waiter at O1.
+`test_f2_a_post_an_unchosen_waiter_holds_back_is_not_offered_to_a_newer_waiter_and_holds_nothing` pins the safety
+properties: never offered to either waiter, no hold, and the dispatcher launches with no hold for it at its gate.
+
+**F3a.** The first "Waking an interactive session" section described the superseded design: the project being "the first
+that some thread is in", and a pass recording a `queued` wake and `woken` marks. Both sentences are corrected in place,
+marked as corrected here. The hub takes the first project the client sends, and a pass makes the offer (O1) and sets the
+hold deadline on the pair.
+
+**F3b.** `claude_hooks._write` replaced the settings file with `os.replace`, which turns a symlinked `settings.json` (a
+dotfiles setup) into a regular file. It now writes through `os.path.realpath`. The temporary file goes beside the link's
+target and atomically replaces the target, which keeps its permissions.
+`test_f3b_the_installer_writes_through_a_symlinked_settings_file` checks this with a symlinked file in a temp home, for
+`add` and `remove`, and checks that no temporary file is left.
+
+**S33 and S34 (the check of that commit).**
+- **S33.** Keeping only the latest 8 readers let eight later reads, by other sessions of the agent in the project,
+  evict a reader that was still live, and the hold dropped beside it. Now a reader that can still hold the post (the
+  agent's, in the project, not a dispatched run's, seen within `live_minutes`) is never dropped for a new one. Each
+  write of the list prunes only readers that no longer can; the list keeps the post's own retention, with a hard cap
+  of 64 whose overflow drops the least recently seen. The randomized test's model prunes the same way
+  (`test_s33_later_readers_never_evict_a_reader_that_is_still_live`).
+- **S34.** `claude_hooks.main` now resolves the settings file's real path once, before reading, and reads and
+  atomically replaces that same path. A link retargeted between the two steps leaves the new target untouched
+  (`test_s34_a_settings_link_retargeted_between_the_read_and_the_write_is_written_where_it_was_read`).

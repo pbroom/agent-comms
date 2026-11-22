@@ -183,7 +183,7 @@ def _undelivered(board: Board, human: Principal, now: float, window: float,
                     "managed": workstreams.get_for_post(board, post["id"]) is not None}
             if rule_for(rules, item) is not None:
                 continue   # the dispatcher would launch for it: its pickup path launches and reports it
-            if hosted.holds(c, agent, post["thread_project"], post["id"], now):
+            if hosted.holds(board, agent, post["thread_project"], post["id"], now):
                 continue   # a hosted session of the recipient was just woken for it (hosted_wake.py)
             if c.execute("SELECT 1 FROM sessions WHERE agent = ? AND project = ? AND last_seen >= ?",
                          (agent, post["thread_project"], now - window)).fetchone():
@@ -237,7 +237,7 @@ def _alert(board: Board, human: Principal, fence: tuple[str, str], thread_id: in
         for (post_id, agent), key in zip(entries, keys):
             if _get(board.conn, key) is not None or receipt(board.conn, post_id, agent) is not None:
                 raise Conflict(f"{key} changed meanwhile")
-            if thread is not None and hosted.holds(board.conn, agent, thread["project"], post_id, now):
+            if thread is not None and hosted.holds(board, agent, thread["project"], post_id, now):
                 raise Conflict(f"a hosted session was woken for request #{post_id} meanwhile")
 
     def hook(post: dict) -> None:

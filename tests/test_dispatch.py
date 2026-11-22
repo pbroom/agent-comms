@@ -555,7 +555,7 @@ def test_child_env_is_minimal_and_tokenless(denv, monkeypatch):
                "AGENT_COMMS_CODEX_TOKEN": "ac_codex", "OPENAI_API_KEY": "sk-x", "CODEX_HOME": "/c", "FOO": "bar"}
     cfg = DispatchConfig.from_dict({"runners": {"codex": ["codex", "{prompt}"]}, "env": {"codex": ["CODEX_HOME"]}})
     env = child_env("codex", cfg, environ)
-    assert set(env) == {"HOME", "PATH", "CODEX_HOME", "AGENT_COMMS_HOME"}
+    assert set(env) == {"HOME", "PATH", "CODEX_HOME", "AGENT_COMMS_HOME", "AGENT_COMMS_MANAGED"}
     assert not any(v.startswith(("ac_", "sk-")) for v in env.values())
     with pytest.raises(ValueError):
         DispatchConfig.from_dict({"env": {"codex": ["AGENT_COMMS_CODEX_TOKEN"]}})

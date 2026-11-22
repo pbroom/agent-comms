@@ -842,6 +842,29 @@ class SpawnConfig:
 
 
 @dataclass
+class InteractiveConfig:
+    """`[dispatch.sessions.interactive]`: waking a session the human opened himself (interactive_wake.py). Read on
+    the hub. Off unless `wake = true`: the hub's wait route then answers "off" and nothing else changes."""
+
+    wake: bool = False
+
+    @classmethod
+    def from_dict(cls, d: Any) -> "InteractiveConfig":
+        where = "[dispatch.sessions.interactive]"
+        if not isinstance(d, dict):
+            raise ValueError(f"{where} must be a table")
+        c = cls()
+        for k, v in d.items():
+            if k == "wake":
+                if not isinstance(v, bool):
+                    raise ValueError(f"{where} wake must be true or false")
+                c.wake = v
+            else:
+                raise ValueError(f"unknown setting {where} {k}")
+        return c
+
+
+@dataclass
 class SessionsConfig:
     """`[dispatch.sessions]`: hosted sessions on this machine's node (session_host.py, node_sessions.py). Off unless
     `enabled = true`: only then does `board node` tell the hub it hosts sessions, and start any."""
@@ -852,6 +875,8 @@ class SessionsConfig:
     # or a child session asked for at `full`. Read on the node. Off: such a session is refused, never narrowed.
     allow_full_access: bool = False
     spawn: SpawnConfig = field(default_factory=SpawnConfig)   # child sessions; read on the hub
+    # Waking sessions the human opened himself (interactive_wake.py); read on the hub
+    interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
     idle_hours: float = 8.0     # a session's process idle this long is stopped; its next message resumes it
     max_live: int = 4           # session processes at once; one more stops the longest-idle one, or waits
     # Waking a session for board posts addressed to its agent (hosted_wake.py). These four apply on the hub.
@@ -873,6 +898,8 @@ class SessionsConfig:
                 setattr(c, k, v)
             elif k == "spawn":
                 c.spawn = SpawnConfig.from_dict(v)
+            elif k == "interactive":
+                c.interactive = InteractiveConfig.from_dict(v)
             elif k == "idle_hours":
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 24 * 366:
                     raise ValueError(f"{where} idle_hours must be a positive number of hours")
@@ -1132,6 +1159,7 @@ def child_env(agent: str, config: DispatchConfig, environ: dict[str, str] | None
     env = {k: src[k] for k in names if k in src}
     env.setdefault("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin")
     env["AGENT_COMMS_HOME"] = str(home())   # where the board lives (not a secret); MCP launchers read it
+    env["AGENT_COMMS_MANAGED"] = "1"        # a launched run or hosted session: its wake hook stays out (waiter.py)
     return env
 
 
@@ -1518,8 +1546,9 @@ class Dispatcher:
         pending = self._scan()
         # After the scan, so every trigger it found was first offered to a hosted session of its agent (hosted_wake.py)
         # and `_hosted_holds` below sees that wake. Without hosted sessions this reads two keys and writes nothing.
-        from . import hosted_wake
+        from . import hosted_wake, interactive_wake
         hosted_wake.tick(self.board)
+        interactive_wake.tick(self.board)       # the same for sessions the human opened himself (off by default)
         self._launch_due(pending, now, foreign)
         self._prune_worktrees(foreign)
 
@@ -1839,7 +1868,7 @@ class Dispatcher:
         def check() -> str | None:
             try:
                 thread = conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
-                if thread is None or hosted_wake.reserve(conn, agent, thread["project"], item["post_id"], now):
+                if thread is None or hosted_wake.reserve(self.board, agent, thread["project"], item["post_id"], now):
                     return None
                 return HOSTED_HOLDS
             except Exception:

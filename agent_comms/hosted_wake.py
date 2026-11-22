@@ -689,7 +689,8 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         from . import delivery
         if delivery.read_since(conn, post_id, agent, at, lambda sid: _own_reader(conn, sid, agent, r["project"])):
             return True
-    return False
+    from . import interactive_wake      # a session the human opened himself, woken the same way (its own records)
+    return interactive_wake.holds(board_or_conn, agent, project, post_id, now)     # off for a bare connection
 
 
 def _own_reader(conn, session_id: Any, agent: str, project: str) -> bool:
@@ -765,8 +766,10 @@ def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:
     dispatcher looked), and the launch is then not reserved. Otherwise the request is the dispatcher's from here on:
     it leaves the waiting posts of every session of the agent in the project that has not ended (also one whose
     node is not connected), and a wake already queued for it loses it when the node is shown that wake
-    (`_qualifying`). Writes nothing without a hosted session of the agent in the project."""
-    if holds(conn, agent, project, post_id, now):
+    (`_qualifying`). Writes nothing without a hosted session of the agent in the project. `conn` may be the Board
+    (then a waiter of interactive_wake.py can hold the request and loses it here too)."""
+    board, conn = (conn, conn.conn) if hasattr(conn, "conn") else (None, conn)
+    if holds(board or conn, agent, project, post_id, now):
         return False
     project = (project.rstrip("/") or "/") if isinstance(project, str) else None
     for r in hosted._sessions(conn) if type(post_id) is int else []:
@@ -781,6 +784,8 @@ def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:
                 rec[table].pop(str(post_id), None)
             rec["claimed"][str(post_id)] = now
             _save(conn, r["session_id"], rec, now)
+    from . import interactive_wake
+    interactive_wake.claim(board or conn, agent, project, post_id, now)
     return True
 
 
