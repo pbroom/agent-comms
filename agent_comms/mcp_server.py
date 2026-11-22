@@ -77,7 +77,12 @@ class RequestReplyIn(BaseModel):
 def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions: str = INSTRUCTIONS) -> MCPServer:
     mcp = MCPServer("agent-comms", instructions=instructions)
     # stdio: one process == one agent connection, so remember the registered session for convenience.
-    state: dict[str, Any] = {"session_id": None}
+    state: dict[str, Any] = {"session_id": None,
+                             # Sticky for this server's life (stdio: one connection): it registered for a dispatched
+                             # run once, so it is a dispatched run's, whatever it registers later (hosted_spawn).
+                             "dispatched": False,
+                             # HTTP: the hub's MCP sessions (mcp-session-id) that registered for a dispatched run
+                             "dispatched_mcp": set()}
     # What this process can say about itself to the spawn tools (hosted_spawn.Ident): a session binding from its
     # environment, or the OS session it runs in (best effort); and, not as an identity, the project of the board
     # session this connection registered (an interactive caller's default project).
@@ -86,25 +91,17 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
     except OSError:
         os_session = None
 
-    def own_project(ctx: Context | None, base, agent: str | None) -> str | None:
-        # The project of this connection's board session, only once it is known to be this caller's own: the same
-        # agent and, for a bound one, the same binding verified (hosted_spawn.session_project).
-        # A board session named by a header that is not the caller's gives nothing, not even its project.
-        from . import hosted_spawn
-        sid = state["session_id"] if transport == "stdio" else None
-        if transport == "http" and ctx is not None and ctx.headers:
-            h = ctx.headers.get("x-board-session")
-            sid = int(h) if h and h.isdigit() and len(h) <= 18 else None
-        if sid is None:
-            return os.getcwd() if transport == "stdio" else None
-        return hosted_spawn.session_project(board.conn, sid, base, agent) if agent else None
-
-    def own_board_session(ctx: Context | None) -> int | None:
-        """The board session this connection registered: the server's own (stdio), or the bridge's header (HTTP)."""
+    def named_board_session(ctx: Context | None) -> int | None:
+        """The board session this connection names: the server's own registration (stdio), or the bridge's header
+        (HTTP), which anyone can set: it counts only once it is known to be the caller's own (`ident`)."""
         if transport == "stdio":
             return state["session_id"]
         h = ctx.headers.get("x-board-session") if ctx is not None and ctx.headers else None
         return int(h) if h and h.isdigit() and len(h) <= 18 else None
+
+    def mcp_session(ctx: Context | None) -> str | None:
+        h = ctx.headers.get("mcp-session-id") if ctx is not None and ctx.headers else None
+        return h if isinstance(h, str) and h else None
 
     def ident(ctx: Context | None):
         from . import hosted_spawn
@@ -116,7 +113,15 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
             agent = principal(ctx).name
         except ToolError:
             agent = None
-        return dataclasses.replace(base, project=own_project(ctx, base, agent), board_session=own_board_session(ctx))
+        # The connection's board session, only once it is known to be this caller's own: the same agent and, for a
+        # bound one, the same binding verified (hosted_spawn.session_project). One that is not gives nothing: not
+        # its project, nor whether it was a dispatched run's (exactly as if none were named).
+        sid = named_board_session(ctx)
+        own = hosted_spawn.session_project(board.conn, sid, base, agent) if sid is not None and agent else None
+        project = own if sid is not None else (os.getcwd() if transport == "stdio" else None)
+        dispatched = state["dispatched"] if transport == "stdio" else mcp_session(ctx) in state["dispatched_mcp"]
+        return dataclasses.replace(base, project=project, board_session=sid if own is not None else None,
+                                   dispatched=dispatched)
 
     def principal(ctx: Context | None) -> Principal:
         token = None
@@ -215,6 +220,13 @@ def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions
                                        hosted_spawn.bind_in_register(c, p, sid, who, board.now(), on))))
         if transport == "stdio":
             state["session_id"] = out["session_id"]
+        if dispatch_run_id is not None or hosted_spawn._dispatched(board.conn, out["session_id"], p.name):
+            # Registered for a dispatched run (or resumed a board session that was): this connection stays a
+            # dispatched run's for its life, whatever it registers later.
+            if transport == "stdio":
+                state["dispatched"] = True
+            elif mcp_session(ctx) is not None:
+                state["dispatched_mcp"].add(mcp_session(ctx))
         return out
 
     @mcp.tool(description=(

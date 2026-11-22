@@ -3352,6 +3352,150 @@ def test_after_review_the_async_spawn_tools_read_the_database_off_the_event_loop
     assert not [w for w in where if w[1]], f"read on the event loop: {where}"
 
 
+def _a_dispatch_run(env, run_id="run-1", agent="claude") -> str:
+    """A live dispatched run of `agent` in PROJECT, as the dispatcher records it, that a worker may register for."""
+    thread = env.thread()
+    with hosted.db.write_tx(env.board.conn) as c:
+        c.execute("INSERT OR REPLACE INTO board_state(key, value, updated_at) VALUES (?, ?, ?)",
+                  ("dispatch.run." + run_id, json.dumps({"run_id": run_id, "status": "running", "agent": agent,
+                                                         "thread_id": thread}), env.clock()))
+    return run_id
+
+
+SPAWN_CALLS = lambda kid: (("board_session_spawn", {"task": "start one more"}),     # noqa: E731
+                           ("board_session_send", {"child": kid, "message": "more"}),
+                           ("board_session_status", {"child": kid}),
+                           ("board_session_cancel", {"child": kid}))
+
+
+def test_r14_s39_a_connection_that_registered_for_a_dispatched_run_stays_one_over_stdio(senv, monkeypatch):
+    """S39: the stdio server registers for its dispatched run, then registers again without the run id (another
+    board session; a Codex run's server sees no AGENT_COMMS_MANAGED): it stays a dispatched run's for its life, and
+    every spawn tool still refuses it. A resume of the dispatched board session keeps its run id too."""
+    from mcp import Client
+    grant(senv)
+    kid = spawn(senv, interactive(senv))["child"]["id"]
+    run = _a_dispatch_run(senv)
+    monkeypatch.setenv("AGENT_COMMS_TOKEN", senv.tokens["claude"])
+    for name in (hs.HOSTED_ENV, hs.KEY_ENV, hs.MANAGED_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+    async def as_the_run():
+        async with Client(build_mcp(senv.board, "stdio")) as c:
+            first = await c.call_tool("board_register", {"project": PROJECT, "dispatch_run_id": run})
+            assert not first.is_error, first.content[0].text
+            dispatched = json.loads(first.content[0].text)["session_id"]
+            again = await c.call_tool("board_register", {"project": P2})
+            assert not again.is_error and json.loads(again.content[0].text)["session_id"] != dispatched
+            caps = json.loads((await c.call_tool("board_session_capabilities", {})).content[0].text)
+            out = [await c.call_tool(name, args) for name, args in SPAWN_CALLS(kid)]
+            resumed = await c.call_tool("board_register", {"project": PROJECT, "resume_session_id": dispatched})
+            return dispatched, caps, out, resumed
+
+    dispatched, caps, out, resumed = asyncio.run(as_the_run())
+    assert caps["may_spawn"] is False and hs.DISPATCHED in caps["why_not"]
+    for r in out:
+        assert r.is_error and hs.DISPATCHED in r.content[0].text, r.content[0].text
+    assert not resumed.is_error and hs._dispatched(senv.board.conn, dispatched, "claude"), \
+        "a resume without the run id keeps it"
+
+
+def test_r14_s39_a_bridged_connection_that_registered_for_a_dispatched_run_stays_one(senv):
+    """S39 over the remote bridge: the bridge says so for its life once it relayed a dispatched registration, and
+    the hub keeps it for that MCP session too (shown with the bridge's header taken away)."""
+    from agent_comms import remote
+    grant(senv)
+    kid = spawn(senv, interactive(senv))["child"]["id"]
+    run = _a_dispatch_run(senv)
+    with TestClient(senv.app, base_url="http://127.0.0.1:8787") as tc:
+        out = []
+        b = remote.Bridge("http://127.0.0.1:8787", senv.tokens["claude"], out.append, client=tc)
+        b.client.headers.pop(hs.H_CLIENT_SID, None)
+        b.client.headers.pop(hs.H_MANAGED, None)        # (a server that sees no AGENT_COMMS_MANAGED)
+        _mcp_open(b)
+
+        def call(n, name, args):
+            b.handle({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": name, "arguments": args}})
+            return out[-1]["result"]
+
+        assert not call(2, "board_register", {"project": PROJECT, "dispatch_run_id": run}).get("isError")
+        assert b.client.headers.get(hs.H_MANAGED) == "1", "the bridge: sticky"
+        assert not call(3, "board_register", {"project": P2}).get("isError")
+        for header in (True, False):
+            if not header:
+                b.client.headers.pop(hs.H_MANAGED)      # the hub's own memory of this MCP session
+            caps = json.loads(call(4, "board_session_capabilities", {})["content"][0]["text"])
+            assert hs.DISPATCHED in caps["why_not"], header
+            for i, (name, args) in enumerate(SPAWN_CALLS(kid)):
+                res = call(10 + i, name, args)
+                assert res.get("isError") and hs.DISPATCHED in res["content"][0]["text"], (header, name, res)
+
+
+@pytest.mark.parametrize("limit", ["max_live_children", "max_spawns_per_hour", "max_turns_without_human"])
+def test_r14_s40_two_identical_calls_at_the_budget_edge_end_as_one_child_and_one_handle(senv, monkeypatch, limit):
+    """S40: the second of two identical calls looks for its child, misses, and the first one then creates it (and
+    the interactive root it goes under) and spends the last unit (forced here, between that look and the write): the
+    second gets the handle, created false. One charge, one audit post, one task, no limit alert."""
+    with_spawn(senv, **{limit: 1})
+    grant(senv)
+    ident = interactive(senv)
+    real = hs._retried
+    state = {"forced": False, "first": None}
+
+    def interleaved(board, p, ident_, caller, request_id, limits=None):
+        if not state["forced"] and limits is None and request_id == "job":
+            state["forced"] = True
+            out = real(board, p, ident_, caller, request_id, limits)
+            assert out is None, "(the second call's first look misses)"
+            state["first"] = spawn(senv, ident, request_id="job")       # the first call, all the way through
+            return out
+        return real(board, p, ident_, caller, request_id, limits)
+    monkeypatch.setattr(hs, "_retried", interleaved)
+    hs.flush(senv.board)
+    before = (_posts(senv), hs._budget(senv.board.conn, "claude", PROJECT))
+    second = spawn(senv, ident, request_id="job")
+    first = state["first"]
+    assert first["created"] is True and second["created"] is False
+    assert second["child"]["id"] == first["child"]["id"]
+    hs.flush(senv.board)
+    after_budget = hs._budget(senv.board.conn, "claude", PROJECT)
+    assert len(after_budget["spawned"]) == len(before[1]["spawned"]) + 1, "one charge"
+    assert _posts(senv) == before[0] + 1, "one audit post, and no limit alert"
+    assert stored(senv, first["child"]["id"])["next_n"] == 2, "one task sent"
+
+
+def test_r14_s41_another_agents_board_session_named_in_the_header_says_nothing(senv):
+    """S41: agent claude names, in X-Board-Session, codex's dispatched board session, codex's ordinary one and an id
+    nobody has: the same answer for all three (as without the header), never DISPATCHED. Also a board session of its
+    own agent that is bound to a hosted session it does not prove to be (the binding rule the header follows
+    elsewhere): not its to name, so the same answer again."""
+    from agent_comms import remote
+    sid = a_root(senv)
+    grant(senv)
+    dispatched, ordinary, bound_one = senv.session("codex"), senv.session("codex"), senv.session("claude")
+    with hosted.db.write_tx(senv.board.conn) as c:
+        c.execute("UPDATE sessions SET dispatch_run_id = 'codex-run' WHERE id = ?", (dispatched,))
+        c.execute("UPDATE sessions SET dispatch_run_id = 'claude-run' WHERE id = ?", (bound_one,))
+        hs.bind_in_register(c, senv.p["claude"], bound_one, bound(senv, sid), senv.clock(), True)
+    answers = []
+    with TestClient(senv.app, base_url="http://127.0.0.1:8787") as tc:
+        for named in (dispatched, ordinary, 999999, bound_one):
+            out = []
+            b = remote.Bridge("http://127.0.0.1:8787", senv.tokens["claude"], out.append, client=tc)
+            b.client.headers.pop(hs.H_CLIENT_SID, None)
+            b.client.headers.pop(hs.H_MANAGED, None)
+            b.client.headers["x-board-session"] = str(named)
+            _mcp_open(b)
+            b.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                      "params": {"name": "board_session_capabilities", "arguments": {"project": PROJECT}}})
+            answers.append(json.loads(out[-1]["result"]["content"][0]["text"]))
+    assert answers[0] == answers[1] == answers[2] == answers[3]
+    assert hs.DISPATCHED not in json.dumps(answers[0])
+    assert not hs._dispatched(senv.board.conn, dispatched, "claude") and hs._dispatched(senv.board.conn, dispatched,
+                                                                                        "codex"), \
+        "(and the check itself reads only the caller's own board session)"
+
+
 # ------------------------------------------------------------ rebase onto PR #93 (waking a Codex thread you opened)
 
 

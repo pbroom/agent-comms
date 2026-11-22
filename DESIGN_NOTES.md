@@ -5322,7 +5322,8 @@ each rule is in the mutation check (88 rules, every one caught).
 ### Spawn tools: after the independent review (PR #94, 2026-11-22)
 
 Three items on bdebb09, each verified first and each with tests that fail without it (`test_after_review_*`); the
-mutation check has 154 rules (nine new), every one caught.
+mutation check has 154 rules (nine new), every one caught. Then Sol's review of 4a9921f (round 14, below): 162
+rules.
 - *Dispatched runs are no callers (owner decision).* Verified: `resolve` took every caller without a binding for
   the agent's interactive root, and the shipped Claude dispatch runner allows all agent-comms tools, so a dispatched
   run, which acts on board requests (untrusted), could start children at the grant's ceiling. Now every spawn tool
@@ -5353,6 +5354,28 @@ mutation check has 154 rules (nine new), every one caught.
 - *Database reads off the event loop.* The async spawn tools (spawn, send, status) read who is calling (`ident`:
   the token's principal and the board session's project) and the note of a result another call took
   (`not_taken`) in a worker thread, as their other database work already ran.
+- *Round 14 (Sol, on 4a9921f).* S39: a connection that registered for a dispatched run stays one for its life,
+  whatever it registers later (another board session, another project), so a Codex run, whose server sees no
+  AGENT_COMMS_MANAGED, cannot shed its classification by registering again. Sticky means, over stdio, the board
+  server process (`state["dispatched"]`, set by a successful register with a dispatch_run_id, or of a board session
+  that has one); over HTTP, the bridge process (once it relayed such a register it sends `x-board-managed` on every
+  later call) and, on the hub, that MCP session (`mcp-session-id`); and in the hub's records, the board session
+  itself (a resume never clears `dispatch_run_id`, core's COALESCE, now pinned by a test). A new MCP session opened
+  by something other than that bridge carries none of it: that is a different connection. Tests:
+  `test_r14_s39_a_connection_that_registered_for_a_dispatched_run_stays_one_over_stdio`,
+  `test_r14_s39_a_bridged_connection_that_registered_for_a_dispatched_run_stays_one`. S40: the limit refusal is
+  decided inside the same write transaction as the starter-scoped request-id lookup (`_retried(..., limits=cfg)`,
+  the caller resolved again there, an interactive root made meanwhile counting as the same), before any alert, so two
+  identical concurrent calls end as one child (created true) and one handle (created false): one charge, one audit
+  post, one task, no alert. `create_child` already looked before its own `check` in its transaction. Test, the
+  interleaving forced between the first look and the write, for each of the three limits:
+  `test_r14_s40_two_identical_calls_at_the_budget_edge_end_as_one_child_and_one_handle`. S41: a board session named
+  by `x-board-session` counts (its project, and now whether it was a dispatched run's) only once it is the caller's
+  own, by the rule the header already followed for the project (`session_project`: the same agent and, if bound, the
+  same binding verified); `_dispatched` also reads only the caller's own. Another agent's dispatched session, its
+  ordinary one, an id nobody has, and an own board session bound to a hosted session the caller does not prove to
+  be, all give the same answer as no header:
+  `test_r14_s41_another_agents_board_session_named_in_the_header_says_nothing`.
 
 ### Spawn tools: review round 12 (2026-11-22)
 

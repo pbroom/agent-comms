@@ -126,7 +126,7 @@ class Bridge:
     def _registered(self, message: dict, out: list) -> None:
         """A successful board_register: its board session id goes with every later request (X-Board-Session), as a
         stdio board server remembers it. So the hub's tools take this connection's own board session by default (the
-        spawn tools its project, mcp_server.own_project, which checks that the session is this agent's and, if it is
+        spawn tools its project, mcp_server.ident, which checks that the session is this agent's and, if it is
         bound, this binding's). Only the hub's answer to this very call is read, never anything the model wrote."""
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if message.get("method") != "tools/call" or params.get("name") != "board_register":
@@ -144,6 +144,13 @@ class Bridge:
             sid = body.get("session_id") if isinstance(body, dict) else None
             if type(sid) is int and sid > 0:
                 self.client.headers["x-board-session"] = str(sid)
+                args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+                if args.get("dispatch_run_id") is not None:
+                    # It registered for a dispatched run: from now on, for this bridge's life, it says it is a
+                    # process the board launched (hosted_spawn.H_MANAGED), whatever it registers later. (Only a
+                    # restriction: the call's own argument may say so, never take it back.)
+                    from .hosted_spawn import H_MANAGED
+                    self.client.headers[H_MANAGED] = "1"
 
     def handle(self, message: dict) -> None:
         msg_id, method = message.get("id"), message.get("method")
