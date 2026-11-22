@@ -637,14 +637,16 @@ What to know:
   a warning that any of these forms may also be refused; its own rule text is never copied in. (A runner's own
   `--settings` is refused outright, as before.) A session asked
   for at `read-only` (the access word), and a runner that declares itself read-only, are not scoped and get no such
-  text; a session whose computed label only comes out as `read-only` can still be. When a command
-  it needs is refused it says which one in its reply and stops (its task came as a turn, so there is no request
-  post to block). A runner's own `--append-system-prompt` is kept, with this after it. A resumed session keeps the
-  system prompt it was started with (Claude records it at the first request and sends that record until the
-  conversation is compacted), so a session started before this version, or before a change to its runner's rules,
-  keeps its old instruction and notice until it is compacted or a new session is started; a new session is the
-  remedy. `--system-prompt-snapshot off` in the runner makes every request take the current text, at the cost of
-  prompt-cache reuse; that is the machine owner's choice. DESIGN_NOTES "Scoped sessions are told their commands".
+  text; a session whose computed label only comes out as `read-only` can still be. When a command it needs is
+  refused it stops: a root woken by a board post (above) marks the request it is working blocked, naming the command
+  (the session holds that request, so nothing else would relaunch it or alert you); a human's turn or a child's task
+  has no request, so it says which one in its reply. A runner's own `--append-system-prompt` is kept, with this
+  after it. A resumed session keeps the system prompt it was started with (Claude records it at the first request
+  and sends that record until the conversation is compacted), so a session started before this version, or before a
+  change to its runner's rules, keeps its old instruction and notice until it is compacted or a new session is
+  started; a new session is the remedy. `--system-prompt-snapshot off` in the runner makes every request take the
+  current text, at the cost of prompt-cache reuse; that is the machine owner's choice. DESIGN_NOTES "Scoped sessions
+  are told their commands".
 - **A lost turn is not retried.** A turn that timed out (`[dispatch] timeout_minutes`), whose process died, or whose
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.

@@ -268,10 +268,27 @@ def test_a_rule_the_notice_cannot_word_is_refused_not_left_out(monkeypatch):
         monkeypatch.setattr(rp, "ALLOWED", rp.ALLOWED[:-1])
 
 
+# One hosted text for both kinds of turn: a woken root works request posts it holds (hosted_wake.holds), so it must
+# block them; a human's turn or a child's task has none, so it says so in its reply.
+HOSTED_INSTRUCTION = (
+    "If a command you need is refused, do not work around it: if you are working a board request, mark it blocked "
+    "(board_request_progress state=blocked) naming the command; otherwise say in your reply which one. Then stop.")
+
+
+def test_the_hosted_instruction_covers_a_woken_root_and_a_plain_turn():
+    assert rp.HOSTED_DENIED_TOOL_INSTRUCTION == HOSTED_INSTRUCTION
+    assert rp.DENIED_TOOL_INSTRUCTION == (
+        "If a tool you need is denied, do not work around it: mark the request blocked (board_request_progress "
+        "state=blocked) naming the denied tool, and stop."), "dispatched runs keep their wording exactly"
+    for argv in (PLAIN["shipped"], OWN["unrelated-deny"]):
+        assert rp.with_denied_tool_instruction(argv)[-1] == rp.tools_notice(argv) + " " + HOSTED_INSTRUCTION
+        assert rp.dispatched_instruction(argv) == rp.tools_notice(argv) + " " + rp.DENIED_TOOL_INSTRUCTION
+
+
 def test_the_notice_is_short_enough_to_be_read():
-    assert len(SHIPPED_NOTICE) < 900 and len(rp.with_denied_tool_instruction(PLAIN["shipped"])[-1]) < 1000
+    assert len(SHIPPED_NOTICE) < 900 and len(rp.with_denied_tool_instruction(PLAIN["shipped"])[-1]) < 1100
     assert all(len(rp.tools_notice(a)) < 1000 for a in OWN.values())
-    assert all(len(rp.with_denied_tool_instruction(a)[-1]) < 1100 for a in OWN.values() if "--append-system-prompt"
+    assert all(len(rp.with_denied_tool_instruction(a)[-1]) < 1200 for a in OWN.values() if "--append-system-prompt"
                not in a)
 
 
@@ -326,7 +343,7 @@ def test_a_hosted_session_root_or_child_is_told_its_commands_and_to_say_so_in_it
         text = value_after(argv, "--append-system-prompt")
         assert argv.count("--append-system-prompt") == 1
         assert text == SHIPPED_NOTICE + " " + rp.HOSTED_DENIED_TOOL_INSTRUCTION
-        assert "board_request_progress" not in text and "request" not in text, "no tool that needs a post id"
+        assert text.endswith(HOSTED_INSTRUCTION) and rp.DENIED_TOOL_INSTRUCTION not in text
         # No snapshot flag of the node's own: with it off Claude renders the system prompt for every request and the
         # prompt cache is lost turn after turn (DESIGN_NOTES: a resumed session keeps its first prompt instead).
         assert not any(a.startswith("--system-prompt-snapshot") for a in argv)

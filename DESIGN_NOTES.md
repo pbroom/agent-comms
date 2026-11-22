@@ -6308,8 +6308,8 @@ pin the new rules.
 `runner_preflight.ALLOWED` in `dontAsk` mode, made its edit, then had `git switch -c w1-design-notes-node-protocol`,
 `git commit -am ...` and `python -m pytest -q tests/...` refused and reported itself blocked. Nothing had told it
 that a branch must be `codex/...` or that tests run as `uv run pytest ...`; its appended instruction told it to call
-`board_request_progress`, which needs a request post id its task (a session turn) did not have. The owner's
-decision: the worker must be told which commands it may run.
+`board_request_progress`, which needs a request post id its task (a child's task, a session turn) did not have.
+The owner's decision: the worker must be told which commands it may run.
 
 **What the text says.** `runner_preflight.tools_notice(argv)`, for the shipped runner scoped (874 characters):
 
@@ -6330,8 +6330,15 @@ field between hub and node):
   state=blocked) naming the denied tool, and stop.") to the prompt, as the instruction alone was before (1,025
   characters).
 - *Hosted session*, root or child (session_host.py: its task is a turn): `with_denied_tool_instruction` passes the
-  notice and `HOSTED_DENIED_TOOL_INSTRUCTION` ("If a command you need is refused, do not work around it: say in your
-  reply which one, and stop.") through `--append-system-prompt` (970 characters). A runner's own
+  notice and `HOSTED_DENIED_TOOL_INSTRUCTION` ("If a command you need is refused, do not work around it: if you are
+  working a board request, mark it blocked (board_request_progress state=blocked) naming the command; otherwise say
+  in your reply which one. Then stop.") through `--append-system-prompt` (1,092 characters). One text for both
+  kinds of turn (after the PR review): a human's message or a child's task has no request post, but a root woken by
+  a board post (hosted_wake.py) works request posts addressed to its agent, and once it has been shown one,
+  `hosted_wake.holds` keeps the request for the session, so the dispatcher does not relaunch it and the undelivered
+  alert skips it (delivery.py). Telling such a root only to say so in its reply would leave the request started,
+  held and unseen by the human; it blocks it instead, as on main. The host cannot tell the two apart at launch (one
+  process serves every turn of the session), so the text says both. A runner's own
   `--append-system-prompt` (either spelling) is kept, the text after it in the same flag, as before; a runner's own
   `--system-prompt-snapshot` is left as written (below).
 
@@ -6366,7 +6373,7 @@ scoped.
 - No (the shipped runner, as on the owner's machines): the text above.
 - Yes: the same list, opening "This runner has restrictions of its own, so any of the forms below may also be
   refused. Other commands may be refused without asking.", and "You may be able to edit and create files in your run
-  directory."; nothing is stated as available. Hosted 1,048 characters, dispatched 1,103 for the shipped list.
+  directory."; nothing is stated as available. Hosted 1,170 characters, dispatched 1,103 for the shipped list.
 The shipped `DENIED` rules are one fixed sentence (`DENIED_WORDS`, held against the tuple by a test), and nothing of
 the runner's own text is copied in (a deny rule with backticks and a newline leaves no trace). The board's tools are
 not claimed: whether its MCP server is loaded cannot be read off the argv (a dispatched run's prompt asks for them on
@@ -6434,6 +6441,9 @@ the line was.)
   commands (`ls` ran with no rule in the first real check) the other.
 - An option on the allowlist could gain a tool-restricting meaning in a later Claude Code; the list is kept to
   options with a fixed, non-tool meaning.
+- Two parts of the machine owner's own configuration are not on the command line and cannot be seen: environment
+  variables given to the runner through `[dispatch.env]` (Claude Code reads some that change its behaviour), and a
+  wrapper executable named `claude` (the check reads only the file name).
 
 **Follow-ups (seen in review, unchanged from main).**
 - A runner configured with `--tools=Read` can enter the scoped path (`read_only()` does not look at `--tools`) and

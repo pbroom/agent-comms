@@ -15,13 +15,16 @@ ALLOWED = (
 )
 DENIED = ("Bash(git *--force*)", "Bash(git *--discard-changes*)", "Bash(git * -f*)")
 # What a scoped agent does when a command it needs is refused. A dispatched run was launched for board request
-# posts, so it blocks them; a hosted session's task arrives as a session turn (no post id to block), so it says so
-# in its reply.
+# posts, so it blocks them. A hosted session's turn may be either: a human's message or a child's task (no post to
+# block), or, for a root woken by a board post (hosted_wake.py), request posts addressed to its agent, which the
+# session holds once it has been shown them (hosted_wake.holds: no relaunch, no undelivered alert), so it must block
+# those or they never reach the human.
 DENIED_TOOL_INSTRUCTION = (
     "If a tool you need is denied, do not work around it: mark the request blocked (board_request_progress "
     "state=blocked) naming the denied tool, and stop.")
 HOSTED_DENIED_TOOL_INSTRUCTION = (
-    "If a command you need is refused, do not work around it: say in your reply which one, and stop.")
+    "If a command you need is refused, do not work around it: if you are working a board request, mark it blocked "
+    "(board_request_progress state=blocked) naming the command; otherwise say in your reply which one. Then stop.")
 
 
 # ---------------------------------------------------------------- the notice of what a scoped agent may run

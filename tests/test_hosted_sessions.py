@@ -571,7 +571,7 @@ def test_a_scoped_session_carries_its_commands_and_the_denied_tool_instruction_a
     template = rp.scoped_template(SHIPPED)
     text = rp.tools_notice(template) + " " + rp.HOSTED_DENIED_TOOL_INSTRUCTION
     assert value_after(scoped, "--append-system-prompt") == text, "the hosted wording (test_scoped_notice)"
-    assert rp.DENIED_TOOL_INSTRUCTION not in text, "a session's task has no post id to block"
+    assert rp.DENIED_TOOL_INSTRUCTION not in text, "its own wording: a request to block, or none (test_scoped_notice)"
     assert "--allowedTools=" + ",".join(rp.ALLOWED) in scoped and scoped.count("--append-system-prompt") == 1
     own = argv(SHIPPED + ["--append-system-prompt", "Be brief."], claude_tool_projects=[PROJECT])
     assert own.count("--append-system-prompt") == 1
