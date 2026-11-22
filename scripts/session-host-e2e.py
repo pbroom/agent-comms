@@ -129,6 +129,18 @@ T9b. A second Claude child and a Codex child: each result is written to the pare
     (the Claude child's first); and a child whose turn fails is a result too, with the outcome and the node's reason.
     With real agents (three haiku turns for the parent, two for the Claude children, one Codex turn) the timing
     decides whether the two go together; the script says which it was.
+T10. Spawn tools (hosted_spawn.py). A sixth Claude agent's runner has the temp board's MCP server (this checkout's
+    `board mcp` on the hub's database) and only its tools allowed. The script, acting as that session's own board
+    server (a real `board mcp` process with the session's binding in its environment), finds that without a grant it
+    may not spawn and is told why; the human gives a grant (`board session grant ... --access workspace`); a child
+    above it (`full`) and a forged key are refused. Then two children, a Claude one and a Codex one: with the real
+    CLI the HUMAN tells the session to delegate and the session calls board_session_spawn itself (wait=true) and
+    answers from the replies; with the stand-ins the script makes the calls. Each child's turn starts with the
+    server's frame, each result says the parent started that work, the tree's audit thread has one automatic post
+    per child, and closing the parent ends both (one more audit post each).
+T10b. (stand-ins) An interactive caller: a `board mcp` with no binding is the agent's one interactive root for the
+    project, counted against the same budget; its child runs on the node, and another board server process (a restart)
+    sees it and takes its result, which is never a turn; closing that tree ends the child.
 The settings fixtures live in the temp directory only. They are loaded with `--settings` because Claude Code
 ignores an untrusted directory's own `.claude/settings.json` in print mode (it says so on stderr), and trusting the
 temp checkout would mean writing the user's `~/.claude.json`. With the real CLI those two runners also pass
@@ -168,6 +180,7 @@ FULL_AGENT = "claude-full"      # the tree scenario's second Claude agent: its r
 GRANT_AGENT = "claude-granted"  # ... a third: its runner loads a settings file that allows Bash(*), Write and Edit
 MODE_AGENT = "claude-defmode"   # ... a fourth: its runner loads a settings file whose defaultMode is bypassPermissions
 RESTRICTED_AGENT = "claude-restricted"      # ... a fifth: --restricted beside the bypass mode, which Claude refuses
+SPAWN_AGENT = "claude-spawner"  # ... a sixth: its runner has the temp board's MCP tools, so it can start children itself
 NO_BYPASS = "disableBypassPermissionsMode"  # the settings key (under permissions) a node adds to every launch but full
 GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit", "Read"]}}     # ... and two hooks (enable_tree)
 BYPASS_BY_SETTINGS = {"permissions": {"defaultMode": "bypassPermissions"}}
@@ -226,6 +239,42 @@ print(json.dumps({"now": now, "holds": hosted.holds(board, agent, project, post_
                   "handed_at": (rec.get("handed") or {}).get(str(post_id)),
                   "receipt": delivery.receipt(c, post_id, agent), "readers": delivery.readers(c, post_id, agent),
                   "sessions": rows}))
+"""
+
+
+# T10: the key that proves a process is hosted session argv[1]'s (what its node put into that process's environment),
+# read by another process on the hub's database: so the script can act as that session's own board server.
+BIND_KEY = """
+import sys
+from agent_comms import hosted_spawn
+from agent_comms.config import Settings
+from agent_comms.core import Board
+board = Board(Settings.load())
+hosted_spawn.ensure_secret(board)
+print(hosted_spawn.bind_key(board.conn, sys.argv[1]))
+"""
+
+# T10: board tool calls through a real `board mcp` stdio server, started with the environment this process has (so
+# with a hosted session's binding, or none: an interactive session's board server). argv[1]: the agent; argv[2]: a
+# JSON list of [tool, arguments]. Prints [{"error": bool, "text": str}] for the calls, in order.
+MCP_CALLS = """
+import asyncio, json, os, sys
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+async def main():
+    params = StdioServerParameters(command=sys.executable, args=["-m", "agent_comms.cli", "mcp", "--agent", sys.argv[1]],
+                                   env=dict(os.environ))
+    async with stdio_client(params) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            out = []
+            for name, args in json.loads(sys.argv[2]):
+                res = await s.call_tool(name, args)
+                out.append({"error": bool(res.is_error), "text": res.content[0].text if res.content else ""})
+            print(json.dumps(out))
+
+asyncio.run(main())
 """
 
 
@@ -1011,6 +1060,19 @@ codex = true
         agents = self.hub_home / "agents.toml"
         for name in (FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT):
             create_agent(agents, name, "claude-code")
+        # T10: the spawning agent signs in to the temp board from a token file in the temp directory, through this
+        # checkout's `board mcp` (stdio, on the hub's database), which inherits its session's binding.
+        tokens = self.tmp / "tokens"
+        tokens.chmod(0o700)
+        token_file = tokens / f"{SPAWN_AGENT}.token"
+        token_file.touch(mode=0o600)
+        token_file.write_text(create_agent(agents, SPAWN_AGENT, "claude-code") + "\n")
+        self.spawn_mcp = self.tmp / "spawner-mcp.json"
+        self.spawn_mcp.write_text(json.dumps({"mcpServers": {"agent-comms": {
+            "type": "stdio", "command": sys.executable,
+            "args": ["-m", "agent_comms.cli", "mcp", "--agent", SPAWN_AGENT],
+            "env": {"AGENT_COMMS_HOME": str(self.hub_home), "AGENT_COMMS_TOKEN_DIR": str(tokens),
+                    "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}}}}, indent=2))
         self.project_mode = self.tmp / "checkout-mode"      # where a settings file selects bypassPermissions
         self.worktrees = self.tmp / "worktrees"
         # The grants fixture also carries two command hooks. Each appends the JSON it is given on stdin (it names
@@ -1036,7 +1098,7 @@ codex = true
             (directory / ".claude" / "settings.json").write_text(json.dumps(fixture, indent=2) + "\n")
         hub = (self.hub_home / "board.toml").read_text()
         hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT])}", "agents = " + toml_list(
-            [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT]))
+            [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT]))
         hub = hub.replace(f"projects = {toml_list([str(self.project)])}",
                           f"projects = {toml_list([str(self.project), str(self.project_mode)])}")
         (self.hub_home / "board.toml").write_text(hub + "\n[dispatch.sessions.spawn]\nenabled = true\n"
@@ -1064,6 +1126,9 @@ codex = true
                    *fixture]
         restricted = [exe, "-p", "{prompt}", "--restricted", "--permission-mode", "bypassPermissions", *quiet]
         defmode = [exe, "-p", "{prompt}", "--settings", str(self.project_mode / ".claude" / "settings.json"), *fixture]
+        # T10: the board's tools and nothing else allowed (dontAsk refuses the rest), from the temp board alone.
+        spawner = [exe, "-p", "{prompt}", "--permission-mode", "dontAsk", *quiet, "--mcp-config", str(self.spawn_mcp),
+                   "--allowedTools=mcp__agent-comms"]
         (self.node_home / "board.toml").write_text(f"""[conversations]
 enabled = false
 
@@ -1077,6 +1142,7 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 {GRANT_AGENT} = {toml_list(granted)}
 {MODE_AGENT} = {toml_list(defmode)}
 {RESTRICTED_AGENT} = {toml_list(restricted)}
+{SPAWN_AGENT} = {toml_list(spawner)}
 {CODEX_AGENT} = {toml_list(self.codex_runner())}
 
 [dispatch.worktrees]
@@ -1775,6 +1841,175 @@ max_live = 8
         listed, _, _ = self.board("session", "list")
         self.check(listed.strip() == "(no hosted sessions)", "no hosted session is left")
 
+    def bind_key(self, sid: str) -> str:
+        r = subprocess.run([sys.executable, "-c", BIND_KEY, sid], cwd=str(self.tmp), capture_output=True, text=True,
+                           timeout=60, env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home)})
+        if r.returncode != 0:
+            raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
+        return r.stdout.strip()
+
+    def mcp_calls(self, agent: str, calls: list, hosted: str | None = None) -> list[dict]:
+        """Board tool calls through a real `board mcp` process as `agent`: with hosted session `hosted`'s binding
+        in its environment (as that session's own board server has it), or with none (an interactive session's)."""
+        env = self.env | {"AGENT_COMMS_HOME": str(self.hub_home), "AGENT_COMMS_TOKEN_DIR": str(self.tmp / "tokens")}
+        if hosted is not None:
+            env |= {"AGENT_COMMS_HOSTED_SESSION": hosted, "AGENT_COMMS_HOSTED_KEY": self.bind_key(hosted)}
+        r = subprocess.run([sys.executable, "-c", MCP_CALLS, agent, json.dumps(calls)], cwd=str(self.tmp),
+                           capture_output=True, text=True, timeout=120, env=env)
+        if r.returncode != 0:
+            raise SystemExit(f"the board MCP calls failed:\n{r.stderr[-2000:]}")
+        return json.loads(r.stdout)
+
+    def tree_thread_posts(self, root: str) -> list[dict]:
+        """The posts of a tree's audit thread, read by another process on the hub's database."""
+        code = ("import json, sys\nfrom agent_comms import hosted_spawn\nfrom agent_comms.config import Settings\n"
+                "from agent_comms.core import Board\nb = Board(Settings.load())\n"
+                "t = hosted_spawn._tree(b.conn, sys.argv[1])\n"
+                "rows = [dict(r) for r in b.conn.execute('SELECT id, agent, type, body FROM posts WHERE thread_id = ?"
+                " ORDER BY id', (t['thread'],))] if t['thread'] else []\n"
+                "auto = [r['id'] for r in rows if b.conn.execute(\"SELECT 1 FROM board_state WHERE key = ?\", "
+                "('auto_recovery.post.' + str(r['id']),)).fetchone()]\n"
+                "print(json.dumps({'posts': rows, 'automatic': auto}))")
+        r = subprocess.run([sys.executable, "-c", code, root], cwd=str(self.tmp), capture_output=True, text=True,
+                           timeout=60, env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home)})
+        if r.returncode != 0:
+            raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
+        return json.loads(r.stdout)
+
+    def spawn_scenario(self) -> None:
+        """T10: an agent session starts child sessions itself (hosted_spawn.py), through the board's tools."""
+        real = self.real
+        print("\n[T10] spawn tools: a hosted session starts child sessions of its own")
+        first = "Reply with exactly the word: ready" if real else "ready"
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", SPAWN_AGENT, "--model",
+                               "haiku", "--wait", "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.show(rid)
+        print(f"  parent {rid} ({SPAWN_AGENT})")
+        [caps, refused] = self.mcp_calls(SPAWN_AGENT, [["board_session_capabilities", {}],
+                                                      ["board_session_spawn", {"task": "x", "child_agent": AGENT}]], rid)
+        caps = json.loads(caps["text"])
+        self.check(caps["enabled"] and not caps["may_spawn"] and caps["caller"]["session_id"] == rid
+                   and any("no live spawn grant" in w for w in caps["why_not"]),
+                   "capabilities, from the session's own board server: it is known by its binding, and without a "
+                   "grant it may not spawn (and says why)")
+        self.check(refused["error"] and "no live spawn grant" in refused["text"], "spawn without a grant: refused")
+        g, _, _ = self.board("session", "grant", str(self.project), "--agent", SPAWN_AGENT, "--access", "workspace",
+                             "--hours", "1")
+        print("  " + g.strip())
+        [forged, above, deny_tree] = self.mcp_calls(SPAWN_AGENT, [
+            ["board_session_capabilities", {}],
+            ["board_session_spawn", {"task": "x", "child_agent": AGENT, "access": "full"}],
+            ["board_session_status", {}]], rid)
+        caps = json.loads(forged["text"])
+        self.check(caps["may_spawn"] and caps["grant"]["access"] == "workspace"
+                   and {t["agent"] for t in caps["targets"]} >= {AGENT, CODEX_AGENT},
+                   "with the grant it may, and capabilities lists the targets (Claude and Codex) on its node")
+        self.check(above["error"] and "above what you may give a child now" in above["text"],
+                   "a child above the grant's ceiling (full, over workspace): refused")
+        self.check(not deny_tree["error"] and json.loads(deny_tree["text"])["children"] == [], "no child yet")
+        env_bad = self.env | {"AGENT_COMMS_HOME": str(self.hub_home), "AGENT_COMMS_TOKEN_DIR": str(self.tmp / "tokens"),
+                              "AGENT_COMMS_HOSTED_SESSION": rid, "AGENT_COMMS_HOSTED_KEY": "0" * 64}
+        r = subprocess.run([sys.executable, "-c", MCP_CALLS, SPAWN_AGENT,
+                            json.dumps([["board_session_spawn", {"task": "x"}]])], cwd=str(self.tmp),
+                           capture_output=True, text=True, timeout=120, env=env_bad)
+        [forged] = json.loads(r.stdout)
+        self.check(forged["error"] and "does not verify" in forged["text"], "a forged binding key: refused")
+
+        if real:
+            ask = (f"Delegate two small tasks with the board tool board_session_spawn, wait=true each time: one with "
+                   f"child_agent \"{AGENT}\", model \"haiku\", access \"read-only\" and task \"Reply with exactly the word: "
+                   f"apple\"; one with child_agent \"{CODEX_AGENT}\", model \"{self.args.codex_model}\", effort \"low\", "
+                   f"access \"read-only\" and task \"Reply with exactly the word: pong\". Then reply with exactly the "
+                   f"two words the children replied, separated by one space, and nothing else.")
+            out, _, took = self.board("session", "send", rid, ask, "--wait", "--json")
+            data = json.loads(out)
+            print(f"  the human asked it to delegate; its turn took {took:.1f}s; its tool calls: "
+                  f"{self.tool_calls(rid)}; its reply: {data['reply']!r}")
+            calls = [b for b in self.tool_uses(rid) if b.get("name") == "mcp__agent-comms__board_session_spawn"]
+            self.check(len(calls) >= 2, "it called board_session_spawn itself, for both children")
+        else:
+            spawned = self.mcp_calls(SPAWN_AGENT, [
+                ["board_session_spawn", {"task": "apple", "child_agent": AGENT, "access": "read-only", "role": "research",
+                                         "title": "Say apple"}],
+                ["board_session_spawn", {"task": "pong", "child_agent": CODEX_AGENT, "access": "read-only"}]], rid)
+            self.check(not any(x["error"] for x in spawned), "the session's board server started both children")
+        view = self.show(rid)
+        kids = [k for k in view.get("children", []) if (k.get("spawned_by") or {}).get("session") == rid]
+        print(f"  children it started: {[(k['name'], k['agent'], k['access'], k['state']) for k in kids]}")
+        self.check(len(kids) == 2 and {k["agent"] for k in kids} == {AGENT, CODEX_AGENT}
+                   and all(k["spawned_by"]["agent"] == SPAWN_AGENT for k in kids),
+                   "two children, one Claude and one Codex, each recorded as started by the session")
+        ids = [k["session_id"] for k in kids]
+        deadline = time.monotonic() + 180
+        while True:
+            res = [x for x in self.show(rid).get("results", []) if x["child"] in ids]
+            if len(res) == 2 and all(x["state"] in ("claimed", "delivered") for x in res):
+                break
+            if time.monotonic() > deadline:
+                raise SystemExit(f"FAIL: the children's results did not reach the parent: {json.dumps(res)}")
+            time.sleep(0.3)
+        print(f"  results: {[(x['name'], x['outcome'], x['state'], x['started_by']) for x in res]}")
+        self.check(all(x["outcome"] == "completed" and x["started_by"] == "parent" for x in res),
+                   "both turns completed, and each result says the parent started that work")
+        task_turns = [t for t in self.stdin_lines() if t.startswith(f"[agent-comms] A task from hosted session {rid} "
+                                                                    f"(agent {SPAWN_AGENT})")]
+        self.check(len(task_turns) == 1 and "not the human" in task_turns[0] and "untrusted data" in task_turns[0],
+                   "the Claude child's turn starts with the server's frame: a task from that session, not the human, "
+                   "untrusted data")
+        codex_tasks = [m for m in self.codex_stdin() if m.get("method") == "turn/start"
+                       and str(((m.get("params") or {}).get("input") or [{}])[0].get("text", "")).startswith(
+                           f"[agent-comms] A task from hosted session {rid}")]
+        self.check(len(codex_tasks) == 1, "and so does the Codex child's")
+        if real:
+            reply = (self.show(rid).get("reply") or "").lower()
+            self.check("apple" in reply and "pong" in reply, "the parent answered from its children's results")
+        audit = self.tree_thread_posts(rid)
+        print(f"  audit thread: {len(audit['posts'])} post(s), first: {audit['posts'][0]['body'][:160]!r} ...")
+        self.check(len(audit["posts"]) >= 2 and set(audit["automatic"]) == {p["id"] for p in audit["posts"]}
+                   and all(p["agent"] == "human" and p["body"].startswith("Automatic audit") for p in audit["posts"]),
+                   "one automatic audit post per child, written by the hub, in the tree's thread")
+        listed, _, _ = self.board("session", "list")
+        self.check(listed.count(f"started by {SPAWN_AGENT}") == 2, "`board session list` says who started them")
+
+        print("\n[T10b] an interactive session (a board server with no binding) starts a child")
+        if not real:
+            p = str(self.project)
+            out = self.mcp_calls(SPAWN_AGENT, [
+                ["board_session_capabilities", {"project": p}],
+                ["board_session_spawn", {"task": "pear", "child_agent": AGENT, "access": "read-only", "project": p}]])
+            caps = json.loads(out[0]["text"])
+            self.check(caps["may_spawn"] and caps["caller"]["kind"] == "interactive"
+                       and caps["budget"]["live_now"] == 2,
+                       "a board server with no binding is the agent's interactive root for the project, and counts "
+                       "against the same budget as the hosted session's children (2 live)")
+            kid = json.loads(out[1]["text"])["child"]
+            # Another process (the board server restarted): the same root, its child there, its result taken.
+            [st] = self.mcp_calls(SPAWN_AGENT, [["board_session_status", {"project": p, "wait_seconds": 30}]])
+            st = json.loads(st["text"])
+            print(f"  interactive child {kid['name']} {kid['id']}; taken by another process: "
+                  f"{json.dumps((st.get('result') or {}).get('result'))}")
+            self.check(not out[1]["error"] and kid["id"] in [c["id"] for c in st["children"]]
+                       and st["result"] and st["result"]["result"]["child"] == kid["id"]
+                       and "<<<child-output" in st["result"]["text"]
+                       and "turn 1: [AGENT-COMMS] A TASK FROM AN INTERACTIVE SESSION" in st["result"]["text"],
+                       "its child ran on the node, a restarted board server sees it, and its result came back to the "
+                       "status call (never a turn: nothing can write that session one)")
+            self.board("session", "close", kid["parent"])
+            self.check(self.wait_ended(kid["id"])["state"] == "ended", "closing the interactive tree ends its child")
+        else:
+            print("  (stand-in runs only: it would cost one more haiku turn)")
+
+        self.board("session", "close", rid)
+        self.check(self.wait_ended(rid)["state"] == "ended", "closing the parent ends it")
+        self.check(all(self.wait_ended(k)["state"] == "ended" for k in ids), "and the children it started")
+        audit = self.tree_thread_posts(rid)
+        self.check(len(audit["posts"]) >= 4 and sum("ended: closed because the session it was started under ended"
+                                                    in p["body"] for p in audit["posts"]) == 2,
+                   "and one audit post for each child's end")
+        listed, _, _ = self.board("session", "list")
+        self.check(listed.strip() == "(no hosted sessions)", "no hosted session is left")
+
     # ------------------------------------------------------------ teardown
 
     def stop(self) -> None:
@@ -1888,6 +2123,7 @@ def main() -> int:
             run.start_services()
             run.tree_scenario()
             run.results_scenario()
+            run.spawn_scenario()
             print("\n[T8] stopping the node (SIGTERM) and the hub")
             run.stop()
             run.check(run.leftovers() == [], "no session process is left behind")

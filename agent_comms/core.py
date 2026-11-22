@@ -1059,10 +1059,13 @@ class Board:
 
     def register_session(self, p: Principal, project: str, worktree: str | None = None,
                          resume_session_id: int | None = None, client: tuple[str, str] | None = None,
-                         dispatch_run_id: str | None = None) -> dict:
+                         dispatch_run_id: str | None = None,
+                         on_session: Callable[[sqlite3.Connection, int], Any] | None = None) -> dict:
         """`client` = (kind, conversation uuid) of the client conversation this session runs in. Only server-side
         capture passes it (the stdio MCP server, from its inherited environment); no tool or HTTP parameter maps
-        to it. An invalid value is dropped. Resuming with a client moves the session to that conversation."""
+        to it. An invalid value is dropped. Resuming with a client moves the session to that conversation.
+        `on_session(c, session_id)`: run inside the same write transaction once the session is known (the spawn
+        tools' binding, hosted_spawn.bind_in_register); what it raises undoes the register."""
         project = _norm_path(project)
         if not project:
             raise Invalid("project (absolute path of the repo you are working in) is required")
@@ -1134,6 +1137,8 @@ class Board:
                     if pinned:
                         raise Conflict('an unfinished continuation pins this session environment; register a separate session')
                     c.execute('DELETE FROM session_activity WHERE session_id=?',(resume_session_id,))
+                from . import hosted_spawn      # what it read so far keeps the conversation it was read by
+                hosted_spawn.snapshot_provenance(c, resume_session_id, client, now)
                 c.execute("UPDATE sessions SET project=?, worktree=?, last_seen=?, dispatch_run_id=COALESCE(?,dispatch_run_id) WHERE id=?",
                           (project, worktree, now, dispatch_run_id, resume_session_id))
                 if client:
@@ -1146,12 +1151,15 @@ class Board:
                        client_session_id, dispatch_run_id) VALUES (?,?,?,?,?,?,?,?,?)""",
                     (p.name, p.runtime, project, worktree, now, now, *(client or (None, None)), dispatch_run_id),
                 ).lastrowid
-                # A new session starts where the agent as a whole has read up to, instead of replaying history.
-                c.execute(
-                    """INSERT INTO cursors(session_id, thread_id, agent, last_seq, updated_at)
-                       SELECT ?, thread_id, agent, MAX(last_seq), ? FROM cursors WHERE agent = ? GROUP BY thread_id""",
-                    (sid, now, p.name),
-                )
+                if on_session is not None:
+                    on_session(c, sid)      # first: what the new session is bound to decides what it starts from
+                # A new session starts where the agent as a whole has read up to, instead of replaying history, each copied
+                # cursor keeping whose read it stands for (hosted_spawn.inherit_cursors: never a child's read, and for a
+                # board session bound to a hosted session only reads that count for it).
+                from . import hosted_spawn
+                hosted_spawn.inherit_cursors(c, sid, p.name, now)
+            if on_session is not None and resume_session_id is not None:
+                on_session(c, sid)
             if dispatch_run_id is not None:
                 from . import workstreams
                 workstreams.bind_delivery(self, p, sid, dispatch_run_id)
@@ -1578,6 +1586,9 @@ class Board:
             for source_id in answer_to or []:
                 c.execute('INSERT INTO answer_links(source_post_id,answer_post_id,created_at) VALUES (?,?,?)',
                           (source_id,post_id,now))
+            if answer_to and p.is_human:
+                from . import hosted_spawn      # an exact answer to a spawn limit's item resets its count, here
+                hosted_spawn.answered(c, answer_to, post_id, now)
             unsealed: list[int] = []
             if sealed and type == "finding" and task_id is not None:
                 unsealed = self._auto_unseal(c, task_id)

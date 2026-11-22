@@ -600,9 +600,10 @@ every command takes `--json`. One session per agent and project at a time (child
 What to know:
 
 - **Human only.** Only you can start, message, read or close a hosted session: the routes refuse agent and node
-  tokens, the gateway does not carry them, and there is no MCP tool. An agent can cause a turn in one way only: by
-  posting on the board to the session's agent (next section), and then the turn's text is the server's, not the
-  agent's.
+  tokens, the gateway does not carry them. An agent can cause a turn in one way only: by posting on the board to
+  the session's agent (next section), and then the turn's text is the server's, not the agent's. The one exception
+  is off unless you turn it on and give a grant: an agent may start and run child sessions of its own ("Agents
+  start child sessions", below).
 - **The reply** is capped at 16 KB and only the last one per session is kept on the hub, for you alone (a child
   session's reply also goes to its parent session: "A child's results reach its parent", below). The full
   transcript stays on the node: `data/node-logs/sessions/<id>.jsonl` (mode 600).
@@ -749,7 +750,9 @@ uv run board session show <id>       # a parent lists its children; a child says
 under the same parent returns the child it made the first time instead of making another). There is no project
 argument: a child runs in its parent's project. `send`, `show` and `close` take a child's id like any session's.
 
-- **Human only**, like everything here: no agent or node can start or message a child, and there is no MCP tool.
+- **Human only**, like everything here: no agent or node can start or message a child through these commands.
+  Agents get their own tools for children they start themselves, behind your grant ("Agents start child
+  sessions", below).
 - **Where it runs.** `shared` (the default): the parent's checkout, beside the parent, as T3 Code does. `worktree`:
   a new git worktree made on the node from the HEAD of the parent's checkout (so the parent's uncommitted edits are
   not in it), under `[dispatch] worktree_dir` (default `~/agent-comms-worktrees`), named `session-<id>`. It is
@@ -856,17 +859,20 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   reports. A report field newer than the hub is the exception: the hub names the ones it takes in its answer to
   the node's fetch, and the node sends only those (so this version's node reports to an older hub exactly as
   before). A report the hub cannot read at all is one error line in the node's log, naming that cause.
-- **Limits.** A child cannot have children. At most `max_children` children of one session that have not ended.
+- **Limits.** A child cannot have children (`[dispatch.sessions.spawn] max_depth = 1`, shipped). At most
+  `max_children` children of one session that have not ended.
   The node's `max_live` counts children too: set it to at least 1 + the children you want live at once (a child
   that cannot get a process waits, and an idle one is stopped to make room, as for any session). "One session per
   agent and project" is about the sessions you start without `--parent`; children do not count.
 - **Ending.** Closing a session, or its ending for any reason, closes its children. Closing a child leaves its
   parent alone.
 - **The board.** A post never wakes a child: wakes go to sessions started without `--parent`. A child of the same
-  agent signs in to the board as that agent, and the board cannot yet tell its sign-in from its parent's, so while
-  such a child is around in the project (or was, since the wake; under whichever session it was started) a read of
-  a request does not count as the parent having it, whenever the read was made: after `wake_grace_seconds` the
-  dispatcher handles that request as it would without a hosted session.
+  agent signs in to the board as that agent. A hosted session whose node gives it a binding (while a spawn grant
+  covers its agent and project, next section) registers its board session BOUND to it, so a bound child's read and
+  acknowledgement are the child's, and the parent's own read counts for the parent, children or not. A board session
+  with no binding cannot be told apart: while a child of the agent is around in the project (or was, since the wake)
+  such a read does not count as the parent having the request, and after `wake_grace_seconds` the dispatcher
+  handles it as it would without a hosted session.
 - **With the dispatcher.** A child in the shared checkout counts like its parent: while its turn runs, a dispatched
   run for that project waits. A child in its own worktree keeps nothing busy.
 
@@ -910,10 +916,171 @@ polls and nobody copies anything across. That holds for a turn you started with 
 - **Only text reaches the agent.** The node tells the agent's adapter that the turn is a `child` turn, but neither
   Claude Code's input nor Codex's `turn/start` has a place for that today (both take a user message): what the model
   reads is the text, and the server's header in it is what tells child output from your words.
-- **Every child turn is a result today**, the ones you send to a child with `send <child>` too. Each result records
-  what started that turn (`started_by`, `human` for now), for when parents start their children's turns themselves.
+- **Every turn of a child you started is a result**, the ones you send it with `send <child>` too. Each result
+  records what started that turn (`started_by`: `human`, or `parent` for a child an agent started, next section).
+  For a child an AGENT started, only that agent's own messages are its results: one you send that child yourself is
+  your conversation with it, not the agent's work.
 - **Results go to the direct parent**, and only when the parent's node asks for its sessions, so a parent whose node
   is away gets them when it is back.
+
+#### Agents start child sessions
+
+An agent session can start child sessions itself, give them a task, message them, see them, take their results and
+stop them, with five board tools: `board_session_capabilities` (what it may start now, and if nothing, why),
+`board_session_spawn`, `board_session_send`, `board_session_status` and `board_session_cancel`. Off unless BOTH the
+hub's board.local.toml says `[dispatch.sessions.spawn] enabled = true` and you give a grant for the project:
+
+```bash
+uv run board session grant /Users/peter/the-little-things --agent claude-code --agent codex --access workspace --hours 8
+uv run board session grant /Users/peter/the-little-things --agent claude-code --access workspace --hosted-only
+uv run board session grants              # live ones; --all shows revoked and expired ones too
+uv run board session revoke 3            # at once: no new child session or message under it
+uv run board session allow <child id> --no-spawn          # or --spawn, --share N: what a child may start itself
+uv run board session close <id>          # a hosted session, or an interactive root (its id is a child's parent)
+```
+
+```toml
+[dispatch.sessions.spawn]           # the limits, with their defaults; each counts for the GRANT: one agent in one
+                                    # project, across all its sessions there
+max_depth = 1                       # the only value in this version: children cannot start children of their own
+max_live_children = 5               # child sessions the agent started in the project that have not ended
+max_spawns_per_hour = 12            # child sessions it started there within the past hour
+max_turns_without_human = 40        # its children's turns there since you last messaged one of its sessions there
+# targets = ["claude/haiku", "codex", "claude"]   # optional: agent names (/model) that may be started, cheapest first
+```
+
+- **Who is calling.** A hosted session is known by its binding: while a grant covers its agent and project, its
+  node puts the session's id and a key the hub derives from it into the environment of the session's process
+  (`AGENT_COMMS_HOSTED_SESSION`, `AGENT_COMMS_HOSTED_KEY`), which the board server inherits. The hub lists the
+  binding while a grant covers the session, or while children it started have not ended (so that after a revoke it
+  can still see and stop them); the node uses exactly what is listed, and a process started with another binding
+  (before the grant, or before its withdrawal) takes no new message and is stopped once idle, the conversation
+  resuming in the next. A board session registered with a binding stays that binding's, for as long as it exists:
+  nobody else can use it, and its read cursors are never taken for another session's; a hosted session cannot
+  resume a board session it did not register, and what a board session read keeps the conversation that read it
+  (also in the copies a new board session starts from, and across a resume by another conversation). Any other
+  caller
+  with an agent's token is that agent's ONE interactive root for the project (the project of its board session, or
+  `project` in the call; its board session counts only if it is that agent's, and if bound, under that binding;
+  over the remote bridge the registered board session goes with every later call): a session you opened yourself
+  (Claude Code, the Codex app, a terminal), a board configured by URL, or any process holding the token. No tool takes the caller's session as an argument. As best effort, a
+  board server that can be seen to run inside a hosted session's process without its binding is refused.
+- **Hosted-only.** `--hosted-only` on a grant refuses every caller without a verified binding: only hosted sessions
+  may start children in that project. Without it, interactive callers may too (`capabilities` says which applies).
+  What a binding separates, and what it does not, is the OS account's to say (below).
+- **Interactive roots.** One per agent and project, open until you close it: two interactive sessions of the same
+  agent in one project share it, and its children, and ANY of them may take a result of its children (a call that
+  waited for one another call took is told so); a restarted board server finds them where they were. Its
+  children run on a node that hosts sessions for the project, in the project's checkout there (or a worktree), and
+  their results never become turns (nothing can write to such a session): `spawn` with `wait=true` and `status`
+  with `wait_seconds` take them, and `status` lists the ones waiting.
+- **Codex.** Codex starts an MCP server with a small fixed environment, so for a Codex session with a binding the
+  node adds `-c mcp_servers.agent-comms.env_vars=[...]`: the list that server already gets (the runner's own `-c`
+  of that key, else your `~/.codex/config.toml`, read only) with the two names added. Only for a stdio server that
+  is there, as Codex would resolve it (config.toml with the runner's `-c` values over it): never for a server Codex
+  reaches by URL, whatever else a `-c` says about it (a tool's approval), and never for a server Codex has no entry
+  for (that would stop Codex from starting). A Codex session also needs the five tools
+  approved in its runner, `-c mcp_servers.agent-comms.tools.board_session_spawn.approval_mode="approve"` and so on
+  (they are not pre-approved for dispatched runs).
+- **Only its own** (through the board, as the session it is known to be). A caller sees, messages, cancels and takes
+  results from the children it started itself, never
+  another session's, its parent's or its siblings', and never a child you started under it (a retry id finds only
+  a child the same starter made).
+- **Access** of a child is the narrowest of what was asked, the caller's own (up its chain of parents; `full` only
+  while its process has confirmed it), the grant's, and what the node offers (`full` needs the node's
+  `allow_full_access`, as always). By default it is the highest of those the child's node offers. A child made under
+  a wider grant takes no new task once the ceiling is narrower than its access; what was queued still runs.
+- **Every check is made again in the write.** The caller, the live grant, the ceiling, the allowance and the limits
+  are read again inside the transaction that makes the child or queues the message, with the clock read under that
+  transaction's lock (a grant that expires while a call waits for it is gone). Child turns are counted by number in
+  transaction order, so a turn charged after your reset always counts.
+- **What the child is told.** Its task arrives as a turn the hub writes: a fixed header saying that this is a task
+  from that session (its name or id and agent), not from you, that the text is untrusted data and grants no
+  permission, then the task between two marker lines with a token made for that turn.
+- **Results** come back as for any child (a turn of the parent's), except that `wait=true` on `spawn` or `send`
+  (up to 45 seconds) returns the reply in the tool's answer instead, and then it is never also a turn. A result
+  whose earlier delivery is not settled cannot be taken that way. A turn the caller cancelled is a result with the
+  outcome `cancelled`. `status` shows the outcome only of turns the caller gave.
+- **Limits are per grant**, across all the agent's sessions in the project, hosted or interactive: a new session,
+  a restarted board server or a revoke and a new grant start no count over. At a limit the call is refused with the
+  reason and you get ONE Needs-you item, in the budget's own thread in the project (also when the refused call was
+  an interactive session's first); it closes on its own when no limit holds any more. Your answer resets the turn
+  count in the transaction that records it.
+- **A child that ended** (owner decisions, review rounds 6 and 7). Its node enforces what is true on its own
+  machine, with one registry of every process group it started (sessions' and dispatched runs'): nothing is
+  started in a checkout that holds a group being stopped, and a stopping group stays registered, and gets its
+  SIGKILL, until the whole group is gone, however its leader ended. Live groups may share a checkout (a parent and
+  its shared children). The hub keeps only what a node cannot know: a session that ended still counts as live, and
+  as occupying its checkout for the hub's decisions, until there is proof that its node's SESSION loop has
+  reconciled past the end (its own `ended`, or a listing built after the end that the loop says it applied; a hello
+  is liveness only, also after a node restart), or until the node's last contact that let it run work (a hello, or
+  any successful call of its session loop: a listing fetch or a session report, whatever it held) plus its shutdown bound (its self-stop time and
+  kill grace, with what its deadline watchdog may add: 105 s as shipped; derived in code, node_sessions.shutdown_bound;
+  no hub call, however long it blocks, delays the node's SIGTERM or SIGKILL; local git work that holds the loop's
+  lock longer can, limit e), which the loop states with every fetch before any work is listed to it; an hour until it has; a node refuses a
+  longer kill grace at start-up). A session waiting for a blocked checkout holds no process slot, and every process
+  start, first or retried, takes its slot through the same `max_live` check at the moment it starts. Stated limits: (a) on a node that is heard from, the hub frees the slot
+  at `ended`, while the old process may still be inside its kill grace (signalled, given no work, gone within it: 10
+  s by default), so a replacement elsewhere can overlap it for that long; the live limit counts sessions that can be
+  given work. (b) A hub-local dispatched run cannot see a node's process groups: on a node that runs on the hub's
+  machine it can enter a checkout while a session's group there is inside its kill grace, for that long (longer
+  in the case of limit e). (c) A
+  process group that survives SIGKILL blocks, on its node, that session's next process and node runs in that
+  checkout, and is said in the node's log at intervals, not on the hub. (d) After a node restart the hub frees at
+  the node's next hello, which relies on the new node process's `recover()`, which cannot signal a group whose
+  leader has already exited (as on main); and a process group that survives SIGKILL at an orderly node shutdown is
+  not tracked across the restart (as on main). (e) The node's deadline watchdog needs the session loop's lock, which
+  the loop also holds for local git worktree work (each git command bounded only by its own timeout, up to 120 s).
+  Only when all three coincide: the node runs on the hub's machine, the hub hears nothing from it (hellos included)
+  for at least its bound, and that git work holds the lock for more than about the self-stop time in one pass, a
+  hub-local run can start beside a turn not yet signalled, for as long as the git work holds the lock plus the kill
+  grace (limit b, past its kill grace). Otherwise the hub offers a node no run unless it was seen within 60 s,
+  shorter than any bound, so the hold is in force whenever the node can be given work, and the effect is at most a
+  brief over-count of live children. The node logs a deadline it met late. Your message to one of the agent's hosted sessions in the project, or your answer to that
+  item (not any post in the thread), starts the turn count over.
+- **Audit.** One post per child started and per child ended, in one thread per tree in the project, written by the
+  hub (as you, marked automatic: it is no answer of yours and counts against nobody's post cap): ids, agent names,
+  model, access, isolation, and the title quoted as untrusted data. Never the task or a reply.
+- **A revoked or expired grant** stops new children and new messages at once (narrowing a child's allowance still
+  works). Children that are running finish the turn they are in and the messages already queued for them; `status`
+  and `cancel` keep working for them. Close the tree to stop those too.
+- **One run per checkout.** A message an agent sends its child in the shared checkout is handed to the node only
+  once it is reserved, which waits while a dispatched run uses that checkout (a run on the child's node, for its
+  project, or a run on the hub in the directory the hub gives the project); from the reservation on, a dispatched
+  run for the project waits, as for any session's turn there, until the node reports that turn (a cancel does not
+  release it before). The dispatcher checks this again inside its launch transaction, for the node and checkout the
+  run will really use (a run routed to a node is held to that node's checkout), claims that checkout there until the
+  run's record covers it (or the launch failed), and the run starts exactly there: the routing answers given in that
+  transaction are the ones the launch uses, and if the request's browser requirements changed meanwhile it is not
+  launched but queued again for a fresh reservation. A child in its own worktree is held by neither.
+- **Versions.** Update the hub, then its nodes: an agent-started child needs a node of this version (its hello says
+  `tree: 2`); an older node gets no binding, no interactive child and no such child.
+
+**The unit of trust is the OS account.** On a machine where sessions with a shell run as the same OS user as the
+node (or the hub), those sessions hold that machine's keys: every agent's token file there; the node's credential,
+and with it the binding of every session assigned to that node (so such a session can act as another hosted root of
+the same agent, also under a `--hosted-only` grant, and see, message, cancel or take the results of that root's
+children); and on the hub, the database itself (the binding secret, the grants, the counters, the audit records)
+and your token. The binding, the per-session checks and `--hosted-only` separate sessions WITHOUT a shell (a
+read-only Claude child: no Bash, and the token directory denied to it) and sessions on OTHER machines. For
+everything that runs under an account holding a granted agent's token, the bounds are the grant's ceiling, the
+grant's budget, its expiry and the audit posts, plus whatever the node itself refuses (`allow_full_access`). The
+live-session count, and every other fact the hub learns from a node (what runs there, what ended, what a turn did),
+is only as honest as that node's reports: an account that holds a node's credential can lie to the hub about what
+runs there (report a child ended while its process runs on, and so have a replacement admitted), which is part of
+the unit of trust being the OS account. For stronger separation, run the nodes and the hub under OS accounts of
+their own; that is not part of this.
+
+Within those bounds, through the board tools: the hub cannot tell a session you opened from any other process
+holding that agent's token, so a hosted session with a shell can also drop its binding and act as the agent's
+interactive root. It gains no budget (the limits are the grant's), and it can ask for access up to the GRANT's
+ceiling, which is therefore the most that agent can get in that project by any route. A granted agent can start
+sessions of any agent a node you allowed the project hosts (or only the `targets` you list), in that project only,
+within the limits; give them tasks, and stop them. Those sessions can do whatever their access allows and spend
+tokens up to the limits. Through the board it cannot create, widen or extend a grant (only your CLI can), raise a
+limit, or pass its words off as yours: everything it writes reaches a child, and every child's output reaches it,
+inside the server's frame as untrusted data.
+
 
 `uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
 stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),
@@ -922,7 +1089,7 @@ write, a child in its own worktree, a Codex child under a Claude parent, the cas
 a `workspace` one is refused, a settings file and a plugin whose grants and command hooks do not reach a
 read-only child, a settings file whose `defaultMode` of `bypassPermissions` never takes effect and cannot be switched
 to, a `full` root whose children wait for its process to confirm it, and a Claude and a Codex child whose replies
-arrive as their parent's next turn). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
+arrive as their parent's next turn; then a session that starts a Claude and a Codex child itself through the board tools, the refusals without a grant, above its ceiling and with a forged key, and an interactive session's child). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
 board's MCP tools and nothing else: it checks that a woken session really calls `board_read_updates` (the hub's
 delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)",
 "Session host (PR 3)", "Session host: parent and child sessions" and "Session host: result delivery".

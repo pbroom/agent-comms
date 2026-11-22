@@ -38,7 +38,7 @@ from typing import Any, Callable, Protocol
 # before it is ready), a process that exits before any event of the turn, a timeout the host ends by stopping the
 # process, a write that fails, a turn withdrawn while being written (session_host._fail / _fail_start).
 KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed")
-TURN_KINDS = ("user", "wake", "child")     # whose turn a message is (hosted.KINDS), as `turn` is told
+TURN_KINDS = ("user", "wake", "child", "task")   # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
 REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
 
@@ -89,7 +89,8 @@ class ProviderSession(Protocol):
 
     def turn(self, text: str, kind: str = "user") -> list[bytes]:
         """One turn, as the bytes to write. `kind` (TURN_KINDS) says whose turn it is: the human's (`user`), or one
-        the hub wrote (`wake`, `child`: a child session's results). An adapter may pass that on where its provider's
+        the hub wrote (`wake`, `child`: a child session's results, `task`: a message from the agent session that
+        started this one, in a frame the hub writes). An adapter may pass that on where its provider's
         input has a place for it; Claude's stream-json input and Codex's `turn/start` have none today (both take
         user text), so both write the text alone, and what the model reads is that text."""
         ...

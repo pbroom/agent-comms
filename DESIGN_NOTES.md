@@ -2264,7 +2264,8 @@ message's write.
   a fetch has succeeded again: the queue and the stop flags the node holds may be out of date, and a session the
   human just closed must not start another turn. Turns already running go on. After `node.SELF_STOP_SECONDS` (90 s)
   without a successful hub call, turns in flight are stopped (`SessionHost.stop_turns`) and reported failed once the
-  hub answers; idle processes stay. After a failed call the hub is left alone for 2 s. The hub, for its part, fails a turn in flight when
+  hub answers; idle processes stay. (Spawn review round 11: from then on nothing starts and no new turn is written
+  either, until a listing fetched since contact came back has been applied.) After a failed call the hub is left alone for 2 s. The hub, for its part, fails a turn in flight when
   its node has been silent for `nodes.NODE_LOST_SECONDS` (180 s), on the human's next read (`hosted._settle`), as
   `RemoteChild.poll` does for a run; the decision is taken again inside the write transaction, so a node that
   reconnected and reported in between keeps its turn. A paused board refuses node calls (as it does a node's run reports), so a pause
@@ -4849,6 +4850,12 @@ both installers.
     cannot share it.
   - `AGENT_COMMS_CODEX_TOKEN`: the token itself, for stdio.py. Refused, forwarded or written.
   - `AGENT_COMMS_TOKEN_FILE`: the human's token file. Refused, forwarded or written.
+  - `AGENT_COMMS_HOSTED_SESSION`: a hosted session's id (hosted_spawn binding), which the node sets for a hosted Codex
+    session's processes and passes to its board server with `-c mcp_servers.agent-comms.env_vars=[...]`
+    (session_host.bound_template), never through a user's configuration. Refused, forwarded or written: an
+    interactive thread's board tools must not carry a hosted binding (spawn tools, review round 8 rebase).
+  - `AGENT_COMMS_HOSTED_KEY`: the key that proves that binding (an HMAC the hub derives). Refused, forwarded or
+    written, for the same reason.
   - `AGENT_COMMS_MANAGED`: the waiter's "never wait" flag (child_env). Harmless.
   - `AGENT_COMMS_CHANNEL`: turns MCP channel notifications on. Harmless.
   - `AGENT_COMMS_ALLOW_MIGRATE`: lets a checkout migrate its own local database. No board, hub or identity: harmless.
@@ -4965,3 +4972,736 @@ stdio.sh, wait.sh, procinfo.py and waiter.py.
 - **The reviewer's doc note.** The project-override limit has its own README bullet, outside "Where wakes do not work"
   (wakes do work there), and says the consequence: the hooks still wait and are charged as the agent, while that
   thread's board tools may act as someone else.
+
+## Session host: spawn tools (2026-11-21)
+
+**Report.** Step 2, PR 4: an AGENT session may start child sessions of its own, through five board tools
+(`spawn_mcp.py`, the work in `hosted_spawn.py`): `board_session_capabilities`, `board_session_spawn`,
+`board_session_send`, `board_session_status`, `board_session_cancel`. Until now only the human could start or message
+a hosted session. Off unless the hub says `[dispatch.sessions.spawn] enabled = true` AND the human has given a spawn
+grant for the caller's project and agent; with either missing every tool but `capabilities` refuses (and
+`capabilities` says why). No schema change: everything under `board_state` keys.
+
+**The owner's decisions, as built.** Interactive sessions the human opened may call the tools (not only hosted
+ones). Children may spawn by default: an allowance at the hub, checked at each call, changeable while the child runs
+by the human or its parent. Depth stays 1 in this PR (`max_depth`), every rule written for more.
+
+**Who is calling** (`Ident`, `resolve`). Never a tool argument: no tool takes the caller's session.
+- *Hosted.* The hub derives a key per session, `bind_key = HMAC-SHA256(secret, "hosted-session:" + id)`, the secret
+  in `host.spawn.secret`, made once and never sent anywhere. The listing gives a session its key (`bind`) only to a
+  node that speaks the spawn protocol, with child sessions on, and while a live grant covers the session's agent
+  and project or the session has children it started that have not ended (`gives_binding`; round 2, S18). The
+  listing's version changes with it. The node puts `AGENT_COMMS_HOSTED_SESSION` and `AGENT_COMMS_HOSTED_KEY` into
+  the environment of every process of that session (`SessionHost._env`), exactly as the current listing says
+  (nothing cached). Each process records the binding it was started with (`proc_bind`); the host never writes a turn
+  to a process whose binding differs from the session's now (`Session.unbound`, at the write boundary in
+  `SessionHost._write`: the process is stopped and the message stays in the inbox for the next one), and an idle
+  one is stopped (`SessionRunner._park_idle`); the conversation resumes. The board's
+  MCP server, a child process of the agent, inherits it (stdio: `mcp_server.ident`; the remote bridge sends it as
+  `x-board-hosted-session`/`-key` headers, which the gateway passes). The hub recomputes and compares
+  (`hmac.compare_digest`), and the session must be the token's agent's. A connection that NAMES a hosted session
+  (even with an empty or wrong key) is never taken for anything else.
+- *Everyone else* with a granted agent's token is that agent's interactive root for the project: the project of the
+  board session the connection registered (stdio state, `x-board-session`), or `project` in the call. The hub cannot
+  tell a session the human opened from any other process holding the token, so it does not try; what bounds such a
+  caller is the grant (its ceiling, its limits, hosted-only). Best effort: a board server whose OS session
+  (`os.getsid`, or the bridge's `x-board-client-sid`) is a live hosted session's process is refused (`LOOKS_HOSTED`).
+- *Codex* starts an MCP server with a small fixed environment. For a Codex session with a binding the node appends
+  `-c mcp_servers.agent-comms.env_vars=[...]` (`session_host.bound_template`): the list in force for that server
+  (the runner's own last `-c` of that key, else the user's config.toml, read only: `codex_config_of`) with the two
+  names added, kept as written otherwise (names, or tables). Only for a stdio server, resolved as Codex resolves it
+  (`_effective_server`: config.toml with the runner's `-c`/`--config` values for that server applied over it in
+  order): an entry with `command` and no `url`. A URL server never gets it, also not one a runner's `-c` names for a
+  tool's approval (round 2, S8). Verified with codex-cli 0.171.0 in a private
+  CODEX_HOME (`codex mcp get agent-comms --json`, no model call): a `-c mcp_servers.agent-comms.env_vars=[...]` on a
+  server the TOML defines replaces that one key and keeps `command`, `args` and the rest; a `-c` sub-key for a
+  server the TOML does not define makes Codex refuse to start ("invalid transport in `mcp_servers.other`").
+- *Board sessions.* A board session registered with a verified binding is bound to that hosted session
+  (`host.board.<id>`), inside `Board.register_session`'s own write transaction (its new `on_session` hook). Every use
+  of a bound board session, over MCP (`mcp_server.session`, `board_register`'s resume) or the HTTP API (`api.sid`,
+  the register and heartbeat routes), needs the same binding, verified by key and agent (`check_board_session`).
+  A binding is its board session's provenance and lives as long as the board session does (round 2, S10): a new
+  board session does not start from the cursors of one bound to a child, nor, when it is itself bound, of one bound
+  to another hosted session (`inherit_cursors`, round 4, in register's transaction, which now binds before it copies the
+  cursors). An interactive caller's default project comes from its board session only when that is the caller's
+  own (the same agent) and, bound, under that binding (`session_project`, S2); the remote bridge carries the
+  registered board session on later calls (`Bridge._registered`, S20).
+
+**Interactive roots** (`host.iroot.<uuid>`): agent, project, state, `child_counts`. ONE per (agent, project), open
+until the human closes it (`board session close <root id>`, which cascades). Its children are ordinary child
+records with `parent_kind: "interactive"`, placed on a live node that hosts sessions for the project and speaks the
+spawn protocol (`hosted_tree.place_interactive`), listed to that node with `parent: None, interactive: true` and
+their access word, which the node takes for such an entry only (`ROOT_ACCESS` still refuses a word on any other
+parentless entry). `hosted_results.target` answers `interactive`: results stay `pending`, never a turn, claimed by
+`spawn`/`send` with `wait` or `status` with `wait_seconds`/`take_result`.
+
+**The grant** (`host.spawn_grant.<n>`, human only: `create_grant`, `list_grants`, `revoke_grant`; routes
+`/api/spawn-grants`, which the gateway does not pass; CLI `board session grant|grants|revoke`). Project (exact),
+agents (callers), access ceiling, expiry (default 8 h, at most 30 days), `hosted_only`. The widest live one that
+names the agent in the project counts (for a caller without a binding, the widest that is not hosted-only).
+
+**Access of a child** = the narrowest of: what was asked; the caller's chain (`_chain_ceiling`: a root's
+`hosted_tree._limit`, `full` only while its live process confirmed it; a child's own word and what its node gave,
+`full` counted as `workspace`); the grant's; and the node's offers. Default: the highest word the child's node
+offers within that ceiling. For an interactive caller the grant is its ceiling. The two-process rule for `full`
+(`max_live` at least 2) is for hosted parents only.
+
+**Limits, per grant** (`_usage`, `host.spawn_budget.<agent>.<sha256(project)[:16]>`): child sessions the agent
+started in the project that have not ended (`max_live_children` 5), sessions it started there in the past hour
+(`max_spawns_per_hour` 12), and its children's task turns there since the human last messaged one of the agent's
+hosted roots in the project (`hosted.start`/`send` -> `human_messaged`, in their transaction) or answered the
+budget's Needs-you item exactly (an `answer_links` row of a human post, consumed once in a transaction)
+(`max_turns_without_human` 40). Turns are counted by NUMBER: each charge takes the next `seq`, a reset records the
+last one issued (`reset`), both inside their write transactions, so the count follows the transactions' order and
+no timestamp, equal or skewed, can drop a turn from it (round 2, S17). A child that ended keeps its slot until its
+node's session loop has reconciled past the end, or that node's last word plus its shutdown bound has passed
+(`hosted.may_still_run`, `holds_slot`; rounds 6 and 7, owner decisions below). Across every root, hosted or interactive; keyed by agent and project, not by
+grant, so a revoke and a new grant reset nothing. At a limit (found before the write or inside it, `LimitReached`,
+which `create_child` now meets before its per-parent cap) the call is refused and the budget asks for ONE Needs-you
+item (`alert_due`), posted by `flush` in the budget's own thread in the project (`_budget_thread`: no tree needed,
+S9) and closed (an attention resolution) once no limit holds. `max_children` (per parent) stays.
+
+**Every check again in the write.** `create_child` runs `check` inside its write transaction: the caller resolved
+again on what is stored, its live grant, the ceiling, the allowance, the limits. Every write path in hosted_spawn,
+hosted_tree and hosted reads the clock under the write lock (round 2, S4), so a grant that expires while a call
+waits for the lock is gone. `send` does the same in its own:
+the caller, the child, the grant (for a message, or for a change that widens the allowance; one that only narrows
+it needs none), the ceiling against the child's access and the node's offers now (a child made under a wider grant
+takes no new task: `ABOVE_NOW`), the turn limit.
+
+**Depth and the allowance.** `max_depth` is 1 in this version (the setting accepts nothing else); a child's call is
+refused with "depth limit". The rules for more are built and tested through a test-only override (`deeper`): depth
+is the parent's plus one, the root the parent's root, `create_child` takes a child parent, the cascade runs for
+every session, the node opens sessions parent before child at any depth, results go to the direct parent, limits
+count per grant. The allowance (`may_spawn` default true, `share` default none) is on the child record.
+
+**What a child is told** (`render_task`): one fixed header line, optionally the line that it may start helper
+sessions (only below the depth limit), then `<<<task T>>>`, the text, `<<<end task T>>>`, T drawn again while it
+occurs in the text. Everything in the header is server-checked.
+
+**Results only for the caller's own work.** A `task` message records `started_by: parent`. A message of the
+human's to a child an agent started is no result for that agent; a human-started child's turns are results as
+before (PR 3). A result taken by `wait` is `claimed` and never a turn; one that an earlier turn carried without a
+confirmed start (`attempts`) is never claimed (its provider's late word could still make it delivered).
+`status` shows a child's last turn only when it was one of the caller's tasks (`last_task_turn`).
+
+**Cancel.** The hub flags the caller's own `task` messages that are queued or in flight; the node stops a turn in
+flight (the process is stopped; a half-written turn is never completed), drops one in its inbox, and reports one it
+never had as never delivered. Outcome `cancelled`; one withdrawn before it began is no result. `close=true` ends the
+child (`hosted.close_session`, recorded `closed_by: caller`).
+
+**Audit.** One post per spawn and per end of an agent-started child, written by the hub as the human, marked
+automatic (`spawn_audit`), in one thread per tree; never the task or a reply. Queued in the tree record inside the
+transaction that makes or ends the child, posted by `flush`. Each post is conditional inside its own transaction
+(`post_check`: the line is still the queue's first), and the thread is made in a transaction that makes it only if
+the tree has none, so two processes flushing at once post each line once and make one thread; the Needs-you item
+is conditional the same way.
+
+**One run per checkout, both ways round.** An agent's `task` for a child not in its own worktree is listed without
+its text until it is reserved (`shown_at`), in the write transaction that shows the node its sessions
+(`hosted._reserve_tasks`, via `hosted_wake.listing`'s `due`/`deliver`), and only while no dispatched run uses the
+checkout (`hosted._checkout_busy`: a run recorded on the child's node for its project, which node runs record as
+their directory, or a hub-local run in the directory the hub's settings give the project). From the reservation on,
+`hosted_wake.turn_projects` counts the checkout busy (its node not lost), until the node reports the turn (a cancel
+releases nothing before that), so the dispatcher cannot take it between the listing and the turn's end. The other
+way round (round 2, S11): the dispatcher's launch transaction (`reserve_dispatch_launch`'s `check`,
+`Dispatcher._launch_check`) asks `turn_projects` again and, when the checkout is free, claims it
+(`dispatch.checkout_claim`, CLAIM_SECONDS), which `_checkout_busy` respects until the run's own record covers it.
+The human's own messages are not held.
+
+**The node protocol.** The hello says `tree: 2`, the fetch `tree=2`. Only to such a node does the hub list `bind`,
+an interactive child, or `cancel`/`held`. No new report field and no new hello field. The node forgets the hub's
+`features` whenever a hub call fails (`SessionRunner._call`).
+
+**Departures from the plan and the brief, and why** (as of review round 1).
+- *An interactive caller is any caller without a binding*, one root per (agent, project): no credential can prove a
+  launch the human made (round 1, S1). Limits per grant make a fresh root worthless; hosted-only is the control.
+- *Raw HTTP MCP clients* are interactive callers like any other; a URL-configured board inside a hosted session is
+  one too, and cannot be told apart: bounded by the grant's ceiling, its limits and hosted-only.
+- *`_shadowed` stays for readers without a binding*; a bound reader is told apart.
+- *The binding env is handed out only under a grant*, so nothing about a session's command line or environment
+  changes for a project nobody granted; a process started before the grant is restarted when idle.
+- *`status` and `cancel` work without a live grant for children the caller has*; narrowing an allowance too.
+- *Queued messages are not withdrawn when a grant is revoked or narrowed*; new ones are refused.
+- *Targets* are an optional ordered list; *the spawn tool's target parameter is `child_agent`*.
+
+**Trust model: the unit of trust is the OS account** (round 2, S3). On a machine where sessions with a shell run as
+the same OS user as the node (or the hub), those sessions hold that machine's keys: the agents' token files there,
+the node's credential (and with it the bindings of every session assigned to the node, so such a session can act as
+another hosted root of the same agent, also under a hosted-only grant, and claim or cancel that root's children),
+and on the hub the database (the binding secret, the grants, the counters, the audit records) and the human token.
+No code here can remove that: every token file on such a machine is readable by the same user too. The binding, the
+per-session checks and hosted-only separate sessions WITHOUT a shell (read-only Claude children: no Bash, the token
+directory denied; tested) and sessions on OTHER machines. For everything that runs under an account holding a
+granted agent's token, the bounds are the grant's ceiling, the grant's budget, its expiry and the audit posts, plus
+whatever the node itself refuses (`allow_full_access`). The live-session count, and every other fact the hub
+learns from a node, depends on that node's lifecycle reports being honest: an account that holds the node's
+credential can lie to the hub about what runs there (report a child ended while its process runs on, so that a
+replacement is admitted), which is part of the unit of trust being the OS account (round 3, S3). Running the nodes
+and the hub under OS accounts of their own is the remedy for stronger separation, out of scope. Within those bounds, and through the board: the hub cannot tell
+a session the human opened from any other process holding that agent's token, so a hosted session with a shell can
+also shed its binding and act as the agent's interactive root, gaining no budget and at most the grant's ceiling; a
+granted agent can start sessions of the agents a node hosts for the project (or the listed targets), within the
+limits, give them tasks, read their results and stop them; through the board it cannot create, widen or extend a
+grant, change a limit, or make its words read as the human's.
+
+**Live, before review** (head 6d34eb9, real Claude Code 2.1.322 and codex-cli 0.171.0: PASS, 89 checks). The
+human told a haiku session to delegate: in one 8.7 s turn it called `board_session_spawn` twice itself
+(wait=true), for a Claude and a Codex child, and replied `apple pong` from their answers; both results `claimed`,
+`started_by: parent`; frames, audit posts, refusals (no grant, above the ceiling, a forged key) as designed.
+
+### Spawn tools: review round 1 (2026-11-21)
+
+On 40402b3: seven blockers, eight should, one nit; the coordinator's rulings applied. Each fix has a test, and each
+rule was then taken out again in a copy of the tree and made a test fail (scratchpad `mutations.py`, 47 rules).
+- *S1 and S6 (blockers), the model changed.* The client-supplied process key and its registration are gone. Any
+  caller without a valid binding is the agent's ONE interactive root for the project, so a restarted board server
+  finds the same root, children and counters. Limits are counted per grant (agent and project) across every root
+  (`host.spawn_budget.*`), surviving a revoke and a new grant. `--hosted-only` grants (`hosted_only`). The getsid
+  guard stays, labelled best effort. Trust statement as above. Tests:
+  `test_every_caller_without_a_binding_is_the_agents_one_interactive_root_for_the_project`,
+  `test_a_shed_binding_buys_no_budget_and_at_most_the_grants_ceiling`, `test_revoking_and_granting_again_resets_no_counter`,
+  `test_a_hosted_only_grant_refuses_every_caller_without_a_verified_binding`,
+  `test_a_read_only_claude_child_has_no_shell_and_no_token_to_shed_its_binding_with`,
+  `test_the_limits_count_for_the_grant_across_every_root`.
+- *S2 (blocker).* The guard verifies the key and the agent, not the claimed id; it covers the HTTP API (reads,
+  acknowledgements, heartbeat, register/resume) as well as MCP; binding happens inside register's transaction; a
+  binding lives as long as its hosted session. Tests: `..._cannot_be_used_or_resumed_by_another_connection` (a wrong
+  key for the right id), `test_the_http_api_holds_a_bound_board_session_to_its_binding_on_every_path`,
+  `test_a_binding_lives_as_long_as_its_hosted_session`.
+- *S3 (documentation, as ruled).* The trust statement no longer promises anything for agents with a shell under the
+  hub's OS account.
+- *S4 (blocker).* Caller, grant, ceiling, allowance and limits re-validated inside the write, for spawn and send;
+  widening an allowance needs a live grant. Test: `test_a_grant_that_goes_between_the_check_and_the_write_is_caught_in_the_write`.
+- *S5 (blocker).* `send` refuses a new task to a child whose access is above the ceiling now or no longer offered by
+  its node. Test: `test_a_narrower_grant_gives_no_new_task_to_a_child_made_under_a_wider_one`.
+- *S7 (blocker).* Retry lookups (`hosted_tree._existing`) are scoped to the starter. Test:
+  `test_a_retry_id_finds_only_a_child_the_same_starter_made`.
+- *S8.* Binding only under a grant; the `env_vars` list merged; a config.toml-defined server supported (verified
+  as above). Tests: `test_the_node_gives_a_session_its_binding_only_under_a_grant_and_restarts_an_idle_process_to_get_it`,
+  `test_a_codex_session_is_told_to_pass_its_binding_on_merged_with_what_its_board_server_already_gets`,
+  `test_a_hosted_codex_session_reads_its_codex_config_read_only`.
+- *S9.* Conditional posts and thread; a limit found inside the write still records the item. Tests:
+  `test_two_flushes_at_once_post_each_audit_line_once_and_make_one_thread`,
+  `test_a_limit_the_write_transaction_finds_still_raises_its_item`.
+- *S10.* A cursor of a board session bound to another hosted session no longer suppresses a root's wake
+  (`hosted_wake._qualifying`). Test: `test_a_bound_childs_acknowledgement_does_not_keep_its_root_from_being_woken`.
+- *S11.* One node-and-checkout identity in `_checkout_busy`; reservation before the text is shown. Tests:
+  `test_a_run_on_the_childs_node_holds_its_task_whatever_the_hubs_own_path_for_the_project`,
+  `test_a_task_is_reserved_before_its_text_is_shown_so_the_dispatcher_cannot_take_the_checkout_between`. Not
+  changed: `hosted_wake._occupied`, which wakes and result turns use (main's code), has the same mapping question
+  for node runs; left for its own fix.
+- *S12.* Default access from the node's offers; the two-slot guard for hosted parents only. Tests:
+  `test_the_default_access_is_the_highest_the_childs_node_offers_within_the_ceiling`,
+  `test_an_interactive_full_child_needs_no_second_slot_for_a_parent_process`.
+- *S13.* `hosted_results.claim` skips a result with an unsettled earlier attempt. Test:
+  `test_a_result_whose_delivery_is_not_settled_cannot_be_claimed`.
+- *S14.* `last_task_turn` only for the caller's own tasks. Test: `test_status_shows_only_the_outcome_of_the_turns_the_caller_started`.
+- *S15.* Only an exact answer (`answer_links`) or a message to a root resets, consumed once. Test:
+  `test_child_turns_without_the_human_are_limited_and_the_humans_message_or_exact_answer_starts_over`.
+- *S16 (nit).* `max_depth` accepts 1 only; deeper trees behind a test-only override.
+- *Renamed:* `max_live_per_tree` is `max_live_children` (it is per grant now).
+- *Found by the first real run on the round-1 code:* the human gave the grant and at once told the session to
+  delegate; the node got the key and the message in the same pass and wrote the message to the process started
+  without it, whose board server was then refused as `LOOKS_HOSTED` (the best-effort guard did its job: no
+  misclassification). Now no message is handed to a process that runs without the binding the session now has: it
+  is stopped first and the message starts the next one (`SessionRunner._hand_over`). Test: the binding test above
+  sends the message in the same pass. The run was repeated on the fixed code.
+
+### Spawn tools: review round 2 (2026-11-21)
+
+On 1891915, rebased onto main cb25b57 (PR #91, waking a session the human opened). S1, S5, S7, S12 to S16 were
+resolved; S2, S3, S4, S6 and S8 to S11 were still open, and S17 to S21 were new. Each fix has a test (named
+`test_r2_*`) that fails on the code before it, and each rule is in the mutation check (scratchpad `mutations.py`,
+75 rules, every one caught).
+- *S2 (blocker).* `mcp_server.ident` takes an interactive caller's default project from its board session only
+  through `hosted_spawn.session_project`: the same agent, and for a bound board session the same binding verified.
+  Another agent's session named in `X-Board-Session` gives nothing, so `capabilities` cannot disclose its project.
+  Test: `test_r2_s2_a_board_session_gives_its_project_only_to_its_own_agent_and_binding` (over the real `/mcp`).
+- *S3 (documentation, as ruled).* The trust model above, once, in README and here; every other statement made
+  consistent with it (the "only its own", hosted-only and "cannot" statements now say "through the board").
+- *S4 (blocker).* `send` (and every other write path in hosted_spawn, hosted_tree and hosted: grants, roots,
+  cancel, allowances, alerts, threads, `start`, `send`, `close_session`) reads the clock inside its write
+  transaction. Test: `test_r2_s4_a_grant_that_expires_while_send_waits_for_the_lock_is_not_honoured`.
+- *S6 (blocker).* `hosted._end`, when the hub ends a session on its own while its node may still run it, records
+  `unconfirmed_until` (last heard + NODE_LOST_SECONDS); `holds_slot` keeps it counted for `max_live_children` and
+  `max_children` until then, or until the node's `ended` for it (the node now sends one once the process of a
+  session the hub no longer lists is reaped; `report` takes it for an ended session and records `confirmed_at`).
+  Test: `test_r2_s6_a_child_ended_while_its_node_was_away_keeps_its_slot_until_the_node_confirms_or_is_lost`.
+- *S8.* `_effective_server` resolves the board server's entry as Codex would (config.toml, then the runner's `-c`
+  and `--config` values for that server, sub-keys and the whole table); the stdio override only for an entry with
+  `command` and no `url`. A tool approval alone no longer makes the hub add the override for a server it cannot see
+  defined. Test: the Codex binding test, with URL-plus-approval, a `-c` that makes it URL, and a whole-table `-c`.
+- *S9.* The budget's item goes to the budget's own thread (`_budget_thread`, one per agent and project, the grant's
+  budget), so a refusal before any root exists still raises it; `create_child` runs the grant-limit check before
+  its per-parent cap. Tests: `test_r2_s9_a_refusal_before_any_root_exists_still_raises_the_budgets_item`,
+  `test_r2_s9_a_limit_reached_with_the_parents_cap_is_the_limit_with_its_item`.
+- *S10.* Register binds before it copies the cursors, and skips those of board sessions of another provenance
+  (`other_provenance`); bindings are kept as long as their board session exists. Test:
+  `test_r2_s10_a_new_board_session_never_starts_from_a_childs_acknowledgement`.
+- *S11.* The dispatcher's launch transaction re-checks `turn_projects` (`CHECKOUT_BUSY`, the trigger waits) and
+  claims the checkout (`dispatch.checkout_claim`) for the window before its run is on record; a shown task stays
+  reserved after a cancel until the node reports it. The launch path changed in one place (the `check` it already
+  passed). Tests, both orders and the cancel: `test_r2_s11_a_launch_reserved_first_holds_the_checkout_before_its_run_is_on_record`,
+  `test_r2_s11_a_task_reserved_first_refuses_the_launch_in_its_own_transaction`,
+  `test_r2_s11_a_cancelled_task_the_node_was_shown_keeps_the_checkout_until_the_node_reports`.
+- *S17 (blocker).* Turns counted by number in transaction order (`_charge`, `_reset`), and `create_child` reads its
+  clock under the lock. Test: `test_r2_s17_a_turn_charged_after_a_reset_always_counts_whatever_the_timestamps`.
+- *S18.* Binding retention as ruled (grant, or live agent-started children); the node takes exactly the listed
+  binding; binding changes bump the listing's version; a process with a withdrawn binding restarts once idle.
+  Tests: `test_r2_s18_the_binding_follows_the_grant_and_live_children_and_the_node_caches_nothing` (revoke, expiry,
+  children ending), `test_r2_s18_a_restarted_node_gives_a_parent_with_children_its_binding_from_the_listing`.
+- *S19.* The binding check is at the provider write boundary (`SessionHost._write`, `Session.unbound`); unwritten
+  messages stay in the inbox across the restart. This replaces round 1's hand-over guard. Test:
+  `test_r2_s19_a_message_already_in_the_hosts_inbox_is_never_written_to_a_process_without_the_binding`.
+- *S20.* The bridge sends the registered board session as `x-board-session` on later calls. Test:
+  `test_r2_s20_a_bridged_client_carries_its_registered_board_session_on_later_calls` (over the real `/mcp`).
+- *S21.* A `wait` whose result another call on the same root took says so (`CLAIMED_ELSEWHERE`, from
+  `hosted_results.claimed`); README says any connection on the shared root can claim a result. Test:
+  `test_r2_s21_a_waiter_whose_result_another_call_took_is_told_so`.
+- *After the rebase onto PR #91.* A waiter is never woken while a hosted root exists (an interactive ROOT of the
+  spawn tools is no hosted session); a bound board session is never a waiter's reader (`interactive_wake._bound` in
+  `_reader`, `_pair_reader`, `read_after_delivery`); an unbound board session that recorded another conversation
+  is never a hosted root's reader (`hosted_wake._other_conversation` in `_credited` and `handed`). A hosted
+  session's process has `AGENT_COMMS_MANAGED=1` beside its binding, its board server resolves as hosted, and
+  `board wait` ends at once there. Tests: `test_r2_interactive_waiters_and_hosted_sessions_never_take_each_others_reads`,
+  `test_r2_a_managed_hosted_process_carries_its_binding_and_its_wake_hook_stays_out`.
+
+### Spawn tools: review round 3 (2026-11-22)
+
+On 99ae93f: nine narrow items left, all accepted. Each fix has a test named `test_r3_*` that fails without it, and
+each rule is in the mutation check (88 rules, every one caught).
+- *S3 (documentation, as ruled).* The trust model says that the live-session count and every other fact from a
+  node is only as honest as that node's lifecycle reports, and that an account holding the node's credential can
+  lie about what runs there.
+- *S6 (blocker), for every end.* The host reports `ended` once it has signalled the process, before the process is
+  gone. `hosted._end` now records `unconfirmed_until` for every end on a node of the spawn protocol (node-reported:
+  now + NODE_LOST_SECONDS; hub-made: last heard + NODE_LOST_SECONDS), and the node sends a second `ended`
+  (`node_sessions.GONE`) once it has reaped the process group (`_after_tick`, for every session it forgets), or at
+  once for a session that had no process (`_ended_without_process`); `report` takes it on an ended session, or in
+  the same report as the end. Only the slot waits (`holds_slot`): the end, the human's `close --wait`, the cascade
+  and the results are applied at the first `ended` as before. A node from before the protocol sends no
+  confirmation and is taken as before. Tests:
+  `test_r3_s6_a_closed_childs_slot_waits_for_its_process_group_even_through_its_whole_grace` (a process that takes
+  its whole kill grace), `test_r3_s6_a_session_ended_with_no_process_confirms_at_once`.
+- *S8.* `bound_template` reads the runner's `-c` values with the Codex adapter's own parsing
+  (`providers.codex.config_values`, sharing `_arguments` with `session_command`): `-c k=v`, `-ck=v`, `-c=k=v`,
+  `--config k=v`, `--config=k=v`. A runner the adapter refuses is left untouched. Test:
+  `test_r3_s8_attached_config_values_are_read_as_the_adapter_reads_them`.
+- *S11, remote dispatch.* The launch transaction resolves the run's destination first (`Dispatcher._destination`:
+  the decisions `_launch` makes, a node when there is no run directory here, the signed-in route, the headless
+  node), and holds a run for a node to the hosted turns on that node in that project
+  (`hosted_wake.turn_sessions`), a run here to the hub's directory as before. The claim records the destination as a
+  run record would (`node`, `cwd`), and `_checkout_busy` reads claims and run records in one loop. Tests, with a
+  node whose checkout is not the hub's: `test_r3_s11_a_run_for_a_remote_node_is_refused_while_a_child_task_there_holds_that_checkout`,
+  `test_r3_s11_a_claim_for_a_remote_node_holds_that_nodes_checkout_by_the_same_identity`.
+- *S17, answers.* `Board.create_post` calls `hosted_spawn.answered` where it writes the exact `answer_links` (one
+  small hook, for a human poster): an answer to a budget's item resets its count in that transaction; `flush` then
+  finds it consumed. Test: `test_r3_s17_an_answer_resets_the_count_in_its_own_transaction`.
+- *S19, partial writes.* `SessionHost._write` checks the binding before every write of a pending turn; if it changed
+  mid-write, the half-written line is not completed, the process is stopped and the message fails as never
+  delivered (`BINDING_CHANGED`), as the turn gate does. Decided: failed, not replayed (part of it reached a
+  process). Test: `test_r3_s19_a_binding_that_changes_mid_write_never_lets_the_old_process_take_the_rest`.
+- *S20.* The bridge records the registered session id before it forwards the answer. Test:
+  `test_r3_s20_the_bridge_keeps_the_session_id_before_the_client_can_read_the_answer`.
+- *S22.* The conversation-provenance rule also applies to wake qualification (`_qualifying`, for a hosted root: a
+  cursor of a board session that recorded another conversation does not count) and to cursor inheritance
+  (`other_provenance`, for a board session bound to a hosted session). Test:
+  `test_r3_s22_another_conversations_acknowledgement_neither_suppresses_a_wake_nor_seeds_the_root`.
+- *S23.* A claim carries its launch's token and is released after `_launch` returns or raises
+  (`Dispatcher._release_claim`); expiry is only for a claim a stopped dispatcher abandoned. Tests:
+  `test_r3_s23_a_claim_is_released_once_the_run_is_on_record_or_the_launch_failed`,
+  `test_r3_s23_after_a_run_ends_no_claim_holds_the_checkout`.
+
+**Residual risks / not verified.**
+- The trust model above: under one OS account, a session with a shell holds that machine's keys, and a node's
+  reports are only as honest as the account that holds its credential (S3).
+- Round 4 replaced the second `ended` with `reaped`, and `_launch` now takes the destination its launch
+  transaction resolved (`route`): see below.
+
+### Spawn tools: review round 12 (2026-11-22)
+
+On 0a10df9 (S38, the remaining path): the contact is renewed in one setter, `SessionRunner._renew_contact` (`last_contact`
+is a read-only property; the only other assignment is its start-up value, when nothing can start before a listing
+anyway), which first latches the deadline against the PREVIOUS contact at the time the call returned, so a report that
+gets through just after the deadline cannot open the gate; and the latch (`latched_at`, the latest moment the node was
+seen past its deadline) is cleared only by a listing from a fetch SENT at or after it, so a fetch that straddled the
+deadline clears nothing. Tests: `test_r12_s38_a_report_right_after_the_deadline_latches_before_it_renews_the_contact`
+(closed, and still listed), `test_r12_s38_a_fetch_sent_before_the_latch_does_not_open_the_gate`, and a "report gets
+through alone past the deadline" step in the interleaving test; 145 mutation rules, every one caught.
+
+### Spawn tools: review round 11 (2026-11-22)
+
+On f4aea5b: one item (S38, blocker), verified: the watchdog stopped turns in flight at the self-stop deadline, but
+a message already in a session's inbox (waiting for a stopping group in its checkout, or for a slot) could still be
+started by `host.tick()` while the node was cut off, after the hub had closed the session and its hold had ended:
+beside a hub-local run, or anything else the hub then allowed there. Now, once the self-stop time has passed since
+the last contact (`SessionRunner._silent`, the one computation the watchdog, the loop and the gate share, on the
+contact counted from when the last successful call was SENT), the node starts no process and writes no new turn,
+for any session, until a listing fetched since contact came back has been applied (the latch, `latched_at` since
+round 12, cleared in
+`pass_once` right after `_reconcile`, which comes before `host.tick()` in the same pass; a report that gets through
+alone renews the contact but clears nothing). Queued messages stay in their inbox; nothing is failed. Reads, reaps,
+stops and kills go on. The gate is `SessionHost.may_start`, asked in `_write`, the one place every start (`_spawn`
+has no other caller) and every new turn (`s.writing = s.inbox.popleft()`; `_fail_start`'s pop only fails one) pass;
+the inbox is filled only by `SessionHost.send`, which only `_hand_over` calls, for every kind of message (the
+human's, an agent's task, a wake, a result turn), and resumes and retried starts are `_spawn` too. A start just
+before the deadline is fine: the watchdog stops its turn at the deadline and the bound covers it. Tests:
+`test_r11_s38_past_the_self_stop_deadline_a_waiting_message_starts_nothing_and_fails_nothing`,
+`test_r11_s38_when_contact_returns_with_the_session_closed_the_waiting_task_never_starts`,
+`test_r11_s38_when_contact_returns_with_the_session_listed_it_starts` (and a report alone starts nothing),
+`test_r11_s38_past_the_self_stop_deadline_no_turn_is_written_to_a_live_idle_process`, and the interleaving test,
+now with a "hub silent" step and the invariant that no session process starts and no byte is written to one while
+the node is past the deadline. The mutation check has 142 rules (five new: the gate at the start, at the write, set
+by the node, the listing required, and the listing applied before the tick), every one caught.
+
+### Spawn tools: review round 10 (2026-11-22)
+
+On 937e372: two items in what this PR adds, and limit e. The mutation check has 137 rules (eleven new), every one
+caught.
+- *S36 (blocker).* Checked against the real constants (CALL_TIMEOUT connect 5 s + read 20 s per phase; a long-poll
+  fetch's read timeout is its wait + 20 s; SELF_STOP 90 s; kill grace 10 s; the stated bound was 10 + 90 + 10 =
+  110 s): the loop checked its self-stop, and sent its SIGKILLs, only between hub calls. A call sent just before
+  second 90 after the last contact that then hangs (5 s connect, 20 s read) put the SIGTERM at about second 115;
+  the next pass with a hub call (2 s later, after RETRY_SECONDS) could hang the same way, so the SIGKILL, due at
+  125, came at about 142. The hub could release the slot and the checkout from second 110 (or 115 with a contact
+  written just before the last call). Sol's 109/119/115 holds in kind; the real worst case was worse. Every blocking
+  call of the loop has the hazard: the report posts (`_flush`, at both ends of a pass, one per session), the listing
+  fetch (`_sync`, plain or long-poll); its own waits (TICK 0.2 s, RETRY 2 s) are bounded. Fixed with a watchdog
+  (shape b): `SessionRunner.enforce_deadlines`, on its own thread (`_watch`, every WATCH_SECONDS 0.5 s, on the
+  monotonic clock), takes the loop's lock (which the loop never holds across a hub call), stops every turn once the
+  self-stop time has passed since the last contact, and sends each due SIGKILL (`SessionHost.kill_due`, the pass's
+  own check). What it stops waits in `watched` for the loop's next `_emit`. The contact now counts from when the call
+  was SENT (the hub records it at or after that), so the node's clock never runs behind the hub's. The bound is
+  derived in code (`node_sessions.shutdown_bound`, the derivation beside it): self-stop + kill grace + 2 x (watch +
+  LOCK_SLACK_SECONDS 2 s) = 105 s as shipped. Shutdown and `recover()` are unchanged (the watchdog does nothing once
+  `stopping` is set; shutdown's code is as it was). Tests:
+  `test_r10_s36_a_hub_call_that_blocks_for_its_whole_timeout_delays_neither_the_self_stop_nor_the_kill` (real
+  threads and clock, scaled down; a report post and a listing fetch each block for their whole timeout, sent 0.1 s
+  before the threshold: SIGTERM and SIGKILL at their deadlines while the call is still blocked, and within the
+  stated bound), `test_r10_s36_the_contact_counts_from_when_the_call_was_sent`,
+  `test_r10_s36_the_stated_bound_follows_every_constant_it_depends_on`,
+  `test_r10_s36_the_node_starts_the_watchdog_beside_its_session_loop`. The loop also holds its lock for local git
+  worktree work, bounded only by each git command's own timeout: accepted as limit e (owner decision, below with
+  limits a to d); the watchdog logs a deadline it met later than the bound allows
+  (`test_r10_limit_e_a_deadline_met_late_is_said_in_the_log`). The relation the limit's argument rests on is pinned:
+  `test_r10_limit_e_a_node_is_offered_work_only_while_the_hold_is_in_force`.
+- *S37 (should).* The async listing handler wrote the contact (`note_contact`, a SQLite write) on the event loop: it
+  now runs it in the thread pool (`run_in_threadpool`), as its reads run in worker threads. The report handler is a
+  plain `def`, which the server already runs in its thread pool: left as is. Nothing else this PR added to those
+  two handlers touches the database on the loop (the listing's own reads and writes run inside `hosted._poll`'s
+  worker thread). Test: `test_r10_s37_the_session_loops_contact_is_written_off_the_event_loop_in_both_handlers`.
+
+### Spawn tools: review round 9 (2026-11-22)
+
+On 71e5540: one revert, two fixes, and one gap the stronger interleaving test found. Each fix has a `test_r9_*` test
+that fails without it; the mutation check has 126 rules (the four round-8 S34 rules out, round 8's two S25 rules now
+one, ten new ones in), every one caught.
+- *Revert of round 8's S34 (S34, S35).* Round 8 kept the record of a group that survived SIGKILL at an orderly
+  node shutdown and had the next node process's `recover()` stop it and hold its checkout (`Groups.hold`). That new
+  recovery path dropped the list of pids `stop_verified` had authenticated by start time and sent SIGKILL to any
+  live group matching a saved pid (S35): a pid the system had reused for something else since would be killed. All
+  of it is out: `SessionHost.stop_all` and `Node.report_stopped` forget a stopped group as on main, `recover()` on
+  both sides is main's, byte for byte, `Groups.hold` and the tests for it are gone. Shutdown and `recover()` differ
+  from main only in what the registry needs while this node process runs: `stop_all` and `report_stopped` take the
+  group out of the registry (`Groups.gone`) as they forget it, and `Node._stop` (which shutdown's `signal_runs` and
+  `kill_runs` go through, as on main) marks the run's group stopping before either signal (round 8, S32). A group
+  that survives SIGKILL at an orderly shutdown is not tracked across the restart: limit d now says so, and it is the
+  first item under "Spawn tools: follow-ups" below.
+- *S25 (blocker; new: the hub's hold).* The node's session-loop contact is recorded in ONE place: the two route
+  handlers of the session loop's calls (`GET /api/nodes/sessions` with `tree` 2 or more, and
+  `POST /api/nodes/sessions/{id}`) call `hosted.note_contact` once the call has succeeded, after auth and whatever
+  path it took inside (an ended session, a duplicate or older `seq`, an empty report): not inside the per-session
+  logic, which round 8 did (and so missed the ended-session and duplicate paths). A refused call (4xx) or one without
+  a node's token records nothing. `last_able` reads that one value (plus LOOP_CONTACT_EVERY, the write interval, so
+  it is never early) and the last hello; `node_reported_at` no longer enters it. Test:
+  `test_r9_s25_every_successful_call_of_the_session_loop_is_contact_and_no_refused_one_is`, a table of every return
+  path of both handlers, on a live and on an ended session.
+- *S33 (main's code: `_admit`, `max_live`, now with the registry).* Every process start, first or retried, takes a
+  fresh slot through the same admission check at the moment it starts: `SessionHost._write` asks `SessionHost.admit`
+  (set by the session runner to `_admit(s, starting=True)`) before `_spawn`, and a session that finds no slot keeps
+  its message in its inbox and asks again the next pass. It is asked only once the registry would let the start go
+  (its checkout holds no stopping group); and the hand-over lets a message for a session waiting for its checkout
+  through to its inbox without asking for a slot. So a session waiting for its checkout neither holds a slot nor
+  stops an idle process for one it could not use. At that moment only process groups that are there count
+  (a stopping or lingering one too, until it is gone); before, the hand-over had admitted sessions waiting for a
+  blocked checkout without a slot, and when the checkout cleared they all started at once. Tests:
+  `test_r9_s33_when_a_lingering_group_clears_three_waiting_sessions_start_only_up_to_max_live` (one lingering group
+  clears, three sessions were waiting, `max_live` 2: two start, the third when a slot is free),
+  `test_r9_s33_a_session_waiting_for_its_checkout_stops_no_idle_process_for_a_slot`, and the interleaving
+  test, now with three more sessions in the same checkout, `max_live` 2, and the invariant checked at every process
+  start against the fake processes: never more than `max_live` session process groups, lingering ones included.
+  Its checks are now recorded and asserted after each step, not raised inside the spawner (the host and the node
+  take a spawner's exception for a failed start, so a raised check could be swallowed).
+- *Rule 1 within one pass (main's code: `SessionHost.tick`, now under the registry).* With its checks no longer
+  swallowed, the interleaving test found a session's process started, in the same pass, beside a group whose leader
+  had just gone by itself, because the pass came to the new session before the exited one. `tick` now looks at
+  every exit (`_read`, `_reap`) before any session's `_pass`, so such a group is registered as stopping before the
+  pass starts anything. The test's ground truth counts a leader that exits by itself as stopping from its owner's
+  next poll (the session host's pass, or the node's for a run): before that poll nobody can know, which is inherent
+  to polling and unchanged from main. Test: `test_r9_a_pass_looks_at_every_exit_before_it_starts_anything`.
+
+### Spawn tools: review round 8 (2026-11-22)
+
+On ae17b26: five small items, the last round on process lifecycle. Each has a `test_r8_*` test that fails without
+it; the mutation check has 121 rules, every one caught; the interleaving test now also has a kill whose terminate
+the node never saw (and eight seeds). Which code each touches: NEW in this PR, or main's process handling now held
+to the registry's invariant.
+- *S25 (blocker; new: the hub's hold; where contact is recorded superseded in round 9).* The deadline counts from
+  the node's last contact that lets its session loop run work, of any kind: a hello, a session report (of any of its sessions), or a session-loop listing fetch (which
+  may carry its first task): `hosted.last_able`, the one function `may_still_run` asks. A fetch's contact time is
+  written with the loop's other facts at most every LOOP_CONTACT_EVERY (5 s), which `last_able` adds, so the time
+  is never early. Test: `test_r8_s25_the_deadline_counts_from_the_session_loops_last_fetch_too` (hellos stalled,
+  the first task fetched, its first report lost).
+- *S31 (new: the hub's hold).* The node's own `ended` for a session the hub had already ended is recorded on the
+  ended record (`node_ended_at`, used only by `may_still_run`), once, with no end side effect repeated (no result,
+  cascade or audit). Test: `test_r8_s31_the_nodes_own_end_of_a_session_the_hub_had_ended_is_proof_and_repeats_nothing`
+  (retried).
+- *S32 (main's code: `Node._stop`, now under the registry).* A run's group is marked stopping before EITHER signal,
+  so a hub's kill that arrives without its terminate holds the checkout too. Audit of every path that signals a
+  group: runs (`Node._stop`: terminate, kill, the hub's stop, the timeout, the self-stop, shutdown's `signal_runs`
+  and `kill_runs`, all through `_stop`) and sessions (`SessionHost._stop`, which every terminate goes through, and
+  whose kills come only after it: the grace in `_pass`, `stop_all`). Test:
+  `test_r8_s32_a_kill_without_a_terminate_still_holds_the_runs_checkout`.
+- *S33 (main's code: `_admit`, `max_live`, now with the registry).* A session whose start the registry refuses holds
+  no slot: its message waits in its inbox for the registry (session_host `_spawn` retries every pass and starts it
+  once the checkout is free), `_admit` does not count it, and `active` does not keep the short cadence for it
+  (`_start_blocked`). Test:
+  `test_r8_s33_sessions_waiting_on_a_blocked_checkout_hold_no_slot`.
+- *S34 (main's code: the two shutdown paths; REVERTED in round 9, S35).* A group still there after its SIGKILL at shutdown keeps its record
+  (`SessionHost.stop_all` keeps its handle, `Node.report_stopped` keeps the run and reports nothing), so the next
+  node process's `recover()` finds it, stops it, and, if it is still there after the wait, holds its checkout as
+  stopping (`Groups.hold`) until it is gone (checked every pass). Unchanged from main (limit d): a group whose
+  leader has already exited cannot be verified, so it is not found. Tests:
+  `test_r8_s34_a_group_that_survives_shutdown_is_found_by_the_next_start_and_holds_its_checkout`,
+  `test_r8_s34_a_run_group_that_survives_shutdown_is_found_by_the_next_start_too`.
+
+### Spawn tools: review round 7 (2026-11-22): one registry on the node, proof from the session loop on the hub
+
+On aa67725 (main still 810d966); round 6's departure on rule 2 ("not heard from since the end") accepted, with the
+right kind of "heard from" (S31). Each item has a `test_r7_*` test; the mutation check has 111 rules, every one
+caught.
+
+*Rule 1, as one invariant:* nothing is started on a node in a checkout directory (by device and inode) that holds a
+process group in the stopping state, and every stopping group stays registered, and receives its SIGKILL, until the
+whole group is gone. Enforced in one place, `node_groups.Groups`, the node's one registry of every process group it
+started (hosted sessions' processes and dispatched runs alike, shared by `SessionHost` and `Node`): `start` checks
+the directory and records the new group under one lock and spawns while holding it, `stopping` marks a group under
+the same lock (`SessionHost._stop`, `Node._stop`), `gone` removes it only when the leader is reaped and no member is
+left (`SessionHost._reap`, `Node._reap`, the shutdown paths). Live groups share a directory freely (a parent and its
+shared-checkout children; a session beside a run the hub allowed); what is blocked is STARTING anything where a
+group is being stopped.
+- *S26.* `Node._start` and a session's stop are atomic: the run is spawned inside `Groups.start`, and a stop is
+  either before (the run waits, assigned) or after (the run is already live). Test:
+  `test_r7_s26_a_run_start_and_a_session_stop_are_atomic_in_the_nodes_one_registry` (a stop lands in the gap).
+- *S29.* A replacement session (or any session process) in a checkout where another session's group is being
+  stopped waits, with capacity to spare; `SessionHost.spawn_gate` (round 6) is gone, the registry does it. Test:
+  `test_r7_s29_a_replacement_session_waits_for_the_previous_sessions_group_in_its_checkout`.
+- *S30.* `Node._reap` keeps a run whose leader went (on its own, or on SIGTERM) while members of its group are left:
+  its group is stopped, its SIGKILL is delivered after the grace, its checkout stays held, and it is reported ended
+  (with the leader's exit code) only once the whole group is gone; `runs_alive` and `kill_runs` count the group too.
+  Test: `test_r7_s30_a_run_whose_leader_exits_on_sigterm_stays_tracked_and_killed_until_its_group_is_gone`.
+- *Interleavings:* `test_r7_rule1_over_interleavings_nothing_starts_beside_a_stopping_group_and_every_one_is_killed_and_leaves`
+  (four seeds, 120 random steps each, over the real node and session host with fake processes: session stop,
+  session start, replacement session start, run start, run stop, a leader exiting leaving a member, a member
+  dying) checks the invariant against the fake processes themselves, not the registry.
+
+*Rule 2, on the hub:* `hosted.may_still_run`.
+- *S25 (blocker).* The node's session loop states its bound on every fetch (`bound`, a query parameter, which an
+  older hub ignores), recorded before the listing is built (`_note_session_loop`, `host.node_loop.<node>`): so the
+  hub knows it before it lists runnable work. Until a node of the protocol has stated one, the cap (3600 s) is
+  assumed, not zero. (Decided: assume the cap rather than withhold work; this node version always states it.) The
+  report field `shutdown_bound` of round 5 is gone. Test:
+  `test_r7_s25_the_hub_knows_a_nodes_bound_before_it_lists_work_and_assumes_the_cap_until_then`.
+- *S31 (blocker).* A hello is liveness only. The hold ends on proof that the SESSION loop has reconciled past the
+  end: the node's own `ended` for that session (`ended_by: node`), or a listing built after the end that the loop
+  says it applied. Precisely: the hub keeps, per node, when each recent listing version was last built for it
+  (`versions`, the latest build time); the loop sends with every fetch the version it last applied (`applied`, set
+  after `_reconcile`, which closed every session the listing no longer had); `applied_at` is that version's build
+  time; the hold ends once `applied_at` is after the session's `ended_at`. A restarted node process proves the same
+  way after its startup recovery (its first listing, then its next fetch). What protects what: the node's registry
+  (rule 1) keeps the node itself from starting anything beside the old group once its loop has closed it; this rule
+  keeps the hub from freeing the SLOT (a replacement on another node) and from taking the checkout as free for its
+  own decisions (the dispatcher's gate and launch transaction, hub-local and node-bound runs alike) until then.
+  Test: `test_r6_rule2_and_limit_d_only_the_session_loop_reconciling_ends_the_hold_also_after_a_restart` (rewritten:
+  a hello alone holds; the loop's listing then its next fetch frees; the same after a restart).
+
+### Spawn tools: review round 6 (2026-11-22): the stored-marker mechanism taken out (owner decisions)
+
+From round 2 on, the hub kept a marker on an ended session (`unconfirmed_until`) that only a node event cleared (a
+second `ended`, then `reaped`), so that a slot and a checkout stayed held until the node had reaped the process
+group. Every finding from S6 through S28 was the same thing in another place: a confirmation that could be lost (a
+retried report, a restart, a shutdown), or a marker set and read differently (S25: a close after the node was
+declared lost; S28: pruning). The owner chose to take the mechanism out. On 6b4a75d (main still 810d966):
+- *Rule 1: the node enforces what is true on its own machine.* It never starts a process beside a process group of
+  its own that is still being stopped in the same checkout: a session's next process (it waits, session_host
+  `_pass`), another session beyond `max_live` (lingering groups count, `_admit`), and now a dispatched run it
+  executes (`Node._start` waits while `SessionRunner.stopping_checkouts()` names its checkout). The other way round
+  the shape existed too, and is closed: a session's process is not started where a run this node started is still
+  being stopped (`SessionHost.spawn_gate`, set by `Node`, from `Node._stopping_run_dirs`). Round 5's `_reap` stays:
+  it is rule 1 for a provider that exits leaving a tool behind. Tests:
+  `test_r6_rule1_a_node_run_waits_while_a_session_group_of_this_node_is_stopped_in_its_checkout`,
+  `test_r6_rule1_a_sessions_process_is_not_started_where_a_run_of_this_node_is_being_stopped`,
+  `test_r6_rule1_a_provider_that_exits_leaving_a_tool_keeps_its_checkout_on_the_node` (fake processes that take
+  their whole grace, or outlive it).
+- *Rule 2: the hub keeps only what a node cannot know.* `hosted.may_still_run(conn, r, now)`, the one function
+  `holds_slot` (the live limit, `max_children`) and `turn_sessions` ask: an ended session may still be running only
+  on a node of the spawn protocol that has not been heard from since the session ended (its hellos and reports), and
+  only until that node's last word plus its reported `shutdown_bound`. Computed from current facts at every
+  evaluation; nothing is stored for it. A node heard from again ends the hold at once (it has reconciled). A node
+  from before the protocol: as on main. Tests:
+  `test_r6_rule2_an_end_while_the_node_is_not_heard_from_holds_until_it_is_or_its_bound_passes` (round 6's S25:
+  the end after the node counts as lost, before its 400 s bound),
+  `test_r6_rule2_and_limit_d_a_node_heard_from_again_ends_the_hold_at_once_also_after_a_restart`.
+- *Removed:* the `reaped` event, its features gate and the node's `GONE`; `unconfirmed_until`, `confirmed_at` and
+  the confirmation branches in `report`; `hosted.unreaped`, the stuck-session naming in the Needs-you item and the
+  human release (`released_by`); the ended-session branch of `turn_sessions` beyond rule 2; `_end`'s `by_node`.
+- *The pruning concern:* `shutdown_bound` (the node's hello interval + self-stop + kill grace) is at most an hour
+  (`SHUTDOWN_BOUND_MAX`), where the hub takes it (refused above) and where the node computes it: `[dispatch]
+  kill_grace_seconds` allows any positive number, so a node whose bound would exceed it refuses to start its
+  session host with a clear error instead of capping quietly. An ended record is pruned after seven days, long after
+  any hold. Test: `test_r6_the_shutdown_bound_is_capped_where_the_node_computes_it_and_where_the_hub_takes_it`.
+- *Stated limits (owner decisions), each pinned by a test:*
+  (a) On a node that is heard from, the hub frees a slot at `ended`. The old process may still be inside its kill
+  grace: signalled, given no further work, gone within that node's kill grace (10 s by default). A replacement on
+  another node can overlap it for at most that long; the live limit counts sessions that can be given work.
+  (b) Hub-local dispatched runs are started by the hub's dispatcher, which cannot see a node's process groups: if a
+  node runs on the hub's machine, a hub-local run can enter a checkout while a session's group there is inside its
+  kill grace. Same bound (except in the case of limit e, which extends it past the kill grace).
+  Test for both: `test_r6_limit_a_a_healthy_node_frees_the_slot_and_the_checkout_at_ended_while_the_process_is_in_its_grace`.
+  (c) A process group that survives SIGKILL blocks, on that node, that session's next process and node runs in that
+  checkout; it shows in the node's log (one line naming the session and the directory, repeated every
+  `LINGER_LOG_SECONDS`), not on the hub. Test:
+  `test_r6_limit_c_a_group_that_outlives_its_sigkill_blocks_its_checkout_and_says_so_in_the_nodes_log`.
+  (d) After a node restart the hub frees slots at the node's next hello; that relies on `recover()` having stopped
+  what the earlier node process left, and `recover()` cannot signal a group whose leader has already exited. And
+  (round 9) a process group that survives SIGKILL at an orderly node shutdown is not tracked across the restart:
+  the node process forgets it as it exits, and the next one neither stops it nor holds its checkout. Both
+  unchanged from main. Test: the second rule 2 test above.
+  (e) (Round 10, owner decision.) The bound the node states (`node_sessions.shutdown_bound`) assumes its deadline
+  watchdog gets the session loop's lock within LOCK_SLACK_SECONDS. The loop also holds that lock for local git
+  worktree work (a child's own worktree made in `_reconcile`, removed in `_drop_worktree`), each git command
+  bounded only by its own timeout (`dispatch.ensure_run_worktree`'s `worktree add` 120 s, `_git_common_dir` 10 s,
+  `session_worktrees._git` 30 s per query, `worktree remove` 60 s; one creation can take up to about 250 s, one
+  removal about 270 s). It matters only while the hub hears nothing from the node: any contact, a hello included,
+  renews the hold. The worst case needs three things at once: the node runs on the hub's machine; the hub hears
+  nothing from that node, hellos included, for at least its bound; and that git work holds the lock for more than
+  about the self-stop time in one pass. Then the hold ends while a turn there may not have been signalled yet, and
+  a hub-local run (limit b) can start in that checkout beside it, for as long as the git work holds the lock plus
+  the kill grace: this extends limit b past the kill grace in that case. Every other case is held: the hub offers a
+  node no run unless it was seen within NODE_STALE_SECONDS (60 s, nodes.pick), which is shorter than any bound a
+  node can state (at least the self-stop time, 90 s), so whenever the node can be given work its last contact is
+  recent enough that the hold is in force (`may_still_run`, and `_launch_check`'s CHECKOUT_BUSY); a returning
+  node's hello restores the hold, which then lasts until its session loop has applied a listing built after the
+  end, by when the loop has closed the session and the node's registry refuses anything new beside its stopping
+  group; a child of a hosted root goes to its parent's node, where the loop closes the ended session (unlisted) in
+  the same reconcile, before anything starts in `host.tick`; a child of an interactive root on another node is in
+  another checkout. There the effect is a brief over-count of live children (the grant's and the parent's counts).
+  The node's registry refuses only STOPPING groups: a live group, a turn not yet signalled, does not by itself keep
+  a dispatched run out of its checkout; one run per checkout is the hub's (CHECKOUT_BUSY). Accepted because it
+  needs a hub that hears nothing from a node on its own machine at the same time as more than the self-stop time of
+  git work in one pass; the node logs any deadline it met later than its bound allows. Tests:
+  `test_r10_limit_e_a_node_is_offered_work_only_while_the_hold_is_in_force`,
+  `test_r10_limit_e_a_deadline_met_late_is_said_in_the_log`.
+- *Kept from rounds 1 to 5:* everything not part of the marker: S6's `_reap`, S11's reserved-route launch, S22's
+  provenance snapshots, the per-grant budget, the binding rules.
+
+### Spawn tools: review round 5 (2026-11-22)
+
+On 4cf523e: four items open, each a defect within the stated model. Each has a `test_r5_*` test that fails without
+its fix, and each rule is in the mutation check (107 rules, every one caught). For each, where else the same shape
+was looked for is said.
+- *S6 (blocker).* `SessionHost._reap` lets go of a process only once its whole process group is gone, however its
+  leader ended. A leader that exits on its own while members of its group are left is an exit at once (its turn
+  fails, `_went_by_itself`), and the group is then stopped as the stop path stops one (SIGTERM, SIGKILL after the
+  grace); the handle is kept, nothing starts beside it, and the node sends `reaped` only once the group is gone.
+  This replaces main's rule that such a process was not held for its group (its test is rewritten:
+  `test_a_process_that_exits_by_itself_is_held_until_its_group_is_gone`). Test:
+  `test_r5_s6_a_provider_that_exits_leaving_a_descendant_is_reaped_only_when_its_group_is_gone`. *Every place that
+  drops the handle:* `_reap` is the only one (stop, timeout, a withdrawn or failed write, a crash, a refused
+  handshake all stop and then reap through it); `forget` needs it dropped; `stop_all` already waits for the group. A
+  failed spawn has no handle to keep (the spawner raised before a process was there). Not changed:
+  `SessionHost.recover` (an earlier node process's sessions) signals only groups whose leader still verifies by its
+  start time; a group whose leader is already gone cannot be told from a reused process group id, so it is left.
+- *S25 (blocker).* `hosted.holds_slot(conn, r, now)` no longer expires on a timer for a node of the spawn protocol:
+  while the node is heard from (NODE_LOST_SECONDS) an ended session holds its slot and its checkout until `reaped`,
+  however long the node's kill grace. Once the node is confirmed lost, it frees them after the node's own shutdown
+  bound has passed too (`shutdown_bound`: the node's self-stop plus its kill grace, which it reports with every
+  report to a hub that names the feature; at least NODE_LOST_SECONDS), counted from when it was last heard. A node
+  from before the protocol keeps the old deadline. A session a healthy node never confirms (a bug) is bounded by
+  the human: the live limit's Needs-you item names it (`hosted.unreaped`), and the human's `board session close` on
+  the ended session lets it go (`released_by`). Tests:
+  `test_r5_s25_a_healthy_nodes_long_grace_keeps_the_slot_and_a_lost_node_its_own_bound` (a 300 s grace),
+  `test_r5_s25_a_session_its_healthy_node_never_confirms_is_named_and_the_human_can_let_it_go`. *Same shape:* the
+  checkout hold of S24 goes through the same `holds_slot`, and so does `max_children`.
+- *S11.* `_destination` records what it computed the route from (`_route_inputs`: the signed-in and headless origins)
+  and every routing answer (base node, signed-in route, headless node, the run directory checked); `_launch` reads
+  none of them again (node, signed-in origins, headless origins, run directory all from `route`). If the inputs
+  changed since the reservation, it refunds the launch, releases the claim and requeues the trigger (`requeue`),
+  starting nothing. Test: `test_r5_s11_a_requirement_added_after_the_reservation_requeues_instead_of_rerouting`.
+  *Same shape:* `_launch` also re-read the headless origins for a node run's browser and a local run's browser, and
+  the run directory (`_run_dir_for`, which reads the signed-in route): all now from `route`. Its browser blockers
+  still read the requirements, but only to refuse, never to route, and run after the requeue check.
+- *S22.* Decided: (1) a connection that proves to be a hosted session resumes only a board session already bound to
+  it (`check_resume`, on MCP and HTTP); binding another one is refused, register a new one. (2) Provenance is a
+  snapshot: `host.inherited.<id>` records, per thread, a cursor value and the provenance it stood for (`[hosted,
+  conversation]`), for what a board session inherited and, on a resume that gives it another recorded conversation,
+  for what it had read before (`snapshot_provenance`, one line in core's resume path, before anything changes);
+  `cursor_provenance` reads that snapshot, never the source's current state, and its delivery receipts from before
+  such a resume are not credited to a hosted root (`provenance_changed`). Tests:
+  `test_r5_s22_a_hosted_session_cannot_resume_another_conversations_board_session`,
+  `test_r5_s22_cursors_keep_the_conversation_that_read_them_across_a_resume_and_in_their_copies` (the direct case
+  and the inherited copy). *Same shape:* delivery receipts (`_credited`), as above; the read marks of `handed` are
+  written with the reader's provenance at the time of the read already. The dashboard's conversation lookup
+  (`Board._resolve_claude`/`_resolve_codex`) sets a conversation only where none was recorded: it says whose the
+  session always was, it does not move it.
+
+### Spawn tools: review round 4 (2026-11-22)
+
+Rebased onto main 810d966 (PR #92, long-poll disconnects; the gateway's binding headers go on both its raced and
+its plain path: `test_r4_the_gateway_passes_the_binding_headers_on_the_raced_and_the_plain_path`). Four items left;
+each has a `test_r4_*` test that fails without its fix, and each rule is in the mutation check (96 rules, every one
+caught).
+- *S6 (blocker).* The reap is a distinct event, `reaped` (`hosted.REAPED`, `node_sessions.GONE`), and only it
+  confirms; a retried `ended` (a report whose answer was lost) is idempotent and confirms nothing. The node sends
+  `reaped` only to a hub that names it in its listing's `features` (`NODE_REPORT_FEATURES`, like `answered`;
+  `SessionRunner.OPTIONAL_KINDS`); a hub that does not gets none and frees the slot at its deadline; a node that
+  sends none is treated as before. Tests: `test_r4_s6_a_retried_ended_whose_answer_was_lost_never_frees_the_slot`
+  (the lost answer, exactly), `test_r4_s6_a_hub_that_does_not_name_reaped_gets_none_and_frees_the_slot_at_the_deadline`.
+- *S24.* `hosted_wake.turn_sessions` (and so `turn_projects`, the dispatcher's gate and its launch transaction) keeps
+  an ended session's checkout while `holds_slot` says its process group may still be there; the logical close
+  applies at once. Found for a root too: a root closed during its turn released its checkout at `ended` the same
+  way, and now keeps it likewise (one rule for every session). A child ended because its node hosts no child
+  sessions (`orphaned`) keeps nothing: nothing runs there. Test:
+  `test_r4_s24_an_ended_session_keeps_its_checkout_until_its_process_group_is_reaped` (a child, then a root).
+- *S11.* `_destination` keeps its routing answers on the item (`route`: the base node, the signed-in route, the
+  headless node), and `_launch` uses them instead of asking again, so a run can only start on the node and checkout
+  its launch transaction checked and claimed. Test: `test_r4_s11_the_run_starts_on_the_node_its_launch_transaction_reserved`
+  (the routing answer changes between the transaction and the launch; the other node holds a child task).
+- *S22.* Register's cursor copy moved into `hosted_spawn.inherit_cursors` (core calls it, one line): unbound
+  sessions keep the agent-wide position, and each copied cursor records its SOURCE (`host.inherited.<id>`, for a
+  source with a provenance of its own: a binding or a recorded conversation). `cursor_source` resolves a cursor
+  that has not moved past its inherited value to that source, and `counts_for` decides whether the source's read
+  counts for a hosted session; hosted wake qualification and every later inheritance go by the source. Test:
+  `test_r4_s22_a_copied_cursor_keeps_whose_read_it_was` (A acknowledges, C copies, a bound session registers: the
+  root is still woken).
+- Bindings of board sessions are kept as long as the board session exists (board sessions are never deleted), so
+  their records grow with the hosted processes started; `inherit_cursors` reads them on each register.
+- A Codex parent calling the tools: its binding rests on the `env_vars` override, verified with Codex's own config
+  parsing (`codex mcp get --json`) and stand-ins, not by a live Codex session calling a tool.
+- The getsid guard assumes an MCP server does not start a new OS session; only Claude's path ran live, and that
+  through the binding.
+- A process started before a grant runs without the binding until it is idle and restarted; meanwhile its board
+  server is an interactive caller (unless the getsid guard catches it), bounded by the grant.
+- `hosted_wake._occupied` (wakes, result turns) still maps node runs through the hub's settings (S11 note).
+- Deeper trees ran only through the test-only override; a node reports no confirmed `full` for a child that is a
+  parent (such a grandchild is held to `workspace`).
+- Queued messages survive a revoked or narrowed grant; the dashboard shows no trees, grants or budgets.
+
+### Spawn tools: follow-ups
+
+- A process group that survives SIGKILL at an orderly node shutdown is not tracked across the restart (limit d,
+  unchanged from main): its checkout is not held by the next node process. Any future recovery of such groups must
+  signal only groups it has re-verified by start time (as `stop_verified` does), never any live group that matches a
+  saved pid (round 9, S35).
+- Move worktree git work out of the session loop's lock (closes limit e).

@@ -89,6 +89,48 @@ def _unquoted(value: str) -> str:
     return value.strip().strip("\"'")
 
 
+def _arguments(template: list[str]):
+    """A `codex exec` runner's arguments after the executable, as this adapter reads them: (kind, flag, value) with
+    kind one of VALUE_FLAGS' kinds ("config" for `-c`/`--config` in every form Codex takes: `-c k=v`, `-ck=v`,
+    `-c=k=v`, `--config k=v`, `--config=k=v`), "exec" (the subcommand, once) or "bare" (BARE_KEPT). The prompt
+    element and BARE_DROPPED are skipped; anything else, and a bypass flag, raises."""
+    exec_seen = False
+    i = 1
+    while i < len(template):
+        arg = template[i]
+        i += 1
+        if arg == "{prompt}":
+            continue                # turns arrive on stdin
+        if arg in ("exec", "e") and not exec_seen:
+            exec_seen = True
+            yield "exec", arg, None
+            continue
+        if arg.split("=", 1)[0] in BYPASS_FLAGS:
+            raise ValueError(BYPASS_REFUSED)
+        if arg in BARE_KEPT:
+            yield "bare", arg, None
+            continue
+        if arg in BARE_DROPPED:
+            continue
+        flag, eq, value = arg.partition("=") if arg.startswith("--") else (arg[:2], "=" if len(arg) > 2 else "",
+                                                                         arg[2:].removeprefix("="))
+        kind = VALUE_FLAGS.get(flag)
+        if kind is None:
+            raise ValueError("this Codex runner has an argument a hosted session does not understand: "
+                             + (flag if arg.startswith("-") else "an extra positional argument"))
+        if not eq:
+            if i >= len(template):
+                raise ValueError(f"this Codex runner's {flag} has no value")
+            value, i = template[i], i + 1
+        yield kind, flag, value
+
+
+def config_values(template: list[str]) -> list[str]:
+    """The runner's `-c` override values (`key=value`), in order, in whichever form each was written: the same
+    reading as `session_command`'s (session_host.bound_template merges with them). Raises as it does."""
+    return [value for kind, _, value in _arguments(template) if kind == "config"]
+
+
 def session_command(template: list[str], model: str | None = None, cwd: str | None = None) -> tuple[list[str], dict]:
     """A `codex exec` runner template as a hosted session: the `codex app-server` argv and the `thread/start`
     parameters. Every `-c` override, `--enable` and `--disable` is kept; `-m/--model` and `--sandbox` become thread
@@ -106,32 +148,13 @@ def session_command(template: list[str], model: str | None = None, cwd: str | No
     kept: list[str] = []
     values: dict[str, str] = {}
     exec_seen = False
-    i = 1
-    while i < len(template):
-        arg = template[i]
-        i += 1
-        if arg == "{prompt}":
-            continue                # turns arrive on stdin
-        if arg in ("exec", "e") and not exec_seen:
+    for kind, arg, value in _arguments(template):
+        if kind == "exec":
             exec_seen = True
             continue
-        if arg.split("=", 1)[0] in BYPASS_FLAGS:
-            raise ValueError(BYPASS_REFUSED)
-        if arg in BARE_KEPT:
+        if kind == "bare":
             kept.append(arg)
             continue
-        if arg in BARE_DROPPED:
-            continue
-        flag, eq, value = arg.partition("=") if arg.startswith("--") else (arg[:2], "=" if len(arg) > 2 else "",
-                                                                         arg[2:].removeprefix("="))
-        kind = VALUE_FLAGS.get(flag)
-        if kind is None:
-            raise ValueError("this Codex runner has an argument a hosted session does not understand: "
-                             + (flag if arg.startswith("-") else "an extra positional argument"))
-        if not eq:
-            if i >= len(template):
-                raise ValueError(f"this Codex runner's {flag} has no value")
-            value, i = template[i], i + 1
         if kind == "config":
             key, sep, val = value.partition("=")
             key = key.strip()

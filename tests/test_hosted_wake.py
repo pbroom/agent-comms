@@ -720,6 +720,7 @@ def test_a_failing_wake_pass_fails_neither_the_nodes_fetch_nor_the_dispatcher(de
     monkeypatch.setattr(hosted_wake, "reserve", boom)
     monkeypatch.setattr(hosted_wake, "holds", boom)
     monkeypatch.setattr(hosted_wake, "turn_projects", boom)
+    monkeypatch.setattr(hosted_wake, "turn_sessions", boom)     # (what the launch transaction reads)
     later(denv, 5 * 60)
     denv.post("human", denv.tid, "your turn", "request", to=["claude"])     # the post itself never touches the pass
     send(denv, sid, "still works")

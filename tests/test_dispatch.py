@@ -1029,7 +1029,9 @@ def test_every_served_tool_is_classified_for_codex_exactly_once(env):
     served = _served_tools(env.board)
     assert served == set(pre) | set(opt), {"unclassified": served - set(pre) - set(opt),
                                            "not served": (set(pre) | set(opt)) - served}
-    assert opt == ("board_resolve_attention",)                 # selective closeout is opt-in
+    assert opt[0] == "board_resolve_attention" and set(opt[1:]) == {   # selective closeout and the spawn tools: opt-in
+        "board_session_capabilities", "board_session_spawn", "board_session_send", "board_session_status",
+        "board_session_cancel"}
     browser = {"board_bind_browser_request", "board_browser_begin_probe", "board_browser_probe",
                "board_browser_failure", "board_browser_reconnect", "board_browser_status"}
     assert browser <= set(pre) and browser <= served           # the tools whose absence stalled dispatched runs

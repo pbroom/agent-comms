@@ -53,6 +53,8 @@ class _Local:
     terminated_at: float | None = None
     killed: bool = False
     cwd: str | None = None   # the run's checkout, inspected when the run ends (checkout_state)
+    exit_code: int | None = None    # its leader's, once it went while members of its group were left
+    terminating: bool = False       # SIGTERM sent
 
 
 def checkout_state(cwd: str | None) -> dict | None:
@@ -78,6 +80,8 @@ class Node:
         self.client, self.config, self.log_dir, self.spawner, self.clock = client, config, log_dir, spawner, clock
         self.probe, self.start_of, self.signal_group, self.sleep = probe, start_of, signal_group, sleep
         self.session_group_alive = session_group_alive
+        from .session_host import group_alive
+        self.group_alive = session_group_alive or group_alive       # a run's process group, too
         # Hosted sessions (node_sessions.py), only with [dispatch.sessions] enabled = true. They share this node's log
         # directory, and have their own loop and thread: tick() below never touches them.
         self.sessions: SessionRunner | None = SessionRunner(
@@ -85,6 +89,10 @@ class Node:
             probe=probe, start_of=start_of, signal_group=signal_group, sleep=sleep,
             **({} if session_group_alive is None else {"group_alive": session_group_alive}),
         ) if config.sessions.enabled else None
+        # The node's one registry of the process groups it started and has not seen gone (node_groups): its hosted
+        # sessions' and its dispatched runs'. Nothing is started in a directory that holds one being stopped.
+        from .node_groups import Groups
+        self.groups = self.sessions.host.groups if self.sessions is not None else Groups()
         self.running: dict[str, _Local] = {}
         self.last_hello = float("-inf")
         self.last_contact = clock()
@@ -208,7 +216,7 @@ class Node:
             # the directory the parent runs in.
             from .session_host import child_words, runner_dir
             words = {k: child_words(self.config, template) for k, template in sorted(self.config.runners.items())}
-            body["session_host"] = {"tree": 1, "runners": {k: w for k, w in words.items() if w}}
+            body["session_host"] = {"tree": 2, "runners": {k: w for k, w in words.items() if w}}   # 2: spawn too
             dirs = {k: runner_dir(self.config.runners[k]) for k in body["session_host"]["runners"]}
             if any(dirs.values()):      # only then: the key is newer than the rest
                 body["session_host"]["dirs"] = {k: d for k, d in dirs.items() if d}
@@ -269,6 +277,12 @@ class Node:
             cwd = self.config.checkout_for(project)
             if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
                 raise FileNotFoundError(f"this machine has no run directory for project {project!r}")
+            if self.groups.blocked(cwd):
+                # A process group of this node is being stopped in that checkout (a session's or a run's, inside its
+                # kill grace or outliving it): the run waits, assigned, and starts on a later pass. (Asked again,
+                # atomically, at the spawn below; this first look only spares the side effects in between.)
+                log.info("run %s waits: a process group in %s is still being stopped", rid, cwd)
+                return
             prompt = r.get("prompt")
             if not isinstance(prompt, str) or not prompt:
                 raise ValueError("assignment has no prompt")
@@ -319,8 +333,13 @@ class Node:
                     self.config.headless_browser, origins, str(out_dir)))
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=r.get("runtime")),
-                                 log_path=self.log_dir / f"{rid}.log")
+            started, child = self.groups.start(cwd, ("run", rid), lambda: self.spawner(
+                argv, cwd=cwd, env=child_env(agent, self.config, runtime=r.get("runtime")),
+                log_path=self.log_dir / f"{rid}.log"))
+            if not started:
+                log.info("run %s waits: a process group in %s is now being stopped", rid, cwd)
+                self._remove_browser_output(rid)
+                return
         except Exception as e:
             log.warning("could not start run %s: %s", rid, e)
             self._remove_browser_output(rid)
@@ -345,22 +364,41 @@ class Node:
                                "headless_browser": {"output_dir": str(out)}})
 
     def _stop(self, local: _Local, how: str) -> None:
+        # Before EITHER signal (a hub's kill can come without its terminate): nothing starts in its checkout until its
+        # whole group is gone (node_groups).
+        self.groups.stopping(("run", local.run_id))
+        if local.terminated_at is None:
+            local.terminated_at = self.clock()
         if how == "kill" and not local.killed:
             local.killed = True
             local.child.kill()
-        elif local.terminated_at is None:
-            local.terminated_at = self.clock()
+        elif how != "kill" and not local.terminating:
+            local.terminating = True
             local.child.terminate()
 
     def _reap(self) -> None:
+        """A run is let go of only once its whole process group is gone, as a session's is (session_host `_reap`): a
+        leader that exits (on its own, or on SIGTERM) while members of its group are left keeps the run tracked, its
+        group stopped (SIGTERM, then SIGKILL after the grace) and its checkout held in the registry (node_groups)."""
         now = self.clock()
         for rid, local in list(self.running.items()):
             code = local.child.poll()
+            if code is not None and self.group_alive(local.child.pid):
+                if local.exit_code is None:
+                    local.exit_code = code
+                if local.terminated_at is None:
+                    log.warning("run %s: its process exited (code %s) and left members of its group: stopping them",
+                                rid, code)
+                    self._stop(local, "terminate")
+                elif not local.killed and now - local.terminated_at >= local.grace:
+                    self._stop(local, "kill")
+                continue
             if code is not None:
                 del self.running[rid]
+                self.groups.gone(("run", rid))
                 self._save_state()
                 self._remove_browser_output(rid)
-                self._report(rid, "ended", exit_code=code,
+                self._report(rid, "ended", exit_code=local.exit_code if local.exit_code is not None else code,
                              **({"checkout": c} if (c := checkout_state(local.cwd)) is not None else {}))
             elif local.terminated_at is None and now - local.started >= local.timeout:
                 self._stop(local, "terminate")
@@ -394,6 +432,7 @@ class Node:
     def report_stopped(self) -> None:
         for rid, local in list(self.running.items()):
             del self.running[rid]
+            self.groups.gone(("run", rid))
             self._remove_browser_output(rid)
             c = checkout_state(local.cwd)
             self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down",

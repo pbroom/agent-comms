@@ -15,10 +15,12 @@ an optional model name and the message text.
 - Placement mirrors a node run: the hub's `[dispatch.nodes.<name>]` entry must cover the project
   (`nodes.grant_covers`) and the agent, and the node must be live, offer the project and a runner for the agent, and
   say it hosts sessions (its `[dispatch.sessions] enabled`). The node checks its own checkout again before it starts.
-- Only the human starts, messages, reads and closes a session (`/api/hosted-sessions`, `board session`). No MCP tool
-  and no agent route reaches this module, and the reply text is returned to the human alone: never to an agent, and
-  never to the node (which wrote it). The one exception is a child session's reply, which goes to its parent
-  session as untrusted data inside a turn the hub writes (hosted_results.py), with child sessions on.
+- Only the human starts, messages, reads and closes a session (`/api/hosted-sessions`, `board session`). No agent
+  route reaches this module, and the reply text is returned to the human alone: never to an agent, and never to the
+  node (which wrote it). The exceptions, with child sessions on: a child session's reply goes to its parent session
+  as untrusted data inside a turn the hub writes (hosted_results.py); and an agent session with the human's spawn
+  grant may start, message, see and stop child sessions of ITS OWN through the board tools (hosted_spawn.py, which
+  checks who is calling and calls `close_session` and the tree's functions here).
 - Only the assigned node reports on a session (`/api/nodes/sessions`). Reports are idempotent: a message moves
   queued -> delivered -> done | failed and never back, so a repeated or late event changes nothing.
 - The host never retries a lost turn. A turn that was lost (timeout, the process died, the node restarted or went
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -47,8 +50,9 @@ from .providers import SESSION_ID_RE, cap_reply, valid_provider_id, validate_mod
 
 SESSION_PREFIX = "host.session."   # <uuid>: the session record
 MSG_PREFIX = "host.msg."           # <uuid>.<n>: one message, n counting from 1 per session
-KINDS = ("user", "wake", "child")  # `user`: the human's (start, send); `wake`, `child`: the hub's own (hosted_wake.py,
-                                    # hosted_results.py)
+KINDS = ("user", "wake", "child", "task")  # `user`: the human's (start, send); `wake`, `child`: the hub's own
+                                    # (hosted_wake.py, hosted_results.py); `task`: from the agent session that started
+                                    # this one, in a frame the hub writes (hosted_spawn.py)
 MSG_STATES = ("queued", "delivered", "done", "failed")
 SETTLED = ("done", "failed")
 SESSION_STATES = ("starting", "idle", "running", "waiting", "ended")   # session_host.STATES, as the node reports them
@@ -248,8 +252,8 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
         raise Invalid(str(e)) from None
     agent, runtime = _agent(board, agent)
     node = _place(board, project, agent, runtime, allowed)
-    now = board.now()
     with db.write_tx(board.conn) as c:
+        now = board.now()       # read under the write lock
         _prune(c, now)
         for other in _sessions(c):
             if (other.get("agent") == agent and other.get("project") == project and other.get("state") != "ended"
@@ -266,8 +270,9 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
             # A root that may get children. Its access is its node's to say (derived from the runner there).
             r |= {"parent": None, "root": r["session_id"], "depth": 0, "access": None}
         m = _enqueue(c, r, "user", text, p.name, now)
-        from . import hosted_wake
+        from . import hosted_spawn, hosted_wake
         hosted_wake.begin(c, r["session_id"], now)      # woken for posts made from now on (PR 3)
+        hosted_spawn.human_messaged(c, r, now)     # the agent's count of child turns without the human starts over
     return {"session": _human_view(board, r), "message": _msg_view(m)}
 
 
@@ -275,11 +280,13 @@ def send(board: Board, p: Principal, session_id: Any, text: Any) -> dict:
     """Queue a message for the session: its next turn if it is idle, the turn after the ones ahead of it otherwise."""
     _human(board, p, "message a hosted session")
     text = _text(text)
-    now = board.now()
     _settle(board, _session(board.conn, session_id))
     with db.write_tx(board.conn) as c:
+        now = board.now()       # read under the write lock
         r = _session(c, session_id)
         m = _enqueue(c, r, "user", text, p.name, now)
+        from . import hosted_spawn
+        hosted_spawn.human_messaged(c, r, now)     # a tree's count of child turns without the human starts over
     return {"session": _human_view(board, r), "message": _msg_view(m)}
 
 
@@ -332,25 +339,104 @@ def close(board: Board, p: Principal, session_id: Any) -> dict:
     it and confirms; a node that is not connected cannot, so the session ends here and the node closes it when it
     is back (a node closes every session the hub no longer lists)."""
     _human(board, p, "close a hosted session")
-    now = board.now()
+    r = close_session(board, p.name, session_id)
+    return _human_view(board, r)
+
+
+def close_session(board: Board, by: str, session_id: Any, closed_by: str | None = None) -> dict:
+    """`close`, without the caller check: the human's route, and the agent-callable cancel for a child that agent
+    started (hosted_spawn.py, `closed_by="caller"`, which the child's record keeps for the audit)."""
+    who = "the session that started it" if closed_by == "caller" else "the human"
     with db.write_tx(board.conn) as c:
+        now = board.now()       # read under the write lock
         r = _session(c, session_id)
         if r["state"] != "ended":
             from . import hosted_tree
+            if closed_by is not None:
+                r["closed_by"] = closed_by
             if (now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS   # away, or no longer hosting sessions
                     or (hosted_tree.is_child(r) and not hosted_tree.node_supports(c, r["node"]))):   # ... or children
-                _end(c, r, "closed by the human (its node was not connected)", p.name, now,
+                _end(c, r, f"closed by {who} (its node was not connected)", by, now,
                      results=_results_on(board))
             elif not r.get("stop"):
                 r |= {"stop": "close", "updated_at": now}
-                hosted_tree.cascade(c, r, p.name, now)      # its children are closed with it, now
-            _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
-    return _human_view(board, r)
+                hosted_tree.cascade(c, r, by, now)      # its children are closed with it, now
+            _put(c, SESSION_PREFIX + r["session_id"], r, by, now)
+    from . import hosted_spawn
+    hosted_spawn.flush(board)
+    return r
 
 
 def _results_on(board: Board) -> bool:
     from . import hosted_results
     return hosted_results.enabled(board)
+
+
+SHUTDOWN_BOUND_MAX = 3600.0      # seconds: the most a node may say it takes to stop a process (node_sessions)
+
+
+def may_still_run(conn, r: dict, now: float) -> bool:
+    """May this ENDED session's process still be running on its node? Decided from current facts at every
+    evaluation, nothing stored for it. No, once there is proof that the node's SESSION loop has reconciled past the
+    end: the node ended it itself (its own `ended`), or the loop has applied a listing built after the end (`applied`
+    on its fetch: the session was absent from it, so the loop closed it; a node process that restarted does the same
+    with its first listings, after its startup recovery). A hello is liveness only: it proves nothing about the loop.
+    Otherwise, until the node's own shutdown bound has passed since it was last able to run work (`last_able`; the
+    bound is its self-stop time and kill grace with what its deadline watchdog may add, node_sessions.shutdown_bound,
+    which its session loop states with every fetch, before any work is listed to it; until it has, the cap): by then
+    it has stopped every turn of its own (limit e: unless its session loop held its lock for longer). A node from before the spawn protocol: no (as before).
+    Owner decision, review round 6: once the loop has reconciled, the slot is free, though the old process may still
+    be inside its kill grace (signalled, given no work, gone within that grace); the node itself starts nothing in
+    that checkout meanwhile (node_groups)."""
+    if r.get("state") != "ended" or r.get("ended_by") == "node" or r.get("node_ended_at") is not None:
+        return False
+    from . import hosted_tree
+    node = r.get("node") or ""
+    if not hosted_tree.node_spawns(conn, node):
+        return False
+    loop = _loop(conn, node)
+    if float(loop.get("applied_at") or 0) > float(r.get("ended_at") or 0):
+        return False
+    heard = last_able(conn, node)
+    bound = loop.get("bound")
+    bound = (min(float(bound), SHUTDOWN_BOUND_MAX) if isinstance(bound, (int, float)) and not isinstance(bound, bool)
+             else SHUTDOWN_BOUND_MAX)
+    return now < heard + bound
+
+
+LOOP_CONTACT_EVERY = 5.0     # seconds: how often the session loop's contact time is written (`note_contact`)
+
+
+def last_able(conn, node: str) -> float:
+    """When this node's session loop was last able to run work: its last successful call to the hub (`note_contact`,
+    recorded at most every LOOP_CONTACT_EVERY seconds, which is added here, so the time is never early), or its last
+    hello."""
+    contact = _loop(conn, node).get("contact")
+    contact = float(contact) + LOOP_CONTACT_EVERY if isinstance(contact, (int, float)) else 0.0
+    return max(_node_seen(conn, node), contact)
+
+
+def note_contact(board: Board, p: Principal) -> None:
+    """Called in ONE place, by the routes of the session loop's two calls (its listing fetch and its session report)
+    once the call has succeeded: whatever path the call took inside, an ended session, a duplicate stamp, an empty
+    report, this is a successful call to the hub, which resets the node's self-stop clock, so `last_able` counts from
+    it. A call refused (4xx) or not authenticated does neither."""
+    if p.is_human or p.runtime != nodes.NODE_RUNTIME:
+        return
+    now = board.now()
+    if now - float(_loop(board.conn, p.name).get("contact") or float("-inf")) < LOOP_CONTACT_EVERY:
+        return
+    with db.write_tx(board.conn) as c:
+        loop = _loop(c, p.name)
+        loop["contact"] = max(float(loop.get("contact") or 0), board.now())
+        _put(c, LOOP_PREFIX + p.name, loop, "hub", board.now())
+
+
+def holds_slot(conn, r: dict, now: float) -> bool:
+    """The session counts against the limits on live sessions (hosted_spawn: max_live_children; hosted_tree:
+    max_children) and occupies its checkout for the hub's decisions (hosted_wake.turn_sessions): it has not ended,
+    or it ended and `may_still_run`."""
+    return r.get("state") != "ended" or may_still_run(conn, r, now)
 
 
 def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) -> None:
@@ -370,6 +456,8 @@ def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) ->
     hosted_tree.cascade(c, r, by, now)      # however a parent ended, its children are closed
     from . import hosted_results
     hosted_results.ended(c, r, detail, now, record=results, cut=cut)
+    from . import hosted_spawn
+    hosted_spawn.ended(c, r, now)           # an agent-started child: one line for its tree's audit thread
 
 
 def _lost(conn, r: dict, now: float) -> bool:
@@ -433,7 +521,7 @@ def _settle(board: Board, r: dict) -> dict:
 # ---------------------------------------------------------------- the node's side
 
 
-def node_sessions(board: Board, p: Principal, tree: bool = False) -> dict:
+def node_sessions(board: Board, p: Principal, tree: bool = False, applied: Any = None, bound: Any = None) -> dict:
     """This node's sessions that have not ended, each with its unsettled messages (oldest first). Only the first
     queued message of a session carries its text: the node writes one at a time. `version` changes whenever
     anything the node acts on does, so the node's long-poll can wait on it.
@@ -442,31 +530,112 @@ def node_sessions(board: Board, p: Principal, tree: bool = False) -> dict:
     rolled back to an earlier version) would open a child as an ordinary session of its agent, in the shared
     checkout and with its runner's own permissions, whatever access and isolation the child was made with."""
     nodes._require_node(board, p)
-    from . import hosted_results, hosted_wake
+    from . import hosted_results, hosted_spawn, hosted_tree, hosted_wake
+    t0 = board.now()
+    _note_session_loop(board, p.name, applied, bound)      # before anything runnable is listed to it
+    if tree >= hosted_tree.SPAWN_PROTOCOL and hosted_tree.spawn_config(board).enabled:
+        hosted_spawn.ensure_secret(board)      # the listing gives each session its binding (read-only there)
+    hosted_spawn.flush(board)                  # audit lines and Needs-you items of agent-started child sessions
     # PR 3: queue the wakes that are due; a wake is validated in the transaction that shows it (hosted_wake.listing).
     # A child's results waiting for a free parent here become its next turn in that same transaction, after the
     # wakes were checked (hosted_results.deliver): so they are made and shown on what is stored then.
-    return hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree),
-                               due=lambda conn: hosted_results.due(board, conn, p.name),
-                               deliver=lambda c, now: hosted_results.deliver(board, c, p.name, now))
+    # An agent's task for a child is shown with its text only once it is reserved here too (`_reserve_tasks`, in the
+    # same write transaction): from then on the dispatcher counts its checkout busy (hosted_wake.turn_projects).
+    out = hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree),
+                              due=lambda conn: (hosted_results.due(board, conn, p.name)
+                                                or _tasks_due(board, conn, p.name)),
+                              deliver=lambda c, now: (hosted_results.deliver(board, c, p.name, now),
+                                                      _reserve_tasks(board, c, p.name, now)))
+    if tree >= hosted_tree.SPAWN_PROTOCOL:      # (only a node of the protocol says what it applied)
+        _note_listing(board, p.name, out.get("version"), t0)
+    return out
+
+
+LOOP_PREFIX = "host.node_loop."      # <node>: what the hub knows of a node's SESSION loop (not of its hellos)
+LOOP_VERSIONS = 32
+
+
+def _loop(conn, node: str) -> dict:
+    v = _get(conn, LOOP_PREFIX + node)
+    return v if isinstance(v, dict) else {}
+
+
+def _note_listing(board: Board, node: str, version: Any, at: float) -> None:
+    """A listing was built for this node's session loop at (or after) `at`: kept by version, so that when the loop
+    says it applied that version (`applied`), the hub knows the loop has reconciled everything that happened before
+    `at` (a session ended by then is absent from it, and the loop closed it)."""
+    if not isinstance(version, str):
+        return
+    known = _loop(board.conn, node).get("versions", {}).get(version)
+    if isinstance(known, (int, float)) and not _waiting_since(board.conn, node, known):
+        return      # (the same listing again, and no end of this node's waits on a newer one: nothing to write)
+    with db.write_tx(board.conn) as c:
+        loop = _loop(c, node)
+        versions = loop.get("versions") if isinstance(loop.get("versions"), dict) else {}
+        versions[version] = max(at, float(versions.get(version) or 0))      # the latest time it was built
+        loop["versions"] = dict(sorted(versions.items(), key=lambda kv: kv[1])[-LOOP_VERSIONS:])
+        _put(c, LOOP_PREFIX + node, loop, "hub", board.now())
+
+
+def _waiting_since(conn, node: str, at: float) -> bool:
+    """A session of this node ended after `at` and waits for proof that the session loop has reconciled past it."""
+    return any(r.get("node") == node and r.get("state") == "ended" and r.get("ended_by") != "node"
+               and float(r.get("ended_at") or 0) >= at for r in _sessions(conn))
+
+
+def _note_session_loop(board: Board, node: str, applied: Any, bound: Any) -> None:
+    """What the node's session loop says with its fetch: the listing version it last applied (so `applied_at`, when
+    that listing was built) and its shutdown bound. Written only when it changes."""
+    if bound is not None and (isinstance(bound, bool) or not isinstance(bound, (int, float))
+                              or not 0 <= bound <= SHUTDOWN_BOUND_MAX):
+        raise Invalid(f"bound must be a number of seconds, at most {SHUTDOWN_BOUND_MAX:g}")
+    if applied is not None and (not isinstance(applied, str) or not _SEEN.fullmatch(applied)):
+        raise Invalid("applied must be a version this route returned")
+    loop = _loop(board.conn, node)
+    at = (loop.get("versions") or {}).get(applied) if applied is not None else None
+    new_at = isinstance(at, (int, float)) and at > float(loop.get("applied_at") or 0)
+    new_bound = bound is not None and float(bound) != loop.get("bound")
+    if not (new_at or new_bound):
+        return
+    with db.write_tx(board.conn) as c:
+        loop = _loop(c, node)
+        if new_at:
+            loop["applied_at"] = max(float(loop.get("applied_at") or 0), float(at))
+        if new_bound:
+            loop["bound"] = float(bound)
+        _put(c, LOOP_PREFIX + node, loop, "hub", board.now())
 
 
 def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     """node_sessions' answer, read inside the transaction hosted_wake.listing opened."""
     nodes._require_node(board, p)       # again, in that transaction: a pause may have landed since the first check
-    from . import hosted_tree
+    from . import hosted_spawn, hosted_tree
     spawn = hosted_tree.spawn_config(board).enabled
+    # A node that speaks the spawn protocol (`tree` 2): each session's binding, a child of an interactive session,
+    # and the messages whose turn their starter cancelled. Nothing of it for an earlier node, or with spawn off.
+    spawns = spawn and int(tree) >= hosted_tree.SPAWN_PROTOCOL
     out, mark = [], []
     for r in sorted(_sessions(board.conn), key=lambda r: r["session_id"]):
-        if r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree):
+        if (r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree)
+                or (hosted_tree.interactive(r) and not spawns)):
             continue
         msgs, first = [], True
         for m in _messages(board.conn, r["session_id"]):
             if m.get("state") in SETTLED:
                 continue
             item = {"n": m["n"], "kind": m.get("kind"), "state": m.get("state")}
-            if m.get("state") == "queued" and first:
-                item["text"], first = m.get("text"), False
+            if spawns and m.get("cancel") is not None:
+                item["cancel"] = True       # its starter cancelled it: the node stops it, or never hands it over
+            elif m.get("state") == "queued" and first:
+                first = False
+                if m.get("kind") == "task" and m.get("shown_at") is None:
+                    # An agent's message to its child is an automatic turn, like a wake or a result turn: it is shown
+                    # without its text (so the node does not hand it over) until it is reserved (`_reserve_tasks`),
+                    # which waits while a dispatched run uses the checkout the child works in. The human's own never
+                    # waits.
+                    item["held"] = "checkout" if _checkout_busy(board, r) else "reserving"
+                else:
+                    item["text"] = m.get("text")
             msgs.append(item)
         out.append({k: r.get(k) for k in ("session_id", "agent", "runtime", "project", "model", "stop")}
                    | {"resume": r.get("resume") is True, "messages": msgs,
@@ -475,13 +644,89 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
                       "status_seq": int(r.get("status_seq") or 0)}
                    # A child's parent, access word, isolation and effort; `access: None` on a root when child
                    # sessions are on. Nothing otherwise: the entry is then what it was before there were trees.
-                   | hosted_tree.node_extra(r, spawn and tree))
-        mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] for m in msgs]])
+                   | hosted_tree.node_extra(r, bool(spawn and tree), hosted_spawn.bind_key(board.conn, r["session_id"])
+                                            if spawns and hosted_spawn.gives_binding(board.conn, r, board.now())
+                                            else None))
+        mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] + (["cancel"] if m.get("cancel") else [])
+                                                      + ([m["held"]] if m.get("held") else []) for m in msgs],
+                     "bind" in out[-1]])        # a binding given or withdrawn is news for the node's long-poll
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
     # What this hub takes in a node's reports beyond what every hub took: a node sends such a field only to a hub
     # that names it here, so a newer node's reports reach an older hub exactly as before (its strict model refuses an
     # unknown field, and the report would be lost).
     return {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
+
+
+def _checkout_busy(board: Board, r: dict) -> bool:
+    """A dispatched run may still be using the checkout this session's turns run in: one run per checkout, both
+    ways round. The identity is the node's: a run on a node is recorded with the project path as its directory
+    (dispatch._run_dir_for), so it holds this session when it is on the same node and for the same project; a run on
+    the hub holds it when its directory is the one the hub's settings give the project (as for a wake, and on the
+    safe side when the session's node is another machine). A child with a worktree of its own runs elsewhere and is
+    never held. Unreadable records hold it (safe side)."""
+    if r.get("isolation") == "worktree":
+        return False
+    from . import dispatch, hosted_wake
+    try:
+        hub_dir = os.path.realpath(hosted_wake._run_dir(board, r["project"]))
+        # The runs on record, and the launches the dispatcher reserved whose run is not on record yet (its claims,
+        # made in its launch transaction): one identity for both.
+        claims = dispatch.checkout_claims(board.conn, board.now())
+        if any(d.get("unreadable") for d in claims):
+            return True
+        for d in dispatch._active_records(board) + claims:
+            cwd = d.get("cwd")
+            if not isinstance(cwd, str) or not cwd:
+                continue
+            if d.get("node"):
+                if d["node"] == r.get("node") and os.path.normpath(cwd) == os.path.normpath(r["project"]):
+                    return True
+            elif os.path.realpath(cwd) == hub_dir:
+                return True
+        return False
+    except Exception:
+        return True
+
+
+def _next_task(conn, r: dict) -> dict | None:
+    """The session's next message to hand over, when it is an agent's task not reserved yet."""
+    for m in _messages(conn, r["session_id"]):
+        if m.get("state") == "queued" and m.get("cancel") is None:
+            return m if m.get("kind") == "task" and m.get("shown_at") is None else None
+    return None
+
+
+def _tasks_due(board: Board, conn, node: str) -> bool:
+    """Read only: a session on this node has an agent's task to reserve now (its checkout is free)."""
+    try:
+        return any(r.get("node") == node and r.get("state") != "ended" and int(r.get("queued") or 0)
+                   and _next_task(conn, r) is not None and not _checkout_busy(board, r) for r in _sessions(conn))
+    except Exception:
+        return False
+
+
+def _reserve_tasks(board: Board, c, node: str, now: float) -> None:
+    """Inside the write transaction that shows this node its sessions: each agent's task that is next for its session
+    and whose checkout no dispatched run uses is reserved (`shown_at`), so it is shown with its text in this same
+    transaction, and the dispatcher counts its checkout busy from now on (hosted_wake.turn_projects)."""
+    for r in _sessions(c):
+        if r.get("node") != node or r.get("state") == "ended" or not int(r.get("queued") or 0):
+            continue
+        m = _next_task(c, r)
+        if m is not None and not _checkout_busy(board, r):
+            m |= {"shown_at": now, "updated_at": now}
+            _put(c, _msg_key(r["session_id"], m["n"]), m, "hub", now)
+
+
+def shown_task(conn, r: dict) -> bool:
+    """An agent's task for this session was reserved and shown to its node, and the node has not reported on it yet
+    (its turn in flight, or its end): its checkout is taken all the same (hosted_wake.turn_projects). Also once its
+    starter cancelled it: the node may have it already, and the reservation holds until the node says it ended (its
+    `turn_ended`, which settles it) or the node is lost (turn_projects)."""
+    if not int(r.get("queued") or 0):
+        return False
+    return any(m.get("state") == "queued" and m.get("kind") == "task" and m.get("shown_at") is not None
+               for m in _messages(conn, r["session_id"]))
 
 
 def _events(events: Any) -> list[dict]:
@@ -530,6 +775,7 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
         return      # only once the session has ended (`report`)
     if kind == "ended":
         _end(c, r, ev["detail"] or "the node ended the session", by, now, results=results)
+        r["ended_by"] = "node"      # its session loop ended it itself: nothing of it is left for the hub to wait for
         return
     if kind == "approval_requested":
         r["denials"] = ev["denials"]
@@ -629,8 +875,8 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         if path is not None and (not isinstance(path, str) or not path.startswith("/") or len(path) > 1024
                                  or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)):
             raise Invalid(f"{what} must be an absolute path")
-    now = board.now()
     with db.write_tx(board.conn) as c:
+        now = board.now()       # read under the write lock
         r = _get(c, SESSION_PREFIX + _sid(session_id))
         if not isinstance(r, dict) or r.get("node") != p.name:
             raise NotFound(f"session {session_id} is not hosted on this node")
@@ -639,8 +885,14 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         if r["state"] == "ended":
             # Idempotent: nothing is reported into an ended session. But its node removes a child's own worktree
             # only once the process is gone, which is after the session ended here: that one fact is still taken.
+            # And the node's own end of a session the hub had already ended: its session loop has reconciled past
+            # the end (hosted.may_still_run), recorded once; no end is repeated (no result, cascade or audit).
+            ended_here = any(ev["kind"] == "ended" for ev in events) and r.get("node_ended_at") is None
             if removed:
                 r["worktree_removed_at"] = now
+            if ended_here:
+                r["node_ended_at"] = now
+            if removed or ended_here:
                 _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
             return _node_view(r)
         results = _results_on(board)
@@ -666,6 +918,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
             hosted_tree.reported(r, access, worktree, ceiling, checkout)
         r |= {"updated_at": now, "node_reported_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
+    if r["state"] == "ended":
+        from . import hosted_spawn
+        hosted_spawn.flush(board)       # an agent-started child that ended: its audit line, and a limit that lifted
     return _node_view(r)
 
 
@@ -707,13 +962,13 @@ async def _poll(fetch: Callable[[], dict], done: Callable[[dict], bool], seconds
 
 
 async def node_sessions_wait(board: Board, p: Principal, wait: Any = 0, seen: Any = None, gone=None,
-                             tree: bool = False) -> dict:
+                             tree: bool = False, applied: Any = None, bound: Any = None) -> dict:
     """node_sessions, held back for up to `wait` seconds while its version is still the one the node has `seen`."""
     seconds = _wait_seconds(wait, NODE_WAIT_MAX)
     if seen is not None and (not isinstance(seen, str) or not _SEEN.fullmatch(seen)):
         raise Invalid("seen must be a version this route returned")
-    return await _poll(lambda: node_sessions(board, p, tree), lambda out: seen is None or out["version"] != seen,
-                       seconds, gone)
+    return await _poll(lambda: node_sessions(board, p, tree, applied, bound),
+                       lambda out: seen is None or out["version"] != seen, seconds, gone)
 
 
 async def message_wait(board: Board, p: Principal, session_id: Any, n: Any, wait: Any = 0, gone=None) -> dict:

@@ -47,7 +47,9 @@ from starlette.routing import Route
 
 DEFAULT_PORT = 8790
 HEADERS = {"accept", "content-type", "authorization", "mcp-session-id", "mcp-protocol-version", "last-event-id",
-           "x-board-session"}
+           "x-board-session",
+           # what a board server process says about itself to the spawn tools (hosted_spawn.HEADERS)
+           "x-board-hosted-session", "x-board-hosted-key", "x-board-client-sid"}
 RESPONSE_HEADERS = {"content-type", "mcp-session-id", "mcp-protocol-version"}
 _ID = r"[1-9][0-9]*"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"

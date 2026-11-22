@@ -35,7 +35,9 @@ then queues one `wake` message, the only message kind that does not come from th
   session. After the grace without that it launches exactly as it does without hosted sessions, and the request is
   then the dispatcher's for good: no wake is queued or handed for it, and no hosted session holds it again.
 - *Roots only.* A child session (hosted_tree.py) has no watcher record and is never woken, and nothing a child reads
-  on the board counts as its root having read it (`_shadowed`).
+  on the board counts as its root having read it: a board session registered with a hosted session's binding
+  (hosted_spawn.board_binding) counts for that session alone (`_credited`, the `mine` mark), and one with no binding
+  is held to the old rule (`_shadowed`: not while a child of the agent is around).
 - *After results.* While results of its child sessions wait for a session (hosted_results.py), no wake is queued
   for it, and one queued before they came steps back behind them when the node would be shown it (`_recheck`).
 """
@@ -109,12 +111,17 @@ def _new(mark: int, post: int | None = None) -> dict:
     session (the last day)."""
     return {"mark": mark, "post": post, "sealed": [], "pending": {}, "sent": [], "threads": {}, "woken": {},
             "handed": {}, "read": {}, "claimed": {}, "closing": [], "grace": 120.0, "hour_ack": None, "items": []}
+# `mine`: post id -> when the board showed that post to a board session BOUND to this session (hosted_spawn: it was
+# registered from this session's own process). Kept only when there is one; a read mark that no child can have made.
+COVERAGE = ("woken", "handed", "read", "mine")
 
 
 def _clean(rec: Any) -> dict | None:
     if not isinstance(rec, dict) or type(rec.get("mark")) is not int:
         return None
     out = _new(rec["mark"], rec["post"] if type(rec.get("post")) is int else None)
+    if isinstance(rec.get("mine"), dict):
+        out["mine"] = rec["mine"]
     for key, kind in (("pending", dict), ("threads", dict), ("woken", dict), ("handed", dict), ("read", dict),
                       ("claimed", dict), ("sent", list), ("closing", list), ("sealed", list), ("items", list)):
         if isinstance(rec.get(key), kind):
@@ -156,6 +163,8 @@ def _save(c, session_id: str, rec: dict, now: float) -> None:
     rec["woken"] = _recent(rec["woken"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["handed"] = _recent(rec["handed"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["read"] = _recent(rec["read"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
+    if "mine" in rec:
+        rec["mine"] = _recent(rec["mine"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     rec["claimed"] = _recent(rec["claimed"], now, KEEP_WOKEN_SECONDS, MAX_WOKEN)
     if len(rec["pending"]) > MAX_PENDING:
         rec["pending"] = dict(sorted(rec["pending"].items(), key=lambda kv: kv[1][3])[-MAX_PENDING:])
@@ -219,17 +228,27 @@ def _entry(row) -> list:
     return [row["thread_id"], row["agent"], bool(row["needs_response"]), row["seq"]]
 
 
-def _qualifying(board: Board, p: Principal, project: str, ids: list[int], rec: dict) -> dict[str, list]:
+def _qualifying(board: Board, p: Principal, project: str, ids: list[int], rec: dict,
+                root: str | None = None) -> dict[str, list]:
     """Of these posts, the ones a wake may still be for: eligible as when they were found (channel.eligible), not a
     managed continuation's, not read yet (no session of the agent has acknowledged past them), and not reserved by
-    the dispatcher for a run of its own (`reserve`)."""
+    the dispatcher for a run of its own (`reserve`). A board session BOUND to another hosted session (a child's, or
+    another root's: hosted_spawn.board_binding) acknowledges for that session only, never for `root`."""
+    from . import hosted_spawn
     out, acked = {}, {}
+    # Whose read each cursor stands for, as it was when the read was made (hosted_spawn.cursor_provenance: a snapshot,
+    # for what a board session inherited or had read before a resume changed it), and whether that read counts for
+    # `root` (hosted_spawn.counts_for: not a board session bound to another hosted session; for a hosted root, not
+    # another conversation's).
+    r = _get(board.conn, hosted.SESSION_PREFIX + root) if isinstance(root, str) else None
     for row in channel.eligible(board, p, ids=ids, project=project) if ids else []:
         tid = row["thread_id"]
         if tid not in acked:
-            acked[tid] = board.conn.execute(
-                "SELECT COALESCE(MAX(last_seq), 0) FROM cursors WHERE agent = ? AND thread_id = ?",
-                (p.name, tid)).fetchone()[0]
+            acked[tid] = max([c["last_seq"] for c in board.conn.execute(
+                "SELECT session_id, last_seq FROM cursors WHERE agent = ? AND thread_id = ?", (p.name, tid))
+                if hosted_spawn.counts_for(hosted_spawn.cursor_provenance(board.conn, c["session_id"], tid,
+                                                                          c["last_seq"]), root, r)],
+                             default=0)
         if (row["seq"] > acked[tid] and str(row["id"]) not in rec["claimed"]
                 and not _managed(board.conn, row["id"])):
             out[str(row["id"])] = _entry(row)
@@ -425,7 +444,7 @@ def _advance(board: Board, session_id: str, cfg, now: float) -> dict | None:
                 and _waiting(rec, cfg, now) and not _occupied(board, r)
                 and not hosted_results.waiting(board, c, session_id)):     # a child's results go before a wake
             # Checked again now, not only when found: the batch may have waited (a turn, the interval, a pause).
-            rec["pending"] = _qualifying(board, p, r["project"], [int(k) for k in rec["pending"]], rec)
+            rec["pending"] = _qualifying(board, p, r["project"], [int(k) for k in rec["pending"]], rec, session_id)
             batch = {k: e for k, e in rec["pending"].items() if not _stopped(rec, e[0])}
             for tid in sorted({e[0] for e in batch.values()}):
                 t = _thread(c, rec, tid)
@@ -558,8 +577,8 @@ def _set_aside(c, session_id: str, m: dict, now: float) -> None:
         return
     ids = [i for i in m.get("posts") or [] if type(i) is int]
     for k in (str(i) for i in ids):
-        for table in ("woken", "handed", "read"):
-            rec[table].pop(k, None)
+        for table in COVERAGE:
+            rec.get(table, {}).pop(k, None)
     for row in c.execute("""SELECT id, thread_id, agent, needs_response, seq FROM posts
                             WHERE id IN (SELECT value FROM json_each(?))""", (json.dumps(ids),)):
         if str(row["id"]) not in rec["claimed"]:
@@ -612,7 +631,7 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
         return      # nothing to check, or already the node's (never settled as not sent once it was shown)
     rec = _load(c, session_id) or _new(*_tops(c))
     p = _agent(c, r["agent"])
-    keep = _qualifying(board, p, r["project"], m["posts"], rec) if p is not None else {}
+    keep = _qualifying(board, p, r["project"], m["posts"], rec, session_id) if p is not None else {}
     behind = bool(keep) and not human_waiting and hosted_results.waiting(board, c, session_id)
     occupied = bool(keep) and not human_waiting and not behind and _occupied(board, r)
     defer = bool(keep) and (human_waiting or behind or occupied)
@@ -621,8 +640,8 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
             # No wake reached anyone for it (dropped, or stepping back behind the human's message): its coverage
             # goes, whether or not an entry is still there, so the dispatcher is not held back by a wake that was
             # never delivered. Of a wake that steps back, only the posts that still qualify wait for the next one.
-            for table in ("woken", "handed", "read"):
-                rec[table].pop(k, None)
+            for table in COVERAGE:
+                rec.get(table, {}).pop(k, None)
             if k in keep:
                 rec["pending"][k] = keep[k]
         elif m.get("handed_at") is None:
@@ -678,19 +697,46 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
         handed_at = rec["handed"].get(str(post_id))
         if now - max(at, handed_at if isinstance(handed_at, (int, float)) else at) < rec["grace"]:
             return True
+        mine = rec.get("mine", {}).get(str(post_id))
+        if isinstance(mine, (int, float)) and mine >= at:
+            return True     # shown to this session's OWN board session (bound to it): no child can have made it
         read = rec["read"].get(str(post_id))
-        if _shadowed(conn, r, at):
-            # Neither a read mark nor a receipt can be told to be the root's own, whenever it was made: a child of
-            # the agent in the project that has been around since the wake may be its reader, or may be the one
-            # that goes on to work from it. After the grace such a root holds nothing.
-            continue
-        if isinstance(read, (int, float)) and read >= at:
+        if isinstance(read, (int, float)) and read >= at and not _shadowed(conn, r, at):
+            # A read by a board session that carries no binding cannot be told apart from a child's of the same
+            # agent: while such a child has been around since the wake, it is not taken for the root's.
             return True
         from . import delivery
-        if delivery.read_since(conn, post_id, agent, at, lambda sid: _own_reader(conn, sid, agent, r["project"])):
+        if delivery.read_since(conn, post_id, agent, at, lambda sid: _credited(conn, sid, r, at)):
             return True
     from . import interactive_wake      # a session the human opened himself, woken the same way (its own records)
     return interactive_wake.holds(board_or_conn, agent, project, post_id, now)     # off for a bare connection
+
+
+def _credited(conn, session_id: Any, r: dict, since: float) -> bool:
+    """A read by this board session counts as the hosted root `r` having the post: it is the agent's, registered in
+    r's project and not a dispatched run's (`_own_reader`), and either BOUND to r (registered from r's own process,
+    hosted_spawn.board_binding) or, carrying no binding at all, not possibly a child's (`_shadowed`). One bound to
+    another hosted session (a child, of whichever root) never counts."""
+    if not _own_reader(conn, session_id, r.get("agent"), r.get("project")):
+        return False
+    from . import hosted_spawn
+    bound = hosted_spawn.board_binding(conn, session_id)
+    if bound is not None:
+        return bound == r["session_id"]
+    if hosted_spawn.provenance_changed(conn, session_id):
+        return False        # a resume gave it another conversation: what it was handed before is not the new one's
+    return not _other_conversation(conn, session_id, r) and not _shadowed(conn, r, since)
+
+
+def _other_conversation(conn, session_id: Any, r: dict) -> bool:
+    """An unbound board session that recorded a conversation of its own that is not this hosted session's
+    (conversations.py: a session the human opened himself, which interactive_wake.py may wake): what it reads is that
+    conversation's, never the hosted session's. A hosted Claude session's conversation id is its session id; a
+    provider that issues its own records it as `provider_id`."""
+    row = conn.execute("SELECT client_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone() \
+        if type(session_id) is int else None
+    cid = row["client_session_id"] if row is not None else None
+    return cid is not None and cid not in (r.get("session_id"), r.get("provider_id"))
 
 
 def _own_reader(conn, session_id: Any, agent: str, project: str) -> bool:
@@ -705,11 +751,12 @@ def _own_reader(conn, session_id: Any, agent: str, project: str) -> bool:
 
 def _shadowed(conn, r: dict, since: float) -> bool:
     """Some CHILD session of this root's agent in this root's project has been alive at or after `since` (to this
-    day), whichever root it was started under. Such a child signs in to the board with the same identity,
-    and nothing in a board session's row says which hosted session opened it: registered in the project (a shared
-    child runs there; a worktree child may name it too) it passes `_own_reader` exactly as the root's own board
-    session does. A Codex child under a Claude root is, to the board, the same reader as a separate Codex root in
-    that project. So while one was around, no read is taken for the root's: a child's read must never keep the
+    day), whichever root it was started under. Asked only of a board session that carries NO binding
+    (hosted_spawn.board_binding: with child sessions on, every hosted session's own board server registers bound
+    to it, so a child's read is the child's and a root's own read is the root's, `_credited`). Such an unbound
+    session signs in with the same identity as a child of the agent, and nothing in its row says which process
+    opened it: registered in the project it passes `_own_reader` exactly as the root's own board session does. So
+    while such a child was around, an unbound read is not taken for the root's: a child's read must never keep the
     dispatcher off a request the root did not read. A child for another agent, or in another project, has another
     identity or place and is never mistaken (`_own_reader` asks for the root's agent and project)."""
     return any(is_child(x) and x.get("agent") == r.get("agent") and x.get("project") == r.get("project")
@@ -717,11 +764,11 @@ def _shadowed(conn, r: dict, since: float) -> bool:
                for x in hosted._sessions(conn))
 
 
-def _unmarked(rec: dict, ids: list[int]) -> list[str]:
-    """Of these posts, the ones a wake covered that have no `read` mark at or after that wake."""
+def _unmarked(rec: dict, ids: list[int], table: str = "read") -> list[str]:
+    """Of these posts, the ones a wake covered that have no mark in `table` (`read`, or `mine`) at or after it."""
     out = []
     for k in (str(i) for i in ids):
-        woken, read = rec["woken"].get(k), rec["read"].get(k)
+        woken, read = rec["woken"].get(k), rec.get(table, {}).get(k)
         if isinstance(woken, (int, float)) and not (isinstance(read, (int, float)) and read >= woken):
             out.append(k)
     return out
@@ -742,18 +789,25 @@ def handed(board: Board, p: Principal, session_id: int, posts: list[dict]) -> No
         if not mine:
             return
         now = board.now()
+        from . import hosted_spawn
+        bound = hosted_spawn.board_binding(board.conn, session_id)
         for r in mine:
+            if bound is not None and bound != r["session_id"]:
+                continue        # another hosted session's own board session (a child's): never this root's read
+            table = "mine" if bound is not None else "read"
             rec = (_load(board.conn, r["session_id"])
-                   if _own_reader(board.conn, session_id, p.name, r.get("project")) else None)
-            if rec is None or not _unmarked(rec, ids):
+                   if _own_reader(board.conn, session_id, p.name, r.get("project"))
+                   and (bound is not None or not _other_conversation(board.conn, session_id, r)) else None)
+            if rec is None or not _unmarked(rec, ids, table):
                 continue        # nothing to note: no write (a re-read, or a post no wake covered)
             with db.write_tx(board.conn) as c:
                 rec = _load(c, r["session_id"])
-                todo = _unmarked(rec, ids) if rec else []
-                # Not while the reader may be a child session of the same agent (`_shadowed`): no mark is written.
-                todo = [k for k in todo if not _shadowed(c, r, rec["woken"][k])]
+                todo = _unmarked(rec, ids, table) if rec else []
+                if table == "read":
+                    # A reader with no binding may be a child session of the same agent (`_shadowed`): no mark.
+                    todo = [k for k in todo if not _shadowed(c, r, rec["woken"][k])]
                 for k in todo:
-                    rec["read"][k] = now
+                    rec.setdefault(table, {})[k] = now
                 if todo:
                     _save(c, r["session_id"], rec, now)
     except Exception:
@@ -780,8 +834,8 @@ def reserve(conn, agent: str, project: Any, post_id: Any, now: float) -> bool:
             continue
         rec = _load(conn, r["session_id"])
         if rec is not None:
-            for table in ("pending", "woken", "handed", "read"):    # no longer waiting here, no longer covered
-                rec[table].pop(str(post_id), None)
+            for table in ("pending", *COVERAGE):    # no longer waiting here, no longer covered
+                rec.get(table, {}).pop(str(post_id), None)
             rec["claimed"][str(post_id)] = now
             _save(conn, r["session_id"], rec, now)
     from . import interactive_wake
@@ -794,12 +848,28 @@ def turn_projects(board_or_conn: Any, now: float) -> set[str]:
     reach the session's process and has not seen its turn end, and the node is not lost (hosted._lost: silent for
     nodes.NODE_LOST_SECONDS, or no longer hosting sessions; the same test that fails such a turn on the human's
     next read). A child session in the shared checkout counts exactly like its parent (its project is the
-    parent's); a child in its own worktree runs in another directory and makes nothing busy."""
+    parent's); a child in its own worktree runs in another directory and makes nothing busy. A session that ended
+    on a node not heard from since keeps its checkout busy while it may still be running there (`turn_sessions`,
+    hosted.may_still_run). On a node that is heard from, the node itself keeps whatever is still being stopped out of
+    what it starts in that checkout (node_sessions, node.py); a hub-local run cannot be held that way (an owner
+    decision: at most that node's kill grace)."""
+    return {r["project"] for r in turn_sessions(board_or_conn, now)}
+
+
+def turn_sessions(board_or_conn: Any, now: float) -> list[dict]:
+    """The sessions `turn_projects` counts: each with its node and project, for a caller that holds them to the
+    node-and-checkout identity (Dispatcher._launch_check, for a run that goes to a node)."""
     conn = getattr(board_or_conn, "conn", board_or_conn)
-    return {r["project"] for r in hosted._sessions(conn)
-            if r.get("state") != "ended" and r.get("in_flight") is not None and isinstance(r.get("project"), str)
-            and not (is_child(r) and r.get("isolation") == "worktree")
-            and not hosted._lost(conn, r, now)}
+    return [r for r in hosted._sessions(conn)
+            if isinstance(r.get("project"), str) and not (is_child(r) and r.get("isolation") == "worktree")
+            and ((r.get("state") != "ended"
+                  and (r.get("in_flight") is not None
+                       or (hosted.shown_task(conn, r)     # an agent's task, reserved
+                           and now - hosted._node_seen(conn, r["node"]) <= nodes.NODE_LOST_SECONDS))
+                  and not hosted._lost(conn, r, now))
+                 # A session that ended on a node not heard from since, which may still be running it
+                 # (hosted.may_still_run): it occupies its checkout for the hub's decisions until then.
+                 or hosted.may_still_run(conn, r, now))]
 
 
 # ---------------------------------------------------------------- telling the human

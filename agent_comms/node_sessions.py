@@ -25,8 +25,10 @@ Rules the hub relies on:
   after one refused start (session_host._correct_start_mode).
 - A hub call failed (unreachable, paused, an error): turns already running go on, but nothing new is handed over
   until a fetch has succeeded again, because the queue and the stop flags this node holds may be out of date.
-  No hub for `self_stop_seconds` (node.SELF_STOP_SECONDS): turns in flight are stopped and reported failed once the
-  hub answers; idle processes stay.
+  No hub for `self_stop_seconds` (node.SELF_STOP_SECONDS): turns in flight are stopped then, by the deadline
+  watchdog whatever hub call the loop is waiting on (`enforce_deadlines`), and reported failed once the hub
+  answers; idle processes stay. From then on nothing starts and no new turn is written, for any session, until a
+  listing fetched since contact came back has been applied (`_may_start`): what waits in an inbox stays there.
 - A session the hub no longer lists is closed here. Shutdown stops every process (`stop_all`); the sessions go on
   at the next start. From the moment shutdown begins, shutdown alone reports: the loop posts nothing more.
 - `[dispatch.sessions]`: `idle_hours` (a process idle that long is stopped; its session stays and the next message
@@ -74,9 +76,35 @@ from .session_host import HostEvent, SessionHost
 log = logging.getLogger("agent_comms.node_sessions")
 
 TICK_SECONDS = 0.2          # between passes while any session has work
+SHUTDOWN_BOUND_MAX = 3600.0     # hosted.SHUTDOWN_BOUND_MAX (named here, so the node does not import the hub's module)
 SYNC_SECONDS = 1.0          # between fetches of the hub's list while any session has work
 LONG_POLL_SECONDS = 20      # how long one fetch may wait at the hub when nothing has work
 RETRY_SECONDS = 2.0         # after a hub call failed, with nothing else to do
+WATCH_SECONDS = 0.5         # how often the deadline watchdog looks (`_watch`): the self-stop and the kills after it
+LOCK_SLACK_SECONDS = 2.0    # the most the watchdog waits for the loop's lock (the loop holds it only for local work)
+
+
+def shutdown_bound(self_stop_seconds: float, kill_grace: float, watch_seconds: float | None = None) -> float:
+    """How long after its session loop's last successful hub call this node may still be stopping a turn's process:
+    the bound the loop states to the hub (`_sync`, hosted.may_still_run), derived here from what it depends on.
+
+    Let S be when that call was SENT (`_call` takes the send time: the hub recorded the contact at or after it,
+    hosted.note_contact, so the hub counts from S or later). No hub call, however long it blocks, delays either
+    deadline: the watchdog (`_watch`), off the hub-I/O path, looks every `watch_seconds` and may wait up to
+    LOCK_SLACK_SECONDS for the loop's lock:
+      SIGTERM to every turn's process group   <= S + self_stop + (watch + slack)
+      SIGKILL to what is left of each group   <= SIGTERM + kill_grace + (watch + slack)
+    and a SIGKILLed group is gone (a member that outlives SIGKILL is limit c). So the bound is
+      self_stop + kill_grace + 2 * (watch + slack)
+    (with the shipped values 90 + 10 + 2 * 2.5 = 105 s). The constants are read when it is called: raising one
+    raises the bound.
+
+    It assumes the loop's lock is free within LOCK_SLACK_SECONDS. The loop also holds it for local git worktree
+    work (a child's own worktree made or removed), bounded only by each git command's own timeout: if that runs
+    longer while the hub hears nothing from this node, the watchdog is late by as much (limit e, DESIGN_NOTES; it
+    says so in the log, `enforce_deadlines`)."""
+    watch = WATCH_SECONDS if watch_seconds is None else watch_seconds
+    return float(self_stop_seconds + kill_grace + 2 * (watch + LOCK_SLACK_SECONDS))
 JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a loop waiting at the hub is not waited for
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
 MAX_BATCH = 100             # events in one report
@@ -97,18 +125,29 @@ NO_ROOM_FOR_FULL = ("this node runs at most {n} session process at a time ([disp
 ABOVE_PARENT = ("its access ({have}) is above what its parent session has on this node now ({limit}): a child session "
                 "never has more access than its parent")
 LOST = "the node restarted while this turn was in flight; it was not replayed"
+CANCELLED = "cancelled by the session that started it"      # hosted_results.CANCELLED: the hub's outcome reads it
 FRESH_START = (". Before that the agent refused to resume this session's conversation: the next message starts a NEW "
                "one, without the earlier turns")
+
+
+def _bind_of(view: dict) -> str | None:
+    """The binding key the hub gave a session (hosted_spawn.bind_key: 64 hex), or None."""
+    bind = view.get("bind")
+    return bind if isinstance(bind, str) and len(bind) == 64 and all(ch in "0123456789abcdef" for ch in bind) \
+        else None
 
 
 class SessionRunner:
     def __init__(self, client: httpx.Client, config: DispatchConfig, log_dir: Path, *, host: SessionHost | None = None,
                  clock: Callable[[], float] = time.monotonic, self_stop_seconds: float = 90.0,
-                 long_poll: float = LONG_POLL_SECONDS, sync_seconds: float = SYNC_SECONDS, **host_kw):
+                 long_poll: float = LONG_POLL_SECONDS, sync_seconds: float = SYNC_SECONDS,
+                 watch_seconds: float | None = None, **host_kw):
         self.client, self.log_dir, self.clock = client, Path(log_dir), clock
         self.config = config
         self.host = host or SessionHost(config, self.log_dir, clock=clock, **host_kw)
         self.host.turn_gate = self._turn_allowed      # a child's turn is held to its parent when it is WRITTEN, too
+        self.host.admit = lambda s: self._admit(s, starting=True)    # every process start takes a slot here
+        self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
@@ -116,6 +155,14 @@ class SessionRunner:
         self.swept = float("-inf")
         self.max_live, self.idle_seconds = config.sessions.max_live, config.sessions.idle_hours * 3600
         self.self_stop_seconds, self.long_poll, self.sync_seconds = self_stop_seconds, long_poll, sync_seconds
+        self.watch_seconds = WATCH_SECONDS if watch_seconds is None else watch_seconds
+        self.shutdown_bound = shutdown_bound(self_stop_seconds, self.host.kill_grace, self.watch_seconds)
+        if self.shutdown_bound > SHUTDOWN_BOUND_MAX:
+            # The hub keeps a slot for at most that long while it does not hear from this node (hosted.may_still_run):
+            # a longer stop would outlast it. Refused at start-up rather than capped quietly.
+            raise ValueError(f"[dispatch] kill_grace_seconds is too large for hosted sessions: this node could take "
+                             f"{self.shutdown_bound:g} s to stop a session's process after the hub last heard from it, "
+                             f"and the hub waits at most {SHUTDOWN_BOUND_MAX:g} s")
         self.pending: list[tuple[str, dict]] = []     # (session id, event) not yet taken by the hub, oldest first
         self.queue: dict[str, list[dict]] = {}        # session id -> the hub's queued messages not yet handed over
         self.handed: dict[str, int] = self._load_handed()
@@ -131,8 +178,16 @@ class SessionRunner:
         self.last_sync = float("-inf")
         self.retry_at = float("-inf")
         self.fresh = False                            # the last hub call was a fetch that succeeded: `queue` is current
-        self.last_contact = clock()
-        self.lock = threading.Lock()                  # the host, between the loop and shutdown()
+        # The last contact (`last_contact`, read-only; renewed only by `_renew_contact`). At start-up it is the start:
+        # nothing can start before the first listing anyway (a session is opened, and its inbox filled, only from a
+        # listing the loop applied; `recover()` only stops what an earlier process left and reads its records).
+        self._last_contact = clock()
+        self.lock = threading.Lock()                  # the host, between the loop, the watchdog and shutdown()
+        self.watched: list[HostEvent] = []            # what the watchdog's self-stop reported, for the loop to post
+        # When the node was last seen past its self-stop deadline, or None: from then on nothing starts until a
+        # listing from a fetch SENT after that moment has been applied (`_may_start`, `pass_once`).
+        self.latched_at: float | None = None
+        self.latch_lock = threading.Lock()            # the latch, between the loop's calls, the loop and the watchdog
         self.report_lock = threading.Lock()           # the report queue: one flush at a time, shutdown's last
         self.seq = self._load_seq()                   # the last report's stamp (`_stamp`), an earlier process's included
         self.seq_unsaved = False                      # the last attempt to put it on disk failed (said once)
@@ -140,6 +195,7 @@ class SessionRunner:
         self.sent: dict[str, int] = {}                # session id -> stamp of this process's last status the hub took
         self.stopping = threading.Event()
         self.thread: threading.Thread | None = None
+        self.watch_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------ local state (survives a node restart)
 
@@ -203,9 +259,18 @@ class SessionRunner:
     # ------------------------------------------------------------ hub calls
 
     def _call(self, method: str, path: str, **kw) -> Any:
-        r = self.client.request(method, path, **kw)
-        r.raise_for_status()
-        self.last_contact = self.clock()
+        # The contact counts from when the call was SENT: the hub records it at or after that (hosted.note_contact),
+        # so the node's self-stop clock never runs behind the hub's (`shutdown_bound`).
+        sent = self.clock()
+        try:
+            r = self.client.request(method, path, **kw)
+            r.raise_for_status()
+        except Exception:
+            # Whatever answers next may be another hub (one rolled back to an earlier version): until a fetch says
+            # again which report fields it takes, none beyond the first ones are sent (`_for_hub`).
+            self.hub_features = set()
+            raise
+        self._renew_contact(sent)
         return r.json()
 
     def _add(self, session_id: str, event: dict) -> None:
@@ -236,6 +301,8 @@ class SessionRunner:
         return {k: v for k, v in event.items() if k not in drop} if drop else event
 
     def _emit(self, events: list[HostEvent]) -> None:
+        if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
+            events, self.watched = self.watched + list(events), []
         for e in events:
             if e.kind == "ended":
                 self.ending.add(e.session_id)
@@ -325,7 +392,13 @@ class SessionRunner:
         return True
 
     def _sync(self, wait: float) -> dict:
-        params: dict[str, Any] = {"wait": wait, "tree": 1}     # this node speaks the child-session protocol
+        params: dict[str, Any] = {"wait": wait, "tree": 2,     # it speaks the child-session protocol, spawn included
+                                  # how long it may take to stop a session's process after the hub last heard from it
+                                  # (`shutdown_bound`), stated before any work is listed to it; and the listing it last
+                                  # applied (hosted.may_still_run)
+                                  "bound": self.shutdown_bound}
+        if self.version:
+            params["applied"] = self.version
         if wait and self.version:
             params["seen"] = self.version
         if not wait:
@@ -338,12 +411,23 @@ class SessionRunner:
         """Something needs the short cadence: a turn, a message to hand over, a process going down, a report. Not
         a message that only waits for its session's parent (a full child whose parent has no live process that
         confirmed full access): that can last hours, nothing here can end the wait, and the parent's own next turn
-        is work enough to bring the short cadence back for it."""
-        return bool(self.pending or any(q and not self._waits_on_parent(sid) for sid, q in self.queue.items())
+        is work enough to bring the short cadence back for it. Nor one the hub holds back, listed without its text (an
+        agent's message to its child while a dispatched run uses the checkout): the hub's next answer brings it."""
+        return bool(self.pending or any(q and not self._waits_on_parent(sid) and isinstance(q[0].get("text"), str)
+                                        and not self._start_blocked(self.host.sessions.get(sid))
+                                        for sid, q in self.queue.items())
                     or any(self.reported.get(sid) != st for sid, st in self.status.items())
-                    or any(s.busy or (s.inbox and not self._held_inbox(sid, s)) or s.ended
+                    or any(s.busy or (s.inbox and not self._held_inbox(sid, s) and not self._start_blocked(s)) or s.ended
                            or (s.child is not None and s.stopping_since is not None)
                            for sid, s in self.host.sessions.items()))
+
+    def stopping_checkouts(self) -> set[str]:
+        """The directories (real paths) that hold a process group of this node being stopped (node_groups)."""
+        return {os.path.realpath(d) for d in self.host.groups.stopping_dirs()}
+
+    def _start_blocked(self, s) -> bool:
+        """This session has no process, and none may start now: a process group is being stopped in its checkout."""
+        return s is not None and s.child is None and not s.ended and self.host.groups.blocked(s.cwd)
 
     def _held_inbox(self, sid: str, s) -> bool:
         """A message already handed to a child waits in its inbox only for the parent (its parent's process went
@@ -360,8 +444,10 @@ class SessionRunner:
         if wait is None:
             wait = self.long_poll if ok and not self.active() else 0
         data = None
+        fetch_sent = self.clock()
         if ok and (wait or not self.fresh or self.clock() - self.last_sync >= self.sync_seconds):
             try:
+                fetch_sent = self.clock()
                 data = self._sync(wait)
                 self.last_sync = self.clock()
             except Exception as e:
@@ -379,9 +465,12 @@ class SessionRunner:
             now = self.clock()
             if data is not None:
                 self._reconcile(data)
-            if now - self.last_contact >= self.self_stop_seconds:
-                self._emit(self.host.stop_turns(
-                    f"the node had no hub contact for {self.self_stop_seconds:g} seconds and stopped the turn"))
+                # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
+                # above): what waits in an inbox may start again, in `tick` below. Only a listing from a fetch SENT
+                # after the latch was set: one sent before may have been built before the hub decided.
+                self._unlatch(fetch_sent, now)
+            if self._silent(now):
+                self._emit(self.host.stop_turns(self._self_stop_detail()))
             if self.fresh:
                 self._hand_over(now)
             self._park_idle(now)
@@ -408,8 +497,15 @@ class SessionRunner:
             return
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
-        # Roots first: a child is only opened under a parent that is open here (`_parent_problem`).
-        for sid, view in sorted(listed.items(), key=lambda kv: isinstance(kv[1].get("parent"), str)):
+        # Roots first, then each level under the one above it: a child is only opened under a parent that is open
+        # here (`_parent_problem`), and a deeper tree's child's parent is itself a child.
+        def depth(view: dict) -> int:
+            n, cur = 0, view
+            while isinstance(cur.get("parent"), str) and n < 10:
+                n, cur = n + 1, listed.get(cur["parent"]) or {}
+            return n
+
+        for sid, view in sorted(listed.items(), key=lambda kv: depth(kv[1])):
             applied = view.get("status_seq")
             if type(applied) is int:
                 self.hub_seq = max(self.hub_seq, applied)
@@ -427,8 +523,7 @@ class SessionRunner:
                 if s is not None:
                     self._emit(self.host.close(sid, why))
                 else:
-                    self.ending.add(sid)
-                    self._add(sid, {"kind": "ended", "detail": why})
+                    self._ended_without_process(sid, why)
                 continue
             parent = view.get("parent") if isinstance(view.get("parent"), str) else None
             if parent is not None:
@@ -452,11 +547,14 @@ class SessionRunner:
                                        **self._tree_open(sid, view))
                 except Exception as e:
                     log.warning("cannot host session %s: %s", sid, e)
-                    self.ending.add(sid)
-                    self._add(sid, {"kind": "ended",
-                                    "detail": f"this node cannot host the session: {type(e).__name__}: {e}"[:300]})
+                    self._ended_without_process(sid, f"this node cannot host the session: {type(e).__name__}: {e}")
                     continue
                 self.last_busy[sid] = self.clock()
+            # Exactly the binding the hub lists now, nothing cached beyond it: given (a grant came) or withdrawn (a
+            # revoke or an expiry, once no child it started is left). The next process gets it as it is; a process
+            # started with another one takes no new message (the host's write boundary, session_host `unbound`) and
+            # is stopped once idle (`_park_idle`), the conversation resuming in the next.
+            s.bind = _bind_of(view)
             if parent is not None and self._parent_problem(parent, s) is not None:
                 self._end_child(sid, self._parent_problem(parent, s))   # the access it has here is above its parent's
                 continue
@@ -468,6 +566,17 @@ class SessionRunner:
             for m in sorted((m for m in view.get("messages", []) if isinstance(m, dict) and type(m.get("n")) is int),
                             key=lambda m: m["n"]):
                 n = m["n"]
+                if m.get("cancel") is True:
+                    # The session that started this turn cancelled it (hosted_spawn.cancel): stopped where it is if
+                    # the host has it, never handed over if not. Reported once; the hub then lists it no more.
+                    if n in held:
+                        self._emit(self.host.cancel(sid, str(n), CANCELLED))
+                    elif (n > self.handed.get(sid, 0) and m.get("state") == "queued"
+                          and not any(x == sid and e.get("message") == n for x, e in self.pending)):
+                        self._add(sid, {"kind": "turn_ended", "message": n, "ok": False, "delivered": False,
+                                        "detail": CANCELLED})
+                    if n in held or n > self.handed.get(sid, 0):
+                        continue
                 if n > self.handed.get(sid, 0) and m.get("state") == "queued":
                     queue.append(m)
                 elif n not in held and not any(x == sid and e.get("message") == n for x, e in self.pending):
@@ -515,13 +624,18 @@ class SessionRunner:
         if "access" not in view and "parent" not in view:
             return {}
         is_child = isinstance(view.get("parent"), str)
-        if not is_child and view.get("access") is not None:
+        # A child of an interactive session (hosted_spawn.py) has no parent here: its word is the hub's, from the
+        # human's grant, and this machine's own settings (allow_full_access, the runner) still decide what it can be.
+        interactive = not is_child and "parent" in view and view.get("interactive") is True
+        if not is_child and not interactive and view.get("access") is not None:
             # The checks that hold a session to a parent (`_parent_problem`, the ceiling) only run for an entry that
             # names one. So a word on an entry that names none would be applied unchecked: `full` on any runner of
             # a node that allows full access. This hub never sends that; it is refused here all the same.
             raise ValueError(ROOT_ACCESS)
         kw: dict[str, Any] = {"access": view.get("access"), "effort": view.get("effort")}
-        isolation = view.get("isolation") if is_child else None
+        if _bind_of(view) is not None:
+            kw["bind"] = _bind_of(view)     # the key that proves the session's process is this session's
+        isolation = view.get("isolation") if is_child or interactive else None
         if isolation == "worktree":
             checkout = self.config.checkout_for(view.get("project"))
             if not checkout:
@@ -571,8 +685,12 @@ class SessionRunner:
         if sid in self.host.sessions:
             self._emit(self.host.close(sid, why))
         else:
-            self.ending.add(sid)
-            self._add(sid, {"kind": "ended", "detail": why[:300]})
+            self._ended_without_process(sid, why)
+
+    def _ended_without_process(self, sid: str, why: str) -> None:
+        """A session that ends here with no process (never opened here): its end."""
+        self.ending.add(sid)
+        self._add(sid, {"kind": "ended", "detail": why[:300]})
 
     def _tree_status(self, sid: str, view: dict, s) -> None:
         """Whether this session's reports carry its access and worktree: only for a hub that asked. The access
@@ -647,7 +765,7 @@ class SessionRunner:
                 return True
         return False
 
-    def _admit(self, s) -> bool:
+    def _admit(self, s, starting: bool = False) -> bool:
         """May this session's process start now? Not while `max_live` processes are up: then the longest-idle one is
         stopped (one at a time) and the message waits; with none idle it just waits.
 
@@ -659,7 +777,17 @@ class SessionRunner:
         Its child is then held until the parent's next turn, like any full child whose parent has no process."""
         if s.child is not None:
             return True
-        live = [x for x in self.host.sessions.values() if x.child is not None or x.inbox]
+        # A session waiting for its checkout (a group being stopped there: node_groups) holds no slot: the message in
+        # its inbox waits for the registry to let its process start (session_host `_spawn`) and does not count here.
+        # `starting`: asked by the host itself at the moment it would start the process (`SessionHost.admit`), for
+        # every start, first or retried: then only the process groups that are there count (a stopping one too,
+        # until it is gone), and the session that asks is not one of them, so no two starts share one slot.
+        # And one that asks while its checkout is blocked is let through to its inbox at once, stopping nobody: it
+        # cannot start yet, and asks for its slot (here, `starting`) only once the registry would let it start.
+        if not starting and self.host.groups.blocked(s.cwd):
+            return True
+        live = [x for x in self.host.sessions.values()
+                if x.child is not None or (not starting and x.inbox and not self.host.groups.blocked(x.cwd))]
         if len(live) < self.max_live:
             return True
         if not any(x.child is not None and x.stopping_since is not None for x in live):
@@ -702,6 +830,10 @@ class SessionRunner:
 
     def _park_idle(self, now: float) -> None:
         for sid, s in self.host.sessions.items():
+            if (s.unbound and not s.ended and not s.busy and not s.inbox and not self._lends_full(sid)
+                    and self.host.park(sid)):
+                log.info("session %s: its process was stopped to start again with its binding as it is now", sid)
+        for sid, s in self.host.sessions.items():
             if s.busy or s.inbox or self._lends_full(sid):
                 self.last_busy[sid] = now
             elif s.child is not None and now - self.last_busy.setdefault(sid, now) >= self.idle_seconds:
@@ -732,6 +864,90 @@ class SessionRunner:
         session id, which the hub has: nothing is added to its reports."""
         return s.provider_id if s.provider_id != s.session_id else None
 
+    # ------------------------------------------------------------ the deadlines, off the hub-I/O path
+
+    @property
+    def last_contact(self) -> float:
+        """When the last successful hub call of the session loop was SENT (`_renew_contact`)."""
+        return self._last_contact
+
+    def _renew_contact(self, sent: float) -> None:
+        """The one place the contact is renewed (`_call`, after a successful call). First the deadline is looked at
+        with the PREVIOUS contact, at the time the call RETURNED (now: the node was unheard for all of that): had it
+        passed, the latch is set before the contact moves on, whether or not the watchdog or the loop had seen it
+        yet. So a report that gets through just after the deadline cannot open the gate without a listing."""
+        self._silent(self.clock())
+        self._last_contact = max(self._last_contact, sent)
+
+    def _self_stop_due(self) -> float:
+        """When the node's self-stop is due: `self_stop_seconds` after its last successful hub call, counted from when
+        that call was SENT (`_call`), so never later than the hub's view of the contact."""
+        return self.last_contact + self.self_stop_seconds
+
+    def _silent(self, now: float | None = None) -> bool:
+        """Past the self-stop deadline (the one computation the watchdog, the loop, the start gate and the contact's
+        renewal share). Latched: from then on nothing starts until a listing from a fetch sent after the latest such
+        moment has been applied (`_unlatch`)."""
+        now = self.clock() if now is None else now
+        if now >= self._self_stop_due():
+            with self.latch_lock:
+                self.latched_at = now if self.latched_at is None else max(self.latched_at, now)
+            return True
+        return False
+
+    def _unlatch(self, fetch_sent: float, now: float) -> None:
+        """After a listing from a successful fetch was applied: the latch goes if that fetch was sent at or after the
+        moment it was (last) set, and the node is not past its deadline now. A fetch sent before (it straddled the
+        deadline) clears nothing: the next one will."""
+        if self._silent(now):
+            return
+        with self.latch_lock:
+            if self.latched_at is not None and fetch_sent >= self.latched_at:
+                self.latched_at = None
+
+    def _may_start(self) -> bool:
+        """May the host start a session's process, or write a new turn to one, now (SessionHost.may_start)? Not once
+        the node is past its self-stop deadline, until a listing fetched since contact came back has been applied
+        (`pass_once` reconciles it before it ticks the host): a message that waits in an inbox, for its checkout or
+        for a slot, is then neither started nor written while the hub may have closed or cancelled it and released
+        its hold, and it waits, failing nothing. A start just BEFORE the deadline is fine: the watchdog stops its turn
+        at the deadline, and `shutdown_bound` covers it."""
+        return not self._silent() and self.latched_at is None
+
+    def _self_stop_detail(self) -> str:
+        return f"the node had no hub contact for {self.self_stop_seconds:g} seconds and stopped the turn"
+
+    def enforce_deadlines(self) -> None:
+        """The node's two deadlines without the hub, whatever the loop is doing: its self-stop (SIGTERM to every
+        turn's process group once `self_stop_seconds` have passed since its last successful hub call) and the
+        SIGKILL after each grace. Under the loop's lock, which the loop holds only for local work, never across a
+        hub call. What the self-stop reports waits in `watched` for the loop's next `_emit`. A deadline met later than
+        `shutdown_bound` allows it (the watch interval plus LOCK_SLACK_SECONDS: the loop held its lock for longer,
+        limit e) is said in the log, once, with how late it was."""
+        with self.lock:
+            if self.stopping.is_set():
+                return          # shutdown stops everything itself
+            now = self.clock()
+            allowed = self.watch_seconds + LOCK_SLACK_SECONDS
+            due = self._self_stop_due()
+            if self._silent(now):
+                stopped = self.host.stop_turns(self._self_stop_detail())
+                if stopped and now - due > allowed:
+                    log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop held "
+                                "its lock that long (limit e)", now - due)
+                self.watched += stopped
+            for sid, at in self.host.kill_due():
+                if now - at > allowed:
+                    log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the session "
+                                "loop held its lock that long (limit e)", sid, now - at)
+
+    def _watch(self) -> None:
+        while not self.stopping.wait(self.watch_seconds):
+            try:
+                self.enforce_deadlines()
+            except Exception:
+                log.exception("hosted sessions: the deadline watchdog failed a pass")
+
     # ------------------------------------------------------------ the thread
 
     def run_forever(self) -> None:
@@ -749,6 +965,8 @@ class SessionRunner:
     def start(self) -> None:
         self.thread = threading.Thread(target=self.run_forever, name="hosted-sessions", daemon=True)
         self.thread.start()
+        self.watch_thread = threading.Thread(target=self._watch, name="hosted-sessions-deadlines", daemon=True)
+        self.watch_thread.start()
 
     def signal(self) -> None:
         """The first step of a shutdown: SIGTERM to every session process, now. No waiting and no reporting, so the
