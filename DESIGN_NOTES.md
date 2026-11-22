@@ -3869,10 +3869,10 @@ hand-over: still eligible, not acknowledged by any session of the agent, not res
 
 **The dispatcher's side** goes through the hooks it already has, so delivery.py and dispatch.py ask nothing new:
 `hosted_wake.holds` ends by asking `interactive_wake.holds` (the same rule on a waiter's record: within the grace,
-or a read mark or delivery receipt after the wake by a board session that is the agent's in the project, not a
-dispatched run's, and not one recorded for another conversation); `hosted_wake.reserve` also calls
-`interactive_wake.claim`; `Board.read_updates` calls `interactive_wake.handed` beside `hosted_wake.handed`. Without
-waiter records each is one key-range read and no write.
+or a read mark after the wake by a board session that was the agent's in the post's project when it read, not a
+dispatched run's, and not one recorded for another conversation; a delivery receipt alone does not count, since
+review round 6); `hosted_wake.reserve` also calls `interactive_wake.claim`; `Board.read_updates` calls
+`interactive_wake.handed` beside `hosted_wake.handed`. Without waiter records each is one key-range read and no write.
 
 **Off is off.** The route answers `{"state": "off"}` before it reads or writes any board state; the dispatcher's pass reads one key
 range and writes nothing when there is no record (and drops records left from when it was on); `holds`, `claim` and
@@ -4339,3 +4339,24 @@ not_ours`).
 **S32.** A SessionStart `board wait` never waits out the grace past its own `--max-seconds` deadline. If the
 deadline comes first, it writes the wake and exits 2 at the deadline: the ack is already committed, and exiting 0
 would lose the wake (`test_s32_the_grace_never_runs_past_the_commands_own_deadline`).
+
+### Waking an interactive session: review round 6 (2026-11-21)
+
+Round 6 (on d534333, rebased onto main 71cfa82) left one point open. The owner settled S26, S27 and S29; S28, S31 and
+S32 were resolved.
+
+**S30, the receipt path.** `read_after_delivery` still counted a delivery receipt. It checked the reader against the
+project the board session is registered in now. A receipt names only the session, not the project the session was in
+when it read. So a conversation's session could read unfiltered while registered in another project, which writes a
+receipt for the post, then re-register in the post's project. That read then passed the check: the request stayed held
+past the grace and the dispatcher could not reserve it. Now only the project-qualified read mark counts for an
+interactive hold. `handed` writes that mark at the time of the read, for a reader registered in the post's thread's
+project, and both read paths that write receipts call it. No other interactive path counts a receipt (`holds` reaches
+read evidence only through `read_after_delivery`). Pinned by
+`test_s30_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering`, which fails on d534333.
+`hosted_wake.holds` (main's code, for hosted sessions) still counts receipts with the same now-registered-project check.
+It is unchanged here and could be reviewed separately.
+
+**Comments.** Two comments in waiter.py still described the removed unread return (O5). They now say what happens
+instead: the post is not offered again, its hold ends at the request's deadline, and the prompt check reports it at the
+next prompt. No other mention of the unread return remains outside the history entries above.

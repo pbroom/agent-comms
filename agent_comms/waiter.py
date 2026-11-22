@@ -51,7 +51,8 @@ ACK_TRIES = 3               # sends of one ack whose reply could not be read (th
 # A SessionStart hook's wake is written no sooner than this long after the hook started (the Stop hook's at once).
 # Observed on Claude Code 2.1.322 (DESIGN_NOTES "Known Claude Code behaviour"): a SessionStart asyncRewake hook that
 # exited 2 within about two seconds of launch was reported as a hook result but started no turn. Waiting out this
-# start-up window avoids that; the hub's O5 (a delivered wake nobody read comes back) recovers if it happens anyway.
+# start-up window avoids that. If it happens anyway, the post is not offered again: its hold ends at the request's
+# deadline, after which the dispatcher can take it, and the prompt check reports it at the session's next prompt.
 STARTUP_GRACE = 10.0
 # Off unless set: a file to which `board wait` appends one JSON line per step (start, armed, offer, ack sent, ack
 # answer, grace begun and ended, wake written, exit), with wall-clock times. For measuring (scripts/interactive-wake-
@@ -293,7 +294,8 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float
         return None
     # Acknowledged at once (the hub's deadline stands); the wake itself waits out the start-up grace of a
     # SessionStart hook. SIGTERM, SIGHUP, SIGINT or the Claude process going away still end this process (exit 0)
-    # meanwhile; the hub then returns the wake nobody read (O5).
+    # meanwhile. The post stays delivered and is never offered again; unread, it is held only until the request's
+    # deadline, and then the dispatcher can take it.
     if not_before is not None and not_before - clock() > 0:
         trace("grace_begin", seconds=round(not_before - clock(), 3))
         while (left := not_before - clock()) > 0:

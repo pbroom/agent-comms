@@ -174,6 +174,27 @@ def test_a_read_in_another_project_is_no_read_evidence_for_the_posts_project(sen
     assert iw._pair(senv.board.conn, "claude", P2)["read"] == {} and rec(senv)["read"] == {}
 
 
+def test_s30_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering(senv):
+    """S30 (review round 6): the conversation's board session read (unfiltered) while registered in P2, which wrote
+    a delivery receipt for the P1 post; then it re-registered in P1. The receipt names a session now in P1, yet it
+    was not shown the post there: after the grace nothing holds the request and the dispatcher can reserve it. Only
+    the project-qualified read mark (`handed`) is read evidence for an interactive hold."""
+    from agent_comms import delivery
+    from test_hosted_sessions import P2
+    on(senv)
+    tid = senv.thread()
+    post = delivered(senv, tid)                                               # the P1 waiter is woken for it
+    s = senv.board.register_session(senv.p["claude"], P2, client=("claude-code", CONV))["session_id"]
+    out = senv.board.read_updates(senv.p["claude"], s)                        # unfiltered, registered in P2
+    assert post["id"] in [d["id"] for d in out["posts"]], "the P2 session is shown the P1 post"
+    assert delivery.receipt(senv.board.conn, post["id"], "claude")["session_id"] == s, "and a receipt is written"
+    senv.board.register_session(senv.p["claude"], PROJECT, resume_session_id=s, client=("claude-code", CONV))
+    senv.clock.advance(GRACE + 1)
+    assert not hosted.holds(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the receipt holds nothing"
+    assert hosted_wake.reserve(senv.board, "claude", PROJECT, post["id"], senv.clock()), "the dispatcher takes it"
+    assert pair(senv)["read"] == {} and rec(senv)["read"] == {}
+
+
 # ------------------------------------------------------------ S28: a reservation with no waiter left in the pair
 
 

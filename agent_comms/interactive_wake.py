@@ -76,7 +76,8 @@ Other rules
   when the human posts there, the hourly one when the hour has room. No Needs-you item is posted.
 - *The dispatcher* (`holds`, `claim`, `handed`). A request is held from its first offer until `wake_grace_seconds`
   later (one deadline per request, kept across take-backs and re-offers), and after that only if a board session
-  that can be the waiter's read it after it was delivered. A waiter never offered the request holds nothing.
+  that can be the waiter's read it after it was delivered while registered in the post's project (the read mark
+  `handed` records; a delivery receipt alone does not count). A waiter never offered the request holds nothing.
 - *Text.* hosted_wake.wake_text: counts, thread ids and agent names only, plus the fixed note.
 - *What it cannot stop.* Any process holding the agent's token can call as a waiter of that agent: the hub cannot
   tell it from the agent's own session. It can take that agent's wakes and hold a request back for one grace period
@@ -584,17 +585,16 @@ def _delivery(conn, agent: str, project: str, k: str) -> tuple[float | None, dic
 
 def read_after_delivery(conn, agent: str, project: str, post_id: int) -> bool:
     """A board session that can be the own session of a waiter the post was delivered to was shown it after that
-    delivery: a read mark (kept on the pair, and on the waiter) or a delivery receipt."""
+    delivery: a read mark (kept on the pair, and on the waiter), which `handed` writes only for a reader registered
+    in the post's project at the time of the read. A delivery receipt alone is no evidence (review round 6, S30):
+    it names the session, not the project the session was registered in when it read, so a session that read in
+    another project and later re-registered here would pass a check made now. Both read paths that write receipts
+    also call `handed`."""
     k = str(post_id)
     at, pair, recs = _delivery(conn, agent, project, k)
     if at is None or hosted_wake._shadowed(conn, {"agent": agent, "project": project}, at):
         return False
-    if pair["read"].get(k, -1.0) >= at or any(r["read"].get(k, -1.0) >= r["delivered"][k] for r in recs.values()):
-        return True
-    convs = {r["client_session_id"] for r in recs.values()} | (
-        {pair["delivered_to"][k]} if k in pair["delivered_to"] else set())
-    from . import delivery
-    return delivery.read_since(conn, post_id, agent, at, lambda sid: _pair_reader(conn, sid, agent, project, convs))
+    return pair["read"].get(k, -1.0) >= at or any(r["read"].get(k, -1.0) >= r["delivered"][k] for r in recs.values())
 
 
 def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float) -> bool:
