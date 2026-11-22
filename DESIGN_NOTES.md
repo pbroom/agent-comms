@@ -2496,10 +2496,10 @@ in that project has not ended and is not being closed, its node was seen within 
 has not reserved a run for the post, and either a wake covering the post was queued or handed less than
 `wake_grace_seconds` ago, or the board showed the post, at or after that wake was queued, to a board session that
 can be the hosted one. Such a session is the agent's, registered in the hosted session's project, and not bound to
-a dispatcher run (`_own_reader`). "Showed" is either of two records about such a session: a delivery receipt or
-reader record (an unfiltered read or the `post_ids` view), or the watcher's own `read` mark, written by
-`hosted_wake.handed` where `Board.read_updates` returns posts, in EVERY view, when the response really contains a
-post a wake covered. The record keeps two times per covered post: `woken`, when its wake was queued, which is what
+a dispatcher run (`_own_reader`). "Showed" is the watcher's own `read` mark (or `mine`, for a board session bound to
+the hosted session), written by `hosted_wake.handed` where `Board.read_updates` returns posts, in EVERY view, when the
+response really contains a post a wake covered. (Until S30 for hosted sessions, 2026-11-22, a delivery receipt or
+reader record counted too; it no longer does: see that entry and its follow-ups.) The record keeps two times per covered post: `woken`, when its wake was queued, which is what
 read evidence is compared with, and `handed`, when the node was first shown that wake, which only extends the grace
 (it counts from the later of the two). A read between the two therefore counts. With the grace in force stored too,
 `holds` needs only a connection. It is asked in `_policy_held`, at the launch gate for all three kinds of rule, and
@@ -2512,8 +2512,9 @@ passed, the dispatcher launched, its run read the request with `post_ids` and ex
 read made `holds` true again and the request was never retried, where without a hosted session it is retried twice
 and then blocked. The same with an unfiltered read by the agent's session in another project. Now a post the
 dispatcher reserved a run for is the dispatcher's for good (`claimed`: `holds` is false, and the reservation drops
-its coverage), and neither a dispatched run's session nor a session registered elsewhere is ever taken for the
-hosted one.
+its coverage), and neither a dispatched run's session nor a session registered elsewhere is taken for the hosted
+one. That holds when the session was registered elsewhere at the time of the read, except in the window of S30
+hosted follow-up A.
 
 *Why the second record* (observed, 2026-11-20). In two of eight real `--with-board` runs the woken session read the
 post and the hub had no delivery receipt. The second time the script printed the calls: `board_register({"project":
@@ -4362,9 +4363,34 @@ read evidence only through `read_after_delivery`). Pinned by
 `hosted_wake.holds` (main's code, for hosted sessions) still counts receipts with the same now-registered-project check.
 It is unchanged here and could be reviewed separately.
 Later fixed the same way (2026-11-22): `hosted_wake.holds` no longer counts a delivery receipt. Only the `read` and
-`mine` marks count, which `hosted_wake.handed` writes at the time of the read for a reader registered in the hosted
-session's project. Both read paths that write receipts call it. Pinned by
+`mine` marks count. `hosted_wake.handed` writes them right after the read, looking the reader's session up again, so a
+mark reflects the project the session is registered in at that moment. That is the read's project, except in the
+window of follow-up A below. Both read paths that write receipts call `handed`. This closes the sequential case (read
+in another project, then re-register). Pinned by
 `test_s30_hosted_a_receipt_from_a_read_in_another_project_is_no_read_evidence_after_re_registering`.
+
+**S30 for hosted sessions: follow-ups** (from the branch's review; not done on it):
+
+- **A. Re-registering inside one read.** `Board._read_updates_once` and the post_ids view (core.py) select posts
+  with the reader's session row, then `delivery.record`, then `hosted_wake.handed` (via `_own_reader`) and
+  `interactive_wake.handed` look the session's project up again. A re-register into the request's project in between
+  makes `handed` write a mark for a read made elsewhere, and `reserve` refuses after the grace. Proposed fix: capture
+  the project and reader identity when the posts are selected and pass that snapshot to all recorders.
+- **B. A lost mark holds nothing.** `delivery.record` commits first; `hosted_wake.handed` swallows its exceptions and
+  only logs, so if its write fails the post is still returned with no mark. Before this branch the same-project
+  receipt still held the request; now the dispatcher may reserve it after the grace and start a run beside a session
+  that did read it. This head trades that for closing the cross-project hole. Judgment: the old failure is worse.
+  It is silent and lasts as long as the session stays live, keeping a request away from any run while the session
+  that "has" it was never shown it in this project. A lost mark needs a failed write after a committed one, and it
+  costs at most one duplicate run that the request lifecycle (claims, request_reply) makes visible. Proposed fix: write
+  the mark in the same transaction as the receipt, or record the read's project on the receipt and count it.
+- **C. Dead code.** `hosted_wake._credited` now has only test callers (tests/test_hosted_spawn.py), and
+  `delivery.read_since` has none. `_credited` is the only reader of `hosted_spawn.provenance_changed` and its
+  `changed_at` marker. Remove them together, or reuse them for B's receipt-with-project fix.
+- **D. The policy gate.** `Dispatcher._policy_held` (dispatch.py) still combines a delivery receipt or reader record
+  with the session's CURRENT project and `last_seen`. After the sequential re-registration, an `agent_delivery` policy
+  can still defer a launch that `hosted_wake.reserve` would allow. This was there before the branch. Proposed fix: the
+  same as here, counting only project-qualified read evidence.
 
 **Comments.** Two comments in waiter.py still described the removed unread return (O5). They now say what happens
 instead: the post is not offered again, its hold ends at the request's deadline, and the prompt check reports it at the

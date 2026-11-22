@@ -36,7 +36,7 @@ then queues one `wake` message, the only message kind that does not come from th
   then the dispatcher's for good: no wake is queued or handed for it, and no hosted session holds it again.
 - *Roots only.* A child session (hosted_tree.py) has no watcher record and is never woken, and nothing a child reads
   on the board counts as its root having read it: a board session registered with a hosted session's binding
-  (hosted_spawn.board_binding) counts for that session alone (`_credited`, the `mine` mark), and one with no binding
+  (hosted_spawn.board_binding) counts for that session alone (the `mine` mark), and one with no binding
   is held to the old rule (`_shadowed`: not while a child of the agent is around).
 - *After results.* While results of its child sessions wait for a session (hosted_results.py), no wake is queued
   for it, and one queued before they came steps back behind them when the node would be shown it (`_recheck`).
@@ -61,7 +61,7 @@ HUB = "hub"                     # who wrote a wake message and these records
 HOUR = 3600.0
 MAX_PENDING = 200               # posts waiting for one session; the oldest are dropped beyond this
 MAX_SEALED = 200                # sealed posts remembered so that their unsealing counts
-KEEP_WOKEN_SECONDS = 7 * 86400  # how long "a wake covered this post" is remembered (for `holds` with a receipt)
+KEEP_WOKEN_SECONDS = 7 * 86400  # how long "a wake covered this post" is remembered (for `holds` with a read mark)
 MAX_WOKEN = 500
 ALERT_RETRY_SECONDS = 60        # a Needs-you item that could not be posted is tried again after this long
 MARKER_KIND = "wake_limit"      # autorecover.POST_PREFIX marker of the Needs-you item
@@ -646,7 +646,7 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
                 rec["pending"][k] = keep[k]
         elif m.get("handed_at") is None:
             # Shown to the node now: the grace period counts from here. `woken` keeps the time the wake was queued,
-            # so that a read between then and now (a mark or a dated receipt) still counts as after the wake.
+            # so that a read between then and now (a `read` or `mine` mark) still counts as after the wake.
             rec["handed"][k] = now
     if defer:
         _uncount(rec, m)
@@ -682,11 +682,13 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
     that has not ended, on a node seen within nodes.NODE_STALE_SECONDS, and either a wake covering the post was
     queued or handed less than `wake_grace_seconds` ago, or the board showed the post, at or after that wake was
     queued, to a board session that can be the hosted one: a session of the agent registered in this project that is
-    not a dispatched run's (`_own_reader`). Shown means the record's `read` or `mine` mark, which `handed` writes at
-    the time of the read (any view) and only for a reader registered in the hosted session's project then. A delivery
-    receipt alone is no evidence (as interactive_wake.read_after_delivery, S30): it names the board session, not the
-    project that session was registered in when it read, so a read made in another project before the session
-    re-registered here would pass `_own_reader` now. Both read paths that write receipts also call `handed`.
+    not a dispatched run's (`_own_reader`). Shown means only the record's `read` or `mine` mark. `handed` writes it
+    right after the read (any view), looking the reader's session up again then, so the mark reflects the project the
+    session is registered in at that moment: the read's project, except when the session is re-registered between the
+    posts being selected and `handed` (DESIGN_NOTES "S30 for hosted sessions: follow-ups", A). A delivery receipt is
+    no evidence (as interactive_wake.read_after_delivery, S30): it names the board session, not the project that
+    session was registered in when it read. Both read paths that write receipts also call `handed`; a mark that
+    `handed` failed to write is lost, and nothing then holds the request (follow-up B).
     A session that was never woken for the post, or was woken and was not shown it,
     holds nothing once the grace has passed; and a post the dispatcher reserved a run for is the dispatcher's
     (`reserve`): whatever that run or anybody else reads afterwards, no hosted session holds it."""
@@ -714,8 +716,9 @@ def holds(board_or_conn: Any, agent: str, project: Any, post_id: Any, now: float
 
 
 def _credited(conn, session_id: Any, r: dict, since: float) -> bool:
-    """A read by this board session counts as the hosted root `r` having the post: it is the agent's, registered in
-    r's project and not a dispatched run's (`_own_reader`), and either BOUND to r (registered from r's own process,
+    """(Not called by `holds` since S30 for hosted sessions: a receipt is no hold evidence. Kept for its tests until
+    follow-up C.) A read by this board session would count as the hosted root `r` having the post: it is the agent's,
+    registered in r's project and not a dispatched run's (`_own_reader`), and either BOUND to r (registered from r's own process,
     hosted_spawn.board_binding) or, carrying no binding at all, not possibly a child's (`_shadowed`). One bound to
     another hosted session (a child, of whichever root) never counts."""
     if not _own_reader(conn, session_id, r.get("agent"), r.get("project")):
