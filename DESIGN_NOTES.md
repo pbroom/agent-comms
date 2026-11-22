@@ -4215,3 +4215,25 @@ is offered it again, or, for a request the dispatcher could run, for the request
 - **The e2e script.** R1 now checks that the SessionStart wake came no sooner than the grace after the hook
   started, although the post came right after it armed. And if a hook exits 2 with no turn within 30 s, the run
   fails at once saying exactly that, and keeps its logs.
+
+### Waking an interactive session: measuring the start-up wake (2026-11-21)
+
+**A correction to the record above.** The second missed turn, the run after M1 in which the hook's result reached
+the transcript about 84 s after launch, overlapped a sleep of the Mac. `pmset -g log` has "Entering Sleep state due
+to 'Maintenance Sleep'" at 19:58:05 and "Wake ... due to ... lid" at 19:59:21. That falls between the hub's ack
+(19:58:01) and the `hook_response` line (19:59:23). `time.monotonic()` on this Mac does not advance during sleep. So
+the 84 s says nothing about M1 or about Claude Code. The first missed turn (18:57) overlapped no sleep: its hook
+exited 2 about 2 s after launch, and no turn followed.
+
+**Instrumentation, off by default.**
+- `AGENT_COMMS_WAIT_TRACE=<file>` makes `board wait` and `wait.sh` append one JSON line per step, with wall-clock
+  times: start, hook input, the first answer from the hub, offer, ack sent and its answer, grace begun and ended,
+  wake written, the exit code, a signal.
+- `scripts/interactive-wake-e2e.py --trace` sets it for the real session, starts Claude with `--debug-file`, and
+  writes to `logs/` the receive time of every stream-json event and Claude's process start time.
+- `--r1-post-delay`, `--skip-stand-in` and `--session-start-async` (an experiment: "async": true beside
+  "asyncRewake" on the SessionStart hook) shape the runs.
+
+Claude's debug log shows whether a hook was backgrounded: "Hooks: Config-based async hook, backgrounding process
+async_hook_<n>", logged just before "Hooks: SessionStart:startup [...]". A working run logs "Hook SessionStart:startup
+(SessionStart) error: status code 2" when the hook exits, then "[engine] turn 1 start".

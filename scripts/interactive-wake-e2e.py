@@ -308,6 +308,8 @@ wake = true
         print("real step: claude --model haiku, stream-json, the wake hooks only")
         command = claude_hooks.command(str(self.home), "claude", str(WAIT_SH))
         settings = claude_hooks.add({}, str(WAIT_SH), command, 600)
+        if self.args.session_start_async:
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["async"] = True     # an experiment: both flags
         (self.tmp / "claude-settings.json").write_text(json.dumps(settings, indent=2))
         (self.tmp / "claude-mcp.json").write_text(json.dumps({"mcpServers": {"agent-comms": {
             "type": "stdio", "command": sys.executable, "args": ["-P", "-m", "agent_comms.cli", "mcp", "--agent",
@@ -319,11 +321,20 @@ wake = true
                 str(self.tmp / "claude-settings.json"), "--strict-mcp-config", "--mcp-config",
                 str(self.tmp / "claude-mcp.json"), "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms",
                 "--disallowedTools=Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"]
+        env = {k: v for k, v in self.env.items() if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID")}
+        if self.args.trace:
+            # Measuring (--trace): board wait's and wait.sh's steps, Claude's debug log, and every stream-json event's
+            # receive time, all with wall-clock times, in logs/.
+            env["AGENT_COMMS_WAIT_TRACE"] = str(self.tmp / "logs" / "wait-trace.jsonl")
+            argv += ["--debug-file", str(self.tmp / "logs" / "claude-debug.log")]
+        claude_started = time.time()
         claude = subprocess.Popen(argv, cwd=str(self.project), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=open(self.tmp / "logs" / "claude.stderr", "w"), text=True,
-                                  env={k: v for k, v in self.env.items()
-                                       if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID")},
+                                  stderr=open(self.tmp / "logs" / "claude.stderr", "w"), text=True, env=env,
                                   start_new_session=True)
+        if self.args.trace:
+            (self.tmp / "logs" / "claude-start.json").write_text(json.dumps({"t": round(claude_started, 3),
+                                                                             "pid": claude.pid}))
+            received = open(self.tmp / "logs" / "claude-events.jsonl", "w")
         self.procs.append(claude)
         events: list[tuple[float, dict]] = []
         transcript = open(self.tmp / "logs" / "claude.jsonl", "w")
@@ -334,6 +345,9 @@ wake = true
                 transcript.flush()
                 try:
                     events.append((time.monotonic(), json.loads(line)))
+                    if self.args.trace:
+                        received.write(json.dumps({"recv": round(time.time(), 3), "event": events[-1][1]}) + "\n")
+                        received.flush()
                 except ValueError:
                     pass
         threading.Thread(target=read, daemon=True).start()
@@ -379,6 +393,9 @@ wake = true
                     took = self.armed(conv, since, 60)
                     self.check(True, f"R2 the Stop hook waits again {took:.1f} s after the turn")
                     time.sleep(INTERVAL)
+                if step == "R1" and self.args.r1_post_delay:
+                    # The first post only this long after Claude started: nothing about start-up is in play.
+                    time.sleep(max(0.0, claude_started + self.args.r1_post_delay - time.time()))
                 t0 = time.monotonic()
                 post = self.post()
                 def done() -> bool:
@@ -469,6 +486,14 @@ def main() -> int:
     ap.add_argument("--max-real-wake", type=float, default=120.0, metavar="SECONDS",
                     help="most seconds from a post to the real session's board_read_updates call")
     ap.add_argument("--keep", action="store_true", help="keep the temp directory (logs, transcript, database)")
+    ap.add_argument("--trace", action="store_true",
+                    help="real step: record board wait's steps (AGENT_COMMS_WAIT_TRACE), Claude's debug log and every "
+                         "event's receive time in logs/, with wall-clock times (for measuring the wake's timing)")
+    ap.add_argument("--r1-post-delay", type=float, default=0.0, metavar="SECONDS",
+                    help="real step: make R1's post this long after Claude started (default: right after it arms)")
+    ap.add_argument("--skip-stand-in", action="store_true", help="run only the real step (with --claude-bin)")
+    ap.add_argument("--session-start-async", action="store_true",
+                    help='real step, an experiment: give the SessionStart hook "async": true beside "asyncRewake"')
     args = ap.parse_args()
     run = Run(args)
 
@@ -477,7 +502,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, terminated)
     try:
         run.setup()
-        run.stand_in()
+        if not args.skip_stand_in:
+            run.stand_in()
         if args.claude_bin:
             run.real()
         run.ok = True

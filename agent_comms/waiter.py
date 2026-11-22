@@ -53,6 +53,24 @@ ACK_TRIES = 3               # sends of one ack whose reply could not be read (th
 # exited 2 within about two seconds of launch was reported as a hook result but started no turn. Waiting out this
 # start-up window avoids that; the hub's O5 (a delivered wake nobody read comes back) recovers if it happens anyway.
 STARTUP_GRACE = 10.0
+# Off unless set: a file to which `board wait` appends one JSON line per step (start, armed, offer, ack sent, ack
+# answer, grace begun and ended, wake written, exit), with wall-clock times. For measuring (scripts/interactive-wake-
+# e2e.py --trace), never needed to run.
+TRACE = "AGENT_COMMS_WAIT_TRACE"
+
+
+def _tracer(environ: dict) -> Callable[..., None]:
+    path = environ.get(TRACE)
+    if not path:
+        return lambda *a, **k: None
+
+    def trace(event: str, **fields: Any) -> None:
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps({"t": round(time.time(), 3), "pid": os.getpid(), "event": event, **fields}) + "\n")
+        except OSError:
+            pass
+    return trace
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MANAGED = "AGENT_COMMS_MANAGED"     # set by dispatch.child_env for every launched run and hosted session
 _NAME = r"[a-z][a-z0-9_-]{0,31}"
@@ -123,12 +141,17 @@ def run(agent: str, projects: list[str] | None = None, max_seconds: float = DEFA
         sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
         watch: bool = True) -> int:
     """The exit code (WAKE or 0). Never raises: whatever goes wrong, the session is not woken."""
+    environ = os.environ if environ is None else environ
+    trace = _tracer(environ)
+    trace("start")
     try:
-        return _run(agent, projects, max_seconds, sys.stdin if stdin is None else stdin,
-                    sys.stderr if stderr is None else stderr, os.environ if environ is None else environ,
-                    client, sleep, clock, watch)
-    except Exception:
-        return 0
+        code = _run(agent, projects, max_seconds, sys.stdin if stdin is None else stdin,
+                    sys.stderr if stderr is None else stderr, environ, client, sleep, clock, watch, trace)
+    except Exception as e:
+        trace("error", error=type(e).__name__)
+        code = 0
+    trace("exit", code=code)
+    return code
 
 
 def project_of(cwd: str, environ: dict | None = None) -> str:
@@ -156,16 +179,18 @@ def project_of(cwd: str, environ: dict | None = None) -> str:
     return main.rstrip("/") or "/"
 
 
-def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, clock, watch) -> int:
+def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, clock, watch, trace=None) -> int:
+    trace = trace or (lambda *a, **k: None)
     started = clock()       # the hook process's start, as near as this process can tell
     if environ.get(MANAGED) == "1":
         return 0            # a dispatched run or hosted session: never the interactive session's waiter
     hook = _hook_input(stdin)
     sid = hook.get("session_id")
+    trace("hook", hook_event=hook.get("hook_event_name"), session_id=sid)
     if not isinstance(sid, str) or not UUID_RE.fullmatch(sid):
         return 0
     if watch:
-        leave = lambda *_: os._exit(0)      # noqa: E731  silent, whatever the main thread is doing
+        leave = lambda *_: (trace("leave"), os._exit(0))    # noqa: E731  silent, whatever the main thread does
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(sig, leave)
         _watch(environ, leave)
@@ -180,6 +205,7 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
                               headers={"Authorization": "Bearer " + token})
     body = {"client_session_id": sid, "projects": projects, "nonce": secrets.token_hex(16), "client": "claude-code"}
     deadline, reached, failing_since, failures, rejected = clock() + max_seconds, False, None, 0, 0
+    traced_first = False
     while (left := deadline - clock()) >= 1:
         try:
             r = client.post("/api/wait", json=body | {"wait": min(CALL_SECONDS, left)})
@@ -204,11 +230,14 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
             continue
         failing_since, failures = None, 0
         state = answer.get("state") if isinstance(answer, dict) else None
+        if state != "idle" or not traced_first:
+            trace("answer", state=state)        # the first answer (armed at the hub) and every one not idle
+            traced_first = True
         if state == "idle":
             rejected = 0        # the cap is on rejections in a row, not over a long session
         if state == "wake":
             not_before = started + STARTUP_GRACE if hook.get("hook_event_name") == "SessionStart" else None
-            woken = _woken(client, body, answer, stderr, not_before, clock, sleep)
+            woken = _woken(client, body, answer, stderr, not_before, clock, sleep, trace)
             if woken is not None:
                 return woken
             rejected += 1
@@ -221,7 +250,8 @@ def _run(agent, projects, max_seconds, stdin, stderr, environ, client, sleep, cl
 
 
 def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float | None = None,
-           clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> int | None:
+           clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+           trace: Callable[..., None] = lambda *a, **k: None) -> int | None:
     """Acknowledge the wake, then wake the session (WAKE): when the hub accepts the acknowledgement, or when it could
     not be delivered at all (no answer, or a 5xx: the hub then takes the wake back after a while and may offer the
     same posts once more). 0 when the hub says this process was superseded or the feature is off, or refuses the
@@ -232,11 +262,14 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float
     text, wake_id = answer.get("text"), answer.get("id")
     if not (isinstance(text, str) and WAKE_RE.fullmatch(text) and isinstance(wake_id, str)):
         return 0
+    trace("offer", id=wake_id)
     for _ in range(ACK_TRIES):
+        trace("ack_sent", id=wake_id)
         try:
             r = client.post("/api/wait", json=body | {"ack": wake_id, "wait": 0}, timeout=5)
         except Exception:
             r = None        # not delivered: woken all the same
+        trace("ack_answer", status=getattr(r, "status_code", None))
         if r is None or r.status_code >= 500:
             break
         if r.status_code != 200:
@@ -258,8 +291,12 @@ def _woken(client: Any, body: dict, answer: dict, stderr: Any, not_before: float
     # Acknowledged at once (the hub's deadline stands); the wake itself waits out the start-up grace of a
     # SessionStart hook. SIGTERM, SIGHUP, SIGINT or the Claude process going away still end this process (exit 0)
     # meanwhile; the hub then returns the wake nobody read (O5).
-    while not_before is not None and (left := not_before - clock()) > 0:
-        sleep(min(left, 1.0))
+    if not_before is not None and not_before - clock() > 0:
+        trace("grace_begin", seconds=round(not_before - clock(), 3))
+        while (left := not_before - clock()) > 0:
+            sleep(min(left, 1.0))
+        trace("grace_end")
     stderr.write(text + "\n")
     stderr.flush()
+    trace("wake_written")
     return WAKE
