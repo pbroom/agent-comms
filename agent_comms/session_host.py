@@ -251,18 +251,25 @@ def bound_template(template: list[str], bind: str | None, codex_config: dict | N
     Claude Code gives an MCP server its own environment."""
     if bind is None or not template or os.path.basename(template[0]) != "codex":
         return template
+    return [*template, *env_vars_override(template, BIND_ENV, codex_config)]
+
+
+def env_vars_override(template: list[str], add: tuple[str, ...], codex_config: dict | None) -> list[str]:
+    """`["-c", "mcp_servers.agent-comms.env_vars=[...]"]`: the list in force for the board server of this Codex
+    runner with the names `add` added (see `bound_template`); [] when nothing can be added (no such server, one this
+    host cannot read, or not a stdio one). Also used by dispatch.with_managed_env for a dispatched Codex run."""
     entry = _effective_server(template, codex_config)
     if entry is None or not isinstance(entry.get("command"), str) or "url" in entry:
-        return template         # no such server, one this host cannot read, or not a stdio one: nothing to pass on
+        return []               # no such server, one this host cannot read, or not a stdio one: nothing to pass on
     current: Any = entry.get("env_vars", [])
     if not isinstance(current, list):
-        return template
+        return []
     names = {v if isinstance(v, str) else v.get("name") for v in current if isinstance(v, (str, dict))}
-    merged = list(current) + [n for n in BIND_ENV if n not in names]
+    merged = list(current) + [n for n in add if n not in names]
     items = [_toml_item(v) for v in merged]
     if any(x is None for x in items):
-        return template
-    return [*template, "-c", f"mcp_servers.{session_access.BOARD_SERVER}.env_vars=[{', '.join(items)}]"]
+        return []
+    return ["-c", f"mcp_servers.{session_access.BOARD_SERVER}.env_vars=[{', '.join(items)}]"]
 
 
 def _effective_server(template: list[str], codex_config: dict | None) -> dict | None:

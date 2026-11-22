@@ -5817,8 +5817,9 @@ caught).
   (quoted and labelled as untrusted today).
 - `board_session_status` and `board_session_cancel` reach the caller's own ended children without a grant until the
   records are pruned.
-- A Codex dispatched run: forward AGENT_COMMS_MANAGED to its board server (`env_vars`), so the environment check
-  covers it as it covers Claude's, not only its registered board session.
+- *Done.* A Codex dispatched run forwards AGENT_COMMS_MANAGED to its board server (`dispatch.with_managed_env`, the
+  hosted binding's `env_vars` override, on the hub and on a node), so the environment check covers it before it
+  registers, as it covers Claude's.
 
 ## Session host: deeper trees (2026-11-22)
 

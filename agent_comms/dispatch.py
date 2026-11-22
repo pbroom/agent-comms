@@ -535,6 +535,18 @@ def with_headless_browser(template: list[str], overrides: list[str]) -> list[str
     return template[:i] + overrides + template[i:]
 
 
+def with_managed_env(template: list[str], env: dict[str, str]) -> list[str]:
+    """A dispatched Codex run: Codex starts an MCP server with a small fixed environment, not its own, so the board
+    server is told to take AGENT_COMMS_MANAGED (child_env sets it to 1) from the run's, as Claude's board server does;
+    the spawn tools then refuse the run from its environment, before it registers (hosted_spawn.Ident.managed). The
+    same `env_vars` override as a hosted session's binding (session_host.env_vars_override). Last: it must follow
+    with_codex_inbox_mcp's whole-table `mcp_servers={...}` override, which drops dotted keys set before it."""
+    if not uses_codex(template):
+        return template
+    from .session_host import codex_config_of, env_vars_override
+    return with_headless_browser(template, env_vars_override(template, ("AGENT_COMMS_MANAGED",), codex_config_of(env)))
+
+
 # ---------------------------------------------------------------- signed-in browser profiles (access.py)
 # `[dispatch.browser_profiles."<origin>"] user_data_dir = "..."`: a browser profile on this machine that the human
 # signed in to that site once. A Codex run launched for signed-in work on that origin (its record's browser_access)
@@ -2944,6 +2956,7 @@ class Dispatcher:
                         raise Conflict(conflict)
                     template = with_headless_browser(template, signed_in_browser_overrides(
                         self.config.headless_browser, profile, record["signed_in_browser"]["output_dir"]))
+                template = with_managed_env(template, child_env(agent, self.config, runtime=self._runtime(agent)))
                 argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
                 child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
                                      log_path=log_path)

@@ -3229,6 +3229,38 @@ def test_after_review_a_dispatched_run_is_refused_by_all_five_spawn_tools(senv, 
         "no budget spent, no child touched, no audit line"
 
 
+def test_a_managed_run_is_refused_by_all_five_spawn_tools_before_it_registers(senv, monkeypatch):
+    """A dispatched run's board server that sees AGENT_COMMS_MANAGED=1 (a Claude run's, and now a Codex run's:
+    dispatch.with_managed_env) is refused by every spawn tool from its environment alone, before any board_register.
+    No budget, no child touched, no audit line."""
+    from mcp import Client
+    grant(senv)
+    kid = spawn(senv, interactive(senv))["child"]["id"]
+    hs.flush(senv.board)
+    before = (_posts(senv), hs._usage(senv.board.conn, "claude", PROJECT, senv.clock()), stored(senv, kid))
+    monkeypatch.setenv("AGENT_COMMS_TOKEN", senv.tokens["claude"])
+    monkeypatch.delenv(hs.HOSTED_ENV, raising=False)
+    monkeypatch.delenv(hs.KEY_ENV, raising=False)
+    monkeypatch.setenv(hs.MANAGED_ENV, "1")
+
+    async def as_the_run():
+        async with Client(build_mcp(senv.board, "stdio")) as c:
+            return [await c.call_tool(name, args) for name, args in (
+                ("board_session_capabilities", {"project": PROJECT}),
+                ("board_session_spawn", {"task": "start one more", "project": PROJECT}),
+                ("board_session_send", {"child": kid, "message": "more"}),
+                ("board_session_status", {"child": kid}),
+                ("board_session_cancel", {"child": kid, "close": True}))]
+
+    caps, *refused = asyncio.run(as_the_run())
+    out = json.loads(caps.content[0].text)
+    assert not caps.is_error and out["may_spawn"] is False and hs.DISPATCHED in out["why_not"]
+    for r in refused:
+        assert r.is_error and hs.DISPATCHED in r.content[0].text, r.content[0].text
+    hs.flush(senv.board)
+    assert (_posts(senv), hs._usage(senv.board.conn, "claude", PROJECT, senv.clock()), stored(senv, kid)) == before
+
+
 def test_after_review_the_remote_bridge_says_a_process_is_managed_and_the_hub_refuses_it(senv):
     """Over the remote bridge: what the bridge sends for a managed process without a binding (Ident.headers), the
     gateway forwards, and the hub reads back (Ident.from_headers): refused like the stdio server."""

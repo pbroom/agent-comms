@@ -369,6 +369,22 @@ def test_a_node_runs_browser_bound_work_with_its_own_scoped_headless_browser(nen
     assert not out_dir.exists(), "the browser output goes once the run has ended"
 
 
+def test_a_node_starts_a_codex_run_with_agent_comms_managed_for_its_board_server(nenv, tmp_path, monkeypatch):
+    """As the hub's dispatcher does (dispatch.with_managed_env): the run's board server takes AGENT_COMMS_MANAGED."""
+    _browser_node(nenv, tmp_path, monkeypatch, headless=False)
+    (tmp_path / "home" / ".codex").mkdir()
+    (tmp_path / "home" / ".codex" / "config.toml").write_text('[mcp_servers.agent-comms]\ncommand = "bash"\n')
+    nenv.node.hello()
+    allow(nenv, agents=["codex"])
+    human_post(nenv, ["codex"], body="Plain code task")
+    nenv.d.tick()
+    nenv.node.tick()
+    [call] = nenv.node_spawner.calls
+    assert call["env"]["AGENT_COMMS_MANAGED"] == "1"
+    i = call["argv"].index('mcp_servers.agent-comms.env_vars=["AGENT_COMMS_MANAGED"]')
+    assert call["argv"][i - 1] == "-c" and i < len(call["argv"]) - 1
+
+
 def test_browser_bound_work_is_refused_when_no_node_can_attach_a_browser(nenv, tmp_path, monkeypatch):
     _browser_node(nenv, tmp_path, monkeypatch, headless=False)
     assert nenv.node.hello()["headless_browser"] == []

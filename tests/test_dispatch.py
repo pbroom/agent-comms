@@ -1101,6 +1101,53 @@ def test_codex_runner_missing_browser_approvals_is_refused_with_named_tools(denv
     assert denv.board.list_dispatch_rules(denv.p["human"])[0]["launches_left"] == 3
 
 
+FULL_CODEX = (["codex", "exec", "--cd", "{project}"]
+              + [a for t in dispatch.CODEX_PREAPPROVED_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
+              + ["{prompt}"])
+MANAGED_OVERRIDE = 'mcp_servers.agent-comms.env_vars=["FOO", "AGENT_COMMS_MANAGED"]'
+
+
+def _codex_home(tmp_path, monkeypatch, extra=""):
+    """A HOME whose Codex config defines the board's stdio server (forwarding FOO) and, with `extra`, more."""
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "config.toml").write_text(
+        '[mcp_servers.agent-comms]\ncommand = "bash"\nargs = ["stdio.sh"]\nenv_vars = ["FOO"]\n' + extra)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    return {"HOME": str(home)}
+
+
+def test_a_codex_run_forwards_agent_comms_managed_to_its_board_server(tmp_path, monkeypatch):
+    """Codex gives its MCP servers a small fixed environment, so a dispatched Codex run's board server is told to
+    take AGENT_COMMS_MANAGED from the run's (`env_vars`, the list in force with the name added), before {prompt}.
+    A Claude runner, or a Codex one without a stdio board server, is left as it is."""
+    env = _codex_home(tmp_path, monkeypatch)
+    argv = dispatch.with_managed_env(FULL_CODEX, env)
+    i = argv.index(MANAGED_OVERRIDE)
+    assert argv[i - 1] == "-c" and argv[i + 1] == "{prompt}" and argv[:i - 1] == FULL_CODEX[:-1]
+    assert dispatch.with_managed_env(["claude", "-p", "{prompt}"], env) == ["claude", "-p", "{prompt}"]
+    assert dispatch.with_managed_env(FULL_CODEX, {"HOME": str(tmp_path / "nowhere")}) == FULL_CODEX
+    # After the inbox narrowing's whole-table `mcp_servers={...}` override, which drops dotted keys set before it.
+    _codex_home(tmp_path / "2", monkeypatch, '[mcp_servers.other]\ncommand = "x"\n')
+    narrowed = dispatch.with_codex_inbox_mcp(FULL_CODEX, {"HOME": os.environ["HOME"]})
+    argv = dispatch.with_managed_env(narrowed, {"HOME": os.environ["HOME"]})
+    assert argv.index(MANAGED_OVERRIDE) > argv.index('mcp_servers={"other"={enabled=false}}')
+
+
+def test_a_dispatched_codex_run_is_launched_with_agent_comms_managed_for_its_board_server(denv, tmp_path,
+                                                                                          monkeypatch):
+    _codex_home(tmp_path, monkeypatch)
+    denv.config.runners["codex"] = list(FULL_CODEX)
+    allow(denv, agents=["codex"])
+    human_post(denv, ["codex"])
+    denv.d.tick()
+    [call] = denv.spawner.calls
+    assert call["env"]["AGENT_COMMS_MANAGED"] == "1", "the run's own environment, as for Claude"
+    i = call["argv"].index(MANAGED_OVERRIDE)
+    assert call["argv"][i - 1] == "-c" and i < len(call["argv"]) - 1, "an option, before the prompt"
+
+
 def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, capsys, tmp_path):
     denv.d.release_loop()
     home = tmp_path / "home"
