@@ -560,7 +560,7 @@ def test_other_permission_modes_are_hosted_as_configured(senv):
         assert value_after(host._argv(s), "--permission-mode") == mode
 
 
-def test_a_scoped_session_carries_the_denied_tool_instruction_as_an_appended_system_prompt(senv):
+def test_a_scoped_session_carries_its_commands_and_the_denied_tool_instruction_as_an_appended_system_prompt(senv):
     def argv(runner, **over):
         host = SessionHost(node_config(senv, runners={"claude-code": runner}, **over), senv.tmp / "scoped-logs")
         return host._argv(host.open(UNKNOWN, agent="claude", runtime="claude-code", project=PROJECT))
@@ -568,13 +568,17 @@ def test_a_scoped_session_carries_the_denied_tool_instruction_as_an_appended_sys
     plain = argv(SHIPPED)
     assert "--append-system-prompt" not in plain and "--allowedTools=mcp__agent-comms" in plain, "scoping is opt-in"
     scoped = argv(SHIPPED, claude_tool_projects=[PROJECT])
-    assert value_after(scoped, "--append-system-prompt") == rp.DENIED_TOOL_INSTRUCTION
+    template = rp.scoped_template(SHIPPED)
+    text = rp.tools_notice(template) + " " + rp.HOSTED_DENIED_TOOL_INSTRUCTION
+    assert value_after(scoped, "--append-system-prompt") == text, "the hosted wording (test_scoped_notice)"
+    assert rp.DENIED_TOOL_INSTRUCTION not in text, "its own wording: a request to block, or none (test_scoped_notice)"
     assert "--allowedTools=" + ",".join(rp.ALLOWED) in scoped and scoped.count("--append-system-prompt") == 1
     own = argv(SHIPPED + ["--append-system-prompt", "Be brief."], claude_tool_projects=[PROJECT])
     assert own.count("--append-system-prompt") == 1
-    assert value_after(own, "--append-system-prompt") == "Be brief.\n\n" + rp.DENIED_TOOL_INSTRUCTION
+    assert value_after(own, "--append-system-prompt") == "Be brief.\n\n" + text
     assert rp.with_denied_tool_instruction(["claude", "--append-system-prompt=Be brief.", "{prompt}"]) == [
-        "claude", "--append-system-prompt=Be brief.\n\n" + rp.DENIED_TOOL_INSTRUCTION, "{prompt}"]
+        "claude", "--append-system-prompt=Be brief.\n\n" + rp.tools_notice(["claude", "{prompt}"]) + " "
+        + rp.HOSTED_DENIED_TOOL_INSTRUCTION, "{prompt}"]
 
 
 def test_a_process_idle_for_idle_hours_is_stopped_and_the_next_message_resumes_the_session(senv):

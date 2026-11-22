@@ -628,7 +628,25 @@ What to know:
     short): the transcript notes its length.
   A session whose process reports `bypassPermissions` without having been started as a full-access one is ended.
   Otherwise the runner is hosted as written. A project in `claude_tool_projects` gets the scoped tools, as a run
-  does.
+  does, and is told which forms it can use: its appended system prompt, written on the node from its own scoped
+  command line (never from the task or the board), lists the shipped forms: the git commands, a new branch named
+  `codex/<name>` (`git switch -c codex/<name>`), tests as `uv run pytest ...` or `pytest ...` (not `python -m
+  pytest`), and the read-only `gh` commands, with "other commands may be refused without asking". That plain text
+  is used only for a runner whose options are all known not to restrict tools; any other option a scoped launch
+  accepts (a deny rule, `--tools`, `--restricted`, a plugin, or one this code does not know) gets the same list with
+  a warning that any of these forms may also be refused; its own rule text is never copied in. (A runner's own
+  `--settings` is refused outright, as before.) A session asked
+  for at `read-only` (the access word), and a runner that declares itself read-only, are not scoped and get no such
+  text; a session whose computed label only comes out as `read-only` can still be. When a command it needs is
+  refused it stops: a root woken by a board post (above) marks the request it is working blocked, naming the command
+  (the session holds that request, so nothing else would relaunch it or alert you); a human's turn or a child's task
+  has no request, so it says which one in its reply. A runner's own `--append-system-prompt` is kept, with this
+  after it. A resumed session keeps the system prompt it was started with (Claude records it at the first request
+  and sends that record until the conversation is compacted), so a session started before this version, or before a
+  change to its runner's rules, keeps its old instruction and notice until it is compacted or a new session is
+  started; a new session is the remedy. `--system-prompt-snapshot off` in the runner makes every request take the
+  current text, at the cost of prompt-cache reuse; that is the machine owner's choice. DESIGN_NOTES "Scoped sessions
+  are told their commands".
 - **A lost turn is not retried.** A turn that timed out (`[dispatch] timeout_minutes`), whose process died, or whose
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.
@@ -1793,8 +1811,9 @@ while `tasks.auto_recover_stalled_work` is on and the board is not paused. Only 
 blocked, which is when it reaches you. Retries do not use up the approval's `max_launches` (it counts distinct
 launches), and task leases the ended run held on the thread are expired so the retry can reclaim them. A run that
 failed to start blocks at once (relaunching cannot fix it). A run whose tool is denied should block its request
-itself; if it exits without doing so it is retried like a crash, so a denied tool can cost up to two extra runs
-before the request blocks. To stop a runaway
+itself (a scoped Claude run's prompt, in a `claude_tool_projects` project, offers the command forms its command
+line allows and tells it to); if it exits without doing so it is retried like a crash, so a denied tool can cost up
+to two extra runs before the request blocks. To stop a runaway
 agent, use `board dispatch stop` (a halt); killing its process by hand counts as a crash and is retried.
 
 A plain stop (and Ctrl-C, SIGTERM, or the Settings page's stop) is a halt: the stopped agents' requests stay blocked

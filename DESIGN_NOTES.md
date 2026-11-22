@@ -2330,7 +2330,9 @@ marker included (`providers.cap_reply`), `HostEvent.text` passes it on, and the 
 **Policy (the human's decisions).**
 - Tool scoping stays opt-in exactly as in PR 1 (`runner_preflight.scoped`). A scoped session gets
   `runner_preflight.DENIED_TOOL_INSTRUCTION` through `--append-system-prompt` (a session has no launch prompt to
-  carry it); a runner that already appends its own system prompt keeps it, with the instruction after it, in the one
+  carry it; since "Scoped sessions are told their commands" it is the notice of its commands and
+  `HOSTED_DENIED_TOOL_INSTRUCTION` instead); a runner that already appends its own system prompt keeps it, with
+  the instruction after it, in the one
   flag. Neither `OWN_FLAGS` nor `scoped_template` refuses that flag.
 - A runner with `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` or `--permission-mode
   bypassPermissions` cannot be hosted: `open` raises (`providers.claude.bypasses_permissions`) and the hub shows the
@@ -6299,3 +6301,151 @@ dispatcher, recovery waits, the undelivered alert, Unstick and open obligations,
 including authors and the human as routed assignees, access-routed and closed-thread successors, the skipped browser
 gate on both entry points, settlement rollback, idempotent retry); two older tests that pinned the blanket refusal now
 pin the new rules.
+
+## Scoped sessions are told their commands (2026-11-22)
+
+**What happened.** On the owner's machines a hosted child at `workspace` in a `claude_tool_projects` project ran with
+`runner_preflight.ALLOWED` in `dontAsk` mode, made its edit, then had `git switch -c w1-design-notes-node-protocol`,
+`git commit -am ...` and `python -m pytest -q tests/...` refused and reported itself blocked. Nothing had told it
+that a branch must be `codex/...` or that tests run as `uv run pytest ...`; its appended instruction told it to call
+`board_request_progress`, which needs a request post id its task (a child's task, a session turn) did not have.
+The owner's decision: the worker must be told which commands it may run.
+
+**What the text says.** `runner_preflight.tools_notice(argv)`, for the shipped runner scoped (874 characters):
+
+> Use the forms below. Other commands may be refused without asking. You may edit and create files in your run
+> directory. Commands: git: `git status ...`, `git diff ...`, `git log ...`, `git show ...`, `git rev-parse ...`,
+> `git add ...`, `git commit ...`, `git fetch origin`, `git fetch origin main`, `git worktree add -b codex/<name> ...`,
+> `git switch -c codex/<name> ...`; tests: `uv run pytest ...`, `pytest ...` (not `python -m pytest`); GitHub,
+> read-only: `gh --version`, `gh pr view ...`, `gh pr list ...`, `gh pr diff ...`, `gh pr checks ...`,
+> `gh run view ...`. `...` is any arguments, or none. A new branch must be named `codex/<name>`:
+> `git switch -c codex/<name>`. A git command line holding --force, --discard-changes or a word starting with -f
+> anywhere, a commit message included, is refused. Run each command on its own, not chained to another or wrapped
+> in one.
+
+Then, by where the agent's task comes from (decided at the call site, from what the code there already is; no new
+field between hub and node):
+- *Dispatched run* (dispatch.py, node.py: launched for board request posts): `dispatched_instruction` appends the
+  notice and the unchanged `DENIED_TOOL_INSTRUCTION` ("... mark the request blocked (board_request_progress
+  state=blocked) naming the denied tool, and stop.") to the prompt, as the instruction alone was before (1,025
+  characters).
+- *Hosted session*, root or child (session_host.py: its task is a turn): `with_denied_tool_instruction` passes the
+  notice and `HOSTED_DENIED_TOOL_INSTRUCTION` ("If a command you need is refused, do not work around it: if you are
+  working a board request, mark it blocked (board_request_progress state=blocked) naming the command; otherwise say
+  in your reply which one. Then stop.") through `--append-system-prompt` (1,092 characters). One text for both
+  kinds of turn (after the PR review): a human's message or a child's task has no request post, but a root woken by
+  a board post (hosted_wake.py) works request posts addressed to its agent, and once it has been shown one,
+  `hosted_wake.holds` keeps the request for the session, so the dispatcher does not relaunch it and the undelivered
+  alert skips it (delivery.py). Telling such a root only to say so in its reply would leave the request started,
+  held and unseen by the human; it blocks it instead, as on main. The host cannot tell the two apart at launch (one
+  process serves every turn of the session), so the text says both. A runner's own
+  `--append-system-prompt` (either spelling) is kept, the text after it in the same flag, as before; a runner's own
+  `--system-prompt-snapshot` is left as written (below).
+
+**One coarse rule, not a model (review round 2).** The text is built on the node from the scoped command line,
+never from the task or the board. It always lists the shipped forms, read from the allow rules this code writes
+(`ALLOWED`), so text and rules cannot drift; an allow rule it has no words for raises (`ALLOWED` is the only source of
+allow rules on this path, so that is a change to this file), and the tests hold every listed form against its rule.
+Round 1 tried to drop each form a runner's own restriction could cover; round 2 found three more interactions that
+got wrong (`--disallowedTools=*` takes Bash, Edit and Write away; a `Read(./**)` deny refuses Edit and Write too; in
+`--tools=Read --append-system-prompt --tools=Bash` the second token is the prompt's value, not a tool list), so the
+modelling is gone. In its place one boolean, `own_restrictions()`, erring toward yes. Since round 3 it is an
+allowlist: the plain text is used only for a runner whose options are all known not to restrict tools, and any other
+option gets the warning. No only when every token of the scoped command line is accounted for: the `claude`
+executable, the `{prompt}` placeholder, the allow and deny lists exactly as `scoped_template` writes them (the deny
+list holding `DENIED` alone), `--permission-mode dontAsk`, the host's own `--settings` value, and `SAFE_OPTIONS`
+(`-p`/`--print`, `--verbose`, `--strict-mcp-config`, `--model`, `--effort`, `--append-system-prompt`,
+`--input-format`, `--output-format`, `--session-id`, `--resume`, `--permission-prompts`, `--system-prompt-snapshot`,
+and `--mcp-config` with one or more values), each consuming its value(s) without reading them. Anything else is a
+yes: an option this code has never heard of, a known one in another spelling, a switch given a value, a value that
+starts with `-` (Claude may read it either way), a stray positional, another executable (a runner's own
+`--settings` never gets this far: `scoped_template` refuses it, as on main). A
+list of restricting options was always one option behind the CLI: round 3 found two hidden ones of Claude Code
+2.1.322 that `claude --help` does not list, `--plugin-dir-no-mcp` (accepted; a plugin loaded through it with a
+PreToolUse hook blocked Bash, seen live) and `--project-config-root` (accepted when it names an existing directory;
+it can select project settings that deny tools), while a made-up `--some-new-flag` is refused by the CLI. Patterns,
+tool-name globs and path scopes are never read. A wrong yes only softens the words; a wrong no would promise a
+refused form. The shipped `claude-code` runner, board.toml's commented `acceptEdits` example and the owner's own
+shape (`claude -p {prompt} --permission-mode acceptEdits --allowedTools=...`) all come out plain once scoped (tested),
+as does the full command line the host starts (its stream flags, settings value, session id and model). The
+commented triage runner would come out softened (its own deny rules), but it declares itself read-only and is never
+scoped.
+- No (the shipped runner, as on the owner's machines): the text above.
+- Yes: the same list, opening "This runner has restrictions of its own, so any of the forms below may also be
+  refused. Other commands may be refused without asking.", and "You may be able to edit and create files in your run
+  directory."; nothing is stated as available. Hosted 1,170 characters, dispatched 1,103 for the shipped list.
+The shipped `DENIED` rules are one fixed sentence (`DENIED_WORDS`, held against the tuple by a test), and nothing of
+the runner's own text is copied in (a deny rule with backticks and a newline leaves no trace). The board's tools are
+not claimed: whether its MCP server is loaded cannot be read off the argv (a dispatched run's prompt asks for them on
+its own).
+
+Seen on Claude Code 2.1.322 (haiku, `--setting-sources= --strict-mcp-config`, dontAsk):
+- A trailing ` *` matches the bare command, in an allow rule and in a deny rule: `Bash(gh pr view *)` denied refused
+  `gh pr view` while `Bash(gh pr view)` was allowed.
+- `Edit(path)` decides writes for Edit and Write alike: with `Edit(./**)` allowed alone the Write tool created a file;
+  with `Write(./**)` allowed alone it was refused; with `Write(./**)` allowed and `Edit(./**)` denied it was refused.
+  (`Write(./**)` in `ALLOWED` grants nothing; it is left as it is.) A `Read(./**)` deny refused a Write ("covered by
+  a Read deny rule").
+- `--disallowedTools=*` started with no tools at all; `--restricted --tools=default` without Bash; `--tools=Read
+  --append-system-prompt --tools=Bash` with Read alone (the init event's tools).
+- `Bash(git *--force*)` refused `git commit --allow-empty -m 'never use --force here'`: the rule matches anywhere on
+  the line, hence "a commit message included".
+
+**Resumed sessions (review round 1).** Claude Code records a conversation's system prompt at its first request and
+sends that record on every resume until the conversation is compacted (`claude --help`, `--system-prompt-snapshot`).
+Seen live: a session started with `--append-system-prompt "The codeword is ALPHA."`, resumed with BRAVO, still
+answered ALPHA; resumed with CHARLIE and `--system-prompt-snapshot off` it answered CHARLIE, and DELTA the next time.
+The node does not pass that flag (a reversal after round 1, the coordinator's ruling): with it off the system prompt
+is rendered for every request, its per-machine parts (git status, for one) change as a worker edits, and the prompt
+cache is lost turn after turn for the life of every scoped hosted session, a permanent cost to fix a one-time case.
+So this is a stated limit: a resumed session keeps the system prompt it was started with, and a session started
+before this version, or before a change to its runner's rules, keeps its old instruction and notice until it is
+compacted or a new session is started. A new session is the remedy; `--system-prompt-snapshot off` in the runner
+(left as written, like any value a runner sets) is the machine owner's option if they prefer freshness over cache
+reuse. Dispatched runs are one prompt and never resumed.
+
+**Variants.** `ALLOWED` is the same for every project, agent, worktree and access word, so the list is too; what
+varies is whether the runner has restrictions of its own. Tests pin the shipped runner's text exactly (also for an
+`acceptEdits` runner, `--strict-mcp-config` and an own appended prompt), and the softened text for an overlapping deny,
+an unrelated `WebFetch` deny, `--disallowedTools=*`, a `Read(./**)` deny, both flag spellings, an empty deny list,
+`--tools` (also `default`), `--restricted`, the N3 command line, an agent, a plugin directory, the two hidden
+options in both spellings, a made-up option, a stray positional and a hostile deny text; each allowlisted option alone
+stays plain;
+as well as a root session, a child at `workspace` in its own worktree, and a local dispatched run and a node run,
+each pinned prompt and argv in full. Not scoped, and so given no text: a session asked for at `read-only` (the access
+word), a runner that declares itself read-only (`read_only()`), a `full` session, Codex, and any project not in
+`claude_tool_projects` (pinned byte for byte for an unscoped hosted session and an unscoped dispatched run). A
+session whose computed label only comes out as `read-only` can still be scoped (follow-ups). `hosted_spawn.py`'s
+frame text is unchanged.
+
+**The `codex/` prefix.** It came in with "Preserve pickup authorization and routine isolated worktree commands"
+(829944a) and is a naming convention only (Codex's own branch prefix): no code, hook or CI reads it, and `git switch
+-c codex/<name>` works the same for a Claude worker in its own worktree on a detached HEAD (the real check below did
+exactly that). It is left as it is and stated in the notice. Allowing the agent's own name as a second prefix
+(agent names are `[a-z][a-z0-9_-]{0,31}`, safe in a rule) would make `ALLOWED` vary per agent and add a rule to every
+scoped launch, for a name only; not done.
+
+**Proof.** `tests/test_scoped_notice.py` (61 tests) and the hosted test in `test_hosted_sessions.py`; 30 one-line
+mutations (an unknown option let through, the boolean both ways, removing each kind of allowlist entry, the value
+checks, the softened opening and file sentence, the list, the hosted wrapper and the call sites), 30 caught. Real
+check (Claude Code 2.1.322, `--model haiku`; run in round 1, when the argv also carried `--system-prompt-snapshot off`; the shipped runner's text has not changed since):
+the argv `SessionHost` builds for a hosted session in an opted-in project, plus only `--setting-sources=
+--strict-mcp-config`, in a temp git repository, asked to create a branch, change README.md, commit and run the tests:
+`git status`, `git switch -c codex/update-readme`, an Edit, `git add README.md && git commit -m ...`, `pytest
+tests/`, each on the first try, `permission_denials: []`. (It chained the add and the commit; both are allowed, so
+the line was.)
+
+**Residual.**
+- Allow or deny rules in the machine's own or managed Claude settings still apply under `dontAsk` and cannot be
+  seen from the argv; the opening line ("may be refused") covers the one direction, and Claude Code's own read-only
+  commands (`ls` ran with no rule in the first real check) the other.
+- An option on the allowlist could gain a tool-restricting meaning in a later Claude Code; the list is kept to
+  options with a fixed, non-tool meaning.
+- Two parts of the machine owner's own configuration are not on the command line and cannot be seen: environment
+  variables given to the runner through `[dispatch.env]` (Claude Code reads some that change its behaviour), and a
+  wrapper executable named `claude` (the check reads only the file name).
+
+**Follow-ups (seen in review, unchanged from main).**
+- A runner configured with `--tools=Read` can enter the scoped path (`read_only()` does not look at `--tools`) and
+  be labelled read-only afterwards (`claude_label`); it then gets the softened list.
+- The dispatched instruction names `board_request_progress` even when a runner denies that tool.

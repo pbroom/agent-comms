@@ -2923,12 +2923,12 @@ class Dispatcher:
                 if template is None:
                     raise LookupError(f"no runner configured for {agent}")
                 from . import runner_preflight
-                # An opted-in project runs Claude with scoped implementation tools (runner_preflight.ALLOWED); a denied
-                # tool is the agent's to report as a blocker. A read-only runner (the triage agent's) keeps its own
-                # narrower tools: the scoped override would widen it.
+                # An opted-in project runs Claude with scoped implementation tools (runner_preflight.ALLOWED); its
+                # prompt says which commands those are, and a denied tool is the agent's to report as a blocker. A
+                # read-only runner (the triage agent's) keeps its own narrower tools: the scoped override would widen it.
                 if not inbox and runner_preflight.scoped(template, project, self.config.claude_tool_projects):
                     template = runner_preflight.scoped_template(template)
-                    prompt += " " + runner_preflight.DENIED_TOOL_INSTRUCTION
+                    prompt += " " + runner_preflight.dispatched_instruction(template)
                 if not inbox:
                     # The signed-in browser's output directory is writable too, so a file to upload can be copied in.
                     template = with_writable_roots(template, self.config.extra_roots(template, project) + (
