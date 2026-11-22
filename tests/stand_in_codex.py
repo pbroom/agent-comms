@@ -16,6 +16,8 @@ own, its own `turn/completed`) and a `commentary` message, which the adapter mus
 What a turn does is in its text:
 - `sleep N ...`: the turn takes N seconds (and can be interrupted with `turn/interrupt`).
 - `fail ...`: the turn ends `failed` with an error.
+- `reject ...`: `turn/start` is answered with a JSON-RPC error: no turn is started at all.
+- `crash ...`: the process exits (code 3) at once, before any answer or event for the turn.
 - `deny ...`: the server asks to run a command (`item/commandExecution/requestApproval`), waits for the answer and
   reports the command `declined` unless it was accepted.
 - `mcp ...`: an MCP tool call fails because it would need approval (as under approvalPolicy never).
@@ -141,6 +143,11 @@ class Server:
                 # A turn/start while a turn is active steers into it: Codex answers with the active turn.
                 return self.write({"id": rid, "result": {"turn": self.turn_view(self.active["id"], "inProgress")}})
             text = "".join(x.get("text", "") for x in params.get("input", []) if isinstance(x, dict))
+            if text.startswith("reject"):
+                return self.error(rid, "stand-in: turn/start refused")
+            if text.startswith("crash"):
+                sys.stdout.flush()
+                os._exit(3)
             return self.turn(rid, tid, text)
         if method == "turn/interrupt":
             if self.active is None or params.get("turnId") != self.active["id"]:

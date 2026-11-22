@@ -102,6 +102,15 @@ def test_a_result_that_is_not_a_plain_success_is_a_failed_turn(change):
     p, _ = session()
     [ev], _ = p.feed(line({**DENIED_RESULT, "permission_denials": [], **change}))
     assert (ev.kind, ev.ok, ev.denials) == ("turn_ended", False, ())
+    assert ev.answered is True, "Claude's own result, an error too: it took the turn (result delivery, round 3)"
+
+
+def test_a_result_is_the_one_end_of_a_turn_that_says_claude_took_it():
+    p, _ = session()
+    [ev], _ = p.feed(line(DENIED_RESULT))
+    assert (ev.ok, ev.answered) == (True, True)
+    for raw in (line(INIT), line(PERMISSION_DENIED), b"not json", line({"type": "assistant"})):
+        assert all(e.kind != "turn_ended" for e in p.feed(raw)[0]), "nothing else ends a turn"
 
 
 @pytest.mark.parametrize("denials, names", [

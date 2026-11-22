@@ -728,7 +728,8 @@ class HandshakeProvider:
     def on_open(self):
         return [b'{"method":"initialize"}\n']
 
-    def turn(self, text):
+    def turn(self, text, kind="user"):
+        self.kinds = getattr(self, "kinds", []) + [kind]
         return [json.dumps({"method": "turn/start", "text": text}).encode() + b"\n"]
 
     def feed(self, line):
@@ -1492,6 +1493,53 @@ def turn_end(host, message_id, seconds=20.0):
                 return e
         time.sleep(0.02)
     raise AssertionError(f"the turn of {message_id} did not end within {seconds}s")
+
+
+def test_real_pipes_each_way_a_claude_turn_ends_says_whether_the_provider_took_it(tmp_path, monkeypatch):
+    """Round 3 of result delivery (S10): `answered` is the adapter's word, per path (providers.Event). Claude: a
+    `result` line for the turn, a success or an error, is the provider's own end; a process that exits before any of
+    the turn's lines, and a timeout the host ends by stopping the process, are not."""
+    host, s = real_host(tmp_path, monkeypatch, (ROOT / "tests" / "stand_in_claude.py").read_text(),
+                        timeout_seconds=3, grace=2)
+    try:
+        seen = []
+        for text in ("hello", "fail on purpose", "crash now", "sleep 30 then answer"):
+            ev = turn_end(host, host.send(SID, text), seconds=30)
+            seen.append((text, ev.ok, ev.answered))
+            while s.child is not None and s.stopping_since is not None:     # a stopped process goes first
+                host.tick()
+                time.sleep(0.02)
+        assert seen == [("hello", True, True), ("fail on purpose", False, True), ("crash now", False, False),
+                        ("sleep 30 then answer", False, False)]
+    finally:
+        host.stop_all()
+
+
+def test_real_pipes_each_way_a_codex_turn_ends_says_whether_the_provider_took_it(tmp_path):
+    """Codex: `turn/completed` for a turn that was accepted (its `turn/start` answered with the turn, or
+    `turn/started` seen) is the provider's own end, completed, failed or interrupted after a timeout; an error answer
+    to `turn/start`, a process that exits before anything of the turn, and a handshake that fails are not."""
+    store = tmp_path / "bin" / "stand-in-codex"
+    host = real_codex_host(tmp_path, timeout_seconds=3)
+    s = host.open(SID, agent="codex", runtime="codex-cli", project=PROJECT)
+    seen = []
+    try:
+        for text in ("hello", "fail on purpose", "reject this", "sleep 60 while the host waits", "crash now"):
+            ev = turn_end(host, host.send(SID, text), seconds=30)
+            seen.append((text, ev.ok, ev.answered))
+        thread = s.provider_id
+    finally:
+        host.stop_all()
+    assert seen == [("hello", True, True), ("fail on purpose", False, True), ("reject this", False, False),
+                    ("sleep 60 while the host waits", False, True), ("crash now", False, False)]
+    (store / "threads" / f"{thread}.json").unlink()    # the handshake fails: Codex cannot resume the thread
+    later = real_codex_host(tmp_path)
+    later.open(SID, agent="codex", runtime="codex-cli", project=PROJECT, resume=True)
+    try:
+        ev = turn_end(later, later.send(SID, "anyone there"))
+        assert (ev.ok, ev.delivered, ev.answered) == (False, False, False)
+    finally:
+        later.stop_all()
 
 
 def test_real_pipes_a_codex_session_takes_turns_declines_is_interrupted_in_band_and_resumes(tmp_path):

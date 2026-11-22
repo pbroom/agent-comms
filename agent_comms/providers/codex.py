@@ -264,7 +264,8 @@ class CodexSession:
         return [self._request("initialize", {"clientInfo": CLIENT,
                                              "capabilities": {"optOutNotificationMethods": list(OPT_OUT)}})]
 
-    def turn(self, text: str) -> list[bytes]:
+    def turn(self, text: str, kind: str = "user") -> list[bytes]:
+        # `kind` has no place in `turn/start` (its input is user items: text here): the text is all Codex gets.
         self._end_turn()
         self._turn_open = True
         params = {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]}
@@ -382,9 +383,11 @@ class CodexSession:
             # Only the answer to the request of the turn in flight (an earlier turn's request was retired when that
             # turn ended, so its late answer never names this one).
             if failed:
+                # Codex refused to START the turn: it never took it, so this end is no answer (Event.answered).
                 denials = tuple(self._denials)
                 self._end_turn()
-                return [Event("turn_ended", ok=False, denials=denials, detail=f"Codex refused the turn: {why}")], []
+                return [Event("turn_ended", ok=False, denials=denials, detail=f"Codex refused the turn: {why}",
+                              answered=False)], []
             turn = result.get("turn")
             if isinstance(turn, dict) and isinstance(turn.get("id"), str):
                 self._turn_id = turn["id"]
@@ -490,7 +493,9 @@ class CodexSession:
         detail = "" if ok else (_error_text(error) if isinstance(error, dict)
                                 else "the turn was interrupted" if status == "interrupted"
                                 else "Codex reported that the turn failed")
+        # Codex's own end of a turn it took: one whose id came from its answer to turn/start or from turn/started
+        # (Event.answered), whatever the status.
         event = Event("turn_ended", ok=ok, meta=meta, denials=tuple(self._denials), detail=detail,
-                      text=cap_reply(text))
+                      text=cap_reply(text), answered=self._turn_id is not None)
         self._end_turn()
         return event

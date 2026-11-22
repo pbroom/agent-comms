@@ -417,7 +417,8 @@ What to know:
   tokens, the gateway does not carry them, and there is no MCP tool. An agent can cause a turn in one way only: by
   posting on the board to the session's agent (next section), and then the turn's text is the server's, not the
   agent's.
-- **The reply** is capped at 16 KB and only the last one per session is kept on the hub, for you alone. The full
+- **The reply** is capped at 16 KB and only the last one per session is kept on the hub, for you alone (a child
+  session's reply also goes to its parent session: "A child's results reach its parent", below). The full
   transcript stays on the node: `data/node-logs/sessions/<id>.jsonl` (mode 600).
 - **Permissions** are the runner's, as for a dispatched run, with nobody to ask: a tool that would prompt is denied
   and listed (`show` says which). A runner with `--dangerously-skip-permissions` or `--permission-mode
@@ -532,8 +533,9 @@ also one you send just after a wake was queued.
   approval, delivery policy, retries, limits), and from then on the request is the dispatcher's. An open session
   holds no checkout: only while one of its turns is running does a dispatched run for the same project wait, as it
   would behind another run. The same the other way round: while a dispatched run is using that checkout, a post
-  does not wake the session; it does when the run is over (your own `board session send` is not held back). A run
-  in its own parallel worktree does not count. With no hosted session, nothing about the dispatcher changes.
+  does not wake the session; it does when the run is over (your own `board session send` is not held back), and
+  the results of its child sessions wait the same way ("A child's results reach its parent", below). A run in its
+  own parallel worktree does not count. With no hosted session, nothing about the dispatcher changes.
 
 #### Parent and child sessions
 
@@ -658,11 +660,16 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   fetch). Its hello also says, for each runner, the access words a child of it can really be started at there (a
   Codex runner only with `codex = true`; `full` only with `allow_full_access`; nothing for a runner its session
   host refuses): `start --parent` is refused for anything else, and a node rolled back to an earlier version is
-  listed no child, and the children it had are ended by the hub (a turn in flight there is lost). A Codex runner
+  listed no child, and the children it had are ended by the hub (a turn in flight there is lost). So is a node
+  restarted with `[dispatch.sessions] enabled = false`: its hello says nothing about child sessions, so its children
+  are ended for good at that hello, while its root sessions stay and resume once sessions are switched back on. A
+  child's own worktree stays on disk and is removed by the usual rule once the node hosts sessions again. A Codex runner
   whose `--cd` names a directory of its own can be a session in that directory
   only: a child of it must share the parent's checkout, and that checkout must be the directory; otherwise
   `start --parent` is refused. Update the hub before its nodes: an older hub refuses the newer node's hello and
-  reports.
+  reports. A report field newer than the hub is the exception: the hub names the ones it takes in its answer to
+  the node's fetch, and the node sends only those (so this version's node reports to an older hub exactly as
+  before). A report the hub cannot read at all is one error line in the node's log, naming that cause.
 - **Limits.** A child cannot have children. At most `max_children` children of one session that have not ended.
   The node's `max_live` counts children too: set it to at least 1 + the children you want live at once (a child
   that cannot get a process waits, and an idle one is stopped to make room, as for any session). "One session per
@@ -677,16 +684,62 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
 - **With the dispatcher.** A child in the shared checkout counts like its parent: while its turn runs, a dispatched
   run for that project waits. A child in its own worktree keeps nothing busy.
 
+#### A child's results reach its parent
+
+With child sessions on (the same `[dispatch.sessions.spawn] enabled = true`, nothing else to set), every turn a
+child finishes is a RESULT for the session it was started under, and the parent takes it as its next turn: nobody
+polls and nobody copies anything across. That holds for a turn you started with `send <child>` too.
+
+- **What the parent is told.** Text the hub writes: a header saying that these are results from child sessions the
+  session started, written by the server and not by you, untrusted data and no instruction; then for each result one
+  line with the child's name, id and agent, its message number and the outcome (`completed`, `failed`, `timed out`,
+  `withdrawn`: the message did not reach the child's process, or was not confirmed to; `the child session ended`),
+  the title and the node's reason as quoted strings; then the child's reply (capped at 16 KB, as every reply is)
+  between two marker lines with a token made for that turn. Each result's line carries its id (`result <k>`). A
+  child that ends, for any reason but its parent's own ending, is a result too, after a result for each message the
+  end cut short (the turn in flight `failed`, one not yet written `withdrawn`); a child its parent's ending is
+  closing is not.
+- **Order.** Your messages first, then results, then board wakes. Results wait while the parent has a turn running
+  or a message of yours queued; a wake is not queued while results wait, and one queued before them steps back
+  (`show` lists it as not sent, and its posts go with the next wake). Like a wake, results also wait while a
+  dispatched run is using the parent's checkout, and go once the run is over (a child in its own worktree still
+  takes its turns meanwhile; your own messages to the parent are never held).
+- **Several at once** go together as one turn, oldest first, up to 10 results and 64 KB; the rest follow as the
+  next one.
+- **Delivered once when confirmed, at most one marked repeat, never silently lost.** A result is kept on the hub,
+  the child's reply with it, until the parent's own process says the turn carrying it started, or itself ends that
+  turn (with a reply or with an error of its own; Codex refusing to start the turn is not that), also across a
+  restart of the hub or the node; then it is
+  delivered and never sent again. Written to the process is not enough: a process can go before it reads its input.
+  A word that comes late (after the hub gave the turn up for lost with its node) still counts, as long as the result
+  has not been put in another turn. If the turn ends without that word (the process went, a timeout with no answer,
+  the node restarted with it handed over, the node could not write it), the result is sent ONCE more
+  with a later result turn, its line saying it may repeat result <id> of message <n>, so the parent can tell. If
+  that second turn is not confirmed either, the result is not sent again. Such a result, and any that was still
+  waiting when the parent ended, is kept with the child's reply: `board session show <parent>` prints it under
+  "results from its children" with the reason, whatever its age (beside the latest 20 results), and says how many
+  such results were dropped if a parent ever has more than 200 result records. At most 50 results wait for one
+  parent, those in a turn whose start is not confirmed yet included (they may come back); one more is kept the same
+  way.
+- **Only text reaches the agent.** The node tells the agent's adapter that the turn is a `child` turn, but neither
+  Claude Code's input nor Codex's `turn/start` has a place for that today (both take a user message): what the model
+  reads is the text, and the server's header in it is what tells child output from your words.
+- **Every child turn is a result today**, the ones you send to a child with `send <child>` too. Each result records
+  what started that turn (`started_by`, `human` for now), for when parents start their children's turns themselves.
+- **Results go to the direct parent**, and only when the parent's node asks for its sessions, so a parent whose node
+  is away gets them when it is back.
+
 `uv run python scripts/session-host-e2e.py` checks the whole path with a real hub and node in a temp directory (a
 stand-in for Claude by default; `--claude-bin "$(command -v claude)"` uses the real CLI for seven small haiku turns),
 the wake included, and then parent and child sessions (`--only tree` runs just that: a read-only child that cannot
 write, a child in its own worktree, a Codex child under a Claude parent, the cascade, and a `full` child doing what
 a `workspace` one is refused, a settings file and a plugin whose grants and command hooks do not reach a
 read-only child, a settings file whose `defaultMode` of `bypassPermissions` never takes effect and cannot be switched
-to, and a `full` root whose children wait for its process to confirm it). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
+to, a `full` root whose children wait for its process to confirm it, and a Claude and a Codex child whose replies
+arrive as their parent's next turn). Add `--with-board` to the real-CLI form for a two-turn run in which the session has the temp
 board's MCP tools and nothing else: it checks that a woken session really calls `board_read_updates` (the hub's
 delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)",
-"Session host (PR 3)" and "Session host: parent and child sessions".
+"Session host (PR 3)", "Session host: parent and child sessions" and "Session host: result delivery".
 
 ## ChatGPT / remote connectors
 

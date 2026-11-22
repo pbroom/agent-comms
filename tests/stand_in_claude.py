@@ -7,6 +7,7 @@ tests and scripts/session-host-e2e.py install it as an executable named `claude`
 What a turn does is in its text:
 - `sleep N ...`: the turn takes N seconds.
 - `fail ...`: the result is an error.
+- `crash ...`: the process exits (code 3) at once, before anything of the turn is written.
 - `deny ...`: the result lists a refused Write (the turn itself succeeds, as Claude's does).
 - `big ...`: the reply is 40 KB.
 - `write NAME`: the turn tries to create the file NAME in its working directory with the Write tool.
@@ -207,6 +208,8 @@ def main() -> None:
                   flush=True)
             continue
         text = message["message"]["content"]
+        if text.startswith("crash"):
+            sys.exit(3)
         turn += 1
         if turn == 1:
             run_hooks(args, "SessionStart", sid)

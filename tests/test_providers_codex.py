@@ -79,6 +79,29 @@ def ready(**kw) -> CodexSession:
     return p
 
 
+def test_answered_says_codex_took_the_turn_and_a_refused_start_is_no_answer():
+    """Result delivery, round 3 (S10): a turn whose start Codex accepted ends `answered`, whatever its status; an
+    error answer to `turn/start` ends the turn with `answered` False (Codex never started it), and so does a
+    `turn/completed` for a turn neither its start answer nor `turn/started` ever named."""
+    for status in ("completed", "failed", "interrupted"):
+        p = in_turn()
+        [ev], _ = p.feed(line(completed(status=status)))
+        assert ev.answered is True, status
+    p = ready()
+    p.turn("hello")
+    assert p.feed(reply(3, TURN_REPLY)) == ([], [])     # accepted: the answer names the turn
+    [ev], _ = p.feed(line(completed()))
+    assert (ev.ok, ev.answered) == (True, True)
+    p = ready()
+    p.turn("hello")
+    [ev], _ = p.feed(reply(3, error={"code": -32600, "message": "turn/start refused"}))
+    assert (ev.kind, ev.ok, ev.answered) == ("turn_ended", False, False) and "Codex refused the turn" in ev.detail
+    p = ready()
+    p.turn("hello")
+    [ev], _ = p.feed(line(completed()))                 # no start answer, no turn/started: nothing named it
+    assert ev.answered is False
+
+
 def in_turn(text="hello", **kw) -> CodexSession:
     """... and with a turn in flight that Codex has named (request 3)."""
     p = ready(**kw)

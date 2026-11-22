@@ -25,8 +25,20 @@ from typing import Any, Callable, Protocol
 # `sealed`: the process's answer to whether bypassing permission checks is switched off in it (`ok`), from a provider
 # that asks (Claude, for a session started from a settings file its host merged).
 # `text` (turn_ended only): the turn's reply, capped by `cap_reply`. It is for the human who sent the message and for
-# nobody else: the hub keeps the last one per session and never hands it to an agent (hosted.py).
+# nobody else: the hub keeps the last one per session and never hands it to an agent (hosted.py), except a child
+# session's reply, which goes to its parent as untrusted data (hosted_results.py).
+# `answered` (turn_ended only): the ADAPTER's word that the provider took the turn (it read it and ended it itself).
+# The host passes it on as HostEvent.answered and the hub confirms a result turn by it (or by `turn_started`); it is
+# never read off `ok`. Which ends mean the provider took the turn:
+#   Claude: a `result` line for the turn, a success or an error of its own (`answered`).
+#   Codex:  `turn/completed` for a turn that was accepted, its id from the answer to `turn/start` or from
+#           `turn/started` (`answered`), whatever its status: completed, failed, or interrupted after a timeout.
+#   Not taken (`answered` False): Codex answering `turn/start` with an error (the turn never started).
+# Ends the HOST makes are never answered either: a handshake that fails (`start_failed`, a process that exits
+# before it is ready), a process that exits before any event of the turn, a timeout the host ends by stopping the
+# process, a write that fails, a turn withdrawn while being written (session_host._fail / _fail_start).
 KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed")
+TURN_KINDS = ("user", "wake", "child")     # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
 REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
 
@@ -53,6 +65,7 @@ class Event:
     text: str = ""
     mode: str | None = field(default=None, compare=False)
     tools: tuple[str, ...] = field(default=(), compare=False)
+    answered: bool = field(default=False, compare=False)     # turn_ended: the provider took the turn (above)
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -74,8 +87,11 @@ class ProviderSession(Protocol):
         """What to write as soon as the process is up (a handshake), before any turn."""
         ...
 
-    def turn(self, text: str) -> list[bytes]:
-        """One user turn, as the bytes to write."""
+    def turn(self, text: str, kind: str = "user") -> list[bytes]:
+        """One turn, as the bytes to write. `kind` (TURN_KINDS) says whose turn it is: the human's (`user`), or one
+        the hub wrote (`wake`, `child`: a child session's results). An adapter may pass that on where its provider's
+        input has a place for it; Claude's stream-json input and Codex's `turn/start` have none today (both take
+        user text), so both write the text alone, and what the model reads is that text."""
         ...
 
     def feed(self, line: bytes) -> tuple[list[Event], list[bytes]]:

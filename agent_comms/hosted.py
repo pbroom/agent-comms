@@ -17,7 +17,8 @@ an optional model name and the message text.
   say it hosts sessions (its `[dispatch.sessions] enabled`). The node checks its own checkout again before it starts.
 - Only the human starts, messages, reads and closes a session (`/api/hosted-sessions`, `board session`). No MCP tool
   and no agent route reaches this module, and the reply text is returned to the human alone: never to an agent, and
-  never to the node (which wrote it).
+  never to the node (which wrote it). The one exception is a child session's reply, which goes to its parent
+  session as untrusted data inside a turn the hub writes (hosted_results.py), with child sessions on.
 - Only the assigned node reports on a session (`/api/nodes/sessions`). Reports are idempotent: a message moves
   queued -> delivered -> done | failed and never back, so a repeated or late event changes nothing.
 - The host never retries a lost turn. A turn that was lost (timeout, the process died, the node restarted or went
@@ -27,6 +28,8 @@ an optional model name and the message text.
 - A session may have children (hosted_tree.py, off unless `[dispatch.sessions.spawn] enabled = true` on the hub):
   the same records with a `parent`. "One session per (agent, project)" and wakes are for roots only, and a parent
   that ends takes its children with it.
+- `child` is the other message kind that is not the human's (hosted_results.py, with child sessions on): a child's
+  results, delivered to its parent as a turn whose text the hub writes.
 """
 from __future__ import annotations
 
@@ -44,7 +47,8 @@ from .providers import SESSION_ID_RE, cap_reply, valid_provider_id, validate_mod
 
 SESSION_PREFIX = "host.session."   # <uuid>: the session record
 MSG_PREFIX = "host.msg."           # <uuid>.<n>: one message, n counting from 1 per session
-KINDS = ("user", "wake")           # `user`: the human's (start, send); `wake`: the hub's own (hosted_wake.py)
+KINDS = ("user", "wake", "child")  # `user`: the human's (start, send); `wake`, `child`: the hub's own (hosted_wake.py,
+                                    # hosted_results.py)
 MSG_STATES = ("queued", "delivered", "done", "failed")
 SETTLED = ("done", "failed")
 SESSION_STATES = ("starting", "idle", "running", "waiting", "ended")   # session_host.STATES, as the node reports them
@@ -59,6 +63,7 @@ SHOW_MESSAGES = 20                 # the most recent messages `show` lists
 KEEP_ENDED_SECONDS = 7 * 86400     # an ended session's record is kept this long
 KEEP_SETTLED_SECONDS = 86400       # a settled message's record, in a session that goes on
 NODE_WAIT_MAX = 25                 # seconds one long-poll of a node may wait
+NODE_REPORT_FEATURES = ("answered",)    # report fields this hub takes beyond the first ones (`_listed`)
 HUMAN_WAIT_MAX = 30                # ... and one of the human's CLI
 WAIT_POLL_SECONDS = 0.25           # how often a waiting call re-reads the database
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -207,6 +212,10 @@ def _prune(c, now: float) -> None:
         if r.get("state") == "ended" and float(r.get("updated_at") or 0) < now - KEEP_ENDED_SECONDS:
             c.execute("DELETE FROM board_state WHERE key = ?", (SESSION_PREFIX + r["session_id"],))
             c.execute("DELETE FROM board_state WHERE key >= ? AND key < ?", _range(f"{MSG_PREFIX}{r['session_id']}."))
+            from . import hosted_results       # what its children sent it, kept for the human until now
+            c.execute("DELETE FROM board_state WHERE key >= ? AND key < ?",
+                      _range(f"{hosted_results.RESULT_PREFIX}{r['session_id']}."))
+            c.execute("DELETE FROM board_state WHERE key = ?", (hosted_results.OUTBOX_PREFIX + r["session_id"],))
 
 
 def _enqueue(c, r: dict, kind: str, text: str, by: str, now: float) -> dict:
@@ -291,6 +300,12 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
     kids = hosted_tree.children_view(board, r)
     if kids:
         out["children"] = kids
+    from . import hosted_results
+    results, dropped = hosted_results.view(board.conn, r["session_id"])
+    if results:
+        out["results"] = results        # what its children sent it (hosted_results.py)
+    if dropped:
+        out["results_dropped"] = dropped    # undelivered results the retention limit took away: how many, when
     return out
 
 
@@ -324,7 +339,8 @@ def close(board: Board, p: Principal, session_id: Any) -> dict:
             from . import hosted_tree
             if (now - _node_seen(c, r["node"]) > nodes.NODE_STALE_SECONDS   # away, or no longer hosting sessions
                     or (hosted_tree.is_child(r) and not hosted_tree.node_supports(c, r["node"]))):   # ... or children
-                _end(c, r, "closed by the human (its node was not connected)", p.name, now)
+                _end(c, r, "closed by the human (its node was not connected)", p.name, now,
+                     results=_results_on(board))
             elif not r.get("stop"):
                 r |= {"stop": "close", "updated_at": now}
                 hosted_tree.cascade(c, r, p.name, now)      # its children are closed with it, now
@@ -332,11 +348,19 @@ def close(board: Board, p: Principal, session_id: Any) -> dict:
     return _human_view(board, r)
 
 
-def _end(c, r: dict, detail: str, by: str, now: float) -> None:
-    """The session is over: every message that was not settled fails with the reason. The caller stores `r`."""
+def _results_on(board: Board) -> bool:
+    from . import hosted_results
+    return hosted_results.enabled(board)
+
+
+def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) -> None:
+    """The session is over: every message that was not settled fails with the reason. The caller stores `r`.
+    `results`: child sessions' results are on (hosted_results.py), so a child that ends tells its parent."""
     detail = (detail or "ended")[:300]
+    cut = []        # the messages this end fails, as they were (a child's parent is told of each)
     for m in _messages(c, r["session_id"]):
         if m.get("state") not in SETTLED:
+            cut.append(dict(m))
             m |= {"state": "failed", "ok": False, "detail": f"session ended: {detail}"[:300], "text": "",
                   "ended_at": now, "updated_at": now}
             _put(c, _msg_key(r["session_id"], m["n"]), m, by, now)
@@ -344,6 +368,8 @@ def _end(c, r: dict, detail: str, by: str, now: float) -> None:
           "in_flight": None}
     from . import hosted_tree
     hosted_tree.cascade(c, r, by, now)      # however a parent ended, its children are closed
+    from . import hosted_results
+    hosted_results.ended(c, r, detail, now, record=results, cut=cut)
 
 
 def _lost(conn, r: dict, now: float) -> bool:
@@ -374,13 +400,14 @@ def _settle(board: Board, r: dict) -> dict:
         if hosted_tree.orphaned(c, r):
             # A child whose node hosts no child sessions (any more): nobody there will run it, report on it or end
             # it. Ended here, its turn in flight failed as lost. (The node's next hello does the same.)
-            _end(c, r, hosted_tree.ORPHANED, "hub", now)
+            _end(c, r, hosted_tree.ORPHANED, "hub", now, results=_results_on(board))
             _put(c, SESSION_PREFIX + r["session_id"], r, "hub", now)
             return r
         if not _lost(c, r, now):
             return r
+        results = _results_on(board)
         if r.get("stop"):
-            _end(c, r, "closed by the human (its node went silent)", "hub", now)
+            _end(c, r, "closed by the human (its node went silent)", "hub", now, results=results)
         else:
             for m in _messages(c, r["session_id"]):
                 if m.get("state") == "delivered":
@@ -390,6 +417,14 @@ def _settle(board: Board, r: dict) -> dict:
                     _put(c, _msg_key(r["session_id"], m["n"]), m, "hub", now)
                     r["last_result"] = {"message": m["n"], "ok": False, "detail": m["detail"], "denials": [],
                                         "meta": {}, "at": now}
+                    from . import hosted_results
+                    if m.get("kind") == hosted_results.KIND:
+                        # Not confirmed (a turn its provider started had its results delivered then): they go once
+                        # more, or are kept undelivered.
+                        hosted_results.carried(c, r, m, False, now)
+                    if results and hosted_results.hosted_tree.is_child(r):
+                        hosted_results.turn(c, r, m, ok=False, delivered=True, detail=m["detail"], text="",
+                                            denials=[], now=now)
             r |= {"in_flight": None, "state": "idle", "pid": None, "updated_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, "hub", now)
     return r
@@ -407,9 +442,13 @@ def node_sessions(board: Board, p: Principal, tree: bool = False) -> dict:
     rolled back to an earlier version) would open a child as an ordinary session of its agent, in the shared
     checkout and with its runner's own permissions, whatever access and isolation the child was made with."""
     nodes._require_node(board, p)
-    from . import hosted_wake
+    from . import hosted_results, hosted_wake
     # PR 3: queue the wakes that are due; a wake is validated in the transaction that shows it (hosted_wake.listing).
-    return hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree))
+    # A child's results waiting for a free parent here become its next turn in that same transaction, after the
+    # wakes were checked (hosted_results.deliver): so they are made and shown on what is stored then.
+    return hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree),
+                               due=lambda conn: hosted_results.due(board, conn, p.name),
+                               deliver=lambda c, now: hosted_results.deliver(board, c, p.name, now))
 
 
 def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
@@ -439,7 +478,10 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
                    | hosted_tree.node_extra(r, spawn and tree))
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] for m in msgs]])
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
-    return {"node": p.name, "sessions": out, "version": version}
+    # What this hub takes in a node's reports beyond what every hub took: a node sends such a field only to a hub
+    # that names it here, so a newer node's reports reach an older hub exactly as before (its strict model refuses an
+    # unknown field, and the report would be lost).
+    return {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
 
 
 def _events(events: Any) -> list[dict]:
@@ -467,26 +509,42 @@ def _events(events: Any) -> list[dict]:
             raise Invalid("meta must be a small table of scalars")
         if ok is not None and not isinstance(ok, bool):
             raise Invalid("ok must be true or false")
+        answered = ev.get("answered", False)
+        if not isinstance(answered, bool):
+            raise Invalid("answered must be true or false")
         out.append({"kind": ev["kind"], "message": n, "ok": ok, "delivered": ev.get("delivered") is not False,
-                    "detail": detail, "text": cap_reply(text), "denials": denials, "meta": meta})
+                    "detail": detail, "text": cap_reply(text), "denials": denials, "meta": meta,
+                    # turn_ended: the provider itself ended the turn (session_host.HostEvent.answered); a node
+                    # from before the field says nothing, which counts as not known
+                    "answered": answered})
     return out
 
 
-def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
+def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> None:
     """One event from the node, applied to the session `r` (stored by the caller) and its message. A message only
-    moves forward, so an event that arrives twice, late or for an unknown message changes nothing."""
+    moves forward, so an event that arrives twice, late or for an unknown message changes nothing. `results`: child
+    sessions' results are on (hosted_results.py): a child's settled turn, or its end, is a result for its parent."""
+    from . import hosted_results
     kind, n, sid = ev["kind"], ev["message"], r["session_id"]
     if kind == WORKTREE_REMOVED:
         return      # only once the session has ended (`report`)
     if kind == "ended":
-        _end(c, r, ev["detail"] or "the node ended the session", by, now)
+        _end(c, r, ev["detail"] or "the node ended the session", by, now, results=results)
         return
     if kind == "approval_requested":
         r["denials"] = ev["denials"]
         return
     m = _get(c, _msg_key(sid, n)) if n is not None else None
-    if not isinstance(m, dict) or m.get("state") in SETTLED:
+    if not isinstance(m, dict):
         return
+    if m.get("state") in SETTLED:
+        if (m.get("kind") == hosted_results.KIND
+                and (kind == "turn_started" or (kind == "turn_ended" and ev["answered"]))):
+            # The hub settled this result turn without its provider's word (node lost), and the word comes now:
+            # the results it carried that wait to go again are delivered after all. The message stays settled.
+            hosted_results.confirmed_late(c, r, m, now)
+        return
+    was = m["state"]
     if m["state"] == "queued":      # whichever event comes first takes it out of the queue
         r["queued"] = max(0, int(r.get("queued") or 0) - 1)
     if kind in ("delivered", "turn_started"):
@@ -495,12 +553,26 @@ def _apply(c, r: dict, ev: dict, by: str, now: float) -> None:
             r["in_flight"] = n
         if kind == "turn_started":
             r["resume"] = True      # the provider began a turn in it, so its session exists (a write proves nothing)
+            if m.get("kind") == hosted_results.KIND and m.get("started_at") is None:
+                # Written is not read: the results it carries count as delivered only now that the parent's own
+                # provider says the turn started.
+                m["started_at"] = now
+                hosted_results.carried(c, r, m, True, now)
     else:
         ok = ev["ok"] is True
         detail = ev["detail"] or ("" if ok else "the agent reported that the turn failed"
                                   + (f" ({ev['meta']['subtype']})" if isinstance(ev["meta"].get("subtype"), str) else ""))
         m |= {"state": "done" if ok else "failed", "ok": ok, "detail": detail, "denials": ev["denials"], "text": "",
               "ended_at": now}
+        reached = was == "delivered" or ev["delivered"]
+        if m.get("kind") == hosted_results.KIND:
+            # A turn its provider started was confirmed then (above); one the provider itself ended, with a success
+            # or an error of its own (`answered`), is confirmed now. One the host gave up on was not: its results go
+            # once more, or are kept undelivered.
+            hosted_results.carried(c, r, m, ev["answered"], now)
+        if results and hosted_results.hosted_tree.is_child(r):
+            hosted_results.turn(c, r, m, ok=ok, delivered=reached, detail=detail, text=ev["text"],
+                                denials=ev["denials"], now=now)
         if r.get("in_flight") == n:
             r["in_flight"] = None
         r["last_result"] = {"message": n, "ok": ok, "detail": detail, "denials": ev["denials"], "meta": ev["meta"],
@@ -571,8 +643,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
                 r["worktree_removed_at"] = now
                 _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
             return _node_view(r)
+        results = _results_on(board)
         for ev in events:
-            _apply(c, r, ev, p.name, now)
+            _apply(c, r, ev, p.name, now, results=results)
             if r["state"] == "ended":
                 break
         if removed and r["state"] == "ended":

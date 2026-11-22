@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_comms import cli, db, delivery, dispatch, hosted, hosted_tree, hosted_wake, nodes, runner_preflight as rp
+from agent_comms import cli, db, delivery, dispatch, hosted, hosted_results, hosted_tree, hosted_wake, nodes
+from agent_comms import runner_preflight as rp
 from agent_comms import session_access as access, session_worktrees
 from agent_comms.core import Conflict, Forbidden
 from agent_comms.dispatch import DispatchConfig
@@ -1197,12 +1198,14 @@ def test_a_child_is_never_woken_and_has_no_watcher_record(senv):
     other = child(senv, sid, "another agent", agent="codex")["session_id"]
     tick(senv)
     answer(senv, same)
+    tick(senv)
+    answer(senv, sid)                   # the root's turn with its child's result (hosted_results.py)
     tid = senv.thread()
     ask(senv, tid, as_="grok", to=["claude"])
     ask(senv, tid, as_="grok", to=["codex"])
     tick(senv, times=2)
     hosted_wake.tick(senv.board)
-    assert [m["kind"] for m in show(senv, sid)["messages"]] == ["user", "wake"], "the root is woken"
+    assert [m["kind"] for m in show(senv, sid)["messages"]] == ["user", "child", "wake"], "the root is woken"
     assert wakes(senv, same) == [] and wakes(senv, other) == [], "a child is not, whoever the post is for"
     keys = [k for (k,) in senv.board.conn.execute("SELECT key FROM board_state WHERE key LIKE 'host.wake.%'")]
     assert keys == [hosted_wake.WAKE_PREFIX + sid], "only the root has a watcher record"
@@ -1246,6 +1249,8 @@ def test_a_child_of_another_agent_or_one_that_ended_before_the_wake_changes_noth
     answer(senv, sid)
     gone = child(senv, sid, "early")["session_id"]
     close(senv, gone)
+    assert msg(senv, sid, 2)["kind"] == "child"
+    answer(senv, sid)                   # the root's turn with that child's end (hosted_results.py)
     later(senv, 5)
     post = ask(senv, senv.thread())
     tick(senv)
@@ -1566,6 +1571,7 @@ def test_a_full_child_waits_after_a_restart_until_its_parents_process_has_confir
     kid = child(senv, sid, "one")["session_id"]
     tick(senv, node)
     answer(senv, kid, node=node)
+    claimed(senv, sid)
     again = make_node(senv, config=config(), log_dir=senv.tmp / "r-logs")       # the node is restarted
     tick(senv, again)
     parent = again.sessions.host.sessions[sid]
@@ -1584,6 +1590,15 @@ def test_a_full_child_waits_after_a_restart_until_its_parents_process_has_confir
     tick(senv, again)
     assert msg(senv, kid, 2)["state"] == "delivered", "now the child's turn is handed over"
     senv.node.hello()
+
+
+def claimed(env, parent) -> None:
+    """Take every result waiting for this parent (hosted_results.claim), so that none becomes a turn of its own: for
+    the tests below, which are about the parent's process and count its turns."""
+    for _ in range(hosted_results.MAX_WAITING + 1):
+        if hosted_results.claim(env.board, parent, "test") is None:
+            return
+    raise AssertionError("a claimed result is still waiting")
 
 
 def full_node(env, name, **sessions):
@@ -1619,6 +1634,7 @@ def test_full_counts_for_children_only_while_the_process_that_confirmed_it_is_al
     proc_of(senv, sid, node)[1].emit(result(sid))
     tick(senv, node, times=2)
     answer(senv, kid, node=node)
+    claimed(senv, sid)
     assert msg(senv, kid, 1)["state"] == "done"
     # The parent's process is stopped (as the idle limit would): the word was that process's, and it is gone.
     assert host.park(sid)
@@ -1686,6 +1702,37 @@ def test_a_full_childs_turn_is_not_written_once_its_parents_process_is_gone(senv
     tick(senv, node)
     assert [m["params"]["input"][0]["text"] for m in written(proc) if m.get("method") == "turn/start"] == ["count"]
     assert msg(senv, kid, 1)["state"] == "delivered"
+    senv.node.hello()
+
+
+def test_a_message_held_in_a_full_childs_inbox_does_not_keep_the_node_busy(senv):
+    """R4, the inbox case. A message handed to a full child that then waits in its inbox, because the parent's
+    process went during the child's handshake, used to count as activity until the parent's next turn: the node
+    kept its short cadence all that time. It counts while the child's process is in its handshake (that needs the
+    passes), not once the child only waits; the parent's next turn brings the cadence back and the turn goes."""
+    node = full_node(senv, "h")
+    runner = node.sessions
+    sid = root(senv, node=node)
+    answer(senv, sid, node=node)
+    kid = child(senv, sid, "count", agent="codex", access="full")["session_id"]
+    tick(senv, node)
+    host, proc = runner.host, codex_proc(senv, node)
+    proc_of(senv, sid, node)[1].code = 1                 # the parent's process dies during the child's handshake
+    proc.emit(cx.reply(1, cx.INIT_RESULT))
+    tick(senv, node)
+    assert [m.id for m in host.sessions[kid].inbox] == ["1"] and not host.sessions[kid].ready
+    assert runner.active(), "a handshake under way is work"
+    proc.emit(cx.reply(2, cx.THREAD_RESULT | {"sandbox": {"type": "dangerFullAccess"}}))
+    tick(senv, node, times=3)
+    assert host.sessions[kid].ready and [m.id for m in host.sessions[kid].inbox] == ["1"]
+    assert not runner.active(), "held in its inbox: nothing to do until the parent has a turn"
+    send(senv, sid, "again")
+    tick(senv, node)
+    assert runner.active()
+    begin(senv, sid, node)
+    tick(senv, node)
+    assert [m["params"]["input"][0]["text"] for m in written(proc) if m.get("method") == "turn/start"] == ["count"]
+    assert msg(senv, kid, 1)["state"] == "delivered" and runner.active()
     senv.node.hello()
 
 
@@ -2127,6 +2174,7 @@ def test_a_turn_half_written_when_its_parents_process_goes_is_withdrawn(senv):
     kid = child(senv, sid, "one")["session_id"]
     tick(senv, node)
     answer(senv, kid, node=node)
+    claimed(senv, sid)
     host, kid_proc, parent_proc = node.sessions.host, proc_of(senv, kid, node)[1], proc_of(senv, sid, node)[1]
     first = len(kid_proc.stdin)
     kid_proc.accept = 12                                 # the pipe takes twelve bytes of a write, no more
@@ -2136,8 +2184,15 @@ def test_a_turn_half_written_when_its_parents_process_goes_is_withdrawn(senv):
     assert msg(senv, kid, 2)["state"] == "queued", "partly written is not delivered"
     parent_proc.code = 1                                 # the parent's process dies before the next write
     kid_proc.accept = None
-    started = len(node.session_spawner.calls)
+
+    def kid_starts() -> int:
+        return sum(1 for c in node.session_spawner.calls if kid in c["argv"])
+    started = kid_starts()
     tick(senv, node, times=4)
+    # The parent is told (hosted_results.py): that result is its next turn, in a process of its own.
+    [res] = [x for x in show(senv, sid)["results"] if x["state"] != "claimed"]
+    assert (res["message"], res["outcome"], msg(senv, sid, 2)["kind"]) == (2, "withdrawn", "child")
+    assert TURN_WITHDRAWN[:60] in res["detail"]
     assert len(kid_proc.stdin) == first + 12, "not one byte more: a half-written line is never completed"
     assert kid_proc.terminated == 1 and host.sessions[kid].child is None, "its process was stopped"
     failed = msg(senv, kid, 2)
@@ -2145,11 +2200,11 @@ def test_a_turn_half_written_when_its_parents_process_goes_is_withdrawn(senv):
     assert TURN_WITHDRAWN[:60] in json.dumps(failed)
     view = show(senv, kid)
     assert view["state"] == "idle" and view["turns"] == 1, "the child itself stays open; one turn is all it had"
-    assert len(node.session_spawner.calls) == started, "and nothing is started again for that message"
+    assert kid_starts() == started, "and nothing is started again for that message"
     # Held like any full child whose parent has no process, until the parent's next turn says it runs bypassed.
     send(senv, kid, "three")
     tick(senv, node, times=3)
-    assert msg(senv, kid, 3)["state"] == "queued" and len(node.session_spawner.calls) == started
+    assert msg(senv, kid, 3)["state"] == "queued" and kid_starts() == started
     send(senv, sid, "again")
     tick(senv, node)
     begin(senv, sid, node)
@@ -2190,6 +2245,7 @@ def test_two_parents_and_two_waiting_full_children_in_two_slots_make_progress(se
         "the OTHER pair's parent made room; the running child's own parent was not touched"
     assert show(senv, kids[second])["state"] != "ended" and show(senv, parents[second])["ceiling"] == "workspace"
     answer(senv, kids[first], node=node)
+    claimed(senv, parents[first])
     tick(senv, node, times=3)
     assert msg(senv, kids[first], 1)["state"] == "done" and msg(senv, kids[second], 1)["state"] == "queued"
     assert [k for k, _ in under] == [kids[first]], "nothing was started for the child whose parent has no process"
@@ -2634,6 +2690,7 @@ def test_a_child_whose_node_was_rolled_back_is_settled_by_the_hub(senv):
     tick(senv)
     begin(senv, kid)                                     # its turn is running, in the shared checkout
     answer(senv, idle)
+    claimed(senv, sid)                                   # (no turn of the parent's for that result)
     assert msg(senv, kid, 1)["state"] == "delivered" and hosted_wake.turn_projects(senv.board, senv.clock()) == {PROJECT}
     hello = {"projects": [PROJECT, P2, P3], "runners": ["claude-code", "codex-cli"], "sessions": {"max_live": 4}}
     assert senv.laptop.post("/api/nodes/hello", json=hello).status_code == 200      # rolled back: no session_host
@@ -2645,10 +2702,14 @@ def test_a_child_whose_node_was_rolled_back_is_settled_by_the_hub(senv):
     failed = msg(senv, kid, 1)
     assert failed["state"] == "failed" and "no longer hosts child sessions" in failed["detail"]
     assert show(senv, sid)["state"] != "ended", "its parent, an ordinary session to that node, goes on"
+    assert sorted((x["child"], x["outcome"]) for x in show(senv, sid)["results"] if x["state"] != "claimed") == \
+        sorted([(kid, "failed"), (kid, "ended"), (idle, "ended")]), \
+        "and is told of the turn that was lost and that both ended (hosted_results.py)"
     # The same when the hub only finds out on a read (the hello's own settling is taken out here).
     senv.node.hello()
     late = child(senv, sid, "more")["session_id"]
     tick(senv)
+    answer(senv, sid)                                    # the parent's turn with those results
     begin(senv, late)
     with db.write_tx(senv.board.conn) as c:
         info = nodes._get(c, nodes.NODE_PREFIX + "laptop")
@@ -2792,6 +2853,7 @@ def test_a_child_that_only_waits_for_its_parent_does_not_keep_the_node_busy(senv
     kid = child(senv, sid, "one")["session_id"]
     tick(senv, node)
     answer(senv, kid, node=node)
+    claimed(senv, sid)
     runner, host = node.sessions, node.sessions.host
     assert host.park(sid)                                # the parent's process is stopped (the idle limit)
     tick(senv, node, times=3)

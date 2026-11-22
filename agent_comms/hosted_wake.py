@@ -36,6 +36,8 @@ then queues one `wake` message, the only message kind that does not come from th
   then the dispatcher's for good: no wake is queued or handed for it, and no hosted session holds it again.
 - *Roots only.* A child session (hosted_tree.py) has no watcher record and is never woken, and nothing a child reads
   on the board counts as its root having read it (`_shadowed`).
+- *After results.* While results of its child sessions wait for a session (hosted_results.py), no wake is queued
+  for it, and one queued before they came steps back behind them when the node would be shown it (`_recheck`).
 """
 from __future__ import annotations
 
@@ -45,7 +47,7 @@ import os
 import time
 from typing import Any, Callable
 
-from . import channel, db, hosted, nodes
+from . import channel, db, hosted, hosted_results, nodes
 from .hosted_tree import is_child
 from .core import Board, BoardError, Conflict, Principal
 from .nodes import _get, _put
@@ -68,6 +70,8 @@ NOT_SENT = "not sent: no post this wake was queued for still qualifies"
 DEFERRED = "not sent: a message of yours was waiting, so it goes first; the posts go with the next wake"
 OCCUPIED = "not sent: a dispatched run is using the checkout; the posts go with the next wake"
 SET_ASIDE = "not sent: it could not be checked (see the hub's log) and a message of yours was waiting behind it"
+BEHIND_RESULTS = ("not sent: results of its child sessions were waiting, so they go first; the posts go with the next "
+                  "wake")
 
 DAY = 86400.0
 MAX_NAMED = 20                  # thread ids spelled out in one Needs-you item
@@ -418,7 +422,8 @@ def _advance(board: Board, session_id: str, cfg, now: float) -> dict | None:
             _look(board, c, rec, r, p, top, top_id)
             _lift(c, rec, last)
         if (_free(r) and (last is None or now - last >= cfg.wake_min_interval_seconds)
-                and _waiting(rec, cfg, now) and not _occupied(board, r)):
+                and _waiting(rec, cfg, now) and not _occupied(board, r)
+                and not hosted_results.waiting(board, c, session_id)):     # a child's results go before a wake
             # Checked again now, not only when found: the batch may have waited (a turn, the interval, a pause).
             rec["pending"] = _qualifying(board, p, r["project"], [int(k) for k in rec["pending"]], rec)
             batch = {k: e for k, e in rec["pending"].items() if not _stopped(rec, e[0])}
@@ -454,11 +459,16 @@ def _advance(board: Board, session_id: str, cfg, now: float) -> dict | None:
 # ---------------------------------------------------------------- the node is shown a wake
 
 
-def listing(board: Board, node: str, build: Callable[[], dict]) -> dict:
+def listing(board: Board, node: str, build: Callable[[], dict], due: Callable[[Any], bool] | None = None,
+            deliver: Callable[[Any, float], None] | None = None) -> dict:
     """hosted.node_sessions' answer (`build` reads it from the connection), made so that a wake the node is shown
     with its text was validated in the very transaction that showed it: queue what is due, then, in one read
     snapshot, look at the wake each session would be handed next. If each is already handed and still stands, the
     answer is built in that snapshot. Otherwise the re-check (`_recheck`) and the answer share one write transaction.
+    `due(conn)` / `deliver(c, now)` (hosted_results.py): results wait for a free session of this node; then the
+    write transaction is taken too. Whenever it is taken, after the re-check (a wake that waited may step back
+    behind results, which frees its session) the waiting results become a turn in it, so that turn is shown in the
+    transaction that made it.
     `build` checks the pause itself, inside either transaction, and its refusals pass through. A failure of the
     wake code never fails the node's fetch and never keeps a message of the human's from it (`_fallback`)."""
     tick(board, node)
@@ -470,7 +480,8 @@ def listing(board: Board, node: str, build: Callable[[], dict]) -> dict:
         except Exception:
             _complain("hosted sessions: could not check the queued wakes")
             todo = None
-        if todo == []:
+        results = due is not None and deliver is not None and due(conn)
+        if todo == [] and not results:
             return build()
     finally:
         conn.execute("ROLLBACK")
@@ -482,6 +493,8 @@ def listing(board: Board, node: str, build: Callable[[], dict]) -> dict:
                 # dispatcher pass, for any of this node's sessions) is re-checked too before the answer can show it.
                 for sid in _unsettled(board, node):
                     _recheck(board, c, sid, now)
+                if deliver is not None:
+                    deliver(c, now)     # never raises; checks everything again inside this transaction
                 return build()
         except BoardError:
             raise
@@ -600,8 +613,9 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
     rec = _load(c, session_id) or _new(*_tops(c))
     p = _agent(c, r["agent"])
     keep = _qualifying(board, p, r["project"], m["posts"], rec) if p is not None else {}
-    occupied = bool(keep) and not human_waiting and _occupied(board, r)
-    defer = bool(keep) and (human_waiting or occupied)
+    behind = bool(keep) and not human_waiting and hosted_results.waiting(board, c, session_id)
+    occupied = bool(keep) and not human_waiting and not behind and _occupied(board, r)
+    defer = bool(keep) and (human_waiting or behind or occupied)
     for k in (str(i) for i in m["posts"]):
         if k not in keep or defer:
             # No wake reached anyone for it (dropped, or stepping back behind the human's message): its coverage
@@ -622,7 +636,7 @@ def _recheck(board: Board, c, session_id: str, now: float) -> None:
               "handed_at": m.get("handed_at") or now, "updated_at": now}
     else:
         m |= {"state": "failed", "ok": False, "text": "", "ended_at": now, "updated_at": now,
-              "detail": OCCUPIED if occupied else DEFERRED if defer else NOT_SENT}
+              "detail": OCCUPIED if occupied else BEHIND_RESULTS if behind else DEFERRED if defer else NOT_SENT}
         r |= {"queued": max(0, int(r.get("queued") or 0) - 1), "updated_at": now}
         _put(c, hosted.SESSION_PREFIX + session_id, r, HUB, now)
     _put(c, hosted._msg_key(session_id, m["n"]), m, HUB, now)

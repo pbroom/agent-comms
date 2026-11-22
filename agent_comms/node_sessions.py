@@ -127,6 +127,7 @@ class SessionRunner:
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
         self.version: str | None = None
+        self.hub_features: set[str] = set()           # report fields the hub named as taken (its listing's `features`)
         self.last_sync = float("-inf")
         self.retry_at = float("-inf")
         self.fresh = False                            # the last hub call was a fetch that succeeded: `queue` is current
@@ -219,12 +220,20 @@ class SessionRunner:
             d["message"] = int(e.message_id)
         if e.kind == "turn_ended":
             d |= {"ok": bool(e.ok), "delivered": bool(e.delivered), "detail": e.detail[:300],
-                  "denials": list(e.denials), "meta": dict(e.meta), "text": e.text}
+                  "denials": list(e.denials), "meta": dict(e.meta), "text": e.text,
+                  "answered": bool(e.answered)}     # the provider itself ended it (HostEvent.answered)
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
             d["detail"] = e.detail[:300]
         return d
+
+    OPTIONAL_FIELDS = ("answered",)     # sent only to a hub whose listing names them (hosted.NODE_REPORT_FEATURES)
+
+    def _for_hub(self, event: dict) -> dict:
+        """The event as this hub takes it: without a field it has not named in its listing's `features`."""
+        drop = [k for k in self.OPTIONAL_FIELDS if k in event and k not in self.hub_features]
+        return {k: v for k, v in event.items() if k not in drop} if drop else event
 
     def _emit(self, events: list[HostEvent]) -> None:
         for e in events:
@@ -275,7 +284,9 @@ class SessionRunner:
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
         for sid in order:
             events = [e for s, e in self.pending if s == sid][:MAX_BATCH]
-            body: dict[str, Any] = {"events": events, "seq": self._stamp()}
+            # A field the hub has not named as one it takes (its listing's `features`) is not sent: a hub from
+            # before it refuses the whole report, and its turn ends would be lost.
+            body: dict[str, Any] = {"events": [self._for_hub(e) for e in events], "seq": self._stamp()}
             status = self.status.get(sid)
             if status is not None:
                 body |= {"state": status[0], "pid": status[1], "resume": status[2]}
@@ -292,7 +303,14 @@ class SessionRunner:
                 if code not in (400, 404, 422):
                     log.warning("could not report session %s: %s", sid, e)
                     return False
-                log.warning("hub refused the report for session %s (%s); dropping it", sid, code)
+                if code == 422:
+                    # The hub could not read the report at all: most likely it is older than this node (update the
+                    # hub before its nodes). Said once per report, at error level, as it costs the turn ends in it.
+                    log.error("the hub refused the report for session %s as malformed (422), so the %d event(s) in "
+                              "it are lost: the hub is probably older than this node. Update the hub to this "
+                              "version (hubs before nodes)", sid, len(events))
+                else:
+                    log.warning("hub refused the report for session %s (%s); dropping it", sid, code)
             if status is not None:
                 self.reported[sid] = status
                 self.sent[sid] = body["seq"]
@@ -323,8 +341,15 @@ class SessionRunner:
         is work enough to bring the short cadence back for it."""
         return bool(self.pending or any(q and not self._waits_on_parent(sid) for sid, q in self.queue.items())
                     or any(self.reported.get(sid) != st for sid, st in self.status.items())
-                    or any(s.busy or s.inbox or s.ended or (s.child is not None and s.stopping_since is not None)
-                           for s in self.host.sessions.values()))
+                    or any(s.busy or (s.inbox and not self._held_inbox(sid, s)) or s.ended
+                           or (s.child is not None and s.stopping_since is not None)
+                           for sid, s in self.host.sessions.items()))
+
+    def _held_inbox(self, sid: str, s) -> bool:
+        """A message already handed to a child waits in its inbox only for the parent (its parent's process went
+        while the child's was in its handshake): the child's process is up and past its handshake, so it has
+        nothing to say meanwhile, and the parent's next turn is the work that brings the short cadence back."""
+        return self._waits_on_parent(sid) and s.child is not None and s.state == "idle"
 
     def pass_once(self, wait: float | None = None) -> bool:
         """One pass: report, fetch the hub's list (waiting there when nothing has work), reconcile, hand over the next
@@ -478,6 +503,8 @@ class SessionRunner:
             for sid in [x for x in self.worktrees if x not in listed and x not in self.host.sessions]:
                 self._drop_worktree(sid)
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
+        named = data.get("features")
+        self.hub_features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 
@@ -664,7 +691,10 @@ class SessionRunner:
             self.handed[sid] = m["n"]
             self._save_handed()         # on disk first: after a crash this message is lost, never written twice
             try:
-                self.host.send(sid, m["text"], message_id=str(m["n"]))
+                # Its kind goes with it to the provider (`turn`): whose turn it is, which the text alone does not say.
+                # A kind this node does not know (a newer hub) is refused, never passed off as the human's.
+                kind = m.get("kind") if m.get("kind") is not None else "user"
+                self.host.send(sid, m["text"], message_id=str(m["n"]), kind=kind)
             except ValueError as e:
                 self._add(sid, {"kind": "turn_ended", "message": m["n"], "ok": False, "delivered": False,
                                 "detail": f"the node refused the message: {e}"[:300]})
