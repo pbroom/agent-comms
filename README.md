@@ -337,7 +337,9 @@ What it does not cover:
   So the `SessionStart` hook `--wake` writes carries both `"async": true` and `"asyncRewake": true` (the `Stop` hook
   is unchanged), and its wake is written no sooner than 10 s after the hook started. And a delivered wake that no
   session of the agent in the project has read within 90 s comes back once, uncharged, for the next waiting session
-  (normally the same session's next turn). With this configuration, SOAK_RESULT. In the worst case, a wake that
+  (normally the same session's next turn). With this configuration, 19 of 19 traced test runs on mains power woke
+  the session (the post made right after the hook armed); runs with the post made later are still to do. In the
+  worst case, a wake that
   starts no turn, the post waits for the session's next turn (when its `Stop` hook is offered it again), or, for a
   request the dispatcher could run, for the request's grace to end. If a backgrounded `SessionStart` wake is ever
   seen to miss its turn, arm on `Stop` only: delete the `SessionStart` entry that runs `wait.sh` from

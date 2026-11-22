@@ -4256,7 +4256,12 @@ is unchanged.
   ack and the hook's result).
 - *In 12 traced runs before this change* (5 with the old shape, 5 with both flags, 2 smoke runs), the debug log
   showed the SessionStart hook backgrounded, and every one woke.
-- *With the configuration as shipped:* SOAK_RESULT.
+- *With the configuration as shipped:* 19 of 19 traced runs on mains power, under `caffeinate -i`, with no sleep
+  or wake in any of them, woke the session. These were the worst case: the post made right after the
+  SessionStart hook armed. The debug log showed the SessionStart hook (and every Stop hook) backgrounded in each
+  one. The hook exited 10.29 to 10.32 s after Claude started; Claude reported it within 10 ms and started its turn
+  within about 30 ms. The twentieth run and the five runs with the post 90 s after start were not made: the Mac
+  went back to battery.
 
 **The worst case, and the fallback.**
 - *Worst case:* a SessionStart wake that starts no turn. The post comes back after 90 s (O5) for the next waiter,
