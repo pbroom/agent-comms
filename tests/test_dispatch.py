@@ -1104,48 +1104,111 @@ def test_codex_runner_missing_browser_approvals_is_refused_with_named_tools(denv
 FULL_CODEX = (["codex", "exec", "--cd", "{project}"]
               + [a for t in dispatch.CODEX_PREAPPROVED_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
               + ["{prompt}"])
-MANAGED_OVERRIDE = 'mcp_servers.agent-comms.env_vars=["FOO", "AGENT_COMMS_MANAGED"]'
+MANAGED_OVERRIDE = 'mcp_servers.agent-comms.env.AGENT_COMMS_MANAGED="1"'
+BOARD_SERVER = ('[mcp_servers.agent-comms]\ncommand = "bash"\nargs = ["stdio.sh"]\nenv_vars = ["FOO"]\n'
+                '[mcp_servers.agent-comms.env]\nOTHER = "x"\nAGENT_COMMS_MANAGED = "0"\n')
+APPROVALS = [a for t in dispatch.CODEX_PREAPPROVED_TOOLS for a in ("-c", dispatch.codex_approval_override(t))]
+INLINE_SERVER = ["-c", 'mcp_servers.agent-comms.command="bash"']
 
 
-def _codex_home(tmp_path, monkeypatch, extra=""):
-    """A HOME whose Codex config defines the board's stdio server (forwarding FOO) and, with `extra`, more."""
+def _codex_home(tmp_path, monkeypatch, text=BOARD_SERVER):
+    """A HOME whose Codex config.toml is `text` (by default the board's stdio server, with an `env_vars` list and
+    `env` values of its own, a literal AGENT_COMMS_MANAGED="0" among them)."""
     home = tmp_path / "home"
     (home / ".codex").mkdir(parents=True)
-    (home / ".codex" / "config.toml").write_text(
-        '[mcp_servers.agent-comms]\ncommand = "bash"\nargs = ["stdio.sh"]\nenv_vars = ["FOO"]\n' + extra)
+    (home / ".codex" / "config.toml").write_text(text)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    return {"HOME": str(home)}
+    return {"HOME": str(home), "AGENT_COMMS_MANAGED": "1"}
 
 
-def test_a_codex_run_forwards_agent_comms_managed_to_its_board_server(tmp_path, monkeypatch):
-    """Codex gives its MCP servers a small fixed environment, so a dispatched Codex run's board server is told to
-    take AGENT_COMMS_MANAGED from the run's (`env_vars`, the list in force with the name added), before {prompt}.
-    A Claude runner, or a Codex one without a stdio board server, is left as it is."""
-    env = _codex_home(tmp_path, monkeypatch)
-    argv = dispatch.with_managed_env(FULL_CODEX, env)
-    i = argv.index(MANAGED_OVERRIDE)
-    assert argv[i - 1] == "-c" and argv[i + 1] == "{prompt}" and argv[:i - 1] == FULL_CODEX[:-1]
-    assert dispatch.with_managed_env(["claude", "-p", "{prompt}"], env) == ["claude", "-p", "{prompt}"]
-    assert dispatch.with_managed_env(FULL_CODEX, {"HOME": str(tmp_path / "nowhere")}) == FULL_CODEX
-    # After the inbox narrowing's whole-table `mcp_servers={...}` override, which drops dotted keys set before it.
-    _codex_home(tmp_path / "2", monkeypatch, '[mcp_servers.other]\ncommand = "x"\n')
-    narrowed = dispatch.with_codex_inbox_mcp(FULL_CODEX, {"HOME": os.environ["HOME"]})
-    argv = dispatch.with_managed_env(narrowed, {"HOME": os.environ["HOME"]})
-    assert argv.index(MANAGED_OVERRIDE) > argv.index('mcp_servers={"other"={enabled=false}}')
+def _board_env_overrides(argv):
+    return [v for v in dispatch._codex_overrides(argv) if v.startswith("mcp_servers.agent-comms.env")]
 
 
-def test_a_dispatched_codex_run_is_launched_with_agent_comms_managed_for_its_board_server(denv, tmp_path,
-                                                                                          monkeypatch):
-    _codex_home(tmp_path, monkeypatch)
-    denv.config.runners["codex"] = list(FULL_CODEX)
+def _launch(denv, runner):
+    denv.config.runners["codex"] = list(runner)
     allow(denv, agents=["codex"])
     human_post(denv, ["codex"])
     denv.d.tick()
     [call] = denv.spawner.calls
-    assert call["env"]["AGENT_COMMS_MANAGED"] == "1", "the run's own environment, as for Claude"
-    i = call["argv"].index(MANAGED_OVERRIDE)
-    assert call["argv"][i - 1] == "-c" and i < len(call["argv"]) - 1, "an option, before the prompt"
+    return call
+
+
+@pytest.mark.parametrize("runner", [
+    FULL_CODEX,
+    ["codex", "exec", "--ephemeral", "--cd", "{project}"] + APPROVALS + ["{prompt}"],
+    ["codex", "exec", "--profile", "x", "--cd", "{project}"] + APPROVALS + ["{prompt}"],
+    ["codex", "exec", "--ignore-user-config", "--cd", "{project}"] + APPROVALS + INLINE_SERVER + ["{prompt}"],
+    ["codex", "exec", "resume", "--last"] + APPROVALS + ["{prompt}"],
+], ids=["plain", "ephemeral", "profile", "ignore-user-config", "exec-resume-last"])
+def test_a_dispatched_codex_run_gives_its_board_server_agent_comms_managed(denv, tmp_path, monkeypatch, runner):
+    """Codex gives its MCP servers a small fixed environment, so a dispatched Codex run's board server gets
+    AGENT_COMMS_MANAGED, the value child_env put in the run's environment, as one dotted `env.` key before {prompt},
+    whatever other flags the runner carries. The server's `env_vars` list and other `env` values are not rewritten
+    (Codex merges the dotted key into the entry); the literal "0" in config.toml is overridden by it."""
+    _codex_home(tmp_path, monkeypatch)
+    call = _launch(denv, runner)
+    assert call["env"]["AGENT_COMMS_MANAGED"] == "1"
+    argv = call["argv"]
+    i = argv.index(MANAGED_OVERRIDE)
+    assert argv[i - 1] == "-c" and i < len(argv) - 1, "an option, before the prompt"
+    assert argv[:i - 1] == [call["cwd"] if x == "{project}" else x for x in runner[:-1]], \
+        "the runner's own arguments are kept as they are"
+    assert _board_env_overrides(argv) == [MANAGED_OVERRIDE], "no env_vars list or other env value is written"
+
+
+def test_a_dispatched_codex_inbox_run_gets_agent_comms_managed_after_the_whole_table_override(denv, tmp_path,
+                                                                                             monkeypatch):
+    """The inbox narrowing's `mcp_servers={...}` override drops dotted keys set before it: this one comes after."""
+    _codex_home(tmp_path, monkeypatch, BOARD_SERVER + '[mcp_servers.other]\ncommand = "other"\n')
+    denv.config.runners["codex"] = list(FULL_CODEX)
+    denv.board.create_inbox_policy(denv.p["human"], scope="all_projects")
+    human_post(denv, ["codex"])
+    denv.clock.advance(120)
+    denv.d.tick()
+    [call] = denv.spawner.calls
+    argv = call["argv"]
+    assert argv.index(MANAGED_OVERRIDE) > argv.index('mcp_servers={"other"={enabled=false}}')
+    assert _board_env_overrides(argv) == [MANAGED_OVERRIDE]
+
+
+@pytest.mark.parametrize("text,extra", [
+    ("", []),                                                                       # no board server at all
+    ('[mcp_servers.agent-comms]\nurl = "https://board.invalid/mcp"\n', []),        # a URL server
+    ('[mcp_servers.board]\ncommand = "bash"\n', []),                                # another name
+    ("", ["-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="approve"']),  # approvals only: no entry
+    (BOARD_SERVER, ["-c", 'mcp_servers.agent-comms.url="https://board.invalid/mcp"']),  # a runner makes it a URL one
+], ids=["none", "url", "other-name", "approvals-only", "runner-url"])
+def test_a_dispatched_codex_run_without_a_stdio_board_server_gets_nothing(denv, tmp_path, monkeypatch, text, extra):
+    """No `env.` key for a server Codex has no entry for (it would refuse to start: "invalid transport"), nor for a
+    URL one."""
+    _codex_home(tmp_path, monkeypatch, text)
+    runner = FULL_CODEX[:-1] + extra + ["{prompt}"]
+    call = _launch(denv, runner)
+    assert call["argv"][:-1] == [call["cwd"] if x == "{project}" else x for x in runner[:-1]]
+
+
+def test_a_claude_run_gets_no_codex_override(denv, tmp_path, monkeypatch):
+    _codex_home(tmp_path, monkeypatch)
+    allow(denv, agents=["claude"])
+    human_post(denv, ["claude"])
+    denv.d.tick()
+    [call] = denv.spawner.calls
+    assert not any("mcp_servers" in x for x in call["argv"]) and call["env"]["AGENT_COMMS_MANAGED"] == "1"
+    assert dispatch.with_managed_env(["claude", "-p", "{prompt}"], {"AGENT_COMMS_MANAGED": "1"}) == \
+        ["claude", "-p", "{prompt}"]
+
+
+def test_codex_board_server_follows_whole_table_overrides_in_order(tmp_path, monkeypatch):
+    """A whole-table `mcp_servers={...}` override in the runner drops the dotted keys before it, as in Codex."""
+    env = _codex_home(tmp_path, monkeypatch, "")
+    url = ["-c", 'mcp_servers.agent-comms.url="https://board.invalid/mcp"']
+    table = ["-c", 'mcp_servers={agent-comms={command="bash"}}']
+    assert MANAGED_OVERRIDE in dispatch.with_managed_env(["codex", "exec"] + url + table + ["{prompt}"], env)
+    assert MANAGED_OVERRIDE not in dispatch.with_managed_env(["codex", "exec"] + table + url + ["{prompt}"], env)
+    assert MANAGED_OVERRIDE in dispatch.with_managed_env(["codex", "exec", "-c", "mcp_servers.agent-comms.command=bash",
+                                                          "{prompt}"], env), "a value that is not TOML is a string"
 
 
 def test_allow_warns_only_for_codex_runner_without_approvals(denv, monkeypatch, capsys, tmp_path):

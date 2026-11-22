@@ -5335,10 +5335,11 @@ rules; of 2f02fb5 (round 15): 164; of ff15048 (round 16): 166; after the indepen
   `dispatch_run_id` its launch prompt has it register with). How the server learns it: over stdio from its own
   environment, which Claude Code gives its MCP servers; over the remote bridge from the `x-board-managed` header the
   bridge sends from its environment (the gateway forwards it), and the bridge's `x-board-session` for the board
-  session. The refusal comes before anything is written: no budget, no audit line, no child touched. What it does
-  not stop: a Codex dispatched run's board server does not see AGENT_COMMS_MANAGED (Codex gives an MCP server a
-  small fixed environment plus its `env_vars`), so such a run is refused only through its registered board session,
-  and the spawn tools are not pre-approved for a dispatched Codex run (CODEX_OPT_IN_TOOLS); and a process that
+  session. The refusal comes before anything is written: no budget, no audit line, no child touched. What it did
+  not stop at the time: a Codex dispatched run's board server did not see AGENT_COMMS_MANAGED (Codex gives an MCP
+  server a small fixed environment plus its `env_vars`), so such a run was refused only through its registered board
+  session (since closed for the `agent-comms` stdio server: see "Spawn tools: follow-ups"), and the spawn tools are
+  not pre-approved for a dispatched Codex run (CODEX_OPT_IN_TOOLS). What it does not stop: a process that
   strips or forges its environment, starts a board server of its own, or calls the hub's /mcp with its token and
   without those headers is the OS account (the trust model), which this does not try to tell apart. Over HTTP,
   leaving a header out takes the same deliberate step as unsetting a variable: no easier way round. A side effect:
@@ -5356,8 +5357,9 @@ rules; of 2f02fb5 (round 15): 164; of ff15048 (round 16): 166; after the indepen
   the token's principal and the board session's project) and the note of a result another call took
   (`not_taken`) in a worker thread, as their other database work already ran.
 - *Round 14 (Sol, on 4a9921f).* S39: a connection that registered for a dispatched run stays one for its life,
-  whatever it registers later (another board session, another project), so a Codex run, whose server sees no
-  AGENT_COMMS_MANAGED, cannot shed its classification by registering again. Sticky means, over stdio, the board
+  whatever it registers later (another board session, another project), so a Codex run, whose server then saw no
+  AGENT_COMMS_MANAGED (it does now, through `dispatch.with_managed_env`), cannot shed its classification by
+  registering again. Sticky means, over stdio, the board
   server process (`state["dispatched"]`, set by a successful register with a dispatch_run_id, or of a board session
   that has one); over HTTP, the bridge process (once it relayed such a register it sends `x-board-managed` on every
   later call) and, on the hub, that MCP session (`mcp-session-id`); and in the hub's records, the board session
@@ -5817,9 +5819,12 @@ caught).
   (quoted and labelled as untrusted today).
 - `board_session_status` and `board_session_cancel` reach the caller's own ended children without a grant until the
   records are pruned.
-- *Done.* A Codex dispatched run forwards AGENT_COMMS_MANAGED to its board server (`dispatch.with_managed_env`, the
-  hosted binding's `env_vars` override, on the hub and on a node), so the environment check covers it before it
-  registers, as it covers Claude's.
+- *Done, for the `agent-comms` stdio server.* A Codex dispatched run, on the hub or a node, gives that server
+  AGENT_COMMS_MANAGED as one dotted key (`-c mcp_servers.agent-comms.env.AGENT_COMMS_MANAGED=...`, child_env's
+  value; `dispatch.with_managed_env`), so the environment check covers it before it registers, as it covers
+  Claude's. Only when the dispatcher can see that server (`codex_board_server`: the system, user and profile config
+  and the runner's `-c` values) with a `command` and no `url`; a server defined only in a trusted checkout's own
+  `.codex/config.toml`, or a URL one, gets nothing (a warning), and the run is refused once it registers.
 
 ## Session host: deeper trees (2026-11-22)
 

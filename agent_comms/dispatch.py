@@ -179,18 +179,7 @@ def with_codex_inbox_mcp(template: list[str], env: dict[str, str]) -> list[str]:
     """
     if not uses_codex(template):
         return template
-    codex_home = Path(env.get('CODEX_HOME') or os.path.join(env.get('HOME') or '~','.codex')).expanduser()
-    sources = [Path('/etc/codex/config.toml')]
-    if '--ignore-user-config' not in template:
-        sources.append(codex_home / 'config.toml')
-    profile = None
-    for i,arg in enumerate(template):
-        if arg in ('-p','--profile') and i+1 < len(template):
-            profile = template[i+1]
-        elif arg.startswith('--profile='):
-            profile = arg.partition('=')[2]
-    if profile:
-        sources.append(codex_home / (profile + '.config.toml'))
+    sources, profile = _codex_config_files(template, env)
     names, local = set(), {}
 
     def collect(table, effective=True):
@@ -242,6 +231,75 @@ def with_codex_inbox_mcp(template: list[str], env: dict[str, str]) -> list[str]:
     overrides += ['-c',f'mcp_servers.{CODEX_SERVER}.required=true']
     i = template.index('{prompt}')
     return template[:i] + overrides + template[i:]
+
+
+def _codex_config_files(template: list[str], env: dict[str, str]) -> tuple[list[Path], str | None]:
+    """The Codex config files a run of this runner with this environment loads that the dispatcher can read (system,
+    user unless --ignore-user-config, the selected profile's), and that profile's name. A checkout's own
+    `.codex/config.toml` is not among them: Codex loads it only for a project it trusts."""
+    codex_home = Path(env.get('CODEX_HOME') or os.path.join(env.get('HOME') or '~','.codex')).expanduser()
+    sources = [Path('/etc/codex/config.toml')]
+    if '--ignore-user-config' not in template:
+        sources.append(codex_home / 'config.toml')
+    profile = None
+    for i,arg in enumerate(template):
+        if arg in ('-p','--profile') and i+1 < len(template):
+            profile = template[i+1]
+        elif arg.startswith('--profile='):
+            profile = arg.partition('=')[2]
+    if profile:
+        sources.append(codex_home / (profile + '.config.toml'))
+    return sources, profile
+
+
+def _merged(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merged(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def codex_board_server(template: list[str], env: dict[str, str]) -> dict | None:
+    """The board server's (`mcp_servers.agent-comms`) entry as a run of this Codex runner would see it, from what the
+    dispatcher can read: the config files (`_codex_config_files`, with the selected profile's table), then the
+    runner's own `-c`/`--config` overrides in every form (`_codex_overrides`, whatever other flags the runner has), in
+    order; a whole-table `mcp_servers={...}` override drops the dotted keys set before it, as in Codex. A value that is
+    not TOML is a string, as Codex takes it. None when there is no entry or a config file cannot be read."""
+    entry: dict = {}
+    sources, profile = _codex_config_files(template, env)
+
+    def server(table) -> dict:
+        servers = table.get('mcp_servers') if isinstance(table, dict) else None
+        found = servers.get(CODEX_SERVER) if isinstance(servers, dict) else None
+        return found if isinstance(found, dict) else {}
+    try:
+        for path in sources:
+            try:
+                table = tomllib.loads(path.read_text())
+            except FileNotFoundError:
+                continue
+            entry = _merged(entry, server(table))
+            profiles = table.get('profiles')
+            if profile and isinstance(profiles, dict):
+                entry = _merged(entry, server(profiles.get(profile)))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    cli: dict = {}
+    for override in _codex_overrides(template):
+        key, sep, raw = override.partition('=')
+        key = key.strip()
+        if not sep or not key.startswith('mcp_servers'):
+            continue
+        try:
+            table = tomllib.loads(f'{key} = {raw}')
+        except tomllib.TOMLDecodeError:
+            try:
+                table = tomllib.loads(f'{key} = {json.dumps(raw)}')
+            except tomllib.TOMLDecodeError:
+                continue            # a key this cannot place: Codex reads it, this does not
+        cli = server(table) if key == 'mcp_servers' else _merged(cli, server(table))
+    entry = _merged(entry, cli)
+    return entry or None
 
 
 def _codex_overrides(template: list[str]) -> list[str]:
@@ -537,14 +595,25 @@ def with_headless_browser(template: list[str], overrides: list[str]) -> list[str
 
 def with_managed_env(template: list[str], env: dict[str, str]) -> list[str]:
     """A dispatched Codex run: Codex starts an MCP server with a small fixed environment, not its own, so the board
-    server is told to take AGENT_COMMS_MANAGED (child_env sets it to 1) from the run's, as Claude's board server does;
-    the spawn tools then refuse the run from its environment, before it registers (hosted_spawn.Ident.managed). The
-    same `env_vars` override as a hosted session's binding (session_host.env_vars_override). Last: it must follow
-    with_codex_inbox_mcp's whole-table `mcp_servers={...}` override, which drops dotted keys set before it."""
-    if not uses_codex(template):
+    server is given AGENT_COMMS_MANAGED, with the value child_env put in the run's `env`, as a literal of its own
+    (`-c mcp_servers.agent-comms.env.AGENT_COMMS_MANAGED=...`), as Claude's board server inherits it; the spawn tools
+    then refuse the run from its environment, before it registers (hosted_spawn.Ident.managed). One dotted key:
+    Codex merges it into the server's entry and keeps its `env_vars` and other `env` values, and a literal `env`
+    value wins over one the server would inherit. Only for a stdio board server this can see (`codex_board_server`:
+    `command`, no `url`): a `-c` sub-key for a server Codex has no entry for makes it refuse to start ("invalid
+    transport"), and a URL server has no process environment. A board server defined only where this cannot read it
+    (a trusted checkout's own `.codex/config.toml`) gets nothing, and the run is refused once it registers. Last: it
+    must follow with_codex_inbox_mcp's whole-table `mcp_servers={...}` override, which drops dotted keys set before
+    it."""
+    value = env.get("AGENT_COMMS_MANAGED")
+    if not uses_codex(template) or value is None:
         return template
-    from .session_host import codex_config_of, env_vars_override
-    return with_headless_browser(template, env_vars_override(template, ("AGENT_COMMS_MANAGED",), codex_config_of(env)))
+    entry = codex_board_server(template, env)
+    if entry is None or not isinstance(entry.get("command"), str) or not entry["command"].strip() or "url" in entry:
+        log.warning("a Codex run without a stdio %s server the dispatcher can see: AGENT_COMMS_MANAGED is not "
+                    "passed to its board server", CODEX_SERVER)
+        return template
+    return with_headless_browser(template, ["-c", f"mcp_servers.{CODEX_SERVER}.env.AGENT_COMMS_MANAGED={_toml(value)}"])
 
 
 # ---------------------------------------------------------------- signed-in browser profiles (access.py)
