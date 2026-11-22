@@ -100,7 +100,8 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
     @mcp.tool(description=(
         "Send a follow-up message to a child session you started (only yours: never your parent's or a sibling's), "
         "and/or change what that child may start itself: may_spawn (true/false) and spawn_share (how many sessions it "
-        "may start in all; -1: no share of its own). The message runs as the child's next turn, and its reply comes "
+        "may start in all; -1: no share of its own), never more than you may start yourself; off for it is off for "
+        "every session under it while it is off. The message runs as the child's next turn, and its reply comes "
         "back to you as a result, as for board_session_spawn (wait=true waits up to 45 s for it)." + PROJECT
         + UNTRUSTED + warning))
     async def board_session_send(child: str, message: str | None = None, may_spawn: bool | None = None,

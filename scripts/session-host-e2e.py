@@ -141,6 +141,18 @@ T10. Spawn tools (hosted_spawn.py). A sixth Claude agent's runner has the temp b
 T10b. (stand-ins) An interactive caller: a `board mcp` with no binding is the agent's one interactive root for the
     project, counted against the same budget; its child runs on the node, and another board server process (a restart)
     sees it and takes its result, which is never a turn; closing that tree ends the child.
+T11. A deeper tree (max_depth 2, shipped). A root of the sixth agent starts a child of the same agent (workspace),
+    which starts a read-only Claude grandchild: with the real CLI the human asks the root to delegate two levels down
+    and each level calls board_session_spawn itself (wait=true); with the stand-ins the script makes each call from
+    that session's own board server (its binding). The child's frame says it may start helpers and that theirs may
+    not; the grandchild's says it cannot. The grandchild's result goes to the child only, the child's to the root.
+    Each run proves one path, and requires it: with the real CLI each level waits in its own turn, so both results
+    are `claimed`, and the root's reply is exactly the grandchild's word; with the stand-ins nobody waits, so both are
+    turns (`delivered`: the child takes its helper's result as a turn, and its reply to it is the root's next
+    turn), and then the waiting path is run deterministically too (a second grandchild started with wait=true from
+    the child's board server, a message to the child sent with wait=true from the root's: both `claimed`). One audit
+    post per start naming the direct parent and the root; closing the root ends everything under it, with an audit
+    post for each end below it.
 The settings fixtures live in the temp directory only. They are loaded with `--settings` because Claude Code
 ignores an untrusted directory's own `.claude/settings.json` in print mode (it says so on stderr), and trusting the
 temp checkout would mean writing the user's `~/.claude.json`. With the real CLI those two runners also pass
@@ -2010,6 +2022,167 @@ max_live = 8
         listed, _, _ = self.board("session", "list")
         self.check(listed.strip() == "(no hosted sessions)", "no hosted session is left")
 
+    def deep_scenario(self) -> None:
+        """T11: a deeper tree (max_depth 2, shipped): a hosted session starts a child that starts a grandchild, and the
+        results come back up level by level (DESIGN_NOTES "Session host: deeper trees")."""
+        real = self.real
+        print("\n[T11] a deeper tree: a parent starts a child that starts a grandchild")
+        first = "Reply with exactly the word: ready" if real else "ready"
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", SPAWN_AGENT, "--model",
+                               "haiku", "--wait", "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.show(rid)
+        print(f"  root {rid} ({SPAWN_AGENT})")
+        if real:
+            inner = (f"Use the board tool board_session_spawn once, with wait=true, child_agent '{AGENT}', model "
+                     "'haiku', access 'read-only' and task 'Reply with exactly the word: plum'. Then reply with "
+                     "exactly the word that session replied, and nothing else.")
+            ask = (f"Use the board tool board_session_spawn once, with wait=true, child_agent '{SPAWN_AGENT}', model "
+                   f"'haiku', access 'workspace' and this task: \"{inner}\" Then reply with exactly the word your "
+                   "child session replied, and nothing else.")
+            out, _, took = self.board("session", "send", rid, ask, "--wait", "--json")
+            print(f"  the human asked the root to delegate two levels down; its turn took {took:.1f}s; its tool "
+                  f"calls: {self.tool_calls(rid)}; its reply: {json.loads(out)['reply']!r}")
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not [k for k in self.show(rid).get("children", [])
+                                                       if (k.get("spawned_by") or {}).get("session") == rid]:
+                time.sleep(0.3)
+        else:
+            [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+                "task": "olive", "child_agent": SPAWN_AGENT, "access": "workspace", "role": "research"}]], rid)
+            self.check(not made["error"], "the root's board server started the child")
+        kids = [k for k in self.show(rid).get("children", []) if (k.get("spawned_by") or {}).get("session") == rid]
+        self.check(len(kids) == 1 and kids[0]["agent"] == SPAWN_AGENT and kids[0]["depth"] == 1,
+                   "the root started one child, at depth 1, of the same agent (recursion is bounded by depth and "
+                   "budget)")
+        kid = kids[0]["session_id"]
+        if not real:
+            deadline = time.monotonic() + 30        # the child's first turn (`olive`) is over: then it is idle
+            while self.show(kid).get("turns", 0) < 1 and time.monotonic() < deadline:
+                time.sleep(0.2)
+            [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+                "task": "plum", "child_agent": AGENT, "access": "read-only", "role": "test"}]], kid)
+            self.check(not made["error"], "the child's own board server (its binding) started the grandchild")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not self.show(kid).get("children"):
+            time.sleep(0.3)
+        grands = self.show(kid).get("children", [])
+        if not grands:
+            print(f"  the child's own reply: {self.show(kid).get('reply')!r}")     # (why it started none)
+        self.check(len(grands) == 1 and grands[0]["depth"] == 2 and grands[0]["root"] == rid
+                   and grands[0]["parent"] == kid and grands[0]["access"] == "read-only"
+                   and (grands[0].get("spawned_by") or {}).get("session") == kid,
+                   "the child started one grandchild, at depth 2, under it and in the root's tree")
+        grand = grands[0]["session_id"]
+        deadline = time.monotonic() + 240
+        while True:
+            from_grand = [x for x in self.show(kid).get("results", []) if x["child"] == grand]
+            from_kid = [x for x in self.show(rid).get("results", []) if x["child"] == kid]
+            # What each run proves. Real CLIs: each level waits in its own turn (wait=true), so every result is
+            # `claimed` by the call that waited. Stand-ins: nobody waits, so every result is a turn (`delivered`).
+            settled = ("claimed",) if real else ("delivered",)
+            done = ("claimed", "delivered", "undelivered")
+            if (from_grand and all(x["state"] in done for x in from_grand)
+                    and len(from_kid) >= (1 if real else 2) and all(x["state"] in done for x in from_kid)
+                    and self.show(rid)["state"] == "idle" and not self.show(rid).get("queued")):
+                break
+            if time.monotonic() > deadline:
+                raise SystemExit(f"FAIL: the results did not come back up: grandchild {json.dumps(from_grand)}, "
+                                 f"child {json.dumps(from_kid)}")
+            time.sleep(0.5)
+        lines = self.stdin_lines()     # (once both turns are over)
+        self.check(any("You may start helper sessions of your own" in t and "depth 1 of at most 2" in t
+                       and "cannot start any of their own" in t for t in lines),
+                   "the child's frame says it may start helpers, and that theirs may not")
+        self.check(any("You cannot start helper sessions of your own: you are at depth 2, the deepest level" in t
+                       for t in lines), "the grandchild's frame says plainly that it cannot")
+        print(f"  grandchild -> child: {[(x['outcome'], x['state'], x['started_by']) for x in from_grand]}")
+        print(f"  child -> root: {[(x['outcome'], x['state'], x['started_by']) for x in from_kid]}")
+        self.check(all(x["state"] in settled for x in from_grand + from_kid),
+                   "every result came back by the path this run takes: " + (
+                       "each level waited for it in its own turn (claimed)" if real
+                       else "each was its parent's next turn (delivered)"))
+        self.check(all(x["outcome"] == "completed" and x["started_by"] == "parent" for x in from_grand),
+                   "the grandchild's result went to the child, its direct parent")
+        self.check(not [x for x in self.show(rid).get("results", []) if x["child"] == grand],
+                   "and never to the root: nothing skips a level")
+        grand2 = None
+        if real:
+            reply = (self.show(rid).get("reply") or "").strip()
+            print(f"  the root's last reply: {reply!r}")
+            self.check(reply == "plum", "the root answered with exactly the grandchild's word, passed up through the "
+                                        "child")
+        else:
+            self.check(from_kid[-1]["started_by"] == "child" and from_kid[-1]["outcome"] == "completed",
+                       "the child took the grandchild's result as a turn, and its reply to it is a result for the root")
+            # (A stand-in replies `turn <k>: <its turn's text in capitals>`.)
+            turns = self.stdin_lines()
+            self.check(any(t.startswith("[agent-comms] Results from 1 child session")
+                           and "\nturn 1: [AGENT-COMMS] A TASK FROM CHILD SESSION" in t and "PLUM" in t for t in turns),
+                       "the child's turn carried the grandchild's reply, framed by the server")
+            self.check(any(t.startswith("[agent-comms] Results from 1 child session")
+                           and "turn 2: [AGENT-COMMS] RESULTS FROM 1 CHILD SESSION" in t and "PLUM" in t
+                           for t in turns),
+                       "the root's turn carried the child's reply to it, which holds the grandchild's")
+            # The other path, deterministic with stand-ins: each level waits in its turn (wait=true) and takes the
+            # result in the tool's answer; it is `claimed`, and never also a turn. A waiting session is busy in its
+            # turn, so the human gives each a turn that is held open (`hold <file>`: it lasts until the file exists;
+            # no result for anybody) while its board server waits; otherwise an idle stand-in's result could become a
+            # turn before the call takes it. Each is released explicitly, and each wait call is made only once its
+            # session is seen in that turn.
+            release = {x: self.tmp / f"release-{x}" for x in ("root", "child")}
+            self.board("session", "send", rid, f"hold {release['root']} the root is in a turn")
+            self.board("session", "send", kid, f"hold {release['child']} the child is in a turn")
+
+            def in_turn(sid: str, want: bool, what: str) -> None:
+                deadline = time.monotonic() + 30
+                while bool(self.show(sid).get("in_flight")) != want:
+                    if time.monotonic() > deadline:
+                        raise SystemExit(f"FAIL: {what} was not {'in' if want else 'out of'} its held turn within 30 s")
+                    time.sleep(0.1)
+
+            in_turn(rid, True, "the root")
+            in_turn(kid, True, "the child")
+            self.check(bool(self.show(rid).get("in_flight")) and bool(self.show(kid).get("in_flight")),
+                       "the root and the child are each in a turn held open")
+            [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+                "task": "pear", "child_agent": AGENT, "access": "read-only", "role": "test", "wait": True}]], kid)
+            if made["error"]:
+                raise SystemExit(f"FAIL: the second grandchild was refused: {made['text'][:600]}")
+            out = json.loads(made["text"])
+            grand2 = out["child"]["id"]
+            self.check(bool(out.get("result")) and "PEAR" in out["result"]["text"]
+                       and out["result"]["result"]["child"] == grand2,
+                       "the child's board server waited for a second grandchild and took its result in the answer")
+            release["child"].touch()                    # the child's held turn ends; the root's is still open
+            in_turn(kid, False, "the child")
+            self.check(bool(self.show(rid).get("in_flight")), "the root is still in its held turn")
+            [sent] = self.mcp_calls(SPAWN_AGENT, [["board_session_send", {"child": kid, "message": "fig",
+                                                                          "wait": True}]], rid)
+            out = json.loads(sent["text"]) if not sent["error"] else {}
+            self.check(bool(out.get("result")) and "FIG" in out["result"]["text"],
+                       "the root's board server waited for the child's reply and took it in the answer")
+            self.check(bool(self.show(rid).get("in_flight")), "the root was in its held turn all through its wait")
+            fig = out["result"]["result"]["message"]
+            mine = [x for x in self.show(kid).get("results", []) if x["child"] == grand2]
+            took = [x for x in self.show(rid).get("results", []) if x["child"] == kid and x["message"] == fig]
+            self.check([x["state"] for x in mine] == ["claimed"] and [x["state"] for x in took] == ["claimed"],
+                       "both claimed, one level each, and neither became a turn")
+            release["root"].touch()
+        audit = self.tree_thread_posts(rid)
+        self.check(sum("started child session" in p["body"] for p in audit["posts"]) == (2 if real else 3)
+                   and any(f"depth 2 under parent {kid} in tree {rid}" in p["body"] for p in audit["posts"]),
+                   "one audit post per start, at each level, naming the direct parent and the root")
+        self.board("session", "close", rid)
+        below = [kid, grand] + ([grand2] if grand2 else [])
+        self.check(all(self.wait_ended(x)["state"] == "ended" for x in [rid] + below),
+                   "closing the root ends the child and the grandchild" + ("ren" if grand2 else ""))
+        audit = self.tree_thread_posts(rid)
+        self.check(sum("ended: closed because the session it was started under ended" in p["body"]
+                       for p in audit["posts"]) == len(below), "one audit post for each end below the root")
+        listed, _, _ = self.board("session", "list")
+        self.check(listed.strip() == "(no hosted sessions)", "no hosted session is left")
+
     # ------------------------------------------------------------ teardown
 
     def stop(self) -> None:
@@ -2124,6 +2297,7 @@ def main() -> int:
             run.tree_scenario()
             run.results_scenario()
             run.spawn_scenario()
+            run.deep_scenario()
             print("\n[T8] stopping the node (SIGTERM) and the hub")
             run.stop()
             run.check(run.leftovers() == [], "no session process is left behind")

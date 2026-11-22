@@ -273,11 +273,17 @@ def test_a_name_is_never_reused_under_a_parent(senv):
     assert child(senv, sid, role="test")["name"] == "test-2"
 
 
-def test_the_parent_must_exist_be_open_and_be_a_root(senv):
+def test_the_parent_must_exist_be_open_and_within_the_depth_limit(senv):
     assert child(senv, UNKNOWN, expect=404)["message"] == "no such hosted session"
     assert senv.human.post("/api/hosted-sessions/not-a-uuid/children", json={"message": "x"}).status_code == 404
     sid = root(senv)
     kid = child(senv, sid)
+    tick(senv)
+    grand = child(senv, kid["session_id"])          # max_depth 2 as shipped: a grandchild
+    assert (grand["parent"], grand["root"], grand["depth"]) == (kid["session_id"], sid, 2)
+    out = child(senv, grand["session_id"], expect=409)
+    assert "depth limit" in out["message"] and "max_depth is 2" in out["message"], "depth 2"
+    senv.board.s.dispatch = {**TREE, "sessions": {"spawn": {"enabled": True, "max_depth": 1}}}
     out = child(senv, kid["session_id"], expect=409)
     assert "a child cannot have children" in out["message"] and sid in out["message"], "depth 1"
     assert senv.human.post(f"/api/hosted-sessions/{sid}/close").status_code == 200
@@ -2349,7 +2355,7 @@ def test_a_runner_that_names_its_own_directory_is_held_against_where_the_parent_
     node = make_node(senv, config=config, log_dir=senv.tmp / "b-logs")
     node.hello()
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 2, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 3, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]},
                                     "dirs": {"codex-cli": str(here)}}
     sid = start(senv)["session_id"]
@@ -2427,14 +2433,14 @@ def test_a_node_that_does_not_declare_the_child_protocol_is_listed_no_child(senv
                              "status_seq"}, "... and that as before there were trees"
     declared = {x["session_id"]: x for x in senv.laptop.get("/api/nodes/sessions", params={"tree": 1}).json()["sessions"]}
     assert set(declared) == {sid, kid} and declared[kid]["parent"] == sid and declared[sid]["access"] is None
-    assert spy.gets and all(params.get("tree") == 2 for _, params in spy.gets), "this node says so every time"
+    assert spy.gets and all(params.get("tree") == 3 for _, params in spy.gets), "this node says so every time"
     assert msg(senv, kid, 1)["state"] == "queued"
 
 
 def test_children_need_a_node_whose_latest_hello_declares_the_protocol(senv):
     """S5. Creation requires current support, and a child whose node no longer has it is not left closing for ever."""
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 2, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 3, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]}}
     sid = root(senv)
     kid = child(senv, sid)["session_id"]
@@ -2700,7 +2706,9 @@ def test_a_child_whose_node_was_rolled_back_is_settled_by_the_hub(senv):
     hello = {"projects": [PROJECT, P2, P3], "runners": ["claude-code", "codex-cli"], "sessions": {"max_live": 4}}
     assert senv.laptop.post("/api/nodes/hello", json=hello).status_code == 200      # rolled back: no session_host
     assert [x["session_id"] for x in senv.laptop.get("/api/nodes/sessions").json()["sessions"]] == [sid]
-    assert hosted_wake.turn_projects(senv.board, senv.clock()) == set(), "the project is the dispatcher's again"
+    assert [r["session_id"] for r in hosted_wake.turn_sessions(senv.board, senv.clock())] == [sid], \
+        "the children no longer hold the project; only the parent's turn with their results, reserved once listed " \
+        "(review round 1 of deeper trees, D2), until its node reports it"
     for x in (kid, idle):
         view = show(senv, x)
         assert view["state"] == "ended" and view["error"] == hosted_tree.ORPHANED[:300], x

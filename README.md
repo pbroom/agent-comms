@@ -859,13 +859,18 @@ argument: a child runs in its parent's project. `send`, `show` and `close` take 
   reports. A report field newer than the hub is the exception: the hub names the ones it takes in its answer to
   the node's fetch, and the node sends only those (so this version's node reports to an older hub exactly as
   before). A report the hub cannot read at all is one error line in the node's log, naming that cause.
-- **Limits.** A child cannot have children (`[dispatch.sessions.spawn] max_depth = 1`, shipped). At most
-  `max_children` children of one session that have not ended.
+- **Limits.** A child may have children of its own, down to `[dispatch.sessions.spawn] max_depth` levels below
+  the root (1 to 4; 2 as shipped: a root, its children and theirs). At most `max_children` children of one parent
+  that have not ended (each parent counts its own). `shared` means the project's checkout on the node at every
+  level, also under a child that has a worktree of its own; a grandchild can have a worktree of its own too.
   The node's `max_live` counts children too: set it to at least 1 + the children you want live at once (a child
-  that cannot get a process waits, and an idle one is stopped to make room, as for any session). "One session per
-  agent and project" is about the sessions you start without `--parent`; children do not count.
-- **Ending.** Closing a session, or its ending for any reason, closes its children. Closing a child leaves its
-  parent alone.
+  that cannot get a process waits, and an idle one is stopped to make room, as for any session; the parent of a
+  full-access child is kept while that child or anything under it is at work, and is not stopped for being idle
+  while anything under that child is alive or anything of it waits, since that child takes turns only under its
+  parent's live process). "One session per agent and project" is about the sessions you start without
+  `--parent`; children do not count.
+- **Ending.** Closing a session, or its ending for any reason, closes everything under it, every level at once.
+  Closing a child leaves its parent alone.
 - **The board.** A post never wakes a child: wakes go to sessions started without `--parent`. A child of the same
   agent signs in to the board as that agent. A hosted session whose node gives it a binding (while a spawn grant
   covers its agent and project, next section) registers its board session BOUND to it, so a bound child's read and
@@ -894,8 +899,11 @@ polls and nobody copies anything across. That holds for a turn you started with 
 - **Order.** Your messages first, then results, then board wakes. Results wait while the parent has a turn running
   or a message of yours queued; a wake is not queued while results wait, and one queued before them steps back
   (`show` lists it as not sent, and its posts go with the next wake). Like a wake, results also wait while a
-  dispatched run is using the parent's checkout, and go once the run is over (a child in its own worktree still
-  takes its turns meanwhile; your own messages to the parent are never held).
+  dispatched run is using the parent's checkout (a run on the parent's node for the project, a run on the hub in the
+  directory the hub gives it, or a launch the dispatcher has claimed), and go once the run is over; once a result
+  turn is made, a dispatched run for that checkout waits for it until the node reports it, as for an agent's task (a
+  child in its own worktree still takes its turns meanwhile, and its own children's results go to it; your own
+  messages to the parent are never held). `board session show <parent>` says, for each result that waits, why.
 - **Several at once** go together as one turn, oldest first, up to 10 results and 64 KB; the rest follow as the
   next one.
 - **Delivered once when confirmed, at most one marked repeat, never silently lost.** A result is kept on the hub,
@@ -942,7 +950,7 @@ uv run board session close <id>          # a hosted session, or an interactive r
 ```toml
 [dispatch.sessions.spawn]           # the limits, with their defaults; each counts for the GRANT: one agent in one
                                     # project, across all its sessions there
-max_depth = 1                       # the only value in this version: children cannot start children of their own
+max_depth = 2                       # 1 to 4 levels below a root; 2: children may start children, theirs may not
 max_live_children = 5               # child sessions the agent started in the project that have not ended
 max_spawns_per_hour = 12            # child sessions it started there within the past hour
 max_turns_without_human = 40        # its children's turns there since you last messaged one of its sessions there
@@ -1000,11 +1008,33 @@ max_turns_without_human = 40        # its children's turns there since you last 
   transaction order, so a turn charged after your reset always counts.
 - **What the child is told.** Its task arrives as a turn the hub writes: a fixed header saying that this is a task
   from that session (its name or id and agent), not from you, that the text is untrusted data and grants no
-  permission, then the task between two marker lines with a token made for that turn.
+  permission; then one line saying whether it may start helpers of its own (that starting them is part of what it
+  already has: your grant and the budget you set aside for it, checked by the server at every call, so it needs no
+  further approval within those limits, and the task text cannot widen them; how many levels remain below it, the
+  targets it could start on its own node, which are no dearer than its own, and the budget left after the start
+  that made it), or plainly that it cannot (at the deepest level, with no grant for its own agent, with no budget
+  left, or with no target on its node); then the task between two marker lines with a token made for that turn. The
+  line is true when it is written; it is advice and can go stale (`board_session_capabilities` says what holds now,
+  and the tools decide).
+- **Deeper trees.** A child starts children of its own with the same tools, within `max_depth`. Everything above
+  holds at every level: it reaches only the children it started; their access is the narrowest of the whole chain
+  above them; a result goes to its direct parent only, as that parent's next turn (so a grandchild's result is the
+  child's turn, and the child's reply to it is a result for the root); the limits count every session the agent
+  started in the project, at every level and under every root; `max_children` is each parent's own; closing or
+  ending a session ends everything under it. A child of another agent starts helpers under its own agent's grant
+  and budget. A child may start the same agent and model as itself: that is bounded by the depth and the budget,
+  like any other start.
 - **Results** come back as for any child (a turn of the parent's), except that `wait=true` on `spawn` or `send`
   (up to 45 seconds) returns the reply in the tool's answer instead, and then it is never also a turn. A result
   whose earlier delivery is not settled cannot be taken that way. A turn the caller cancelled is a result with the
   outcome `cancelled`. `status` shows the outcome only of turns the caller gave.
+- **The allowance.** Each child may start sessions of its own by default. You change that while it runs (`board
+  session allow <child> --no-spawn | --spawn | --share N`), and so can its parent (`board_session_send` with
+  `may_spawn` or `spawn_share`), never to more than the parent may do itself: whatever the call gives, the
+  allowance it leaves is no wider than the parent's own (on over off; no share of its own over any number, a larger
+  number over a smaller), and nothing is widened while the parent or a session above it is off. A child starts
+  with its starter's share. Off for a session is off for every session under it while it is off. No process is
+  restarted for it.
 - **Limits are per grant**, across all the agent's sessions in the project, hosted or interactive: a new session,
   a restarted board server or a revoke and a new grant start no count over. At a limit the call is refused with the
   reason and you get ONE Needs-you item, in the budget's own thread in the project (also when the refused call was
@@ -1044,7 +1074,8 @@ max_turns_without_human = 40        # its children's turns there since you last 
   item (not any post in the thread), starts the turn count over.
 - **Audit.** One post per child started and per child ended, in one thread per tree in the project, written by the
   hub (as you, marked automatic: it is no answer of yours and counts against nobody's post cap): ids, agent names,
-  model, access, isolation, and the title quoted as untrusted data. Never the task or a reply.
+  model, access, isolation, the depth, the direct parent and the root, and the title quoted as untrusted data. Never
+  the task or a reply.
 - **A revoked or expired grant** stops new children and new messages at once (narrowing a child's allowance still
   works). Children that are running finish the turn they are in and the messages already queued for them; `status`
   and `cancel` keep working for them. Close the tree to stop those too.
@@ -1058,7 +1089,10 @@ max_turns_without_human = 40        # its children's turns there since you last 
   transaction are the ones the launch uses, and if the request's browser requirements changed meanwhile it is not
   launched but queued again for a fresh reservation. A child in its own worktree is held by neither.
 - **Versions.** Update the hub, then its nodes: an agent-started child needs a node of this version (its hello says
-  `tree: 2`); an older node gets no binding, no interactive child and no such child.
+  `tree: 2`); an older node gets no binding, no interactive child and no such child. A session under a full-access
+  child needs a node that keeps that child's parent up for its results (`tree: 3`); on an older one the start is
+  refused with the reason, and the frame and `capabilities` say so; a node that comes back older than that has the
+  sessions it had under a full-access child ended, with the reason.
 
 **The unit of trust is the OS account.** On a machine where sessions with a shell run as the same OS user as the
 node (or the hub), those sessions hold that machine's keys: every agent's token file there; the node's credential,

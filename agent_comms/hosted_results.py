@@ -359,14 +359,19 @@ def render(results: list[dict], token: str | None = None, header: str | None = N
 def _free(r: Any, node: str | None, board: Board | None = None) -> bool:
     """A hosted parent that can take results as its next turn now: open, not being closed, on this node, with no
     turn in flight and nothing queued (a message of the human's that waits goes first), and, with `board`, its
-    checkout not in use by a dispatched run (hosted_wake._occupied: one run per checkout, both ways round, as for a
-    wake; a result turn is an automatic turn too, and only the human's own message is exempt)."""
+    checkout not in use by a dispatched run: by the hub's path for the project (hosted_wake._occupied, as for a wake)
+    nor by the node-and-checkout identity an agent's task is held to (hosted._checkout_busy: a run on the parent's
+    node for its project, or a launch the dispatcher has claimed). A result turn is an automatic turn too, and only
+    the human's own message is exempt. Once made, the turn is RESERVED (`shown_at`, `_deliver`): the dispatcher
+    counts the checkout busy until the node reports on it (hosted.shown_task, hosted_wake.turn_projects)."""
     if not (isinstance(r, dict) and r.get("state") != "ended" and not r.get("stop")
             and (node is None or r.get("node") == node)
             and r.get("in_flight") is None and not int(r.get("queued") or 0)):
         return False
     from . import hosted_wake
-    return board is None or not hosted_wake._occupied(board, r)
+    # (A parent with a worktree of its own runs elsewhere: only the identity check holds it, as for an agent's task.)
+    return board is None or not ((r.get("isolation") != "worktree" and hosted_wake._occupied(board, r))
+                                 or hosted._checkout_busy(board, r))
 
 
 def _pending_parents(conn) -> list[str]:
@@ -374,6 +379,15 @@ def _pending_parents(conn) -> list[str]:
                            WHERE key >= ? AND key < ? AND json_valid(value)
                              AND json_extract(value, '$.state') = 'pending'""", hosted._range(RESULT_PREFIX))
     return sorted(p for (p,) in rows if isinstance(p, str) and SESSION_ID_RE.fullmatch(p))
+
+
+def outstanding(conn, session_id: str) -> bool:
+    """A result for this session is not settled yet: pending, or queued (in a turn of the session's that its
+    provider has not confirmed it started: such a turn can still settle without that word, and the result then goes
+    back to pending, `carried`). Settled: delivered (that turn started), claimed or undelivered."""
+    return conn.execute("""SELECT 1 FROM board_state WHERE key >= ? AND key < ? AND json_valid(value)
+                           AND json_extract(value, '$.state') IN ('pending', 'queued') LIMIT 1""",
+                        hosted._range(f"{RESULT_PREFIX}{session_id}.")).fetchone() is not None
 
 
 def waiting(board: Board, conn, session_id: str) -> bool:
@@ -433,6 +447,7 @@ def _deliver(c, r: dict, now: float) -> dict | None:
         return None
     m = hosted._enqueue(c, r, KIND, render(batch), HUB, now)
     m["results"] = [x["n"] for x in batch]
+    m["shown_at"] = now     # reserved, as an agent's task is: shown to the node in this transaction (hosted.shown_task)
     _put(c, hosted._msg_key(pid, m["n"]), m, HUB, now)
     for x in batch:
         x |= {"state": "queued", "carrier": m["n"], "updated_at": now}
@@ -518,12 +533,52 @@ def view_one(x: dict, text: bool = False) -> dict:
     return out
 
 
-def view(conn, parent_id: str) -> tuple[list[dict], dict | None]:
+def waiting_because(board: Board, conn, x: dict) -> str | None:
+    """Why a result that waits has not reached its parent yet, in the server's words (None: it does not wait). Read
+    from what is stored now, by the same rules that decide its delivery (`_free`, the node's hold of a full child)."""
+    if x.get("state") not in WAITING:
+        return None
+    parent = _get(conn, hosted.SESSION_PREFIX + x["parent"]) if isinstance(x.get("parent"), str) else None
+    if x["state"] == "queued":
+        top = (_get(conn, hosted.SESSION_PREFIX + parent["parent"])
+               if hosted_tree.is_child(parent) and parent.get("access") == "full"
+               and not hosted_tree.interactive(parent) else None)
+        if isinstance(top, dict) and top.get("ceiling") != "full":
+            return ("in the parent's next turn, which its node holds until the parent's own parent has a live process "
+                    "that confirmed full access again (that session's next turn)")
+        return "in a turn of the parent's that its node has not started yet"
+    if not isinstance(parent, dict):
+        return ("it waits to be taken by its starter's call (board_session_status with wait_seconds, or a wait): "
+                "nothing can write an interactive session a turn") if is_interactive_parent(conn, x) else \
+            "its parent session is not on record"
+    if parent.get("state") == "ended" or parent.get("stop"):
+        return "its parent session has ended or is being closed"
+    if parent.get("in_flight") is not None or int(parent.get("queued") or 0):
+        return "the parent has a turn running, or a message queued before it (a message of the human's goes first)"
+    from . import hosted_wake
+    if (parent.get("isolation") != "worktree" and hosted_wake._occupied(board, parent)) or hosted._checkout_busy(
+            board, parent):
+        return "a dispatched run is using the parent's checkout: it goes once the run is over"
+    return "it goes as the parent's next turn when the parent's node next asks for its sessions"
+
+
+def is_interactive_parent(conn, x: dict) -> bool:
+    from . import hosted_spawn
+    return isinstance(x.get("parent"), str) and hosted_spawn.is_iroot(conn, x["parent"])
+
+
+def view(conn, parent_id: str, board: Board | None = None) -> tuple[list[dict], dict | None]:
     """The results for this session as `show` lists them: the most recent SHOW_RESULTS, and every undelivered one
-    besides, with the child's reply; and how many undelivered ones the retention limit dropped (None: none)."""
+    besides, with the child's reply; and how many undelivered ones the retention limit dropped (None: none). With
+    `board`, each one that waits says why (`waiting_because`)."""
     rows = _results(conn, parent_id)
     recent = {x["n"] for x in rows[-SHOW_RESULTS:]}
     listed = [view_one(x, text=x.get("state") == "undelivered") for x in rows
               if x["n"] in recent or x.get("state") == "undelivered"]
+    if board is not None:
+        for v in listed:
+            why = waiting_because(board, conn, v | {"parent": parent_id})
+            if why:
+                v["waiting_because"] = why
     dropped = _box(conn, parent_id)["dropped"]
     return listed, (dropped if int(dropped.get("count") or 0) else None)

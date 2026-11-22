@@ -6,6 +6,8 @@ tests and scripts/session-host-e2e.py install it as an executable named `claude`
 
 What a turn does is in its text:
 - `sleep N ...`: the turn takes N seconds.
+- `hold PATH ...`: the turn lasts until the file PATH exists (at most 120 seconds): a turn held open for as long as
+  a test needs, released by creating the file.
 - `fail ...`: the result is an error.
 - `crash ...`: the process exits (code 3) at once, before anything of the turn is written.
 - `deny ...`: the result lists a refused Write (the turn itself succeeds, as Claude's does).
@@ -219,6 +221,11 @@ def main() -> None:
         pause = re.match(r"sleep (\d+(?:\.\d+)?)\b", text)
         if pause:
             time.sleep(float(pause.group(1)))
+        held = re.match(r"hold (/\S+)", text)
+        if held:
+            until = time.monotonic() + 120
+            while not os.path.exists(held.group(1)) and time.monotonic() < until:
+                time.sleep(0.05)
         failed = text.startswith("fail")
         reply = "x" * 40_000 if text.startswith("big") else f"turn {turn}: {text.upper()}"
         denials = ([{"tool_name": "Write", "tool_use_id": "toolu_01", "tool_input": {"file_path": "/tmp/x"}}]

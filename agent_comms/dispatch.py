@@ -855,10 +855,10 @@ class SpawnConfig:
     unless `enabled = true`: without it no session can be started under another, and nothing else changes."""
 
     enabled: bool = False
-    max_children: int = 5       # children of one root session that have not ended, at most
+    max_children: int = 5       # children of one parent session that have not ended, at most (each parent's own)
     # Agent-callable spawn tools (hosted_spawn.py), also read on the hub. Every limit is per GRANT: for one agent in
     # one project, across all its roots (hosted or interactive), so neither depth nor a fresh root multiplies them.
-    max_depth: int = 1                  # levels below a root; 1: a child's own spawn call is refused ("depth limit")
+    max_depth: int = 2                  # levels below a root, 1 to 4; 2: a root, its children and their children
     max_live_children: int = 5          # child sessions the agent started in the project that have not ended
     max_spawns_per_hour: int = 12       # child sessions it started there within the past hour
     max_turns_without_human: int = 40   # its child sessions' turns there since the human last messaged one of its
@@ -873,8 +873,7 @@ class SpawnConfig:
         if not isinstance(d, dict):
             raise ValueError(f"{where} must be a table")
         c = cls()
-        # max_depth: 1 in this version (deeper trees are built and tested, behind a test-only override)
-        bounds = {"max_children": 50, "max_depth": 1, "max_live_children": 50, "max_spawns_per_hour": 1000,
+        bounds = {"max_children": 50, "max_depth": 4, "max_live_children": 50, "max_spawns_per_hour": 1000,
                   "max_turns_without_human": 10000}
         for k, v in d.items():
             if k == "enabled":

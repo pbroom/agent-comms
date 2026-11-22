@@ -4,26 +4,29 @@ A hosted session (hosted.py) can have CHILDREN: sessions started under it, possi
 their own isolation and access level. Everything here is off unless the hub says `[dispatch.sessions.spawn] enabled =
 true`; with it off no child can be created and nothing else changes.
 
-- *Records.* Still `board_state`, the same `host.session.<uuid>` records. A child's record also holds `parent` and
-  `root` (the same id: the tree is one level deep), `depth` 1, `name` (`<role>-<n>`, unique under its parent),
-  `title`, `role`, `isolation` (`shared`: the parent's checkout; `worktree`: a git worktree of its own on the node),
+- *Records.* Still `board_state`, the same `host.session.<uuid>` records. A child's record also holds `parent` (its
+  direct parent), `root` (its parent's root: the session at the top of the tree), `depth` (its parent's plus one),
+  `name` (`<role>-<n>`, unique under its parent), `title`, `role`, `isolation` (`shared`: the project's checkout on
+  the node, the one its root runs in, at every level; `worktree`: a git worktree of its own on the node),
   `access` (the word asked of its node), `effort` and `request_id`. A root's `access` is what its node reported
   for it (derived from the node's runner). A record without `parent` is a root, whenever it was made.
 - *Who.* `create_child` is the one function that makes a child, and it checks no caller: the human's route
   (`start_child`) does, and the agent-callable spawn tool does after its own checks (hosted_spawn.py: who is
   calling, the human's grant, the tree's limits).
 - *Rules.* The parent exists, has not ended and is not being closed, and the child's depth (its parent's plus one)
-  is at most [dispatch.sessions.spawn] max_depth (1 as shipped: the parent must be a root). The child runs on
+  is at most [dispatch.sessions.spawn] max_depth (1 to 4; 2 as shipped: a root, its children and theirs). The
+  parent may itself be a child (a deeper tree, DESIGN_NOTES "Deeper trees"); the rules are the same at every
+  level. The child runs on
   the parent's node, in the parent's project, for an agent that node offers a hostable runner for and the hub's
   `[dispatch.nodes.<node>]` lists (the check a root gets). Its access defaults to the parent's and may be narrower;
   above the parent's is refused, and so is `full` until the parent's process has confirmed full access (`_limit`).
-  A runner that names its own directory is held against the directory the parent runs in (`_fits`). At most
-  `max_children` children of one root that have not ended. The same (parent, request_id) returns the child it made
-  the first time.
+  A runner that names its own directory is held against the directory a shared child runs in (`_fits`). At most
+  `max_children` children of one PARENT that have not ended (each parent's own). The same (parent, request_id)
+  returns the child it made the first time.
 - *Not for children.* "One session per (agent, project)" (roots only), board wakes (hosted_wake.py: a child has no
   watcher record) and a project's busy directory when the child has its own worktree.
-- *Ending.* A parent that ends or is closed takes its children with it (`cascade`); closing a child leaves its
-  parent alone.
+- *Ending.* A parent that ends or is closed takes its whole subtree with it, every level marked in that one
+  transaction (`cascade`); closing a child leaves its parent alone.
 """
 from __future__ import annotations
 
@@ -43,6 +46,10 @@ REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 OFF = ("child sessions are off: the hub's settings need [dispatch.sessions.spawn] enabled = true before a session "
        "can be started under another")
 PARENT_ENDED = "its parent session ended"
+ORPHANED_HOLD = ("its node now runs a version of agent-comms that does not keep a full-access session's parent up "
+                 "while the sessions under it work (its latest hello says session protocol 2 or earlier), so it may "
+                 "not run a session under a full-access child: the hub ended it. A turn that was in flight there was "
+                 "lost and is not replayed. Update the node and start `board node` again")
 ORPHANED = ("its node no longer hosts child sessions (its latest hello is from a version of agent-comms before them, "
             "or one it was rolled back to), so it can neither run nor end this one: the hub ended it. A turn that "
             "was in flight there was lost and is not replayed")
@@ -129,6 +136,17 @@ def interactive(r: Any) -> bool:
 
 
 SPAWN_PROTOCOL = 2      # a node's `tree` version that knows bindings, interactive children and cancel
+HOLD_PROTOCOL = 3       # ... that also keeps a full-access child's parent up while results wait for that child
+
+
+def node_holds(conn, node: str) -> bool:
+    """The node's latest hello says it keeps a full-access session's parent up while the hub's listing says results
+    wait for that session (session_host.tree 3 or later: node_sessions `results_waiting`). Only such a node gets a
+    session under a full-access child: an earlier one would stop the parent while that session works, and the
+    session's result would then wait as the full-access child's turn for the parent's next turn."""
+    info = _get(conn, nodes.NODE_PREFIX + node)
+    hosting = info.get("session_host") if isinstance(info, dict) else None
+    return isinstance(hosting, dict) and type(hosting.get("tree")) is int and hosting["tree"] >= HOLD_PROTOCOL
 
 
 def node_spawns(conn, node: str) -> bool:
@@ -189,22 +207,83 @@ def node_supports(conn, node: str) -> bool:
     return isinstance(hosting, dict) and type(hosting.get("tree")) is int and hosting["tree"] >= 1
 
 
+def orphan_reason(conn, r: Any) -> str | None:
+    """Why a child that has not ended can no longer run on its node, as that node's latest hello says it, or None.
+    Its node hosts no child sessions (an earlier version, or one rolled back to): such a node is listed no child
+    (hosted._listed), so it will never report on this one or end it. Or the child is interactive (hosted_spawn.py)
+    and its node does not speak the spawn protocol. Or it is under a full-access child and its node does not keep
+    that child's parent up for it (`node_holds`: below session protocol 3), the rule a start is held to
+    (`_target`). The hub settles such a child itself (`end_orphans` at that hello, hosted._settle on a read), and
+    until it has, the child counts as lost (hosted._lost): nothing of it keeps a project busy."""
+    if not is_child(r) or r.get("state") == "ended":
+        return None
+    if not node_supports(conn, r["node"]) or (interactive(r) and not node_spawns(conn, r["node"])):
+        return ORPHANED
+    if under_full(conn, r) and not node_holds(conn, r["node"]):
+        return ORPHANED_HOLD
+    return None
+
+
 def orphaned(conn, r: Any) -> bool:
-    """A child that has not ended, on a node whose latest hello does not say it hosts child sessions. Such a node
-    is listed no child (hosted._listed), so it will never report on this one or end it; its hellos say only that an
-    ordinary session host is there. The hub settles the child itself (`end_orphans`, hosted._settle), and until it
-    has, the child counts as lost (hosted._lost): nothing of it keeps a project busy."""
-    return is_child(r) and r.get("state") != "ended" and (
-        not node_supports(conn, r["node"]) or (interactive(r) and not node_spawns(conn, r["node"])))
+    return orphan_reason(conn, r) is not None
+
+
+def under_full(conn, r: dict) -> bool:
+    """A session above `r` (not `r` itself) is a full-access child."""
+    cur, hops = r, 0
+    while is_child(cur) and not interactive(cur) and hops < 10:
+        hops += 1
+        cur = _get(conn, hosted.SESSION_PREFIX + cur["parent"])
+        if is_child(cur) and cur.get("access") == "full":
+            return True
+    return False
+
+
+def under(sessions: list[dict], top_id: str) -> list[dict]:
+    """The sessions below `top_id` (its children, theirs, and so on), whatever their state, from `sessions`."""
+    kids: dict[str, list[dict]] = {}
+    for r in sessions:
+        if is_child(r):
+            kids.setdefault(r["parent"], []).append(r)
+    out, level = [], [top_id]
+    while level:
+        nxt = [x for pid in level for x in kids.get(pid, [])]
+        out += nxt
+        level = [x["session_id"] for x in nxt]
+    return out
+
+
+def subtree_open(board: Board, conn, k: dict, sessions: list[dict] | None = None) -> dict[str, list[str]]:
+    """What keeps full child `k`'s subtree open, as the hub records it (empty lists: closed). `live`: a session under
+    it not ended. `results`: a result for it or for a session under it not settled (pending, or in a turn whose
+    start its provider has not confirmed: `hosted_results.outstanding`; settled: delivered once that turn started,
+    claimed, or kept undelivered). `queued`: a message for it or for a session under it that is queued, or written
+    and not settled yet (in flight at the hub, whether or not its start was confirmed).
+    While any holds, a next turn of `k` may come, and `k` takes turns only under its parent's live process: the
+    node spares that process (node_sessions `_lends_full`). The hub ends a session and makes the result of its end
+    (and of the turn it cut) in one transaction, and a turn's result in the transaction that takes its report, so
+    a session under `k` counts as `live` until what it produced counts as a result."""
+    from . import hosted_results
+    below = under(sessions if sessions is not None else hosted._sessions(conn), k["session_id"])
+    everyone = [k] + below
+    return {"live": [x["session_id"] for x in below if x.get("state") != "ended"],
+            "results": [x["session_id"] for x in everyone if hosted_results.outstanding(conn, x["session_id"])],
+            "queued": [x["session_id"] for x in everyone if x.get("state") != "ended"
+                       and (int(x.get("queued") or 0) or x.get("in_flight") is not None)]}
 
 
 def end_orphans(c, node: str, by: str, now: float, results: bool = False) -> None:
-    """Inside the transaction of a hello from `node` that does not declare the child protocol: its children that
-    have not ended are ended here, each unsettled message failed with the reason. `results`: each end is a result
-    for the child's parent (hosted_results.py)."""
-    for r in hosted._sessions(c):
-        if r.get("node") == node and orphaned(c, r):
-            hosted._end(c, r, ORPHANED, by, now, results=results)
+    """Inside the transaction of every hello from `node`: its children that can no longer run there
+    (`orphan_reason`: the node does not declare the child protocol, or no longer the level a child needs) are ended
+    here, each unsettled message failed with the reason. `results`: each end is a result for the child's parent
+    (hosted_results.py)."""
+    # Ancestors first, each record read again before it is decided: a parent's end has already ended (cascade) the
+    # sessions under it, and a stale copy of one must not end it a second time.
+    for sid in [r["session_id"] for r in sorted(hosted._sessions(c), key=lambda r: int(r.get("depth") or 0))]:
+        r = _get(c, hosted.SESSION_PREFIX + sid)
+        why = orphan_reason(c, r) if isinstance(r, dict) and r.get("node") == node else None
+        if why is not None:
+            hosted._end(c, r, why, by, now, results=results)
             _put(c, hosted.SESSION_PREFIX + r["session_id"], r, by, now)
 
 
@@ -231,6 +310,18 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
                        "session from that runner (for a Codex runner the node's settings need [dispatch.sessions] "
                        "codex = true, and a runner its session host refuses, say one with --approve-for-me, is "
                        "never hosted)")
+    _holds_for(board.conn, parent)
+
+
+def _holds_for(conn, parent: dict) -> None:
+    """A session under a full-access child only on a node that keeps that child's parent up (`node_holds`). Asked
+    before the start (`_target`) and again inside its write transaction (`create_child`), so a hello that lands in
+    between, from a node rolled back, is seen."""
+    node = parent["node"]
+    if is_child(parent) and parent.get("access") == "full" and not node_holds(conn, node):
+        raise Conflict(f"node {node} runs a version of agent-comms that does not keep a full-access session's parent "
+                       "up while that session's children work, so nothing can be started under a full-access child "
+                       f"there (session {parent.get('session_id')}). Update the node and start `board node` again")
 
 
 def _max_live(conn, node: str) -> int:
@@ -257,6 +348,24 @@ def place_interactive(board: Board, project: str, agent: str, runtime: str | Non
     return None
 
 
+def _hosted_root(conn, r: dict) -> dict | None:
+    """The hosted root of session `r`'s tree (`r` itself for a root), or None: its tree is an interactive root's
+    (hosted_spawn.py), or a record on the way is gone."""
+    cur, hops = r, 0
+    while is_child(cur) and hops < 10:
+        hops += 1
+        cur = _get(conn, hosted.SESSION_PREFIX + cur["parent"]) if not interactive(cur) else None
+    return cur if isinstance(cur, dict) and not is_child(cur) and cur.get("kind") != "interactive" else None
+
+
+def shared_checkout(conn, r: dict) -> str | None:
+    """Where a `shared` child of session `r` runs, as the nodes reported it: the checkout its ROOT runs in. `shared`
+    is the project's checkout on the node at every level (the node opens a shared child there, not in a worktree its
+    parent may have of its own), and only a root's node reports where it runs. None: not known (yet)."""
+    top = _hosted_root(conn, r)
+    return top.get("checkout") if top is not None and isinstance(top.get("checkout"), str) else None
+
+
 def _fits(conn, parent: dict, agent: str, runtime: str | None, isolation: str) -> None:
     """A runner that names its own directory (the node's hello: `dirs`) can be a session in that directory only. A
     child of it must therefore share the parent's checkout, and that checkout (as the node reported it) must be the
@@ -269,17 +378,33 @@ def _fits(conn, parent: dict, agent: str, runtime: str | None, isolation: str) -
         return
     where = (f"node {parent['node']}'s runner for {agent} names its own directory ({only}) and can be a session "
              "there only")
-    if parent.get("kind") == "interactive":
-        raise Conflict(f"{where}: it cannot be started for an interactive session, whose checkout there is not "
-                       "known")
+    if parent.get("kind") == "interactive" or (is_child(parent) and _hosted_root(conn, parent) is None):
+        raise Conflict(f"{where}: it cannot be started in an interactive session's tree, whose checkout there is "
+                       "not known")
     if isolation != "shared":
         raise Conflict(f"{where}: a child of it cannot have a worktree of its own")
-    here = parent.get("checkout")
+    here = shared_checkout(conn, parent)
     if not isinstance(here, str):
         raise Conflict(f"{where}, and where session {parent['session_id']} runs on its node is not known yet (its "
                        "node reports it once it has opened the session). Try again in a moment")
     if os.path.normpath(here) != os.path.normpath(only):
         raise Conflict(f"{where}; session {parent['session_id']} runs in {here}")
+
+
+def placement_problem(board: Board, conn, parent: dict, agent: str, runtime: str | None,
+                      allowed: dict[str, dict] | None, isolation: str = "shared") -> str | None:
+    """Why a child of `agent` could not be placed under `parent` (on the parent's node), or None: the same two checks
+    `create_child` makes, `_target` (the node may run it, hosts sessions with a runner for it, speaks the protocol,
+    offers a word for it) and `_fits` (a runner that names its own directory, held against the checkout a shared
+    child runs in). For a caller that lists what could be started (hosted_spawn: capabilities and the frame), so that
+    nothing is listed that the start would refuse. `parent` needs `node` and `project`, and `parent` (its own
+    parent's id) or `kind` to say where it stands in its tree."""
+    try:
+        _target(board, parent, agent, runtime, allowed)
+        _fits(conn, parent, agent, runtime, isolation)
+    except Conflict as e:
+        return e.message
+    return None
 
 
 def _offers(conn, node: str, agent: str, runtime: str | None) -> list[str]:
@@ -302,7 +427,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
                  effort: Any = None, title: Any = None, role: Any = None, isolation: Any = None, access: Any = None,
                  request_id: Any = None, allowed: dict[str, dict] | None = None, spawn: Any = None,
                  kind: str = "user", spawned_by: dict | None = None, ceiling: str | None = None,
-                 interactive: bool = False, check=None, hook=None, tx=None) -> dict:
+                 interactive: bool = False, check=None, hook=None, tx=None, allowance: dict | None = None) -> dict:
     """Start a session under `parent_id` with its first message. Returns {"session": its record, "message": its
     first message's record, "created": False when (parent, request_id) had made it already}. `by` is recorded as
     who created it; whether `by` MAY is the caller's to have decided (see the module text). `agent`: default the
@@ -358,6 +483,13 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
             raise Conflict(f"session {pid} has ended: nothing can be started under it")
         if parent.get("stop"):
             raise Conflict(f"session {pid} is being closed: nothing can be started under it")
+        # The node's protocol again, on its latest hello as stored now: one rolled back between the check before
+        # this transaction and here would otherwise be given the child (the hello's orphan sweep ran before it).
+        if not node_supports(c, parent["node"]) or (spawned_by is not None and not node_spawns(c, parent["node"])):
+            raise Conflict(f"node {parent['node']} no longer speaks the child-session protocol this session needs (its "
+                           "latest hello came while the session was being started). Update it and start `board node` "
+                           "again")
+        _holds_for(c, parent)
         depth = 0 if interactive else int(parent.get("depth") or (1 if is_child(parent) else 0))
         if depth + 1 > spawn.max_depth:
             if spawn.max_depth == 1:
@@ -418,7 +550,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         if interactive:
             r["parent_kind"] = "interactive"
         if spawned_by is not None:
-            r |= {"spawned_by": dict(spawned_by), "allowance": {"may_spawn": True, "share": None}}
+            # What it may start itself: on, and (`allowance`, the spawn tool's) no share above its starter's own.
+            r |= {"spawned_by": dict(spawned_by), "allowance": dict(allowance or {"may_spawn": True, "share": None})}
         m = hosted._enqueue(c, r, kind, text, by, now)
         parent["child_counts"] = counts         # a name is unique under the parent, also once a child's record is gone
         if interactive:
@@ -446,16 +579,22 @@ def cascade(c, parent: dict, by: str, now: float) -> None:
     are closed with it. A child whose node is connected gets the stop flag, which the node carries out and confirms
     (as for a session the human closes); one whose node is away ends here, and the node closes it when it is back.
     Any session's children: one that is itself a child (a deeper tree) takes its own with it when it ends, since
-    hosted._end calls this for every session; an interactive root's too (hosted_spawn.close_iroot)."""
+    hosted._end calls this for every session; an interactive root's too (hosted_spawn.close_iroot).
+    Deeper trees: the WHOLE subtree is marked in this one transaction, each level under the one above it, not one
+    level per confirmation from the node. So no descendant keeps running (or starts anything: a session being
+    closed can have nothing started under it) while the level above it waits for its node, and each one's result
+    and end tell nobody (`stop: "parent"`, hosted_results._cascaded). An end here (`hosted._end`) cascades by
+    itself; a child marked here takes its own along below."""
     for child in children(c, parent["session_id"], live=True):
         if (now - hosted._node_seen(c, child["node"]) > nodes.NODE_STALE_SECONDS
                 or not node_supports(c, child["node"])):        # nobody there will carry a stop flag out
-            hosted._end(c, child, PARENT_ENDED + " (its node was not connected)", by, now)
-        elif not child.get("stop"):
-            child |= {"stop": "parent", "updated_at": now}
-        else:
+            hosted._end(c, child, PARENT_ENDED + " (its node was not connected)", by, now)     # (cascades itself)
+            _put(c, hosted.SESSION_PREFIX + child["session_id"], child, by, now)
             continue
-        _put(c, hosted.SESSION_PREFIX + child["session_id"], child, by, now)
+        if not child.get("stop"):
+            child |= {"stop": "parent", "updated_at": now}
+            _put(c, hosted.SESSION_PREFIX + child["session_id"], child, by, now)
+        cascade(c, child, by, now)      # its own children too, now (already marked ones are left as they are)
 
 
 def children_view(board: Board, r: dict) -> list[dict]:

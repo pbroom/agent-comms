@@ -882,8 +882,8 @@ def test_claim_wait_takes_a_result_as_soon_as_it_is_there_and_cancels_nothing_wh
 
 
 def test_results_go_to_the_direct_parent_and_never_past_it(senv):
-    """The tree is one level deep today; a deeper one is coming. A record whose parent is itself a child (as a
-    grandchild's will be) sends its results to that child, not to the root."""
+    """A record whose parent is itself a child (a grandchild's, in a deeper tree) sends its results to that child,
+    not to the root. (The whole path, through the spawn tools and the node, is in test_deeper_trees.)"""
     sid, [kid] = a_tree(senv)
     grandchild = dict(stored(senv, kid)) | {"session_id": "6f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0", "parent": kid,
                                             "root": sid, "depth": 2, "name": "test-1"}

@@ -308,7 +308,7 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
     if kids:
         out["children"] = kids
     from . import hosted_results
-    results, dropped = hosted_results.view(board.conn, r["session_id"])
+    results, dropped = hosted_results.view(board.conn, r["session_id"], board)
     if results:
         out["results"] = results        # what its children sent it (hosted_results.py)
     if dropped:
@@ -441,7 +441,15 @@ def holds_slot(conn, r: dict, now: float) -> bool:
 
 def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) -> None:
     """The session is over: every message that was not settled fails with the reason. The caller stores `r`.
-    `results`: child sessions' results are on (hosted_results.py), so a child that ends tells its parent."""
+    `results`: child sessions' results are on (hosted_results.py), so a child that ends tells its parent.
+    Idempotent: a session that has already ended as stored (a cascade above ended it while the caller held an older
+    copy) is not ended again. `r` becomes the stored record, so the caller stores it unchanged: one end, one audit
+    line, one result, the first reason kept."""
+    stored = _get(c, SESSION_PREFIX + r["session_id"])
+    if isinstance(stored, dict) and stored.get("state") == "ended":
+        r.clear()
+        r.update(stored)
+        return
     detail = (detail or "ended")[:300]
     cut = []        # the messages this end fails, as they were (a child's parent is told of each)
     for m in _messages(c, r["session_id"]):
@@ -486,9 +494,10 @@ def _settle(board: Board, r: dict) -> dict:
         # freshly delivered turn between the check above and here must not have that turn failed under it.
         r = _session(c, r["session_id"])
         if hosted_tree.orphaned(c, r):
-            # A child whose node hosts no child sessions (any more): nobody there will run it, report on it or end
-            # it. Ended here, its turn in flight failed as lost. (The node's next hello does the same.)
-            _end(c, r, hosted_tree.ORPHANED, "hub", now, results=_results_on(board))
+            # A child whose node hosts no child sessions (any more), or no longer the level it needs: nobody there
+            # will run it, report on it or end it. Ended here, its turn in flight failed as lost. (The node's next
+            # hello does the same.)
+            _end(c, r, hosted_tree.orphan_reason(c, r), "hub", now, results=_results_on(board))
             _put(c, SESSION_PREFIX + r["session_id"], r, "hub", now)
             return r
         if not _lost(c, r, now):
@@ -615,7 +624,8 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     # and the messages whose turn their starter cancelled. Nothing of it for an earlier node, or with spawn off.
     spawns = spawn and int(tree) >= hosted_tree.SPAWN_PROTOCOL
     out, mark = [], []
-    for r in sorted(_sessions(board.conn), key=lambda r: r["session_id"]):
+    every = _sessions(board.conn)
+    for r in sorted(every, key=lambda r: r["session_id"]):
         if (r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree)
                 or (hosted_tree.interactive(r) and not spawns)):
             continue
@@ -637,6 +647,12 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
                 else:
                     item["text"] = m.get("text")
             msgs.append(item)
+        # A full child's parent is spared on its node while the child's subtree is open (node_sessions
+        # `_lends_full`, hosted_tree.subtree_open): the hub's own record of it, said only to a node of the spawn
+        # protocol (an older node does not read it), and only for a child at `full`, the one kind that needs its
+        # parent's live process.
+        held = bool(spawns and hosted_tree.is_child(r) and r.get("access") == "full"
+                    and any(hosted_tree.subtree_open(board, board.conn, r, every).values()))
         out.append({k: r.get(k) for k in ("session_id", "agent", "runtime", "project", "model", "stop")}
                    | {"resume": r.get("resume") is True, "messages": msgs,
                       # The stamp of the last status applied (`report`): the node stamps above it, whatever its
@@ -646,10 +662,11 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
                    # sessions are on. Nothing otherwise: the entry is then what it was before there were trees.
                    | hosted_tree.node_extra(r, bool(spawn and tree), hosted_spawn.bind_key(board.conn, r["session_id"])
                                             if spawns and hosted_spawn.gives_binding(board.conn, r, board.now())
-                                            else None))
+                                            else None)
+                   | ({"subtree_open": True} if held else {}))
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] + (["cancel"] if m.get("cancel") else [])
                                                       + ([m["held"]] if m.get("held") else []) for m in msgs],
-                     "bind" in out[-1]])        # a binding given or withdrawn is news for the node's long-poll
+                     "bind" in out[-1], held])  # a binding given or withdrawn, a subtree open or not: news
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
     # What this hub takes in a node's reports beyond what every hub took: a node sends such a field only to a hub
     # that names it here, so a newer node's reports reach an older hub exactly as before (its strict model refuses an
@@ -719,13 +736,15 @@ def _reserve_tasks(board: Board, c, node: str, now: float) -> None:
 
 
 def shown_task(conn, r: dict) -> bool:
-    """An agent's task for this session was reserved and shown to its node, and the node has not reported on it yet
-    (its turn in flight, or its end): its checkout is taken all the same (hosted_wake.turn_projects). Also once its
-    starter cancelled it: the node may have it already, and the reservation holds until the node says it ended (its
-    `turn_ended`, which settles it) or the node is lost (turn_projects)."""
+    """An automatic turn for this session was reserved and shown to its node, and the node has not reported on it
+    yet (its turn in flight, or its end): its checkout is taken all the same (hosted_wake.turn_projects). An agent's
+    task (`_reserve_tasks`), and a turn that carries child sessions' results (hosted_results._deliver, made and
+    shown in the listing's transaction). Also once a task's starter cancelled it: the node may have it already, and
+    the reservation holds until the node says it ended (its `turn_ended`, which settles it) or the node is lost
+    (turn_projects)."""
     if not int(r.get("queued") or 0):
         return False
-    return any(m.get("state") == "queued" and m.get("kind") == "task" and m.get("shown_at") is not None
+    return any(m.get("state") == "queued" and m.get("kind") in ("task", "child") and m.get("shown_at") is not None
                for m in _messages(conn, r["session_id"]))
 
 
