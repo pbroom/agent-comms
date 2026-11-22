@@ -1227,12 +1227,17 @@ def test_a_board_server_defined_only_in_a_profile_follows_codex_profile_selectio
 
 
 def test_a_profile_layer_wins_over_the_user_config(denv, tmp_path, monkeypatch):
-    """The selected profile's file is over config.toml: a profile that makes the board server a URL one gets nothing."""
-    _codex_home(tmp_path, monkeypatch)
-    (tmp_path / "home" / ".codex" / "work.config.toml").write_text(
-        '[mcp_servers.agent-comms]\nurl = "https://board.invalid/mcp"\n')
-    argv = _launch(denv, ["codex", "exec", "-pwork", "--cd", "{project}"] + APPROVALS + ["{prompt}"])["argv"]
-    assert MANAGED_OVERRIDE not in argv
+    """The selected profile's file is over config.toml: both define a valid stdio board server, and the profile's
+    `command` is the one in force, with config.toml's other keys kept. An exec-level profile beats a root-level one."""
+    env = _codex_home(tmp_path, monkeypatch)
+    (tmp_path / "home" / ".codex" / "work.config.toml").write_text('[mcp_servers.agent-comms]\ncommand = "zsh"\n')
+    (tmp_path / "home" / ".codex" / "root.config.toml").write_text('[mcp_servers.agent-comms]\ncommand = "sh"\n')
+    runner = ["codex", "exec", "-pwork", "--cd", "{project}"] + APPROVALS + ["{prompt}"]
+    entry = dispatch.codex_board_server(runner, env)
+    assert entry["command"] == "zsh" and entry["args"] == ["stdio.sh"] and entry["env_vars"] == ["FOO"]
+    assert dispatch.codex_board_server(["codex", "-p", "root", "exec", "-p", "work", "{prompt}"], env)["command"] \
+        == "zsh"
+    assert MANAGED_OVERRIDE in _launch(denv, runner)["argv"]
 
 
 def test_a_quoted_dotted_override_names_another_server(tmp_path, monkeypatch):
@@ -1242,6 +1247,9 @@ def test_a_quoted_dotted_override_names_another_server(tmp_path, monkeypatch):
     quoted = ["codex", "exec", "-c", 'mcp_servers."agent-comms".command="bash"', "{prompt}"]
     assert dispatch.with_managed_env(quoted, env) == quoted
     assert dispatch.codex_board_server(quoted, env) is None
+    for spaced in ('mcp_servers. agent-comms.command="true"', 'mcp_servers.agent-comms .command="true"'):
+        argv = ["codex", "exec", "-c", spaced, "{prompt}"]      # names " agent-comms" / "agent-comms ", as in Codex
+        assert dispatch.with_managed_env(argv, env) == argv, spaced
     plain = ["codex", "exec", "-c", 'mcp_servers.agent-comms.command="bash"', "{prompt}"]
     assert MANAGED_OVERRIDE in dispatch.with_managed_env(plain, env)
     after = ["codex", "exec", "{prompt}", "--", "-c", 'mcp_servers.agent-comms.command="bash"']

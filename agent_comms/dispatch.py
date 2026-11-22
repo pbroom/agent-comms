@@ -266,8 +266,10 @@ def _codex_options(template: list[str]) -> list[str]:
 
 
 def _codex_profile(template: list[str]) -> str | None:
-    """The profile a Codex runner selects (the last one), in every spelling Codex takes: `-p x`, `-px`, `-p=x`,
-    `--profile x`, `--profile=x`."""
+    """The profile a Codex runner selects, in every spelling Codex takes: `-p x`, `-px`, `-p=x`, `--profile x`,
+    `--profile=x`. This takes the last flag in the argv. Codex refuses a second profile flag in the same scope (the
+    launch fails there anyway), and with one before `exec` and one after it, the exec-level one wins: the later one
+    in the argv, so this picks the same."""
     opts, profile = _codex_options(template), None
     for i, arg in enumerate(opts):
         if arg in ('-p', '--profile'):
@@ -324,7 +326,7 @@ def codex_board_server(template: list[str], env: dict[str, str]) -> dict | None:
     cli: dict = {}
     for override in _codex_overrides(opts):
         key, sep, raw = override.partition('=')
-        path = [p.strip() for p in key.strip().split('.')]
+        path = key.strip().split('.')       # segments untrimmed, as Codex: `mcp_servers. x` names " x"
         if not sep or path[0] != 'mcp_servers' or any(not p for p in path):
             continue
         try:
