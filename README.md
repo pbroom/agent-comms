@@ -352,8 +352,12 @@ What it does not cover:
   seen to miss its turn, arm on `Stop` only: delete the `SessionStart` entry that runs `wait.sh` from
   `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (`--wake` would add it back). A session is then wakeable only
   after its first turn since it opened or resumed.
-- **A session that just went away.** The hub cannot see a caller hang up, so for up to 25 s after a session ends
-  its last call still counts as waiting. A wake is counted only once `board wait` acknowledges it; one offered to
+- **A session that just went away.** When `board wait` dies, the hub sees the call hang up (directly or through
+  the gateway) and ends it within a second: the call stops polling and stops refreshing its heartbeat. The
+  session still counts as connected for up to 20 s after its last heartbeat, so the dispatcher may still offer it
+  a wake in that time. Where the hub cannot see the hang-up (a proxy that holds the connection open), the call
+  goes on polling for up to 25 s. So the acknowledgement stays: a wake is counted only once `board wait`
+  acknowledges it; one offered to
   a session that is gone is taken back after 10 s and goes to the next session that waits. If the
   acknowledgement itself is lost on the way, the session is woken and the same posts may wake it once more. If the
   hub rejects it (the offer ran out on the way, the board was paused, a hosted session or the dispatcher took the

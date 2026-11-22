@@ -690,7 +690,9 @@ async def _poll(fetch: Callable[[], dict], done: Callable[[dict], bool], seconds
     """`fetch()` now, then again every WAIT_POLL_SECONDS until `done` or the time is up. Each read runs briefly in a
     worker thread (sqlite blocks); the wait between reads holds neither a thread nor the event loop. The deadline is
     wall time, not the board's clock: a wait must end even when that clock is a test's. `gone` (awaited before each
-    sleep) ends the wait early: the caller hung up, or the server is stopping and must not be held up by a waiter."""
+    sleep and again after it) ends the wait early: the caller hung up, or the server is stopping and must not be held
+    up by a waiter. A caller gone during the sleep gets no further `fetch`: a fetch can hand something over (a wake's
+    `handed_at`, hosted_wake.listing), and nobody would receive it."""
     import anyio
     from anyio import to_thread
 
@@ -698,6 +700,8 @@ async def _poll(fetch: Callable[[], dict], done: Callable[[dict], bool], seconds
     out = await to_thread.run_sync(fetch)
     while not done(out) and time.monotonic() < deadline and not (gone is not None and await gone()):
         await anyio.sleep(max(0.0, min(WAIT_POLL_SECONDS, deadline - time.monotonic())))
+        if gone is not None and await gone():
+            break
         out = await to_thread.run_sync(fetch)
     return out
 

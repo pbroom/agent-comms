@@ -7,7 +7,7 @@ with the hook's JSON on stdin (`session_id`, `cwd`, `hook_event_name`). This pro
 - exits 2 with the wake text on stderr when the hub says wake: Claude then wakes the idle session at once and shows
   it that text as a system reminder. The text is the hub's (hosted_wake.wake_text: counts, thread ids and agent
   names) and is passed on only when it has exactly that text's form (WAKE_RE); nothing else is ever printed. First
-  it acknowledges the wake (`ack`; the hub cannot see a caller hang up, and takes back a wake nobody acknowledged):
+  it acknowledges the wake (`ack`; the hub may not see a caller hang up, and takes back a wake nobody acknowledged):
   it exits 2 when the hub accepts the acknowledgement, or when the acknowledgement could not be delivered at all
   (then the hub may offer the same posts once more); it waits on with the same nonce when the hub rejects it while
   this is still the current process, or answers in a way it cannot read (see `_woken`). A SessionStart hook's
