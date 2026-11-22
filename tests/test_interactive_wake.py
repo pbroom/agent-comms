@@ -590,8 +590,8 @@ def test_claude_hooks_add_is_idempotent_and_remove_takes_out_only_ours(tmp_path)
         assert claude_hooks.main(add) == 0
     got = json.loads(f.read_text())
     ours = {"type": "command", "command": cmd, "asyncRewake": True, "timeout": 86400}
-    assert got["hooks"]["Stop"] == mine["hooks"]["Stop"] + [{"hooks": [ours]}]
-    assert got["hooks"]["SessionStart"] == [{"hooks": [ours]}]
+    assert got["hooks"]["Stop"] == mine["hooks"]["Stop"] + [{"hooks": [ours]}], "Stop: as before"
+    assert got["hooks"]["SessionStart"] == [{"hooks": [ours | {"async": True}]}], "SessionStart: async too"
     assert got["model"] == "x" and got["hooks"]["PreToolUse"] == mine["hooks"]["PreToolUse"]
     assert f.stat().st_mode & 0o777 == 0o640
     assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
@@ -623,7 +623,8 @@ def test_install_sh_wake_and_remove_wake_touch_only_the_temp_settings(tmp_path):
         assert r.returncode == 0, r.stderr
     got = json.loads((cfg / "settings.json").read_text())
     [stop], [start] = got["hooks"]["Stop"], got["hooks"]["SessionStart"]
-    assert stop == start and stop["hooks"][0]["asyncRewake"] is True and stop["hooks"][0]["timeout"] == 86400
+    assert start["hooks"][0] == stop["hooks"][0] | {"async": True}, "the SessionStart entry also has async"
+    assert stop["hooks"][0]["asyncRewake"] is True and stop["hooks"][0]["timeout"] == 86400
     assert stop["hooks"][0]["command"] == (f"AGENT_COMMS_HOME='{board_home}' AGENT_COMMS_AGENT='claude' "
                                            f"bash '{ROOT}/integrations/claude-code/wait.sh'")
     assert (cfg / "settings.json").stat().st_mode & 0o777 == 0o600
@@ -633,3 +634,28 @@ def test_install_sh_wake_and_remove_wake_touch_only_the_temp_settings(tmp_path):
     r = subprocess.run(["bash", str(script), "--wake", "--agent", "nobody"], env=env, capture_output=True,
                        text=True, timeout=120)
     assert r.returncode != 0 and json.loads((cfg / "settings.json").read_text()) == {}, "a token that fails: no hook"
+
+
+def test_claude_hooks_upgrade_an_entry_an_earlier_version_wrote(tmp_path):
+    """Earlier versions wrote SessionStart like Stop ("asyncRewake" alone). --wake again replaces it with the new
+    shape, once; --remove-wake takes out either shape; nothing else is touched."""
+    f = tmp_path / "settings.json"
+    cmd = claude_hooks.command("/b", "claude", "/x/wait.sh")
+    old = {"type": "command", "command": cmd, "asyncRewake": True, "timeout": 86400}
+    other = {"hooks": [{"type": "command", "command": "echo /x/wait.sh", "async": True}]}
+    f.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [old]}, other], "Stop": [{"hooks": [old]}]}}))
+    add = ["add", "--settings", str(f), "--script", "/x/wait.sh", "--home", "/b", "--agent", "claude"]
+    for _ in range(2):
+        assert claude_hooks.main(add) == 0
+    got = json.loads(f.read_text())["hooks"]
+    assert got["SessionStart"] == [other, {"hooks": [old | {"async": True}]}], "the old entry replaced, once"
+    assert got["Stop"] == [{"hooks": [old]}]
+    assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
+    assert json.loads(f.read_text()) == {"hooks": {"SessionStart": [other]}}
+    f.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [old]}], "Stop": [{"hooks": [old]}]}}))
+    assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
+    assert json.loads(f.read_text()) == {}, "an old install is removed whole"
+    odd = old | {"async": False}                        # not a shape this module ever wrote
+    f.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [odd]}]}}))
+    assert claude_hooks.main(["remove", "--settings", str(f), "--script", "/x/wait.sh"]) == 0
+    assert json.loads(f.read_text()) == {"hooks": {"SessionStart": [{"hooks": [odd]}]}}

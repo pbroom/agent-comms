@@ -308,8 +308,8 @@ wake = true
         print("real step: claude --model haiku, stream-json, the wake hooks only")
         command = claude_hooks.command(str(self.home), "claude", str(WAIT_SH))
         settings = claude_hooks.add({}, str(WAIT_SH), command, 600)
-        if self.args.session_start_async:
-            settings["hooks"]["SessionStart"][0]["hooks"][0]["async"] = True     # an experiment: both flags
+        if self.args.old_hook_shape:
+            del settings["hooks"]["SessionStart"][0]["hooks"][0]["async"]       # for comparison: asyncRewake alone
         (self.tmp / "claude-settings.json").write_text(json.dumps(settings, indent=2))
         (self.tmp / "claude-mcp.json").write_text(json.dumps({"mcpServers": {"agent-comms": {
             "type": "stdio", "command": sys.executable, "args": ["-P", "-m", "agent_comms.cli", "mcp", "--agent",
@@ -492,8 +492,9 @@ def main() -> int:
     ap.add_argument("--r1-post-delay", type=float, default=0.0, metavar="SECONDS",
                     help="real step: make R1's post this long after Claude started (default: right after it arms)")
     ap.add_argument("--skip-stand-in", action="store_true", help="run only the real step (with --claude-bin)")
-    ap.add_argument("--session-start-async", action="store_true",
-                    help='real step, an experiment: give the SessionStart hook "async": true beside "asyncRewake"')
+    ap.add_argument("--old-hook-shape", action="store_true",
+                    help='real step, for comparison: the SessionStart hook as earlier versions wrote it, '
+                         '"asyncRewake" without "async"')
     args = ap.parse_args()
     run = Run(args)
 

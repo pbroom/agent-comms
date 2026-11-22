@@ -3,10 +3,11 @@
 `python -m agent_comms.claude_hooks add --settings FILE --script PATH --home DIR --agent NAME [--timeout S]`
 `python -m agent_comms.claude_hooks remove --settings FILE --script PATH`
 
-The hooks are a `Stop` and a `SessionStart` command hook with `"asyncRewake": true` running `command()`. A hook is
-ours only when it sits under `Stop` or `SessionStart` and is exactly that shape: the four keys `type` ("command"),
-`command` (exactly `AGENT_COMMS_HOME='<dir>' AGENT_COMMS_AGENT='<name>' bash '<this script>'`), `asyncRewake` (true)
-and `timeout`. `add` replaces ours (idempotent, and a new agent or board home takes effect); `remove` takes out ours
+The hooks are a `Stop` and a `SessionStart` command hook with `"asyncRewake": true` running `command()`; the
+SessionStart one also has `"async": true` (`hook_for`). A hook is ours only when it sits under `Stop` or
+`SessionStart` and is exactly one of the shapes this module writes or wrote (`SHAPES`): the keys `type` ("command"),
+`command` (exactly `AGENT_COMMS_HOME='<dir>' AGENT_COMMS_AGENT='<name>' bash '<this script>'`), `asyncRewake` (true),
+`timeout`, and possibly `async` (true). `add` replaces ours (idempotent, and a new agent or board home takes effect); `remove` takes out ours
 and nothing else, and drops only a group, event list or `hooks` object that taking ours out left empty (a group with
 anything beside `hooks`, such as a matcher, is kept). Every other setting and hook is kept as it was, also one whose
 command merely mentions the script. The file is written atomically, with its mode kept (600 when new); a file that
@@ -33,10 +34,26 @@ def command(home: str, agent: str, script: str) -> str:
     return f"AGENT_COMMS_HOME='{home}' AGENT_COMMS_AGENT='{agent}' bash '{script}'"
 
 
+# The keys of a hook this module writes: SessionStart's now (with "async"), and the earlier shape, which every event
+# had before and Stop still has. Both are recognised, so that --remove-wake and a re-run of --wake clean up an entry an
+# earlier version wrote.
+SHAPES = ({"type", "command", "asyncRewake", "timeout"}, {"type", "command", "async", "asyncRewake", "timeout"})
+
+
+def hook_for(event: str, cmd: str, timeout: int = TIMEOUT) -> dict:
+    """The hook entry for one event. SessionStart carries "async": true beside "asyncRewake": true: two readings of
+    the Claude Code 2.1.322 build say a SessionStart hook with "asyncRewake" alone can be run synchronously in a
+    stream-json session (its exit 2 then wakes nothing), and that an explicit "async" takes the background path
+    (DESIGN_NOTES "Known Claude Code behaviour"). Stop is left as it was."""
+    if event == "SessionStart":
+        return {"type": "command", "command": cmd, "async": True, "asyncRewake": True, "timeout": timeout}
+    return {"type": "command", "command": cmd, "asyncRewake": True, "timeout": timeout}
+
+
 def _ours(hook, script: str) -> bool:
-    if not (isinstance(hook, dict) and set(hook) == {"type", "command", "asyncRewake", "timeout"}
-            and hook["type"] == "command" and hook["asyncRewake"] is True and isinstance(hook["command"], str)
-            and type(hook["timeout"]) is int):
+    if not (isinstance(hook, dict) and set(hook) in SHAPES and hook["type"] == "command"
+            and hook["asyncRewake"] is True and hook.get("async", True) is True
+            and isinstance(hook["command"], str) and type(hook["timeout"]) is int):
         return False
     shape = rf"AGENT_COMMS_HOME='[^']*' AGENT_COMMS_AGENT='{NAME_RE.pattern}' bash '{re.escape(script)}'"
     return re.fullmatch(shape, hook["command"]) is not None
@@ -78,13 +95,12 @@ def add(settings: dict, script: str, cmd: str, timeout: int = TIMEOUT) -> dict:
     for event in EVENTS:
         if not isinstance(hooks.get(event, []), list):
             raise ValueError(f"the settings file's hooks.{event} is not a list")
-    hook = {"type": "command", "command": cmd, "asyncRewake": True, "timeout": timeout}
-    if not _ours(hook, script):
+    if not _ours(hook_for("Stop", cmd, timeout), script):
         raise ValueError("the command must run the script exactly as command() writes it")
     settings = strip(settings, script)
     hooks = settings.setdefault("hooks", {})
     for event in EVENTS:
-        hooks.setdefault(event, []).append({"hooks": [dict(hook)]})
+        hooks.setdefault(event, []).append({"hooks": [hook_for(event, cmd, timeout)]})
     return settings
 
 
