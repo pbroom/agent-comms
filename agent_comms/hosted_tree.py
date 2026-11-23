@@ -23,6 +23,9 @@ true`; with it off no child can be created and nothing else changes.
   A runner that names its own directory is held against the directory a shared child runs in (`_fits`). At most
   `max_children` children of one PARENT that have not ended (each parent's own). The same (parent, request_id)
   returns the child it made the first time.
+- *Accounts.* An agent the hub's `[dispatch.agent_projects]` lists is started as a child only in a project listed
+  for it (agent_accounts.py): in `_target`, so neither capabilities nor the spawn frame offer it elsewhere, and
+  again inside `create_child`'s transaction.
 - *Not for children.* "One session per (agent, project)" (roots only), board wakes (hosted_wake.py: a child has no
   watcher record) and a project's busy directory when the child has its own worktree.
 - *Ending.* A parent that ends or is closed takes its whole subtree with it, every level marked in that one
@@ -294,6 +297,8 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
     (its hello says at which access words: none for a Codex runner where Codex sessions are off, or one its
     session preparation refuses). The word itself is checked when the child is admitted (`_offers`)."""
     node, project = parent["node"], parent["project"]
+    from . import agent_accounts
+    agent_accounts.check(board, agent, project)     # the hub's opt-in list (agent_accounts.py)
     grant = (allowed or {}).get(node)
     if (not isinstance(grant, dict) or not nodes.grant_covers(grant, project)
             or (agent not in grant.get("agents", []) and runtime not in grant.get("agents", []))):
@@ -458,6 +463,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
     if done is not None:
         return done
     agent, runtime = hosted._agent(board, agent if agent is not None else parent.get("agent"))
+    from . import agent_accounts
+    agent_accounts.check(board, agent, parent["project"])   # the hub's opt-in list, before placement's reasons
     node = None
     if interactive:
         node = place_interactive(board, parent["project"], agent, runtime, allowed)
@@ -483,6 +490,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
             raise Conflict(f"session {pid} has ended: nothing can be started under it")
         if parent.get("stop"):
             raise Conflict(f"session {pid} is being closed: nothing can be started under it")
+        agent_accounts.check(board, agent, parent["project"])   # ... and in the write that makes the child
         # The node's protocol again, on its latest hello as stored now: one rolled back between the check before
         # this transaction and here would otherwise be given the child (the hello's orphan sweep ran before it).
         if not node_supports(c, parent["node"]) or (spawned_by is not None and not node_spawns(c, parent["node"])):

@@ -91,6 +91,11 @@ def route_successor(board, human, post_id: int, recipient: str, to_agent: str, o
         if routed_successor(board, post_id) is not None:
             raise Conflict('a request already routed by access is not routed again')
         decision_actions.assert_execution_authorized(board, post_id, to_agent)
+        # Routing creates work for `to_agent`: the hub's opt-in list for the thread's project, in this write
+        # (agent_accounts.py), as for any start.
+        from . import agent_accounts
+        thread = board.conn.execute('SELECT project FROM threads WHERE id=?', (source['thread_id'],)).fetchone()
+        agent_accounts.check(board, to_agent, thread['project'] if thread else None)
         if source['task_id'] is not None:   # the successor's start rechecks this task's grant for to_agent
             task = board.conn.execute('SELECT * FROM tasks WHERE id=?', (source['task_id'],)).fetchone()
             if (not task or task['status'] in ('done', 'declined')

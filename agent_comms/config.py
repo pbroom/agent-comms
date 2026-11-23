@@ -15,7 +15,7 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 RUNTIME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 LOCAL_SETTINGS = "board.local.toml"   # per-machine overrides next to board.toml; gitignored
 SECTIONS = ("server", "limits", "tasks", "web")
-NOT_SETTINGS = {"dispatch", "conversations", "unstick", "config_path"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
+NOT_SETTINGS = {"dispatch", "conversations", "unstick", "config_path", "files_sig"}   # Settings fields that are not [server]/[limits]/[tasks]/[web] keys
 PREVENTION_KEYS = ("prevention_owner", "prevention_thread", "prevention_forward_to")   # [unstick] (prevention_config)
 
 
@@ -111,6 +111,10 @@ class Settings:
     # code. Not a setting: it lets a running Board hot-reload them (Board.reload_settings) and the Settings page
     # save edits to board.local.toml.
     config_path: Path | None = field(default=None, compare=False)
+    # The settings files' signatures (settings_files_sig) as they were just BEFORE these settings were read: a Board
+    # starts its hot reload from them, so a file saved after the read and before the Board is built is seen by its
+    # first refresh. Not a setting.
+    files_sig: tuple | None = field(default=None, compare=False)
 
     @classmethod
     def known_keys(cls) -> set[str]:
@@ -162,10 +166,24 @@ class Settings:
     @classmethod
     def load(cls, path: Path | None = None, local: bool = True) -> "Settings":
         path = path or home() / "board.toml"
+        sig = settings_files_sig(path) if local else None      # before the read: a save after it is always newer
         s = cls.from_data(cls.read_layers(path, local))
         # Only a board that reads the overlay can hot-reload it or save edits to it.
         s.config_path = path if local else None
+        s.files_sig = sig
         return s
+
+
+def settings_files_sig(path: Path) -> tuple:
+    """What changes when board.toml or board.local.toml is edited or replaced (an atomic replace gives a new inode),
+    in the form Board's hot reload compares (core._file_sig): (board.toml's, board.local.toml's), None when absent."""
+    def one(p) -> tuple | None:
+        try:
+            st = os.stat(p)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    return (one(path), one(path.with_name(LOCAL_SETTINGS)))
 
 
 def hash_token(token: str) -> str:

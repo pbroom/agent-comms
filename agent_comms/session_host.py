@@ -555,6 +555,9 @@ class SessionHost:
             cwd = checkout
         elif not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
             raise FileNotFoundError("the session's own run directory does not exist")
+        conflict = self.config.launch_blocker(agent, runtime, cwd)     # account folders (agent_accounts.py)
+        if conflict:
+            raise LookupError(conflict)
         if bind is not None and (not isinstance(bind, str) or len(bind) != 64
                                  or any(ch not in "0123456789abcdef" for ch in bind)):
             raise ValueError("a session's binding key must be 64 hex characters")
@@ -1110,7 +1113,14 @@ class SessionHost:
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
         try:
+            # Account folders at every process start, not only at `open`: the folder as it is now, and the directory
+            # the process starts in (agent_accounts.py). A start refused here ends the session with the reason.
             argv = self._argv(s)
+            # Account folders at every process start, on the very argv the provider will execute (its writable roots
+            # included) and the directory it starts in, with the folder as it is now (agent_accounts.py).
+            blocked = self.config.launch_blocker(s.agent, s.runtime, s.cwd, argv=argv)
+            if blocked:
+                raise LookupError(blocked)
             self.sessions_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.sessions_dir.mkdir(exist_ok=True, mode=0o700)
             try:

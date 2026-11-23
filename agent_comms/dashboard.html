@@ -2873,6 +2873,9 @@ function accessText(n) {
   return n.access + (n.granted && n.granted !== n.access ? ` (its node gives ${n.granted})` : "")
     + (n.access === "full" && n.ceiling && n.ceiling !== "full" ? " (not confirmed by a live process)" : "");
 }
+// A runner's account folder ([dispatch.runner_homes]) as its node reported it: a path, shown under the home folder
+// as ~ (the whole path in the title). Nothing from inside the folder is ever shown or known.
+function accountText(p) { return typeof p === "string" && p ? "account folder " + p.replace(/^\/(Users|home)\/[^/]+\//, "~/") : ""; }
 // The facts of one session, as short items that wrap; long values are cut with the whole value in the title.
 function linFacts(n) {
   const item = (text, title) => text ? el("span", { class: "lin-fact", title: title || text }, text) : null;
@@ -2881,7 +2884,7 @@ function linFacts(n) {
     n.state === "ended" && n.error ? item(`ended: ${n.error}`) : null];
   const model = [n.model ? `model ${n.model}` : "runner's model", n.effort ? `effort ${n.effort}` : ""].filter(Boolean).join(", ");
   const where = n.parent ? (n.isolation === "worktree" ? "own worktree" : "shared checkout") : "project checkout";
-  return [item(n.agent), item(model), item(accessText(n)), item(where, n.isolation === "worktree" && n.worktree ? n.worktree : null),
+  return [item(n.agent), item(accountText(n.account_home), n.account_home), item(model), item(accessText(n)), item(where, n.isolation === "worktree" && n.worktree ? n.worktree : null),
     item(`node ${n.node}` + (n.node_live || n.state === "ended" ? "" : " (not connected)")),
     item(`${n.turns || 0} turn${n.turns === 1 ? "" : "s"}`), item(`${n.queued || 0} queued`),
     n.in_flight !== null && n.in_flight !== undefined ? item(`message ${n.in_flight} in flight`) : null,
@@ -3110,6 +3113,7 @@ function renderSessionDetail(n) {
     detailRow("Kind", n.kind === "interactive" ? "interactive root" : n.parent ? `child (depth ${n.depth})` : "hosted root"),
     detailRow("State", linState(n) + (n.state === "ended" && n.error ? `: ${n.error}` : "")),
     detailRow("Agent", n.kind === "hosted" ? `${n.agent} (${s.runtime || "?"})` : n.agent),
+    s.account_home ? detailRow("Account folder", s.account_home) : null,
     n.kind === "hosted" ? detailRow("Model", [s.model || "the runner's own", s.effort ? `effort ${s.effort}` : ""].filter(Boolean).join(", ")) : null,
     detailRow("Access", accessText(s)),
     detailRow("Isolation", s.isolation),

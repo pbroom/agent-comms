@@ -28,6 +28,7 @@ import httpx
 from . import access
 from .dispatch import (DispatchConfig, _signal_group, child_env, codex_config_conflict, headless_browser_overrides,
                        plain_origins, probe_process, process_start, remove_browser_output, render_argv,
+                       browser_output_path, make_browser_output,
                        signed_in_browser_overrides, signed_in_profile, spawn_piped, spawn_process, stop_verified,
                        with_headless_browser, with_managed_env, with_writable_roots)
 from .node_sessions import SessionRunner
@@ -53,6 +54,7 @@ class _Local:
     terminated_at: float | None = None
     killed: bool = False
     cwd: str | None = None   # the run's checkout, inspected when the run ends (checkout_state)
+    browser_out: str | None = None  # the browser output directory this start made (removed when the run ends)
     exit_code: int | None = None    # its leader's, once it went while members of its group were left
     terminating: bool = False       # SIGTERM sent
 
@@ -114,7 +116,9 @@ class Node:
     def _save_state(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         data = {rid: {"pid": getattr(l.child, "pid", None),
-                      "proc_start": getattr(l, "proc_start", None), "cwd": l.cwd} for rid, l in self.running.items()}
+                      "proc_start": getattr(l, "proc_start", None), "cwd": l.cwd,
+                      **({"browser_out": l.browser_out} if l.browser_out else {})}
+                for rid, l in self.running.items()}
         tmp = self._state_path().with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
         os.replace(tmp, self._state_path())
@@ -127,8 +131,12 @@ class Node:
         stop_verified([(d.get("pid"), d.get("proc_start")) for d in left.values() if isinstance(d, dict)],
                       probe=self.probe, signal_group=self.signal_group, sleep=self.sleep,
                       grace=self.config.kill_grace_seconds)
-        for rid in left:
-            self._remove_browser_output(rid)
+        for rid, d in left.items():
+            # The output of each run this node verified from its own state (its process group stopped above): the
+            # exact directory the run recorded, else main's name for it. Nothing else in the log folder is touched:
+            # a leftover no state names stays (each attempt's fresh name keeps a retry clear of it).
+            out = d.get("browser_out") if isinstance(d, dict) else None
+            self._remove_browser_output(rid, out if isinstance(out, str) else self.log_dir / f"{rid}-browser")
         self.unreported = list(left)
         self.unreported_cwd = {rid: d["cwd"] for rid, d in left.items()
                                if isinstance(d, dict) and isinstance(d.get("cwd"), str)}
@@ -204,6 +212,8 @@ class Node:
         held = {k: v for k, v in self.config.runner_access.items() if k in self.config.runners}
         if held:        # only then: a hub older than this field refuses any hello that carries it
             body["access"] = held
+        if self.config.runner_homes:    # only then (and see below): the account folder each runner uses, path only
+            body["homes"] = dict(sorted(self.config.runner_homes.items()))
         if self.sessions is not None:   # only then: a hub older than this field refuses any hello that carries it
             body["sessions"] = {"max_live": self.config.sessions.max_live}
             # This node speaks the child-session protocol (hosted_tree.py). `runners`: for each runner a child
@@ -222,7 +232,19 @@ class Node:
             dirs = {k: runner_dir(self.config.runners[k]) for k in body["session_host"]["runners"]}
             if any(dirs.values()):      # only then: the key is newer than the rest
                 body["session_host"]["dirs"] = {k: d for k, d in dirs.items() if d}
-        out = self._call("POST", "/api/nodes/hello", json=body)
+        try:
+            out = self._call("POST", "/api/nodes/hello", json=body)
+        except httpx.HTTPStatusError as e:
+            if "homes" not in body or e.response.status_code != 422:
+                raise
+            # A hub from before account folders refuses the field. The folders are for the human's view only (the
+            # node sets them itself), so the hello goes again without them, and the hub is said to be older.
+            if not getattr(self, "_homes_refused", False):
+                log.warning("the hub refused this node's account folders ([dispatch.runner_homes]): it runs an "
+                            "older version of agent-comms. The runs still use them; only the hub's view lacks them")
+                self._homes_refused = True
+            body.pop("homes")
+            out = self._call("POST", "/api/nodes/hello", json=body)
         self.last_hello = self.clock()
         return out
 
@@ -272,6 +294,7 @@ class Node:
 
     def _start(self, r: dict) -> None:
         rid, agent, project = r["run_id"], r.get("agent"), r.get("project")
+        made = False        # this start made the run's browser output directory: only then may it remove it
         try:
             template = self.config.runner_for(agent, r.get("runtime"))
             if template is None:
@@ -302,7 +325,8 @@ class Node:
                     raise LookupError("this machine's runner does not declare a signed-in browser for the bound "
                                       "origin ([dispatch.runner_access])")
             profile = signed_in_profile(self.config, agent, r.get("runtime"), signed_in) if signed_in else None
-            out_dir = self.log_dir / f"{rid}-browser"
+            out_dir = browser_output_path(self.log_dir, rid)    # this attempt's own: never a leftover's name
+            fresh = False       # the run's browser output directory is made once the command line is checked
             # The signed-in browser's output directory is writable too, so a file to upload can be copied in.
             template = with_writable_roots(template, self.config.extra_roots(template, project)
                                            + ([str(out_dir)] if profile is not None else []))
@@ -313,9 +337,7 @@ class Node:
                 conflict = codex_config_conflict(env)
                 if conflict:
                     raise LookupError(conflict)
-                self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                self._remove_browser_output(rid)
-                out_dir.mkdir(mode=0o700)   # fresh per run; removed when it ends
+                fresh = True        # fresh per run; removed when it ends
                 template = with_headless_browser(template, signed_in_browser_overrides(
                     self.config.headless_browser, profile, str(out_dir)))
             browser = r.get("headless_browser")
@@ -326,30 +348,38 @@ class Node:
                 blocker = self._headless_blocker(agent, r.get("runtime"))
                 if blocker:
                     raise LookupError(blocker)
-                self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                out_dir = self.log_dir / f"{rid}-browser"
                 if profile is None:   # else the signed-in browser's fresh directory, shared by both servers
-                    self._remove_browser_output(rid)   # left by a node that died before recording this run
-                    out_dir.mkdir(mode=0o700)   # fresh per run; never reused
+                    fresh = True        # fresh per run; never reused
                 template = with_headless_browser(template, headless_browser_overrides(
                     self.config.headless_browser, origins, str(out_dir)))
             template = with_managed_env(template, child_env(agent, self.config, runtime=r.get("runtime")))
             argv = render_argv(template, prompt=prompt, project=cwd, thread_id=int(r.get("thread_id") or 0))
+            # Account folders, at the spawn, on the command line as it will run: its cwd, the workspace a Codex
+            # runner names itself and every writable root it is given, generated ones included (agent_accounts.py);
+            # before the run's browser output directory is made.
+            conflict = self.config.launch_blocker(agent, r.get("runtime"), cwd, argv=argv)
+            if conflict:
+                raise LookupError(conflict)
             self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if fresh:
+                make_browser_output(self.config, out_dir)   # validated, then made exclusively
+                made = True
             started, child = self.groups.start(cwd, ("run", rid), lambda: self.spawner(
                 argv, cwd=cwd, env=child_env(agent, self.config, runtime=r.get("runtime")),
                 log_path=self.log_dir / f"{rid}.log"))
             if not started:
                 log.info("run %s waits: a process group in %s is now being stopped", rid, cwd)
-                self._remove_browser_output(rid)
+                if made:
+                    self._remove_browser_output(rid, out_dir)
                 return
         except Exception as e:
             log.warning("could not start run %s: %s", rid, e)
-            self._remove_browser_output(rid)
+            if made:
+                self._remove_browser_output(rid, out_dir)
             self._report(rid, "ended", error=f"{type(e).__name__}: {e}"[:300])
             return
         local = _Local(rid, child, self.clock(), float(r.get("timeout_seconds") or 1800),
-                       float(r.get("kill_grace_seconds") or 10), cwd=cwd)
+                       float(r.get("kill_grace_seconds") or 10), cwd=cwd, browser_out=str(out_dir) if made else None)
         try:
             local.proc_start = self.start_of(child.pid)
         except Exception:
@@ -361,8 +391,11 @@ class Node:
             self._stop(local, "terminate")    # the hub stopped it while we were starting it
         log.info("started %s for thread %s (run %s)", agent, r.get("thread_id"), rid)
 
-    def _remove_browser_output(self, run_id: str) -> None:
-        out = self.log_dir / f"{run_id}-browser"
+    def _remove_browser_output(self, run_id: str, out: Any) -> None:
+        """Remove one browser output directory this node made for `run_id` (dispatch.remove_browser_output's
+        rules: one of the run's own names, in this log folder, never through a symlink). Nothing for None."""
+        if out is None:
+            return
         remove_browser_output({"run_id": run_id, "log": str(self.log_dir / f"{run_id}.log"),
                                "headless_browser": {"output_dir": str(out)}})
 
@@ -400,7 +433,7 @@ class Node:
                 del self.running[rid]
                 self.groups.gone(("run", rid))
                 self._save_state()
-                self._remove_browser_output(rid)
+                self._remove_browser_output(rid, local.browser_out)
                 self._report(rid, "ended", exit_code=local.exit_code if local.exit_code is not None else code,
                              **({"checkout": c} if (c := checkout_state(local.cwd)) is not None else {}))
             elif local.terminated_at is None and now - local.started >= local.timeout:
@@ -436,7 +469,7 @@ class Node:
         for rid, local in list(self.running.items()):
             del self.running[rid]
             self.groups.gone(("run", rid))
-            self._remove_browser_output(rid)
+            self._remove_browser_output(rid, local.browser_out)
             c = checkout_state(local.cwd)
             self._report(rid, "ended", exit_code=local.child.poll(), error="node shut down",
                          **({"checkout": c} if c is not None else {}))

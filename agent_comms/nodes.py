@@ -94,7 +94,7 @@ def _access_levels() -> tuple[str, ...]:
 
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
           headless_browser: Any = None, checkout_roots: Any = None, access: Any = None,
-          sessions: Any = None, session_host: Any = None) -> dict:
+          sessions: Any = None, session_host: Any = None, homes: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
@@ -103,7 +103,9 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
     `session_host`: {"tree": 1, "runners": {key: [words]}} from a node that speaks the child-session protocol
     (hosted_tree.py): for each runner it can start a child session from, the access words it can start one at
     (session_access.LEVELS). Optionally `dirs`: {key: directory} for a runner that can be a session in that one
-    directory only. A node that does not say so gets no child sessions."""
+    directory only. A node that does not say so gets no child sessions.
+    `homes`: runner key (one the node offers) -> the account folder that runner's processes use there
+    ([dispatch.runner_homes], agent_accounts.py): a path, for the human's view only. The hub never acts on it."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -151,6 +153,10 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         hosting = {"tree": tree, "runners": {k: [x for x in _access_levels() if x in w] for k, w in offered.items()}}
         if dirs:
             hosting["dirs"] = dict(dirs)
+    if homes is not None and (not isinstance(homes, dict) or len(homes) > MAX_ITEMS or any(
+            k not in runners or not isinstance(v, str) or not v.startswith("/") or len(v) > 1024
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in v) for k, v in homes.items())):
+        raise Invalid("homes maps runner keys the node offers to the account folder (an absolute path) each uses")
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,
@@ -159,6 +165,8 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         info["sessions"] = {"max_live": sessions["max_live"]}
     if hosting is not None:
         info["session_host"] = hosting
+    if homes:
+        info["homes"] = dict(homes)
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
         # A node that does not (or no longer) host child sessions is listed none, so it can never report on one

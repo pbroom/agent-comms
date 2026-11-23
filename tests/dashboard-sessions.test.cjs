@@ -29,7 +29,7 @@ function session(id, extra = {}) {
 function fixture() {
   const grand = session(GRAND, { parent: KID, depth: 2, name: 'review-1', role: 'review', title: 'check the diff',
     access: 'read-only', isolation: 'shared', state: 'running', in_flight: 2, turns: 1, model: 'haiku', effort: 'low',
-    started_by: { kind: 'agent', name: 'claude', via: 'hosted', session: KID } });
+    started_by: { kind: 'agent', name: 'claude', via: 'hosted', session: KID }, account_home: '/Users/you/.claude-work' });
   const kid = session(KID, { parent: ROOT, depth: 1, name: 'general-1', title: 'look around', isolation: 'worktree',
     worktree: '/wt/session-2222', model: 'opus', effort: 'high', turns: 3, queued: 1,
     started_by: { kind: 'agent', name: 'claude', via: 'hosted', session: ROOT },
@@ -58,7 +58,7 @@ const out = text => ({ text, truncated: false, length: text.length });
 function detailOf(id) {
   if (id === IROOT) return { session_id: IROOT, kind: 'interactive', agent: 'codex', project: '/repo/app', state: 'open',
     created_at: NOW - 900, messages: [], results: [], version: 'v1' };
-  return { ...session(id), messages: [{ n: 1, kind: 'user', state: 'done', detail: '' }, { n: 2, kind: 'child', state: 'done', detail: '' }],
+  return { ...session(id), ...(id === GRAND ? { account_home: '/Users/you/.claude-work' } : {}), messages: [{ n: 1, kind: 'user', state: 'done', detail: '' }, { n: 2, kind: 'child', state: 'done', detail: '' }],
     results: id === ROOT ? [{ n: 7, child: GONE, name: 'test-1', message: 1, outcome: 'failed', state: 'undelivered',
       why: 'its parent session ended', output: out('<b>kept</b> [x](https://evil.example)') }] : [],
     output: { ...out(`full reply of ${id.slice(0, 8)} <i>not html</i>`), for_message: 2 }, version: 'v1' };
@@ -418,5 +418,21 @@ test('details are cached under the version their body carries, so a passing chan
   assert.doesNotMatch(document.getElementById('session-detail').textContent, /a transient reason/);
   await win.refresh(); await settle();
   assert.equal(calls.filter(u => u === `/api/hosted-trees/${ROOT}`).length, 2, 'then cached under v1');
+  dom.window.close();
+});
+
+test("a session whose node gives its runner an account folder shows the folder's path, and others show none", async () => {
+  const { dom, document } = await setup();
+  const facts = document.querySelector(`li[data-session="${GRAND}"] > .lin-facts`);
+  const item = [...facts.querySelectorAll('.lin-fact')].find(x => x.textContent.startsWith('account folder'));
+  assert.equal(item.textContent, 'account folder ~/.claude-work');
+  assert.equal(item.getAttribute('title'), '/Users/you/.claude-work', 'the whole path in the title');
+  assert.ok(!document.querySelector(`li[data-session="${KID}"] > .lin-facts`).textContent.includes('account folder'));
+  document.getElementById(`lin-open-${GRAND}`).click();
+  await settle();
+  assert.match(document.getElementById('session-detail').textContent, /Account folder\/Users\/you\/\.claude-work/);
+  document.getElementById(`lin-open-${KID}`).click();
+  await settle();
+  assert.doesNotMatch(document.getElementById('session-detail').textContent, /Account folder/);
   dom.window.close();
 });

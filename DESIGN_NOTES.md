@@ -6609,3 +6609,326 @@ does them. The transcript itself (it stays on the node). The result's own copy o
 is the same text, and a delivered result's copy is emptied anyway). Wakes and grants (Settings and `board session
 grants` show those). A live push channel: the existing polling refresh is enough for a view a human reads, and adds
 no new long-poll on the hub.
+
+## Agent accounts (2026-11-22)
+
+**Why.** The owner has two Claude subscriptions on the main laptop: the personal one in Claude Code's default config
+folder (`~/.claude`) and a company one signed in in its own (`CLAUDE_CONFIG_DIR=~/.claude-work`; Claude Code keeps
+each folder's login apart). The board already had an identity for the work account (`claude-work`, runtime
+claude-code). Missing: a runner could not choose its account (a runner is an argv, and `[dispatch.env]` passes only
+the NAMES of variables whose values come from the launching process's own environment, so every Claude run used the
+same folder), and nothing kept the work account out of projects that are not the company's. `agent_accounts.py`.
+
+**Two settings, read in two places.**
+- `[dispatch.runner_homes]`: runner key -> account folder. Read on the machine that LAUNCHES (a node, or the hub's
+  own dispatcher), like `[dispatch.runners]`. `dispatch.child_env` sets the variable, and every start path builds
+  its environment there: a dispatched run here (`Dispatcher._launch`) or on a node (`Node._start`), a hosted session
+  and a child session (`SessionHost._env`, which `node_sessions` drives). So whatever reads the CLI's config through
+  that environment follows the folder too: the Codex config a dispatched run's board server is found in
+  (`with_managed_env`, `with_codex_inbox_mcp`, `codex_config_conflict`), the one a bound hosted Codex session's
+  `env_vars` are merged with (`session_host.codex_config_of`), and the app-server and `thread/start`, which run in
+  that environment. So a Codex runner's generated `-c` values for the board's MCP server (the run's
+  AGENT_COMMS_MANAGED, a session's binding) come from the account's own config.toml and can differ from the
+  default home's (`test_a_hosted_codex_session_reads_its_board_server_from_the_accounts_own_config`). Nothing else
+  on a command line changes, and a Claude runner's not at all: scoping (`runner_preflight`, `claude_tool_projects`),
+  read-only children (`session_access.prepare`) and the frame are as without a folder. The variable is chosen by the
+  runner's CLI (`claude` -> CLAUDE_CONFIG_DIR, `codex` -> CODEX_HOME; any other CLI cannot have an entry), never
+  named by config. The folder: a literal absolute, normalized path (no `~`, `$VAR`, `.`, `..`), an existing
+  directory, its own real path, owned by the user the process runs as; never `/` or the home folder, and never the
+  token folder (`AGENT_COMMS_TOKEN_DIR` and the default), the folder of the human's token file
+  (`AGENT_COMMS_TOKEN_FILE`), the board's home, its data directory or `~/.ssh`, nor inside or around one of them,
+  nor around the human's token file as it RESOLVES (`board` reads it through a symlink) or a relocated
+  agents.toml. No directory a run of this machine may be given to write may overlap
+  an account folder (a run that could write there could read or change that account's credentials): checked when
+  the settings are read for every writable root, every `[dispatch.worktrees]` checkout and `worktree_root()` (where
+  parallel runs' and child sessions' own worktrees go, whatever `parallel_worktrees` says), discovered checkouts are
+  never inside one (`protected_dirs`), and at each start `DispatchConfig.launch_blocker` checks the directory the
+  process is started in (the hub's fallback run directory is the thread's project path itself; a child's own
+  worktree) against every runner's folder, and the runner's own folder against the rules again (it may have been
+  replaced by a symlink, removed or given away since). One way only: a runner whose
+  variable `[dispatch.env]` also passes is refused when the settings are read (same key) or, when only the lookup at
+  launch shows it (the runner keyed by agent name, `[dispatch.env]` by runtime), at preflight, at the node's start
+  and at `SessionHost.open` (all through `launch_blocker`), each with the reason; and again where each process is
+  really spawned (round 2, AC4): `SessionHost._spawn`, for every process of a session (a delayed first turn, a
+  respawn: a folder changed since `open` ends the session with the reason), and `Dispatcher._launch` on the run's
+  final directory (its own worktree made by then: a failed start, refunded); a child's own worktree path is held
+  against the folders before it is made (`session_worktrees.ensure`). `child_env` lets the folder win should
+  anything start it anyway.
+  Without an entry `child_env` returns exactly what it did (a test compares the JSON byte for byte).
+- `[dispatch.agent_projects]`: agent name -> the projects it may run in. Read on the HUB, from the Board's live
+  settings (`board.s.dispatch`, reloaded on every pass), never from a node. No entry: unrestricted (every existing
+  setup). An entry, even an empty list: only those projects. A table that cannot be read refuses every start
+  (`UNREADABLE`). While the latest edit of the settings files did not load (`Board.settings_error`: the Board keeps
+  the last good settings, whose table may be the one being changed), every start is refused (`UNLOADED`, "the hub's
+  settings did not load: fix board.toml/board.local.toml") when the list is or may be in play: the last good
+  settings have an entry in it, or board.toml / board.local.toml on disk set it (`mentioned_on_disk`: from the
+  parsed keys when the file parses, so a quoted or escaped spelling of the key counts and a comment does not; a
+  bounded byte search for `agent_projects` when it does not; a file that cannot be read counts as setting it).
+  Without either, a broken edit keeps main's behaviour (the last good settings stand and starts go on).
+  ONE project identity: `agent_accounts.project_id` is the very string the creating path stores and launches with
+  (`hosted._project`'s value for a session, a child's parent's, a thread's as stored), with trailing slashes off as
+  those paths take them off and nothing more; each entry is normalized the same way. So no space is trimmed (a
+  checkout named `/a ` is not `/a`, round 2's AC3: round 1 used `core._norm_path`, which trims what hosted placement
+  keeps), no case folded and no path resolved. Nothing on any disk is read: the hub often has no checkout of the
+  project at all, so nothing there could prove that a directory belongs to an opted-in repository. (Round 0 compared
+  a worktree's main repository from its `.git` file and `commondir`; that trusted checkout-controlled files and read
+  under the write lock, and was taken out.) A child in its own worktree keeps its parent's project, so it is
+  covered.
+
+**Where the opt-in list is decided: when work is CREATED, inside the write that creates it, and nowhere else**
+(the owner's rulings in rounds 2 and 3). Taking a project off the list stops new work there: new sessions, children,
+dispatched launches and routings. Work that already exists is not withdrawn and proceeds: a session with no process
+yet, a queued first task or wake, an assigned or running run, a session that has taken turns (and what reaches it:
+the human's messages, its children's results, its starter's follow-ups, and wakes: a wake delivers a board post to a
+session that already exists, so `hosted_wake.py` and `interactive_wake.py` are main's code and not governed by the
+list; to stop a session being woken, close it). The human stops it: `board session close`,
+`board dispatch stop` (the dispatcher and its runs), `board dispatch revoke` (further launches under an approval). Sessions the human opens himself are never governed by the list. Every refusal says `<agent>
+is not opted in to <project>: ...`.
+- Dispatcher launch: `_preflight` (recorded as `preflight_failed`, the request blocked with the reason; the preflight
+  retry requeues it once the owner opts the agent in), and again inside the launch's reservation transaction
+  (`_launch_check`): refused there, the trigger stays pending and the next pass's preflight records it. The project is
+  the thread's, also for an inbox delivery that runs in a private directory: the work is that project's.
+- Hosted session (`hosted.start`): before placement (so its reason beats "no node") and inside the write that makes
+  the record.
+- Child session (`hosted_tree.create_child`, the human's `--parent` and the agents' `board_session_spawn`): before
+  placement, in `_target` (which `placement_problem` uses, so `board_session_capabilities` and the spawn frame's
+  target list never offer the agent where it may not run), and inside the create transaction (which for a spawn is
+  `_spawn_in`'s one deciding transaction).
+- Routing a signed-in browser request to another agent (`Dispatcher._route_by_access`, `access.route_successor`)
+  creates work for that agent: a holder the list bars from the thread's project is not a candidate, and the
+  transfer's own write asks again (round 2, AC13).
+- The dispatcher's reservation asks the list FIRST in its transaction (round 1, AC6), before the hosted hold
+  (`hosted_wake.reserve`) takes the request from the hosted and interactive watchers and before the checkout
+  claim: a refused launch changes neither watcher.
+- *Settings in force at each creating write.* Every creating path reads the list from the Board's live settings,
+  after the board's own "reload if the files changed" step: an HTTP request or a `board mcp` tool call
+  authenticates first (`Board.authenticate` -> `refresh_identities` -> `reload_settings`), and each dispatcher
+  pass starts with `refresh_config` (`reload_settings`) before it launches or routes. None decides on settings older
+  than its own request or pass. (Unlike the list, a machine's own `[dispatch]` table, account folders and writable
+  roots included, is read when `board dispatch run` or `board node` starts, as runners and worktrees always were;
+  `launch_blocker` checks the folder itself on disk at every spawn.)
+
+**What is not restricted, by design** (owner decisions). A session the human opens himself in a terminal on the
+work account is his own: the board never starts it, and the list does not apply to it (nor to the wake of such a
+session, interactive_wake.py, which only wakes what the human opened). Work that exists already is not withdrawn
+(above). An agent's follow-up message to its own child (`board_session_send`) is a turn in an existing session and is
+not checked (left alone also because another change is reworking that path). Nothing
+can verify which subscription a process really used: the board sets one environment variable, the CLI decides what
+it does with it, and nothing is read from inside the folder.
+
+**Showing the account.** The node's hello carries `homes` (runner key -> folder path) only when it has some.
+`hosted.account_home` looks the session's runner up in its node's latest hello (`nodes.runner_key`, as the hub does
+for a runner's words), and `_human_view` adds `account_home` only when there is one, so `board session list|show`
+("claude-work (account folder /Users/you/.claude-work)"), the lineage view and the dashboard (a fact item
+"account folder ~/.claude-work", the whole path in its title, and a details row) show it. The path only.
+
+**Versions.** An older hub refuses a hello with an unknown field (422); a node of this version then sends it again
+without `homes` and logs once that the hub is older: runs still use the folders, only the view lacks them. An older
+node never sends the field. An older node (or dispatcher) that finds `runner_homes` or `agent_projects` in its
+board.local.toml refuses the unknown setting and does not start, as for every new key: upgrade a machine before
+adding the setting to it, the hub first. The opt-in list needs nothing from nodes: it is decided on the hub.
+
+**Installers.** `integrations/claude-code/install.sh` copied the skill to `$HOME/.claude/skills` while the MCP server
+(`claude mcp add --scope user`) and the wake hooks (`--wake`, which writes them) followed `CLAUDE_CONFIG_DIR`; now
+the skill goes to `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` too. The ordinary install does not write the SessionStart
+and UserPromptSubmit hooks: it prints them, and the printed advice now names that folder's settings.json. The Codex installer had
+no such mistake in what it writes (`codex mcp add` and the hooks follow `CODEX_HOME`; the skill goes to
+`~/.agents/skills`, which Codex reads for any home), but two printed messages said `~/.codex/config.toml`; they now
+name `${CODEX_HOME:-~/.codex}`.
+
+**Follow-ups (unchanged from main, not fixed here).** Conversation links look in ONE home per CLI: `[conversations]
+claude_home` / `codex_home` (else `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` of the hub process, else the defaults;
+conversations.py, core.py's session conversation lookup), so a session that ran on another account folder may get no
+link or a lookup in the wrong home; and the resume commands the dashboard copies (`claude --resume`, `codex resume`)
+carry no account variable, so they resume in the default account unless the owner sets it. A split-home lookup
+(one per runner folder, from the node's report) and the variable in the copied command would close both.
+
+**Tests.** `tests/test_agent_accounts.py` (each rule of both settings, every start path with fakes, the refusals and
+their messages, the decisions inside the transactions, wakes, the hello and an older hub, byte-for-byte back-compat,
+both installers with a temp HOME, CLAUDE_CONFIG_DIR and CODEX_HOME and stub CLIs), a dashboard test in
+`tests/dashboard-sessions.test.cjs`, and A1-A3 in `scripts/session-host-e2e.py` (stand-ins: a work agent with a
+folder and an opt-in list; its sessions and its child get the variable, a start in another project is refused, and a
+spawn by the other agent into the opted-in project works while the other project is not offered).
+
+### Agent accounts: review round 1 (2026-11-22)
+
+Sol's round 1 (on 1d0ab8c): with both settings absent nothing differs from main. Each finding was checked first.
+- *AC1 (true).* The opt-in list failed open on a rejected reload: `Board.reload_settings` keeps the last good settings,
+  so a broken edit of the table left the old one in force. `hub_table` now refuses every start while
+  `Board.settings_error` is set and the list is or may be in play (coordinator's narrowing: an entry in the last good
+  settings, or the text `agent_projects` in either file on disk, an unreadable file counting as one); a board that
+  uses neither keeps main's behaviour. Tests through the real reload path for the four cells (the last good
+  settings with or without the table, the files on disk mentioning it or not), an unreadable file, an over-long
+  file, and a board with neither whose hosted session still starts on the last good settings.
+- *AC2 (true; retired in round 2 by the owner's ruling, see below).* A root with no process yet, a child's first task and an assigned node run could be handed to the node
+  after the agent was taken off the list. Now withheld and ended with the reason at the hand-off (above, "Hand-off of
+  what has not started"); what has taken a turn, and what is running, is untouched.
+- *AC3 (true; the owner's ruling).* The git-metadata comparison trusted checkout-controlled files, never checked the
+  backlink and read files under the write lock; and the hub often has no checkout at all. Taken out: the board's own
+  project string, normalized as threads and sessions are keyed (`core._norm_path`). Tests: exact match, another
+  spelling refused (case, `.`, a subfolder, a symlink, another prefix), normalization as the board does it, and
+  nothing read from the disk to decide (the comparison runs with `os.path` and `open` made to fail).
+- *AC4 (true; the token folder was covered, the token FILE was not).* The folder is now held against every
+  `[dispatch.worktrees]` checkout and `worktree_root()` whatever `parallel_worktrees` says (a child's own worktree
+  goes there), against the directory each process is started in (`launch_blocker`, at every start: the hub's
+  fallback run directory is the project path itself), re-validated at each start, and kept clear of the human token
+  file's folder (`AGENT_COMMS_TOKEN_FILE`) and a relocated agents.toml.
+- *AC5 (true).* A refused wake moved the watcher past posts it never delivered, and a withdrawn wake still counted.
+  Now skipped before any write (mark untouched); the withdrawal of a queued wake went in round 2 with the ruling.
+- *AC6 (true).* The reservation asked the list after the hosted hold had claimed the request from both watchers.
+  Now first; the test asserts the hosted and interactive watcher records (and the checkout claim) are unchanged.
+- *AC7 (true).* A hosted root that may not be woken still kept the owner's own session from its wake. Now only an
+  eligible root takes priority; tested with both kinds of session together.
+- *AC8 (true).* The docs said nothing on a command line changes and that the installer writes the hooks: a Codex
+  runner's board-server `-c` values come from the account's own config.toml, and the ordinary install prints the
+  SessionStart/UserPromptSubmit hooks while `--wake` writes the wake hooks. Both said now.
+- *AC9 (true, unchanged from main).* Documented under Follow-ups above; not fixed.
+- Mutation check on the round-1 rules with the earlier ones: 70 of 70 caught (two earlier mutants became equivalent
+  and their redundant code was removed: the extra account-folder term in the `parallel_worktrees` check, now covered
+  by the directory list, and a token-file entry covered by its folder).
+
+### Agent accounts: review round 2 (2026-11-22)
+
+Sol's round 2 (on b9dca6d): AC6, AC7 and AC8 resolved. **Owner ruling on revocation**, replacing round 1's AC2 fix:
+the opt-in list is decided when work is created, inside the creating write, and nowhere else (above, "Where the
+opt-in list is decided"). Taken out with it: `hosted._withdraw_refused`, `hosted.unstarted`, the skip in `_listed`,
+`nodes._withdraw_refused` and the filter in `nodes.assignments`, and the withdrawal (with its restore and refund) of
+an already queued wake in `hosted_wake._recheck`, which is main's again. Every creation-time check stays.
+- *AC2 remainder, AC5 remainder, AC10, AC12: no longer apply* under the ruling: each was about withdrawing work that
+  already existed (at hand-off, or a queued wake), which is no longer done.
+- *AC1 (true).* A quoted key with an escape (`"agent_projects"`) decodes to `agent_projects` without those
+  bytes, so a broken edit could bring the list in unseen. `mentioned_on_disk` now decides from the parsed keys of a
+  file that parses (`[dispatch]` has the key, or `dispatch` is not a table), and from the bytes only for a file that
+  does not; a comment no longer counts. Tests: the escaped key, a comment, a key in board.toml, a file that does not
+  parse with and without the text.
+- *AC3 (true).* `core._norm_path` trims surrounding space, which `hosted._project` keeps and the node launches with,
+  so a checkout `/a ` passed the entry `/a`. One identity now: the stored string, trailing slashes off, nothing else,
+  for the project and for each entry. Tests: the trailing-space pair (also through `hosted.start`), a trailing
+  no-break space, a leading space (an invalid entry), a space before a slash, an entry that itself ends in a space.
+- *AC4 (true).* Checked only at `open` (session host) and before the final worktree (dispatcher). Now also at every
+  process spawn (`SessionHost._spawn`: a respawn after the folder was replaced by a symlink ends the session with
+  the reason, no process) and in `Dispatcher._launch` on the final directory (a failed start, refunded); a child's
+  worktree path is checked before it is made (`session_worktrees.ensure`). The human's token file is protected where
+  it resolves (a symlink into the folder is refused).
+- *AC11 (true).* With the cursor kept, a post the human's own session was handed while the hosted root could not be
+  woken was woken for again once the agent was opted in. `_qualifying` leaves out posts in that agent and project's
+  interactive pair `delivered`; posts that session was not handed still wake the root. Test with both sessions.
+- *AC13 (true).* Routing a signed-in browser request could hand it to an agent the list bars from the project.
+  Candidates are filtered, and `access.route_successor` asks again inside its write.
+- Mutation check after round 2: 78 of 78 applied mutants caught (77 single mutations and the reservation-order
+  one); 13 mutants of round 1 retired with the code the ruling removed or replaced. One that survived at first
+  (the candidate filter of AC13, which the transfer's own check made redundant in effect) now has a test that the
+  barred holder is never tried.
+
+### Agent accounts: review round 3 (2026-11-22)
+
+Sol's round 3 (on 0e1be5e): AC1, AC3 and AC13 resolved; `_listed`, `assignments` and `_recheck` match main.
+**Owner ruling on wakes** (extends round 2's): a wake delivers a board post to a session that already exists, so it
+is not governed by the list; the list governs only the creation of sessions, children, dispatched launches and
+routings. `agent_comms/hosted_wake.py` and `agent_comms/interactive_wake.py` are main's code again (no diff).
+- *AC5, AC7, AC11, AC14: no longer apply* under the ruling (the refused-watcher skip, the hosted root's priority
+  over the owner's own session, the replay exclusion, and a stale policy creating a wake in an open long-poll were
+  all about wakes). Tests now show an existing hosted session still woken after its project leaves the list, and a
+  new session there refused.
+- *Stale settings (checked, creation paths only).* Each creating write runs after the board's reload step of its
+  own request or dispatcher pass (above); no creation path runs on settings older than that. The long-lived node
+  long-poll that AC14 named creates no sessions; with wakes out of scope nothing it does is governed by the list.
+- *AC4 remainder (true).* The spawn-time check looked at the cwd only. `launch_blocker` now takes the command line as
+  it will run and the project: the workspace a Codex command line names (`--cd`/`-C` in every spelling the Codex
+  adapter reads, `agent_accounts.codex_workspaces` over `providers.codex.VALUE_FLAGS`, a relative one resolved
+  against the cwd) and the project's extra writable roots (round 4: what the command line really grants) are held against every account
+  folder, at the spawn on the hub (`Dispatcher._launch`), on the node (`Node._start`, after the argv is rendered) and
+  for every hosted process (`SessionHost._spawn`). Tests: five spellings and a relative `--cd`, `--cd {project}`
+  allowed, a writable root overlapping a folder at spawn time on the hub and on the node, a node runner's `-C`.
+
+### Agent accounts: review round 4 (2026-11-22)
+
+Sol's round 4 (on 47306ef): all four creation paths traced, both wake files match main. Two items, both true.
+- *AC4 remainder (true).* The spawn check took the configured project roots, not what the board actually grants:
+  a root it generates itself (a run's signed-in browser output directory, on the hub and on the node) was missed,
+  and a log folder that is a symlink into an account folder put that directory inside it. Now one function,
+  `dispatch.granted_writable_roots`, reads every root the final command line grants (Claude `--add-dir` in both
+  spellings, Codex `sandbox_workspace_write.writable_roots` in every `-c` spelling the dispatcher reads, a
+  `sandbox_workspace_write` table too; options end at `--`; an unreadable value refuses the start), and
+  `launch_blocker` resolves and checks those, the cwd and the Codex workspace, on the hub, the node and the session
+  host. The run's browser output directory is made only after the check passes (hub and node), and a run's own
+  worktree (or an inbox run's directory) is checked before it is made. A read-only child, which is given no extra
+  roots, is no longer refused over a project root it does not get. The Codex workspace parser stops at `--`.
+  Tests: the signed-in browser's output through a symlinked log folder on the hub and on the node (refused, the
+  directory never made), the read-only child, a run's worktree refused before it is made, the parser at `--`, and
+  the granted-roots reader in each spelling.
+- *AC15 (true).* `Board.reload_settings` (main's sequence) clears `settings_error` before it publishes the new
+  `[dispatch]` table, so a decision between the two saw "no error" beside the old table. The reload holds
+  `Board._settings_lock` for its whole update; `agent_accounts._snapshot` now reads the status and the table as one
+  snapshot under that same lock, and `hub_refusal` decides from that one snapshot (no second read of the status).
+  `core.py` is unchanged. Test: the writer held exactly between the two assignments (a `Settings` whose `dispatch`
+  assignment waits), a decision then waits for it and sees the new table; without the lock it saw the old table
+  allowed.
+- Mutation check after round 4: 83 of 83 applied mutants caught (82 single mutations and the reservation-order
+  one; 28 retired with code the rulings removed or replaced). Two that first survived (the browser output directory
+  made before the check, on the hub and on the node: a refused run removes what it made, so the result looked the
+  same) are caught by watching the directory being made, not only what is left.
+
+### Agent accounts: review round 5 (2026-11-22)
+
+Sol's round 5 (on 5a0ed0d): AC4 and AC15 fixed as written. Two new items and a follow-up, all true.
+- *AC17 (true).* Round 4's reordering put the browser output directory on the run's record before `mkdir` made it,
+  so the hub's failure cleanup could delete a directory that was already there; both launchers also cleaned up after
+  a refusal that came before any directory was made; and the cleanup's guard accepted a symlinked parent. Now a
+  launch removes only what it made: on the hub the output directory goes on the record only after its exclusive
+  `mkdir` succeeded, and the node removes it only when this start made it (it no longer clears a leftover of the
+  same name first: an existing directory fails the start and is left alone). `remove_browser_output` never removes
+  through a symlink on the way (its parent must be its own real path). Tests: a directory that was already there
+  survives a failed start (it exists) and a refused one (an overlap), on the hub and on the node; a symlinked parent
+  is not followed, a real one is.
+- *AC16 (true; main's sequence, new impact).* A Board took its settings files' signature when it was built, after
+  `Settings.load` had read them, so a save in between paired the old settings with the new signature and the
+  ordinary refresh skipped the new policy until the next edit. `Settings.load` now records the signature from just
+  BEFORE it reads the files (`Settings.files_sig`, `config.settings_files_sig`, core's format), and `Board.__init__`
+  starts from it (the one line changed in core.py). A save after the read is then always newer and the first refresh
+  takes it. Test: a save forced exactly between the read and the Board; the first ordinary refresh applies it (it
+  did not before), and the next finds nothing more.
+- *Follow-up (done).* The session host checked the rendered runner template before the provider built its argv;
+  it now checks the very argv the provider will execute (`_argv(s)`), immediately before the spawn. Test: an argv the
+  provider extends with a writable root in an account folder is refused.
+- Mutation check after round 5: 91 of 91 applied mutants caught (90 single mutations and the reservation-order one;
+  28 retired with code the rulings removed or replaced).
+
+### Agent accounts: review round 6 (2026-11-22)
+
+Sol's round 6 (on 301a691): AC16, the hosted-argv follow-up and AC17's deletion safety resolved. Two items about the
+generated browser output directory, both true.
+- *AC17 remainder (true).* Under a symlinked log folder the cleanup rightly left a start's directory, and a retry of
+  the same node assignment then failed on that leftover (FileExistsError); startup recovery also missed a directory
+  made before its run reached the node's state file. Now every ATTEMPT gets a fresh name
+  (`dispatch.browser_output_path`: `<run id>-browser`, else the first free `-browser-<n>`), created exclusively, so a
+  leftover never collides with a retry and nothing is cleared to make room. A start removes only the directory it
+  made (the node keeps its path on the run: `_Local.browser_out`); `Node.recover` sweeps every attempt's directory in
+  the node's log folder at startup (nothing runs then), whether or not its run was saved; under a symlinked folder a
+  directory is left and said once in the log. The hub already gives every attempt a run id of its own. Tests: a
+  retry of the same node assignment after a failed start succeeds under a real and under a symlinked log folder, and
+  its own directory goes when the run ends; a hub launch never collides with a leftover of its name, under either;
+  recovery removes every attempt's directory and nothing else.
+- *AC4 remainder (true).* A headless-only browser's output directory (Playwright's cwd and `--output-dir`) is no
+  writable root of the run, so the command-line check never saw it. Every generated browser output directory,
+  headless and signed-in, on the hub and on the node, now comes into being through one helper,
+  `dispatch.make_browser_output`, which holds it against every account folder where it really lands (resolved, so a
+  symlinked log folder counts) and then creates it exclusively. Tests: the headless-only path refused on the hub and
+  on the node, the directory never made.
+- Mutation check after round 6: 96 of 97 applied mutants caught (96 single mutations and the reservation-order
+  one; 31 retired). The one not caught is equivalent: the node's "remove only if this start made it" guard on a
+  failed start, now that each attempt's name is one nothing else has (removing it when this start did not make it
+  removes nothing). The guard stays as a second line.
+
+### Agent accounts: review round 7 (2026-11-22)
+
+- *Startup sweep (true; taken out).* Round 6's sweep in `Node.recover` took the `-browser` suffix as proof of
+  ownership, so it would remove an unrelated `research-browser` directory, and output still in use by a runner spawned
+  just before a crash that never reached the state file. `recover()` again cleans only what main cleaned, the output
+  of runs it verifies from the node's own state after stopping their process groups, at the exact per-attempt
+  directory such a run recorded (`browser_out`, now in `node-runs.json`), else main's `<run id>-browser`; a leftover
+  no verified state names is simply left in the log folder, and each attempt's fresh name lets a retry start past it.
+  Tests: an unrelated `*-browser` directory and an unsaved run's survive startup, a verified run's recorded directory
+  is removed, the state file records it, and a retry starts past an unrecorded leftover.
+- Mutation check after round 7: 97 of 98 applied mutants caught (97 single mutations and the reservation-order one;
+  the sweep's retired with it); the one not caught is round 6's equivalent guard.

@@ -12,6 +12,10 @@ an optional model name and the message text.
 - The hub issues the session id (a UUID). One session per (agent, project) that has not ended. A provider that
   issues an id of its own for the conversation (Codex's thread id) has it on the record too (`provider_id`), as
   the node reported it: for the human to see, never sent to a node.
+- An agent the hub's `[dispatch.agent_projects]` lists runs only in the projects listed for it (agent_accounts.py):
+  decided when a session is CREATED, inside the write that creates it, and nowhere else. Taking a project off the
+  list stops new sessions there; what already exists proceeds (and is woken, hosted_wake.py) until the human
+  closes it.
 - Placement mirrors a node run: the hub's `[dispatch.nodes.<name>]` entry must cover the project
   (`nodes.grant_covers`) and the agent, and the node must be live, offer the project and a runner for the agent, and
   say it hosts sessions (its `[dispatch.sessions] enabled`). The node checks its own checkout again before it starts.
@@ -191,8 +195,23 @@ def _human_view(board: Board, r: dict) -> dict:
     out |= {"reply": r.get("reply"), "reply_for": r.get("reply_for"),
             "node_live": board.now() - _node_seen(board.conn, r["node"]) <= nodes.NODE_STALE_SECONDS,
             "transcript": f"data/node-logs/sessions/{r['session_id']}.jsonl on node {r['node']}"}
+    home = account_home(board.conn, r)
+    if home is not None:        # the account folder its node says this agent's runner uses (agent_accounts.py)
+        out["account_home"] = home
     from . import hosted_tree
     return out | hosted_tree.view(r)        # parent, access and the rest; nothing for a session from before trees
+
+
+def account_home(conn, r: dict) -> str | None:
+    """The account folder ([dispatch.runner_homes]) the session's node says its agent's runner uses, from that
+    node's latest hello: a path, never anything read from inside it. None: the runner has none, or the node does not
+    say (one from before account folders)."""
+    info = _get(conn, nodes.NODE_PREFIX + str(r.get("node")))
+    homes = info.get("homes") if isinstance(info, dict) else None
+    if not isinstance(homes, dict):
+        return None
+    home = homes.get(nodes.runner_key(info, r.get("agent"), r.get("runtime")))
+    return home if isinstance(home, str) else None
 
 
 def _msg_view(m: dict) -> dict:
@@ -251,9 +270,12 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
     except ValueError as e:
         raise Invalid(str(e)) from None
     agent, runtime = _agent(board, agent)
+    from . import agent_accounts
+    agent_accounts.check(board, agent, project)     # the hub's opt-in list, first: its reason beats placement's
     node = _place(board, project, agent, runtime, allowed)
     with db.write_tx(board.conn) as c:
         now = board.now()       # read under the write lock
+        agent_accounts.check(board, agent, project)     # ... and in the write that makes the session
         _prune(c, now)
         for other in _sessions(c):
             if (other.get("agent") == agent and other.get("project") == project and other.get("state") != "ended"
