@@ -1072,6 +1072,12 @@ class SpawnConfig:
     # Optional: the targets an agent may start, cheapest first, each "agent" or "agent/model". Empty: any agent the
     # node offers, any model. A child may start only targets at or before its own place in this list.
     targets: list[str] = field(default_factory=list)
+    # Account pools (account_pools.py), read on the hub for every new session the human or an agent starts, whether
+    # or not child sessions are on: a pool name -> its member agents in preference order; per project, how a pool
+    # is narrowed or reordered there; and when a member counts as near its limit. Empty: no pools, as before.
+    pools: dict[str, list[str]] = field(default_factory=dict)
+    pool_rules: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    pool_headroom: dict[str, float] = field(default_factory=lambda: dict(_pool_defaults()))
 
     @classmethod
     def from_dict(cls, d: Any) -> "SpawnConfig":
@@ -1097,9 +1103,20 @@ class SpawnConfig:
                                                                    t) for t in v) or len(set(v)) != len(v)):
                     raise ValueError(f'{where} targets must be a list of distinct "agent" or "agent/model" names')
                 c.targets = list(v)
+            elif k in ("pools", "pool_rules", "pool_headroom"):
+                from . import account_pools
+                setattr(c, k, getattr(account_pools, "parse_" + k.removeprefix("pool_"))(v))
             else:
                 raise ValueError(f"unknown setting {where} {k}")
+        if c.pool_rules:
+            from . import account_pools
+            account_pools.cross_check(c.pools, c.pool_rules)
         return c
+
+
+def _pool_defaults() -> dict[str, float]:
+    from .account_pools import HEADROOM_DEFAULTS
+    return HEADROOM_DEFAULTS
 
 
 @dataclass

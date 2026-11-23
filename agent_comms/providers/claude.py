@@ -36,13 +36,26 @@ Restart (measured on Claude Code 2.1.330, DESIGN_NOTES "Restarting a running tur
 - An interrupt written behind a turn's user line before that turn's `init` is answered `success` at once and the
   turn then runs whole (measured on 2.1.330, DESIGN_NOTES "Review follow-ups (2026-11-23)"). So the host writes it
   only once the turn's own `init` came (`takes_interrupt`), and a receipt that arrives before it never counts.
+Plan usage (account_pools.py; from Claude Code 2.1.330's own SDK message schema, which the CLI binary carries, and
+checked against lines recorded from real hosted sessions on 2026-11-22/23, tests/fixtures/rate_limit_samples.jsonl:
+DESIGN_NOTES "Account pools"):
+- `{"type": "rate_limit_event", "rate_limit_info": {...}}`, "emitted when rate limit info changes": `status`
+  (allowed | allowed_warning | rejected: whether requests are refused now), `resetsAt` (epoch seconds), `rateLimitType`
+  (five_hour, seven_day, ...), `utilization` (a fraction of the limiting window), `surpassedThreshold` (the highest
+  warning threshold passed, a fraction), and, marked internal, `unifiedWindows` (each window's `utilization`,
+  `resetsAt`, `status`). It is absent for API-key sessions. `usage_of` reads one observation per window
+  from it. Recorded:
+  `unifiedWindows` in every line (`seven_day`, or `five_hour` and `seven_day`), the top-level `utilization` in some
+  only, utilization a fraction 0..1 (0 right after a reset), and overage fields beside them.
+- A turn that fails on the limit: an `assistant` message whose `error` is `rate_limit`. That account counts as
+  exhausted (until the last refusal's reset time, when one was seen).
 """
 from __future__ import annotations
 
 import json
 import re
 
-from . import Event, cap_reply, validate_model, validate_session_id
+from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
 
 # Flags a hosted session sets itself, or that would start, fork or hide a conversation other than the hub's.
 OWN_FLAGS = frozenset((
@@ -129,6 +142,68 @@ def _bypass_off(answer: dict) -> bool:
     return isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
 
 
+
+
+def usage_of(info) -> list[dict] | None:
+    """A `rate_limit_event`'s `rate_limit_info` as an Event.usage (module text): one observation per window, each with
+    its own reset. From `unifiedWindows` when it has a usable window, else from the top-level `utilization` (or the
+    `surpassedThreshold` passed, a lower bound) for the window `rateLimitType` names. `status: rejected` (requests are
+    refused now) marks the limiting window exhausted: the one `rateLimitType` names, else one that says `rejected`,
+    until ITS own reset (the top-level `resetsAt` only for the window it names). None: nothing usable.
+    `unifiedWindows` is marked internal in Claude's schema, so without it the top-level fields alone are read. A
+    missing or null field, a window of a name not known here, a new key or a number out of range never fails: it
+    cannot raise (account_pools.py, rule (b))."""
+    try:
+        return _usage_of(info)
+    except Exception:
+        return None
+
+
+LIMITING = "limiting"   # the window key of the top-level fields when they name no window type
+MISSING = object()      # a fraction that is omitted or malformed: no information (DESIGN_NOTES, the usage table)
+
+
+def _percent(d: dict, key: str):
+    """A fraction field as a percent, three ways kept apart (the usage table): a number (a reading), an explicit null
+    (None: the provider's own clear), or MISSING (omitted or malformed: no information, replacing nothing)."""
+    if key not in d:
+        return MISSING
+    if d[key] is None:
+        return None
+    n = number(d[key])
+    return MISSING if n is None else n * 100
+
+
+def _usage_of(info) -> list[dict] | None:
+    if not isinstance(info, dict):
+        return None
+    kind = info.get("rateLimitType") if isinstance(info.get("rateLimitType"), str) else None
+    top_reset, status = number(info.get("resetsAt")), info.get("status")
+    raw = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
+    windows = {n: w for n, w in raw.items() if isinstance(n, str) and isinstance(w, dict)}
+    # Each window's reset, read on its own (also for a window that carries no utilization); the top-level reset is
+    # the limiting window's, the one `rateLimitType` names.
+    resets = {n: number(w.get("resetsAt")) for n, w in windows.items()}
+    if kind is not None and resets.get(kind) is None:
+        resets[kind] = top_reset
+    out: dict[str, dict | None] = {}
+    # A MISSING percent is no reading: usage_record (clean_usage, the one sanitiser) drops it, replacing nothing.
+    for name, w in windows.items():
+        # A window's own `rejected` alone does not mean requests are refused (the schema): the top level says that.
+        out[name] = usage_record(name, _percent(w, "utilization"), resets.get(name))
+    if not any(out.values()):
+        pct = _percent(info, "utilization")
+        pct = pct if pct is not MISSING else _percent(info, "surpassedThreshold")
+        out = {kind or LIMITING: usage_record(kind or LIMITING, pct, top_reset)}
+    if status == "rejected":    # refused now: the limiting window, until ITS own reset
+        target = kind or next((n for n, w in windows.items() if w.get("status") == "rejected"), None) or LIMITING
+        rec = out.get(target) or {}
+        reset = resets.get(target) if resets.get(target) is not None else top_reset if target == LIMITING else None
+        out[target] = usage_record(target, rec.get("percent"), reset, True)
+    kept = [o for o in out.values() if o is not None]
+    return kept or None
+
+
 def _user_line(text: str) -> bytes:
     # json.dumps escapes every line break inside the text: one turn is exactly one line.
     return json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"
@@ -154,6 +229,7 @@ class ClaudeSession:
         self._ask = False               # this process is asked whether bypass is switched off in it (`on_open`)
         self._asked: str | None = None  # the id of that request, until it is answered
         self._starts = 0
+        self._limit: list[dict] | None = None   # the last usage this process reported (`rate_limit_event`)
         self._reset_turns()
 
     def _reset_turns(self) -> None:
@@ -339,4 +415,16 @@ class ClaudeSession:
             request = ev.get("request")
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":
                 return [Event("approval_requested", denials=tool_names([request]))], []
+        if kind == "rate_limit_event":      # plan usage (module text): for the hub's account pools, advisory
+            usage = usage_of(ev.get("rate_limit_info"))
+            if usage is None:
+                return [], []
+            self._limit = usage
+            return [Event("usage", usage=usage)], []
+        if kind == "assistant" and ev.get("error") == "rate_limit":
+            # The turn hit the limit: the FAILED_TURN mark, with the reset the last refusal named (when one did). The
+            # hub counts it until that reset only if it is after the moment the mark was seen, else for the cool-down.
+            last = next((o for o in self._limit or [] if o["exhausted"]), {})
+            return [Event("usage", usage=[usage_record(FAILED_TURN, None, last.get("resets_at"), True,
+                                                       label=last.get("window"))])], []
         return [], []

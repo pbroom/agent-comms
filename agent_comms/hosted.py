@@ -16,6 +16,8 @@ an optional model name and the message text.
   decided when a session is CREATED, inside the write that creates it, and nowhere else. Taking a project off the
   list stops new sessions there; what already exists proceeds (and is woken, hosted_wake.py) until the human
   closes it.
+- The agent may be asked for by an account pool's name (account_pools.py): its member is chosen in the write that
+  creates the session, with each member's own checks, and the record keeps how (`pool`).
 - Placement mirrors a node run: the hub's `[dispatch.nodes.<name>]` entry must cover the project
   (`nodes.grant_covers`) and the agent, and the node must be live, offer the project and a runner for the agent, and
   say it hosts sessions (its `[dispatch.sessions] enabled`). The node checks its own checkout again before it starts.
@@ -207,6 +209,20 @@ def _place(board: Board, project: str, agent: str, runtime: str, allowed: dict[s
     return node
 
 
+def _root_problem(board: Board, project: str, agent: str, runtime: str,
+                  allowed: dict[str, dict] | None) -> tuple[str | None, str | None]:
+    """(the node, None) where a root of `agent` in `project` could be started now, else (None, why not): the checks
+    `start` makes for a named agent, in its order (account_pools.choose asks this for each member of a pool)."""
+    from . import agent_accounts
+    why = agent_accounts.hub_refusal(board, agent, project)
+    if why:
+        return None, why
+    try:
+        return _place(board, project, agent, runtime, allowed), None
+    except Conflict as e:
+        return None, e.message
+
+
 # ---------------------------------------------------------------- what leaves this module
 
 _SESSION_FIELDS = ("session_id", "agent", "runtime", "project", "node", "model", "state", "pid", "turns", "queued",
@@ -224,6 +240,8 @@ def _human_view(board: Board, r: dict) -> dict:
     home = account_home(board.conn, r)
     if home is not None:        # the account folder its node says this agent's runner uses (agent_accounts.py)
         out["account_home"] = home
+    if isinstance(r.get("pool"), dict):     # the pool its agent was chosen from, and why (account_pools.py)
+        out["pool"] = {"name": r["pool"].get("name"), "why": r["pool"].get("why")}
     from . import hosted_tree
     return out | hosted_tree.view(r)        # parent, access and the rest; nothing for a session from before trees
 
@@ -297,24 +315,47 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
         model = validate_model(model)
     except ValueError as e:
         raise Invalid(str(e)) from None
-    agent, runtime = _agent(board, agent)
-    from . import agent_accounts
-    agent_accounts.check(board, agent, project)     # the hub's opt-in list, first: its reason beats placement's
-    node = _place(board, project, agent, runtime, allowed)
+    from . import account_pools, agent_accounts
+    maybe = account_pools.maybe_pool(board, agent)  # perhaps a pool's name (account_pools.py): decided in the write
+    if not maybe:
+        agent, runtime = _agent(board, agent)
+        agent_accounts.check(board, agent, project)     # the hub's opt-in list, first: its reason beats placement's
+        node = _place(board, project, agent, runtime, allowed)
     with db.write_tx(board.conn) as c:
         now = board.now()       # read under the write lock
+        choice = None
+        if maybe:
+            # Recognised and decided here, on ONE reading of the settings taken in this write. A pool: its member,
+            # with each member's own checks (`_root_problem`: what a start naming it makes). Not one (any more): the
+            # name as an agent's, with the checks above, here.
+            from . import hosted_tree
+            spawn = hosted_tree.spawn_config(board)
+            pool = account_pools.pool_for(board, agent, spawn)
+            if pool is None:
+                agent, runtime = _agent(board, agent)
+                agent_accounts.check(board, agent, project)
+                node = _place(board, project, agent, runtime, allowed)
+            else:
+                choice = account_pools.choose(board, c, pool, project,
+                                              lambda a, rt: _root_problem(board, project, a, rt, allowed), spawn)
+                agent, runtime, node = choice.agent, choice.runtime, choice.node
         agent_accounts.check(board, agent, project)     # ... and in the write that makes the session
         _prune(c, now)
         for other in _sessions(c):
             if (other.get("agent") == agent and other.get("project") == project and other.get("state") != "ended"
                     and not other.get("parent")):       # one ROOT per (agent, project): children do not count
+                # A pool's choice is not moved on from here: the chosen member's existing root refuses, and says so.
                 raise Conflict(f"{agent} already has a hosted session in {project}: {other['session_id']}. Send to "
-                               f"it (`board session send {other['session_id']} ...`) or close it first")
+                               f"it (`board session send {other['session_id']} ...`) or close it first"
+                               + (f" ({agent} was the member chosen from pool {choice.pool}: {choice.why})"
+                                  if choice is not None else ""))
         r = {"session_id": str(uuid.uuid4()), "agent": agent, "runtime": runtime, "project": project, "node": node,
              "model": model, "state": "idle", "pid": None, "resume": False, "turns": 0, "queued": 0,
              "in_flight": None, "next_n": 1, "last_result": None, "reply": None, "reply_for": None, "denials": [],
              "stop": None, "error": None, "created_by": p.name, "created_at": now, "updated_at": now,
              "node_reported_at": None, "ended_at": None}
+        if choice is not None:
+            r["pool"] = choice.record()     # how the agent was chosen: for the human (show) and the record
         from . import hosted_tree
         if hosted_tree.spawn_config(board).enabled:
             # A root that may get children. Its access is its node's to say (derived from the runner there).

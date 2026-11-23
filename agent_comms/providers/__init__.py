@@ -37,13 +37,79 @@ from typing import Any, Callable, Protocol
 # Ends the HOST makes are never answered either: a handshake that fails (`start_failed`, a process that exits
 # before it is ready), a process that exits before any event of the turn, a timeout the host ends by stopping the
 # process, a write that fails, a turn withdrawn while being written (session_host._fail / _fail_start).
-KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed")
+# `usage`: what the provider said about its plan's usage limits (`usage`: a list of observations, one per window it
+# named, each `clean_usage`'s shape), from its own stream: Claude's `rate_limit_event`, Codex's
+# `account/rateLimits/updated`, or a turn that failed on the limit. The host keeps each window's latest per runner,
+# with its own time, for the hub's account pools (account_pools.py); it is advisory and never ends or changes a turn.
+KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed", "usage")
 # What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"). No
 # adapter steers yet (R6): `steers` is False on both, for a later change to implement.
 MODES = ("steer", "restart")
 TURN_KINDS = ("user", "wake", "child", "task")   # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
 REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
+
+
+_WINDOW_RE = re.compile(r"[a-z0-9_]{1,40}")
+
+
+USAGE_MAX_AGE = 86400          # an observation older than a day is not reported, nor kept at the hub
+USAGE_WINDOWS_MAX = 16         # observations (windows) per runner, in a report and at the hub
+
+
+def number(x: Any) -> float | None:
+    """A finite JSON number as a float, else None (a bool is not a number here). Never raises: an integer too large
+    for a float, NaN and the infinities are None too."""
+    import math
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        f = float(x)
+    except (OverflowError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+FAILED_TURN = "failed_turn"    # the window key of a mark a turn that failed on the limit leaves (DESIGN_NOTES table)
+
+
+def clean_usage(obs: Any, *, age: bool = False) -> dict[str, Any] | None:
+    """THE one sanitiser of a usage observation (account_pools.py, rule (b); DESIGN_NOTES "Account pools", the usage
+    record's rules), wherever one is read: from a provider's stream, in the host, in the node's report, in the hub's
+    hello and in the hub's own record. Returns {window (its identity: a short word), label (how it is shown, or None),
+    percent (0 to 1000, to 0.1, or None: an explicit null, the intentional clear), resets_at (epoch seconds, or None),
+    exhausted (bool)}, with `age` (seconds, 0 to USAGE_MAX_AGE) when asked for; or None, the observation dropped, when
+    it cannot be one: no valid window, a percent that is omitted or not a number from 0 to 1000 (no information:
+    never a clear), an exhausted that is not a bool, or (with `age`) no valid age. A malformed reset time or label is
+    only left out. It cannot raise."""
+    try:
+        if not isinstance(obs, dict):
+            return None
+        window, raw, exhausted = obs.get("window"), obs.get("percent"), obs.get("exhausted", False)
+        if not isinstance(window, str) or not _WINDOW_RE.fullmatch(window) or not isinstance(exhausted, bool):
+            return None
+        pct = number(raw)
+        if "percent" not in obs or (raw is not None and (pct is None or not 0 <= pct <= 1000)):
+            return None         # omitted or malformed: no information, replacing nothing (null is the clear)
+        at, label = number(obs.get("resets_at")), obs.get("label")
+        out = {"window": window, "label": label if isinstance(label, str) and _WINDOW_RE.fullmatch(label) else None,
+               "percent": round(pct, 1) if pct is not None else None,
+               "resets_at": at if at is not None and 0 < at < 1e11 else None, "exhausted": exhausted}
+        if age:
+            seconds = number(obs.get("age"))
+            if seconds is None or not 0 <= seconds <= USAGE_MAX_AGE:
+                return None
+            out["age"] = round(seconds, 1)
+        return out
+    except Exception:
+        return None
+
+
+def usage_record(window: Any, percent: Any = None, resets_at: Any = None, exhausted: bool = False,
+                 label: Any = None) -> dict[str, Any] | None:
+    """An adapter's observation of one window, through `clean_usage` (None: dropped). It cannot raise."""
+    return clean_usage({"window": window, "label": label, "percent": percent, "resets_at": resets_at,
+                        "exhausted": exhausted})
 
 
 def cap_reply(text: Any) -> str:
@@ -69,6 +135,7 @@ class Event:
     mode: str | None = field(default=None, compare=False)
     tools: tuple[str, ...] = field(default=(), compare=False)
     answered: bool = field(default=False, compare=False)     # turn_ended: the provider took the turn (above)
+    usage: list[dict[str, Any]] | None = field(default=None, compare=False)     # `usage` only (above)
 
     def __post_init__(self):
         if self.kind not in KINDS:

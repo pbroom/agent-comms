@@ -60,9 +60,10 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
 
     @mcp.tool(description=(
         "What you may start as child sessions right now: the targets (agents, the node each runs on, models, effort "
-        "words, access words), the limits and what is left of the budget (counted for your agent in this project), "
-        "and whether you may start any at all (why_not says why not: child sessions off, no grant from the human, the "
-        "depth limit, your allowance, a limit). Call it before board_session_spawn. Read-only; works without a grant."
+        "words, access words; and pools of accounts, if the hub has any), the limits and what is left of the budget "
+        "(counted for your agent in this project), and whether you may start any at all (why_not says why not: child "
+        "sessions off, no grant from the human, the depth limit, your allowance, a limit). Call it before "
+        "board_session_spawn. Read-only; works without a grant."
         + PROJECT + warning))
     def board_session_capabilities(project: str | None = None, ctx: Context = None) -> dict:
         return run(lambda: hosted_spawn.capabilities(board, principal(ctx), ident(ctx), project))
@@ -72,9 +73,9 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
         "task for you, on the board's node, in your project's checkout (isolation=shared, the default) or in a git "
         "worktree of its own (isolation=worktree). Delegate self-contained work this way (a review, a search, an "
         "independent subtask) so it runs beside you. task: what to do, as you would brief a colleague (it is all the "
-        "child knows). child_agent: which agent (default: your own); model and effort: as capabilities lists them. "
-        "access defaults to the most you may give that the child's node offers (never above your own or the human's "
-        "grant). wait=true waits up to 45 seconds for the child's first reply and returns it here (then it does not "
+        "child knows). child_agent: which agent, or a pool capabilities lists (default: your own); model and effort: "
+        "as capabilities lists them. access defaults to the most you may give that the child's node offers (never "
+        "above your own or the human's grant). wait=true waits up to 45 seconds for the child's first reply and returns it here (then it does not "
         "also come as a turn); otherwise, or if it is not done in time, you get a handle and the reply comes later: as "
         "a turn of yours (a hosted session), or from board_session_status (wait_seconds) for any session. request_id "
         "makes a retry return the same child. Needs a spawn grant from the human; board_session_capabilities says what "

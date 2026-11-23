@@ -96,6 +96,7 @@ class Node:
         from .node_groups import Groups
         self.groups = self.sessions.host.groups if self.sessions is not None else Groups()
         self.running: dict[str, _Local] = {}
+        self.report_usage = False       # the hub's last hello answer asked for usage (account_pools.py)
         self.last_hello = float("-inf")
         self.last_contact = clock()
         self.unreported: list[str] = []   # runs recover() ended locally, to report once the hub answers
@@ -234,19 +235,32 @@ class Node:
             dirs = {k: runner_dir(self.config.runners[k]) for k in body["session_host"]["runners"]}
             if any(dirs.values()):      # only then: the key is newer than the rest
                 body["session_host"]["dirs"] = {k: d for k, d in dirs.items() if d}
-        try:
-            out = self._call("POST", "/api/nodes/hello", json=body)
-        except httpx.HTTPStatusError as e:
-            if "homes" not in body or e.response.status_code != 422:
-                raise
-            # A hub from before account folders refuses the field. The folders are for the human's view only (the
-            # node sets them itself), so the hello goes again without them, and the hub is said to be older.
-            if not getattr(self, "_homes_refused", False):
+        usage = self.sessions.usage_report() if self.sessions is not None and self.report_usage else {}
+        if usage:       # only for a hub whose last answer asked (`report_usage`: it has account pools)
+            body["usage"] = usage
+        optional = [k for k in ("usage", "homes") if k in body]     # newest first: what an older hub refuses
+        while True:
+            try:
+                out = self._call("POST", "/api/nodes/hello", json=body)
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 422 or not optional:
+                    raise
+                field = optional.pop(0)
+                body.pop(field)
+            if field == "usage":
+                # A hub that asked for usage and refuses it now was rolled back: the hello goes again without it, and
+                # none is sent until a hub asks again. Usage only orders a pool's members there.
+                log.info("the hub refused this node's usage report: it no longer takes one; not sending it")
+            elif not getattr(self, "_homes_refused", False):
+                # A hub from before account folders refuses the field. The folders are for the human's view only (the
+                # node sets them itself), so the hello goes again without them, and the hub is said to be older.
                 log.warning("the hub refused this node's account folders ([dispatch.runner_homes]): it runs an "
                             "older version of agent-comms. The runs still use them; only the hub's view lacks them")
                 self._homes_refused = True
-            body.pop("homes")
-            out = self._call("POST", "/api/nodes/hello", json=body)
+        # Account pools (account_pools.py): the hub asks for the usage this node's sessions see, only while it has
+        # pools; an older hub never does. Read from each answer, so a hub that stops asking gets none.
+        self.report_usage = isinstance(out, dict) and out.get("report_usage") is True
         self.last_hello = self.clock()
         return out
 

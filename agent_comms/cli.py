@@ -279,7 +279,8 @@ def main(argv: list[str] | None = None) -> None:
         x.add_argument("project", help="the project's path as the board knows it (a relative path is made "
                                        "absolute). Not with --parent: a child runs in its parent's project")
     x.add_argument("message", help="the first message; - reads it from stdin")
-    x.add_argument("--agent", metavar="NAME", help="default: the one agent with a Claude runtime, if there is only "
+    x.add_argument("--agent", metavar="NAME", help="an agent, or an account pool of the hub's (it picks the member); "
+                                                   "default: the one agent with a Claude runtime, if there is only "
                                                    "one; with --parent, the parent's agent")
     x.add_argument("--model", metavar="M", help="model for the session, e.g. haiku (default: the runner's own)")
     def parent_id(value: str) -> str:
@@ -923,6 +924,12 @@ def _fmt_hosted_tree(sessions: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_pool(pool: dict) -> str:
+    """How a session's agent was chosen from an account pool (account_pools.py)."""
+    return (f"asked for as pool {pool.get('name')}; the hub chose {pool.get('why')} (usage is what nodes reported, "
+            "advisory; the board cannot verify which subscription a process used)")
+
+
 def _fmt_hosted_detail(s: dict) -> str:
     from .core import iso
 
@@ -944,6 +951,8 @@ def _fmt_hosted_detail(s: dict) -> str:
                     if s["state"] == "ended" else "")))
     elif "access" in s:
         lines.append(f"  access {_fmt_access(s)}")
+    if s.get("pool"):
+        lines.append("  " + _fmt_pool(s["pool"]))
     if s.get("children"):
         lines.append("  children:")
         lines += ["    " + _fmt_child(k) for k in s["children"]]
@@ -1083,6 +1092,8 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
                    f"already started for this request id (message {m['n']}: {m['state']}); nothing new was sent"))
     else:
         info = f"session {_fmt_hosted(s)}; message {m['n']} queued"
+    if s.get("pool") and a.session_cmd == "start":
+        info += "\n" + _fmt_pool(s["pool"])
     if not s["node_live"]:
         info += f"\nnote: node {s['node']} is not connected; the message waits until it is"
     if not a.wait:

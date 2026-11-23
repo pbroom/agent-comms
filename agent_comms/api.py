@@ -57,6 +57,7 @@ class NodeHelloIn(Body):
     sessions: dict[str, StrictInt] | None = None    # {"max_live": n}: the node hosts sessions (hosted.py)
     session_host: dict[str, Any] | None = None      # {"tree": 1, "runners": {key: [words]}[, "dirs": {key: dir}]}
     homes: dict[str, str] | None = None             # runner key -> its account folder (agent_accounts.py), path only
+    usage: Any = None   # runner key -> plan usage seen (account_pools.py): advisory, any shape; what is unusable is dropped
 
 
 class NodeReportIn(Body):
@@ -892,7 +893,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         from . import nodes
         return nodes.hello(board, p, body.projects, body.runners, body.max_concurrent,
                            body.headless_browser, body.checkout_roots, body.access, body.sessions,
-                           session_host=body.session_host, homes=body.homes)
+                           session_host=body.session_host, homes=body.homes, usage=body.usage)
 
     @app.get("/api/nodes/assignments")
     def node_assignments(p: Principal = P):
