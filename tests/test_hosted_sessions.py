@@ -461,7 +461,7 @@ def test_reports_are_idempotent_and_a_message_only_moves_forward(senv):
 def test_a_report_the_hub_cannot_read_is_refused_whole(senv):
     sid = start(senv)["session_id"]
     post = lambda **body: senv.laptop.post(f"/api/nodes/sessions/{sid}", json=body).status_code
-    assert post(events=[{"kind": "restarted"}]) == 422
+    assert post(events=[{"kind": "rewound"}]) == 422
     assert post(events=[{"kind": "delivered", "message": 0}]) == 400
     assert post(events=[{"kind": "turn_ended", "message": 1, "ok": True, "denials": ["Bash(rm -rf /)"]}]) == 400
     assert post(events=[{"kind": "turn_ended", "message": 1, "ok": True, "text": "x" * (hosted.REPLY_LIMIT + 1)}]) == 400

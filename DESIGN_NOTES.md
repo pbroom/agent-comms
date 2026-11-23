@@ -6932,3 +6932,204 @@ generated browser output directory, both true.
   is removed, the state file records it, and a retry starts past an unrecorded leftover.
 - Mutation check after round 7: 97 of 98 applied mutants caught (97 single mutations and the reservation-order one;
   the sweep's retired with it); the one not caught is round 6's equivalent guard.
+
+## Restarting a running turn; mid-turn steering deferred (2026-11-22)
+
+**Why.** Parity with T3 Code Orchestrator V2's send modes (`t3_thread_send`: auto, queue, steer, restart). Until now
+a hosted session only queued: a message to a busy session became its next turn, and the only way to change what a
+turn was doing was to cancel it (a parent) or close the session. `board session send --mode` (the human, and `POST
+/api/hosted-sessions/{id}/messages` with `mode`) and `board_session_send(mode=...)` (a parent agent) now take
+`queue` (the default: nothing changes for an existing caller, byte for byte: the same records, listing items,
+answers and turn lines), `restart` and `auto`; `steer` is refused for now (R6, below).
+
+**What was measured, Claude Code 2.1.330** (`claude -p --input-format stream-json --output-format stream-json
+--verbose`, haiku, `--setting-sources=`, `--strict-mcp-config`, `--no-session-persistence`, a private cwd; a probe
+writing lines on cues and timing every stdout line):
+- A user line written to stdin while a turn runs is QUEUED by the process, never dropped and never a second process
+  of anything. A line that carries a `uuid` gets `command_lifecycle` lines (`command_uuid`, `state`: queued at once,
+  started, completed, or cancelled); a line without one gets none. No `--replay-user-messages` needed.
+- The model reads a queued line at the turn's next TOOL BOUNDARY: in a turn running `sleep 12` the line written one
+  second into the command was `started` right after the tool result, before the turn's `result`; the turn went on
+  with it and its ONE `result` (`num_turns` 2) said PINEAPPLE as the line asked. Two lines written back to back were
+  taken at the same boundary, in order (one result, PINEAPPLE MANGO). In a turn that only writes text (no tool) a
+  line written mid-turn was NOT read in it: after the turn's `result` came a new `init` and a second `result` for
+  that line alone (`started` after the first result): it ran as the process's next turn.
+- `control_request` `interrupt` ends the turn in flight at once: a `control_response` (`still_queued`: the uuids of
+  the lines queued then), then the turn's `result` with `subtype: error_during_execution`, `is_error: true`,
+  `terminal_reason: aborted_tools` (the tool call is answered "The user doesn't want to proceed..."), and the
+  process stays. A line written right behind the interrupt (same write, or a moment later) runs as the next turn,
+  with its own `init` and `result`. A line queued BEFORE the interrupt is not lost either: it is in `still_queued`,
+  the interrupted turn's own line is `cancelled`, and the queued one runs next as its own turn.
+- Seen in the real e2e run: Claude Code refuses a standalone `sleep` of 25 s in a Bash call ("Blocked: standalone
+  sleep 25. To wait for a condition, use Monitor..."), while `sleep 12` runs; the scenario uses 12.
+- Every `init` names the process's `capabilities` and `claude_code_version` (2.1.330 lists, among others,
+  `msg_lifecycle_v1`, `interrupt_receipt_v1`, `interrupt_cancel_queued_v1`, `interrupt_requeue_taken_v1`). The
+  lifecycle lines above are what `msg_lifecycle_v1` names. (Kept as the record for a later steering change: R6,
+  below. A restart is offered only with `interrupt_receipt_v1`.)
+(The brief named the in-band interrupt as already used by providers/claude.py: it was not; the adapter's `interrupt`
+returns None and a timed-out Claude turn is still ended by stopping the process. Only restart uses it.)
+
+**What was measured, codex-cli 0.171.0** (`codex app-server` as scripts/session-host-e2e.py runs real Codex: the
+user's Codex home and login, plugins and apps off, every configured MCP server disabled by `-c` for the probe's
+processes only, no `cwd` on `thread/start`, read-only sandbox, approvals never, gpt-6-luna at low effort; the
+config.toml's mtime and SHA-256 compared after each probe, unchanged; protocol from `codex app-server generate-ts`):
+- (For a later steering change, R6.) `turn/steer {threadId, expectedTurnId, input, clientUserMessageId?}` answers `{turnId}` at once and adds a
+  `userMessage` item to the turn in flight (item/started and item/completed with the text); the model reads it at
+  its next request (after the command it is running) and the turn's one `turn/completed` covers it (PINEAPPLE). Two
+  back to back: both answered, both items in order, one final answer covering both.
+- Refused with -32600: "no active turn to steer" right after the turn completed, "expected active turn id `X` but
+  found `Y`" for another id, "expectedTurnId must not be empty". So a steer can never land in a later turn.
+- `turn/start` while a turn is active is answered with the SAME active turn's id and its text is taken into it (as
+  the adapter already said in `holds_turns`): a steer without the id precondition, which this code never uses.
+- `turn/interrupt` then `turn/start` in ONE write: `{}`, `thread/status/changed` idle, the old turn's
+  `turn/completed` with status `interrupted` (no items), then the answer to `turn/start` with a NEW turn id and that
+  turn as usual (KIWI). (The restart as built writes the `turn/start` only after the old turn's end: R2, below.)
+
+
+**The seam** (providers/__init__.py). An adapter says what its process can do with a turn in flight, `restarts`
+(and `steers`, False on both adapters for now: the flag a later change implements), and nothing else guesses it:
+the node reports each session's `modes` with every status (they change: a Claude process says what it can in its
+`init`; a session without a live process has none) and the hub reads only that. `interrupt_turn()` is a restart's
+first step, the in-band interrupt alone (Claude: the `interrupt` control request, offered only with
+`interrupt_receipt_v1` in the process's `init`; Codex: `turn/interrupt` with the turn's id), and
+`interrupted(event)` says whether a turn's end was that interrupt's doing: Claude, only after the process answered
+THAT request (its request id) with `success`, and the result is an error whose terminal reason starts `aborted`
+(R3-03: an error receipt interrupted nothing, and a later abort is the turn's own); Codex, only after it answered
+THAT `turn/interrupt` request with success, and the turn it named ended with status `interrupted` (R5-01: Codex
+ends a turn `interrupted` for causes of its own; a rejected or unanswered request interrupted nothing).
+
+**R6: mid-turn steering is deferred** (owner ruling after review round 3). Three review rounds each found more
+defects of one shape: a steer is a second message living inside another message's turn, so its acknowledgement
+can arrive after the turn's result, across a node silence or a hub downgrade, its text can be exposed out of order,
+and a refusal can be re-decided by the next fetch. With R5 it served only Codex sessions. So this change ships
+`queue`, `restart` and `auto`; `--mode`/`mode` keeps all four names, so the interface matches T3's.
+
+| mode | Claude Code | Codex |
+| --- | --- | --- |
+| queue | yes (unchanged) | yes (unchanged) |
+| steer | not yet: refused, "mid-turn steering is not available yet; use restart to redirect a running turn, or queue" | not yet: the same |
+| restart | yes: interrupts the turn in flight and runs your message next; refused while other messages are queued for the session (`interrupt`, with `interrupt_receipt_v1`; its success receipt; the old turn's `aborted_tools` result) | yes: the same (`turn/interrupt`; `turn/completed` `interrupted`) |
+| auto | starts the session at once when it is idle, else queues behind the turn in flight; never restarts; the answer's `why` says which | the same |
+
+**The rules** (owner rulings after the review rounds):
+- R7. A restart never runs out of order. It is accepted only when nothing is queued for the session behind the turn
+  in flight ("N message(s) are already queued for this session; a restart would have to jump them: cancel them or
+  send with queue"), so its message is always simply the session's NEXT message, and a second restart while one waits
+  is refused the same way. A restart is then two ordinary things: the turn in flight is interrupted in-band and keeps
+  its process, and the message is the next ordinary queued message, written by the ordinary path once the old turn
+  has ended, under the ordinary watermark, listing and checkout rules that any queued message behind a running turn
+  has.
+- R2. The old turn is labelled "interrupted by a restart: message N replaced it", with `restarted_by` (and the
+  restart's `replaced`), only when the interrupt was WHOLLY written before its end (`restart_written`), the provider
+  did not refuse it, and the provider said the interrupt ended it; one that finished by itself first (or whose
+  interrupt was refused) keeps its real outcome and the message simply runs next, with no link: that is what its
+  sender sees. Cancelling the old task stops its process; the message runs next on the next process. Cancelling
+  the restart's message withdraws the interrupt if it is not written yet (once written, the turn ends as it ends,
+  and keeps its own outcome).
+- R3. A restart by the PARENT keeps its `interrupted` result (state `kept`, decided before any limit of automatic
+  delivery: in the lineage, and a call of the parent's waiting for that turn takes it), but does not deliver it as
+  another parent turn. A restart by the human does: the parent learns its task was interrupted. A turn whose
+  interrupt was refused is no restart's, so the parent hears of it as of any turn.
+- R6. Above.
+
+**The node and the host.** The node reads a queued restart in its listing (`mode`, `into`) and asks the host to
+interrupt that turn (`SessionHost.interrupt_for`), the way it already passes a parent's cancel to the host
+(`board_session_cancel` sets the message's `cancel`; the node calls `host.cancel` for its id). The two cannot share
+more than that shape: a cancel stops the process, for every provider, and ends the turn as cancelled; a restart
+writes the provider's in-band interrupt, keeps the process, and is offered only where the provider has one. The
+message itself goes on as ordinary queued work. The host writes the interrupt only while the turn it names is its
+turn in flight and the provider can (Claude: once this process's `init` said `interrupt_receipt_v1`; Codex: once it
+named the turn); otherwise it interrupts nothing and the turn ends by itself.
+
+**The state machine** (one session's host; session_host.py follows it, tests/test_session_restart.py `CELLS` drives
+every cell with one table-driven test). States: **T** a turn in flight; **H** an interrupt asked for M, not written
+(Codex has not named T yet); **R** the interrupt written (whole, or for "R(unwritten)" not one byte of it reached
+the process yet). M itself is never the host's until the node hands it over as the next ordinary message.
+
+| cell (state x event) | what happens |
+| --- | --- |
+| T x result | T ends |
+| H x result | the interrupt is never written; T keeps its outcome, no link |
+| H x cancel M | the interrupt is no longer asked for; the process is untouched |
+| R(unwritten) x result | the interrupt's bytes are taken out, never written; T keeps its outcome, no link |
+| R x result (interrupted) | T failed "interrupted by a restart", `restarted_by` M |
+| R x result (interrupt refused) | T keeps its own outcome, no link (Claude: an error receipt; Codex: an error answer, also when the turn then ends `interrupted` by itself) |
+| R x result (finished first) | T keeps its outcome, no link |
+| R x result (failed otherwise) | T keeps its own failure, no link |
+| R x process exit | T failed, no link |
+| R x cancel T | T stopped, no link |
+| R x cancel M | the link is dropped; T keeps its real outcome |
+
+Host cells: 11. Then, at the hub and the node (tests/test_session_restart_hub.py), nothing beyond main's ordinary
+queued-message behaviour:
+- AC-09 has no code path of its own: a parent's restart message is listed, reserved (`_reserve_tasks`) and held
+  (`held: checkout`) exactly as any queued task behind a running turn; a dispatched run wanting the checkout meets it
+  as it would meet that task. (Tested side by side with an ordinary follow-up.)
+- R4-01 has no code path of its own: the message is never handed out of order, so the host's state file names only
+  the ordinary turn in flight. A node rolled back to protocol 3 with a restart pending is never listed the mode; it
+  takes the message as ordinary queued work and runs it once after the old turn (reported lost if its process went
+  with the old node, as any turn in flight); nothing else is reported lost. The older node never sees the interrupt
+  request: the old turn ends by itself and the message runs after it.
+- A node restarted with a restart pending: the same. A fetch between the old turn's end and the message's write: the
+  same as for any next message (R3-01). Node silence (AC-08): the hub settles the old turn as lost; the message stays
+  queued and runs once when the node is back.
+- Reports (AC-05): per session in order, up to the first event the hub may not take yet; a 422 from a hub that had
+  named what it takes forgets that, keeps every event and sends them again (with only the original fields) once; a
+  second refusal drops the report loudly, as before. To a hub that says it takes no restarts (downgraded with a
+  restart pending, R3-02 and R4-02) the interrupted turn's end goes without `restarted_by`: that hub records it
+  failed with the detail that says it was interrupted, and the message as an ordinary turn of its own; and a parent's
+  own restart then reaches the parent as an ordinary result turn, not `kept` (documented degradation: that hub cannot
+  know who restarted it).
+- Receipts (AC-10): a retry is looked up before any refusal or budget check; every receipt is kept for its whole
+  seven days (none is evicted inside the window, whatever their number), and a message row with the request id
+  answers a retry whatever became of its receipt.
+
+**The hub** (hosted.py `restart_target`, `send_mode`, decided in the transaction that enqueues the message). A
+restart needs: the node's latest hello at session protocol 4 (`hosted_tree.RESTART_PROTOCOL`: the node must know to
+interrupt); a turn in flight (`in_flight`, delivered); `restart` in the session's reported `modes`; that turn being a
+turn of the human's (`user`) or of the session's parent (`task`): a `wake` and a `child` (result-delivery) turn are
+finished untouched, since their text is the hub's and what they settle is what the hub waits for; a parent may
+restart only its OWN task turn, never a turn the human started in its child; the turn not being cancelled; nothing
+queued (R7). The message is a record like any other with `mode` and `into`; the human's text goes as it is, a
+parent's in the ordinary follow-up frame (TASK_HEADER). Nothing in it changes the session's access, allowance or
+budget: the same checks as a follow-up (the caller, the grant, `ABOVE_NOW`, the limits).
+
+**Accounting.** Every message a parent sends is one child turn of `max_turns_without_human`, restarted or queued
+(charged in the transaction that enqueues it); the human's sends reset the count as before. Wakes are untouched: a
+wake turn is never restarted. Request ids (both entry points): a receipt per (request id, sender) on the session
+record (`receipts`, kept RECEIPT_SECONDS = 7 days, past the message's own pruning after a day); a retry by the same
+sender returns that message (`created: false`; `state: settled` once its record is gone, and `--wait` then says its
+reply is no longer kept), nothing enqueued or charged again.
+
+**The protocol gate.** `tree` 4 on every fetch and hello (node_sessions.SESSION_PROTOCOL): the hub lists a
+message's `mode` and `into` only to such a fetch. The hub names the feature `restart` in its listing; only then
+does a node send `modes`, and `restarted_by` on a `turn_ended`. To an older node `restart` is refused ("its node ...
+speaks session protocol 3; restarting needs 4"); a pending one it inherits by a rollback is ordinary work for it.
+Hubs before nodes, as always.
+
+**What R7 removed, and what restart still has.** Removed, because only out-of-order delivery needed them: the
+node's journal (RESTARTS_FILE) and its watermark exceptions, the host holding the message and releasing it ahead of
+the inbox (`restart_msg`, `requeued`), the priority listing of the restart's text and its separate reservation and
+re-validation, `fence_restarts` and the `held: restart` listing for an older node, `unresolved` and its checkout
+hold, and the state-table rows for a held message. Kept: the provider seam (`restarts`, `interrupt_turn`,
+`interrupted` with Claude's receipt matching), the host's interrupt request (`interrupt_for`, write progress,
+`restarted_by` only on a confirmed interruption), `modes` and the protocol-4 gate, holding `restarted_by` until the
+hub says it takes it, the 422 retry, request receipts, and R2/R3 (`kept`).
+
+**Codex's cancel is fenced.** A cancel acts only on the host's own in-flight message id, and the host never writes
+the next turn before reading the previous turn's end; a restart's `turn/interrupt` carries the turn's id, and is
+written only while that turn is the one in flight. So neither reaches a later turn.
+
+**Left out, and follow-ups.**
+- Mid-turn steering (Codex `turn/steer`, measured above; Claude needs a turn precondition on the stdin line, or a
+  cancel-if-not-started in the CLI, so that a line that missed its turn never runs as a turn of its own). The
+  hazards the reviews found, for the next attempt to start from: the acknowledgement can arrive after the turn's
+  result (a fetch then must not report the turn lost, and the result's coverage must be known in the write that
+  makes it); a node silence can settle the target as lost before the acknowledgement arrives; a hub downgrade
+  mid-steer must not turn a covered completion into a second turn with an empty reply; a parent's text must not be
+  exposed before its checkout is reserved, nor after a node silence let dispatch claim it; a refusal must stay
+  decided across fetches. The adapters keep `steers = False` for it.
+- A per-turn interrupt for Claude timeouts (still a stop of the process: only restart uses the in-band interrupt).
+- Restarting a turn Codex runs by itself (`holds_turns`: no message's turn is in flight).
+- The dashboard stays read-only: it shows a message's mode and links (restart of N, it interrupted N, interrupted by
+  N), never a control.

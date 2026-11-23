@@ -140,6 +140,15 @@ def interactive(r: Any) -> bool:
 
 SPAWN_PROTOCOL = 2      # a node's `tree` version that knows bindings, interactive children and cancel
 HOLD_PROTOCOL = 3       # ... that also keeps a full-access child's parent up while results wait for that child
+RESTART_PROTOCOL = 4    # ... that also restarts a turn in flight (hosted.py, "Restarting a running turn")
+
+
+def node_protocol(conn, node: str) -> int:
+    """The session protocol (`tree`) the node's latest hello says it speaks; 0 for none."""
+    info = _get(conn, nodes.NODE_PREFIX + node)
+    hosting = info.get("session_host") if isinstance(info, dict) else None
+    tree = hosting.get("tree") if isinstance(hosting, dict) else None
+    return tree if type(tree) is int else 0
 
 
 def node_holds(conn, node: str) -> bool:

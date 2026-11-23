@@ -305,9 +305,15 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
     raw(x)
     x = ssub.add_parser("send", help="send a message: the next turn if the session is idle, queued behind the "
-                                     "turns ahead of it otherwise")
+                                     "turns ahead of it otherwise (--mode restart replaces the turn in flight)")
     x.add_argument("session_id")
     x.add_argument("message", help="the message; - reads it from stdin")
+    x.add_argument("--mode", choices=("auto", "queue", "steer", "restart"), default="queue",
+                   help="queue (default): its own turn, after those ahead of it; restart: interrupt the turn in "
+                        "flight and run this one next instead; auto: start at once if the session is idle, else "
+                        "queue (it never restarts); steer: not available yet (refused)")
+    x.add_argument("--request-id", metavar="X", help="idempotency: a retry with the same id returns the message the "
+                                                     "first call sent instead of sending another")
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
     raw(x)
     x = ssub.add_parser("show", help="one session: state, queue, last result and last reply")
@@ -953,7 +959,7 @@ def _fmt_hosted_detail(s: dict) -> str:
                                                               if m.get("kind") == "wake" else
                                                               " (results of its child sessions)"
                                                               if m.get("kind") == "child" else "")
-                     + (f" {m['detail']}" if m.get("detail") else ""))
+                     + _fmt_mode(m) + (f" {m['detail']}" if m.get("detail") else ""))
     if s.get("results") or s.get("results_dropped"):
         lines.append("  results from its children:")
         lines += ["    " + line for x in s.get("results", []) for line in _fmt_result(x)]
@@ -985,6 +991,19 @@ def _fmt_result(x: dict) -> list[str]:
         out.append(f"  not delivered: {x.get('why') or 'no reason given'}")
         out += ["  | " + line for line in (x.get("text") or "(no output)").splitlines()]
     return out
+
+
+def _fmt_mode(m: dict) -> str:
+    """What a message sent with a mode says of it, and every link it has (hosted.MODE_FIELDS: a restart that replaced
+    it, the turn it replaced); nothing for any other."""
+    parts = []
+    if m.get("mode") == "restart":
+        parts.append(f"restart of message {m.get('into')}")
+    if m.get("replaced") is not None:
+        parts.append(f"it interrupted message {m['replaced']}")
+    if m.get("restarted_by") is not None:
+        parts.append(f"interrupted: message {m['restarted_by']} replaced it")
+    return "".join(f" ({x})" for x in parts)
 
 
 def _session_cmd(a, out, settings: Settings, token: str) -> None:
@@ -1044,9 +1063,18 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
         body |= {k: v for k, v in (("agent", a.agent), ("model", a.model)) if v}
         r = _api(settings, token, "POST", "/api/hosted-sessions", body)
     else:
-        r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", {"message": text})
+        body = {"message": text} | ({"mode": a.mode} if a.mode != "queue" else {})
+        body |= {"request_id": a.request_id} if a.request_id else {}
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", body)
     s, m = r["session"], r["message"]
-    if s.get("parent"):
+    if a.session_cmd == "send" and (r.get("created") is False or m.get("mode") or r.get("why")):
+        who = f"child {_fmt_child(s)} of {s['parent']}" if s.get("parent") else f"session {_fmt_hosted(s)}"
+        info = who + "; " + (
+            f"already sent for this request id (message {m['n']}: {m['state']}); nothing new was sent"
+            if r.get("created") is False else
+            f"message {m['n']} interrupts the turn in flight (message {m['into']}) and runs next instead"
+            if m.get("mode") == "restart" else f"message {m['n']}: {r['why']}")
+    elif s.get("parent"):
         if m is None:       # --request-id found the child it made before, and its first message is no longer on record
             return out(r, f"child {_fmt_child(s)} of {s['parent']}: already started for this request id")
         info = (f"child {_fmt_child(s)} of {s['parent']}; "
@@ -1058,6 +1086,14 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
         info += f"\nnote: node {s['node']} is not connected; the message waits until it is"
     if not a.wait:
         return out(r, info)
+    if m.get("state") == "settled":
+        # A retry found only the receipt: its message settled long ago and its record is gone, and so is its reply.
+        note = f"message {m['n']} settled before this retry, and its reply is no longer kept on the hub"
+        if a.json:
+            print(json.dumps({"session": s, "message": m, "reply": None, "note": note}, indent=2))
+        else:
+            print(info + f"\nnote: {note}", file=sys.stderr)
+        return
     if not a.json:
         print(info, file=sys.stderr)
     path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{m['n']}?wait=25"

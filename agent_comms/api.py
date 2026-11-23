@@ -70,6 +70,7 @@ class NodeReportIn(Body):
 class HostedEventIn(Body):
     kind: Literal['delivered', 'turn_started', 'turn_ended', 'approval_requested', 'ended', 'worktree_removed']
     message: StrictInt | None = None
+    restarted_by: StrictInt | None = None   # turn_ended: the restart whose interrupt the provider said ended it
     ok: StrictBool | None = None
     delivered: StrictBool = True
     denials: list[str] = []
@@ -90,6 +91,7 @@ class NodeSessionReportIn(Body):
     worktree: str | None = None     # where a child session's own worktree is on the node
     ceiling: str | None = None      # a root: the most a child may have under it now (full only once confirmed)
     checkout: str | None = None     # a root: the directory it runs in on the node
+    modes: list[str] | None = None  # what the session's adapter can do with a turn in flight (restart)
 
 
 class HostedStartIn(Body):
@@ -114,6 +116,8 @@ class HostedChildIn(Body):
 
 class HostedMessageIn(Body):
     message: str
+    mode: Literal['auto', 'queue', 'steer', 'restart'] = 'queue'     # hosted.SEND_MODES
+    request_id: str | None = None   # a retry with the same id returns the first call's message
 
 
 class WaitIn(Body):
@@ -933,7 +937,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         out = hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
                             body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
                             access=body.access, worktree=body.worktree, ceiling=body.ceiling,
-                            checkout=body.checkout)
+                            checkout=body.checkout, modes=body.modes)
         hosted.note_contact(board, p)           # whatever path it took: a successful call of the session loop
         return out
 
@@ -993,7 +997,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/hosted-sessions/{session_id}/messages")
     def hosted_send(session_id: str, body: HostedMessageIn, p: Principal = P):
         from . import hosted
-        return hosted.send(board, p, session_id, body.message)
+        return hosted.send(board, p, session_id, body.message, mode=body.mode, request_id=body.request_id)
 
     @app.get("/api/hosted-sessions/{session_id}/messages/{n}")
     async def hosted_message(request: Request, session_id: str, n: int, wait: float = 0, p: Principal = P):

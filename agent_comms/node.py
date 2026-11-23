@@ -227,8 +227,10 @@ class Node:
             from .session_host import child_words, runner_dir
             words = {k: child_words(self.config, template) for k, template in sorted(self.config.runners.items())}
             # 2: spawn too; 3: it also keeps a full-access session's parent up while the hub says results wait for
-            # that session (node_sessions `results_waiting`), so a session may be started under a full-access child
-            body["session_host"] = {"tree": 3, "runners": {k: w for k, w in words.items() if w}}
+            # that session (node_sessions `results_waiting`), so a session may be started under a full-access child;
+            # 4: it restarts a turn in flight (node_sessions SESSION_PROTOCOL)
+            from .node_sessions import SESSION_PROTOCOL
+            body["session_host"] = {"tree": SESSION_PROTOCOL, "runners": {k: w for k, w in words.items() if w}}
             dirs = {k: runner_dir(self.config.runners[k]) for k in body["session_host"]["runners"]}
             if any(dirs.values()):      # only then: the key is newer than the rest
                 body["session_host"]["dirs"] = {k: d for k, d in dirs.items() if d}

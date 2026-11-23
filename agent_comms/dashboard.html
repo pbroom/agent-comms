@@ -3102,6 +3102,11 @@ function renderSessionDetail(n) {
   const d = sessionDetail && sessionDetail.session_id === n.session_id ? sessionDetail : null;
   const s = d || n, label = linLabel(n);
   const msgKinds = { user: "", wake: " (wake: a board post addressed to the agent)", child: " (results of its child sessions)", task: " (task from the session that started it)" };
+  // A message sent with a mode (hosted.MODE_FIELDS) says so, with every link it has; any other is shown as before.
+  const msgMode = m => [m.mode === "restart" ? `restart of message ${m.into}` : null,
+    m.replaced != null ? `it interrupted message ${m.replaced}` : null,
+    m.restarted_by != null ? `interrupted: message ${m.restarted_by} replaced it` : null]
+    .filter(Boolean).map(x => ` (${x})`).join("");
   const out = [el("div", { class: "card-header" }, el("h2", { class: "card-title" }, `Session details: ${label}`),
     el("p", { class: "card-description" }, n.kind === "interactive"
       ? "The project's interactive root for this agent: the board made it when an agent conversation you opened (Claude Code, Codex) first started a child session, and every such conversation of that agent in this project shares it. It runs on no node; its children's results wait for those conversations' calls to take them."
@@ -3137,7 +3142,7 @@ function renderSessionDetail(n) {
   if (n.result) out.push(resultLine(n.result));
   if (d && Array.isArray(d.messages) && d.messages.length) out.push(el("h3", {}, "Messages"),
     el("ul", { class: "lin-msgs small", role: "list" }, d.messages.map(m => el("li", {},
-      el("span", {}, `message ${m.n} [${m.state}]${msgKinds[m.kind] || ""}`), m.detail ? el("span", { class: "muted lin-clip", title: m.detail }, ` ${m.detail}`) : null))));
+      el("span", {}, `message ${m.n} [${m.state}]${msgKinds[m.kind] || ""}${msgMode(m)}`), m.detail ? el("span", { class: "muted lin-clip", title: m.detail }, ` ${m.detail}`) : null))));
   if (d && Array.isArray(d.results) && d.results.length) out.push(el("h3", {}, "Results from its children"),
     el("ul", { class: "lin-msgs small", role: "list" }, d.results.map(x => el("li", {},
       el("div", {}, `result ${x.n} · ${x.name || "child"} ${shortId(x.child)}${x.message ? ` message ${x.message}` : ""}: ${OUTCOMES[x.outcome] || x.outcome} · ${RESULT_STATES[x.state] || x.state}`),

@@ -26,7 +26,13 @@ What a turn does is in its text:
 - `write NAME`: the turn tries to create the file NAME in the thread's `cwd`. Under the `read-only` sandbox nothing
   is written and, as with Codex, no item says so; under `workspace-write` or `danger-full-access` the file is
   written. The reply says which: `WROTE NAME` or `WRITE REFUSED BY THE SANDBOX`.
+- `hold PATH ...`: the turn lasts until the file PATH exists (at most 120 seconds; it can be interrupted too).
+  With `refuse-interrupt` in the text its `turn/interrupt` is answered with an error and the turn goes on; with
+  `ignore-interrupt` it is answered `{}` and the turn goes on all the same; with `self-interrupt` the turn, once it
+  is over, ends `interrupted` by itself (Codex has causes of its own for that).
 The reply is otherwise `turn <k of this thread>: <TEXT IN CAPITALS>`: k goes on counting after a resume.
+A restart, as codex-cli 0.171.0 was measured to do it (DESIGN_NOTES "Restarting a running turn"): `turn/interrupt`
+ends the active turn `interrupted`; a `turn/start` right behind it starts a new turn.
 """
 import json
 import os
@@ -152,7 +158,10 @@ class Server:
         if method == "turn/interrupt":
             if self.active is None or params.get("turnId") != self.active["id"]:
                 return self.error(rid, "no active turn to interrupt")
-            self.active["interrupted"] = True
+            if "refuse-interrupt" in self.active["text"]:
+                return self.error(rid, "stand-in: the interrupt was refused")
+            if "ignore-interrupt" not in self.active["text"]:
+                self.active["interrupted"] = True
             return self.write({"id": rid, "result": {}})
         self.error(rid, f"Invalid request: unknown variant `{method}`")
 
@@ -193,7 +202,7 @@ class Server:
             thread["first"] = text
         self.save(tid)          # from its first turn on a thread can be resumed
         turn_id = str(uuid.uuid4())
-        self.active = {"thread": tid, "id": turn_id, "interrupted": False}
+        self.active = {"thread": tid, "id": turn_id, "interrupted": False, "text": text}
         self.write({"id": rid, "result": {"turn": self.turn_view(turn_id, "inProgress")}})
         self.notify("thread/status/changed", threadId=tid, status={"type": "active", "activeFlags": []})
         self.notify("turn/started", threadId=tid, turn=self.turn_view(turn_id, "inProgress"))
@@ -209,6 +218,9 @@ class Server:
         pause = re.match(r"sleep (\d+(?:\.\d+)?)\b", text)
         if pause:
             self.pump(float(pause.group(1)))
+        held = re.match(r"hold (/\S+)", text)
+        if held:
+            self.pump(120, until=lambda: os.path.exists(held.group(1)))
         if text.startswith("deny") and not self.active["interrupted"]:
             ask, item_id = self.asked, "exec-" + str(uuid.uuid4())
             self.asked += 1
@@ -231,7 +243,7 @@ class Server:
                 "status": "failed", "arguments": {"body": "STAND-IN-TOOL-ARGUMENT"}, "result": None,
                 "error": {"message": "MCP tool call requires approval, but approval policy is never"}})
 
-        if self.active["interrupted"]:
+        if self.active["interrupted"] or "self-interrupt" in text:
             done = self.turn_view(turn_id, "interrupted")
         elif text.startswith("fail"):
             error = {"message": "stand-in: the turn failed", "codexErrorInfo": "other", "additionalDetails": None}

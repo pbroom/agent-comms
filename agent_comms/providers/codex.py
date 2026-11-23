@@ -25,6 +25,13 @@ adapter relies on was observed on codex-cli 0.171.0 (DESIGN_NOTES "Session host:
   server). The adapter always starts threads with `never`, and still answers every such request with a refusal so
   the process never waits for a person: nothing is ever approved from here. Only the kind or tool name of what was
   refused leaves this module, never a command, a path or an argument.
+Restart (measured on codex-cli 0.171.0, DESIGN_NOTES "Restarting a running turn"):
+- `turn/interrupt` with the turn's id: `{}`, then the turn's `turn/completed` with status `interrupted`
+  (`interrupt_turn`, `interrupted`); a `turn/start` written after that starts a NEW turn as usual (a restart's
+  message). An `interrupted` end counts as the restart's only once Codex answered THAT `turn/interrupt` request with
+  success and the turn that ended is the one it named (R5-01): Codex ends a turn `interrupted` for other causes too,
+  and a rejected or unanswered request interrupted nothing. `turn/steer` was measured too (DESIGN_NOTES) but is not
+  used: no adapter steers yet (R6).
 """
 from __future__ import annotations
 
@@ -227,6 +234,8 @@ def _error_text(error) -> str:
 class CodexSession:
     waits_for_ready = True      # initialize and thread/start (or thread/resume) come before any turn
     reports_sandbox = True      # ... and their answer names the thread's sandbox: `ready` carries it (`mode`)
+    steers = False              # R6: `turn/steer` is not used yet (module text)
+    restarts = True             # turn/interrupt, whose turn then ends `interrupted`
 
     def __init__(self):
         self.session_id: str | None = None
@@ -246,6 +255,7 @@ class CodexSession:
         self._pending = {}
         self._ready = self._dead = False
         self._own_turn: str | None = None       # a turn Codex began in this thread that no message here started
+        self._by_interrupt = False              # the last turn that ended was ended by the restart's interrupt
         self._end_turn()
 
     def _end_turn(self) -> None:
@@ -257,6 +267,10 @@ class CodexSession:
         self._final: str | None = None          # the last final_answer of the turn
         self._plain: str | None = None          # the last message that is not commentary, for a model without phases
         self._denials: list[str] = []
+        # A restart's `turn/interrupt` for this turn: its request id, and whether Codex answered that request with
+        # success (`interrupted`).
+        self._restart_id: int | None = None
+        self._restart_ok = False
 
     # ------------------------------------------------------------ the seam
 
@@ -309,6 +323,19 @@ class CodexSession:
         if not self._turn_open or self._turn_id is None or self._dead:
             return None
         return [self._request("turn/interrupt", {"threadId": self.thread_id, "turnId": self._turn_id})]
+
+    def interrupt_turn(self) -> list[bytes] | None:
+        """A restart's first step: `turn/interrupt` for the turn in flight (as a timeout's), once Codex named it. Its
+        answer is kept (`interrupted`)."""
+        data = self.interrupt()
+        if data is not None:
+            self._restart_id, self._restart_ok = self._next_id, False
+        return data
+
+    def interrupted(self, ev: Event) -> bool:
+        """The restart's interrupt ended the turn: Codex answered that request with success, and the turn it named
+        ended with status `interrupted`."""
+        return self._by_interrupt and not ev.ok and ev.meta.get("status") == "interrupted"
 
     def session_exists(self, stderr: str) -> bool | None:
         """False once Codex refused to resume the thread this process was told to resume (or this machine had no
@@ -402,6 +429,9 @@ class CodexSession:
             kind = sandbox.get("type") if isinstance(sandbox, dict) else None
             return [Event("ready", provider_id=tid,
                           mode=kind if isinstance(kind, str) and NAME_RE.fullmatch(kind) else None)], []
+        if method == "turn/interrupt" and rid == self._restart_id:
+            self._restart_ok = not failed       # the restart's own request: only a success counts (`interrupted`)
+            return [], []
         if method == "turn/start" and self._turn_open and rid == self._start_id:
             # Only the answer to the request of the turn in flight (an earlier turn's request was retired when that
             # turn ended, so its late answer never names this one).
@@ -520,5 +550,8 @@ class CodexSession:
         # (Event.answered), whatever the status.
         event = Event("turn_ended", ok=ok, meta=meta, denials=tuple(self._denials), detail=detail,
                       text=cap_reply(text), answered=self._turn_id is not None)
+        # (The restart's request is this turn's: `turn/completed` is read only for the turn in flight, and
+        # `_end_turn` retires the request with the turn.)
+        self._by_interrupt = self._restart_ok
         self._end_turn()
         return event

@@ -38,6 +38,9 @@ from typing import Any, Callable, Protocol
 # before it is ready), a process that exits before any event of the turn, a timeout the host ends by stopping the
 # process, a write that fails, a turn withdrawn while being written (session_host._fail / _fail_start).
 KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed")
+# What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"). No
+# adapter steers yet (R6): `steers` is False on both, for a later change to implement.
+MODES = ("steer", "restart")
 TURN_KINDS = ("user", "wake", "child", "task")   # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
 REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
@@ -104,6 +107,26 @@ class ProviderSession(Protocol):
         starts it again (resuming) for the next message."""
         ...
 
+    # A turn in flight (optional; DESIGN_NOTES "Restarting a running turn"). `restarts`: this PROCESS can stop the
+    # turn in flight in-band, keeping the process, and its end then says whether it was interrupted (`interrupted`).
+    # Read anew whenever it is reported (Claude learns it from its process's `init`): an adapter without it, or with it
+    # False, is never asked, and the hub is told it cannot (`modes`). `steers`: putting a message into the turn in
+    # flight; False on every adapter for now (R6, the follow-ups in DESIGN_NOTES).
+    steers: bool
+    restarts: bool
+
+    def interrupt_turn(self) -> list[bytes] | None:
+        """The in-band interrupt of the turn in flight, for a restart (the process stays), or None when it cannot be
+        sent now. The turn then ends with its own `turn_ended`; `interrupted` says whether the interrupt ended it.
+        The restart's message is written afterwards, as an ordinary turn. Optional."""
+        ...
+
+    def interrupted(self, ev: "Event") -> bool:
+        """A `turn_ended` of this adapter says the provider ended the turn BECAUSE it was interrupted by
+        `interrupt_turn` (not on its own, not for another failure, and not after the provider refused that
+        interrupt). Optional."""
+        ...
+
     def session_exists(self, stderr: str) -> bool | None:
         """What a process that went without ever confirming the session said about it (on stderr, or to the adapter
         itself in its protocol): True, the session it was told to create already exists (the next process must resume
@@ -138,6 +161,12 @@ class ProviderSession(Protocol):
         only when there is something to say. Optional: a session that needs it is refused for an adapter without
         it."""
         ...
+
+
+def modes(provider) -> tuple[str, ...]:
+    """What this adapter can do with a turn in flight (MODES), as it says itself: never guessed."""
+    return tuple(m for m, attr in (("steer", "steers"), ("restart", "restarts"))
+                 if getattr(provider, attr, False) is True)
 
 
 # A model name is one argv element the hub chose. It may never read as an option or carry anything but a name.

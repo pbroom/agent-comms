@@ -29,6 +29,13 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   caller knows. The id never comes from the hub. It is dropped when the provider refuses to resume it.
 - A message waits while the provider runs something of its own in the session (`holds_turns`).
 - A provider with a handshake (`waits_for_ready`) gets `handshake_seconds` for it, not the turn timeout.
+- Restart (DESIGN_NOTES "Restarting a running turn"): the caller asks for the turn in flight to be interrupted in-band
+  for the message that replaces it (`interrupt_for`); that message itself is the caller's next ordinary message and
+  comes through `send` like any other, once the turn has ended. The interrupt is written only while the turn it names
+  is the one in flight here and the provider says it can (`providers.modes`); otherwise nothing happens and the turn
+  ends by itself. The turn's end says `restarted_by` (labelled INTERRUPTED) only when the interrupt was written
+  whole, the provider did not refuse it, and the provider says it ended the turn. Mid-turn steering is not offered
+  (R6): no adapter steers.
 """
 from __future__ import annotations
 
@@ -59,6 +66,7 @@ TURN_WITHDRAWN = ("the message was not delivered: before all of it was written t
                   "lost what it needs to take a turn (a child session's parent no longer vouches for it). The "
                   "process was stopped, so the part already written is never completed or acted on")
 MESSAGE_ID_MAX = 200
+INTERRUPTED = "interrupted by a restart: message {n} replaced it"
 
 
 def group_alive(pgid: int) -> bool:
@@ -84,7 +92,9 @@ class HostEvent:
       process. `denials`: the tools the provider refused in it, names only. `text`: the reply, capped
       (providers.cap_reply); for the human who sent the message only.
     - `approval_requested`: the provider is waiting for a tool to be allowed (`denials` names it).
-    - `ended`: the session is over (`detail`); `undelivered` lists the queued messages that were never written."""
+    - `ended`: the session is over (`detail`); `undelivered` lists the queued messages that were never written.
+    A `turn_ended` with `restarted_by`: the interrupt asked for that message (`interrupt_for`) ended the turn, as the
+    provider said."""
     session_id: str
     kind: str
     message_id: str | None = None
@@ -100,6 +110,7 @@ class HostEvent:
     # host gave up on it (the process went, a timeout with no answer, a write that failed), and whether the provider
     # ever read it is not known. Never read off `ok`.
     answered: bool = False
+    restarted_by: str | None = None     # turn_ended: the restart whose interrupt the provider said ended this turn
 
 
 @dataclass
@@ -165,6 +176,15 @@ class Session:
     proc_bind: str | None = None
     linger_logged: float = float("-inf")     # when a group that outlived its SIGKILL was last said in the log
     group_token: Any = None                  # its live process's entry in the node's registry (node_groups)
+    # Restart (the module text). `restart_by`: the message the caller asked to interrupt the turn `restart_into` for.
+    # `restart_mark`: where the interrupt's bytes sit in `outbuf` (start, length) until all of them reached the
+    # process (`restart_written`).
+    restart_by: str | None = None
+    restart_into: str | None = None
+    restart_sent: bool = False
+    restart_written: bool = False
+    restart_mark: Any = None
+    begun: bool = False         # the provider said the turn in flight began (`turn_started`)
 
     @property
     def unbound(self) -> bool:
@@ -721,6 +741,26 @@ class SessionHost:
         s.inbox.append(_Message(message_id, text, kind))
         return message_id
 
+    def interrupt_for(self, session_id: str, into: str, by: str) -> None:
+        """Interrupt the turn in flight `into` in-band, for message `by` (which the caller sends afterwards as its
+        next ordinary message): written on a pass while `into` is the turn in flight here and the provider can (the
+        module text). One at a time; asking again for the same message changes nothing."""
+        s = self._session(session_id)
+        for v in (into, by):
+            if not isinstance(v, str) or not 0 < len(v) <= MESSAGE_ID_MAX:
+                raise ValueError("message id must be a short string")
+        if s.ended or s.restart_by is not None:
+            return
+        s.restart_by, s.restart_into, s.restart_sent, s.restart_written = by, into, False, False
+
+    def modes(self, session_id: str) -> tuple[str, ...]:
+        """What this session's LIVE process can do with a turn in flight (providers.MODES), as its adapter says now
+        (Claude: what this process's `init` said). Nothing while it has no process, or one going down."""
+        s = self._session(session_id)
+        if s.child is None or s.stopping_since is not None or s.ended:
+            return ()
+        return providers.modes(s.provider)
+
     def state(self, session_id: str) -> str:
         return self._session(session_id).state
 
@@ -789,6 +829,7 @@ class SessionHost:
                 self._lingering(s, now)
                 return      # still going down: nothing new starts beside it
         if not s.ended:
+            self._restart_pass(s, now, out)
             self._write(s, now, out)
             if s.child is not None and s.stopping_since is not None:
                 self._reap(s, now, out)     # a write that failed stopped it
@@ -846,6 +887,7 @@ class SessionHost:
             if s.access == "full" and ev.mode == "bypassPermissions":
                 s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
             if s.in_flight is not None:
+                s.begun = True      # the provider began the turn in flight (its `init`: Claude's capabilities)
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
         elif ev.kind == "sealed":
             # The process's own word on whether bypass is switched off in it (asked when it started, for a session
@@ -866,10 +908,21 @@ class SessionHost:
             msg, s.in_flight, s.busy_since = s.in_flight, None, None
             timed_out, s.interrupted_at = s.interrupted_at is not None, None
             s.denials, s.waiting = ev.denials, bool(ev.denials)
-            out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=bool(ev.ok) and not timed_out,
-                                 denials=ev.denials, meta=dict(ev.meta),
-                                 detail=self._timeout_detail() if timed_out else ev.detail, text=ev.text,
-                                 answered=bool(ev.answered)))     # the adapter's word: the provider took the turn
+            ok = bool(ev.ok) and not timed_out
+            self._unwritten(s)      # an interrupt not one byte of which reached the process is never written
+            # Interrupted by the restart only when its interrupt was written whole and the provider says that ended
+            # the turn (an abort it did not refuse, `interrupted`): a turn that finished first, or failed for another
+            # reason, keeps its own outcome and the restart's message simply runs next.
+            check = getattr(s.provider, "interrupted", None)
+            by_restart = (s.restart_by is not None and s.restart_into == msg.id and s.restart_written
+                          and not timed_out and check is not None and bool(check(ev)))
+            detail = (self._timeout_detail() if timed_out else INTERRUPTED.format(n=s.restart_by) if by_restart
+                      else ev.detail)
+            out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=ok, denials=ev.denials, meta=dict(ev.meta),
+                                 detail=detail, text=ev.text,
+                                 answered=bool(ev.answered),     # the adapter's word: the provider took the turn
+                                 restarted_by=s.restart_by if by_restart else None))
+            self._forget_restart(s)     # the old turn has settled: the restart's message is the next ordinary one
             self._save_state()
         elif ev.kind == "approval_requested":
             s.denials, s.waiting = ev.denials, True
@@ -927,6 +980,7 @@ class SessionHost:
             s.transcript_fd = None
         if not stopped:
             self._went_by_itself(s, code, was_ready, was_checking, out)
+        self._forget_restart(s)     # nothing is left to interrupt
         s.held_since = None
         self._save_state()
 
@@ -1021,12 +1075,30 @@ class SessionHost:
         self._fail(s, self._timeout_detail(), out)
         self._stop(s, now)
 
+    def _unwritten(self, s: Session) -> None:
+        """At the end of the turn a restart's interrupt was for: if not one byte of it reached the process (a pipe that
+        took nothing, `restart_mark`), it is taken out of the buffer and never written, and the turn keeps its own
+        outcome."""
+        mark = s.restart_mark
+        if mark is None or mark[0] < 0:
+            return
+        start, length = mark
+        del s.outbuf[start:start + length]
+        s.restart_mark = None
+        s.restart_written = False
+
+    @staticmethod
+    def _forget_restart(s: Session) -> None:
+        s.restart_by = s.restart_into = s.restart_mark = None
+        s.restart_sent = s.restart_written = False
+
     def _fail(self, s: Session, detail: str, out: list[HostEvent]) -> None:
-        """Give up on the session's turn: failed, and never written again."""
+        """Give up on the session's turn: failed, and never written again (a restart asked for it: no link)."""
         msg, delivered = (s.in_flight, True) if s.in_flight is not None else (s.writing, False)
         s.in_flight = s.writing = s.busy_since = None
         if msg is not None:
             out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=False, delivered=delivered, detail=detail))
+        self._forget_restart(s)
 
     def _fail_start(self, s: Session, detail: str, out: list[HostEvent]) -> None:
         """A process did not get through its handshake (refused, timed out, exited, or would not take the bytes). The
@@ -1098,6 +1170,13 @@ class SessionHost:
         Anything else (the turn is over, or another one) is left alone."""
         s, out = self._session(session_id), []
         now = self.clock()
+        # A restart's message that is cancelled no longer asks for the interrupt: one not written yet never is, and the
+        # turn keeps its own outcome either way. (The message itself is the caller's, not here.)
+        if s.restart_by == message_id:
+            if not s.restart_written and s.restart_mark is not None:
+                self._unwritten(s)
+            self._forget_restart(s)
+            return out
         if (s.in_flight is not None and s.in_flight.id == message_id) or (
                 s.writing is not None and s.writing.id == message_id):
             if s.writing is not None:
@@ -1105,11 +1184,42 @@ class SessionHost:
             self._fail(s, detail, out)
             self._stop(s, now)
             return out
-        for m in list(s.inbox):
-            if m.id == message_id:
-                s.inbox.remove(m)
-                out.append(HostEvent(s.session_id, "turn_ended", m.id, ok=False, delivered=False, detail=detail))
+        for box in (s.inbox,):
+            for m in list(box):
+                if m.id == message_id:
+                    box.remove(m)
+                    out.append(HostEvent(s.session_id, "turn_ended", m.id, ok=False, delivered=False, detail=detail))
         return out
+
+    def _restart_pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """Write the interrupt asked for (`interrupt_for`; the module text): while its turn is the one in flight here,
+        once the provider can. A turn no longer in flight, or a CLI that cannot, interrupts nothing: the request goes,
+        and the turn ends by itself."""
+        if s.restart_by is None or s.restart_sent:
+            return
+        if s.writing is not None and s.writing.id == s.restart_into:
+            return      # its turn is still being written
+        if s.in_flight is None or s.in_flight.id != s.restart_into:
+            log.info("session %s: message %s is not in flight here: nothing to interrupt for message %s",
+                     s.session_id, s.restart_into, s.restart_by)
+            self._forget_restart(s)
+            return
+        write = getattr(s.provider, "interrupt_turn", None) if "restart" in providers.modes(s.provider) else None
+        if write is None:
+            if s.begun:     # what this process can do is known once it began the turn (Claude: its `init`)
+                log.info("session %s: its agent CLI cannot interrupt a turn in-band: message %s runs after it",
+                         s.session_id, s.restart_by)
+                self._forget_restart(s)
+            return
+        if s.child is None or s.stopping_since is not None:
+            return
+        data = write()
+        if data is None:
+            return      # the provider cannot take it yet (Codex before it named the turn)
+        start = len(s.outbuf)
+        for b in data:
+            s.outbuf += b
+        s.restart_sent, s.restart_mark = True, (start, len(s.outbuf) - start)
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
         try:
@@ -1241,8 +1351,14 @@ class SessionHost:
                 self._stop(s, now)
                 return
             del s.outbuf[:n]
+            if s.restart_mark is not None:
+                start, length = s.restart_mark
+                s.restart_mark = (start - n, length)    # where its bytes are now; below zero: some are written
+        if s.restart_mark is not None and s.restart_mark[0] + s.restart_mark[1] <= 0:
+            s.restart_written = True    # the whole interrupt is in the pipe: an abort from now on is its doing
+            s.restart_mark = None
         if not s.outbuf and s.writing is not None:
-            s.in_flight, s.writing = s.writing, None
+            s.in_flight, s.writing, s.begun = s.writing, None, False
             out.append(HostEvent(s.session_id, "delivered", s.in_flight.id))
 
     # ------------------------------------------------------------ stopping a process, keeping the session
@@ -1253,7 +1369,7 @@ class SessionHost:
         waiting, no process, or one already going down, or when its provider is running a turn of its own in it:
         nothing running is interrupted."""
         s = self._session(session_id)
-        if s.child is None or s.ended or s.busy or s.inbox or s.stopping_since is not None or self.holding(s):
+        if (s.child is None or s.ended or s.busy or s.inbox or s.stopping_since is not None or self.holding(s)):
             return False
         self._stop(s, self.clock())
         return True

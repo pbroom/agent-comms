@@ -716,16 +716,42 @@ def test_a_report_without_answered_counts_as_not_known(senv):
 
 
 def test_a_report_a_hub_refuses_as_malformed_is_said_loudly(senv, caplog):
-    """F2: a dropped 422 report is one clear line in the node's log, naming the likely cause."""
+    """F2: a dropped 422 report is one clear line in the node's log, naming the likely cause. A hub that named the
+    field and refuses it all the same (rolled back since its listing) loses nothing: the report goes again at once
+    with only the first fields (AC-05). One refused with only those is dropped, loudly."""
     import logging
+    import httpx
+    from agent_comms import node_sessions
     runner = senv.node.sessions
     runner.client = OldHub(runner.client, hides_features=False)    # it names the field, and refuses it all the same
     sid = start(senv, "first")["session_id"]
     tick(senv)
     with caplog.at_level(logging.ERROR, logger="agent_comms.node_sessions"):
         answer(senv, sid, "done")
-    [line] = [r for r in caplog.records if r.levelno == logging.ERROR and "422" in r.getMessage()]
-    assert "older than this node" in line.getMessage() and sid in line.getMessage()
+        senv.clock.advance(node_sessions.RETRY_SECONDS + 1)
+        tick(senv)
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert msg(senv, sid, 1)["state"] == "done", "the turn end reached the hub, without the field it refused"
+
+    class Refuses:          # a hub that cannot read any report of this node's
+        def __init__(self, inner):
+            self.inner = inner
+
+        def request(self, method, path, **kw):
+            if method == "POST" and path.startswith("/api/nodes/sessions/"):
+                return httpx.Response(422, json={"detail": "unreadable"},
+                                      request=httpx.Request(method, "http://hub" + path))
+            return self.inner.request(method, path, **kw)
+    runner.client = Refuses(runner.client.inner)
+    send(senv, sid, "second")
+    tick(senv)
+    with caplog.at_level(logging.ERROR, logger="agent_comms.node_sessions"):
+        answer(senv, sid, "done again")
+        for _ in range(2):
+            senv.clock.advance(node_sessions.RETRY_SECONDS + 1)
+            tick(senv)
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR and "422" in r.getMessage()]
+    assert lines and all("older than this node" in x and sid in x for x in lines)
 
 
 def test_a_late_start_report_for_a_turn_settled_as_lost_confirms_its_results(senv):

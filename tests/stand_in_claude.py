@@ -43,12 +43,25 @@ More of what Claude Code 2.1.322 was seen to do (DESIGN_NOTES, tree review round
   `--setting-sources` says.
 The reply is otherwise `turn <k of this process>: <TEXT IN CAPITALS>`.
 With STAND_IN_ARGV set (an env var name the runner passes on), each start appends its argv to that file.
+Mid-turn input, as Claude Code 2.1.330 was measured to handle it (DESIGN_NOTES "Restarting a running turn"; the
+host never steers, R6, but a restart's interrupt comes mid-turn): stdin is read all
+the time, also while a turn runs. A user line that comes during a turn is queued; one with a `uuid` gets
+`command_lifecycle` lines (queued, started, completed, cancelled), as does a turn's own line when it has one. A
+`sleep` or `hold` turn is a TOOL call: at its end (the tool boundary) every queued line is taken into the turn
+(`started` before the result) and the reply adds `; STEERED: <TEXT IN CAPITALS>` for each. A `think N ...` turn takes N
+seconds with no tool, so a line queued during it runs as its own next turn after the result. A `control_request`
+`interrupt` ends the turn at once: a `control_response` with `still_queued` (the queued lines' uuids), the turn's
+result `error_during_execution` (terminal_reason `aborted_tools`), and the queued lines then run as their own turns.
+Every `init` also lists `capabilities` (`msg_lifecycle_v1` and `interrupt_receipt_v1`, as 2.1.330's does; with
+STAND_IN_CAPS set, that comma-separated list instead) and a `claude_code_version`.
 """
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -190,6 +203,77 @@ def control(request_id, request: dict, args) -> dict:
     return {"subtype": "success", "request_id": request_id}
 
 
+def emit(obj: dict) -> None:
+    print(json.dumps(obj), flush=True)
+
+
+class Stdin:
+    """Every stdin line, read on a thread of its own (so a running turn still hears an interrupt or a steer).
+    `queued`: user lines that came while a turn ran, in order, until a turn takes them."""
+
+    def __init__(self, sid: str, args):
+        self.sid, self.args = sid, args
+        self.lines: queue.Queue = queue.Queue()
+        self.queued: list[dict] = []
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        for line in sys.stdin:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def lifecycle(self, message: dict, state: str) -> None:
+        if isinstance(message.get("uuid"), str):
+            emit({"type": "command_lifecycle", "command_uuid": message["uuid"], "state": state,
+                  "session_id": self.sid})
+
+    def take(self, timeout: float | None = None, in_turn: bool = False):
+        """The next line as a message, or None when the time ran out. Stdin closed: exit, except in a turn, which
+        runs to its end first (as when stdin was read only between turns)."""
+        try:
+            line = self.lines.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if line is None:
+            if not in_turn:
+                sys.exit(0)
+            self.lines.put(None)
+            time.sleep(timeout or 0.05)
+            return None
+        return json.loads(line)
+
+    def answer(self, message: dict) -> bool:
+        """A control request: answered at once. True for `interrupt` (the caller ends its turn)."""
+        request = message.get("request") or {}
+        if request.get("subtype") == "interrupt":
+            emit({"type": "control_response", "response": {
+                "subtype": "success", "request_id": message.get("request_id"),
+                "response": {"still_queued": [m["uuid"] for m in self.queued if isinstance(m.get("uuid"), str)]}}})
+            return True
+        emit({"type": "control_response", "response": control(message.get("request_id"), request, self.args)})
+        return False
+
+    def wait(self, seconds: float, until=lambda: False) -> bool:
+        """A turn's wait: lines go on being read. False once an interrupt came."""
+        deadline = time.monotonic() + seconds
+        while True:
+            over = until() or time.monotonic() >= deadline
+            # Once it is over, what has arrived already is still read (the process reads its stdin at once).
+            message = self.take(timeout=0 if over else max(0.001, min(0.05, deadline - time.monotonic())),
+                                in_turn=True)
+            if message is None:
+                if over:
+                    break
+                continue
+            if message.get("type") == "control_request":
+                if self.answer(message):
+                    return False
+                continue
+            self.queued.append(message)
+            self.lifecycle(message, "queued")
+        return True
+
+
 def main() -> None:
     args = sys.argv[1:]
     sid = args[args.index("--resume" if "--resume" in args else "--session-id") + 1]
@@ -202,32 +286,52 @@ def main() -> None:
             f.write(json.dumps(args) + "\n")
     sys.stderr.write("stand-in started\n")
     turn = 0
-    for line in sys.stdin:
-        message = json.loads(line)
-        if message.get("type") == "control_request":
-            print(json.dumps({"type": "control_response",
-                              "response": control(message.get("request_id"), message.get("request") or {}, args)}),
-                  flush=True)
-            continue
+    stdin = Stdin(sid, args)
+    while True:
+        if stdin.queued:
+            message = stdin.queued.pop(0)       # a line that waited behind the last turn: its own turn now
+        else:
+            message = stdin.take()
+            if message.get("type") == "control_request":
+                stdin.answer(message)
+                continue
+            stdin.lifecycle(message, "queued")
         text = message["message"]["content"]
         if text.startswith("crash"):
             sys.exit(3)
+        stdin.lifecycle(message, "started")
         turn += 1
         if turn == 1:
             run_hooks(args, "SessionStart", sid)
         mode, tools, _ = grants(args)
         print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "permissionMode": mode,
-                          "tools": tools}), flush=True)
-        pause = re.match(r"sleep (\d+(?:\.\d+)?)\b", text)
+                          "tools": tools, "claude_code_version": "2.1.330-stand-in",
+                          "capabilities": os.environ.get("STAND_IN_CAPS", "msg_lifecycle_v1,interrupt_receipt_v1")
+                          .split(",")}), flush=True)
+        going, tool = True, False
+        pause = re.match(r"(sleep|think) (\d+(?:\.\d+)?)\b", text)
         if pause:
-            time.sleep(float(pause.group(1)))
+            tool = pause.group(1) == "sleep"
+            going = stdin.wait(float(pause.group(2)))
         held = re.match(r"hold (/\S+)", text)
         if held:
-            until = time.monotonic() + 120
-            while not os.path.exists(held.group(1)) and time.monotonic() < until:
-                time.sleep(0.05)
+            tool = True
+            going = stdin.wait(120, until=lambda: os.path.exists(held.group(1)))
+        if not going:
+            stdin.lifecycle(message, "cancelled")
+            emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 1,
+                  "session_id": sid, "result": None, "stop_reason": "tool_use", "terminal_reason": "aborted_tools",
+                  "permission_denials": []})
+            continue
+        steered = []
+        if tool:
+            # The tool boundary: every line queued meanwhile is read into this turn.
+            steered, stdin.queued = stdin.queued, []
+            for m in steered:
+                stdin.lifecycle(m, "started")
         failed = text.startswith("fail")
         reply = "x" * 40_000 if text.startswith("big") else f"turn {turn}: {text.upper()}"
+        reply += "".join("; STEERED: " + m["message"]["content"].upper() for m in steered)
         denials = ([{"tool_name": "Write", "tool_use_id": "toolu_01", "tool_input": {"file_path": "/tmp/x"}}]
                    if text.startswith("deny") else [])
         acts = re.match(r"(write|touch|try|probe)((?: [A-Za-z0-9._-]+){1,3})$", text)
@@ -256,6 +360,8 @@ def main() -> None:
         print(json.dumps({"type": "result", "subtype": "error_during_execution" if failed else "success",
                           "is_error": failed, "num_turns": 1, "session_id": sid, "result": reply,
                           "stop_reason": "end_turn", "permission_denials": denials}), flush=True)
+        for m in steered + [message]:
+            stdin.lifecycle(m, "completed")
 
 
 if __name__ == "__main__":
