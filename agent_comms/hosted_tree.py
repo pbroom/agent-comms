@@ -694,8 +694,15 @@ def start_child(board: Board, p: Principal, parent_id: Any, text: Any, **kw) -> 
         # settlement that commits meanwhile is either in both or in neither (R5-01, R6-01); then labelled, with the
         # derived data when the reply is still that message's.
         kid, n = out["session"]["session_id"], out["message"]["n"]
-        return hosted.in_snapshot(board, lambda c: hosted.retried_answer(
-            board, c, hosted._session(c, kid), hosted._get(c, hosted._msg_key(kid, n)) or out["message"]))
+
+        def read(c):
+            r, m = hosted._session(c, kid), hosted._get(c, hosted._msg_key(kid, n))
+            if not isinstance(m, dict):
+                # Pruned before the snapshot opened (R7-01): the existing child, with no message and no verdict.
+                return {"session": hosted._human_view(board, r), "message": None, "created": False,
+                        "output_request": hosted.acknowledged(None, False)}
+            return hosted.retried_answer(board, c, r, m)
+        return hosted.in_snapshot(board, read)
     answer = {"session": hosted._human_view(board, out["session"]),
               "message": hosted._msg_view(out["message"]) if out["message"] is not None else None,
               "created": out["created"]}

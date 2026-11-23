@@ -705,20 +705,16 @@ def message(board: Board, p: Principal, session_id: Any, n: Any) -> dict:
     _settle(board, _session(board.conn, session_id))
     # One snapshot for both reads: a turn that completes between them would otherwise show its message `done` beside
     # the session's previous reply, and `--wait` would exit without the reply it waited for.
-    c = board.conn
-    c.execute("BEGIN")
-    try:
+    # The label (which may read the parent's outbox) and the derived data are made in that same snapshot (R7).
+    def read(c):
         r = _session(c, session_id)
         m = _get(c, _msg_key(r["session_id"], n)) if type(n) is int and n > 0 else None
-    finally:
-        c.execute("ROLLBACK")
-    if not isinstance(m, dict):
-        raise NotFound(f"session {r['session_id']} has no message {n}")
-    out = {"message": _labelled(board.conn, r, [m], "whole")[0], "session": _human_view(board, r)}
-    data = _result_data(r, m)
-    if data is not None:
-        out["result_data"] = data
-    return out
+        if not isinstance(m, dict):
+            raise NotFound(f"session {r['session_id']} has no message {n}")
+        out = {"message": _labelled(c, r, [m], "whole")[0], "session": _human_view(board, r)}
+        data = _result_data(r, m)
+        return out if data is None else out | {"result_data": data}
+    return in_snapshot(board, read)
 
 
 def in_snapshot(board: Board, read):

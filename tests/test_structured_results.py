@@ -1363,3 +1363,124 @@ def test_a_replaced_reply_kept_undelivered_says_the_parents_record_holds_it(senv
     label = show(senv, kid)["messages"][0]["output"]["reply"]
     assert label == hosted.REPLY_COPY_KEPT and "goes to the parent" not in label
     assert "the parent's result record still holds it" in label
+
+
+# ------------------------------------------------------------ review after the PR (R7)
+
+
+def a_second_ask(env, sid) -> str:
+    """Message 2 on the same human root, asking too: its own token."""
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": "again", "output_schema": SCHEMA})
+    assert r.status_code == 200 and r.json()["output_request"]["stored"] is True, r.text
+    tick(env)
+    return token_of(human_turns(env, sid)[1])
+
+
+def test_a_reply_that_ends_with_an_earlier_messages_block_is_missing_for_its_own_message(offenv):
+    """R7 (should fix): the verdict is pinned to the message's OWN token. Message 2's reply ends with message 1's
+    well-formed block (token T1): message 2 is `missing` (`no_block`), never `accepted`."""
+    from test_hosted_sessions import run_turn
+    sid, t1 = asked_root(offenv)
+    run_turn(offenv, sid, text=reply_with(t1))
+    assert record(offenv, sid, 1)["output"]["state"] == "accepted"
+    t2 = a_second_ask(offenv, sid)
+    assert t2 != t1
+    run_turn(offenv, sid, text=reply_with(t1, prose="Here is the earlier result again."))
+    out = record(offenv, sid, 2)["output"]
+    assert (out["state"], out["code"], out["data_sha"]) == ("missing", "no_block", None)
+    m = get_message(offenv, sid, 2)
+    assert m["message"]["output"]["state"] == "missing" and "result_data" not in m
+    assert record(offenv, sid, 1)["output"]["state"] == "accepted", "message 1's verdict stands as it was"
+
+
+def test_an_earlier_messages_block_quoted_before_the_own_block_is_quoted_material(offenv):
+    """R7: the other direction. Message 1's block quoted in the middle of message 2's reply, which ends with message
+    2's own block: accepted, and its data is message 2's."""
+    from test_hosted_sessions import run_turn
+    sid, t1 = asked_root(offenv)
+    run_turn(offenv, sid, text=reply_with(t1))
+    t2 = a_second_ask(offenv, sid)
+    mine = {"verdict": "ok", "findings": []}
+    run_turn(offenv, sid, text=reply_with(t1, prose="Before:") + "\nNow:\n" + reply_with(t2, value=mine, prose="x"))
+    assert record(offenv, sid, 2)["output"]["state"] == "accepted"
+    assert get_message(offenv, sid, 2)["result_data"] == mine
+
+
+def test_the_cli_verdict_line_escapes_every_piece_to_ascii_on_one_line():
+    """R7: `_fmt_verdict` prints the hub's words and names inside them; whatever a reason or label holds (a line
+    feed, a line separator, a bidi override, non-ASCII), the line it prints is ASCII and one line."""
+    from agent_comms import cli
+    line = cli._fmt_verdict({"state": "missing", "code": "shape", "words": "wé",
+                             "reasons": ["a\nb", "c d", "e‮f"], "reply": "r\r\x1bz"})
+    assert line.isascii() and "\n" not in line and "\r" not in line and "\x1b" not in line
+    assert line == ("result as data: missing (shape): w\\u00e9; why: a\\nb; c\\u2028d; e\\u202ef; "
+                    "the reply: r\\r\\u001bz")
+
+
+def test_message_labels_the_reply_from_the_same_snapshot_as_the_message(senv, monkeypatch):
+    """R7: `message()` (what `--wait` polls) builds the label, which reads the parent's outbox, inside the snapshot
+    it reads the session and message in. The parent's result loses the reply (from another connection) between the
+    message read and the label: the label is as of the snapshot, the copy the parent's record held."""
+    from agent_comms import hosted_results as hr
+    from agent_comms.core import Board
+    sid = root(senv)
+    answer(senv, sid)
+    kid = child(senv, sid, "go", output_schema=SCHEMA)["session_id"]
+    tick(senv)
+    monkeypatch.setattr(hr, "MAX_WAITING", 0)
+    answer(senv, kid, reply_with(token_of(turns_of(senv, kid)[0])))
+    [res] = results(senv, sid)
+    assert res["state"] == "undelivered"
+    monkeypatch.setattr(hr, "MAX_WAITING", 50)
+    senv.human.post(f"/api/hosted-sessions/{kid}/messages", json={"message": "again"})
+    tick(senv)
+    answer(senv, kid, "a later reply")
+    key = hr._key(sid, res["n"])
+    real, done = hosted._get, []
+
+    def get_then_drop_the_copy(conn, k):
+        out = real(conn, k)
+        if k == hosted._msg_key(kid, 1) and not done:
+            done.append(1)
+            other = Board(senv.settings, clock=senv.clock)
+            with hosted.db.write_tx(other.conn) as c:
+                x = real(c, key)
+                hosted._put(c, key, x | {"text": None}, "hub", other.now())
+        return out
+    monkeypatch.setattr(hosted, "_get", get_then_drop_the_copy)
+    got = get_message(senv, kid, 1)
+    assert done
+    assert got["message"]["output"]["reply"] == hosted.REPLY_COPY_KEPT, "as of the snapshot"
+    monkeypatch.setattr(hosted, "_get", real)
+    assert get_message(senv, kid, 1)["message"]["output"]["reply"] == hosted.REPLY_GONE, "the drop did commit"
+
+
+def test_a_child_start_retry_whose_message_is_pruned_before_the_snapshot_gets_the_child_and_no_message(
+        senv, monkeypatch):
+    """R7-01: the retry's lookup finds the accepted message; it is pruned before the snapshot opens. The answer is
+    the existing child with no message and no verdict (as when it was pruned before the lookup), never the
+    earlier verdict from the lookup."""
+    from agent_comms.core import Board
+    sid = root(senv)
+    answer(senv, sid)
+    kid = child(senv, sid, "go", request_id="c1", output_schema=SCHEMA)["session_id"]
+    tick(senv)
+    answer(senv, kid, reply_with(token_of(turns_of(senv, kid)[0])))
+    assert record(senv, kid, 1)["output"]["state"] == "accepted"
+    real, done = hosted.in_snapshot, []
+
+    def prune_then_snapshot(board, read):
+        if not done:
+            done.append(1)
+            other = Board(senv.settings, clock=senv.clock)
+            with hosted.db.write_tx(other.conn) as c:
+                c.execute("DELETE FROM board_state WHERE key = ?", (hosted._msg_key(kid, 1),))
+        return real(board, read)
+    monkeypatch.setattr(hosted, "in_snapshot", prune_then_snapshot)
+    r = senv.human.post(f"/api/hosted-sessions/{sid}/children",
+                        json={"message": "go", "request_id": "c1", "output_schema": SCHEMA})
+    assert r.status_code == 200 and done, r.text
+    got = r.json()
+    assert got["created"] is False and got["session"]["session_id"] == kid
+    assert got["message"] is None and "result_data" not in got
+    assert got["output_request"] == {"known": False, "why": "the original message is no longer on record"}

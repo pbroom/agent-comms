@@ -235,6 +235,16 @@ def test_the_rendered_schema_has_a_cap_of_its_own():
     assert "once written as compact ASCII-escaped JSON" in refusal(text)
 
 
+def test_a_short_name_is_quoted_whole_and_ascii_escaped_on_the_short_path_too():
+    """R7: a name that fits takes the short path (no cut), and that path escapes as well: non-ASCII, a bidi
+    override, a line separator and a quote come back as escapes, on one line."""
+    name = 'éé"‮ '
+    quoted = o.quote(name)
+    assert len(name) < o.QUOTE_MAX and not quoted.endswith('..."'), "the short path"
+    assert quoted == '"e\\u0301\\u00e9\\"\\u202e\\u2028"'
+    assert quoted.isascii() and json.loads(quoted) == name
+
+
 def test_a_path_in_a_refusal_quotes_names_whole_and_escaped():
     name = 'a"b\\c‮' + "x" * 80
     words = refusal({"type": "object", "properties": {name: {"type": "date"}}})

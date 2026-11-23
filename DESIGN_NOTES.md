@@ -7444,7 +7444,8 @@ so.
 **HTTP and the CLI.**
 - The HTTP bodies of `POST /api/hosted-sessions`, `.../children` and `.../messages` gain `output_schema: str | None`.
   An older hub's strict models refuse the field with a 422.
-- **Empty is refused, never treated as omitted** (R4-01):
+- **On HTTP and the CLI, empty is refused, never treated as omitted** (R4-01). On MCP the empty default means not
+  asked:
   - on HTTP, absent or null means not asked, and `""` (or blank) is a schema given and refused with the schema's
     words;
   - on MCP, `""` is the declared default, and means not asked;
@@ -8181,6 +8182,11 @@ A request closes exactly once, in its settlement transaction; from a closed stat
 | R5-03 result label | `test_structured_results::test_after_a_claim_the_result_says_the_reply_went_with_it_and_the_child_still_holds_its_own` |
 | R5-04 later plain message | `test_structured_results::test_a_plain_message_after_the_last_ask_is_never_read_for_status` |
 | R5-04 outbox once per poll | `test_structured_results::test_a_tree_poll_reads_each_parents_outbox_once_however_many_asks_its_child_made` |
+| R7 verdict reads the first result-data token in the reply | `test_structured_results::test_a_reply_that_ends_with_an_earlier_messages_block_is_missing_for_its_own_message` |
+| R7 `quote` short path without ASCII escaping | `test_output_schema::test_a_short_name_is_quoted_whole_and_ascii_escaped_on_the_short_path_too` |
+| R7 `_fmt_verdict` without its escaping | `test_structured_results::test_the_cli_verdict_line_escapes_every_piece_to_ascii_on_one_line` |
+| R7 `message()` label built outside its snapshot | `test_structured_results::test_message_labels_the_reply_from_the_same_snapshot_as_the_message` |
+| R7-01 child-start retry falls back to the lookup's message | `test_structured_results::test_a_child_start_retry_whose_message_is_pruned_before_the_snapshot_gets_the_child_and_no_message` |
 
 **Real-CLI e2e** (`--only structured`), on the shipped runners, in hosted sessions:
 - D1: a root with child sessions off, `--output-schema --wait --json`.
@@ -8214,8 +8220,9 @@ The stand-in run asserts the exact `shape` in D5, and both D6 branches.
 ### Code review round 4 (2026-11-23)
 
 Each finding was fixed; its test is named in brackets.
-- **R4-01.** An empty schema is refused, never an ordinary turn. On the CLI it is refused before any request; on
-  HTTP, `""` is refused while absent or null means not asked; on MCP, `""` stays the default.
+- **R4-01.** On HTTP and the CLI an empty schema is refused, never an ordinary turn. On the CLI it is refused
+  before any request; on HTTP, `""` is refused while absent or null means not asked; on MCP, `""` stays the default
+  and means not asked.
   [`test_an_empty_or_invalid_schema_over_http_...`, `test_the_cli_refuses_an_empty_schema_...`,
   `test_fresh_invalid_schemas_on_the_agent_tools_enqueue_nothing`]
 - **R4-02.** The original task is checked first, with main's words.
@@ -8308,6 +8315,34 @@ added or changed were all caught.
   says the reply goes to the parent. [`test_a_replaced_reply_kept_undelivered_says_the_parents_record_holds_it`]
 - Three mutations of these checks, each caught by its test: the retry's snapshot, the details' snapshot and the kept
   label.
+
+### Review after the PR (2026-11-23)
+
+The independent review of PR #106 said OK to merge with one should-fix and four notes. They are closed in a new
+commit on top of the reviewed one; its test is named in brackets.
+- **Should fix: the verdict is pinned to the message's OWN token.** The code already scanned for `output["token"]`
+  only, but no test held it. Two asked messages on one session; message 2's reply ends with message 1's well-formed
+  block: message 2 is `missing` (`no_block`), never `accepted`, and message 1's verdict stands. The other direction
+  too: message 1's block quoted in the middle of message 2's reply, which ends with its own block, is accepted with
+  message 2's data. [`test_a_reply_that_ends_with_an_earlier_messages_block_is_missing_for_its_own_message`,
+  `test_an_earlier_messages_block_quoted_before_the_own_block_is_quoted_material`]
+- **`quote()`'s short path escapes too.** A short name with non-ASCII, a bidi override, a line separator and a quote
+  is quoted whole and ASCII-escaped. [`test_a_short_name_is_quoted_whole_and_ascii_escaped_on_the_short_path_too`]
+- **The CLI's verdict line escapes every piece.** Reasons and the label with a line feed, a carriage return, an
+  escape character, U+2028 and U+202E print as one ASCII line.
+  [`test_the_cli_verdict_line_escapes_every_piece_to_ascii_on_one_line`]
+- **`message()` labels inside its snapshot.** The poll `--wait` makes now builds the label (which reads the parent's
+  outbox) and the derived data inside the snapshot it reads the session and the message in (`hosted.in_snapshot`).
+  Before, the label was built after the rollback. In the test a second connection drops the parent's copy between
+  the message read and the label; the label stays as of the snapshot.
+  [`test_message_labels_the_reply_from_the_same_snapshot_as_the_message`]
+- **R7-01: a child-start retry whose message is pruned before the snapshot opens.** It answers the existing child
+  with `message: null` and `output_request: {"known": false, ...}`, as when the message was pruned before the
+  lookup. Before, it fell back to the message the lookup had found and returned its earlier verdict.
+  [`test_a_child_start_retry_whose_message_is_pruned_before_the_snapshot_gets_the_child_and_no_message`]
+- **Wording.** "An empty schema is refused" now says it holds for HTTP and the CLI; on MCP the empty default means
+  not asked.
+- Five mutations, one per item above, each caught by its new test (the mutation table has the rows).
 
 ### Follow-ups
 

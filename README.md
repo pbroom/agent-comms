@@ -691,8 +691,9 @@ uv run board session start --parent "$SESSION_ID" --access read-only "Review the
 ```
 
 `--output-schema S` takes a file's path (8 KB at most), or the JSON text itself when it starts with `{`. An empty one
-(`''`, or an empty file) is refused before anything is sent. For an agent,
-`board_session_spawn` and `board_session_send` take `output_schema`: the schema's JSON TEXT, as a string. Their
+(`''`, or an empty file) is refused before anything is sent, and so is an empty `output_schema` over HTTP. For an
+agent, `board_session_spawn` and `board_session_send` take `output_schema`: the schema's JSON TEXT, as a string
+(empty, their default, means no ask). Their
 answer's `output_request.stored` confirms the ask. An older board server ignores the argument, so without that
 acknowledgement no verdict comes.
 
