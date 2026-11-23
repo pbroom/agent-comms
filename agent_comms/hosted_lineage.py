@@ -97,6 +97,11 @@ def _result(board: Board, x: dict | None, busy: _Busy, text: bool = False) -> di
     out["waiting_because"] = hosted_results.waiting_because(board, board.conn, x, busy=busy)
     if text:
         out["output"] = _cap(x.get("text"))
+    if isinstance(x.get("output"), dict):
+        # The verdict of a request its parent made (a whitelist): a field of its own, never the reply's `output`,
+        # labelled for what THIS view holds of the reply (capped here: in part when cut).
+        shown = None if not text else "cut" if (out["output"] or {}).get("truncated") else "whole"
+        out["verdict"] = hosted_results.view_one(x)["output"] | {"reply": hosted_results.reply_label(x, shown)}
     return out
 
 
@@ -184,7 +189,9 @@ def _body(board: Board, sid: str, r: dict | None, iroot: dict | None, reads: _Re
     results = reads.box(sid)
     if r is not None:
         out = _view(board, r, now)
-        out["messages"] = [hosted._msg_view(m) for m in _messages(board.conn, sid)]
+        cap = out.get("output")         # (`_view` already clipped the reply)
+        out["messages"] = hosted._labelled(board.conn, r, _messages(board.conn, sid),
+                                           "cut" if cap and cap["truncated"] else "whole", box=reads.box)
         out["result"] = reads.view(reads.latest_of(r["parent"], sid)) if hosted_tree.is_child(r) else None
     else:
         out = _iroot(iroot) | {"messages": [], "result": None}
@@ -203,6 +210,11 @@ def _walk(n: dict) -> list[dict]:
 
 
 def trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
+    """`_trees` in ONE read snapshot (R6-01): every record, label and version of the answer as of one moment."""
+    return hosted.in_snapshot(board, lambda c: _trees(board, p, include_ended))
+
+
+def _trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
     """Every session tree; with `include_ended` false, only trees in which a session has not ended (an open
     interactive root with no live child counts as ended: it holds nothing). A shown tree carries all its members,
     the ended ones too, so the lineage stays whole. The shape is found first from the stored records; only the
@@ -254,6 +266,9 @@ def trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
         out = {k: v for k, v in body.items() if k not in ("messages", "results")} | {"version": _version(body)}
         if out.get("output"):
             out["output"] = _preview(out["output"])       # the whole capped text only in `detail`
+        if isinstance(out.get("result"), dict) and "verdict" in out["result"]:
+            # A verdict is the details panel's only (R4-04): the poll stays small; `version` still covers it.
+            out["result"] = {k: v for k, v in out["result"].items() if k != "verdict"}
         if n.get("detached"):
             out["detached"] = True
         if n.get("loop"):
@@ -276,6 +291,11 @@ def trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
 
 
 def detail(board: Board, p: Principal, session_id: Any) -> dict:
+    """`_detail` in ONE read snapshot (R6-01): the session, its messages and their labels as of one moment."""
+    return hosted.in_snapshot(board, lambda c: _detail(board, p, session_id))
+
+
+def _detail(board: Board, p: Principal, session_id: Any) -> dict:
     """The dashboard's details panel for one session (or interactive root), read-only and capped (`_body`), and its
     `version`, the same as `trees` gives it."""
     board._require_human(p, "read a hosted session")

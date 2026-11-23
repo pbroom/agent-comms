@@ -100,6 +100,7 @@ class HostedStartIn(Body):
     message: str
     agent: str | None = None
     model: str | None = None
+    output_schema: str | None = None    # the JSON TEXT of a schema (output_schema.py decodes it strictly)
 
 
 class HostedChildIn(Body):
@@ -113,12 +114,14 @@ class HostedChildIn(Body):
     isolation: str | None = None
     access: str | None = None
     request_id: str | None = None
+    output_schema: str | None = None    # the JSON TEXT of a schema (output_schema.py decodes it strictly)
 
 
 class HostedMessageIn(Body):
     message: str
     mode: Literal['auto', 'queue', 'steer', 'restart'] = 'queue'     # hosted.SEND_MODES
     request_id: str | None = None   # a retry with the same id returns the first call's message
+    output_schema: str | None = None    # the JSON TEXT of a schema (output_schema.py decodes it strictly)
 
 
 class WaitIn(Body):
@@ -976,7 +979,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         if error:
             raise Conflict(f"the hub's [dispatch] settings cannot be read: {error}")
         return hosted.start(board, p, body.project, body.message, agent=body.agent, model=body.model,
-                            allowed=config.nodes)
+                            allowed=config.nodes, output_schema=body.output_schema)
 
     @app.post("/api/hosted-sessions/{session_id}/children")
     def hosted_child(session_id: str, body: HostedChildIn, p: Principal = P):
@@ -998,7 +1001,8 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     @app.post("/api/hosted-sessions/{session_id}/messages")
     def hosted_send(session_id: str, body: HostedMessageIn, p: Principal = P):
         from . import hosted
-        return hosted.send(board, p, session_id, body.message, mode=body.mode, request_id=body.request_id)
+        return hosted.send(board, p, session_id, body.message, mode=body.mode, request_id=body.request_id,
+                           output_schema=body.output_schema)
 
     @app.get("/api/hosted-sessions/{session_id}/messages/{n}")
     async def hosted_message(request: Request, session_id: str, n: int, wait: float = 0, p: Principal = P):

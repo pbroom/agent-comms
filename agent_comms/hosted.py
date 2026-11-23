@@ -57,7 +57,7 @@ import time
 import uuid
 from typing import Any, Callable
 
-from . import db, nodes
+from . import db, nodes, output_schema
 from .core import Board, Conflict, Invalid, NotFound, Principal
 from .nodes import _get, _put
 from .providers import SESSION_ID_RE, cap_reply, valid_provider_id, validate_model
@@ -258,10 +258,150 @@ def account_home(conn, r: dict) -> str | None:
     return home if isinstance(home, str) else None
 
 
-def _msg_view(m: dict) -> dict:
-    # A message sent with a mode also says it, and what came of it; any other is shown exactly as before.
-    return {"session_id": m.get("session_id"), **{k: m.get(k) for k in _MSG_FIELDS},
-            **{k: m[k] for k in MODE_FIELDS if m.get(k) is not None}}
+def _msg_view(m: dict, reply_for: Any = None, projection: str | None = None, copy: str | None = None) -> dict:
+    # A message sent with a mode also says it, and what came of it; any other is shown exactly as before. One that
+    # asked for a result as data also has its verdict (`output_view`); any other has no such key.
+    out = {"session_id": m.get("session_id"), **{k: m.get(k) for k in _MSG_FIELDS},
+           **{k: m[k] for k in MODE_FIELDS if m.get(k) is not None}}
+    if isinstance(m.get("output"), dict):
+        out["output"] = output_view(m, reply_for, projection, copy)
+    return out
+
+
+# Where the reply a verdict was made from is, beside the verdict (DESIGN_NOTES "Structured results", R3-01, R4-04):
+# the label says what the view really holds. Block wording only for an accepted verdict whose reply is here whole.
+REPLY_WHOLE = "in this answer, whole: the session's reply to this message"
+REPLY_WHOLE_BLOCK = REPLY_WHOLE + ", which ends with the result-data block that was checked"
+REPLY_CUT = ("in this view only in part: the reply is cut here before its end; `board session show` has it whole")
+REPLY_NOT_HERE = "not in this view: a verdict only"
+REPLY_COPY = ("not in this answer: a later turn's reply replaced it as the session's latest; a result for the "
+              "parent still holds it, and goes to the parent with it (as a turn, or a claim)")
+REPLY_COPY_KEPT = ("not in this answer: a later turn's reply replaced it as the session's latest; the parent's result "
+                   "record still holds it (kept, not sent as a turn)")
+REPLY_GONE = ("no longer kept on the hub: a later turn's reply replaced it and no result carries it (the session's "
+              "transcript on its node has it)")
+REPLY_NONE = "none on the hub: the turn left no reply"
+UNCHECKED = ("settled by a hub version that does not check results as data: no verdict was made; the reply holds the "
+             "text as written")
+
+
+def output_view(m: dict, reply_for: Any = None, projection: str | None = None, copy: str | None = None) -> dict:
+    """A message's request for a result as data, as the human sees it: a whitelist (never the schema or the
+    token). `reply_for`: the message the answer's reply belongs to; `projection`: what that answer holds of it
+    ("whole", "cut", or None: no reply at all); `copy`: a result for the parent still holds this message's reply,
+    "waits" (on its way to the parent) or "kept" (undelivered or kept: it stays in the record), else None."""
+    o = m["output"]
+    state = o.get("state")
+    if state == "asked" and m.get("state") in SETTLED:
+        state = "unchecked"
+    out: dict = {"state": state, "schema_sha": o.get("schema_sha")}
+    if state == "missing":
+        out |= {"code": o.get("code"), "words": output_schema.WORDS.get(o.get("code"), ""),
+                "reasons": o.get("reasons") or []}
+    if state == "unchecked":
+        out["words"] = UNCHECKED
+    if state in ("accepted", "missing", "unchecked"):
+        n = m.get("n") if type(m.get("n")) is int else 0
+        if reply_for == n:
+            out["reply"] = ((REPLY_WHOLE_BLOCK if state == "accepted" else REPLY_WHOLE) if projection == "whole"
+                            else REPLY_CUT if projection == "cut" else REPLY_NOT_HERE)
+        elif type(reply_for) is int and reply_for > n:
+            out["reply"] = (REPLY_COPY if copy == "waits" else REPLY_COPY_KEPT if copy == "kept" else REPLY_GONE)
+        else:
+            out["reply"] = REPLY_NONE if m.get("state") in SETTLED else REPLY_NOT_HERE
+    return out
+
+
+def carried_copy(conn, r: dict, n: Any, box=None) -> str | None:
+    """Whether a result for this child's parent still holds the reply of message `n`: "waits" (pending or queued: it
+    goes to the parent), "kept" (undelivered, or `kept`: it stays in the parent's result record), or None. Asked only
+    for a message that asked for a result as data. `box(parent)`: the parent's results, read once by the caller
+    (the dashboard's tree poll reads each outbox once, R5-04)."""
+    from . import hosted_results, hosted_tree
+    if not hosted_tree.is_child(r):
+        return None
+    t = hosted_results.target(conn, r)
+    if t is None:
+        return None
+    results = box(t["parent"]) if box is not None else hosted_results._results(conn, t["parent"])
+    held = [x for x in results if x.get("child") == r["session_id"] and x.get("message") == n and x.get("text")]
+    if not held:
+        return None
+    return "waits" if any(x.get("state") in hosted_results.WAITING for x in held) else "kept"
+
+
+def _labelled(conn, r: dict, msgs: list[dict], projection: str | None, box=None) -> list[dict]:
+    """Message views, each asked one labelled for what this answer holds of its reply. The parent's outbox is read
+    at most once for all of them."""
+    rf = r.get("reply_for")
+    if box is None:
+        cache: dict = {}
+
+        def box(pid):
+            from . import hosted_results
+            if pid not in cache:
+                cache[pid] = hosted_results._results(conn, pid)
+            return cache[pid]
+    return [_msg_view(m, rf, projection, copy=carried_copy(conn, r, m["n"], box)
+                      if isinstance(m.get("output"), dict) and type(rf) is int and type(m.get("n")) is int
+                      and rf > m["n"] else None)
+            for m in msgs]
+
+
+def ask(text: str, schema_text: Any, by: str, frame=None) -> tuple[dict | None, str | None, str | None]:
+    """A message's request for a result as data: (its `output` record, the message text with the ask in it, None),
+    or (None, None, the refusal's words). Nothing is raised, so a caller can resolve a retry first (R2-10).
+    `frame(token, shown)`: the agent path's own rendering of the whole message (hosted_spawn); by default the
+    human's text with the hub's block appended."""
+    try:
+        _, shown, sha = output_schema.prepare_schema(schema_text)
+        token = output_schema.fresh_token(text, shown)
+        full = frame(token, shown) if frame is not None else text + output_schema.human_block(token, shown)
+    except output_schema.SchemaError as e:
+        return None, None, str(e)
+    except Invalid as e:
+        return None, None, e.message
+    size = len(full.encode("utf-8", "replace"))
+    if size > MESSAGE_MAX_BYTES:
+        return None, None, (f"your message and its output schema together are over {MESSAGE_MAX_BYTES:,} bytes"
+                            if frame is None else output_schema.TOO_BIG_FRAME.format(n=size, most=MESSAGE_MAX_BYTES))
+    return {"token": token, "by": by, "schema": shown, "schema_sha": sha, "state": "asked"}, full, None
+
+
+def acknowledged(m: dict | None, created: bool) -> dict:
+    """`output_request`, only for an answer to a call that CARRIED a schema (R3-07): what the message it returns
+    asks for."""
+    if not isinstance(m, dict) or m.get("state") == "settled" or "kind" not in m:
+        return {"known": False, "why": "the original message is no longer on record"}
+    o = m.get("output")
+    if isinstance(o, dict):
+        return {"stored": True, "schema_sha": o.get("schema_sha")} | ({} if created else {"original": True})
+    return {"stored": False, "why": f"the original message (message {m.get('n')}) asked for no result as data"}
+
+
+def _turn_code(detail: str, delivered: bool) -> str:
+    """The verdict code of a turn that did not complete, from the facts hosted_results.outcome reads."""
+    from . import hosted_results
+    if detail.startswith(hosted_results.CANCELLED):
+        return "cancelled"
+    if detail.startswith("session ended: "):
+        return "session_ended"
+    if detail.startswith(output_schema.NODE_LOST_PREFIX):
+        return "lost"
+    if not delivered:
+        return "withdrawn"
+    if detail.startswith(hosted_results.INTERRUPTED):
+        return "interrupted"
+    return "timed_out" if detail.startswith(hosted_results.TIMED_OUT) else "failed"
+
+
+def _closed(m: dict, now: float, *, ok: bool, code: str | None = None, reply: Any = "") -> dict | None:
+    """The message's request, closed: a fresh dict, nothing written (the caller installs it). None when the message
+    asked for nothing or its request is already closed."""
+    o = m.get("output")
+    if not isinstance(o, dict) or o.get("state") != "asked":
+        return None
+    return output_schema.safe_verdict(o, ok=ok, code=code, reply=reply) | {"closed_at": now}
 
 
 def _node_view(r: dict) -> dict:
@@ -287,7 +427,7 @@ def _prune(c, now: float) -> None:
             c.execute("DELETE FROM board_state WHERE key = ?", (hosted_results.OUTBOX_PREFIX + r["session_id"],))
 
 
-def _enqueue(c, r: dict, kind: str, text: str, by: str, now: float) -> dict:
+def _enqueue(c, r: dict, kind: str, text: str, by: str, now: float, output: dict | None = None) -> dict:
     """Add a message to the session's queue (inside the caller's transaction). PR 3's wake calls this with `wake`."""
     if kind not in KINDS:
         raise Invalid("unknown message kind")
@@ -300,6 +440,9 @@ def _enqueue(c, r: dict, kind: str, text: str, by: str, now: float) -> dict:
     n = int(r["next_n"])
     m = {"session_id": r["session_id"], "n": n, "kind": kind, "text": text, "state": "queued", "ok": None,
          "detail": "", "denials": [], "created_at": now, "updated_at": now, "delivered_at": None, "ended_at": None}
+    if output is not None:
+        m["output"] = output        # a request for a result as data (`ask`): only then is the key there
+        r["output_asked"] = n       # ... and the session says so, so a schema-free one is never looked into
     r |= {"next_n": n + 1, "queued": int(r.get("queued") or 0) + 1, "updated_at": now}
     _put(c, _msg_key(r["session_id"], n), m, by, now)
     _put(c, SESSION_PREFIX + r["session_id"], r, by, now)
@@ -307,10 +450,16 @@ def _enqueue(c, r: dict, kind: str, text: str, by: str, now: float) -> dict:
 
 
 def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = None, model: Any = None,
-          allowed: dict[str, dict] | None = None) -> dict:
+          allowed: dict[str, dict] | None = None, output_schema: Any = None) -> dict:
     """Start a hosted session of `agent` in `project` with its first message. `allowed`: the hub's [dispatch.nodes]."""
     _human(board, p, "start a hosted session")
     project, text = _project(project), _text(text)
+    output = None
+    if output_schema is not None:   # given, even empty: decided (a root's start has no request id: refused at once)
+        output, text_asked, why = ask(text, output_schema, "human")
+        if why:
+            raise Invalid(why)
+        text = text_asked
     try:
         model = validate_model(model)
     except ValueError as e:
@@ -360,19 +509,27 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
         if hosted_tree.spawn_config(board).enabled:
             # A root that may get children. Its access is its node's to say (derived from the runner there).
             r |= {"parent": None, "root": r["session_id"], "depth": 0, "access": None}
-        m = _enqueue(c, r, "user", text, p.name, now)
+        m = _enqueue(c, r, "user", text, p.name, now, output=output)
         from . import hosted_spawn, hosted_wake
         hosted_wake.begin(c, r["session_id"], now)      # woken for posts made from now on (PR 3)
         hosted_spawn.human_messaged(c, r, now)     # the agent's count of child turns without the human starts over
-    return {"session": _human_view(board, r), "message": _msg_view(m)}
+    out = {"session": _human_view(board, r), "message": _msg_view(m)}
+    if output_schema is not None:
+        out["output_request"] = acknowledged(m, True)
+    return out
 
 
-def send(board: Board, p: Principal, session_id: Any, text: Any, mode: Any = "queue", request_id: Any = None) -> dict:
+def send(board: Board, p: Principal, session_id: Any, text: Any, mode: Any = "queue", request_id: Any = None,
+         output_schema: Any = None) -> dict:
     """Queue a message for the session: its next turn if it is idle, the turn after the ones ahead of it otherwise.
     `mode` (SEND_MODES, `send_mode`): restart the turn in flight with it, or `auto` (start or queue).
     `request_id`: a retry with the same id returns the message the first call made (`created` false), nothing new."""
     _human(board, p, "message a hosted session")
     text, mode = _text(text), _mode(mode)
+    output = why = None
+    if output_schema is not None:   # decided now (empty too), refused only once a retry has been looked for
+        output, text_asked, why = ask(text, output_schema, "human")
+        text = text_asked or text
     from . import hosted_spawn, hosted_tree
     rid = hosted_tree._request_id(request_id)
     _settle(board, _session(board.conn, session_id))
@@ -382,14 +539,20 @@ def send(board: Board, p: Principal, session_id: Any, text: Any, mode: Any = "qu
         by = {"human": p.name}
         hit = sent_before(c, r, rid, by, now)
         if hit is not None:
-            return {"session": _human_view(board, r), "message": _msg_view(hit), "created": False}
+            if output_schema is None:
+                return {"session": _human_view(board, r), "message": _msg_view(hit), "created": False}
+            return retried_answer(board, c, r, hit)
+        if why:
+            raise Invalid(why)
         how = send_mode(c, r, mode, by_parent=False)
-        m = _enqueue(c, r, "user", text, p.name, now)
+        m = _enqueue(c, r, "user", text, p.name, now, output=output)
         _mark(c, r, m, how, rid, by, p.name, now)
         hosted_spawn.human_messaged(c, r, now)     # a tree's count of child turns without the human starts over
     out = {"session": _human_view(board, r), "message": _msg_view(m)}
     if mode != "queue" or rid is not None:
         out |= {"mode": how["mode"], "why": how["why"], "created": True}
+    if output_schema is not None:
+        out["output_request"] = acknowledged(m, True)
     return out
 
 
@@ -509,8 +672,20 @@ def list_sessions(board: Board, p: Principal, include_ended: bool = False) -> di
 def show(board: Board, p: Principal, session_id: Any) -> dict:
     _human(board, p, "read a hosted session")
     r = _settle(board, _session(board.conn, session_id))
-    out = _human_view(board, r)
-    out["messages"] = [_msg_view(m) for m in _messages(board.conn, r["session_id"])[-SHOW_MESSAGES:]]
+    # The session, its messages and the labels made from both, in ONE snapshot (R5-03): a turn that settles between
+    # the reads would otherwise label its message from a session record that does not have its reply yet.
+    c = board.conn
+    c.execute("BEGIN")
+    try:
+        r = _session(c, r["session_id"])
+        out = _human_view(board, r)
+        msgs = _messages(c, r["session_id"])[-SHOW_MESSAGES:]
+        out["messages"] = _labelled(c, r, msgs, "whole")
+        data = _result_data(r, next((m for m in msgs if m.get("n") == r.get("reply_for")), None))
+    finally:
+        c.execute("ROLLBACK")
+    if data is not None:
+        out["result_data"] = data
     from . import hosted_tree
     kids = hosted_tree.children_view(board, r)
     if kids:
@@ -530,16 +705,54 @@ def message(board: Board, p: Principal, session_id: Any, n: Any) -> dict:
     _settle(board, _session(board.conn, session_id))
     # One snapshot for both reads: a turn that completes between them would otherwise show its message `done` beside
     # the session's previous reply, and `--wait` would exit without the reply it waited for.
-    c = board.conn
-    c.execute("BEGIN")
-    try:
+    # The label (which may read the parent's outbox) and the derived data are made in that same snapshot (R7).
+    def read(c):
         r = _session(c, session_id)
         m = _get(c, _msg_key(r["session_id"], n)) if type(n) is int and n > 0 else None
+        if not isinstance(m, dict):
+            raise NotFound(f"session {r['session_id']} has no message {n}")
+        out = {"message": _labelled(c, r, [m], "whole")[0], "session": _human_view(board, r)}
+        data = _result_data(r, m)
+        return out if data is None else out | {"result_data": data}
+    return in_snapshot(board, read)
+
+
+def in_snapshot(board: Board, read):
+    """`read(conn)` inside ONE read snapshot of the database (a deferred transaction, rolled back): everything it
+    reads is as of one moment. Inside a transaction already, that transaction is the snapshot."""
+    c = board.conn
+    if c.in_transaction:
+        return read(c)
+    c.execute("BEGIN")
+    try:
+        return read(c)
     finally:
         c.execute("ROLLBACK")
-    if not isinstance(m, dict):
-        raise NotFound(f"session {r['session_id']} has no message {n}")
-    return {"message": _msg_view(m), "session": _human_view(board, r)}
+
+
+def retried_answer(board: Board, conn, r: dict, m: dict) -> dict:
+    """A retry's answer, for a call that carried a schema: the original message labelled from the session record
+    read with it, and the derived data when the reply is still that message's (R5-01)."""
+    out = {"session": _human_view(board, r), "message": _labelled(conn, r, [m], "whole")[0], "created": False,
+           "output_request": acknowledged(m, False)}
+    data = _result_data(r, m)
+    if data is not None:
+        out["result_data"] = data
+    return out
+
+
+def _result_data(r: dict, m: dict | None) -> dict | None:
+    """The accepted data, re-derived from the reply this same answer returns (R3-02): only for the message that
+    reply belongs to (`reply_for`), only when its verdict is `accepted`, and only when the digest matches. None
+    otherwise, and on any error: the verdict stands without it."""
+    try:
+        o = m.get("output") if isinstance(m, dict) else None
+        if (not isinstance(o, dict) or o.get("state") != "accepted" or m.get("n") != r.get("reply_for")
+                or m.get("session_id") != r.get("session_id")):
+            return None
+        return output_schema.derive(r.get("reply"), o.get("token"), o.get("data_sha"))
+    except Exception:
+        return None
 
 
 def close(board: Board, p: Principal, session_id: Any) -> dict:
@@ -662,9 +875,12 @@ def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) ->
     cut = []        # the messages this end fails, as they were (a child's parent is told of each)
     for m in _messages(c, r["session_id"]):
         if m.get("state") not in SETTLED:
-            cut.append(dict(m))
+            closed = _closed(m, now, ok=False, code="session_ended")
+            cut.append(dict(m) | ({"output": closed} if closed else {}))     # its delivery facts as they were
             m |= {"state": "failed", "ok": False, "detail": f"session ended: {detail}"[:300], "text": "",
                   "ended_at": now, "updated_at": now}
+            if closed:
+                m["output"] = closed
             _put(c, _msg_key(r["session_id"], m["n"]), m, by, now)
     r |= {"state": "ended", "error": detail, "ended_at": now, "updated_at": now, "pid": None, "queued": 0,
           "in_flight": None}
@@ -716,9 +932,12 @@ def _settle(board: Board, r: dict) -> dict:
         else:
             for m in _messages(c, r["session_id"]):
                 if m.get("state") == "delivered":
+                    closed = _closed(m, now, ok=False, code="node_lost")
                     m |= {"state": "failed", "ok": False, "text": "", "ended_at": now, "updated_at": now,
                           "detail": "node_lost: the node went silent (or stopped hosting sessions) while the turn "
                                     "was in flight; it was not replayed"}
+                    if closed:
+                        m["output"] = closed
                     _put(c, _msg_key(r["session_id"], m["n"]), m, "hub", now)
                     r["last_result"] = {"message": m["n"], "ok": False, "detail": m["detail"], "denials": [],
                                         "meta": {}, "at": now}
@@ -1062,6 +1281,13 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
         m |= {"state": "done" if ok else "failed", "ok": ok, "detail": detail, "denials": ev["denials"], "text": "",
               "ended_at": now}
         reached = was == "delivered" or ev["delivered"]
+        # A request for a result as data closes here, in this transaction, on the reply this event carries: a pure
+        # computation that never raises (any fault is missing/internal), installed only once it is made. Only a
+        # completed turn's reply is read.
+        if isinstance(m.get("output"), dict):
+            closed = _closed(m, now, ok=ok, code=None if ok else _turn_code(detail, reached), reply=ev["text"])
+            if closed:
+                m["output"] = closed
         if m.get("kind") == hosted_results.KIND:
             # A turn its provider started was confirmed then (above); one the provider itself ended, with a success
             # or an error of its own (`answered`), is confirmed now. One the host gave up on was not: its results go

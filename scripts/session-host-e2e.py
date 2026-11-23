@@ -275,6 +275,31 @@ post = board.create_post(p, sid, body=sys.argv[3], type="request", thread_id=int
 print(json.dumps({"id": post["id"]}))
 """
 
+# Structured results (D1-D6): the review schema of the design, an unsatisfiable one, and the review task.
+REVIEW_SCHEMA = {"type": "object", "required": ["verdict", "findings"], "additionalProperties": False,
+                 "properties": {"verdict": {"enum": ["ok", "changes"]},
+                                "findings": {"type": "array", "items": {
+                                    "type": "object", "required": ["file", "line", "note"],
+                                    "additionalProperties": False,
+                                    "properties": {"file": {"type": "string"},
+                                                   "line": {"type": "integer", "minimum": 1},
+                                                   "note": {"type": "string", "maxLength": 500}}}}}}
+REVIEW_TEXT = json.dumps(REVIEW_SCHEMA)
+UNSAT_SCHEMA = {"type": "object", "required": ["x"], "additionalProperties": False,
+                "properties": {"x": {"type": "string", "minLength": 2, "maxLength": 1}}}
+REVIEW_TASK = """Review this diff for bugs. Page numbers are 1-based in the new code. Do not use any tools: the diff \
+is all you need.
+
+--- a/src/pager.py
++++ b/src/pager.py
+@@ -1,6 +1,6 @@
+ def page(items, n, size):
+-    start = n * size
+-    return items[start:start + size]
++    start = (n - 1) * size
++    return items[start:start + size + 1]
+"""
+
 BOARD_GRACE = 5                 # --with-board: the hub's wake_grace_seconds, short so `holds` is asked after it
 BOARD_BOUND = 90                # --with-board: most seconds from the post to the session's delivery receipt
 
@@ -2043,6 +2068,203 @@ max_live = 8
             raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
         return json.loads(r.stdout)
 
+    # ------------------------------------------------------------ structured results (DESIGN_NOTES "Structured results")
+
+    def board_rc(self, *argv: str) -> tuple[int, str, str]:
+        """`board ...` with its exit status (for the exit codes 3 and 4 of `--wait` with `--output-schema`)."""
+        r = subprocess.run([sys.executable, "-m", "agent_comms.cli", *argv], cwd=str(self.tmp), capture_output=True,
+                           text=True, timeout=300,
+                           env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home), "BOARD_TOKEN": self.human_token})
+        return r.returncode, r.stdout, r.stderr
+
+    def review_files(self) -> tuple[Path, Path, str, str]:
+        """The review schema and an unsatisfiable one (minLength above maxLength), as files; the review task."""
+        review = self.tmp / "review-schema.json"
+        review.write_text(json.dumps(REVIEW_SCHEMA))
+        unsat = self.tmp / "unsat-schema.json"
+        unsat.write_text(json.dumps(UNSAT_SCHEMA))
+        task = REVIEW_TASK if self.real else "data-valid"
+        codex_task = REVIEW_TASK if self.real_codex else "data-valid"
+        return review, unsat, task, codex_task
+
+    def final_reply(self, sid: str) -> str | None:
+        """The session's last turn's reply as its node's transcript holds it (what the process wrote), capped as the
+        adapter caps it: Claude's last `result`, Codex's last final-answer agent message."""
+        from agent_comms.providers import cap_reply
+        text = None
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("type") == "result" and isinstance(ev.get("result"), str):
+                    text = ev["result"]
+                item = (ev.get("params") or {}).get("item") if ev.get("method") == "item/completed" else None
+                if (isinstance(item, dict) and item.get("type") == "agentMessage" and isinstance(item.get("text"), str)
+                        and item.get("phase") in ("final_answer", None)):
+                    text = item["text"]
+        return cap_reply(text) if text is not None else None
+
+    def check_data(self, label: str, data: dict, rc: int) -> None:
+        from agent_comms import output_schema
+        out = (data.get("message") or {}).get("output") or {}
+        got = data.get("result_data")
+        reasons = output_schema.validate(REVIEW_SCHEMA, got) if isinstance(got, dict) else ["no result_data"]
+        print(f"  {label}: exit {rc}; verdict {out.get('state')} {out.get('code') or ''}; result_data "
+              f"{json.dumps(got)[:200]}")
+        self.check(rc == 0 and out.get("state") == "accepted" and not reasons,
+                   f"{label}: the verdict is accepted, exit 0, and the derived result_data fits the review schema")
+        planted = [f for f in (got or {}).get("findings") or [] if f.get("file") == "src/pager.py"
+                   and f.get("line") == 3]
+        self.check(got.get("verdict") == "changes" and bool(planted),
+                   f"{label}: the review found the planted off-by-one (src/pager.py, line 3)")
+        written = self.final_reply(data["session"]["session_id"])
+        self.check(written is not None and data.get("reply") == written,
+                   f"{label}: the reply is exactly the session's own capped reply, block included")
+
+    def check_carrier(self, label: str, kid: str, reply: str) -> None:
+        """The parent's actual turn that carried this child's result: the one hub line right above the child's exact
+        reply between the turn's child-output markers."""
+        from agent_comms import output_schema
+        lines = self.carriers(kid)
+        turn = lines[-1] if lines else ""
+        token = turn.split("<<<child-output ", 1)[1][:16] if "<<<child-output " in turn else ""
+        paired = (f"{output_schema.ACCEPTED_LINE}\n<<<child-output {token}>>>\n{reply}\n<<<end child-output "
+                  f"{token}>>>")
+        self.check(len(lines) == 1 and turn.count(output_schema.ACCEPTED_LINE) == 1 and paired in turn,
+                   f"{label}: the parent's own turn carried exactly one hub line, right above the child's exact reply")
+
+    def wait_delivered(self, sroot: str, kid: str, seconds: float = 240.0) -> None:
+        deadline, mine = time.monotonic() + seconds, []
+        while time.monotonic() < deadline:
+            parent = self.show(sroot)
+            mine = [x for x in parent.get("results") or [] if x.get("child") == kid]
+            if mine and mine[-1]["state"] == "delivered" and parent.get("in_flight") is None:
+                break
+            time.sleep(0.5)
+        verdict = (mine[-1].get("output") if mine else None) or {}
+        print(f"  delivered as the parent's turn: result {mine[-1]['n'] if mine else None}, verdict {verdict}")
+        self.check(bool(mine) and mine[-1]["state"] == "delivered" and verdict.get("state") == "accepted",
+                   "D6: the result reached the parent as a turn, its verdict accepted")
+
+    def structured_off_scenario(self) -> None:
+        """D1-D2: a result as data from a hosted root, with child sessions OFF (as shipped)."""
+        review, _, task, _ = self.review_files()
+        model = ["--model", "haiku"]
+        print("\n[D1] a hosted root asked for a result as data, child sessions off")
+        for s in json.loads(self.board("session", "list", "--json")[0])["sessions"]:
+            self.board("session", "close", s["session_id"])
+            self.wait_ended(s["session_id"])
+        rc, out, err = self.board_rc("session", "start", str(self.project), task, "--agent", AGENT, *model,
+                                     "--output-schema", str(review), "--wait", "--json")
+        if rc not in (0, 3, 4):
+            raise SystemExit(f"start --output-schema exited {rc}:\n{out}{err}")
+        data = json.loads(out)
+        sid = data["session"]["session_id"]
+        self.check_data("D1 root", data, rc)
+        print("\n[D2] the same session asked again, told to leave the block out: missing, exit 3")
+        none = ("Reply with only the word: skipped. Do not write any result-data block in this reply."
+                if self.real else "data-none")
+        rc, out, err = self.board_rc("session", "send", sid, none, "--output-schema", str(review), "--wait", "--json")
+        data = json.loads(out)
+        out_ = data["message"].get("output") or {}
+        print(f"  exit {rc}; verdict {out_.get('state')} ({out_.get('code')}); reply {data.get('reply')!r}")
+        self.check(rc == 3 and out_.get("state") == "missing" and out_.get("code") == "no_block"
+                   and "result_data" not in data, "D2: no block, so missing (no_block), exit 3, and no result_data")
+        rc, out, err = self.board_rc("session", "send", sid, "done" if not self.real else
+                                     "Reply with exactly the word: done", "--wait")
+        self.check(rc == 0 and "result as data" not in err, "a message without a schema: exit and output as ever")
+        self.board("session", "close", sid)
+        self.wait_ended(sid)
+
+    def structured_scenario(self) -> None:
+        """D3-D6: children asked for a result as data (child sessions on)."""
+        from agent_comms import output_schema
+        review, unsat, task, codex_task = self.review_files()
+        model = ["--model", "haiku"]
+        first = "Reply with exactly the word: ready" if self.real else "ready"
+        print("\n[D3] a stock read-only Claude child (its runner names no MCP config: it has no board tools)")
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", AGENT, *model, "--wait",
+                               "--json")
+        root = json.loads(out)["session"]["session_id"]
+        rc, out, err = self.board_rc("session", "start", "--parent", root, "--access", "read-only", *model,
+                                     "--output-schema", str(review), task, "--wait", "--json")
+        data = json.loads(out)
+        kid = data["session"]["session_id"]
+        argv = self.started_with(kid) or []
+        self.check("--mcp-config" not in argv and "--tools=Read,Grep,Glob" in argv,
+                   "D3: the child is the stock read-only one: no MCP config at all, the read tools only")
+        self.check_data("D3 read-only Claude child", data, rc)
+        print("\n[D4] an unedited Codex child")
+        rc, out, err = self.board_rc("session", "start", "--parent", root, "--agent", CODEX_AGENT,
+                                     "--output-schema", str(review), codex_task, "--wait", "--json")
+        self.check_data("D4 Codex child", json.loads(out), rc)
+        print("\n[D5] an unsatisfiable schema first (missing), then the review schema asked again (accepted)")
+        rc, out, err = self.board_rc("session", "start", "--parent", root, "--access", "read-only", *model,
+                                     "--output-schema", str(unsat), task, "--wait", "--json")
+        data = json.loads(out)
+        kid5 = data["session"]["session_id"]
+        out_ = data["message"].get("output") or {}
+        print(f"  exit {rc}; verdict {out_.get('state')} ({out_.get('code')}); reasons {out_.get('reasons')}")
+        self.check(rc == 3 and out_.get("state") == "missing" and out_.get("code") in ("no_block", "shape")
+                   and (self.real or out_.get("code") == "shape"),
+                   "D5: nothing can fit, so missing (no_block or shape; the stand-in: exactly shape), exit 3")
+        again = ("Now review the same diff again and end your reply with the result-data block as asked."
+                 if self.real else "data-valid")
+        rc, out, err = self.board_rc("session", "send", kid5, again, "--output-schema", str(review), "--wait",
+                                     "--json")
+        self.check_data("D5 asked again", json.loads(out), rc)
+        print("\n[D6] an agent asks through board_session_spawn: the claim's facts, and the parent's own turn")
+        self.board("session", "grant", str(self.project), "--agent", SPAWN_AGENT, "--access", "workspace",
+                   "--hours", "1")
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", SPAWN_AGENT, *model,
+                               "--wait", "--json")
+        sroot = json.loads(out)["session"]["session_id"]
+        facts_keys = {"n", "child", "name", "agent", "message", "started_by", "outcome", "ok", "denials", "attempts",
+                      "output"}
+        hold = self.tmp / "d6-release"
+        if not self.real:
+            # The claim branch, deterministically: the parent is busy (a held turn), so the child's result waits for
+            # the call that waits for it.
+            self.board("session", "send", sroot, f"hold {hold}")
+        [spawned] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+            "task": task, "child_agent": AGENT, "access": "read-only", "output_schema": REVIEW_TEXT, "wait": True}]],
+            sroot)
+        answer = json.loads(spawned["text"])
+        self.check(not spawned["error"] and answer.get("output_request", {}).get("stored") is True,
+                   "D6: the tool acknowledges the request (output_request.stored)")
+        res, kid6 = answer.get("result"), answer["child"]["id"]
+        if not self.real:
+            self.check(res is not None, "D6: with the parent busy, the waiting call took the result")
+            hold.write_text("go")
+        if res is not None:
+            facts, text = res["result"], res.get("text") or ""
+            reply = self.final_reply(kid6)
+            print(f"  claimed with wait=true: facts {json.dumps(facts)[:300]}")
+            self.check(set(facts) == facts_keys and facts["output"] == {
+                "state": "accepted", "schema_sha": output_schema.prepare_schema(REVIEW_TEXT)[2]},
+                "D6: the claim's facts are the whitelist: main's keys plus `output` (state and fingerprint only)")
+            token = text.split("<<<child-output ", 1)[1][:16]
+            self.check(text.count(output_schema.ACCEPTED_LINE) == 1 and
+                       f"{output_schema.ACCEPTED_LINE}\n<<<child-output {token}>>>\n{reply}\n<<<end child-output "
+                       f"{token}>>>" in text, "D6: the claim's text has the one hub line right above the exact reply")
+        else:
+            self.wait_delivered(sroot, kid6)
+            self.check_carrier("D6 (delivered as the parent's turn)", kid6, self.final_reply(kid6))
+        # The delivered branch, deterministically, in a real run too (R5-06): the parent idle, nobody waiting, so no
+        # run passes on the claim branch alone.
+        [spawned] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+            "task": task, "child_agent": AGENT, "access": "read-only", "output_schema": REVIEW_TEXT}]], sroot)
+        kid7 = json.loads(spawned["text"])["child"]["id"]
+        self.wait_delivered(sroot, kid7)
+        self.check_carrier("D6 (delivered as the parent's turn)", kid7, self.final_reply(kid7))
+        for s in (root, sroot):
+            self.board("session", "close", s)
+            self.wait_ended(s)
+
     def spawn_scenario(self) -> None:
         """T10: an agent session starts child sessions itself (hosted_spawn.py), through the board's tools."""
         real = self.real
@@ -2554,9 +2776,9 @@ def main() -> int:
     ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
                     help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
                          "one codex-cli 0.171.0 lists)")
-    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer"),
-                    help="run only that scenario: one agent's, parent and child sessions, or the send modes on a "
-                         "running turn (default: all)")
+    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured"),
+                    help="run only that scenario: one agent's, parent and child sessions, the send modes on a "
+                         "running turn, or results as data (D1-D6) (default: all)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
     ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
@@ -2577,17 +2799,18 @@ def main() -> int:
         args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
         if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
             ap.error("--codex-bin must be an executable named codex")
-    if args.with_board and args.only in ("codex", "tree", "steer"):
+    if args.with_board and args.only in ("codex", "tree", "steer", "structured"):
         ap.error("--with-board is a Claude scenario")
     codex, claude = args.only in (None, "codex") and not args.with_board, args.only in (None, "claude")
     tree = args.only in (None, "tree") and not args.with_board
     steer = args.only in (None, "steer") and not args.with_board
+    structured = args.only in (None, "structured") and not args.with_board
     run = Run(args)
-    if claude or tree or steer:
+    if claude or tree or steer or structured:
         print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
                            else "stand-in (tests/stand_in_claude.py), no model")
               + (", with the temp board's MCP tools" if args.with_board else ""))
-    if codex or tree or steer:
+    if codex or tree or steer or structured:
         print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
@@ -2601,11 +2824,11 @@ def main() -> int:
     try:
         signal.signal(signal.SIGTERM, terminated)
         config_before, claude_before = None, run.claude_settings() if run.real else None
-        if (codex or tree or steer) and run.real_codex:
+        if (codex or tree or steer or structured) and run.real_codex:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
-        if codex or claude or args.with_board or steer:
+        if codex or claude or args.with_board or steer or structured:
             run.start_services()
             if codex:
                 run.codex_scenario()
@@ -2615,6 +2838,8 @@ def main() -> int:
                 run.scenario()
             if steer:
                 run.steer_scenario()
+            if structured:
+                run.structured_off_scenario()
             print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
                   else "\n[8] stopping the node (SIGTERM) and the hub" if claude
                   else "\n[C6] stopping the node (SIGTERM) and the hub" if codex
@@ -2626,15 +2851,18 @@ def main() -> int:
             run.check(run.leftovers() == [], "no session process is left behind")
             if (codex or steer) and run.real_codex:
                 run.check_codex_config(config_before)
-        if tree:
+        if tree or structured:
             run.enable_tree()
             run.start_services()
-            run.tree_scenario()
-            run.results_scenario()
-            run.spawn_scenario()
-            run.deep_scenario()
-            run.accounts_scenario()
-            run.pools_scenario()
+            if tree:
+                run.tree_scenario()
+                run.results_scenario()
+                run.spawn_scenario()
+                run.deep_scenario()
+                run.accounts_scenario()
+                run.pools_scenario()
+            if structured:
+                run.structured_scenario()
             print("\n[T8] stopping the node (SIGTERM) and the hub")
             run.stop()
             run.check(run.leftovers() == [], "no session process is left behind")

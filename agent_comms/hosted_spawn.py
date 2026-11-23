@@ -62,7 +62,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from . import db, hosted, hosted_results, hosted_tree, nodes, session_access
+from . import db, hosted, hosted_results, hosted_tree, nodes, output_schema, session_access
 from .config import NAME_RE
 from .core import Board, BoardError, Conflict, Forbidden, Invalid, NotFound, Principal
 from .nodes import _get, _put
@@ -1070,17 +1070,40 @@ def _pool_words_for(board: Board, c, caller: Caller, targets: list[dict], ceilin
 POOL_SLOT = "\x00"     # where `_spawn_line` leaves room for the pool words (nothing it writes holds one)
 
 
-def _frame(who: str, task: str, line: str, pools: list[dict]) -> str:
+def _frame(who: str, task: str, line: str, pools: list[dict], schema: str | None = None, token: str | None = None,
+           targets: str | None = None) -> str:
     """The task's message, with the spawn line `line` (from ONE evaluation: `_spawn_line`) and, where it left
     POOL_SLOT, the pool words fitted to the bytes the message has left once everything else of it is measured
     (hosted.MESSAGE_MAX_BYTES; render_task's token is the same length every time). Nothing is evaluated again after
     the measure. A line without the slot is rendered as it is (main's)."""
+    if schema is not None:
+        return _frame_asked(who, task, line, pools, schema, token, targets)
     if POOL_SLOT not in line:
         return render_task(who, task, line)
     head, _, rest = line.partition(POOL_SLOT)
     # Measured as hosted._text and _task_text measure a message (UTF-8, errors replaced): any text they take fits.
     room = hosted.MESSAGE_MAX_BYTES - len(render_task(who, task, head + rest).encode("utf-8", "replace"))
     return render_task(who, task, head + _fit_pools(pools, room) + rest)
+
+
+def _frame_asked(who: str, task: str, line: str, pools: list[dict], schema: str, token: str,
+                 targets: str | None) -> str:
+    """A task that asks for a result as data (DESIGN_NOTES "Structured results", F): the WHOLE message, ask line
+    and schema included, measured; the pool words fitted first, then the spawn line's targets cut to a pointer to
+    board_session_capabilities. What still does not fit is refused by the caller (hosted.ask measures the result)."""
+    def full(spawn_line: str) -> str:
+        return render_task(who, task, spawn_line, token=token, schema=schema)
+
+    def size(text: str) -> int:
+        return len(text.encode("utf-8", "replace"))
+
+    head, _, rest = line.partition(POOL_SLOT)
+    room = hosted.MESSAGE_MAX_BYTES - size(full(head + rest))
+    out = full(head + _fit_pools(pools, room) + rest)
+    if size(out) <= hosted.MESSAGE_MAX_BYTES or not targets or targets not in line:
+        return out
+    short = line.replace(targets, output_schema.SHORT_TARGETS, 1).replace(POOL_SLOT, "")
+    return full(short)
 
 
 def _fit_pools(pools: list[dict], room: int | None) -> str:
@@ -1098,7 +1121,8 @@ def _fit_pools(pools: list[dict], room: int | None) -> str:
 
 
 def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, depth: int, cfg, *,
-                node: str | None, access: str, ceiling: str, allowed: dict, pools_out: list | None = None) -> str:
+                node: str | None, access: str, ceiling: str, allowed: dict, pools_out: list | None = None,
+                targets_out: list | None = None) -> str:
     """The server's line telling a child (at `depth`, of `agent` and `model`, at `access`, on `node`) whether it may
     start helper sessions of its own, true at the moment it is written: how many levels remain below it, the targets
     it could start on its own node (within what it could give: its own access, `ceiling` above it, its agent's grant;
@@ -1152,6 +1176,8 @@ def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, 
     else:
         targets = ("agents " + ", ".join(names) + " on your node" + (", your own among them" if mine else "")
                    + " (any model they offer; prefer the cheapest that can do the work)")
+    if targets_out is not None:
+        targets_out.append(targets)     # (a task that asks for data may have it cut: `_frame_asked`)
     if cfg.pools and pools_out is not None:
         from . import account_pools
         wanted = set(n.partition("/")[0] for n in names)
@@ -1170,14 +1196,21 @@ def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, 
     return SPAWN_LINE.format(targets=targets, levels=levels, live=left["live"], hour=left["hour"], turns=left["turns"])
 
 
-def render_task(who: str, text: str, spawn_line: str = "", follow_up: bool = False, token: str | None = None) -> str:
+def render_task(who: str, text: str, spawn_line: str = "", follow_up: bool = False, token: str | None = None,
+                schema: str | None = None) -> str:
+    """`schema` (its rendered text; hosted.ask): the task also asks for its result as data, with the ask line after
+    the spawn line and the schema block after the task. Without it, the frame is what it always was."""
     token = token or secrets.token_hex(8)
-    while token in text:
+    while token in text or (schema is not None and token in schema):
         token = secrets.token_hex(8)
     what = "A follow-up message" if follow_up else "A task"
     head = TASK_HEADER.format(what=what, who=who, who_cap="That session", token=token)
-    return "\n".join([head] + ([spawn_line] if spawn_line else []) + [f"<<<task {token}>>>", text,
-                                                                      f"<<<end task {token}>>>"])
+    if schema is None:
+        return "\n".join([head] + ([spawn_line] if spawn_line else []) + [f"<<<task {token}>>>", text,
+                                                                          f"<<<end task {token}>>>"])
+    return "\n".join([head] + ([spawn_line] if spawn_line else []) + [output_schema.TASK_ASK.format(t=token)]
+                     + [f"<<<task {token}>>>", text, f"<<<end task {token}>>>",
+                        output_schema.schema_block(token, schema)])
 
 
 def _task_text(text: Any) -> str:
@@ -1202,6 +1235,7 @@ def _child_view(conn, r: dict, caller_id: str | None, board: Board | None = None
     """A child as the session that started it sees it: never its reply (that comes as a result) or the human's
     transcript path, and the last turn's outcome only when that turn was the caller's own task."""
     last = r.get("last_result") if isinstance(r.get("last_result"), dict) else None
+    m = None
     if last is not None:
         m = _get(conn, hosted._msg_key(r["session_id"], last.get("message"))) if type(last.get("message")) is int \
             else None
@@ -1218,7 +1252,8 @@ def _child_view(conn, r: dict, caller_id: str | None, board: Board | None = None
             "turns": r.get("turns"), "queued": r.get("queued"), "in_flight": r.get("in_flight"),
             "last_task_turn": ({"message": last.get("message"), "ok": last.get("ok"),
                                 "denials": last.get("denials") or [],
-                                "reason (untrusted)": last.get("detail") or ""} if last else None),
+                                "reason (untrusted)": last.get("detail") or ""}
+                               | _verdict_of(m) if last else None),
             "ended_reason (untrusted)": r.get("error") if r.get("state") == "ended" else None,
             "results_waiting": waiting, "allowance": _allowance(r), "created_at": r.get("created_at"),
             # Why each result of this child that has not reached the caller yet waits: pending ones, and ones in a
@@ -1226,8 +1261,37 @@ def _child_view(conn, r: dict, caller_id: str | None, board: Board | None = None
             **({"results_waiting_because": {str(x["n"]): hosted_results.waiting_because(board, conn, x)
                                             for x in outstanding}} if outstanding and board is not None else {}),
             "ended_at": r.get("ended_at"),
+            **_in_flight_request(conn, r),
             # The pool its agent was chosen from (account_pools.py), only for a child asked for by a pool's name.
             **({"pool": r["pool"].get("name")} if isinstance(r.get("pool"), dict) else {})}
+
+
+STATUS_REPLY = ("not in this view: a verdict only; the reply it was made from comes with the result (a turn of "
+                "yours, or a claim)")
+
+
+def _verdict_of(m: Any) -> dict:
+    """The verdict of the caller's task message `m` (the one `_child_view` already read), as status shows it: only
+    when that message asked, with no data and labelled as a verdict without its reply."""
+    if not isinstance(m, dict) or m.get("kind") != "task" or not isinstance(m.get("output"), dict):
+        return {}
+    v = output_schema.facts(m["output"])
+    if v["state"] == "asked" and m.get("state") in hosted.SETTLED:
+        v["state"] = "unchecked"
+    return {"output": v | {"reply": STATUS_REPLY}}
+
+
+def _in_flight_request(conn, r: dict) -> dict:
+    """The request of the caller's task message in flight, if it asked: its state only. A session never asked
+    (no `output_asked` on its record) is not looked into at all (R4-05)."""
+    n, last = r.get("in_flight"), r.get("output_asked")
+    if type(n) is not int or type(last) is not int or n > last:
+        return {}           # never asked, or the turn in flight is a later (plain) message than the last ask
+    m = _get(conn, hosted._msg_key(r["session_id"], n))
+    if not isinstance(m, dict) or m.get("kind") != "task" or not isinstance(m.get("output"), dict):
+        return {}
+    return {"in_flight_output": {"message": n, "state": m["output"].get("state"),
+                                 "schema_sha": m["output"].get("schema_sha")}}
 
 
 def capabilities(board: Board, p: Principal, ident: Ident, project: Any = None) -> dict:
@@ -1321,7 +1385,7 @@ def _revalidate(c, board: Board, p: Principal, ident: Ident, caller: Caller, cfg
 
 def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = None, model: Any = None,
           effort: Any = None, title: Any = None, role: Any = None, access: Any = None, isolation: Any = None,
-          request_id: Any = None, project: Any = None) -> dict:
+          request_id: Any = None, project: Any = None, output_schema: Any = None) -> dict:
     """Start a child session with a task. Returns {"child", "message", "created"}.
 
     ONE write transaction decides everything, in this order (`_spawn_in`): the caller, resolved (who it is, and a
@@ -1334,16 +1398,28 @@ def spawn(board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any = N
     child, never refuses. A limit's Needs-you item is asked for after the transaction, once it has refused."""
     hit = _retried(board, p, ident, project, request_id)
     if hit is not None:
-        return hit
+        return _acked(board, hit, output_schema)
     try:
         with db.write_tx(board.conn) as c:
             out = _spawn_in(c, board, p, ident, task=task, agent=agent, model=model, effort=effort, title=title,
-                            role=role, access=access, isolation=isolation, request_id=request_id, project=project)
+                            role=role, access=access, isolation=isolation, request_id=request_id, project=project,
+                            output_schema=output_schema)
     except LimitReached as e:
         _intend_alert(board, e.caller, e.reached)
         raise
     flush(board)
-    return out
+    return _acked(board, out, output_schema)
+
+
+def _acked(board: Board, out: dict, schema: Any) -> dict:
+    """`output_request` on an answer, only when THIS call carried a schema (R3-07): what the message the answer
+    returns asks for (a retry's original, whatever the retry carried)."""
+    if schema is None:
+        return out
+    m = out.get("message")
+    kid = (out.get("child") or {}).get("id")
+    rec = _get(board.conn, hosted._msg_key(kid, m["n"])) if isinstance(m, dict) and isinstance(kid, str) else None
+    return out | {"output_request": hosted.acknowledged(rec, bool(out.get("created", True)))}
 
 
 def _handle(c, p: Principal, caller: Caller, rid: str | None) -> dict | None:
@@ -1373,7 +1449,8 @@ def _retried(board: Board, p: Principal, ident: Ident, project: Any, request_id:
 
 
 def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: Any, model: Any, effort: Any,
-              title: Any, role: Any, access: Any, isolation: Any, request_id: Any, project: Any) -> dict:
+              title: Any, role: Any, access: Any, isolation: Any, request_id: Any, project: Any,
+              output_schema: Any = None) -> dict:
     """`spawn`'s one deciding transaction (its order is there). Every decision that compares against the time reads
     the clock afresh, under the write lock, where it is made (the grant's expiry, the hour's window); and everything
     that came from the grant is checked once more, on a fresh reading and the grant in force then, right before the
@@ -1436,9 +1513,19 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
         root = _make_iroot_in(c, p.name, caller.project, now)
         caller.id, caller.root, caller.record = root["session_id"], root["session_id"], root
     pools: list = []
-    text = _frame(_who(caller), task, _spawn_line(c, board, caller, agent, model, caller.depth + 1, cfg, node=node,
-                                                  access=access, ceiling=ceiling, allowed=allowed,
-                                                  pools_out=pools if cfg.pools else None), pools)
+    targets: list = [] if output_schema is not None else None
+    line = _spawn_line(c, board, caller, agent, model, caller.depth + 1, cfg, node=node, access=access,
+                       ceiling=ceiling, allowed=allowed, pools_out=pools if cfg.pools else None, targets_out=targets)
+    output = None
+    if output_schema is not None:
+        # Refused only here, after the retry lookup above (`_handle`): a retry gets its child first (R2-10).
+        who = _who(caller)
+        output, text, why = hosted.ask(task, output_schema, "parent", frame=lambda token, shown: _frame(
+            who, task, line, pools, schema=shown, token=token, targets=targets[0] if targets else None))
+        if why:
+            raise Invalid(why)
+    else:
+        text = _frame(_who(caller), task, line, pools)
     spawned_by = {"kind": caller.kind, "session": caller.id, "agent": p.name}
 
     def final(c2) -> None:
@@ -1474,7 +1561,7 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
         spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", hook=hook, tx=c,
         check=final, allowance={"may_spawn": True,
                                 "share": _allowance(caller.record)["share"] if caller.kind == "hosted" else None},
-        pool=choice.record() if choice is not None else None,
+        pool=choice.record() if choice is not None else None, output=output,
         **({"at": at, "placed": node if caller.kind == "interactive" else None} if choice is not None else {}))
     r, m = out["session"], out["message"]
     return {"child": _child_view(c, r, caller.id), "created": out["created"],
@@ -1550,7 +1637,8 @@ def _resent(board: Board, p: Principal, ident: Ident, child: Any, project: Any, 
 
 
 def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = None, may_spawn: Any = None,
-         spawn_share: Any = None, project: Any = None, mode: Any = "queue", request_id: Any = None) -> dict:
+         spawn_share: Any = None, project: Any = None, mode: Any = "queue", request_id: Any = None,
+         output_schema: Any = None) -> dict:
     """A follow-up message to a child this caller started, and/or a change to what that child may start. A message,
     or a change that widens the allowance, needs a live grant; a change that only narrows it does not.
     `mode` (hosted.SEND_MODES): queue (the next turn, the default), restart (interrupt the child's turn in flight,
@@ -1561,9 +1649,11 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
     rid = hosted_tree._request_id(request_id)
     if message is None and (mode != "queue" or rid is not None):
         raise Invalid("mode and request_id apply to a message")
+    if message is None and output_schema is not None:
+        raise Invalid("output_schema applies to a message")
     hit = _resent(board, p, ident, child, project, rid)
     if hit is not None:
-        return hit      # (before the gate too: as a spawn retry, whatever changed since, spawning switched off)
+        return _acked(board, hit, output_schema)    # (before the gate too: as a spawn retry, whatever changed since)
     cfg = _gate(board)
     if message is None and may_spawn is None and spawn_share is None:
         raise Invalid("give a message, or may_spawn / spawn_share to change what the child may start")
@@ -1575,7 +1665,7 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
     board._check_agent_write(p)
     caller = resolve(board, p, ident, project)
     kid = _own_child(board.conn, caller, child)
-    text = None
+    text = output = why = None
     if message is not None:
         # Without a request id, in main's order: the grant, the text, the limits. With one, the grant and limit
         # refusals wait for the transaction, after its duplicate lookup: a concurrent retry of a send that just went
@@ -1583,7 +1673,13 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
         # the caller's own checks above still come first: a retry with the same arguments passes them as before.)
         if rid is None:
             _grant_for(board.conn, caller, board.now())
-        text = render_task(_who(caller), _task_text(message), follow_up=True)
+        if output_schema is not None:
+            # Decided now; refused only once the retry lookup in the transaction below has missed (R2-10).
+            who, task_text = _who(caller), _task_text(message)
+            output, text, why = hosted.ask(task_text, output_schema, "parent", frame=lambda token, shown: render_task(
+                who, task_text, follow_up=True, token=token, schema=shown))
+        else:
+            text = render_task(_who(caller), _task_text(message), follow_up=True)
         if rid is None:
             try:
                 _check_limits(board.conn, caller, cfg, board.now(), ("turns",))
@@ -1601,7 +1697,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
             by = {"session": again.id, "agent": p.name}
             hit = hosted.sent_before(c, kid, rid, by, now)
             if hit is not None:
-                return _sent_view(c, kid, again, hit, False, {"mode": hit.get("mode") or "queue", "why": None})
+                return _acked(board, _sent_view(c, kid, again, hit, False, {"mode": hit.get("mode") or "queue",
+                                                                            "why": None}), output_schema)
+            if why:
+                raise Invalid(why)
             old = _allowance(kid)
             new = _merged(old, may_spawn, spawn_share)
             widens = _wider(new, old)
@@ -1621,7 +1720,7 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
                 _check_limits(c, again, cfg, now, ("turns",))
                 # Restarted or not, it is one child turn of the budget. Decided here, on what is stored now.
                 how = hosted.send_mode(c, kid, mode, by_parent=True)
-                m = hosted._enqueue(c, kid, "task", text, p.name, now)
+                m = hosted._enqueue(c, kid, "task", text, p.name, now, output=output)
                 hosted._mark(c, kid, m, how, rid, by, p.name, now)
                 b = _budget(c, caller.agent, caller.project)
                 _charge(b)
@@ -1633,9 +1732,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
         raise
     flush(board)
     if m is not None and (mode != "queue" or rid is not None):
-        return _sent_view(board.conn, kid, caller, m, True, how)
-    return {"child": _child_view(board.conn, kid, caller.id),
-            "message": {"n": m["n"], "state": m["state"]} if m else None, "notice": NOTICE}
+        return _acked(board, _sent_view(board.conn, kid, caller, m, True, how), output_schema)
+    return _acked(board, {"child": _child_view(board.conn, kid, caller.id),
+                          "message": {"n": m["n"], "state": m["state"]} if m else None, "notice": NOTICE},
+                  output_schema)
 
 
 def _owner_or_grant(board: Board, caller: Caller) -> None:
@@ -1671,6 +1771,8 @@ def taken(x: dict | None) -> dict | None:
         return None
     facts = {k: x.get(k) for k in ("n", "child", "name", "agent", "message", "started_by", "outcome", "ok",
                                    "denials", "attempts")}
+    if isinstance(x.get("output"), dict):
+        facts["output"] = output_schema.facts(x["output"])     # the verdict; the reply in `text` carries the block
     return {"result": facts, "text": hosted_results.render([x], header=CLAIM_HEADER)}
 
 

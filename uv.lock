@@ -17,6 +17,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "jsonschema" },
     { name = "pytest" },
 ]
 
@@ -31,7 +32,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "jsonschema", specifier = ">=4.26" },
+    { name = "pytest", specifier = ">=8" },
+]
 
 [[package]]
 name = "annotated-doc"

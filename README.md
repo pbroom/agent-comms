@@ -677,6 +677,74 @@ What to know:
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.
 
+#### Results as data
+
+A message can ask for its turn's result as data as well as prose. You give it a JSON Schema, and the board tells
+you whether the reply ended with a JSON object that fits it.
+
+```bash
+SESSION_ID=$(uv run board session start /Users/peter/app "Review the diff on this branch" \
+  --output-schema review.json --wait --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["session"]["session_id"])')
+uv run board session send "$SESSION_ID" "Review it again" --wait --output-schema \
+  '{"type": "object", "required": ["verdict"], "properties": {"verdict": {"enum": ["ok", "changes"]}}}'
+uv run board session start --parent "$SESSION_ID" --access read-only "Review the diff" --output-schema review.json --wait
+```
+
+`--output-schema S` takes a file's path (8 KB at most), or the JSON text itself when it starts with `{`. An empty one
+(`''`, or an empty file) is refused before anything is sent, and so is an empty `output_schema` over HTTP. For an
+agent, `board_session_spawn` and `board_session_send` take `output_schema`: the schema's JSON TEXT, as a string
+(empty, their default, means no ask). Their
+answer's `output_request.stored` confirms the ask. An older board server ignores the argument, so without that
+acknowledgement no verdict comes.
+
+- **What the session is told.** The hub adds a line to the turn's text:
+  - end the reply with a line `<<<result-data T>>>`, then one JSON object matching the schema, then a line
+    `<<<end result-data T>>>`, and nothing after it;
+  - T is the message's token, shown in the frame;
+  - keep the object under 8 KB and the whole reply under 16 KB;
+  - write the marker lines once, and indent any example of them.
+
+  The schema follows the line, between `<<<output-schema T>>>` markers, as one line of ASCII-escaped JSON. It is the
+  asker's text, which for a parent's task is untrusted data like the task.
+- **The verdict.** When the turn ends, the hub reads the end of the reply:
+  - **`accepted`**: exactly one block for this message's token closes the reply, its JSON is strict (no duplicate
+    keys, no NaN, safe numbers) and it fits the schema;
+  - **`missing`** otherwise, with a code: `no_block`, `form` (two blocks, text after it, a marker without its mate),
+    `too_big` (over 8,192 bytes), `not_json`, `not_object`, `shape` (with up to 10 reasons), `truncated` (the reply
+    ends with the hub's truncation marker: a signal that it may have been cut at 16 KB and lost its end);
+  - a turn that did not complete (failed, timed out, interrupted, cancelled, lost, the session ended) is never read.
+
+  Nothing is ever repaired or made up. To try again, send another message with the schema: no turn is re-asked
+  automatically.
+- **Only the shape is checked, and nothing is hidden.** The data is the session's claim, and every view says so.
+  The reply is stored and passed on exactly as without a schema, block included: it goes wherever the reply goes,
+  so asking adds no confidentiality. The hub keeps no copy of the data, only the verdict and a fingerprint.
+- **Who sees the verdict.**
+  - The asker: a parent gets one hub line above the reply in its result turn, and `output` (state, code, reasons) in
+    a claim and in `board_session_status`.
+  - You, always: `board session show` lists the verdict per message, and so does the Sessions tab.
+  - `--wait --json` MAY add `result_data`, the parsed object. It is read again from the reply in that same answer,
+    only while that reply is still the session's latest and its fingerprint still matches; otherwise it is left out
+    and the verdict stands alone (an accepted `--wait` can exit 0 without it).
+  - A parent that receives a turn YOU asked for sees the reply only, as today.
+- **Exit codes of `--wait`** with `--output-schema`:
+  - 0: accepted;
+  - 1: the turn failed;
+  - 3: the turn completed but the data is missing;
+  - 4: no verdict, for one of three reasons: the message is no longer kept, an older hub settled it (`unchecked`),
+    or a retry found an original message that asked for none.
+
+  Without `--output-schema`, exits are as before.
+- **The schema** is a small subset of JSON Schema 2020-12:
+  - the keywords: `type` (a word or a list), `properties`, `required`, `additionalProperties` (true/false), `items`,
+    `minItems`/`maxItems`, `minLength`/`maxLength`, `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`,
+    `enum`/`const` (scalars), `title`, `description`;
+  - the top level is `{"type": "object", ...}`;
+  - no references, patterns, formats or combinators;
+  - at most 8 KB as given and 8 KB as shown.
+
+  Anything else is refused with the reason. DESIGN_NOTES "Structured results" has the whole contract.
+
 #### Seeing session trees
 
 The dashboard's **Sessions** tab (beside Threads and Issues; the count is the hosted sessions recorded as not ended)

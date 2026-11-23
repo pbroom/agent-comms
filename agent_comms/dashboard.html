@@ -3138,6 +3138,12 @@ function renderSessionDetail(n) {
     m.replaced != null ? `it interrupted message ${m.replaced}` : null,
     m.restarted_by != null ? `interrupted: message ${m.restarted_by} replaced it` : null]
     .filter(Boolean).map(x => ` (${x})`).join("");
+  // A message (or a child's result) that asked for a result as data: its verdict, as plain text, labelled as the
+  // agent's claim checked for shape only, and where the reply it was made from is (hosted.output_view).
+  const verdictText = o => !o || typeof o !== "object" ? "" : `result as data: ${o.state}`
+    + (o.state === "missing" ? ` (${o.code}): ${o.words || ""}` + ((o.reasons || []).length ? `; why: ${o.reasons.join("; ")}` : "")
+      : o.state === "accepted" ? " (the agent's claim; only its shape was checked)" : o.state === "unchecked" ? `: ${o.words || ""}` : "")
+    + (o.reply ? `; the reply: ${o.reply}` : "");
   const out = [el("div", { class: "card-header" }, el("h2", { class: "card-title" }, `Session details: ${label}`),
     el("p", { class: "card-description" }, n.kind === "interactive"
       ? "The project's interactive root for this agent: the board made it when an agent conversation you opened (Claude Code, Codex) first started a child session, and every such conversation of that agent in this project shares it. It runs on no node; its children's results wait for those conversations' calls to take them."
@@ -3174,11 +3180,13 @@ function renderSessionDetail(n) {
   if (n.result) out.push(resultLine(n.result));
   if (d && Array.isArray(d.messages) && d.messages.length) out.push(el("h3", {}, "Messages"),
     el("ul", { class: "lin-msgs small", role: "list" }, d.messages.map(m => el("li", {},
-      el("span", {}, `message ${m.n} [${m.state}]${msgKinds[m.kind] || ""}${msgMode(m)}`), m.detail ? el("span", { class: "muted lin-clip", title: m.detail }, ` ${m.detail}`) : null))));
+      el("span", {}, `message ${m.n} [${m.state}]${msgKinds[m.kind] || ""}${msgMode(m)}`), m.detail ? el("span", { class: "muted lin-clip", title: m.detail }, ` ${m.detail}`) : null,
+      m.output ? el("div", { class: "lin-verdict muted" }, verdictText(m.output)) : null))));
   if (d && Array.isArray(d.results) && d.results.length) out.push(el("h3", {}, "Results from its children"),
     el("ul", { class: "lin-msgs small", role: "list" }, d.results.map(x => el("li", {},
       el("div", {}, `result ${x.n} · ${x.name || "child"} ${shortId(x.child)}${x.message ? ` message ${x.message}` : ""}: ${OUTCOMES[x.outcome] || x.outcome} · ${RESULT_STATES[x.state] || x.state}`),
       x.waiting_because ? el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Waits"), x.waiting_because) : null,
+      x.verdict ? el("div", { class: "lin-verdict muted" }, verdictText(x.verdict)) : null,
       x.state === "undelivered" && x.why ? el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Why"), x.why) : null,
       x.state === "undelivered" ? outputBlock(`res-${n.session_id}-${x.n}`, `Output from ${x.name || "child"} (kept for you: never delivered)`,
         x.output && x.output.text || "(no output)", cutNote(x.output, n.session_id, n.kind === "hosted")) : null))));
