@@ -412,6 +412,7 @@ class SessionRunner:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
                     log.warning("could not report session %s: %s", sid, e)
+                    self._drop_sent(sent_items)
                     return False
                 if code == 422 and named and sid not in self.refused:
                     # Refused whole by a hub that, as its last listing said, takes what the report carried: it may
@@ -421,6 +422,7 @@ class SessionRunner:
                     self.refused.add(sid)
                     log.warning("the hub refused the report for session %s as malformed (422): asking again what it "
                                 "takes before reporting again", sid)
+                    self._drop_sent(sent_items)
                     return False
                 if code == 422:
                     # The hub could not read the report at all: most likely it is older than this node (update the
@@ -435,9 +437,13 @@ class SessionRunner:
                 self.reported[sid] = status
                 self.sent[sid] = body["seq"]
             sent_items |= {i for i, _ in mine}
-        # Drop exactly the events that were sent (appends during the flush only ever come after them), keep the order.
-        self.pending = [item for i, item in enumerate(self.pending) if i not in sent_items]
+        self._drop_sent(sent_items)
         return True
+
+    def _drop_sent(self, sent_items: set[int]) -> None:
+        """Drop exactly the events this pass sent (appends during the flush only ever come after them), keeping the
+        order: also when a later session's report stops the pass, so an earlier session's events are not sent again."""
+        self.pending = [item for i, item in enumerate(self.pending) if i not in sent_items]
 
     def _sync(self, wait: float) -> dict:
         params: dict[str, Any] = {"wait": wait, "tree": SESSION_PROTOCOL,   # children, spawn, the hold, restart

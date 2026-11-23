@@ -1441,9 +1441,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
     kid = _own_child(board.conn, caller, child)
     text = None
     if message is not None:
-        # Without a request id, in main's order: the grant, the text, the limits. With one, every refusal waits for
-        # the transaction, after its duplicate lookup: a concurrent retry of a send that just went through gets that
-        # message back, never a limit it reached itself.
+        # Without a request id, in main's order: the grant, the text, the limits. With one, the grant and limit
+        # refusals wait for the transaction, after its duplicate lookup: a concurrent retry of a send that just went
+        # through gets that message back, never a limit it reached itself. (The argument checks, the feature gate and
+        # the caller's own checks above still come first: a retry with the same arguments passes them as before.)
         if rid is None:
             _grant_for(board.conn, caller, board.now())
         text = render_task(_who(caller), _task_text(message), follow_up=True)

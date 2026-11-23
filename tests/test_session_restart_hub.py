@@ -372,6 +372,14 @@ def test_show_lists_both_links_of_a_restart():
     assert line == (" (restart of message 1) (it interrupted message 1) (interrupted: message 5 replaced it)")
 
 
+def test_show_says_in_words_that_a_parents_restarted_turn_was_kept():
+    """Review follow-up (#103): `kept` has a plain label, as the other result states do."""
+    [line] = cli._fmt_result({"n": 3, "state": "kept", "child": "c" * 8, "name": "general-1", "message": 1,
+                              "outcome": "interrupted", "detail": "interrupted by a restart: message 2 replaced it"})
+    assert line.startswith("result 3 [kept, not sent as a turn: its parent restarted the turn itself] general-1 ")
+    assert ": interrupted (interrupted by a restart: message 2 replaced it)" in line
+
+
 # ------------------------------------------------------------ the node: its record, its reports, its races
 
 
@@ -483,6 +491,30 @@ def test_a_report_an_older_hub_refuses_is_kept_and_sent_again_in_order(senv):
     assert [e["kind"] for e in sent] == ["turn_ended", "delivered"] and "restarted_by" not in sent[0]
 
 
+def test_a_pass_stopped_by_a_later_sessions_report_keeps_only_what_was_not_sent(senv):
+    """Review follow-up (#103): the events a pass already posted for an earlier session are dropped even when a later
+    session's report stops the pass (the hub unreachable), so they are never posted again."""
+    runner = senv.node.sessions
+    a, b = "a" * 8, "b" * 8
+    runner.pending = [(a, {"kind": "delivered", "message": 1}), (b, {"kind": "delivered", "message": 1})]
+    posts = []
+
+    class Down:
+        def request(self, method, path, **kw):
+            posts.append(path)
+            if path.endswith(b):
+                raise httpx.ConnectError("the hub went away")
+            return httpx.Response(200, json={}, request=httpx.Request(method, "http://hub" + path))
+    runner.client = Down()
+    assert runner._flush() is False
+    assert runner.pending == [(b, {"kind": "delivered", "message": 1})], "a's event was sent: not kept to go again"
+    runner.client = type("Up", (), {"request": lambda self, method, path, **kw: (posts.append(path), httpx.Response(
+        200, json={}, request=httpx.Request(method, "http://hub" + path)))[1]})()
+    posts.clear()
+    assert runner._flush() is True and runner.pending == []
+    assert posts == [f"/api/nodes/sessions/{b}"], "only b's report goes again"
+
+
 def test_a_hub_downgraded_with_a_restart_pending_records_one_turn_each(senv, monkeypatch):
     """R3-02, for a restart: a hub from before restarts gets the interrupted turn's end without `restarted_by`: that
     turn failed (its detail says it was interrupted), the restart's message is an ordinary turn of its own, with its
@@ -580,6 +612,43 @@ def test_a_parents_restart_runs_in_the_ordinary_frame_and_keeps_the_interrupted_
     interrupted(senv, proc, kid)
     y = next(x for x in results_of(senv, sid) if x["child"] == kid and x["message"] == n)
     assert y["outcome"] == "interrupted" and y["state"] != "kept", "the human's restart tells the parent"
+
+
+def test_a_wrong_restart_link_from_a_faulty_node_never_keeps_a_parents_result(senv):
+    """Review follow-up (#103): `restarted_by` is kept, and a result `kept`, only when the message it names is a
+    restart of this very turn (`mode` restart, `into` it), as the hub already checked for `replaced`."""
+    sid, kid, proc = child_in_turn(senv)
+    other = spawn(senv, bound(senv, sid), task="other task", agent="claude")["child"]["id"]
+    tick(senv)
+    begin(senv, other)
+    for x in (kid, other):
+        hs.send(senv.board, senv.p["claude"], bound(senv, sid), x, message="next, queued")     # an ORDINARY task
+    end = {"kind": "turn_ended", "message": 1, "ok": False, "delivered": True, "detail": "aborted", "denials": [],
+           "meta": {}, "text": "", "answered": True}
+    # The node names an ordinary queued task as the turn's restart: not stored.
+    r = senv.laptop.post(f"/api/nodes/sessions/{kid}", json={"events": [end | {"restarted_by": 2}]})
+    assert r.status_code == 200, r.text
+    assert "restarted_by" not in msg(senv, kid, 1) and "replaced" not in msg(senv, kid, 2)
+    # A link already on the record (however it got there) that names no restart of the turn keeps nothing either.
+    edit_msg(senv, other, 1, restarted_by=2)
+    r = senv.laptop.post(f"/api/nodes/sessions/{other}", json={"events": [end]})
+    assert r.status_code == 200, r.text
+    for x in (kid, other):
+        [res] = [y for y in results_of(senv, sid) if y["child"] == x and y["message"] == 1]
+        assert res["state"] != "kept", x
+
+
+def test_a_restart_named_on_a_turn_that_completed_is_delivered_as_any_result(senv):
+    """Sol R5: `kept` needs an interrupted outcome too. A node that names a valid restart of the turn while reporting
+    the turn a success: the result is delivered, not kept."""
+    sid, kid, proc = child_in_turn(senv)
+    hs.send(senv.board, senv.p["claude"], bound(senv, sid), kid, message="do this instead", mode="restart")
+    end = {"kind": "turn_ended", "message": 1, "ok": True, "delivered": True, "detail": "", "denials": [],
+           "meta": {}, "text": "done anyway", "answered": True, "restarted_by": 2}
+    r = senv.laptop.post(f"/api/nodes/sessions/{kid}", json={"events": [end]})
+    assert r.status_code == 200, r.text
+    [x] = [x for x in results_of(senv, sid) if x["child"] == kid and x["message"] == 1]
+    assert (x["outcome"], x["state"]) == ("completed", "pending"), "an ordinary result, waiting for its parent"
 
 
 def test_a_parents_restart_whose_interrupt_was_refused_still_tells_the_parent(senv):

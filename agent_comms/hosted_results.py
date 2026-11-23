@@ -260,9 +260,12 @@ def turn(c, child: dict, m: dict, *, ok: bool, delivered: bool, detail: str, tex
     # The parent restarted this turn itself: the result is kept (for the lineage, and for a call of the parent's still
     # waiting for this turn), but it is not delivered as another turn of the parent's, decided before any limit of the
     # automatic delivery. A restart by the human still is delivered: the parent learns its task was interrupted.
+    # Only an interrupted turn, and only for the parent's restart of that very turn: that the interrupt caused the end
+    # is still the node's word (`restarted_by`), but a turn that completed (or failed otherwise) is delivered.
     by = _get(c, hosted._msg_key(child["session_id"], m["restarted_by"])) if type(m.get("restarted_by")) is int \
         else None
-    return _add(c, child, fields, now, kept=isinstance(by, dict) and by.get("kind") == "task")
+    return _add(c, child, fields, now, kept=fields["outcome"] == "interrupted" and isinstance(by, dict)
+                and by.get("kind") == "task" and by.get("mode") == "restart" and by.get("into") == m["n"])
 
 
 def ended(c, r: dict, detail: str, now: float, record: bool = False, cut: list[dict] | None = None) -> None:

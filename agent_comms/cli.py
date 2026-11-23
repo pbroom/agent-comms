@@ -978,7 +978,8 @@ def _fmt_result(x: dict) -> list[str]:
     One that will never be a turn comes with the child's reply, which is kept for you."""
     where = {"queued": f"in message {x.get('carrier')}, its start not confirmed yet",
              "delivered": f"delivered in message {x.get('carrier')}",
-             "claimed": "claimed by a caller that waited for it"}.get(x["state"], x["state"])
+             "claimed": "claimed by a caller that waited for it",
+             "kept": "kept, not sent as a turn: its parent restarted the turn itself"}.get(x["state"], x["state"])
     head = (f"result {x['n']} [{where}] {x.get('name') or 'child'} {x['child']}"
             + (f" message {x['message']}" if x.get("message") is not None else "") + f": {x['outcome']}"
             + (f" ({x['detail']})" if x.get("detail") else "")

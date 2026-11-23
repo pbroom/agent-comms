@@ -13,6 +13,8 @@ list` and `show` print) of its record AS STORED, with these additions:
   and why it waits (`hosted_results.waiting_because`, the server's words), never its text.
 - `output`: the session's last reply, the agent's own words, cut to OUTPUT_MAX characters (`truncated`, `length`,
   both in code points). It is untrusted data: returned as a JSON string and shown by the dashboard as plain text.
+  `trees` sends only its first PREVIEW_MAX characters (`truncated` then says the preview is not all of it), so a
+  poll does not carry every session's reply; `detail` has the OUTPUT_MAX text.
 - `unsettled`: what the next settling read (`board session list` or `show`: `hosted._settle`) would do to the
   record, which this view never does: end a child its node can no longer run, or fail the turn in flight (or end
   the session being closed) on a node gone silent. The view shows the record as stored and says this beside it.
@@ -36,10 +38,13 @@ from . import hosted, hosted_results, hosted_spawn, hosted_tree, nodes
 from .core import Board, NotFound, Principal
 
 OUTPUT_MAX = 4000       # code points of any agent text the view returns (`show` keeps up to 16 KB)
+PREVIEW_MAX = 300       # ... of a session's reply in `trees` (the details have up to OUTPUT_MAX)
 LOST = ("its node went silent with a turn in flight or a close pending: the next settling read (`board session "
         "list` or `show`) marks that turn failed as lost, or ends the session being closed")
 ORPHAN = ("its node can no longer run it ({why}): the next settling read (`board session list` or `show`) ends it, "
           "and a turn in flight there is failed as lost")
+LOOP = ("its parent links form a loop (it is, through its parents, its own ancestor), which the hub never makes: "
+        "shown as a root of its own")
 ORPHAN_WHY = {hosted_tree.ORPHANED: "its latest hello says it hosts no child sessions",
               hosted_tree.ORPHANED_HOLD: "it does not keep a full-access session's parent up for the sessions under it"}
 
@@ -48,6 +53,11 @@ def _cap(text: Any) -> dict | None:
     if not isinstance(text, str) or not text:
         return None
     return {"text": text[:OUTPUT_MAX], "truncated": len(text) > OUTPUT_MAX, "length": len(text)}
+
+
+def _preview(out: dict) -> dict:
+    """A capped `output` as `trees` sends it: its first PREVIEW_MAX characters, `length` still the whole reply's."""
+    return out | {"text": out["text"][:PREVIEW_MAX], "truncated": out["truncated"] or len(out["text"]) > PREVIEW_MAX}
 
 
 def _started_by(r: dict) -> dict:
@@ -212,7 +222,23 @@ def trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
             shape[pid]["children"].append(shape[sid])
         else:
             shape[sid]["detached"] = isinstance(pid, str)   # its parent is no longer on record (an old record pruned)
+            shape[sid]["loop"] = pid == sid                 # ... or it is its own parent: the smallest loop (below)
             anchors.append(shape[sid])
+    # A loop in the parent links (A's parent is B, B's parent is A: the hub never makes one) would leave its sessions
+    # under no anchor: each session on the loop is shown as a detached root of its own, with a note, never hidden.
+    reached = {n["id"] for a in anchors for n in _walk(a)}
+    for sid in rows:
+        if sid in reached:
+            continue
+        loop, x = [], sid
+        while x in rows and x not in loop:
+            loop.append(x)
+            x = rows[x].get("parent")
+        for y in loop[loop.index(x):] if x in loop else []:
+            shape[rows[y]["parent"]]["children"].remove(shape[y])
+            shape[y] |= {"detached": True, "loop": True}
+            anchors.append(shape[y])
+            reached |= {n["id"] for n in _walk(shape[y])}
     shown = []
     for a in anchors:
         members = [n for n in _walk(a) if "r" in n]
@@ -226,8 +252,12 @@ def trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
     def build(n: dict) -> dict:
         body = _body(board, n["id"], n.get("r"), n.get("iroot"), reads, now)
         out = {k: v for k, v in body.items() if k not in ("messages", "results")} | {"version": _version(body)}
+        if out.get("output"):
+            out["output"] = _preview(out["output"])       # the whole capped text only in `detail`
         if n.get("detached"):
             out["detached"] = True
+        if n.get("loop"):
+            out["loop"] = LOOP
         kids = sorted(n["children"], key=lambda k: (float((k.get("r") or {}).get("created_at") or 0),
                                                     (k.get("r") or {}).get("child_no") or 0))
         out["children"] = [build(k) for k in kids]
@@ -242,7 +272,7 @@ def trees(board: Board, p: Principal, include_ended: bool = False) -> dict:
                     "sessions": total, "live": live, "created_at": top.get("created_at"), "session": top})
     out.sort(key=lambda t: (t["live"] == 0, -float(t["created_at"] or 0)))
     return {"trees": out, "live_sessions": sum(1 for r in rows.values() if r.get("state") != "ended"),
-            "now": now, "output_max": OUTPUT_MAX}
+            "now": now, "output_max": OUTPUT_MAX, "preview_max": PREVIEW_MAX}
 
 
 def detail(board: Board, p: Principal, session_id: Any) -> dict:

@@ -1880,8 +1880,11 @@ function listRow(attrs, id, href, on, select, title, sub, when) {
 function listRows(label, rows, ids, currentId, select, linkId) {
   const list = el("ul", { class: "rows", role: "list", "aria-label": label }, rows);
   list.addEventListener("keydown", e => {
-    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || currentId === null || currentId === undefined) return;
-    const i = ids.indexOf(currentId) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
+    // From the focused row's link (with none selected, the first row is still in the Tab order), else the selected.
+    const focused = ids.find(id => linkId(id) === (e.target && e.target.id));
+    const from = focused !== undefined ? focused : currentId;
+    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(e.key) || from === null || from === undefined) return;
+    const i = ids.indexOf(from) + (e.key === "ArrowDown" || e.key === "j" ? 1 : -1);
     if (i < 0 || i >= ids.length) return;
     e.preventDefault();
     select(ids[i]);
@@ -2892,9 +2895,10 @@ function linFacts(n) {
     item(`by ${startedBy(n.started_by)}`)];
 }
 const OUTCOMES = { completed: "completed", failed: "failed", timed_out: "timed out", withdrawn: "withdrawn",
-  ended: "the child session ended", cancelled: "cancelled" };
+  ended: "the child session ended", cancelled: "cancelled", interrupted: "interrupted by a restart" };
 const RESULT_STATES = { pending: "waiting for its parent", queued: "in a turn of its parent's, start not confirmed",
-  delivered: "delivered to its parent", claimed: "taken by its starter's call", undelivered: "not delivered" };
+  delivered: "delivered to its parent", claimed: "taken by its starter's call", undelivered: "not delivered",
+  kept: "kept, not sent as a turn (its parent restarted the turn itself)" };
 function resultLine(r) {
   if (!r) return null;
   const bad = r.outcome !== "completed";
@@ -2909,13 +2913,17 @@ function resultLine(r) {
 // An agent's own words: plain text in a <pre> (textContent through el), a few lines unless the human expands it.
 // `key` names the block for the expanded set, so a refresh keeps it open.
 const OUTPUT_LINES = 4;
-function outputBlock(key, label, text, note) {
+// `more`: the text is a preview of what the session's details hold (the trees carry hosted_lineage.PREVIEW_MAX
+// characters of each reply): Show all opens the details instead of unfolding the preview.
+function outputBlock(key, label, text, note, more) {
   if (typeof text !== "string" || !text) return null;
   const open = linOutputOpen.has(key), id = `out-${key}`;
   const long = text.split("\n").length > OUTPUT_LINES || text.length > 320;
-  return el("div", { class: "lin-output-box" },
+  // A labelled region that can take focus (not in the Tab order): Show all in the tree moves the focus here.
+  return el("div", { class: "lin-output-box", id: `${id}-box`, role: "region", "aria-label": label, tabindex: "-1" },
     el("div", { class: "lin-output-label" }, el("span", {}, label), el("span", { class: "badge badge-outline" }, "untrusted · plain text"),
-      long ? el("button", { type: "button", class: "linkish", id: `${id}-toggle`, "aria-expanded": open ? "true" : "false", "aria-controls": id,
+      more ? el("button", { type: "button", class: "linkish", id: `${id}-toggle`, title: "Show the whole reply in the session's details", onclick: more }, "Show all")
+      : long ? el("button", { type: "button", class: "linkish", id: `${id}-toggle`, "aria-expanded": open ? "true" : "false", "aria-controls": id,
         onclick: () => { open ? linOutputOpen.delete(key) : linOutputOpen.add(key); render(); } }, open ? "Show less" : "Show all") : null),
     el("pre", { class: "lin-output" + (long && !open ? " clamped" : ""), id }, text),
     note ? el("div", { class: "muted small" }, note) : null);
@@ -2923,8 +2931,24 @@ function outputBlock(key, label, text, note) {
 function linOutput(n, where) {
   const o = n.output;
   if (!o || typeof o.text !== "string") return null;
-  return outputBlock(`${where}-${n.session_id}`, `Output from ${n.name || linLabel(n)}` + (o.for_message ? ` (reply to message ${o.for_message})` : ""),
-    o.text, cutNote(o, n.session_id));
+  // A preview shorter than what the details hold (up to output_max): Show all loads them, the reply unfolded there,
+  // then (that session still selected) scrolls to that reply and moves the focus to it, or to the error when the
+  // details could not be loaded (the reply shown then is only the preview).
+  const max = lineage && typeof lineage.output_max === "number" ? lineage.output_max : 4000;
+  const id = n.session_id;
+  const more = o.truncated && [...o.text].length < Math.min(o.length, max) ? () => {
+    linOutputOpen.add(`detail-${id}`);
+    selectSession(id);
+    loadSessionDetail().then(() => {
+      const box = selectedSession !== id || shownId() !== id ? null
+        : document.getElementById(sessionDetailError ? "session-detail-error" : `out-detail-${id}-box`);
+      if (!box) return;
+      if (box.scrollIntoView) box.scrollIntoView({ block: "start" });
+      box.focus({ preventScroll: true });
+    });
+  } : null;
+  return outputBlock(`${where}-${id}`, `Output from ${n.name || linLabel(n)}` + (o.for_message ? ` (reply to message ${o.for_message})` : ""),
+    o.text, cutNote(o, n.session_id), more);
 }
 
 function selectSession(id) {
@@ -2958,16 +2982,21 @@ async function fetchLineage() {
     return loadLineage();
   }
   lineage = got; lineageAt = Date.now(); lineageError = "";
-  loadSessionDetail().then(() => { if (onSessionsTab()) render(); });    // on its own: the trees never wait for it
+  // On its own: the trees never wait for it. Drawn again only when the details changed (not for a cached answer).
+  loadSessionDetail().then(changed => { if (changed && onSessionsTab()) render(); });
 }
 // The shown session's details (GET /api/hosted-trees/{id}: read-only and capped), fetched when the shown session or
 // its `version` changes, not on every refresh, and never in the way of the trees. Kept for the same session while a
-// later fetch fails, with the error.
+// later fetch fails, with the error. Resolves true when what the panel shows changed.
 function loadSessionDetail() {
   const { session } = currentLineage();
-  if (!session) { sessionDetail = null; sessionDetailError = ""; detailFor = null; return Promise.resolve(); }
+  if (!session) {
+    const had = sessionDetail !== null || sessionDetailError !== "";
+    sessionDetail = null; sessionDetailError = ""; detailFor = null;
+    return Promise.resolve(had);
+  }
   const want = session.session_id, version = session.version, key = `${want}|${version}`;
-  if (detailFor && detailFor.id === want && detailFor.version === version) return Promise.resolve();
+  if (detailFor && detailFor.id === want && detailFor.version === version) return Promise.resolve(false);
   if (detailFlight && detailFlight.key === key) return detailFlight.promise;
   const flight = { key, promise: null };
   flight.promise = fetchSessionDetail(want, version).finally(() => { if (detailFlight === flight) detailFlight = null; });
@@ -2979,15 +3008,16 @@ async function fetchSessionDetail(want, version) {
   const current = () => gen === detailGen && shownId() === want && onSessionsTab();
   try {
     const d = await api("GET", `/api/hosted-trees/${encodeURIComponent(want)}`);
-    if (!current()) return;
+    if (!current()) return false;
     // Cached under the version the body itself carries (not the tree's, which may be older or newer than it).
     sessionDetail = d; sessionDetailError = "";
     detailFor = { id: want, version: typeof d.version === "string" ? d.version : version };
   } catch (e) {
-    if (!current()) return;
+    if (!current()) return false;
     if (sessionDetail && sessionDetail.session_id !== want) sessionDetail = null;
     sessionDetailError = e.message; detailFor = null;     // tried again on the next refresh
   }
+  return true;
 }
 
 function renderSessionTreeList(threadCount) {
@@ -3038,7 +3068,8 @@ function linItem(n, selectedId, isRoot) {
         "aria-current": on ? "true" : null, title: `${label} (${n.session_id}): show its details`,
         onclick: () => selectSession(n.session_id) }, label),
       stateChip(n),
-      n.detached ? el("span", { class: "chip warn", title: `Its parent ${n.parent} is no longer on record` }, "parent gone") : null,
+      n.loop ? el("span", { class: "chip warn", title: n.loop }, "parent loop")
+      : n.detached ? el("span", { class: "chip warn", title: `Its parent ${n.parent} is no longer on record` }, "parent gone") : null,
       n.unsettled ? el("span", { class: "chip warn", title: n.unsettled }, "not settled") : null,
       kids.length ? el("span", { class: "muted small" }, kids.length === 1 ? "1 child" : `${kids.length} children`) : null),
     el("div", { class: "lin-facts small muted" }, linFacts(n)),
@@ -3112,7 +3143,8 @@ function renderSessionDetail(n) {
       ? "The project's interactive root for this agent: the board made it when an agent conversation you opened (Claude Code, Codex) first started a child session, and every such conversation of that agent in this project shares it. It runs on no node; its children's results wait for those conversations' calls to take them."
       : "What board session show prints for it, as stored on the hub (this view never changes it)."))];
   if (n.unsettled) out.push(el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Not settled yet"), n.unsettled));
-  if (sessionDetailError) out.push(el("div", { class: "err", role: "alert" }, `Couldn't load its details: ${sessionDetailError}`));
+  if (sessionDetailError) out.push(el("div", { class: "err", role: "alert", id: "session-detail-error", tabindex: "-1",
+    "aria-label": `Couldn't load the details of ${label}: ${sessionDetailError}` }, `Couldn't load its details: ${sessionDetailError}`));
   out.push(el("dl", { class: "lin-dl" },
     detailRow("Id", n.session_id),
     detailRow("Kind", n.kind === "interactive" ? "interactive root" : n.parent ? `child (depth ${n.depth})` : "hosted root"),
@@ -3478,7 +3510,7 @@ function draw(app) {
   const received = new Map();   // session id -> [unstick]
   if (human) for (const u of Object.values(lastUnstick)) for (const s of unstickReceivers(u))
     received.set(s.id, [...(received.get(s.id) || []), u]);
-  right.append(el("section", { class: "card", id: "sessions" }, el("h2", {}, "Sessions"),
+  right.append(el("section", { class: "card", id: "sessions" }, el("h2", {}, "Board sessions"),
     state.sessions.map(s => el("div", { class: "post small", "data-session": s.id },
       el("div", {}, el("strong", {}, `s${s.id} ${s.agent}`), " ", el("span", { class: "muted" }, s.runtime),
         (received.get(s.id) || []).flatMap(u => [" ", el("a", { class: "chip warn unstick-chip",

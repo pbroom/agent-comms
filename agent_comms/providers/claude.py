@@ -33,6 +33,9 @@ Restart (measured on Claude Code 2.1.330, DESIGN_NOTES "Restarting a running tur
 - Every `init` lists the process's `capabilities` (`interrupt_receipt_v1` among them) and `claude_code_version`. This
   process restarts only once an `init` of its own said `interrupt_receipt_v1` (`restarts`): a CLI that does not, or a
   process that has not started a turn yet, reports no restart.
+- An interrupt written behind a turn's user line before that turn's `init` is answered `success` at once and the
+  turn then runs whole (measured on 2.1.330, DESIGN_NOTES "Review follow-ups (2026-11-23)"). So the host writes it
+  only once the turn's own `init` came (`takes_interrupt`), and a receipt that arrives before it never counts.
 """
 from __future__ import annotations
 
@@ -155,6 +158,7 @@ class ClaudeSession:
 
     def _reset_turns(self) -> None:
         self._open = False              # a turn is running in this process (written or begun, its result not yet)
+        self._begun = False             # ... and its own `init` came (`takes_interrupt`)
         self._caps: frozenset[str] = frozenset()   # what this process's `init` said it can (module text)
         self._interrupt_id: str | None = None    # the request id of the interrupt written for the turn in flight
         self._interrupt_ok = False      # ... which the process answered with success
@@ -246,12 +250,18 @@ class ClaudeSession:
     def turn(self, text: str, kind: str = "user") -> list[bytes]:
         # `kind` has no place in Claude's stream-json input (a user message is the one kind of turn it takes): the
         # text is all it gets.
-        self._open = True
+        self._open, self._begun = True, False
         self._interrupt_id, self._interrupt_ok = None, False
         return [_user_line(text)]
 
     def interrupt(self) -> list[bytes] | None:
         return None
+
+    def takes_interrupt(self) -> bool:
+        """Only once THIS turn's `init` came. The process says it can restart in its first `init`, but an interrupt
+        written behind a later turn's line, before that turn's `init`, is answered `success` and the turn then runs
+        whole (measured on Claude Code 2.1.330: DESIGN_NOTES "Review follow-ups (2026-11-23)")."""
+        return self._open and self._begun and self.restarts
 
     def interrupt_turn(self) -> list[bytes] | None:
         """The in-band interrupt of the turn in flight (a restart's first step): the turn's `result` follows."""
@@ -297,7 +307,7 @@ class ClaudeSession:
         if init:
             events = [] if self._ready else [Event("ready", provider_id=sid)]
             self._ready = True
-            self._open = True
+            self._open = self._begun = True
             caps = ev.get("capabilities")
             self._caps = frozenset(c for c in (caps if isinstance(caps, list) else [])[:MAX_CAPS] if isinstance(c, str))
             mode, tools = ev.get("permissionMode"), ev.get("tools")
@@ -316,8 +326,10 @@ class ClaudeSession:
             answer = ev.get("response")
             if (self._interrupt_id is not None and isinstance(answer, dict)
                     and answer.get("request_id") == self._interrupt_id):
-                # The receipt for the interrupt of the turn in flight: only `success` counts (`interrupted`).
-                self._interrupt_ok = answer.get("subtype") == "success"
+                # The receipt for the interrupt of the turn in flight: only `success` counts (`interrupted`), and only
+                # once the turn's `init` came: one before it was not applied (measured), so a later abort of the
+                # turn is its own.
+                self._interrupt_ok = answer.get("subtype") == "success" and self._begun
                 return [], []
             if self._asked is None or not isinstance(answer, dict) or answer.get("request_id") != self._asked:
                 return [], []

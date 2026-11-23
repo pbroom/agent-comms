@@ -151,7 +151,7 @@ test('the list row offers Unstick under the amber dot; it opens that thread and 
   dom.window.close();
 });
 
-test('the note and the Sessions panel show which sessions received it, with their conversation links', async () => {
+test('the note and the Board sessions panel show which sessions received it, with their conversation links', async () => {
   const CLAUDE_ID = '3f2c8a5e-1b7d-4c9e-a0f1-6d5e4c3b2a19', CODEX_ID = '01a11421-ce71-7370-a005-a5179018a42d';
   const conv = (url) => ({ app: 'x', url, resume_command: 'x', cwd: '/repo/app' });
   const sess = (id, agent, startedMinAgo, conversation = null) => ({ id, agent, runtime: agent, project: '/repo/app',

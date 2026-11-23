@@ -47,7 +47,7 @@ async function setup(state, { clipboard = true } = {}) {
   return { dom, win: dom.window, document: dom.window.document, copied };
 }
 const links = (root) => [...root.querySelectorAll('.convo a')].map(a => [a.textContent, a.getAttribute('href'), a.getAttribute('rel')]);
-const sessionsCard = d => [...d.querySelectorAll('.pane-side section')].find(s => s.querySelector('h2').textContent === 'Sessions');
+const sessionsCard = d => [...d.querySelectorAll('.pane-side section')].find(s => s.querySelector('h2').textContent === 'Board sessions');
 
 test('sessions panel links each session to its own conversation for the human', async () => {
   const { dom, document } = await setup(stateOf({ sessions: [session(1, 'claude', claudeConv), session(2, 'codex', codexConv),

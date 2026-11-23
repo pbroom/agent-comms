@@ -407,7 +407,7 @@ def test_sessions_are_the_target_agents_live_sessions_last_seen_first(uenv):
     out = unstick.unstick(e.board, e.p["human"], e.tid, DispatchConfig(live_minutes=2))
     assert out["sessions"] == [newer, older] and stale not in out["sessions"]
     assert sorted(out["live_agents"]) == ["codex", "grok"]
-    # The dashboard's Sessions panel shows /api/state's order as is: last seen first.
+    # The dashboard's Board sessions panel shows /api/state's order as is: last seen first.
     seen = [s["last_seen"] for s in e.client.get("/api/state", headers=e.h()).json()["sessions"]]
     assert seen == sorted(seen, reverse=True)
 

@@ -996,10 +996,11 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
         r["queued"] = max(0, int(r.get("queued") or 0) - 1)
     if kind == "turn_ended" and type(ev.get("restarted_by")) is int:
         # The provider said the restart's interrupt ended this turn: the link both ways (never on a turn that
-        # finished by itself first: the node says it only when the provider confirmed the interruption).
-        m["restarted_by"] = ev["restarted_by"]
+        # finished by itself first: the node says it only when the provider confirmed the interruption). Only to a
+        # message that is a restart of this very one: a wrong link from a faulty node is not kept.
         new = _get(c, _msg_key(sid, ev["restarted_by"]))
         if isinstance(new, dict) and new.get("mode") == "restart" and new.get("into") == n:
+            m["restarted_by"] = ev["restarted_by"]
             new |= {"replaced": n, "updated_at": now}
             _put(c, _msg_key(sid, ev["restarted_by"]), new, by, now)
     if kind in ("delivered", "turn_started"):

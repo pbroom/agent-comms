@@ -8,6 +8,8 @@ What a turn does is in its text:
 - `sleep N ...`: the turn takes N seconds.
 - `hold PATH ...`: the turn lasts until the file PATH exists (at most 120 seconds): a turn held open for as long as
   a test needs, released by creating the file.
+- `wait-init PATH REST`: the turn's `init` waits until the file PATH exists (stdin is read meanwhile: a control
+  request is answered, before the `init`); then the turn is REST.
 - `fail ...`: the result is an error.
 - `crash ...`: the process exits (code 3) at once, before anything of the turn is written.
 - `deny ...`: the result lists a refused Write (the turn itself succeeds, as Claude's does).
@@ -52,6 +54,8 @@ the time, also while a turn runs. A user line that comes during a turn is queued
 seconds with no tool, so a line queued during it runs as its own next turn after the result. A `control_request`
 `interrupt` ends the turn at once: a `control_response` with `still_queued` (the queued lines' uuids), the turn's
 result `error_during_execution` (terminal_reason `aborted_tools`), and the queued lines then run as their own turns.
+An interrupt already behind a turn's line when that line is read (before the turn's `init`) is answered `success`
+and interrupts nothing: the turn runs whole (measured on 2.1.330 too).
 Every `init` also lists `capabilities` (`msg_lifecycle_v1` and `interrupt_receipt_v1`, as 2.1.330's does; with
 STAND_IN_CAPS set, that comma-separated list instead) and a `claude_code_version`.
 """
@@ -296,9 +300,31 @@ def main() -> None:
                 stdin.answer(message)
                 continue
             stdin.lifecycle(message, "queued")
+            # What already came behind the turn's line is read before its `init` (measured on 2.1.330, DESIGN_NOTES
+            # "Review follow-ups (2026-11-23)"): an interrupt there is answered `success` and interrupts nothing.
+            while (early := stdin.take(timeout=0, in_turn=True)) is not None:
+                if early.get("type") == "control_request":
+                    stdin.answer(early)
+                else:
+                    stdin.queued.append(early)
+                    stdin.lifecycle(early, "queued")
         text = message["message"]["content"]
         if text.startswith("crash"):
             sys.exit(3)
+        gate = re.match(r"wait-init (/\S+) (.*)", text, re.S)
+        if gate:
+            # The turn's `init` waits for the file; what comes meanwhile is read before it (as measured: a control
+            # request is answered, an interrupt applies to nothing). The rest of the text is the turn.
+            while not os.path.exists(gate.group(1)):
+                early = stdin.take(timeout=0.02, in_turn=True)
+                if early is None:
+                    continue
+                if early.get("type") == "control_request":
+                    stdin.answer(early)
+                else:
+                    stdin.queued.append(early)
+                    stdin.lifecycle(early, "queued")
+            text = gate.group(2)
         stdin.lifecycle(message, "started")
         turn += 1
         if turn == 1:

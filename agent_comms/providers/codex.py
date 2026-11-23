@@ -259,8 +259,10 @@ class CodexSession:
         self._end_turn()
 
     def _end_turn(self) -> None:
-        # The turn's own request is retired with it: its answer, should it still come, belongs to no later turn.
+        # The turn's own requests are retired with it (turn/start, and a restart's turn/interrupt): an answer that
+        # still comes belongs to no later turn.
         self._pending.pop(self._start_id, None)
+        self._pending.pop(getattr(self, "_restart_id", None), None)
         self._start_id = None
         self._turn_open = self._started = False
         self._turn_id: str | None = None
@@ -323,6 +325,10 @@ class CodexSession:
         if not self._turn_open or self._turn_id is None or self._dead:
             return None
         return [self._request("turn/interrupt", {"threadId": self.thread_id, "turnId": self._turn_id})]
+
+    def takes_interrupt(self) -> bool:
+        """Once Codex named the turn (its answer to turn/start, or turn/started), as `interrupt` needs."""
+        return self._turn_open and self._turn_id is not None and not self._dead
 
     def interrupt_turn(self) -> list[bytes] | None:
         """A restart's first step: `turn/interrupt` for the turn in flight (as a timeout's), once Codex named it. Its

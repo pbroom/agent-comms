@@ -1213,6 +1213,9 @@ class SessionHost:
             return
         if s.child is None or s.stopping_since is not None:
             return
+        takes = getattr(s.provider, "takes_interrupt", None)
+        if takes is not None and not takes():
+            return      # not yet, as the provider says (Claude: before this turn's `init`; providers.takes_interrupt)
         data = write()
         if data is None:
             return      # the provider cannot take it yet (Codex before it named the turn)

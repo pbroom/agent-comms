@@ -115,6 +115,12 @@ class ProviderSession(Protocol):
     steers: bool
     restarts: bool
 
+    def takes_interrupt(self) -> bool:
+        """The turn in flight can take the in-band interrupt NOW: the host writes `interrupt_turn` only then, and
+        waits otherwise. Claude: once THIS turn's `init` came (measured: an interrupt written before it is answered
+        `success` and the turn runs whole); Codex: once it named the turn. Optional: without it, at once."""
+        ...
+
     def interrupt_turn(self) -> list[bytes] | None:
         """The in-band interrupt of the turn in flight, for a restart (the process stays), or None when it cannot be
         sent now. The turn then ends with its own `turn_ended`; `interrupted` says whether the interrupt ended it.
