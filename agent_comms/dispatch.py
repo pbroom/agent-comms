@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from . import access, db, nodes, requests, requeue, workstreams, pickup
+from . import access, agent_accounts, db, nodes, requests, requeue, workstreams, pickup
 from .config import NAME_RE, RUNTIME_RE, Settings, home, human_token_file
 from .core import Board, Conflict, Principal, iso
 from .notify import clean
@@ -608,16 +608,58 @@ def codex_config_conflict(env: dict[str, str]) -> str | None:
     return None
 
 
+BROWSER_OUTPUT_SUFFIX = "-browser"
+_LEFT_UNDER_SYMLINK: set[str] = set()    # browser output left (once logged) because its folder is a symlink
+
+
+def browser_output_name(run_id: str, name: str) -> bool:
+    """`name` is one attempt's browser output directory of run `run_id`: `<run id>-browser`, or `-browser-<n>`."""
+    head = run_id + BROWSER_OUTPUT_SUFFIX
+    return name == head or (name.startswith(head + "-") and name[len(head) + 1:].isdigit())
+
+
+def browser_output_path(log_dir: Path | str, run_id: str) -> Path:
+    """The browser output directory one ATTEMPT of a run gets: `<log dir>/<run id>-browser`, else the first of
+    `-browser-2`, `-browser-3`, ... that is not there. A leftover (one a cleanup left under a symlinked folder, or
+    one made before a crash) never collides with a retry, and nothing is cleared to make room. Not made here:
+    `make_browser_output` validates and creates it once the command line that names it was checked."""
+    base = Path(log_dir)
+    path, n = base / (run_id + BROWSER_OUTPUT_SUFFIX), 1
+    while os.path.lexists(path):
+        n += 1
+        path = base / f"{run_id}{BROWSER_OUTPUT_SUFFIX}-{n}"
+    return path
+
+
+def make_browser_output(config: "DispatchConfig", path: Path | str) -> Path:
+    """THE way a generated browser output directory (headless and signed-in, on the hub and on a node) comes into
+    being: held against every account folder where it really lands (resolved: a symlinked log folder counts), then
+    created exclusively (one that is there already is never taken)."""
+    path = Path(path)
+    if config.home_overlap(os.path.realpath(path)) is not None:
+        raise LookupError(f"the browser output directory {path} is, is inside or contains an account folder "
+                          "([dispatch.runner_homes]); a run there could reach that account's credentials")
+    path.mkdir(mode=0o700)
+    return path
+
+
 def remove_browser_output(record: dict) -> None:
-    """Delete a finished run's browser output directory, only when it is exactly `<log dir>/<run id>-browser`.
-    Called only once the run's process is gone (exit, spawn failure, or an orphan found dead), never while the agent
-    may still be copying evidence out of it."""
+    """Delete a finished run's browser output directory, only when it is exactly one of its attempts' own
+    (`<log dir>/<run id>-browser[-<n>]`). Called only once the run's process is gone (exit, spawn failure, or an
+    orphan found dead), never while the agent may still be copying evidence out of it. Never through a symlink on
+    the way to it: such a directory is left where it is, and said once in the log."""
     hb = (record.get("headless_browser") or record.get("signed_in_browser")) if isinstance(record, dict) else None
     out, run_id, log = (hb or {}).get("output_dir"), record.get("run_id"), record.get("log")
     if not (isinstance(out, str) and isinstance(run_id, str) and isinstance(log, str)):
         return
     path = Path(out)
-    if path.name != f"{run_id}-browser" or path.parent != Path(log).parent or path.is_symlink():
+    if not browser_output_name(run_id, path.name) or path.parent != Path(log).parent or path.is_symlink():
+        return
+    if os.path.realpath(path.parent) != os.path.abspath(path.parent):
+        if str(path) not in _LEFT_UNDER_SYMLINK and os.path.lexists(path):
+            _LEFT_UNDER_SYMLINK.add(str(path))
+            log_ = logging.getLogger("agent_comms.dispatch")
+            log_.warning("left the browser output %s where it is: its folder is reached through a symlink", path)
         return
     shutil.rmtree(path, ignore_errors=True)
 
@@ -755,6 +797,44 @@ def sets_writable_roots(template: list[str]) -> bool:
                 or key.endswith("." + WRITABLE_ROOTS_KEY) or key.endswith(".sandbox_workspace_write")):
             return True
     return False
+
+
+def granted_writable_roots(argv: list[str]) -> list[str]:
+    """Every extra writable root this command line really grants its process, generated ones included (a run's
+    signed-in browser output directory): Claude's `--add-dir` (`--add-dir=X`, or `--add-dir X Y ...` up to the next
+    option), and for Codex each `sandbox_workspace_write.writable_roots` override in any `-c` spelling the dispatcher
+    reads (`_codex_overrides`; a `sandbox_workspace_write` table with `writable_roots` too). Option parsing stops at
+    `--`. ValueError when an override's value cannot be read as a list of paths: what it grants is not known."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        if a.startswith("--add-dir="):
+            out.append(a.split("=", 1)[1])
+        elif a == "--add-dir":
+            while i < len(argv) and not argv[i].startswith("-"):
+                out.append(argv[i])
+                i += 1
+    if uses_codex(argv):
+        for v in _codex_overrides(argv[:argv.index("--")] if "--" in argv else argv):
+            key, _, raw = v.partition("=")
+            k = _norm_key(key)
+            table = k == "sandbox_workspace_write" or k.endswith(".sandbox_workspace_write")
+            if not (table or k == WRITABLE_ROOTS_KEY or k.endswith("." + WRITABLE_ROOTS_KEY)):
+                continue
+            try:
+                val = tomllib.loads("x = " + raw)["x"]
+            except (tomllib.TOMLDecodeError, KeyError):
+                raise ValueError(f"a {WRITABLE_ROOTS_KEY} override whose value cannot be read") from None
+            if table:
+                val = val.get("writable_roots", []) if isinstance(val, dict) else None
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise ValueError(f"a {WRITABLE_ROOTS_KEY} override that is not a list of paths")
+            out += val
+    return out
 
 
 def _ident(path: str) -> tuple:
@@ -1127,6 +1207,11 @@ class DispatchConfig:
     nodes: dict[str, dict] = field(default_factory=dict)   # node name -> {projects, agents} it may take (nodes.py)
     undelivered_alert_minutes: float = 0.0   # 0 = off when unset; the shipped board.toml sets 10 (delivery.py)
     sessions: SessionsConfig = field(default_factory=SessionsConfig)   # hosted sessions on this machine's node
+    # Agent accounts (agent_accounts.py). `runner_homes`: runner key -> the account folder its processes use (read
+    # where the runner is launched). `agent_projects`: agent name -> the projects it may run in (read on the hub).
+    runner_homes: dict[str, str] = field(default_factory=dict)
+    agent_projects: dict[str, list[str]] = field(default_factory=dict)
+    home_protected: tuple = field(default_factory=lambda: ([], []))   # what a folder may not touch (agent_accounts)
 
     @classmethod
     def load(cls, path: Path | None = None, local: bool = True) -> "DispatchConfig":
@@ -1225,8 +1310,28 @@ class DispatchConfig:
                 c.browser_profiles = validate_browser_profiles(v)
             elif k == "sessions":
                 c.sessions = SessionsConfig.from_dict(v)
+            elif k == "runner_homes":
+                homes = v      # checked below, against the runners and [dispatch.env]
+            elif k == "agent_projects":
+                c.agent_projects = agent_accounts.validate_projects(v)
             else:
                 raise ValueError(f"unknown setting [dispatch] {k}")
+        if "runner_homes" in d:
+            c.runner_homes = agent_accounts.validate_homes(homes, c.runners, c.env, settings)
+            c.home_protected = agent_accounts.forbidden(settings)
+            if c.checkout_roots:        # an account folder never becomes a discovered checkout either
+                c.protected_dirs = c.protected_dirs + list(c.runner_homes.values())
+            # No directory a run or a session of this machine can be given to write may overlap an account folder:
+            # its extra writable roots, its checkouts ([dispatch.worktrees]) and where its worktrees go (parallel
+            # runs, and a child session's own worktree, whatever parallel_worktrees says). A run directory known
+            # only at launch (a project path the hub names) is held to the same rule there (`launch_blocker`).
+            where = [(f"[dispatch.writable_roots] {proj}", r) for proj, roots in c.writable_roots.items() for r in roots]
+            where += [(f"[dispatch.worktrees] {proj}", wt) for proj, wt in c.worktrees.items()]
+            where.append(("[dispatch] worktree_dir (where worktrees go)", c.worktree_root()))
+            for what, r in where:
+                if c.home_overlap(r):
+                    raise ValueError(f"{what}: {r} overlaps an account folder ([dispatch.runner_homes]); pick a "
+                                     "separate folder")
         c.headless_browser.check_runners(c.runners)
         unknown = sorted(set(c.runner_access) - set(c.runners))
         if unknown:
@@ -1294,6 +1399,72 @@ class DispatchConfig:
         key = self.runner_key(agent, runtime)
         return list(self.runner_access.get(key, [])) if key is not None else []
 
+    def runner_home(self, agent: str, runtime: str | None) -> tuple[str, str] | None:
+        """(variable, account folder) for this agent's runner (by name, else runtime), or None: it has no
+        [dispatch.runner_homes] entry, and its processes get the environment they always did."""
+        key = self.runner_key(agent, runtime)
+        if key is None or key not in self.runner_homes:
+            return None
+        var = agent_accounts.home_var(self.runners[key])
+        return (var, self.runner_homes[key]) if var else None
+
+    def home_overlap(self, path: Any) -> str | None:
+        """The account folder ([dispatch.runner_homes], any runner's) that `path` is, is inside or contains, else
+        None."""
+        if not isinstance(path, str) or not path:
+            return None
+        return next((h for h in self.runner_homes.values() if _within(path, h) or _within(h, path)), None)
+
+    def launch_blocker(self, agent: str, runtime: str | None, cwd: Any = None,
+                       argv: list[str] | None = None) -> str | None:
+        """Why this agent's runner may not be started in `cwd` here, as far as account folders go, or None: its
+        variable is set two ways (`home_conflict`); its folder no longer passes the rules it passed when the settings
+        were read (replaced by a symlink, removed, given to another user); or a directory the process may work or
+        write in is, holds or lies inside an account folder (any runner's: a run there could read or change that
+        account's credentials). Those directories are its cwd, and from the command line as it will run (`argv`):
+        the workspace a Codex command line names itself (`--cd`/`-C` in every spelling the Codex adapter reads,
+        relative to `cwd`) and every writable root it is really given (`granted_writable_roots`: configured and
+        generated alike, resolved). Asked at every start, before any directory generated for the run is made: a
+        dispatched run here and on a node (at the spawn), every process of a hosted session."""
+        conflict = self.home_conflict(agent, runtime)
+        if conflict:
+            return conflict
+        home = self.runner_home(agent, runtime)
+        if home is not None:
+            try:
+                agent_accounts.check_home(self.runner_key(agent, runtime), home[1], home[0], self.home_protected)
+            except ValueError as e:
+                return str(e)
+        dirs = [("the run directory", cwd)] if isinstance(cwd, str) and cwd else []
+        if argv and uses_codex(argv):
+            base = cwd if isinstance(cwd, str) and cwd else "/"
+            dirs += [("the workspace its command line names", os.path.join(base, d))
+                     for d in agent_accounts.codex_workspaces(argv)]
+        if argv:
+            try:
+                granted = granted_writable_roots(argv)
+            except ValueError as e:
+                return f"its command line grants writable folders that cannot be told: {e}"
+            base = cwd if isinstance(cwd, str) and cwd else "/"
+            dirs += [("the extra writable folder", os.path.join(base, r)) for r in granted]
+        for what, d in dirs:
+            if self.home_overlap(os.path.realpath(d)) is not None:
+                return (f"{what} {d} is, is inside or contains an account folder ([dispatch.runner_homes]); a run "
+                        "there could reach that account's credentials")
+        return None
+
+    def home_conflict(self, agent: str, runtime: str | None) -> str | None:
+        """Why this agent's runner cannot be started with its account folder: [dispatch.env] passes the same
+        variable to this agent (by name, else runtime; child_env's lookup), so the folder would be set two ways."""
+        home = self.runner_home(agent, runtime)
+        if home is None:
+            return None
+        key = agent if agent in self.env else runtime
+        if home[0] in self.env.get(key or "", []):
+            return (f"[dispatch.env] {key} passes {home[0]} while runner {self.runner_key(agent, runtime)} has an "
+                    "account folder ([dispatch.runner_homes]): set it one way only")
+        return None
+
     def headless_browser_for(self, agent: str, runtime: str | None) -> bool:
         """Whether this agent's runner (by name, else runtime) is a Codex runner given the headless browser."""
         key = self.runner_key(agent, runtime)
@@ -1341,6 +1512,9 @@ def child_env(agent: str, config: DispatchConfig, environ: dict[str, str] | None
     env.setdefault("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin")
     env["AGENT_COMMS_HOME"] = str(home())   # where the board lives (not a secret); MCP launchers read it
     env["AGENT_COMMS_MANAGED"] = "1"        # a launched run or hosted session: its wake hook stays out (waiter.py)
+    account = config.runner_home(agent, runtime)
+    if account is not None:     # [dispatch.runner_homes]: the runner's account folder, always this one
+        env[account[0]] = account[1]
     return env
 
 
@@ -2081,6 +2255,12 @@ class Dispatcher:
         key = self._dir_key(run_dir)
 
         def check() -> str | None:
+            # The hub's opt-in list once more, as it stands inside this transaction (agent_accounts.py), FIRST:
+            # before the hosted hold claims the request from any wake watcher and before the checkout claim. A
+            # launch refused here stays pending, and the next pass's preflight records why.
+            refused = self._account_blocker(agent, item)
+            if refused:
+                return refused
             t = self.board.now()
             dest = self._destination(agent, project, thread_id, item, inbox) if isinstance(project, str) else None
             try:
@@ -2575,6 +2755,8 @@ class Dispatcher:
                 break
             if not self._dispatchable(rules, to_agent, item['thread_id'], now):
                 continue   # it would never be launched: try the next holder
+            if self._account_blocker(to_agent, item):
+                continue   # the hub's opt-in list bars it from the thread's project (agent_accounts.py): the next
             try:
                 successor = access.route_successor(self.board, self.human, post_id, rows[0]['recipient'], to_agent,
                                                    origins, where)
@@ -2591,7 +2773,19 @@ class Dispatcher:
             return True
         return False
 
+    def _account_blocker(self, agent: str, item: dict | None) -> str | None:
+        """Why the hub may not launch `agent` for this item's thread: the hub's [dispatch.agent_projects] does not
+        list that thread's project for it (agent_accounts.py), or the list cannot be read. None for an agent without
+        an entry. Asked in preflight and again inside the launch's reservation (`_launch_check`)."""
+        if not item or not item.get("thread_id"):
+            return None
+        row = self.board.conn.execute("SELECT project FROM threads WHERE id = ?", (item["thread_id"],)).fetchone()
+        return agent_accounts.hub_refusal(self.board, agent, row["project"] if row else None)
+
     def _preflight(self, agent: str, rule: dict, item: dict | None = None) -> str | None:
+        refused = self._account_blocker(agent, item)
+        if refused:
+            return refused
         project = rule["project"]
         cwd = self.config.run_dir(project)
         if item and item.get('post_id') and not item.get('managed') and rule.get('kind') != 'inbox_delivery':
@@ -2605,6 +2799,10 @@ class Dispatcher:
         template = self._runner(agent)
         if template is None:
             return "no runner configured"
+        conflict = self.config.launch_blocker(agent, self._runtime(agent),
+                                              cwd if rule.get('kind') != 'inbox_delivery' else None)
+        if conflict:
+            return conflict
         if shutil.which(template[0], path=child_env(agent, self.config,
                                                   runtime=self._runtime(agent)).get("PATH")) is None:
             return "required runner executable is unavailable"
@@ -3002,6 +3200,9 @@ class Dispatcher:
             if node is None:
                 planned = (cwd if inbox else route["run_dir"] if "run_dir" in route
                            else self._run_dir_for(agent, project, thread_id, item, inbox))
+                blocked = self.config.launch_blocker(agent, self._runtime(agent), planned)
+                if blocked:     # before its worktree (or an inbox run's directory) is made
+                    raise LookupError(blocked)
                 if planned != cwd:
                     cwd = ensure_run_worktree(cwd, planned)
                     record |= {"cwd": cwd, "run_worktree": cwd}
@@ -3020,22 +3221,21 @@ class Dispatcher:
                         shutil.copyfile(rules,Path(cwd) / 'AGENT_RULES.md')
                 if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
                     raise FileNotFoundError(f"run directory {cwd!r} does not exist")
-                browser = None
+                browser, fresh_out = None, None
                 if not inbox and self.config.headless_browser_for(agent, self._runtime(agent)):
                     origins = (route["inputs"][1] if "inputs" in route
                                else self._headless_origins(agent, thread_id, record["request_ids"]))
                     if origins:   # nothing bound: no browser server at all
-                        out_dir = self.log_dir / f"{run_id}-browser"
-                        out_dir.mkdir(mode=0o700)   # fresh per run; never reused
+                        out_dir = browser_output_path(self.log_dir, run_id)     # this attempt's own
+                        fresh_out = out_dir     # made fresh (never reused) once the command line is checked
                         browser = {"origins": origins, "output_dir": str(out_dir)}
-                        record["headless_browser"] = browser
                 profile = signed_in_profile(self.config, agent, self._runtime(agent), signed_in) if signed_in else None
                 if profile is not None:
                     # Shares the headless server's directory when both are attached (a recovery run linking both).
-                    out_dir = self.log_dir / f"{run_id}-browser"
                     if browser is None:
-                        out_dir.mkdir(mode=0o700)   # fresh per run; removed when it ends
-                    record["signed_in_browser"] = {"output_dir": str(out_dir)}
+                        out_dir = browser_output_path(self.log_dir, run_id)     # this attempt's own
+                        fresh_out = out_dir     # fresh per run (made below); removed when it ends
+                    signed_out = str(out_dir)
                 prompt = (build_inbox_prompt(thread_id,rule['id'],record['request_ids'],run_id,cwd) if inbox
                           else build_prompt(thread_id, rule['id'], rule['purpose'], record['request_ids'], run_id,
                                             headless_browser=browser is not None, signed_in_browser=bool(signed_in)))
@@ -3058,7 +3258,7 @@ class Dispatcher:
                 if not inbox:
                     # The signed-in browser's output directory is writable too, so a file to upload can be copied in.
                     template = with_writable_roots(template, self.config.extra_roots(template, project) + (
-                        [record["signed_in_browser"]["output_dir"]] if profile is not None else []))
+                        [signed_out] if profile is not None else []))
                 else:
                     template = with_codex_inbox_mcp(template,child_env(agent,self.config,runtime=self._runtime(agent)))
                 if browser is not None:
@@ -3069,9 +3269,22 @@ class Dispatcher:
                     if conflict:
                         raise Conflict(conflict)
                     template = with_headless_browser(template, signed_in_browser_overrides(
-                        self.config.headless_browser, profile, record["signed_in_browser"]["output_dir"]))
+                        self.config.headless_browser, profile, signed_out))
                 template = with_managed_env(template, child_env(agent, self.config, runtime=self._runtime(agent)))
                 argv = render_argv(template, prompt=prompt, project=cwd, thread_id=thread_id)
+                # Account folders, on the command line as it will run (the directory it starts in, its own worktree
+                # made by now; every writable root it is given, generated ones included) and on the folder as it is
+                # now (agent_accounts.py), BEFORE the run's browser output directory is made: a failed start.
+                blocked = self.config.launch_blocker(agent, self._runtime(agent), cwd, argv=argv)
+                if blocked:
+                    raise LookupError(blocked)
+                if fresh_out is not None:
+                    make_browser_output(self.config, fresh_out)     # validated, then made exclusively
+                # On the record (which the cleanup removes) only now that this launch has made it.
+                if browser is not None:
+                    record["headless_browser"] = browser
+                if profile is not None:
+                    record["signed_in_browser"] = {"output_dir": signed_out}
                 child = self.spawner(argv, cwd=cwd, env=child_env(agent, self.config, runtime=self._runtime(agent)),
                                      log_path=log_path)
         except Exception as e:

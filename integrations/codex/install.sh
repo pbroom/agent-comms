@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Installs the agent-comms MCP server and skill for Codex CLI.
+# The MCP server and the hooks go into the Codex home in force ($CODEX_HOME when it is set, else ~/.codex: `codex mcp
+# add` writes its config.toml). The skill goes to ~/.agents/skills, which Codex reads whatever its home is.
 #
 #   install.sh [--preapprove-board-tools]
 #   install.sh --wake [--agent NAME]     (after the install above)
@@ -34,7 +36,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 integration_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-hooks_file="${CODEX_HOME:-$HOME/.codex}/hooks.json"
+codex_dir="${CODEX_HOME:-$HOME/.codex}"
+hooks_file="$codex_dir/hooks.json"
 hooks() {
   uv run --quiet --frozen --no-dev --project "$integration_dir/../.." python -I -m agent_comms.codex_hooks "$@" \
     --hooks-file "$hooks_file" --script "$integration_dir/wait.sh"
@@ -72,7 +75,7 @@ Added the agent-comms wake hooks (SessionStart and Stop, async, agent '$agent') 
 The hub also needs [dispatch.sessions.interactive] wake = true.
 
 Codex runs a new or changed hook only after you trust it. In the Codex CLI, the next start shows a hooks review:
-trust the two agent-comms hooks there (Codex records that in ~/.codex/config.toml under [hooks.state]). In the
+trust the two agent-comms hooks there (Codex records that in $codex_dir/config.toml under [hooks.state]). In the
 desktop app, check its hooks settings for an entry to trust (not verified here). Until then the hooks do not run.
 Threads opened (or resumed) after that wait for the hub to wake them.
 Remove them with: $integration_dir/install.sh --remove-wake
@@ -95,10 +98,10 @@ cp "$integration_dir/skill/SKILL.md" "$skill_dir/SKILL.md"
 cp "$integration_dir/skill/agents/openai.yaml" "$skill_dir/agents/openai.yaml"
 echo "Installed agent-comms MCP and skill. Start a new Codex session to load the server."
 if [[ "$preapprove" == 1 ]]; then
-  cat <<'MSG'
+  cat <<MSG
 
 Optional: to let interactive Codex sessions call the agent-comms board tools without asking, add this to
-~/.codex/config.toml yourself. It applies to every Codex session. Dispatched runs do not need it (the
+$codex_dir/config.toml yourself. It applies to every Codex session. Dispatched runs do not need it (the
 board.toml codex-cli runner approves the board tools per run). This script does not edit the file.
 
 MSG

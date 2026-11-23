@@ -96,6 +96,10 @@ def ensure(config: DispatchConfig, checkout: str, session_id: str) -> str:
     checkout is not a Git repository, the path is taken by anything that is not this checkout's registered linked
     worktree at exactly that path, a symlink is on the way, or git refused."""
     path = path_for(config, checkout, session_id)
+    inside = config.home_overlap(path)
+    if inside is not None:      # never made in or around an account folder ([dispatch.runner_homes])
+        raise Conflict(f"a child session's worktree {path} would be in or around an account folder "
+                       "([dispatch.runner_homes]); move [dispatch] worktree_dir")
     if os.path.lexists(path):
         if not registered(checkout, path):
             raise Conflict(NOT_OURS)

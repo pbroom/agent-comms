@@ -862,7 +862,8 @@ def _api(settings: Settings, token: str, method: str, path: str, body: dict | No
 def _fmt_hosted(s: dict) -> str:
     where = "" if s["node_live"] or s["state"] == "ended" else " (not connected)"
     return (f"{s['session_id']} [{s['state']}{', closing' if s.get('stop') and s['state'] != 'ended' else ''}] "
-            f"{s['agent']} in {s['project']} on node {s['node']}{where}, turns {s['turns']}, queued {s['queued']}"
+            f"{s['agent']}" + (f" (account folder {s['account_home']})" if s.get("account_home") else "")
+            + f" in {s['project']} on node {s['node']}{where}, turns {s['turns']}, queued {s['queued']}"
             + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else ""))
 
 
@@ -879,6 +880,7 @@ def _fmt_child(s: dict) -> str:
     where = "" if s["node_live"] or s["state"] == "ended" else " (not connected)"
     return (f"{s.get('name') or 'child'} {s['session_id']} "
             f"[{s['state']}{', closing' if s.get('stop') and s['state'] != 'ended' else ''}] {s['agent']}"
+            + (f" (account folder {s['account_home']})" if s.get("account_home") else "")
             + (f", model {s['model']}" if s.get("model") else "")
             + (f", effort {s['effort']}" if s.get("effort") else "")
             + f", access {_fmt_access(s)}, {s.get('isolation') or 'shared'}{where}, turns {s['turns']}, "

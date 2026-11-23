@@ -153,6 +153,16 @@ T11. A deeper tree (max_depth 2, shipped). A root of the sixth agent starts a ch
     the child's board server, a message to the child sent with wait=true from the root's: both `claimed`). One audit
     post per start naming the direct parent and the root; closing the root ends everything under it, with an audit
     post for each end below it.
+A1-A3 (stand-ins only: a real CLI in a fresh account folder has no sign-in). Two accounts on one machine (README
+"Two accounts on one machine"): a seventh Claude agent, claude-work, whose runner on the node has an account folder
+in the temp directory ([dispatch.runner_homes]), and which the hub opts in to the temp checkout only
+([dispatch.agent_projects]).
+A1. A session of claude-work: its process is started with CLAUDE_CONFIG_DIR set to that folder (a wrapper records
+    it), and `show` and `list` say which folder it is.
+A2. A session of claude-work in the second temp checkout is refused with the reason; nothing is made.
+A3. The spawning agent's session in the temp checkout sees claude-work among its targets and starts a child of it,
+    whose process gets the folder too; an interactive caller of the spawning agent in the second checkout is not
+    offered claude-work there, and its spawn of it is refused with the reason.
 The settings fixtures live in the temp directory only. They are loaded with `--settings` because Claude Code
 ignores an untrusted directory's own `.claude/settings.json` in print mode (it says so on stderr), and trusting the
 temp checkout would mean writing the user's `~/.claude.json`. With the real CLI those two runners also pass
@@ -193,6 +203,8 @@ GRANT_AGENT = "claude-granted"  # ... a third: its runner loads a settings file 
 MODE_AGENT = "claude-defmode"   # ... a fourth: its runner loads a settings file whose defaultMode is bypassPermissions
 RESTRICTED_AGENT = "claude-restricted"      # ... a fifth: --restricted beside the bypass mode, which Claude refuses
 SPAWN_AGENT = "claude-spawner"  # ... a sixth: its runner has the temp board's MCP tools, so it can start children itself
+WORK_AGENT = "claude-work"      # ... a seventh: another account's runner (an account folder of its own), opted in to
+                                # the temp checkout only (A1-A3)
 NO_BYPASS = "disableBypassPermissionsMode"  # the settings key (under permissions) a node adds to every launch but full
 GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit", "Read"]}}     # ... and two hooks (enable_tree)
 BYPASS_BY_SETTINGS = {"permissions": {"defaultMode": "bypassPermissions"}}
@@ -216,6 +228,15 @@ try:
 except OSError:
     pass
 sys.exit(child.wait())
+"""
+
+# A1: the work account's runner, a wrapper named `claude` that records the CLAUDE_CONFIG_DIR its process was started
+# with (and its arguments), then runs the ordinary wrapper.
+ENV_WRAPPER = """#!{python}
+import json, os, sys
+with open({log!r}, "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR")}}) + "\\n")
+os.execv({inner!r}, [{inner!r}, *sys.argv[1:]])
 """
 
 # A post written straight to the hub's database by another process, as `board mcp` (stdio) does.
@@ -1070,8 +1091,17 @@ codex = true
         directory in the temp directory and the runners described in the module text (node). Full access is NOT
         allowed on the node at first (`node_settings`)."""
         agents = self.hub_home / "agents.toml"
-        for name in (FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT):
+        for name in (FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, WORK_AGENT):
             create_agent(agents, name, "claude-code")
+        # A1: the work account's folder (an empty one: the stand-in reads nothing there) and its recording wrapper.
+        self.work_home = self.tmp / "claude-work-home"
+        self.work_home.mkdir(exist_ok=True)
+        self.work_env_log = self.tmp / "logs" / "work-env.log"
+        work_exe = self.tmp / "bin-work" / "claude"
+        work_exe.parent.mkdir(exist_ok=True)
+        work_exe.write_text(ENV_WRAPPER.format(python=sys.executable, log=str(self.work_env_log),
+                                               inner=str(self.tmp / "bin" / "claude")))
+        work_exe.chmod(0o700)
         # T10: the spawning agent signs in to the temp board from a token file in the temp directory, through this
         # checkout's `board mcp` (stdio, on the hub's database), which inherits its session's binding.
         tokens = self.tmp / "tokens"
@@ -1110,11 +1140,14 @@ codex = true
             (directory / ".claude" / "settings.json").write_text(json.dumps(fixture, indent=2) + "\n")
         hub = (self.hub_home / "board.toml").read_text()
         hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT])}", "agents = " + toml_list(
-            [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT]))
+            [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT, WORK_AGENT]))
         hub = hub.replace(f"projects = {toml_list([str(self.project)])}",
                           f"projects = {toml_list([str(self.project), str(self.project_mode)])}")
         (self.hub_home / "board.toml").write_text(hub + "\n[dispatch.sessions.spawn]\nenabled = true\n"
-                                                        "max_children = 8\n")
+                                                        "max_children = 8\n"
+                                                        # A2: claude-work runs in the temp checkout only
+                                                        f"\n[dispatch.agent_projects]\n{json.dumps(WORK_AGENT)} = "
+                                                        f"{toml_list([str(self.project)])}\n")
         self.node_settings(allow_full=False)
         if not (self.project / ".git").exists():
             self.git("init", "-q")
@@ -1141,6 +1174,8 @@ codex = true
         # T10: the board's tools and nothing else allowed (dontAsk refuses the rest), from the temp board alone.
         spawner = [exe, "-p", "{prompt}", "--permission-mode", "dontAsk", *quiet, "--mcp-config", str(self.spawn_mcp),
                    "--allowedTools=mcp__agent-comms"]
+        # A1: the work account's runner: the ordinary one, through the wrapper that records its environment.
+        work = [str(self.tmp / "bin-work" / "claude"), "-p", "{prompt}", "--permission-mode", "dontAsk", *quiet]
         (self.node_home / "board.toml").write_text(f"""[conversations]
 enabled = false
 
@@ -1155,7 +1190,11 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 {MODE_AGENT} = {toml_list(defmode)}
 {RESTRICTED_AGENT} = {toml_list(restricted)}
 {SPAWN_AGENT} = {toml_list(spawner)}
+{WORK_AGENT} = {toml_list(work)}
 {CODEX_AGENT} = {toml_list(self.codex_runner())}
+
+[dispatch.runner_homes]
+{json.dumps(WORK_AGENT)} = {json.dumps(str(self.work_home))}
 
 [dispatch.worktrees]
 {json.dumps(str(self.project))} = {json.dumps(str(self.project))}
@@ -2022,6 +2061,75 @@ max_live = 8
         listed, _, _ = self.board("session", "list")
         self.check(listed.strip() == "(no hosted sessions)", "no hosted session is left")
 
+    def work_homes(self, sid: str) -> list:
+        """The CLAUDE_CONFIG_DIR each start of this session's process had, as the work runner's wrapper recorded it."""
+        try:
+            lines = [json.loads(x) for x in self.work_env_log.read_text().splitlines()]
+        except OSError:
+            return []
+        return [x["CLAUDE_CONFIG_DIR"] for x in lines if sid in x["argv"]]
+
+    def accounts_scenario(self) -> None:
+        """A1-A3: two accounts on one machine (agent_accounts.py)."""
+        print("\n[A1] another account: a runner with an account folder, opted in to one project")
+        if self.real:
+            print("  (stand-in runs only: a real CLI in a fresh account folder has no sign-in)")
+            return
+        out, _, _ = self.board("session", "start", str(self.project), "ready", "--agent", WORK_AGENT, "--wait",
+                               "--json")
+        sid = json.loads(out)["session"]["session_id"]
+        view = self.show(sid)
+        print(f"  {WORK_AGENT} session {sid}: account folder {view.get('account_home')}")
+        self.check(self.work_homes(sid) == [str(self.work_home)],
+                   "its process was started with CLAUDE_CONFIG_DIR set to the runner's account folder")
+        self.check(view.get("account_home") == str(self.work_home), "`show` says which account folder")
+        listed, _, _ = self.board("session", "list")
+        self.check(f"{WORK_AGENT} (account folder {self.work_home}) in {self.project}" in listed,
+                   "and so does `list`")
+
+        print("\n[A2] a project it is not opted in to")
+        out, err, _ = self.board("session", "start", str(self.project_mode), "ready", "--agent", WORK_AGENT,
+                                 ok=False)
+        print(f"  {(out + err).strip()[:200]}")
+        self.check(f"{WORK_AGENT} is not opted in to {self.project_mode}" in out + err,
+                   "a session in the second checkout is refused, with the reason")
+        listed, _, _ = self.board("session", "list")
+        self.check(str(self.project_mode) not in listed, "and nothing was made")
+
+        print("\n[A3] the other agent starts the work agent's helper where it is opted in, and only there")
+        out, _, _ = self.board("session", "start", str(self.project), "ready", "--agent", SPAWN_AGENT, "--wait",
+                               "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.show(rid)
+        self.board("session", "grant", str(self.project), "--agent", SPAWN_AGENT, "--access", "workspace",
+                   "--hours", "1")
+        self.board("session", "grant", str(self.project_mode), "--agent", SPAWN_AGENT, "--access", "workspace",
+                   "--hours", "1")
+        [caps, spawned] = self.mcp_calls(SPAWN_AGENT, [
+            ["board_session_capabilities", {}],
+            ["board_session_spawn", {"task": "ready", "child_agent": WORK_AGENT, "access": "read-only"}]], rid)
+        caps = json.loads(caps["text"])
+        self.check(caps["may_spawn"] and WORK_AGENT in {t["agent"] for t in caps["targets"]},
+                   f"in the checkout {WORK_AGENT} is opted in to, it is among the session's targets")
+        self.check(not spawned["error"], f"and the session started a child of {WORK_AGENT} there")
+        kid = json.loads(spawned["text"])["child"]["id"]
+        self.wait_for("the work child's process", lambda: self.work_homes(kid) != [])
+        self.check(self.work_homes(kid) == [str(self.work_home)], "the child's process has the account folder too")
+        p = str(self.project_mode)
+        [caps, refused] = self.mcp_calls(SPAWN_AGENT, [
+            ["board_session_capabilities", {"project": p}],
+            ["board_session_spawn", {"task": "x", "child_agent": WORK_AGENT, "access": "read-only", "project": p}]])
+        caps = json.loads(caps["text"])
+        print(f"  targets in the second checkout: {sorted(t['agent'] for t in caps.get('targets', []))}")
+        self.check(caps["may_spawn"] and WORK_AGENT not in {t["agent"] for t in caps.get("targets", [])},
+                   f"in the second checkout {WORK_AGENT} is not offered")
+        self.check(refused["error"] and f"{WORK_AGENT} is not opted in to {p}" in refused["text"],
+                   "and starting it there is refused, with the reason")
+        for x in (rid, sid):
+            self.board("session", "close", x)
+            self.check(self.wait_ended(x)["state"] == "ended", f"closing {x} ends it")
+        self.check(self.wait_ended(kid)["state"] == "ended", "and the child under it")
+
     def deep_scenario(self) -> None:
         """T11: a deeper tree (max_depth 2, shipped): a hosted session starts a child that starts a grandchild, and the
         results come back up level by level (DESIGN_NOTES "Session host: deeper trees")."""
@@ -2298,6 +2406,7 @@ def main() -> int:
             run.results_scenario()
             run.spawn_scenario()
             run.deep_scenario()
+            run.accounts_scenario()
             print("\n[T8] stopping the node (SIGTERM) and the hub")
             run.stop()
             run.check(run.leftovers() == [], "no session process is left behind")

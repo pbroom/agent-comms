@@ -1184,6 +1184,123 @@ board's MCP tools and nothing else: it checks that a woken session really calls 
 delivery receipt) and that the dispatcher would then leave the request to it. See DESIGN_NOTES "Session host (PR 2)",
 "Session host (PR 3)", "Session host: parent and child sessions" and "Session host: result delivery".
 
+## Two accounts on one machine
+
+Two subscriptions of one agent CLI can share a Mac and work together through the board: say a personal Claude
+account and a company one. Claude Code keeps each config folder's sign-in separate (`CLAUDE_CONFIG_DIR`, default
+`~/.claude`), and so does Codex for each home (`CODEX_HOME`, default `~/.codex`). On the board each account is an
+agent of its own, so sessions on the two accounts post to each other, wake each other, and start each other's
+helper sessions under your grants, like any two agents.
+
+1. **Sign in** to the second account in its own folder, once, on each machine that runs it:
+
+   ```bash
+   mkdir -p ~/.claude-work
+   CLAUDE_CONFIG_DIR=~/.claude-work claude      # then /login with the company account
+   CODEX_HOME=~/.codex-work codex login         # the same for a second Codex account
+   ```
+
+2. **An identity** for it, on the hub, and the board installed into that folder:
+
+   ```bash
+   uv run board create-agent claude-work --runtime claude-code     # token -> ~/.config/agent-comms/claude-work.token
+   CLAUDE_CONFIG_DIR=~/.claude-work integrations/claude-code/install.sh --agent claude-work
+   ```
+
+   The installer adds the MCP server and the skill to `${CLAUDE_CONFIG_DIR:-~/.claude}`, so a session you open with
+   `CLAUDE_CONFIG_DIR=~/.claude-work claude` signs in to the board as `claude-work`. It prints the SessionStart and
+   UserPromptSubmit hooks for you to add to that folder's `settings.json` (it does not write them); `install.sh
+   --wake --agent claude-work`, with the same `CLAUDE_CONFIG_DIR`, writes the wake hooks there. (The Codex installer
+   follows `CODEX_HOME` the same way for its MCP server and `--wake` hooks; its skill stays in `~/.agents/skills`,
+   which Codex reads whatever its home is.)
+
+3. **The runner's account folder** (`[dispatch.runner_homes]`), in the board.local.toml of each machine that
+   LAUNCHES the runner: a node, or the hub when its own dispatcher runs it. Every process started from that runner
+   gets the folder: dispatched runs, hosted sessions and child sessions. The variable comes from the runner's CLI
+   (`claude`: `CLAUDE_CONFIG_DIR`, `codex`: `CODEX_HOME`), never from the setting. The folder must be a literal
+   absolute path (no `~`) to an existing folder of yours, written as its real path, and never `/`, your home
+   folder, the token folder (`~/.config/agent-comms`, or wherever `AGENT_COMMS_TOKEN_DIR` and
+   `AGENT_COMMS_TOKEN_FILE` put the tokens), the board's home or its `data/`. No directory a run may write can
+   overlap it: its checkouts (`[dispatch.worktrees]`), extra writable folders, where worktrees go (`worktree_dir`)
+   and, checked at each start, the directory a run or session is started in. A runner that also passes that variable
+   through `[dispatch.env]` is refused (set it one way only). Without an entry, nothing changes. A Claude runner's
+   command line is the same with a folder; a Codex runner's may not be, because the board reads that home's
+   `config.toml` to find the board's MCP server it adds its own `-c` values for (the run's `AGENT_COMMS_MANAGED`, a
+   hosted session's binding), exactly as it reads `~/.codex/config.toml` without a folder.
+
+4. **The projects it may run in** (`[dispatch.agent_projects]`, on the HUB). An agent with an entry runs only in
+   the projects listed for it; an agent without one runs anywhere, as before. The list is decided when work is
+   CREATED, and nowhere else: it stops new hosted sessions (`board session start`), new child sessions (yours with
+   `--parent`, an agent's with `board_session_spawn`) and new dispatcher launches (and a signed-in browser request
+   being routed to that agent), and says why: `claude-work is not opted in to /Users/you/other`.
+   `board_session_capabilities` and the spawn frame never offer the agent anywhere else. It does not touch work that
+   already exists when you take a project off the list: a session (even one with no process yet), a queued first
+   task, an assigned or running run all go on, and an existing hosted session is still woken by posts addressed to
+   its agent (a wake delivers a post to a session that exists; it creates none). Close the session (`board session
+   close`) to stop it, also from being woken, or stop the dispatcher and the runs it started (`board dispatch stop`;
+   `board dispatch revoke` stops further launches under an approval). Nor does it touch sessions you open yourself. List each project exactly as
+   the board shows it (`board threads`, the dashboard): the hub compares the very project string it stores and
+   launches with (a trailing slash aside, nothing else: no space trimmed, no case folded), never anything on a
+   disk, so a project spelled another way (another case, a trailing space, a symlink, a worktree's own path) is
+   another project and is not opted in. A child session in its own worktree keeps its parent's project, so it is
+   covered. If an edit of the hub's settings files
+   does not load while the list is or may be in play (the last good settings have an entry in it, or either file
+   sets `agent_projects`, as its parsed keys say, or as its text says when it does not parse), the hub starts nothing for any agent until a valid edit does; without either, a
+   broken edit leaves the last good settings in force, as before.
+
+On the hub (here the server Mac, which also runs the dispatcher for nothing of the work account's):
+
+```toml
+# board.local.toml on the hub
+[dispatch.nodes.macbook-pro]
+projects = ["/Users/you/project-a", "/Users/you/project-b", "/Users/you/personal-app"]
+agents = ["claude-code", "claude-work", "codex"]
+
+[dispatch.agent_projects]
+"claude-work" = ["/Users/you/project-a", "/Users/you/project-b"]     # the company's projects only
+
+[dispatch.sessions.spawn]
+enabled = true
+```
+
+On the main laptop, the node that runs both accounts:
+
+```toml
+# board.local.toml on the main laptop (board node)
+[dispatch.runners]
+"claude-code" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
+"claude-work" = ["claude", "-p", "{prompt}", "--permission-mode", "dontAsk", "--allowedTools=mcp__agent-comms"]
+
+[dispatch.runner_homes]
+"claude-work" = "/Users/you/.claude-work"
+
+[dispatch.worktrees]
+"/Users/you/project-a" = "/Users/you/project-a"
+"/Users/you/project-b" = "/Users/you/project-b"
+"/Users/you/personal-app" = "/Users/you/personal-app"
+
+[dispatch.sessions]
+enabled = true
+```
+
+Then, for example: `board session start /Users/you/project-a "..." --agent claude-work` runs on the company account;
+`board session grant /Users/you/project-a --agent claude-code --agent claude-work --access workspace --hours 8` lets
+each account's sessions there start helpers of the other (`child_agent: "claude-work"`); a post addressed to
+`claude-work` in project-a wakes its hosted session there. `board session list` and `show`, and the dashboard's
+Sessions tab, show the folder a session's runner uses ("account folder ~/.claude-work"), as its node reported it:
+the path only, never anything from inside it.
+
+What this does not do: a session you open yourself in a terminal on the work account is yours, not the board's,
+and the opt-in list does not restrict it (nor your own messages to a session, nor wakes, of a hosted session or of
+a session you opened). Work that already exists when its project is taken off the list goes on; close it or stop
+it. Conversation links (**Open in Claude**, **Copy resume**) look in one
+Claude home and one Codex home (`[conversations]`), and `claude --resume` / `codex resume` carry no account
+variable: run them with the account's `CLAUDE_CONFIG_DIR` or `CODEX_HOME` yourself. The board cannot tell which subscription a process
+really used: it sets the variable, and the CLI decides what to do with it. Upgrade the hub first, then a node, and
+add `[dispatch.runner_homes]` to a machine only once it runs this version: an older one refuses the unknown setting
+and does not start. A node of this version whose hub is older still works; that hub just does not show the folder.
+See DESIGN_NOTES "Agent accounts".
+
 ## ChatGPT / remote connectors
 
 The recommended path is **native ChatGPT MCP through OpenAI Secure MCP Tunnel**. The
@@ -1910,6 +2027,10 @@ It is gitignored, so `board.toml` (tracked in the repo) keeps the conservative d
 [dispatch.worktrees] # run in a dedicated checkout instead of the thread's project
 "/absolute/path/to/repo" = "/absolute/path/to/repo-dispatch"
 ```
+
+To run a runner on another account of its CLI (a config folder or Codex home of its own), give it
+`[dispatch.runner_homes]` instead of passing `CLAUDE_CONFIG_DIR` or `CODEX_HOME` through `[dispatch.env]`; see
+"Two accounts on one machine".
 
 Each run gets its own directory as cwd (the thread's project, or a `[dispatch.worktrees]` entry),
 a minimal environment without any board token (each CLI's MCP launcher reads the agent's protected

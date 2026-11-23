@@ -329,7 +329,7 @@ class Board:
         self._sync_lock = threading.Lock()
         # Settings hot reload: the files' signatures as of these settings; a bump on every applied reload.
         self._settings_lock = threading.Lock()
-        self._settings_sig = self._settings_files_sig()
+        self._settings_sig = settings.files_sig if settings.files_sig is not None else self._settings_files_sig()
         self.settings_generation = 0
         self.settings_restart_required: list[str] = []
         self.settings_error: str | None = None   # why the last reload was refused (the last good settings stay)

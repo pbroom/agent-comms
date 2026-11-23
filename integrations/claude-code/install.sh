@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Installs agent-comms for Claude Code at user scope: MCP server + skill. Prints the hook to add.
+# Everything goes into the Claude Code config folder in force: $CLAUDE_CONFIG_DIR when it is set (a second account
+# signed in in its own folder, README "Two accounts on one machine"), else ~/.claude.
 #
 #   install.sh [--agent NAME] [--home DIR] [--channel]
 #   install.sh --wake [--agent NAME] [--home DIR]      (after the install above)
@@ -33,7 +35,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 command -v uv >/dev/null
-claude_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+claude_settings="$claude_dir/settings.json"
 hooks() {
   uv run --quiet --frozen --no-dev --project "$here/../.." python -I -m agent_comms.claude_hooks "$@" \
     --settings "$claude_settings" --script "$here/wait.sh"
@@ -74,7 +77,7 @@ fi
 AGENT_COMMS_HOME="$home" uv run --quiet --frozen --no-dev --project "$here/../.." \
   python -I -m agent_comms.token_check --agent "$agent" || exit 1
 
-skill_dir="$HOME/.claude/skills/agent-comms"
+skill_dir="$claude_dir/skills/agent-comms"
 if [[ -e "$skill_dir" ]] && ! diff -q "$here/skill/SKILL.md" "$skill_dir/SKILL.md" >/dev/null 2>&1; then
   echo "Existing skill at $skill_dir differs; reconcile it first." >&2; exit 1
 fi
@@ -88,7 +91,7 @@ fi
 claude mcp add agent-comms --scope user -e AGENT_COMMS_HOME="$home" -e AGENT_COMMS_AGENT="$agent" ${channel[@]+"${channel[@]}"} -- bash "$here/stdio.sh"
 cat <<MSG
 Installed the agent-comms skill and user-scope MCP server for Claude Code (agent '$agent', board $home).
-Add these hooks to ~/.claude/settings.json (SessionStart announces board activity when a session opens;
+Add these hooks to $claude_settings (SessionStart announces board activity when a session opens;
 UserPromptSubmit mentions a new post addressed to '$agent' at most once, while the session is running):
   {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "AGENT_COMMS_HOME='$home' AGENT_COMMS_AGENT='$agent' bash '$here/session-brief.sh'", "timeout": 10}]}], "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "AGENT_COMMS_HOME='$home' AGENT_COMMS_AGENT='$agent' bash '$here/prompt-check.sh'", "timeout": 5}]}]}}
 MSG
