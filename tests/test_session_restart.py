@@ -194,6 +194,18 @@ def test_codex_counts_an_interrupted_end_as_the_restarts_only_after_a_success_an
     assert not q.interrupted(end), "accepted, but the turn completed by itself"
 
 
+def test_codex_retires_an_unanswered_restart_request_with_its_turn():
+    """Review follow-up (#103): a restart's turn/interrupt that is never answered does not stay pending after its
+    turn ended (as the turn's own turn/start does not); a late answer then changes nothing."""
+    q = cx.in_turn("long")
+    q.feed(cx.reply(3, cx.TURN_REPLY))
+    [stop] = cx.sent(q.interrupt_turn())
+    assert q._pending.get(stop["id"]) == "turn/interrupt"
+    [end], _ = q.feed(cx.line(cx.completed(status="interrupted")))
+    assert stop["id"] not in q._pending, "retired with the turn"
+    assert q.feed(cx.reply(stop["id"], {})) == ([], [])
+
+
 # ------------------------------------------------------------ the session host
 
 
@@ -250,6 +262,106 @@ def test_a_restart_waits_for_a_claude_turn_to_begin_before_it_knows_whether_it_c
     assert henv.host.tick() == [] and not interrupts(child)
     child.emit(cinit())
     assert kinds(henv.host.tick()) == [("turn_started", "1")] and len(interrupts(child)) == 1
+
+
+def test_a_restart_waits_for_a_later_claude_turn_to_begin_too(henv):
+    """Review follow-up (#103), measured on Claude Code 2.1.330: from a process's second turn on it has said it can
+    restart (its first `init`), but an interrupt written before THIS turn's `init` is answered `success` and the turn
+    then runs whole. The interrupt waits for the turn's own `init`."""
+    s, child = claude_turn(henv)
+    child.emit(result())
+    assert kinds(henv.host.tick()) == [("turn_ended", "1")]
+    henv.host.send(SID, "second, long", message_id="2")
+    assert kinds(henv.host.tick()) == [("delivered", "2")] and s.in_flight.id == "2" and not s.begun
+    assert henv.host.modes(SID) == ("restart",), "the process said so in its first turn"
+    henv.host.interrupt_for(SID, "2", "3")
+    henv.host.tick()
+    assert not interrupts(child), "not before the turn began"
+    child.emit(cinit())
+    assert kinds(henv.host.tick()) == [("turn_started", "2")] and len(interrupts(child)) == 1
+    answered(child)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.restarted_by) == ("2", "3")
+
+
+def test_a_codex_restart_is_written_once_turn_start_named_the_turn_even_without_turn_started(henv):
+    """Sol R1: Codex is interrupted as soon as it named the turn (as on main): its answer to turn/start is enough,
+    `turn/started` may come late or not at all."""
+    host, s = codex_host(henv)
+    henv.host = host
+    host.send(SID, "first", message_id="1")
+    host.tick()
+    child = henv.spawner.children[-1]
+    codex_ready(host, child)
+    host.tick()
+    child.emit(cx.reply(3, cx.TURN_REPLY))          # the turn's id, and no turn/started
+    host.tick()
+    assert s.in_flight.id == "1" and not s.begun
+    host.interrupt_for(SID, "1", "2")
+    host.tick()
+    assert sent(child)[-1] == {"id": 4, "method": "turn/interrupt", "params": {"threadId": cx.THREAD,
+                                                                                "turnId": cx.TURN}}
+
+
+def test_each_adapter_says_when_its_turn_takes_the_interrupt():
+    """Sol R1: the seam (`takes_interrupt`). Claude: once THIS turn's `init` came; Codex: once it named the turn."""
+    p = claude_in_turn()
+    assert p.takes_interrupt()
+    p.feed(json.dumps(result()).encode())
+    p.turn("second")
+    assert p.restarts and not p.takes_interrupt(), "the process can restart, but this turn has not begun"
+    p.feed(json.dumps(cinit()).encode())
+    assert p.takes_interrupt()
+    q = cx.ready()
+    q.turn("long")
+    assert not q.takes_interrupt(), "Codex has not named the turn yet"
+    q.feed(cx.reply(3, cx.TURN_REPLY))
+    assert q.takes_interrupt(), "its answer to turn/start names it"
+
+
+def test_a_claude_receipt_before_the_turns_init_never_credits_a_later_abort_to_the_restart(tmp_path):
+    """Sol R2, through real pipes with the stand-in: an interrupt written before a turn's `init` (as a node on the
+    previous version may write it) gets an early `success` receipt that was not applied; a later abort of the same
+    turn (here by another interrupt, not the restart's) is the turn's own. Deterministic: the stand-in holds the
+    turn's `init` until a file exists (`wait-init`), and the file is made only once the early receipt was read."""
+    import subprocess
+    import sys
+    p = ClaudeSession()
+    argv = p.argv(["claude", "-p", "{prompt}"], session_id=SID, resume=False, model=None)
+    proc = subprocess.Popen([sys.executable, str(ROOT / "tests" / "stand_in_claude.py"), *argv[1:]], cwd=tmp_path,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def until(stop):
+        """Feed the adapter each line the process writes, up to the first that `stop(parsed line, events)` accepts."""
+        for raw in proc.stdout:
+            events, _ = p.feed(raw)
+            if stop(json.loads(raw), events):
+                return events
+        raise AssertionError("the stand-in exited")
+    ended = lambda ev, events: any(e.kind == "turn_ended" for e in events)      # noqa: E731
+    try:
+        proc.stdin.write(b"".join(p.turn("first")))
+        proc.stdin.flush()
+        [first] = until(ended)
+        assert first.ok and p.restarts
+        gate, release = tmp_path / "gate", tmp_path / "release"
+        line = b"".join(p.turn(f"wait-init {gate} hold {release}"))
+        early = p.interrupt_turn()          # written behind the line, before the turn's `init`
+        proc.stdin.write(line + b"".join(early))
+        proc.stdin.flush()
+        until(lambda ev, events: ev.get("type") == "control_response")          # the early receipt
+        assert not p._interrupt_ok, "received before the turn's init: not applied"
+        gate.touch()                                                            # only now the turn's `init`
+        until(lambda ev, events: any(e.kind == "turn_started" for e in events))
+        proc.stdin.write(json.dumps({"type": "control_request", "request": {"subtype": "interrupt"},
+                                     "request_id": "someone-else"}).encode() + b"\n")
+        proc.stdin.flush()
+        [end] = until(ended)
+        assert end.meta.get("terminal_reason") == "aborted_tools" and not p.interrupted(end), \
+            "the abort is not the early interrupt's"
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_a_restarted_turn_that_finished_first_keeps_its_outcome(henv):

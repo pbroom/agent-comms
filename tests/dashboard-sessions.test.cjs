@@ -436,3 +436,110 @@ test("a session whose node gives its runner an account folder shows the folder's
   assert.doesNotMatch(document.getElementById('session-detail').textContent, /Account folder/);
   dom.window.close();
 });
+
+// ---------------------------------------------------------------- review follow-ups (2026-11-23)
+
+test("the trees carry a reply's preview: Show all loads the session's details, the whole reply unfolded there", async () => {
+  const full = 'p'.repeat(299) + '<b>q</b>' + 'r'.repeat(700);
+  const { dom, document, calls, world } = await setup({ intercept: (u, answer) => {
+    if (u !== `/api/hosted-trees/${KID}`) return answer();
+    return ok({ ...detailOf(KID), output: { text: full, truncated: false, length: full.length, for_message: 3 } });
+  } });
+  world.live[0].session.children[0].output = { text: full.slice(0, 300), truncated: true, length: full.length, for_message: 3 };
+  await dom.window.refresh(); await settle();
+  const box = document.querySelector(`li[data-session="${KID}"] > .lin-output-box`);
+  assert.equal(box.querySelector('pre.lin-output').textContent, full.slice(0, 300), 'the preview, as text');
+  assert.ok(!calls.includes(`/api/hosted-trees/${KID}`));
+  const more = document.getElementById(`out-tree-${KID}-toggle`);
+  assert.equal(more.textContent, 'Show all');
+  more.click(); await settle();
+  assert.ok(calls.includes(`/api/hosted-trees/${KID}`), 'the details are loaded');
+  assert.equal(dom.window.location.hash, `#session-${KID}`);
+  const pre = document.getElementById(`out-detail-${KID}`);
+  assert.equal(pre.textContent, full, 'the whole capped reply, as text');
+  assert.equal(pre.children.length, 0);
+  assert.ok(!pre.classList.contains('clamped'), 'unfolded');
+  const region = document.getElementById(`out-detail-${KID}-box`);
+  assert.equal(document.activeElement, region, 'the focus moved to the expanded reply');
+  assert.equal(region.getAttribute('tabindex'), '-1');
+  assert.match(region.getAttribute('aria-label'), /Last reply from general-1/);
+  dom.window.close();
+});
+
+test('when the details fail to load, Show all moves the focus to the error, not to the preview', async () => {
+  const { dom, document, world } = await setup({ intercept: (u, answer) => u === `/api/hosted-trees/${KID}`
+    ? { ok: false, status: 500, statusText: '500', json: async () => ({ message: 'boom' }) } : answer() });
+  world.live[0].session.children[0].output = { text: 'p'.repeat(300), truncated: true, length: 1000, for_message: 3 };
+  await dom.window.refresh(); await settle();
+  document.getElementById(`out-tree-${KID}-toggle`).click(); await settle();
+  const err = document.getElementById('session-detail-error');
+  assert.ok(err, 'the error is shown');
+  assert.equal(document.activeElement, err, 'and it has the focus');
+  assert.equal(err.getAttribute('tabindex'), '-1');
+  assert.match(err.getAttribute('aria-label'), /Couldn't load the details of general-1: look around: boom/);
+  dom.window.close();
+});
+
+test('Show all moves the focus only if its session is still the one selected when the details land', async () => {
+  const full = 'p'.repeat(1000);
+  const h = holder();
+  const { dom, document, world } = await setup({ intercept: (u, answer) => {
+    if (u === `/api/hosted-trees/${KID}`) return h.intercept(u, () => ok({ ...detailOf(KID), output: { text: full, truncated: false, length: 1000 } }));
+    return answer();
+  } });
+  world.live[0].session.children[0].output = { text: full.slice(0, 300), truncated: true, length: 1000, for_message: 3 };
+  await dom.window.refresh(); await settle();
+  h.hold(u => u === `/api/hosted-trees/${KID}`);
+  document.getElementById(`out-tree-${KID}-toggle`).click(); await settle();
+  h.stop();
+  document.getElementById(`lin-open-${GRAND}`).click(); await settle();     // another session, before KID's details
+  h.held.forEach(release => release()); await settle();
+  assert.notEqual(document.activeElement.id, `out-detail-${KID}-box`);
+  assert.match(document.getElementById('session-detail').textContent, /review-1: check the diff/, 'still the new selection');
+  dom.window.close();
+});
+
+test('a session on a loop of parent links is a root of its own with the note', async () => {
+  const { dom, document, world } = await setup();
+  const LOOPED = 'parent links form a loop';
+  world.live[0].session = { ...world.live[0].session, detached: true, loop: LOOPED, parent: KID };
+  await dom.window.refresh(); await settle();
+  const chip = [...document.querySelectorAll(`li[data-session="${ROOT}"] > .lin-row .chip`)].find(c => c.textContent === 'parent loop');
+  assert.ok(chip, 'the loop is named');
+  assert.equal(chip.getAttribute('title'), LOOPED);
+  assert.ok(![...document.querySelectorAll('.chip')].some(c => c.textContent === 'parent gone'));
+  dom.window.close();
+});
+
+test('a refresh with the details cached draws the page once', async () => {
+  const { dom, win } = await setup();
+  let draws = 0;
+  const real = win.render;
+  win.render = (...a) => { draws++; return real(...a); };
+  await win.refresh(); await settle();
+  assert.equal(draws, 1, 'no second render for an unchanged, cached detail');
+  dom.window.close();
+});
+
+test('with the linked session gone, arrow keys move from the focused first tree row', async () => {
+  const GHOST = '99999999-9999-4999-8999-999999999999';
+  const { dom, document, win } = await setup({ url: `http://127.0.0.1:8787/#session-${GHOST}` });
+  const first = document.querySelector('.session-list a.row-link');
+  first.focus();
+  first.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  await settle();
+  assert.equal(win.location.hash, `#session-${IROOT}`, 'the next tree is selected');
+  assert.equal(document.activeElement.id, `tree-row-${IROOT}`);
+  dom.window.close();
+});
+
+test('a kept or interrupted result says so in words', async () => {
+  const { dom, document, world } = await setup();
+  world.live[0].session.children[0].result = { n: 5, message: 1, started_by: 'parent', outcome: 'interrupted', ok: false,
+    detail: 'interrupted by a restart: message 2 replaced it', state: 'kept', carrier: null, attempts: [], why: null };
+  await dom.window.refresh(); await settle();
+  const line = document.querySelector(`li[data-session="${KID}"] > .lin-result`).textContent;
+  assert.match(line, /message 1: interrupted by a restart/);
+  assert.match(line, /kept, not sent as a turn \(its parent restarted the turn itself\)/);
+  dom.window.close();
+});

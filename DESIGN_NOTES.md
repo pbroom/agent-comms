@@ -7133,3 +7133,67 @@ written only while that turn is the one in flight. So neither reaches a later tu
 - Restarting a turn Codex runs by itself (`holds_turns`: no message's turn is in flight).
 - The dashboard stays read-only: it shows a message's mode and links (restart of N, it interrupted N, interrupted by
   N), never a control.
+
+## Review follow-ups (2026-11-23)
+
+Non-blocking items the independent reviewers and Sol left on #100-#103, each checked against the code first.
+
+**Measured: an interrupt written before a turn's `init`** (Claude Code 2.1.330: `claude -p --permission-mode
+dontAsk --setting-sources= --strict-mcp-config --allowedTools "Bash(sleep:*)"` with the stream flags,
+`--permission-prompts none`, haiku, `--no-session-persistence`, a private scratch cwd; a probe timing every stdout
+line). One process: turn 1 ran to its `result`; one second later turn 2's user line was written (a `sleep 12` tool
+turn, or a ~700-word text turn), the in-band `interrupt` right behind it, in the same write or in a second write
+straight after. In all four runs the process answered the interrupt FIRST (`control_response` `success`,
+`still_queued: []`, ~3 ms), then wrote turn 2's `init` and ran turn 2 whole (`result` `success`, `terminal_reason`
+`completed`); a third turn then ran normally. So the interrupt is lost, and it comes with a success receipt that
+says nothing was applied. Since a Claude process says it can restart in its first `init` only, from its second turn
+on the host could write the interrupt in that window. Now:
+- The adapter says when its turn can take the interrupt (`takes_interrupt`, providers/__init__.py), and the host
+  writes it only then (session_host `_restart_pass`). Claude: once THIS turn's `init` came. Codex: as on main, as
+  soon as it named the turn (its answer to `turn/start` is enough; `turn/started` may come late or not at all).
+- A Claude receipt that arrives before the turn's `init` never counts (`_interrupt_ok` stays False), so it cannot be
+  credited to a later, independent abort of the same turn. Only a receipt received after `init` can.
+- The Claude stand-in answers an interrupt already behind a turn's line before that turn's `init`, as measured.
+Attribution stays as the module says otherwise: a success receipt for that request after `init`, then an `aborted*`
+result. A node still on the previous version (46c2913, #103) may write the interrupt before `init` and credit its
+early receipt to a later abort of that turn; such a node has this gap until it is upgraded.
+
+**What this change fixed.**
+- #103: a report pass that a later session's post stops (hub unreachable, or the 422 retry) drops the events it
+  already posted for earlier sessions, so they are not posted again (`_drop_sent`). The hub keeps a node's
+  `restarted_by` only when the message it names is a restart of that very turn (`mode` restart, `into` it), and a
+  parent's result is `kept` only on the same check and only when the turn's outcome is `interrupted`: a link to a
+  message that is no restart of the turn, or one named on a turn that completed or failed otherwise, never keeps a
+  result. That the interrupt caused the end is still the node's word: the hub checks the link's shape and the
+  outcome, not the cause.
+  The dashboard and `board session show` have plain words for the `kept` state and the `interrupted` outcome (the
+  CLI already printed the outcome word itself). Codex retires an unanswered restart `turn/interrupt` with its turn,
+  as it does `turn/start`. The comment in `hosted_spawn.send` says which refusals wait for the transaction (the
+  grant and the limits; the argument checks, the feature gate and the caller's checks still come first).
+- #102 (docs): `[dispatch.runner_homes]` is read when `board node` or `board dispatch run` starts, so a change needs
+  that restarted on the machine; `~/.ssh` is in the README's list of folders an account folder may not touch; a run's
+  browser output folder is left in place (logged once) when the log folder's path goes through a symlink.
+- #101: `trees` sends only a PREVIEW_MAX (300) character preview of each reply (`truncated`, `length`), `detail`
+  keeps the OUTPUT_MAX text, and the tree's Show all loads the details with the reply unfolded there (about 1.4 MB
+  per 3-second poll at 301 children before). A loop in the parent links shows each session on it as a detached root
+  with a note (`loop`; the hub never makes one), and so does a session that is its own parent (it said "parent
+  gone" before). After Show all the page scrolls to the expanded reply in the details and moves the focus to it (a
+  labelled region), only if that session is still selected when the details land. A cached detail answer no longer
+  draws the page a second time on each tree refresh, and with a deep link to a session that is not available the
+  focused first tree row is where the arrow keys start. The sidebar's card of BOARD sessions is "Board sessions", apart from the Sessions tab (the
+  older notes above that say "Sessions panel" mean that card).
+
+**What remains open, by design** (from the follow-up notes above, unchanged here):
+- Mid-turn steering (R6): deferred for every provider; the hazards to start from are listed under "Restarting a
+  running turn".
+- A managed continuation whose fix will never reach its descendants has no agent path and no human request action;
+  only closing its thread hides it ("Superseding linked requests").
+- An issue-linked request stays open after the human resolves its issue and still refuses supersede (the same).
+- A successor in a closed thread holds its original until the human reopens the thread (the same).
+- Recovery retirement receipts carry one ref per linked source, so an acknowledgement with more sources than
+  `max_refs` (20 by default; Unstick links up to 100) cannot retire automatically (the same).
+- Conversation links look in ONE home per CLI, so a session that ran on another account folder may get no link or a
+  lookup in the wrong home, and the copied resume commands carry no account variable ("Agent accounts").
+- A contradictory node report (a turn ended `ok: true` naming a valid restart in `restarted_by`) still stores the
+  link (hosted.py `_apply`), so the lineage labels a completed message as interrupted; unchanged from main (its
+  result is delivered, not kept).

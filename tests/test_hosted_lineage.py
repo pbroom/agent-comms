@@ -138,9 +138,48 @@ def test_a_waiting_result_says_why_and_child_output_is_returned_as_capped_data(s
     assert "a dispatched run is using the parent's checkout" in res["waiting_because"]
     assert "text" not in res, "the result's own copy of the reply is not repeated"
     out = n[kid]["output"]
-    assert out["text"] == long[:hosted_lineage.OUTPUT_MAX] and out["text"].startswith(HOSTILE), "data, unchanged"
+    assert out["text"] == long[:hosted_lineage.PREVIEW_MAX] and out["text"].startswith(HOSTILE), "data, unchanged"
     assert (out["truncated"], out["length"], out["for_message"]) == (True, len(long), 1)
     assert n[sid]["result"] is None, "a root has no parent to send results to"
+    d = senv.human.get(f"/api/hosted-trees/{kid}").json()["output"]
+    assert (d["text"], d["truncated"], d["length"]) == (long[:hosted_lineage.OUTPUT_MAX], True, len(long))
+
+
+def test_the_trees_carry_a_short_preview_of_each_reply_and_the_details_the_capped_text(senv):
+    """Review follow-up (#101): a poll of the trees carries only the first PREVIEW_MAX characters of each reply (with
+    `truncated` and the whole `length`); the details route has the OUTPUT_MAX text, and the version is unchanged."""
+    sid = a_root(senv)
+    send(senv, sid, "more")
+    tick(senv)
+    reply = HOSTILE + "z" * 1000                  # longer than the preview, shorter than the cap
+    answer(senv, sid, reply)
+    got = trees(senv)
+    assert got["preview_max"] == hosted_lineage.PREVIEW_MAX == 300
+    out = got["trees"][0]["session"]["output"]
+    assert out == {"text": reply[:300], "truncated": True, "length": len(reply), "for_message": 2}
+    d = senv.human.get(f"/api/hosted-trees/{sid}").json()
+    assert d["output"] == {"text": reply, "truncated": False, "length": len(reply), "for_message": 2}
+    assert d["version"] == got["trees"][0]["session"]["version"], "the version is still the details'"
+
+
+def test_a_loop_in_the_parent_links_shows_each_session_on_it_as_a_detached_root(senv):
+    """Review follow-up (#101): A's parent is B and B's parent is A (the hub never makes this): neither is hidden;
+    each is a detached root of its own, with the note. So is a session that is its own parent (Sol R4)."""
+    from agent_comms import hosted
+    sid = a_root(senv)
+    a = child(senv, sid, "a")["session_id"]
+    b = child(senv, sid, "b")["session_id"]
+    c = child(senv, sid, "c")["session_id"]
+    with hosted.db.write_tx(senv.board.conn) as conn:
+        for me, parent in ((a, b), (b, a), (c, c)):
+            r = hosted._session(conn, me)
+            hosted._put(conn, hosted.SESSION_PREFIX + me, r | {"parent": parent}, "hub", senv.clock())
+    got = {t["root"]: t for t in trees(senv)["trees"]}
+    assert set(got) == {sid, a, b, c}, "every session is in a tree"
+    assert by_id(got[sid]).keys() == {sid}
+    for x in (a, b, c):
+        top = got[x]["session"]
+        assert top["detached"] is True and top["loop"] == hosted_lineage.LOOP and top["children"] == []
 
 
 def test_short_hostile_output_comes_back_whole_and_unescaped(senv):
