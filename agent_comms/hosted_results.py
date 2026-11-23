@@ -533,9 +533,11 @@ def view_one(x: dict, text: bool = False) -> dict:
     return out
 
 
-def waiting_because(board: Board, conn, x: dict) -> str | None:
+def waiting_because(board: Board, conn, x: dict, busy=None) -> str | None:
     """Why a result that waits has not reached its parent yet, in the server's words (None: it does not wait). Read
-    from what is stored now, by the same rules that decide its delivery (`_free`, the node's hold of a full child)."""
+    from what is stored now, by the same rules that decide its delivery (`_free`, the node's hold of a full child).
+    `busy(parent)`: whether a dispatched run uses the parent's checkout, for a caller that answers it from one look at
+    the runs (hosted_lineage.py); by default asked here."""
     if x.get("state") not in WAITING:
         return None
     parent = _get(conn, hosted.SESSION_PREFIX + x["parent"]) if isinstance(x.get("parent"), str) else None
@@ -555,9 +557,13 @@ def waiting_because(board: Board, conn, x: dict) -> str | None:
         return "its parent session has ended or is being closed"
     if parent.get("in_flight") is not None or int(parent.get("queued") or 0):
         return "the parent has a turn running, or a message queued before it (a message of the human's goes first)"
-    from . import hosted_wake
-    if (parent.get("isolation") != "worktree" and hosted_wake._occupied(board, parent)) or hosted._checkout_busy(
-            board, parent):
+    if busy is None:
+        from . import hosted_wake
+
+        def busy(p: dict) -> bool:
+            return (p.get("isolation") != "worktree" and hosted_wake._occupied(board, p)) or hosted._checkout_busy(
+                board, p)
+    if busy(parent):
         return "a dispatched run is using the parent's checkout: it goes once the run is over"
     return "it goes as the parent's next turn when the parent's node next asks for its sessions"
 

@@ -674,13 +674,20 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     return {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
 
 
-def _checkout_busy(board: Board, r: dict) -> bool:
+def checkout_runs(board: Board) -> tuple[list[dict], list[dict]]:
+    """(the dispatcher's checkout claims, its active run records): what `_checkout_busy` reads, read once."""
+    from . import dispatch
+    return dispatch.checkout_claims(board.conn, board.now()), dispatch._active_records(board)
+
+
+def _checkout_busy(board: Board, r: dict, runs: tuple[list[dict], list[dict]] | None = None) -> bool:
     """A dispatched run may still be using the checkout this session's turns run in: one run per checkout, both
     ways round. The identity is the node's: a run on a node is recorded with the project path as its directory
     (dispatch._run_dir_for), so it holds this session when it is on the same node and for the same project; a run on
     the hub holds it when its directory is the one the hub's settings give the project (as for a wake, and on the
     safe side when the session's node is another machine). A child with a worktree of its own runs elsewhere and is
-    never held. Unreadable records hold it (safe side)."""
+    never held. Unreadable records hold it (safe side). `runs`: `checkout_runs` read once by a caller that asks
+    for many sessions (the dashboard's lineage view)."""
     if r.get("isolation") == "worktree":
         return False
     from . import dispatch, hosted_wake
@@ -688,10 +695,10 @@ def _checkout_busy(board: Board, r: dict) -> bool:
         hub_dir = os.path.realpath(hosted_wake._run_dir(board, r["project"]))
         # The runs on record, and the launches the dispatcher reserved whose run is not on record yet (its claims,
         # made in its launch transaction): one identity for both.
-        claims = dispatch.checkout_claims(board.conn, board.now())
+        claims = runs[0] if runs is not None else dispatch.checkout_claims(board.conn, board.now())
         if any(d.get("unreadable") for d in claims):
             return True
-        for d in dispatch._active_records(board) + claims:
+        for d in (runs[1] if runs is not None else dispatch._active_records(board)) + claims:
             cwd = d.get("cwd")
             if not isinstance(cwd, str) or not cwd:
                 continue

@@ -309,15 +309,16 @@ def _run_dir(board: Board, project: str) -> str:
 _run_dir_cache: dict = {}
 
 
-def _occupied(board: Board, r: dict) -> bool:
+def _occupied(board: Board, r: dict, dirs: set[str] | None = None) -> bool:
     """A dispatched run that may still be going is using the directory a run for this session's project uses: the
     dispatcher's own rule of one run per run directory (dispatch.occupied_run_dirs, the directories its `_busy_dirs`
     holds), applied the other way round, so that no automatic turn starts beside a run in the same checkout. A run
     in its own parallel worktree has another directory and does not count. Only wakes ask this: a message of the
-    human's is the human's call."""
+    human's is the human's call. `dirs`: `dispatch.occupied_run_dirs`, read once by a caller that asks for many."""
     from . import dispatch
 
-    return os.path.realpath(_run_dir(board, r["project"])) in dispatch.occupied_run_dirs(board)
+    return os.path.realpath(_run_dir(board, r["project"])) in (dispatch.occupied_run_dirs(board) if dirs is None
+                                                                else dirs)
 
 
 # ---------------------------------------------------------------- one pass

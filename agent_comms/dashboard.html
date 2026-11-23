@@ -144,8 +144,8 @@ select.input-sm { padding-right: 22px; background-position: right 6px center; }
 .alert .card-footer { margin-top: 8px; }
 
 /* Tabs (list pane) */
-.tabs-list { display: flex; gap: 2px; padding: 2px; background: var(--muted); border-radius: var(--radius); }
-.tabs-trigger { flex: 1; border: 1px solid transparent; background: transparent; box-shadow: none; color: var(--muted-foreground);
+.tabs-list { display: flex; flex-wrap: wrap; gap: 2px; padding: 2px; background: var(--muted); border-radius: var(--radius); }
+.tabs-trigger { flex: 1 0 auto; border: 1px solid transparent; background: transparent; box-shadow: none; color: var(--muted-foreground);
   padding: 3px 8px; font-size: 12.5px; border-radius: calc(var(--radius) - 2px); }
 .tabs-trigger:hover:not(:disabled) { background: transparent; color: var(--foreground); }
 .tabs-trigger[aria-selected=true] { background: var(--card); color: var(--foreground); border-color: var(--border); box-shadow: var(--shadow-xs); }
@@ -457,6 +457,60 @@ button.needs-chip:hover:not(:disabled) { background: var(--warning-bg); box-shad
 .issue-empty { text-align: center; padding: 32px 20px; }
 .issue-empty .card-title { font-size: 15px; }
 .issue-empty p { max-width: 52ch; margin: 6px auto 0; color: var(--muted-foreground); }
+
+/* ---- Session trees (Sessions tab): a nested list, the root as the anchor, ended members greyed ---- */
+.thread-list .row.ended .title { color: var(--muted-foreground); }
+.lineage .lin-links { display: flex; gap: 6px 12px; flex-wrap: wrap; align-items: baseline; min-width: 0; }
+.lineage .lin-links > span { overflow-wrap: anywhere; min-width: 0; }
+.lin-note { margin: 0 0 10px; }
+.lin-tree, .lin-group { list-style: none; margin: 0; padding: 0; }
+.lin-group { margin-left: 11px; padding-left: 12px; border-left: 1px solid var(--border); }
+.lin-group[hidden] { display: none; }
+.lin-item { padding: 8px 0 0; min-width: 0; }
+.lin-item > .lin-facts, .lin-item > .lin-result, .lin-item > .lin-output-box, .lin-item > .lin-clip { margin-left: 28px; }
+.lin-root { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px 10px; background: var(--background);
+  box-shadow: inset 3px 0 0 var(--primary); }
+.lin-root > .lin-group { margin-top: 2px; }
+.lin-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; }
+button.lin-fold { width: 22px; height: 22px; padding: 0; flex: none; color: var(--muted-foreground); }
+.lin-fold-sp { width: 22px; flex: none; }
+button.lin-open { display: inline-block; flex: 0 1 auto; font-size: 13.5px; font-weight: 600; padding: 1px 4px; border: 0; background: none; box-shadow: none; color: var(--foreground);
+  white-space: normal; text-align: left; overflow-wrap: anywhere; min-width: 0; max-width: 100%; justify-content: flex-start; }
+button.lin-open:hover:not(:disabled) { background: var(--accent); }
+button.lin-open[aria-current=true] { background: var(--muted); box-shadow: inset 0 -2px 0 var(--primary); }
+.lin-facts { display: flex; gap: 2px 10px; flex-wrap: wrap; margin-top: 2px; min-width: 0; }
+.lin-fact { display: inline-block; vertical-align: bottom; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.lin-clip { overflow-wrap: anywhere; }
+.chip.lin-state.s-running::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: dot-pulse 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .chip.lin-state.s-running::before { animation: none; } }
+.chip.lin-state.s-ended { background: transparent; border-color: var(--border); color: var(--muted-foreground); }
+.lin-item.ended > .lin-row button.lin-open, .lin-item.ended > .lin-facts { color: var(--muted-foreground); }
+.lin-item.ended > .lin-row button.lin-open { font-weight: 500; }
+.lin-result { display: flex; gap: 2px 6px; flex-wrap: wrap; align-items: baseline; margin-top: 4px; font-size: 12.5px; min-width: 0; }
+.lin-result.bad > span:nth-child(2) { color: var(--destructive); }
+.lin-k { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted-foreground); }
+.lin-waits { flex-basis: 100%; display: flex; gap: 6px; align-items: baseline; overflow-wrap: anywhere; color: var(--warning); min-width: 0; }
+.lin-output-box { margin-top: 6px; min-width: 0; }
+.lin-output-label { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted-foreground); }
+.lin-output-label .linkish { font-size: 12px; }
+pre.lin-output { margin: 4px 0 0; padding: 6px 8px; border: 1px dashed var(--border); border-radius: var(--radius); background: var(--card);
+  font: 12.5px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; }
+pre.lin-output.clamped { max-height: calc(1.45em * 4 + 12px); overflow: hidden;
+  -webkit-mask-image: linear-gradient(#000 60%, transparent); mask-image: linear-gradient(#000 60%, transparent); }
+.lin-detail h3 { margin-top: 12px; }
+.lin-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; margin: 0; font-size: 13px; }
+.lin-dl dt { color: var(--muted-foreground); }
+.lin-dl dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.lin-msgs { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.lin-msgs > li { border-top: 1px solid var(--border); padding-top: 4px; overflow-wrap: anywhere; min-width: 0; }
+.lin-msgs > li:first-child { border-top: 0; padding-top: 0; }
+@media (max-width: 480px) {
+  .lin-group { margin-left: 6px; padding-left: 8px; }
+  .lin-item > .lin-facts, .lin-item > .lin-result, .lin-item > .lin-output-box, .lin-item > .lin-clip { margin-left: 0; }
+  .lin-root { padding: 6px 8px 8px; }
+  .lin-dl { grid-template-columns: minmax(0, 1fr); }
+  .lin-dl dd { margin-bottom: 4px; }
+}
 </style>
 </head>
 <body>
@@ -477,12 +531,28 @@ let grantDraft = { project: "", category: "review", agents: [], purpose: "", exp
 let grantError = "", grantBusy = false, grantFormOpen = false;
 // Settings view (human only). Drafts live here so a re-render never loses what is being typed.
 let view = location.hash === "#settings" ? "settings" : "board";
-// The list pane's tab: "threads" or "issues". A #issue-N / #issues link opens Issues and a #thread-N / #post-N link
-// Threads; otherwise the tab last chosen in this browser (a convenience only).
+// The list pane's tab: "threads", "issues" or "sessions" (the human's). A #issue-N / #issues link opens Issues, a
+// #session-<id> / #sessions link Sessions and a #thread-N / #post-N link Threads; otherwise the tab last chosen in this
+// browser (a convenience only).
 const TAB_KEY = "agent-comms-tab";
 const ISSUES_HASH = /^#issues?(?:-|$)/;
-let listTab = ISSUES_HASH.test(location.hash) ? "issues" : /^#(post|thread)-/.test(location.hash) ? "threads"
-  : load(TAB_KEY) === "issues" ? "issues" : "threads";
+const SESSIONS_HASH = /^#sessions$|^#session-[0-9a-f-]{36}$/;
+const sessionFromHash = () => (/^#session-([0-9a-f-]{36})$/.exec(location.hash) || [])[1] || null;
+let listTab = ISSUES_HASH.test(location.hash) ? "issues" : SESSIONS_HASH.test(location.hash) ? "sessions"
+  : /^#(post|thread)-/.test(location.hash) ? "threads"
+  : ["issues", "sessions"].includes(load(TAB_KEY)) ? load(TAB_KEY) : "threads";
+// Sessions tab (hosted_lineage.py): the trees, when they were fetched, the selected tree and session, the selected
+// session's `show`, and what the human folded or expanded (kept across the 3-second re-render).
+let lineage = null, lineageAt = 0, lineageError = "", showEndedTrees = false;
+let selectedSession = sessionFromHash(), sessionDetail = null, sessionDetailError = "";
+// Each kind of fetch has its own generation: an answer that is not the latest of its kind, or that comes back after
+// the tab, the "Show ended" toggle or the selection it was for has changed, is dropped (success and failure alike).
+// `detailFor`: the session and `version` the shown details were fetched for (they are fetched again only when either
+// changes). `endedLookedFor`: the explicit target the ended trees were already loaded for, once.
+// A poll whose scope (the toggle and the selection; the session and its version for details) is that of a request
+// still in flight waits for that request instead of starting another, so a slow hub is caught up with, not chased.
+let lineageGen = 0, detailGen = 0, detailFor = null, endedLookedFor = null, lineageFlight = null, detailFlight = null;
+const linCollapsed = new Set(), linOutputOpen = new Set();
 let selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null;
 let selectedIssueDetail = null;
 let issueSource = null, issueSearch = "", issueBusy = false, issueError = "", issueCreateOpen = false, scrollToIssue = false;
@@ -647,12 +717,13 @@ function signedOut(message) {
   issueSearchVersion++; issueSearchResults = []; issueSearchLoading = false; issueSearchError = "";
   issueCreate = { title: "", body: "", needs_human: true };
   for (const id of Object.keys(issueDrafts)) delete issueDrafts[id];
+  lineage = null; lineageError = ""; sessionDetail = null; sessionDetailError = "";
 }
 
 // Where to land after a token is exchanged: this view, never the token-bearing fragment.
 function nextPath() {
   const h = location.hash;
-  return "/" + (parseFocus(h) || h === "#settings" || /^#issues?(?:-\d+)?$/.test(h) ? h : "");
+  return "/" + (parseFocus(h) || h === "#settings" || /^#issues?(?:-\d+)?$/.test(h) || SESSIONS_HASH.test(h) ? h : "");
 }
 
 // Swap a token for a one-time sign-in link and follow it (the server sets the session cookie and comes back
@@ -722,6 +793,7 @@ async function refresh() {
     } catch (e) { issueError = e.message; }
   }
   if (state && state.me.is_human && view === "settings") await loadSettings();
+  if (state && state.me.is_human && view === "board" && listTab === "sessions") await loadLineage();   // the Sessions tab
   render();
 }
 
@@ -740,13 +812,15 @@ function setView(next) {
   focusVersion++;
   view = next;
   if (next !== "board") highlight = focus = null;
-  const back = listTab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : location.pathname;
+  const back = listTab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : listTab === "sessions" ? sessionHash()
+    : selected ? `#thread-${selected}` : location.pathname;
   try { history.replaceState(null, "", next === "settings" ? "#settings" : back); } catch (e) {}
   refresh();
 }
 window.addEventListener("hashchange", () => {
   view = location.hash === "#settings" ? "settings" : "board";
   if (ISSUES_HASH.test(location.hash)) { listTab = "issues"; selectedIssue = Number((/^#issue-(\d+)$/.exec(location.hash) || [])[1]) || null; }
+  if (SESSIONS_HASH.test(location.hash)) { listTab = "sessions"; selectedSession = sessionFromHash(); }
   setFocusFromHash();
   refresh();
 });
@@ -2723,27 +2797,403 @@ async function searchIssues(value) {
   }
 }
 
-// Tabs at the top of the list pane: Threads | Issues (awaiting count). Arrow keys move between them.
+// ---------------------------------------------------------------- hosted session trees (the list pane's Sessions tab)
+// Human only and read-only: one row per TREE in the list (a hosted root, or an interactive session you opened that
+// started children), never a child on its own; the selected tree nested in the center, and the selected session's
+// details below it. Data: GET /api/hosted-trees and GET /api/hosted-trees/{id} (hosted_lineage.py: read-only, capped).
+// What an agent wrote (titles, replies, results' details) is untrusted data: set as text through el(), never as HTML,
+// and never turned into links. Expanded and collapsed state lives here, so the 3-second refresh keeps it.
+
+function lineageTrees() { return lineage && Array.isArray(lineage.trees) ? lineage.trees : []; }
+function linWalk(n) { return [n, ...(n.children || []).flatMap(linWalk)]; }
+function linTreeOf(id) { return lineageTrees().find(t => linWalk(t.session).some(n => n.session_id === id)) || null; }
+function linFind(id) {
+  for (const t of lineageTrees()) { const n = linWalk(t.session).find(x => x.session_id === id); if (n) return n; }
+  return null;
+}
+// The tree shown in the center and the session whose details are shown under it. A selected session (a click, or a
+// #session-<id> link) shows its own tree or, when it is in none of them, nothing but that it is not available: never
+// another tree under a URL that names this one. With nothing selected, the first tree and its root.
+function currentLineage() {
+  if (selectedSession) {
+    const tree = linTreeOf(selectedSession);
+    return { tree, session: tree && linWalk(tree.session).find(n => n.session_id === selectedSession), missing: !tree };
+  }
+  const tree = lineageTrees()[0] || null;
+  return { tree, session: tree && tree.session, missing: false };
+}
+const onSessionsTab = () => view === "board" && listTab === "sessions";
+const shownId = () => { const s = currentLineage().session; return s ? s.session_id : null; };
+const shortId = id => typeof id === "string" ? id.slice(0, 8) : "";
+// The server's clock, moved on by the time since the answer: a duration never depends on this browser's clock.
+function linNow() { return lineage && typeof lineage.now === "number" ? lineage.now + (Date.now() - lineageAt) / 1000 : Date.now() / 1000; }
+function duration(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`; if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h`;
+}
+function when(ts) { return typeof ts === "number" ? new Date(ts * 1000).toLocaleString() : ""; }
+function agoTs(ts) { return typeof ts === "number" ? ago(new Date(ts * 1000).toISOString()) : ""; }
+// How long it has run (live) or ran (ended), from the server's own times.
+function ranFor(n) {
+  if (typeof n.created_at !== "number") return "";
+  const end = n.state === "ended" ? (typeof n.ended_at === "number" ? n.ended_at : n.updated_at) : linNow();
+  return (n.state === "ended" ? "ran " : "open ") + duration(end - n.created_at);
+}
+function linLabel(n) {
+  if (n.kind === "interactive") return `${n.agent || "agent"} (interactive root)`;
+  if (n.parent || n.depth) return n.title ? `${n.name || "child"}: ${n.title}` : (n.name || `child ${shortId(n.session_id)}`);
+  return `${n.agent || "agent"} root session`;
+}
+function treeLabel(t) { return `${t.agent || "agent"} in ${baseName(t.project || "") || t.project || "?"}`; }
+// One word for where a session stands: running, waiting, queued, idle, starting, closing, ended, open.
+function linState(n) {
+  if (n.kind === "interactive") return n.state === "ended" ? "ended" : "open";
+  if (n.state === "ended") return "ended";
+  if (n.closing) return "closing";
+  if (n.state === "running" || n.state === "waiting") return n.state;
+  if ((n.queued || 0) > 0 || n.in_flight !== null && n.in_flight !== undefined) return "queued";
+  return n.state || "unknown";
+}
+const STATE_CHIP = { running: "accent", waiting: "warn", queued: "", idle: "", starting: "", closing: "warn", ended: "", open: "", unknown: "" };
+function stateChip(n) {
+  const s = linState(n), why = s === "ended" && n.error ? `ended: ${n.error}` : s;
+  return el("span", { class: `chip lin-state s-${s} ${STATE_CHIP[s] || ""}`.trim(), title: why }, s);
+}
+function startedBy(by) {
+  if (!by || typeof by !== "object") return "";
+  if (by.kind === "agent") return `agent ${by.name || "?"}` + (by.via === "interactive" ? " (from an interactive session)"
+    : by.session ? ` (from session ${shortId(by.session)})` : "");
+  if (by.kind === "interactive") return `the first child session a ${by.name || "agent"} conversation you opened started`;
+  return !by.name || by.name === "human" ? "the human" : `${by.name} (the human)`;
+}
+function accessText(n) {
+  if (!n.access) return n.kind === "interactive" ? "" : "access not reported yet";
+  return n.access + (n.granted && n.granted !== n.access ? ` (its node gives ${n.granted})` : "")
+    + (n.access === "full" && n.ceiling && n.ceiling !== "full" ? " (not confirmed by a live process)" : "");
+}
+// The facts of one session, as short items that wrap; long values are cut with the whole value in the title.
+function linFacts(n) {
+  const item = (text, title) => text ? el("span", { class: "lin-fact", title: title || text }, text) : null;
+  if (n.kind === "interactive") return [item(n.project ? baseName(n.project) : "", n.project),
+    item(`root made ${agoTs(n.created_at)}, at its first child`, when(n.created_at)),
+    n.state === "ended" && n.error ? item(`ended: ${n.error}`) : null];
+  const model = [n.model ? `model ${n.model}` : "runner's model", n.effort ? `effort ${n.effort}` : ""].filter(Boolean).join(", ");
+  const where = n.parent ? (n.isolation === "worktree" ? "own worktree" : "shared checkout") : "project checkout";
+  return [item(n.agent), item(model), item(accessText(n)), item(where, n.isolation === "worktree" && n.worktree ? n.worktree : null),
+    item(`node ${n.node}` + (n.node_live || n.state === "ended" ? "" : " (not connected)")),
+    item(`${n.turns || 0} turn${n.turns === 1 ? "" : "s"}`), item(`${n.queued || 0} queued`),
+    n.in_flight !== null && n.in_flight !== undefined ? item(`message ${n.in_flight} in flight`) : null,
+    item(`started ${agoTs(n.created_at)}`, when(n.created_at)), item(ranFor(n)),
+    item(`by ${startedBy(n.started_by)}`)];
+}
+const OUTCOMES = { completed: "completed", failed: "failed", timed_out: "timed out", withdrawn: "withdrawn",
+  ended: "the child session ended", cancelled: "cancelled" };
+const RESULT_STATES = { pending: "waiting for its parent", queued: "in a turn of its parent's, start not confirmed",
+  delivered: "delivered to its parent", claimed: "taken by its starter's call", undelivered: "not delivered" };
+function resultLine(r) {
+  if (!r) return null;
+  const bad = r.outcome !== "completed";
+  return el("div", { class: "lin-result" + (bad ? " bad" : "") },
+    el("span", { class: "lin-k" }, "Latest result"),
+    el("span", {}, `${r.message ? `message ${r.message}: ` : ""}${OUTCOMES[r.outcome] || r.outcome || "?"}`),
+    el("span", { class: "muted" }, `· ${RESULT_STATES[r.state] || r.state}`),
+    r.detail ? el("span", { class: "muted lin-clip", title: r.detail }, `· ${r.detail}`) : null,
+    r.waiting_because ? el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Waits"), r.waiting_because) : null,
+    r.state === "undelivered" && r.why ? el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Why"), r.why) : null);
+}
+// An agent's own words: plain text in a <pre> (textContent through el), a few lines unless the human expands it.
+// `key` names the block for the expanded set, so a refresh keeps it open.
+const OUTPUT_LINES = 4;
+function outputBlock(key, label, text, note) {
+  if (typeof text !== "string" || !text) return null;
+  const open = linOutputOpen.has(key), id = `out-${key}`;
+  const long = text.split("\n").length > OUTPUT_LINES || text.length > 320;
+  return el("div", { class: "lin-output-box" },
+    el("div", { class: "lin-output-label" }, el("span", {}, label), el("span", { class: "badge badge-outline" }, "untrusted · plain text"),
+      long ? el("button", { type: "button", class: "linkish", id: `${id}-toggle`, "aria-expanded": open ? "true" : "false", "aria-controls": id,
+        onclick: () => { open ? linOutputOpen.delete(key) : linOutputOpen.add(key); render(); } }, open ? "Show less" : "Show all") : null),
+    el("pre", { class: "lin-output" + (long && !open ? " clamped" : ""), id }, text),
+    note ? el("div", { class: "muted small" }, note) : null);
+}
+function linOutput(n, where) {
+  const o = n.output;
+  if (!o || typeof o.text !== "string") return null;
+  return outputBlock(`${where}-${n.session_id}`, `Output from ${n.name || linLabel(n)}` + (o.for_message ? ` (reply to message ${o.for_message})` : ""),
+    o.text, cutNote(o, n.session_id));
+}
+
+function selectSession(id) {
+  focusVersion++;
+  if (selectedSession !== id) { selectedSession = id; sessionDetail = null; sessionDetailError = ""; detailFor = null; }
+  try { history.replaceState(null, "", `#session-${id}`); } catch (e) {}
+  render();
+  loadSessionDetail().then(render);
+}
+const selectTree = root => selectSession(root);     // a tree is selected by its root
+function treesHold(got, id) { return (got.trees || []).some(t => linWalk(t.session).some(n => n.session_id === id)); }
+function loadLineage() {
+  const key = `${showEndedTrees}|${selectedSession}`;
+  if (lineageFlight && lineageFlight.key === key) return lineageFlight.promise;
+  const flight = { key, promise: null };
+  flight.promise = fetchLineage().finally(() => { if (lineageFlight === flight) lineageFlight = null; });
+  lineageFlight = flight;
+  return flight.promise;
+}
+async function fetchLineage() {
+  const gen = ++lineageGen, all = showEndedTrees, target = selectedSession;
+  const current = () => gen === lineageGen && all === showEndedTrees && target === selectedSession && onSessionsTab();
+  let got;
+  try { got = await api("GET", "/api/hosted-trees" + (all ? "?all=true" : "")); }
+  catch (e) { if (current()) lineageError = e.message; return; }
+  if (!current()) return;
+  // An explicit target that is in no live tree: its tree may have ended. Look among the ended ones, once per target
+  // (the toggle then says so; unticking it again is respected).
+  if (target && !all && endedLookedFor !== target && !treesHold(got, target)) {
+    endedLookedFor = target; showEndedTrees = true;
+    return loadLineage();
+  }
+  lineage = got; lineageAt = Date.now(); lineageError = "";
+  loadSessionDetail().then(() => { if (onSessionsTab()) render(); });    // on its own: the trees never wait for it
+}
+// The shown session's details (GET /api/hosted-trees/{id}: read-only and capped), fetched when the shown session or
+// its `version` changes, not on every refresh, and never in the way of the trees. Kept for the same session while a
+// later fetch fails, with the error.
+function loadSessionDetail() {
+  const { session } = currentLineage();
+  if (!session) { sessionDetail = null; sessionDetailError = ""; detailFor = null; return Promise.resolve(); }
+  const want = session.session_id, version = session.version, key = `${want}|${version}`;
+  if (detailFor && detailFor.id === want && detailFor.version === version) return Promise.resolve();
+  if (detailFlight && detailFlight.key === key) return detailFlight.promise;
+  const flight = { key, promise: null };
+  flight.promise = fetchSessionDetail(want, version).finally(() => { if (detailFlight === flight) detailFlight = null; });
+  detailFlight = flight;
+  return flight.promise;
+}
+async function fetchSessionDetail(want, version) {
+  const gen = ++detailGen;
+  const current = () => gen === detailGen && shownId() === want && onSessionsTab();
+  try {
+    const d = await api("GET", `/api/hosted-trees/${encodeURIComponent(want)}`);
+    if (!current()) return;
+    // Cached under the version the body itself carries (not the tree's, which may be older or newer than it).
+    sessionDetail = d; sessionDetailError = "";
+    detailFor = { id: want, version: typeof d.version === "string" ? d.version : version };
+  } catch (e) {
+    if (!current()) return;
+    if (sessionDetail && sessionDetail.session_id !== want) sessionDetail = null;
+    sessionDetailError = e.message; detailFor = null;     // tried again on the next refresh
+  }
+}
+
+function renderSessionTreeList(threadCount) {
+  const trees = lineageTrees(), { tree: current } = currentLineage();
+  const rows = trees.map(t => {
+    const on = !!current && current.root === t.root, r = t.session;
+    return listRow({ class: "tree-row" + (t.live ? "" : " ended"), "data-tree": t.root }, `tree-row-${t.root}`, `#session-${t.root}`, on, () => selectTree(t.root),
+      [el("span", { class: "muted" }, t.kind === "interactive" ? "Interactive · " : "Hosted · "), treeLabel(t)],
+      el("div", { class: "sub", id: `tree-row-${t.root}-sub` },
+        el("span", {}, `${t.live} live of ${plural(t.sessions, "session")}`),
+        t.node ? el("span", { title: `node ${t.node}` }, `· ${t.node}`) : null,
+        el("span", { title: t.root }, `· ${shortId(t.root)}`)),
+      [el("span", { title: when(t.created_at) }, agoTs(t.created_at)), stateChip(r)]);
+  });
+  // No row selected (the linked session is not available): the first row is still in the Tab order, unselected.
+  if (!current && rows.length) { const a = rows[0].querySelector("a.row-link"); if (a) a.setAttribute("tabindex", "0"); }
+  const table = listRows("Session trees", rows, trees.map(t => t.root), current && current.root,
+    id => selectTree(id), id => `tree-row-${id}`);
+  const toggle = el("label", { class: "small muted", title: "Trees whose sessions have all ended (kept 7 days)" },
+    el("input", { type: "checkbox", id: "show-ended-sessions", checked: showEndedTrees,
+      onchange: e => { showEndedTrees = e.target.checked; refresh(); } }), "Show ended");
+  const body = lineageError && !lineage ? el("div", { class: "empty", role: "alert" }, el("strong", {}, "Couldn't load session trees"), el("span", {}, lineageError))
+    : trees.length ? table : el("div", { class: "empty" }, el("strong", {}, showEndedTrees ? "No session trees" : "No live session trees"),
+      el("span", {}, showEndedTrees ? "Start one with board session start in a terminal." : "Tick Show ended for trees that have ended."));
+  return el("section", { class: "card thread-list session-list", "data-tab": "sessions" },
+    renderListTabs(threadCount),
+    el("div", { id: "list-panel", role: "tabpanel", "aria-labelledby": "tab-sessions" },
+      el("div", { class: "head tools small muted" }, el("span", {}, plural(trees.length, "tree")), el("span", { class: "sp" }), toggle),
+      body));
+}
+
+// One session and, nested under it, the sessions it started: a list of lists. Its name is the button that opens its
+// details; a fold button (when it has children) hides or shows them. Up/Down (or j/k) move between the names,
+// Left folds or goes to the parent, Right unfolds or goes to the first child.
+function linItem(n, selectedId, isRoot) {
+  const kids = n.children || [], folded = linCollapsed.has(n.session_id), on = n.session_id === selectedId;
+  const label = linLabel(n), group = `lin-group-${n.session_id}`;
+  return el("li", { class: "lin-item" + (isRoot ? " lin-root" : "") + (linState(n) === "ended" ? " ended" : ""), "data-session": n.session_id,
+      "data-depth": n.depth || 0 },
+    el("div", { class: "lin-row" },
+      kids.length ? el("button", { type: "button", class: "lin-fold btn-ghost", id: `lin-fold-${n.session_id}`, "aria-expanded": folded ? "false" : "true",
+        "aria-controls": group, "aria-label": `${folded ? "Show" : "Hide"} the ${plural(kids.length, "session")} started by ${label}`,
+        title: folded ? "Show the sessions it started" : "Hide the sessions it started",
+        onclick: () => { folded ? linCollapsed.delete(n.session_id) : linCollapsed.add(n.session_id); render(); } },
+        el("span", { "aria-hidden": "true" }, folded ? "▸" : "▾")) : el("span", { class: "lin-fold-sp", "aria-hidden": "true" }),
+      isRoot ? el("span", { class: "badge badge-outline" }, n.kind === "interactive" ? "interactive root" : "root") : null,
+      el("button", { type: "button", class: "lin-open", id: `lin-open-${n.session_id}`, "data-session": n.session_id,
+        "aria-current": on ? "true" : null, title: `${label} (${n.session_id}): show its details`,
+        onclick: () => selectSession(n.session_id) }, label),
+      stateChip(n),
+      n.detached ? el("span", { class: "chip warn", title: `Its parent ${n.parent} is no longer on record` }, "parent gone") : null,
+      n.unsettled ? el("span", { class: "chip warn", title: n.unsettled }, "not settled") : null,
+      kids.length ? el("span", { class: "muted small" }, kids.length === 1 ? "1 child" : `${kids.length} children`) : null),
+    el("div", { class: "lin-facts small muted" }, linFacts(n)),
+    n.state === "ended" && n.error && n.kind === "hosted" ? el("div", { class: "small muted lin-clip", title: n.error }, `Ended: ${n.error}`) : null,
+    resultLine(n.result),
+    linOutput(n, "tree"),
+    kids.length ? el("ul", { class: "lin-group", id: group, role: "list", hidden: folded },
+      kids.map(k => linItem(k, selectedId, false))) : null);
+}
+function linKeys(e) {
+  const t = e.target;
+  if (!t.classList || !t.classList.contains("lin-open")) return;
+  const all = [...e.currentTarget.querySelectorAll("button.lin-open")].filter(b => !b.closest("ul[hidden]"));
+  const i = all.indexOf(t), id = t.dataset.session, n = linFind(id);
+  const go = b => { if (b) { e.preventDefault(); b.focus(); if (b.scrollIntoView) b.scrollIntoView({ block: "nearest" }); } };
+  const kids = n && n.children && n.children.length;
+  if (e.key === "ArrowDown" || e.key === "j") go(all[i + 1]);
+  else if (e.key === "ArrowUp" || e.key === "k") go(all[i - 1]);
+  else if (e.key === "Home") go(all[0]);
+  else if (e.key === "End") go(all[all.length - 1]);
+  else if (e.key === "ArrowRight" && kids) {
+    e.preventDefault();
+    if (linCollapsed.has(id)) { linCollapsed.delete(id); render(); }
+    else go(document.getElementById(`lin-open-${n.children[0].session_id}`));
+  } else if (e.key === "ArrowLeft" && n) {
+    e.preventDefault();
+    if (kids && !linCollapsed.has(id)) { linCollapsed.add(id); render(); }
+    else if (n.parent) go(document.getElementById(`lin-open-${n.parent}`));
+  }
+}
+function renderLineage(tree, session) {
+  const r = tree.session;
+  const head = el("div", { class: "card-header" },
+    el("h2", { class: "card-title" }, `Session tree: ${treeLabel(tree)}`),
+    el("p", { class: "card-description" }, `${tree.kind === "interactive" ? "The project's interactive root for this agent (made at its first child)" : "A hosted session"}`
+      + ` and the sessions started under it: ${tree.live} live of ${plural(tree.sessions, "session")}.`
+      + (tree.node ? ` Node ${tree.node}.` : "")),
+    el("div", { class: "lin-links small" },
+      tree.audit_thread ? el("a", { href: `#thread-${tree.audit_thread}`, id: `lin-audit-${tree.root}`,
+        onclick: e => { e.preventDefault(); openThread(tree.audit_thread); } }, `Audit thread #${tree.audit_thread}`)
+        : el("span", { class: "muted" }, "No audit thread: the board writes one when an agent starts a child session."),
+      el("span", { class: "muted", title: tree.project }, tree.project)));
+  const list = el("ul", { class: "lin-tree", role: "list", "aria-label": `Sessions in the tree of ${treeLabel(tree)}`, onkeydown: linKeys },
+    linItem(r, session && session.session_id, true));
+  return el("section", { class: "card lineage", id: "lineage", "aria-label": "Session tree" }, head,
+    el("p", { class: "small muted lin-note" }, "Read-only. Start, message or close sessions with board session in a terminal. "
+      + "What a session wrote is its own text: untrusted, shown as plain text."),
+    list);
+}
+function detailRow(k, v, title) {
+  if (v === null || v === undefined || v === "") return null;
+  return [el("dt", {}, k), el("dd", { title: title || (typeof v === "string" ? v : null) }, v)];
+}
+// Agent text the server cut (hosted_lineage.OUTPUT_MAX, in code points, as counted here): where the whole of it is,
+// when a command can show it (`show` takes a hosted session's id; an interactive root has none).
+function cutNote(o, id, hosted = true) {
+  if (!o || !o.truncated) return null;
+  return `Cut at ${[...o.text].length} of ${o.length} characters here` + (hosted ? `; board session show ${id} has all of it.` : ".");
+}
+function renderSessionDetail(n) {
+  const d = sessionDetail && sessionDetail.session_id === n.session_id ? sessionDetail : null;
+  const s = d || n, label = linLabel(n);
+  const msgKinds = { user: "", wake: " (wake: a board post addressed to the agent)", child: " (results of its child sessions)", task: " (task from the session that started it)" };
+  const out = [el("div", { class: "card-header" }, el("h2", { class: "card-title" }, `Session details: ${label}`),
+    el("p", { class: "card-description" }, n.kind === "interactive"
+      ? "The project's interactive root for this agent: the board made it when an agent conversation you opened (Claude Code, Codex) first started a child session, and every such conversation of that agent in this project shares it. It runs on no node; its children's results wait for those conversations' calls to take them."
+      : "What board session show prints for it, as stored on the hub (this view never changes it)."))];
+  if (n.unsettled) out.push(el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Not settled yet"), n.unsettled));
+  if (sessionDetailError) out.push(el("div", { class: "err", role: "alert" }, `Couldn't load its details: ${sessionDetailError}`));
+  out.push(el("dl", { class: "lin-dl" },
+    detailRow("Id", n.session_id),
+    detailRow("Kind", n.kind === "interactive" ? "interactive root" : n.parent ? `child (depth ${n.depth})` : "hosted root"),
+    detailRow("State", linState(n) + (n.state === "ended" && n.error ? `: ${n.error}` : "")),
+    detailRow("Agent", n.kind === "hosted" ? `${n.agent} (${s.runtime || "?"})` : n.agent),
+    n.kind === "hosted" ? detailRow("Model", [s.model || "the runner's own", s.effort ? `effort ${s.effort}` : ""].filter(Boolean).join(", ")) : null,
+    detailRow("Access", accessText(s)),
+    detailRow("Isolation", s.isolation),
+    s.isolation === "worktree" ? detailRow("Worktree", s.worktree || "not made yet") : null,
+    detailRow("Node", n.node ? n.node + (n.node_live || n.state === "ended" ? "" : " (not connected)") : null),
+    detailRow("Project", s.project),
+    n.kind === "hosted" ? detailRow("Turns", `${s.turns || 0}, ${s.queued || 0} queued` + (s.in_flight != null ? `, message ${s.in_flight} in flight` : "")) : null,
+    detailRow(n.kind === "interactive" ? "Root made" : "Started", when(n.created_at)),
+    detailRow("Ended", n.state === "ended" ? when(n.ended_at) : null),
+    detailRow("Duration", ranFor(n)),
+    detailRow(n.kind === "interactive" ? "Made by" : "Started by", startedBy(n.started_by)),
+    n.parent ? [el("dt", {}, "Parent"), el("dd", {}, linFind(n.parent) ? el("button", { type: "button", class: "linkish", id: `lin-parent-${n.session_id}`,
+      onclick: () => selectSession(n.parent) }, linLabel(linFind(n.parent))) : n.parent)] : null,
+    detailRow("Provider id", s.provider_id),
+    detailRow("Transcript", s.transcript)));
+  const last = s.last_result;
+  if (last && typeof last === "object") out.push(el("div", { class: "lin-result" + (last.ok ? "" : " bad") },
+    el("span", { class: "lin-k" }, "Last turn"), el("span", {}, `message ${last.message}: ${last.ok ? "ok" : "failed"}`),
+    last.detail ? el("span", { class: "muted lin-clip", title: last.detail }, `· ${last.detail}`) : null,
+    (last.denials || []).length ? el("span", { class: "muted" }, `· tools denied: ${last.denials.join(", ")}`) : null));
+  if (n.result) out.push(resultLine(n.result));
+  if (d && Array.isArray(d.messages) && d.messages.length) out.push(el("h3", {}, "Messages"),
+    el("ul", { class: "lin-msgs small", role: "list" }, d.messages.map(m => el("li", {},
+      el("span", {}, `message ${m.n} [${m.state}]${msgKinds[m.kind] || ""}`), m.detail ? el("span", { class: "muted lin-clip", title: m.detail }, ` ${m.detail}`) : null))));
+  if (d && Array.isArray(d.results) && d.results.length) out.push(el("h3", {}, "Results from its children"),
+    el("ul", { class: "lin-msgs small", role: "list" }, d.results.map(x => el("li", {},
+      el("div", {}, `result ${x.n} · ${x.name || "child"} ${shortId(x.child)}${x.message ? ` message ${x.message}` : ""}: ${OUTCOMES[x.outcome] || x.outcome} · ${RESULT_STATES[x.state] || x.state}`),
+      x.waiting_because ? el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Waits"), x.waiting_because) : null,
+      x.state === "undelivered" && x.why ? el("div", { class: "lin-waits" }, el("span", { class: "lin-k" }, "Why"), x.why) : null,
+      x.state === "undelivered" ? outputBlock(`res-${n.session_id}-${x.n}`, `Output from ${x.name || "child"} (kept for you: never delivered)`,
+        x.output && x.output.text || "(no output)", cutNote(x.output, n.session_id, n.kind === "hosted")) : null))));
+  const reply = d ? d.output : n.output;
+  if (reply && typeof reply.text === "string") out.push(outputBlock(`detail-${n.session_id}`,
+    `Last reply from ${n.name || label}` + (reply.for_message ? ` (to message ${reply.for_message})` : ""), reply.text, cutNote(reply, n.session_id)));
+  return el("section", { class: "card lin-detail", id: "session-detail", "aria-label": `Details of ${label}` }, out);
+}
+function renderSessionPane() {
+  const { tree, session } = currentLineage();
+  if (lineageError && lineage) return [el("div", { class: "alert alert-destructive", role: "alert" },
+    el("div", { class: "alert-title" }, "Couldn't refresh session trees"), el("div", { class: "alert-description" }, lineageError)),
+    ...(tree ? [renderLineage(tree, session), renderSessionDetail(session)] : [])];
+  if (!tree) return [el("div", { class: "card muted", id: "lineage-empty", role: lineage && selectedSession ? "status" : null },
+    !lineage ? (lineageError || "Loading session trees…")
+    : selectedSession && !showEndedTrees ? `Session ${selectedSession} is not in a live tree. Tick Show ended to see ended trees.`
+    : selectedSession ? `Session ${selectedSession} is not available: no tree on the hub holds it (an ended session's record is kept 7 days).`
+    : "No session trees to show. Hosted sessions you start with board session start, and the child sessions under them, appear here.")];
+  return [renderLineage(tree, session), renderSessionDetail(session)];
+}
+
+// Tabs at the top of the list pane: Threads | Issues (awaiting count) | Sessions (live hosted sessions; the human's
+// only). Arrow keys, Home and End move between them.
 function renderListTabs(threadCount) {
   const awaiting = waitingIssues().filter(i => i.status !== "resolved").length;
+  const ids = ["threads", "issues", ...(state.me.is_human ? ["sessions"] : [])];
   const tab = (id, label, extra) => el("button", { type: "button", role: "tab", class: "tabs-trigger", id: `tab-${id}`,
     "aria-selected": listTab === id ? "true" : "false", "aria-controls": "list-panel", tabindex: listTab === id ? "0" : "-1",
     onclick: () => setTab(id),
     onkeydown: e => {
-      if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
-      e.preventDefault(); const next = id === "threads" ? "issues" : "threads"; setTab(next);
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+      e.preventDefault();
+      const i = ids.indexOf(id), next = e.key === "Home" ? ids[0] : e.key === "End" ? ids[ids.length - 1]
+        : ids[(i + (e.key === "ArrowRight" ? 1 : ids.length - 1)) % ids.length];
+      setTab(next);
       const n = document.getElementById(`tab-${next}`); if (n) n.focus();
     } }, label, extra);
+  // The count comes with every snapshot (`hosted_live`, the human's only); the trees only while the tab is open.
+  const live = typeof state.hosted_live === "number" ? state.hosted_live
+    : lineage && typeof lineage.live_sessions === "number" ? lineage.live_sessions : null;
   return el("div", { class: "head tabs" }, el("div", { class: "tabs-list", role: "tablist", "aria-label": "Lists", style: "flex:1" },
     tab("threads", "Threads", el("span", { class: "count" }, String(threadCount))),
     tab("issues", "Issues", awaiting ? el("span", { class: "badge badge-warning", title: `${awaiting} awaiting your decision` }, `${awaiting} awaiting`)
-      : el("span", { class: "count" }, String(allIssues().length)))));
+      : el("span", { class: "count" }, String(allIssues().length))),
+    state.me.is_human ? tab("sessions", "Sessions", el("span", { class: "count", title: live === null ? "Not loaded yet"
+      : `${plural(live, "hosted session")} recorded as not ended` }, live === null ? "–" : String(live))) : null));
 }
+// The URL names a session only once the human chose one (a click or a link); the default first tree is `#sessions`,
+// since a refresh may put another tree first.
+function sessionHash() { return selectedSession ? `#session-${selectedSession}` : "#sessions"; }
 function setTab(tab) {
   focusVersion++;
   if (listTab === tab && view === "board") return;
   listTab = tab; view = "board"; store(TAB_KEY, tab); highlight = focus = null;
-  const hash = tab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : selected ? `#thread-${selected}` : "";
+  const hash = tab === "issues" ? (selectedIssue ? `#issue-${selectedIssue}` : "#issues") : tab === "sessions" ? sessionHash()
+    : selected ? `#thread-${selected}` : "";
   try { history.replaceState(null, "", hash || location.pathname); } catch (e) {}
   refresh();
 }
@@ -2863,7 +3313,7 @@ function renderSettings() {
 }
 
 // Re-rendering replaces the DOM every few seconds; keep each list's own scroll position (per tab).
-const savedListScroll = { threads: 0, issues: 0 };
+const savedListScroll = { threads: 0, issues: 0, sessions: 0 };
 let scrollToThread = false;
 function keepScroll(selector) {
   return () => { const n = document.querySelector(selector); if (n) n.scrollTop = savedListScroll[listTab] || 0; };
@@ -2874,7 +3324,9 @@ function keepScroll(selector) {
 // refresh skips while one is being edited).
 let rendering = false;
 function focusTarget(n) {
-  if (!n || !n.tagName || ["INPUT", "TEXTAREA", "SELECT", "BODY", "HTML"].includes(n.tagName)) return null;
+  if (!n || !n.tagName) return null;
+  if (n.tagName === "INPUT" && n.type === "checkbox" && n.id) { const id = n.id; return () => document.getElementById(id); }
+  if (["INPUT", "TEXTAREA", "SELECT", "BODY", "HTML"].includes(n.tagName)) return null;
   if (n.id) { const id = n.id; return () => document.getElementById(id); }
   if (n.dataset && n.dataset.confirm) { const key = n.dataset.confirm; return () => confirmButtons(key)[0]; }
   return null;
@@ -2958,7 +3410,12 @@ function draw(app) {
   // while you read (or arrow through it); a reload tidies them away.
   const threads = all.filter(t => showClosed || t.id === pinned || t.id === selected || opened.has(t.id)
     || (statuses.get(t.id) || {}).kind !== "done");
-  if (listTab === "issues") {
+  if (listTab === "sessions" && !human) listTab = "threads";     // the human's tab only
+  if (listTab === "sessions") {
+    // Sessions tab: one row per session tree on the left, the selected tree and session in the center.
+    list.append(renderSessionTreeList(threads.length));
+    pane.append(...renderSessionPane());
+  } else if (listTab === "issues") {
     // Issues tab: the issue list on the left, the selected issue in the center. Header and sidebar are unchanged.
     const current = currentIssue();
     list.append(renderIssueList(current, threads.length));

@@ -6512,3 +6512,100 @@ the line was.)
 - A runner configured with `--tools=Read` can enter the scoped path (`read_only()` does not look at `--tools`) and
   be labelled read-only afterwards (`claude_label`); it then gets the softened list.
 - The dispatched instruction names `board_request_progress` even when a runner denies that tool.
+
+## Session lineage view (2026-11-22)
+
+**Why.** The owner wanted one place that shows each session tree, as T3 Code's lineage view does (child threads with
+model, status, progress, results and duration). Until now a tree was seen only in a terminal (`board session list`,
+`show`) or piecemeal in the hub's audit posts. A known complaint about T3 (pingdotgg/t3code#15713) is that subagent
+threads clutter its main thread list, so here a child is never a row of its own: it is nested under its root.
+
+**What it shows.** A third tab in the dashboard's list pane, **Sessions**, the human's only. Its count is the hosted
+sessions that have not ended (`hosted_live` on the human's `/api/state`, `hosted_lineage.live_count`: a count of the
+stored records, nothing settled). The list holds one row per TREE: a hosted root, an interactive root (the agent
+conversation the human opened whose first child made it, hosted_spawn.py), or a session whose parent is no longer
+on record (`detached`, after the 7-day prune). The center shows the selected tree as a list of lists, the root boxed
+as the anchor, every session under its parent at every depth; under it the selected session's details. Per session:
+title or role, agent, model and effort, access (with what its node gives when narrower, and an unconfirmed full),
+where it runs, node (and whether connected), state as one word (running, waiting, queued, idle, starting, closing,
+ended with its reason, open for an interactive root), turns, queued messages, the message in flight, when it started,
+how long it has been open or ran (from the server's clock, `now`, moved on by the time since the answer), and who
+started it. A child also shows its latest result as its parent's outbox holds it: outcome, state, the node's detail
+and, while it waits, `hosted_results.waiting_because` (the same words `show` prints). The details panel is
+`GET /api/hosted-trees/{id}` (hosted_lineage.detail): the same view, the recent messages (no text), the results its
+children sent it (an undelivered one with its kept text) and the last reply, every text capped as in the tree; for an
+interactive root, which runs nowhere, its record and the results waiting to be claimed. (An interactive root is
+the project's root for that agent, made at its first child; its time is shown as when the root was made, not when a
+conversation opened.) A tree whose children an
+agent started links to its audit thread (`host.tree.<root>.thread`). A link to a session (`#session-<id>`) shows
+that session's tree and nothing else: when no live tree holds it, the ended trees are loaded once (and the toggle
+ticked), and a session no tree holds is said to be not available.
+
+**Where the data comes from.** `GET /api/hosted-trees[?all=true]` (hosted_lineage.trees) and `GET
+/api/hosted-trees/{id}` (hosted_lineage.detail), human only. Each session is `hosted._human_view` (what `board
+session list` and `show` print) of its record AS STORED, nested by its `parent`; children of an interactive root
+hang under the iroot record. Additions: `started_by` (the record's `created_by`, or its `spawned_by` agent and
+whether that was a hosted or an interactive session), `result` (the child's latest result record, without its text),
+`output` (the session's last reply, at most `OUTPUT_MAX` = 4000 characters, with `truncated` and the full `length`;
+the same cap for an undelivered result's text in the details; both counted in code points, as the dashboard counts
+them when it says where a text was cut), `unsettled` (below) and `version`: a hash of exactly the body the details
+route returns (`_body`, its messages and every result it lists included), computed by both routes from the same
+records, so the dashboard fetches the details again when, and only when, the selection or what they show changed
+(a node's liveness among it). Both routes refuse agents and nodes (`_require_human`),
+and the gateway's allowlist does not carry them; no tool or route an agent can call changed, and `board session
+show`'s answer is unchanged. The trees are fetched only while the tab is open, on the dashboard's existing 3-second
+refresh; the count rides on the snapshot it already fetches, counted in SQL without decoding a record.
+
+**Read-only: what is not settled.** `list` and `show` call `hosted._settle`, which WRITES: a child whose node no
+longer hosts children (or no longer the level it needs) is ended with that reason, and a session whose node has been
+silent past `NODE_LOST_SECONDS` with a turn in flight or a close pending has the turn failed (`node_lost`, its
+results given back or kept) or the session ended. A view refreshed every few seconds must not do that (review round
+1, S2: a lineage read turned a delivered message into a failed one). So neither route settles anything: the records
+are shown as stored, with `unsettled` saying what the next settling read (`board session list` or `show`) would do
+(`ORPHAN` for `hosted_tree.orphan_reason`, worded as what that read will do rather than as done; `LOST` for
+`hosted._lost`) and the row marked "not settled". The tab's count is likewise the sessions RECORDED as not ended
+(`live_count`, in SQL with `hosted._sessions`' own shape check: a JSON object whose session_id is text). The difference is only in timing: the same
+record, read by the CLI, is settled then. A test compares the whole database before and after both requests.
+
+**Cost per request.** The tree's shape is found from the stored records first, and only the trees shown are viewed
+and their results read. Why a result waits depends on the dispatcher's runs (`hosted_wake._occupied`,
+`hosted._checkout_busy`); those are read ONCE per request (`_Busy`: `hosted.checkout_runs`, the run directories
+derived from the same records) and answered once per checkout, where the default reads them twice per result.
+Each outbox (a parent's results) is read once per request and indexed by child (`_Reads`), so a child's latest result
+does not reread its parent's box, and each result's view is made once; of a session's messages only the last
+`SHOW_MESSAGES` are read and decoded (`_messages`: ordered by the number its key ends in, `LIMIT` in SQL). A test
+traces the statements: one outbox read and one limited message read per session.
+
+**Why child output is plain text.** A reply is whatever the model wrote, and a child's model reads the board, the
+code and the web: its output can be shaped by anyone. The dashboard renders everything through `el()`, which adds a
+string as a text node and an attribute with `setAttribute`; the page has no `innerHTML` or other HTML parser at all
+(a test reads the source for that). Output goes into a `<pre>` whose only child is that text node, labelled as the
+session's own words, "untrusted · plain text". No markdown is rendered, so a `[link](javascript:...)` stays those
+characters, and nothing in it becomes a link: the only links in the view are the server's (the audit thread, the
+tree rows). The same holds for the details panel's reply and for an undelivered result's kept text. A title, a
+node's detail and a reason are shown the same way.
+
+**Live update.** The whole page is re-rendered on each refresh, as before. What the human folded, which outputs are
+expanded, and the selected session live in page variables (Sets keyed by session id), and every control has a stable
+id, so `render()` puts focus back where it was (the "Show ended" checkbox too); no `<details>` is used (an open one
+pauses the refresh). Each kind of fetch (trees, details) has its own generation: an answer that is not the latest of
+its kind, or that lands after the tab, the toggle or the selection it was for changed, is dropped, success or
+failure, so a late live-only answer cannot replace the ended trees and a late error cannot erase the details of the
+session selected since. A poll whose scope (toggle and selection; for the details, the session and its version) is
+that of a request still in flight waits for that request instead of starting another, so a hub slower than the
+3-second refresh is caught up with rather than chased. The two kinds are independent: a tree answer is rendered
+at once and the next poll may fetch the trees again while the details are still on their way (they render when they
+land). The details are cached under the `version` their own body carries, not the tree's, so a change that came and
+went between the two reads is fetched again rather than kept. The URL names a session only once the human chose one;
+coming back to the tab keeps `#sessions`, since a refresh may put another tree first. With a linked session that is
+not available, the first tree row stays in the Tab order (unselected).
+
+**Ended.** Without `all`, a tree is listed only while a session in it has not ended (an interactive root with no
+live child counts as ended); a listed tree carries all its members, the ended ones greyed, so the lineage stays whole.
+"Show ended" asks for `all`.
+
+**Deliberately left out.** Actions (start, send, cancel, close, allowance): read-only in this version; `board session`
+does them. The transcript itself (it stays on the node). The result's own copy of the reply (the session's `output`
+is the same text, and a delivered result's copy is emptied anyway). Wakes and grants (Settings and `board session
+grants` show those). A live push channel: the existing polling refresh is enough for a view a human reads, and adds
+no new long-poll on the hub.

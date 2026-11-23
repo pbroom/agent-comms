@@ -651,6 +651,40 @@ What to know:
   node restarted or went silent is marked failed with the reason; send again if you want it again. The session
   itself goes on and resumes the conversation.
 
+#### Seeing session trees
+
+The dashboard's **Sessions** tab (beside Threads and Issues; the count is the hosted sessions recorded as not ended)
+shows each session tree in one place: on the left one row per tree, a hosted root or an interactive session of yours
+that started children ("Agents start child sessions", below), never a child on its own; in the middle the selected
+tree, its root as the anchor and every session started under it nested below its parent, at every depth. Each
+session shows its title or role, agent, model and effort, access, where it runs (the project checkout, the shared
+checkout or its own worktree), node, state (running, waiting, queued, idle, closing, ended and why), turns, queued
+messages, when it started, how long it has been open or ran, and who started it (you, or which agent from which
+session). A child also shows its latest result: the outcome, where it stands (waiting for its parent, delivered...)
+and, when it waits, why, in the hub's words.
+
+- **Output is plain text.** A session's last reply is shown as the agent's own words, labelled untrusted, as plain
+  text: never HTML or markdown, and nothing in it is a link. A few lines show; "Show all" opens the rest. The
+  dashboard gets at most 4000 characters of any one text and says when it was cut; `board session show` has the
+  whole reply as kept (16 KB at most).
+- **Details.** A session's name opens its details under the tree, what `board session show` prints for it: its
+  messages, the results its children sent it (one never delivered keeps its text), its last reply and transcript
+  path. They are fetched again only when what they show changed. A tree with agent-started children links to its
+  audit thread on the board. A link to a session (`#session-<id>`) shows that session's tree, an ended one too;
+  one the hub no longer holds says so.
+- **Ended.** Trees whose sessions have all ended are hidden unless you tick "Show ended". A tree with a live session
+  is shown whole, its ended members greyed.
+- **Read-only, as stored.** Nothing here starts, messages, cancels or closes a session: use `board session` for
+  that. Nor does looking change anything: the view shows the hub's records as they are. Where a `board session`
+  read would settle one (a turn in flight on a node that went silent, a child its node can no longer run), the view
+  marks it "not settled" and says what the next settling read (`board session list` or `show`) would do.
+  Folded branches and expanded output stay as you left them through the dashboard's refresh. Keyboard: Up/Down (or
+  j/k) move between sessions, Left folds a branch or goes to the parent, Right unfolds or goes to the first child,
+  Enter opens the details.
+- **Human only**, like the rest of hosted sessions: the data comes from `GET /api/hosted-trees` (and `?all=true`)
+  and `GET /api/hosted-trees/<id>` (the details), which refuse agent and node tokens and which the agent gateway
+  does not carry. DESIGN_NOTES "Session lineage view".
+
 #### Codex sessions
 
 Off unless the node's board.local.toml says so (and `board node` is restarted):
@@ -2186,6 +2220,7 @@ agent_comms/session_host.py hosted sessions on a node: one long-lived agent proc
 agent_comms/providers/     the agent CLI's wire protocol for a hosted session (Claude stream-json)
 agent_comms/node_sessions.py `board node`'s session loop: fetches messages from the hub, drives the host, reports
 agent_comms/hosted.py      hosted sessions on the hub: registry, queue, human-only routes' rules (`board session`)
+agent_comms/hosted_lineage.py the dashboard's Sessions tab: session trees and details, read-only (`/api/hosted-trees`)
 agent_comms/board_settings.py the Settings page: editable settings, bounds, board.local.toml writer, audit
 agent_comms/summary.py     menu bar app routes: `GET /api/summary` (counts and ids) and `GET /api/needs-you` (previews)
 agent_comms/unstick.py     the dashboard's Unstick: who a stalled thread waits on, the fixed request and one-shot rule
