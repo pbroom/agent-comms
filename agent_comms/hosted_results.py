@@ -78,8 +78,10 @@ OUTBOX_PREFIX = "host.outbox."      # <parent id>: {"parent", "next", "dropped":
 RESULT_PREFIX = "host.result."      # <parent id>.<k>: one result
 KIND = "child"                      # the parent's message that carries results (hosted.KINDS)
 HUB = "hub"                         # who writes these records
-STATES = ("pending", "queued", "delivered", "claimed", "undelivered")
-OUTCOMES = ("completed", "failed", "timed_out", "withdrawn", "ended", "cancelled")
+STATES = ("pending", "queued", "delivered", "claimed", "undelivered", "kept")
+# `kept`: made, and never sent as a turn on its own: a turn the parent itself restarted (its restart said so), whose
+# `interrupted` result a call of the parent's waiting for that turn may still take (`claim` with its number).
+OUTCOMES = ("completed", "failed", "timed_out", "withdrawn", "ended", "cancelled", "interrupted")
 WAITING = ("pending", "queued")
 BATCH_MAX = 10                      # results in one turn
 BATCH_BYTES = hosted.MESSAGE_MAX_BYTES      # the text of one turn
@@ -91,6 +93,7 @@ CLAIM_WAIT_MAX = 45                 # seconds one claim_wait may wait
 DETAIL_MAX = 300
 TIMED_OUT = "timed out after "      # how a host says a turn ran past its limit (session_host._timeout_detail)
 CANCELLED = "cancelled by the session that started it"     # ... and a turn its starter cancelled (hosted_spawn.py)
+INTERRUPTED = "interrupted by a restart"     # ... and a turn a restart replaced (session_host.INTERRUPTED)
 _NAME = re.compile(r"[a-z]+-[0-9]{1,6}")    # a child's name: its role and a counter (hosted_tree.create_child)
 STARTED_BY = {"user": "human", "task": "parent"}    # what started a child's turn, by the kind of its message
 
@@ -105,7 +108,9 @@ PHRASES = {"completed": "the turn completed",
            "withdrawn": ("the turn was withdrawn (its message did not reach the child's process, or was not "
                          "confirmed to)"),
            "ended": "the child session ended",
-           "cancelled": "the turn was cancelled by you (it was stopped where it was)"}
+           "cancelled": "the turn was cancelled by you (it was stopped where it was)",
+           "interrupted": "the turn was interrupted by a restart (a newer message replaced it; its own result comes "
+                          "separately)"}
 REPEAT = (" This may repeat result {k}, sent earlier in message {carrier}: that turn's start was not confirmed, so it "
           "is sent once more.")
 
@@ -169,7 +174,9 @@ def _undelivered(why: str, now: float) -> dict:
     return {"state": "undelivered", "why": why[:DETAIL_MAX], "carrier": None, "settled_at": now, "updated_at": now}
 
 
-def _add(c, child: dict, fields: dict, now: float) -> dict | None:
+def _add(c, child: dict, fields: dict, now: float, kept: bool = False) -> dict | None:
+    """`kept`: a result never to be a turn on its own (R3): `kept` before any limit of what waits for the parent, which
+    only automatic delivery has; it never holds a place there."""
     t = target(c, child)
     if t is None:
         log.warning("child session %s: its parent is not on record; its result is not kept", child.get("session_id"))
@@ -181,14 +188,16 @@ def _add(c, child: dict, fields: dict, now: float) -> dict | None:
            "title": child.get("title"), "message": None, "started_by": None, "outcome": "ended", "ok": False,
            "detail": "", "denials": [], "text": "", "state": "pending", "carrier": None, "attempts": [], "why": None,
            "created_at": now, "updated_at": now, "settled_at": None} | fields
-    kept = _results(c, pid)
+    held = _results(c, pid)
     if parent.get("state") == "ended" or parent.get("stop"):
         res |= _undelivered("its parent session had ended (or was being closed) when the result was made", now)
-    elif sum(1 for x in kept if _holds_a_place(x)) >= MAX_WAITING:
+    elif kept:
+        res |= {"state": "kept", "why": "the parent restarted this turn itself: not sent as a turn"}
+    elif sum(1 for x in held if _holds_a_place(x)) >= MAX_WAITING:
         res |= _undelivered(f"{MAX_WAITING} results were already waiting for the parent session", now)
     box["next"] = k + 1
     _put(c, _key(pid, k), res, HUB, now)
-    _trim(c, box, kept, now)
+    _trim(c, box, held, now)
     _put(c, OUTBOX_PREFIX + pid, box, HUB, now)
     return res
 
@@ -205,7 +214,7 @@ def _trim(c, box: dict, kept: list[dict], now: float) -> None:
     """Delivered and claimed results go after a day (as a settled message does). Beyond MAX_KEPT records the oldest
     settled ones go, delivered and claimed before undelivered; an undelivered one that goes is counted on the outbox
     (`dropped`), which `show` reports. A result that is still waiting is never dropped."""
-    done = [x for x in kept if x.get("state") in ("delivered", "claimed")]
+    done = [x for x in kept if x.get("state") in ("delivered", "claimed", "kept")]
     lost = [x for x in kept if x.get("state") == "undelivered"]
     drop = {x["n"] for x in done if float(x.get("updated_at") or 0) < now - hosted.KEEP_SETTLED_SECONDS}
     over = len(kept) + 1 - len(drop) - MAX_KEPT
@@ -225,6 +234,8 @@ def outcome(ok: bool, delivered: bool, detail: str) -> str:
         return "completed"
     if detail.startswith(CANCELLED):
         return "cancelled"
+    if delivered and detail.startswith(INTERRUPTED):
+        return "interrupted"
     if not delivered:
         return "withdrawn"
     return "timed_out" if detail.startswith(TIMED_OUT) else "failed"
@@ -243,10 +254,15 @@ def turn(c, child: dict, m: dict, *, ok: bool, delivered: bool, detail: str, tex
         return None
     if not ok and not delivered and detail.startswith(CANCELLED):
         return None     # its starter withdrew it before it began: the cancel call already said so
-    return _add(c, child, {"message": m["n"], "started_by": STARTED_BY.get(m.get("kind"), m.get("kind")),
-                           "outcome": outcome(ok, delivered, detail), "ok": bool(ok), "detail": detail,
-                           "denials": [d for d in denials if isinstance(d, str)][:50],
-                           "text": text if isinstance(text, str) else ""}, now)
+    fields = {"message": m["n"], "started_by": STARTED_BY.get(m.get("kind"), m.get("kind")),
+              "outcome": outcome(ok, delivered, detail), "ok": bool(ok), "detail": detail,
+              "denials": [d for d in denials if isinstance(d, str)][:50], "text": text if isinstance(text, str) else ""}
+    # The parent restarted this turn itself: the result is kept (for the lineage, and for a call of the parent's still
+    # waiting for this turn), but it is not delivered as another turn of the parent's, decided before any limit of the
+    # automatic delivery. A restart by the human still is delivered: the parent learns its task was interrupted.
+    by = _get(c, hosted._msg_key(child["session_id"], m["restarted_by"])) if type(m.get("restarted_by")) is int \
+        else None
+    return _add(c, child, fields, now, kept=isinstance(by, dict) and by.get("kind") == "task")
 
 
 def ended(c, r: dict, detail: str, now: float, record: bool = False, cut: list[dict] | None = None) -> None:
@@ -486,7 +502,9 @@ def claim(board: Board, parent_id: Any, by: str, *, child: Any = None, message: 
     with db.write_tx(board.conn) as c:
         now = board.now()       # read under the write lock
         for x in _results(c, pid):
-            if (x.get("state") == "pending" and (among is None or x.get("child") in among)
+            # A `kept` result only for a call that waits for that very turn (it is never a turn on its own).
+            if ((x.get("state") == "pending" or (x.get("state") == "kept" and message is not None))
+                    and (among is None or x.get("child") in among)
                     and (message is None or x.get("message") == message)
                     # Not one an earlier turn carried whose delivery is not settled: its provider may still say it
                     # started that turn (confirmed_late), and it would then have reached the parent twice. Such a

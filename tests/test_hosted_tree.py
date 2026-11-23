@@ -215,7 +215,7 @@ def test_with_spawn_off_no_child_can_be_started_and_a_session_is_what_it_was(tmp
     assert not {"parent", "root", "depth", "access", "child_counts", "ceiling", "checkout"} & set(stored(env, sid))
     view = show(env, sid)
     assert not {"parent", "access", "children", "depth", "ceiling"} & set(view)
-    assert all(set(body) <= {"events", "seq", "state", "pid", "resume"} for _, body in spy.posts), \
+    assert all(set(body) <= {"events", "seq", "state", "pid", "resume", "modes"} for _, body in spy.posts), \
         "and reports what it always reported"
     assert [k for (k,) in env.board.conn.execute("SELECT key FROM board_state WHERE key LIKE 'host.session.%'")] == [
         hosted.SESSION_PREFIX + sid]
@@ -901,6 +901,7 @@ def test_the_node_opens_each_child_at_its_access_and_reports_what_it_really_has(
     begin(senv, ws)
     assert [show(senv, x)["state"] for x in (ro, ws)] == ["running", "running"], "and their processes agree"
     assert all(set(body) <= {"events", "seq", "state", "pid", "resume", "provider_id", "access", "ceiling", "checkout",
+                             "modes",              # what the session's adapter can do with a turn in flight
                              "shutdown_bound"}     # (spawn review round 5, S25: how long the node may take to stop one)
                for _, body in spy.posts), "words, and where the root runs"
     roots = [body for path, body in spy.posts if path.endswith(sid) and "state" in body]
@@ -2355,7 +2356,7 @@ def test_a_runner_that_names_its_own_directory_is_held_against_where_the_parent_
     node = make_node(senv, config=config, log_dir=senv.tmp / "b-logs")
     node.hello()
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 3, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 4, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]},
                                     "dirs": {"codex-cli": str(here)}}
     sid = start(senv)["session_id"]
@@ -2433,14 +2434,14 @@ def test_a_node_that_does_not_declare_the_child_protocol_is_listed_no_child(senv
                              "status_seq"}, "... and that as before there were trees"
     declared = {x["session_id"]: x for x in senv.laptop.get("/api/nodes/sessions", params={"tree": 1}).json()["sessions"]}
     assert set(declared) == {sid, kid} and declared[kid]["parent"] == sid and declared[sid]["access"] is None
-    assert spy.gets and all(params.get("tree") == 3 for _, params in spy.gets), "this node says so every time"
+    assert spy.gets and all(params.get("tree") == 4 for _, params in spy.gets), "this node says so every time"
     assert msg(senv, kid, 1)["state"] == "queued"
 
 
 def test_children_need_a_node_whose_latest_hello_declares_the_protocol(senv):
     """S5. Creation requires current support, and a child whose node no longer has it is not left closing for ever."""
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 3, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 4, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]}}
     sid = root(senv)
     kid = child(senv, sid)["session_id"]

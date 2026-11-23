@@ -43,6 +43,13 @@ Rules the hub relies on:
   ended and it holds nothing unique. A hub that says none of this gets none of it: the session is opened and
   reported exactly as before.
 - This node says it speaks that protocol on every fetch (`tree=1`), and only then does the hub list children to it.
+- Restart (`tree` 4, SESSION_PROTOCOL; DESIGN_NOTES "Restarting a running turn"). A hub that has it lists a queued
+  message sent with mode `restart` with its `mode` and `into` (the turn in flight it replaces); the hub accepts one
+  only when nothing else is queued for the session, so it is the session's next message. The node asks the host to
+  interrupt that turn in-band (`interrupt_for`, as a cancel goes to the host) and otherwise treats the message as the
+  ordinary queued message it is: handed over by the ordinary path once the turn has ended, under the ordinary
+  watermark. Reports say what the session's adapter can do (`modes`) and carry `restarted_by` on a turn's end, to a
+  hub that names the feature `restart` in its listing.
 - A child runs only under its parent AS THE PARENT IS HERE NOW. Roots are reconciled first; a child is opened, and
   handed a turn, only while its parent is open on this node and has at least the child's access (`_parent_problem`).
   The hub's stored words are not enough: this machine's runner may have been edited since. Otherwise the child is
@@ -109,6 +116,7 @@ JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
+SESSION_PROTOCOL = 4        # `tree` on every fetch and hello: 2 spawn, 3 the hold, 4 restart (hosted_tree)
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 WORKTREES_FILE = "node-session-worktrees.json"   # session id -> {path, checkout}: a child session's own worktree
 SWEEP_SECONDS = 3600.0      # how often the worktrees of sessions that are gone are looked at again
@@ -180,6 +188,8 @@ class SessionRunner:
         self.recovered: dict[str, dict] = {}
         self.version: str | None = None
         self.hub_features: set[str] = set()           # report fields the hub named as taken (its listing's `features`)
+        self.features_known = False                   # ... as a listing applied since the last failed call said
+        self.refused: set[str] = set()                # sessions whose last report a hub that named it refused (422)
         self.last_sync = float("-inf")
         self.retry_at = float("-inf")
         self.fresh = False                            # the last hub call was a fetch that succeeded: `queue` is current
@@ -272,8 +282,9 @@ class SessionRunner:
             r.raise_for_status()
         except Exception:
             # Whatever answers next may be another hub (one rolled back to an earlier version): until a fetch says
-            # again which report fields it takes, none beyond the first ones are sent (`_for_hub`).
-            self.hub_features = set()
+            # again which report fields it takes, none beyond the first ones are sent (`_for_hub`), and an event that
+            # needs one waits (`_takes`).
+            self.hub_features, self.features_known = set(), False
             raise
         self._renew_contact(sent)
         return r.json()
@@ -292,18 +303,30 @@ class SessionRunner:
             d |= {"ok": bool(e.ok), "delivered": bool(e.delivered), "detail": e.detail[:300],
                   "denials": list(e.denials), "meta": dict(e.meta), "text": e.text,
                   "answered": bool(e.answered)}     # the provider itself ended it (HostEvent.answered)
+            if isinstance(e.restarted_by, str) and e.restarted_by.isdigit():
+                d["restarted_by"] = int(e.restarted_by)     # the provider said that restart's interrupt ended it
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
             d["detail"] = e.detail[:300]
         return d
 
-    OPTIONAL_FIELDS = ("answered",)     # sent only to a hub whose listing names them (hosted.NODE_REPORT_FEATURES)
+    # Sent only to a hub whose listing names their feature (hosted.NODE_REPORT_FEATURES): field -> feature.
+    OPTIONAL_FIELDS = {"answered": "answered", "restarted_by": "restart"}
 
     def _for_hub(self, event: dict) -> dict:
         """The event as this hub takes it: without a field it has not named in its listing's `features`."""
-        drop = [k for k in self.OPTIONAL_FIELDS if k in event and k not in self.hub_features]
+        drop = [k for k, f in self.OPTIONAL_FIELDS.items() if k in event and f not in self.hub_features]
         return {k: v for k, v in event.items() if k not in drop} if drop else event
+
+    def _takes(self, event: dict) -> bool:
+        """This event may go to the hub now. A turn's end with `restarted_by` (what only a hub of the restart protocol
+        reads) waits while what the hub takes is not known (a call failed and no listing has said it again): never
+        sent stripped of it to a hub that may take it, and (`_post_pending`) nothing of its session goes before it.
+        To a hub that said it does not take it (one from before restarts) it goes without it (`_for_hub`): that hub
+        records the turn as failed, with the detail that says it was interrupted (and a parent hears of it as of any
+        turn: R4-02)."""
+        return "restarted_by" not in event or "restart" in self.hub_features or self.features_known
 
     def _emit(self, events: list[HostEvent]) -> None:
         if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
@@ -354,8 +377,20 @@ class SessionRunner:
             if sid not in order:
                 order.append(sid)
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
+        sent_items: set[int] = set()
         for sid in order:
-            events = [e for s, e in self.pending if s == sid][:MAX_BATCH]
+            # In order, up to the first event this hub may not take yet (`_takes`): nothing of the session overtakes
+            # it, so the hub applies them as they happened.
+            mine = []
+            for i, (x, e) in enumerate(self.pending):
+                if x != sid:
+                    continue
+                if not self._takes(e) or len(mine) >= MAX_BATCH:
+                    break
+                mine.append((i, e))
+            events = [e for _, e in mine]
+            if not events and (self.status.get(sid) is None or self.reported.get(sid) == self.status.get(sid)):
+                continue        # only events this hub does not take wait for this session: nothing to post now
             # A field the hub has not named as one it takes (its listing's `features`) is not sent: a hub from
             # before it refuses the whole report, and its turn ends would be lost.
             body: dict[str, Any] = {"events": [self._for_hub(e) for e in events], "seq": self._stamp()}
@@ -368,12 +403,24 @@ class SessionRunner:
                     body["provider_id"] = status[3]
                 # The access the session really has here and a child's own worktree, for a hub that asked.
                 body |= {k: v for k, v in self.tree.get(sid, {}).items() if v is not None}
+                if "restart" in self.hub_features:
+                    body["modes"] = list(status[4])     # what its adapter can do with a turn in flight now
+            named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
                 self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
                     log.warning("could not report session %s: %s", sid, e)
+                    return False
+                if code == 422 and named and sid not in self.refused:
+                    # Refused whole by a hub that, as its last listing said, takes what the report carried: it may
+                    # have been rolled back since. Nothing is dropped: what it takes is not known until a listing says
+                    # it again (only the first fields are sent meanwhile, and `restarted_by` waits), and the report
+                    # goes again after it, once. Refused again after that, it is dropped as below.
+                    self.refused.add(sid)
+                    log.warning("the hub refused the report for session %s as malformed (422): asking again what it "
+                                "takes before reporting again", sid)
                     return False
                 if code == 422:
                     # The hub could not read the report at all: most likely it is older than this node (update the
@@ -383,21 +430,17 @@ class SessionRunner:
                               "version (hubs before nodes)", sid, len(events))
                 else:
                     log.warning("hub refused the report for session %s (%s); dropping it", sid, code)
+            self.refused.discard(sid)
             if status is not None:
                 self.reported[sid] = status
                 self.sent[sid] = body["seq"]
-            taken = len(events)
-            kept = []
-            for item in self.pending:       # drop exactly the events that were sent, keep their order
-                if item[0] == sid and taken:
-                    taken -= 1
-                else:
-                    kept.append(item)
-            self.pending = kept
+            sent_items |= {i for i, _ in mine}
+        # Drop exactly the events that were sent (appends during the flush only ever come after them), keep the order.
+        self.pending = [item for i, item in enumerate(self.pending) if i not in sent_items]
         return True
 
     def _sync(self, wait: float) -> dict:
-        params: dict[str, Any] = {"wait": wait, "tree": 3,     # the child-session protocol, spawn and the hold included
+        params: dict[str, Any] = {"wait": wait, "tree": SESSION_PROTOCOL,   # children, spawn, the hold, restart
                                   # how long it may take to stop a session's process after the hub last heard from it
                                   # (`shutdown_bound`), stated before any work is listed to it; and the listing it last
                                   # applied (hosted.may_still_run)
@@ -575,9 +618,17 @@ class SessionRunner:
             for m in sorted((m for m in view.get("messages", []) if isinstance(m, dict) and type(m.get("n")) is int),
                             key=lambda m: m["n"]):
                 n = m["n"]
+                if (m.get("mode") == "restart" and type(m.get("into")) is int and m.get("state") == "queued"
+                        and m.get("cancel") is not True):
+                    # Sent to replace the turn in flight `into`: that turn is interrupted in-band (when it is the
+                    # host's turn in flight here, and its CLI can), as a cancel is passed to the host below; the
+                    # message itself is the next ordinary one, handed over as any is once that turn has ended.
+                    self.host.interrupt_for(sid, str(m["into"]), str(n))
                 if m.get("cancel") is True:
                     # The session that started this turn cancelled it (hosted_spawn.cancel): stopped where it is if
                     # the host has it, never handed over if not. Reported once; the hub then lists it no more.
+                    if n not in held:
+                        self.host.cancel(sid, str(n), CANCELLED)    # a restart's: its interrupt is no longer asked for
                     if n in held:
                         self._emit(self.host.cancel(sid, str(n), CANCELLED))
                     elif (n > self.handed.get(sid, 0) and m.get("state") == "queued"
@@ -623,7 +674,10 @@ class SessionRunner:
                 self._drop_worktree(sid)
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
         named = data.get("features")
-        self.hub_features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
+        features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
+        if "restart" in features and "restart" not in self.hub_features:
+            self.reported.clear()       # a hub that takes `modes` now: every session says it again
+        self.hub_features, self.features_known = features, True
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 
@@ -894,7 +948,9 @@ class SessionRunner:
                 self.dropped.discard(sid)
                 self._drop_worktree(sid)        # a child's own worktree, now that its process is gone
             elif not s.ended and sid not in self.dropped:
-                self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s))
+                # (and what its adapter can do with a turn in flight NOW: Claude says it in each process's `init`)
+                self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s),
+                                    self.host.modes(sid))
                 self._tree_now(sid, s)      # a root's ceiling changes when its process confirms full access
 
     @staticmethod
@@ -1064,8 +1120,8 @@ class SessionRunner:
         self.report_lock.release()
         with self.lock:             # the loop is past its last pass: `pending` and `status` are shutdown's now
             self._emit(events)
-            self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s)) for sid, s in self.host.sessions.items()
-                           if not s.ended and sid not in self.dropped}
+            self.status = {sid: (s.state, None, bool(s.resume), self._own_id(s), ()) for sid, s in
+                           self.host.sessions.items() if not s.ended and sid not in self.dropped}
             for sid, s in self.host.sessions.items():
                 self._tree_now(sid, s)      # no process is left to have confirmed anything: the ceiling says so
         try:

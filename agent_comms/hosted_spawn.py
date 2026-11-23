@@ -1387,10 +1387,47 @@ def _not_above_own(c, caller: Caller, new: dict) -> None:
                                              "that (spawn_share)"))
 
 
+def _sent_view(conn, kid: dict, caller: Caller, m: dict, created: bool, how: dict | None) -> dict:
+    out = {"child": _child_view(conn, kid, caller.id),
+           "message": {"n": m["n"], "state": m["state"]}
+           | {k: m[k] for k in hosted.MODE_FIELDS if m.get(k) is not None},
+           "notice": NOTICE}
+    if how is not None:
+        out |= {"mode": how["mode"], "why": how["why"], "created": created}
+    return out
+
+
+def _resent(board: Board, p: Principal, ident: Ident, child: Any, project: Any, rid: str | None) -> dict | None:
+    """The fast path of a retried send: the message this starter already sent to its child with this request id,
+    returned at once, whatever has changed since (as for spawn: nothing charged or sent again). Only ever returns."""
+    if rid is None:
+        return None
+    try:
+        caller = resolve(board, p, ident, project)
+        kid = _own_child(board.conn, caller, child)
+        m = hosted.sent_before(board.conn, kid, rid, {"session": caller.id, "agent": p.name}, board.now())
+    except BoardError:
+        return None
+    if m is None:
+        return None
+    return _sent_view(board.conn, kid, caller, m, False, {"mode": m.get("mode") or "queue", "why": None})
+
+
 def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = None, may_spawn: Any = None,
-         spawn_share: Any = None, project: Any = None) -> dict:
+         spawn_share: Any = None, project: Any = None, mode: Any = "queue", request_id: Any = None) -> dict:
     """A follow-up message to a child this caller started, and/or a change to what that child may start. A message,
-    or a change that widens the allowance, needs a live grant; a change that only narrows it does not."""
+    or a change that widens the allowance, needs a live grant; a change that only narrows it does not.
+    `mode` (hosted.SEND_MODES): queue (the next turn, the default), restart (interrupt the child's turn in flight,
+    which must be one this caller gave it, and run this one next instead) or auto (start at once if the child is
+    idle, else queue); steer is refused for now (R6). Every one is a child turn of the budget. `request_id`: a
+    retry returns the first call's message (`created` false), and nothing is charged or sent again."""
+    mode = hosted._mode(mode)
+    rid = hosted_tree._request_id(request_id)
+    if message is None and (mode != "queue" or rid is not None):
+        raise Invalid("mode and request_id apply to a message")
+    hit = _resent(board, p, ident, child, project, rid)
+    if hit is not None:
+        return hit      # (before the gate too: as a spawn retry, whatever changed since, spawning switched off)
     cfg = _gate(board)
     if message is None and may_spawn is None and spawn_share is None:
         raise Invalid("give a message, or may_spawn / spawn_share to change what the child may start")
@@ -1404,13 +1441,18 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
     kid = _own_child(board.conn, caller, child)
     text = None
     if message is not None:
-        _grant_for(board.conn, caller, board.now())
+        # Without a request id, in main's order: the grant, the text, the limits. With one, every refusal waits for
+        # the transaction, after its duplicate lookup: a concurrent retry of a send that just went through gets that
+        # message back, never a limit it reached itself.
+        if rid is None:
+            _grant_for(board.conn, caller, board.now())
         text = render_task(_who(caller), _task_text(message), follow_up=True)
-        try:
-            _check_limits(board.conn, caller, cfg, board.now(), ("turns",))
-        except LimitReached as e:
-            _intend_alert(board, caller, e.reached)
-            raise
+        if rid is None:
+            try:
+                _check_limits(board.conn, caller, cfg, board.now(), ("turns",))
+            except LimitReached as e:
+                _intend_alert(board, caller, e.reached)
+                raise
     hosted._settle(board, kid)
     try:
         with db.write_tx(board.conn) as c:
@@ -1419,6 +1461,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
             if again.id != caller.id:
                 raise Conflict("the calling session changed meanwhile; try again")
             kid = _own_child(c, again, child)
+            by = {"session": again.id, "agent": p.name}
+            hit = hosted.sent_before(c, kid, rid, by, now)
+            if hit is not None:
+                return _sent_view(c, kid, again, hit, False, {"mode": hit.get("mode") or "queue", "why": None})
             old = _allowance(kid)
             new = _merged(old, may_spawn, spawn_share)
             widens = _wider(new, old)
@@ -1436,7 +1482,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
                                                     ceiling=ceiling if kid.get("access") in offered
                                                     else f"its node offers {', '.join(offered) or 'none'}"))
                 _check_limits(c, again, cfg, now, ("turns",))
+                # Restarted or not, it is one child turn of the budget. Decided here, on what is stored now.
+                how = hosted.send_mode(c, kid, mode, by_parent=True)
                 m = hosted._enqueue(c, kid, "task", text, p.name, now)
+                hosted._mark(c, kid, m, how, rid, by, p.name, now)
                 b = _budget(c, caller.agent, caller.project)
                 _charge(b)
                 _save_budget(c, b, now)
@@ -1446,6 +1495,8 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
         _intend_alert(board, caller, e.reached)
         raise
     flush(board)
+    if m is not None and (mode != "queue" or rid is not None):
+        return _sent_view(board.conn, kid, caller, m, True, how)
     return {"child": _child_view(board.conn, kid, caller.id),
             "message": {"n": m["n"], "state": m["state"]} if m else None, "notice": NOTICE}
 

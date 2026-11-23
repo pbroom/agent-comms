@@ -60,6 +60,16 @@ session was shown the post (hosted_wake.handed; a delivery receipt too when the 
 `hosted.holds` is true for it
 once the wake's grace has passed.
 
+Then the send modes on a running turn (`--only steer` runs nothing else; DESIGN_NOTES "Restarting a running turn"),
+for a Claude session (an agent of its own, whose runner may also run `sleep`) and a Codex one:
+S1/S4. A long turn (the stand-in holds it until the script releases it; a real model runs `sleep 12`), then
+    `--mode steer`: refused with the reason (R6: mid-turn steering is not available yet), nothing is sent, and the
+    turn runs to its end.
+S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long turn ends `interrupted by a restart:
+    message N replaced it` (the provider said the interrupt ended it), the new message is written only after that
+    end, as an ordinary turn, and answered (kiwi), and the same process took it (the in-band interrupt).
+S3/S6. `--mode auto` on the idle session: a turn of its own, written within --max-latency.
+With --claude-bin and --codex-bin those sessions are real (three small turns each).
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
 the same temp directory with `[dispatch.sessions.spawn] enabled = true` on the hub, and on the node a worktree
@@ -205,6 +215,7 @@ RESTRICTED_AGENT = "claude-restricted"      # ... a fifth: --restricted beside t
 SPAWN_AGENT = "claude-spawner"  # ... a sixth: its runner has the temp board's MCP tools, so it can start children itself
 WORK_AGENT = "claude-work"      # ... a seventh: another account's runner (an account folder of its own), opted in to
                                 # the temp checkout only (A1-A3)
+STEER_AGENT = "claude-steer"    # the send-mode scenario's Claude agent: its runner may also run `sleep` (a long call)
 NO_BYPASS = "disableBypassPermissionsMode"  # the settings key (under permissions) a node adds to every launch but full
 GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit", "Read"]}}     # ... and two hooks (enable_tree)
 BYPASS_BY_SETTINGS = {"permissions": {"defaultMode": "bypassPermissions"}}
@@ -379,6 +390,7 @@ class Run:
         agent_token = create_agent(agents, AGENT, "claude-code")
         self.poster_token = create_agent(agents, POSTER, "codex-cli")
         create_agent(agents, CODEX_AGENT, "codex-cli")
+        create_agent(agents, STEER_AGENT, "claude-code")
         self.node_token = create_agent(agents, NODE, "node")
         (self.hub_home / "board.toml").write_text(f"""[server]
 host = "127.0.0.1"
@@ -391,7 +403,7 @@ enabled = false
 
 [dispatch.nodes.{NODE}]
 projects = {toml_list([str(self.project)])}
-agents = {toml_list([AGENT, CODEX_AGENT])}
+agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT])}
 
 [dispatch.sessions]
 wake_min_interval_seconds = {WAKE_INTERVAL}
@@ -411,6 +423,9 @@ wake_min_interval_seconds = {WAKE_INTERVAL}
         runner = [str(exe), "-p", "{prompt}", "--permission-mode", "dontAsk"]
         if self.real:
             runner += ["--setting-sources=", "--strict-mcp-config"]
+        # The send-mode scenario's runner: the same, and `sleep` may run (a turn that waits in a tool call, so a
+        # restart arrives while it runs). Nothing else is allowed.
+        steer_runner = runner + ["--allowedTools", "Bash(sleep:*)"]
         if self.args.with_board:
             # The session's only MCP server: this checkout's `board mcp` (stdio), on the TEMP hub's database, signed
             # in as the temp agent from a token file in the temp directory. Nothing else is configured or allowed:
@@ -436,6 +451,7 @@ kill_grace_seconds = 5
 [dispatch.runners]
 {AGENT} = {toml_list(runner)}
 {CODEX_AGENT} = {toml_list(self.codex_runner())}
+{STEER_AGENT} = {toml_list(steer_runner)}
 
 [dispatch.worktrees]
 {json.dumps(str(self.project))} = {json.dumps(str(self.project))}
@@ -880,6 +896,93 @@ codex = true
         self.check("has ended" in err, "a closed session takes no message")
         self.check(gone(pid), f"its process (pid {pid}) is gone")
 
+    # ------------------------------------------------------------ the send modes on a running turn (--only steer)
+
+    def steer_scenario(self) -> None:
+        """S1-S6 (the module text): a Claude session and a Codex one: a steer is refused with the reason; restart;
+        auto."""
+        self._steer_one("Claude", STEER_AGENT, self.real, ["--model", "haiku"], "S")
+        self._steer_one("Codex", CODEX_AGENT, self.real_codex, ["--model", self.args.codex_model], "S")
+
+    def _steer_one(self, label: str, agent: str, real: bool, model: list[str], tag: str) -> None:
+        steps = ("1", "2", "3") if label == "Claude" else ("4", "5", "6")
+        hold1, hold2 = self.tmp / f"steer-release-{agent}-1", self.tmp / f"steer-release-{agent}-2"
+        if real:
+            long1 = ("Run this exact shell command once, with your shell or Bash tool, and nothing else first: "
+                     "`sleep 12`. When it has finished, reply with one short sentence.")
+            long2 = ("Run this exact shell command once, with your shell or Bash tool, and nothing else first: "
+                     "`sleep 12`. When it has finished, reply with exactly the word: done")
+        else:
+            long1, long2 = f"hold {hold1} for the steer", f"hold {hold2} for the restart"
+        steer = "IMPORTANT UPDATE: in your final reply also include the exact word PINEAPPLE."
+        steer_no = "mid-turn steering is not available yet; use restart to redirect a running turn, or queue"
+        restart = "Reply with exactly the word: kiwi" if real else "kiwi"
+        idle = "Reply with exactly the word: apple" if real else "apple"
+
+        def running(sid: str, n: int) -> None:
+            m = self.message(sid, n, lambda m: m["state"] == "delivered", 60)
+            self.check(m is not None and m["state"] == "delivered", f"message {n}'s turn is in flight")
+            deadline = time.monotonic() + 60
+            while self.show(sid)["state"] != "running" and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if real:
+                time.sleep(4)       # into the command the model runs
+                m = next(m for m in self.show(sid)["messages"] if m["n"] == n)
+                if m["state"] != "delivered":
+                    raise SystemExit(f"FAIL: the model ended the long turn within 4 s ({m['state']}: {m['detail']!r}, "
+                                     f"transcript {self.show(sid)['transcript']}): nothing to send into")
+
+        print(f"\n[{tag}{steps[0]}] {label}: a long turn, then board session send <id> <message> --mode steer")
+        out, _, _ = self.board("session", "start", str(self.project), long1, "--agent", agent, *model, "--json")
+        sid = json.loads(out)["session"]["session_id"]
+        running(sid, 1)
+        pid = self.show(sid)["pid"]
+        # R6: no session steers yet; the send is refused with the reason and nothing is made for it.
+        out, err, _ = self.board("session", "send", sid, steer, "--mode", "steer", ok=False)
+        self.check(steer_no in err, "a steer is refused with the reason, and nothing is sent")
+        self.check(len(self.show(sid)["messages"]) == 1, "no message was made for it")
+        if not real:
+            hold1.touch()
+        m1 = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 90)
+        self.check(m1 is not None and m1["state"] == "done", "the long turn ran to its end untouched")
+        self._restart_and_auto(label, sid, pid, real, long2, restart, idle, hold2, running, tag, steps, 2)
+
+    def _restart_and_auto(self, label, sid, pid, real, long2, restart, idle, hold2, running, tag, steps, k) -> None:
+        """A long turn (message k) restarted by message k+1; then `auto` on the idle session (message k+2)."""
+        limit = self.args.max_latency
+        print(f"\n[{tag}{steps[1]}] {label}: a long turn, then --mode restart")
+        self.board("session", "send", sid, long2)
+        running(sid, k)
+        out, err, took = self.board("session", "send", sid, restart, "--mode", "restart", "--wait", "--json")
+        data = json.loads(out)
+        print(f"  reply: {data['reply']!r}; wall {took:.2f}s")
+        view = self.show(sid)
+        old, new = (next(m for m in view["messages"] if m["n"] == n) for n in (k, k + 1))
+        self.check(old["state"] == "failed" and old["detail"].startswith(f"interrupted by a restart: message {k + 1}")
+                   and old.get("restarted_by") == k + 1, "the long turn was interrupted by the restart, and says so")
+        self.check(new.get("replaced") == k and new["delivered_at"] >= old["ended_at"],
+                   "the restart's message was written only after the interrupted turn had ended")
+        self.check(new["state"] == "done" and "kiwi" in (data["reply"] or "").lower(),
+                   "the restart's message was answered")
+        self.check(view["pid"] == pid, f"in-band: the same process (pid {pid}) took the new turn")
+        if not real:
+            hold2.touch()
+
+        print(f"\n[{tag}{steps[2]}] {label}: board session send <id> <message> --mode auto (the session is idle)")
+        out, err, took = self.board("session", "send", sid, idle, "--mode", "auto", "--wait", "--json")
+        data = json.loads(out)
+        last = next(m for m in self.show(sid)["messages"] if m["n"] == k + 2)
+        print(f"  reply: {data['reply']!r}; queued -> written {last['delivered_at'] - last['created_at']:.2f}s")
+        self.check("mode" not in last and last["state"] == "done" and "apple" in (data["reply"] or "").lower(),
+                   "auto on an idle session started a turn of its own")
+        self.check(data["message"].get("mode") is None, "auto never restarts")
+        self.check(last["delivered_at"] - last["created_at"] <= limit, f"written within {limit:g}s")
+        self.board("session", "close", sid)
+        deadline = time.monotonic() + 20
+        while self.show(sid)["state"] != "ended" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.check(self.show(sid)["state"] == "ended" and gone(pid), "closed, and its process is gone")
+
     # ------------------------------------------------------------ --with-board: a woken session reads the board
 
     def probe(self, post_id: int, sid: str) -> dict:
@@ -1139,7 +1242,7 @@ codex = true
             (directory / ".claude").mkdir(parents=True, exist_ok=True)
             (directory / ".claude" / "settings.json").write_text(json.dumps(fixture, indent=2) + "\n")
         hub = (self.hub_home / "board.toml").read_text()
-        hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT])}", "agents = " + toml_list(
+        hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT])}", "agents = " + toml_list(
             [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT, WORK_AGENT]))
         hub = hub.replace(f"projects = {toml_list([str(self.project)])}",
                           f"projects = {toml_list([str(self.project), str(self.project_mode)])}")
@@ -2332,8 +2435,9 @@ def main() -> int:
     ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
                     help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
                          "one codex-cli 0.171.0 lists)")
-    ap.add_argument("--only", choices=("claude", "codex", "tree"),
-                    help="run only that scenario: one agent's, or parent and child sessions (default: all)")
+    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer"),
+                    help="run only that scenario: one agent's, parent and child sessions, or the send modes on a "
+                         "running turn (default: all)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
     ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
@@ -2354,16 +2458,17 @@ def main() -> int:
         args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
         if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
             ap.error("--codex-bin must be an executable named codex")
-    if args.with_board and args.only in ("codex", "tree"):
+    if args.with_board and args.only in ("codex", "tree", "steer"):
         ap.error("--with-board is a Claude scenario")
     codex, claude = args.only in (None, "codex") and not args.with_board, args.only in (None, "claude")
     tree = args.only in (None, "tree") and not args.with_board
+    steer = args.only in (None, "steer") and not args.with_board
     run = Run(args)
-    if claude or tree:
+    if claude or tree or steer:
         print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
                            else "stand-in (tests/stand_in_claude.py), no model")
               + (", with the temp board's MCP tools" if args.with_board else ""))
-    if codex or tree:
+    if codex or tree or steer:
         print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
@@ -2377,11 +2482,11 @@ def main() -> int:
     try:
         signal.signal(signal.SIGTERM, terminated)
         config_before, claude_before = None, run.claude_settings() if run.real else None
-        if (codex or tree) and run.real_codex:
+        if (codex or tree or steer) and run.real_codex:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
-        if codex or claude or args.with_board:
+        if codex or claude or args.with_board or steer:
             run.start_services()
             if codex:
                 run.codex_scenario()
@@ -2389,15 +2494,18 @@ def main() -> int:
                 run.board_scenario()
             elif claude:
                 run.scenario()
+            if steer:
+                run.steer_scenario()
             print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
                   else "\n[8] stopping the node (SIGTERM) and the hub" if claude
-                  else "\n[C6] stopping the node (SIGTERM) and the hub")
+                  else "\n[C6] stopping the node (SIGTERM) and the hub" if codex
+                  else "\n[S7] stopping the node (SIGTERM) and the hub")
             run.stop()
             if claude:
                 run.check(not alive(run.open_pid),
                           f"the open session's process (pid {run.open_pid}) was stopped with the node")
             run.check(run.leftovers() == [], "no session process is left behind")
-            if codex and run.real_codex:
+            if (codex or steer) and run.real_codex:
                 run.check_codex_config(config_before)
         if tree:
             run.enable_tree()

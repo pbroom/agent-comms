@@ -36,6 +36,14 @@ an optional model name and the message text.
   that ends takes its children with it.
 - `child` is the other message kind that is not the human's (hosted_results.py, with child sessions on): a child's
   results, delivered to its parent as a turn whose text the hub writes.
+- A message may be sent with a mode (DESIGN_NOTES "Restarting a running turn"): `queue` (the default: everything
+  above), `restart` (interrupt the turn in flight and run this one next), `auto` (start at once if the session is
+  idle, else queue behind the turn in flight; it never restarts by itself; the answer says which) or `steer`, which
+  is refused for every session for now (R6). `restart_target` decides, in the transaction that enqueues it: refused
+  with the reason when the node's protocol, the session's agent CLI, the turn in flight or its kind do not allow it,
+  or when other messages are queued (R7: a restart never runs out of order). Such a message is an ordinary queued
+  message with `mode` and `into` (the turn it replaces): its node interrupts that turn, and runs it next as it
+  would any queued message.
 """
 from __future__ import annotations
 
@@ -61,6 +69,23 @@ MSG_STATES = ("queued", "delivered", "done", "failed")
 SETTLED = ("done", "failed")
 SESSION_STATES = ("starting", "idle", "running", "waiting", "ended")   # session_host.STATES, as the node reports them
 EVENT_KINDS = ("delivered", "turn_started", "turn_ended", "approval_requested", "ended")
+SEND_MODES = ("auto", "queue", "steer", "restart")
+MODE_FIELDS = ("mode", "into", "restarted_by", "replaced")     # on a message sent with a mode, and what came of it
+RECEIPT_SECONDS = 7 * 86400     # how long a request id is remembered (`receipts`), past its message's own record
+REFUSED = {
+    "steer": "mid-turn steering is not available yet; use restart to redirect a running turn, or queue",
+    "protocol": ("its node {node} speaks session protocol {tree}; restarting needs {need} (update the node: `board "
+                 "node` from this version)"),
+    "cli": "this session's agent CLI cannot restart a running turn (its node says so)",
+    "idle": "no turn is in flight",
+    "kind": "the turn in flight (message {n}) is {what}, which the session finishes untouched",
+    "foreign": "the turn in flight (message {n}) is not one you started",
+    "cancelled": "the turn in flight (message {n}) is being cancelled",
+    "queued": ("{k} message(s) are already queued for this session; a restart would have to jump them: cancel them "
+               "or send with queue"),
+}
+KIND_WORDS = {"wake": "a wake turn (board posts for its agent)",
+              "child": "a result-delivery turn (its children's results)"}
 # The one thing a node may still say about a session that has ended: it removed the child's own worktree.
 WORKTREE_REMOVED = "worktree_removed"
 MESSAGE_MAX_BYTES = 64 * 1024      # one message's text
@@ -71,7 +96,8 @@ SHOW_MESSAGES = 20                 # the most recent messages `show` lists
 KEEP_ENDED_SECONDS = 7 * 86400     # an ended session's record is kept this long
 KEEP_SETTLED_SECONDS = 86400       # a settled message's record, in a session that goes on
 NODE_WAIT_MAX = 25                 # seconds one long-poll of a node may wait
-NODE_REPORT_FEATURES = ("answered",)    # report fields this hub takes beyond the first ones (`_listed`)
+NODE_REPORT_FEATURES = ("answered", "restart")  # report fields this hub takes beyond the first ones (`_listed`);
+                                                # `restart`: `modes`, and `restarted_by` on a turn's end
 HUMAN_WAIT_MAX = 30                # ... and one of the human's CLI
 WAIT_POLL_SECONDS = 0.25           # how often a waiting call re-reads the database
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -215,7 +241,9 @@ def account_home(conn, r: dict) -> str | None:
 
 
 def _msg_view(m: dict) -> dict:
-    return {"session_id": m.get("session_id"), **{k: m.get(k) for k in _MSG_FIELDS}}
+    # A message sent with a mode also says it, and what came of it; any other is shown exactly as before.
+    return {"session_id": m.get("session_id"), **{k: m.get(k) for k in _MSG_FIELDS},
+            **{k: m[k] for k in MODE_FIELDS if m.get(k) is not None}}
 
 
 def _node_view(r: dict) -> dict:
@@ -298,18 +326,135 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
     return {"session": _human_view(board, r), "message": _msg_view(m)}
 
 
-def send(board: Board, p: Principal, session_id: Any, text: Any) -> dict:
-    """Queue a message for the session: its next turn if it is idle, the turn after the ones ahead of it otherwise."""
+def send(board: Board, p: Principal, session_id: Any, text: Any, mode: Any = "queue", request_id: Any = None) -> dict:
+    """Queue a message for the session: its next turn if it is idle, the turn after the ones ahead of it otherwise.
+    `mode` (SEND_MODES, `send_mode`): restart the turn in flight with it, or `auto` (start or queue).
+    `request_id`: a retry with the same id returns the message the first call made (`created` false), nothing new."""
     _human(board, p, "message a hosted session")
-    text = _text(text)
+    text, mode = _text(text), _mode(mode)
+    from . import hosted_spawn, hosted_tree
+    rid = hosted_tree._request_id(request_id)
     _settle(board, _session(board.conn, session_id))
     with db.write_tx(board.conn) as c:
         now = board.now()       # read under the write lock
         r = _session(c, session_id)
+        by = {"human": p.name}
+        hit = sent_before(c, r, rid, by, now)
+        if hit is not None:
+            return {"session": _human_view(board, r), "message": _msg_view(hit), "created": False}
+        how = send_mode(c, r, mode, by_parent=False)
         m = _enqueue(c, r, "user", text, p.name, now)
-        from . import hosted_spawn
+        _mark(c, r, m, how, rid, by, p.name, now)
         hosted_spawn.human_messaged(c, r, now)     # a tree's count of child turns without the human starts over
-    return {"session": _human_view(board, r), "message": _msg_view(m)}
+    out = {"session": _human_view(board, r), "message": _msg_view(m)}
+    if mode != "queue" or rid is not None:
+        out |= {"mode": how["mode"], "why": how["why"], "created": True}
+    return out
+
+
+def _mode(mode: Any) -> str:
+    if mode is None:
+        return "queue"
+    if mode not in SEND_MODES:
+        raise Invalid("mode must be one of " + ", ".join(SEND_MODES))
+    return mode
+
+
+def restart_target(c, r: dict, by_parent: bool) -> tuple[dict | None, str | None]:
+    """The turn in flight a restart would replace, or (None, why not). Read in the caller's write transaction. The
+    node's protocol first (its latest hello), then the turn: there is one in flight, and the session's agent CLI can
+    restart it (never guessed: the session's own report, `modes`), it is a turn of the human's or of the session's
+    parent (a wake or a result-delivery turn is finished untouched, as its text is the hub's and its outcome is what
+    the hub waits for), it is the caller's own when the caller is a parent (never a turn the human started in its
+    child), it is not being cancelled, and nothing is queued for the session (R7: so the restart's message is the
+    session's next message, as any message queued behind a running turn is; a second restart while one waits is
+    refused the same way)."""
+    from . import hosted_tree
+    tree = hosted_tree.node_protocol(c, r["node"])
+    if tree < hosted_tree.RESTART_PROTOCOL:
+        return None, REFUSED["protocol"].format(node=r["node"], tree=tree, need=hosted_tree.RESTART_PROTOCOL)
+    n = r.get("in_flight")
+    m = _get(c, _msg_key(r["session_id"], n)) if type(n) is int else None
+    if not isinstance(m, dict) or m.get("state") != "delivered":
+        return None, REFUSED["idle"]
+    if "restart" not in (r.get("modes") or []):
+        return None, REFUSED["cli"]
+    if m.get("kind") in KIND_WORDS:
+        return None, REFUSED["kind"].format(n=n, what=KIND_WORDS[m["kind"]])
+    if by_parent and m.get("kind") != "task":
+        return None, REFUSED["foreign"].format(n=n)
+    if m.get("cancel") is not None:
+        return None, REFUSED["cancelled"].format(n=n)
+    if int(r.get("queued") or 0) > 0:
+        return None, REFUSED["queued"].format(k=int(r["queued"]))
+    return m, None
+
+
+def send_mode(c, r: dict, mode: str, by_parent: bool) -> dict:
+    """What a message sent with `mode` becomes, decided in the caller's write transaction: {"mode": queue | restart,
+    "into": the turn's number or None, "why": what `auto` did, or None}. A restart that cannot be done is refused
+    (Conflict) with the reason, and so is every steer (R6); `auto` never restarts: it starts the session at once when
+    it is idle, and queues behind the turn in flight otherwise, and says which."""
+    if r["state"] == "ended" or r.get("stop"):
+        return {"mode": "queue", "into": None, "why": None}       # _enqueue refuses it with its own reason
+    if mode == "queue":
+        return {"mode": "queue", "into": None, "why": None}
+    if mode == "steer":
+        raise Conflict(f"cannot steer into session {r['session_id']}: {REFUSED['steer']}")
+    if mode == "auto":
+        busy = r.get("in_flight") is not None or int(r.get("queued") or 0) > 0
+        return {"mode": "queue", "into": None,
+                "why": (f"queued behind the turn in flight (message {r['in_flight']})" if r.get("in_flight")
+                        is not None else "queued behind the messages ahead of it") if busy
+                else "the session was idle: it starts at once"}
+    target, why = restart_target(c, r, by_parent)
+    if target is None:
+        raise Conflict(f"cannot restart the turn in flight of session {r['session_id']}: {why}")
+    return {"mode": "restart", "into": target["n"], "why": None}
+
+
+def _receipt_key(rid: str, by: dict) -> str:
+    return hashlib.sha256(json.dumps([rid, by], sort_keys=True).encode()).hexdigest()[:32]
+
+
+def sent_before(c, r: dict, rid: str | None, by: dict, now: float) -> dict | None:
+    """The message this sender already sent to the session with this request id, or None. Read from the session's
+    receipts (`receipts`: request id and sender -> message number, kept RECEIPT_SECONDS), which outlive the message's
+    own record: a retry after the message was pruned still finds it (its number, `state: settled`) for the whole
+    window."""
+    if rid is None:
+        return None
+    got = (r.get("receipts") or {}).get(_receipt_key(rid, by))
+    if isinstance(got, dict) and type(got.get("n")) is int and float(got.get("at") or 0) > now - RECEIPT_SECONDS:
+        m = _get(c, _msg_key(r["session_id"], got["n"]))
+        if isinstance(m, dict):
+            return m
+        return {"session_id": r["session_id"], **{k: None for k in _MSG_FIELDS}, "n": got["n"], "state": "settled"}
+    # The message rows too: one that is still there was sent with this id, whatever became of its receipt.
+    for m in _messages(c, r["session_id"]):
+        if (m.get("request_id") == rid and m.get("sent_by") == by
+                and float(m.get("created_at") or 0) > now - RECEIPT_SECONDS):
+            return m
+    return None
+
+
+def _mark(c, r: dict, m: dict, how: dict, rid: str | None, by: dict, who: str, now: float) -> None:
+    """A message just enqueued, sent with a mode or a request id: what it is for, on its record."""
+    extra: dict = {}
+    if how["mode"] == "restart":
+        extra |= {"mode": how["mode"], "into": how["into"]}
+    if rid is not None:
+        extra |= {"request_id": rid, "sent_by": by}
+        keep = {k: v for k, v in (r.get("receipts") or {}).items()
+                if isinstance(v, dict) and float(v.get("at") or 0) > now - RECEIPT_SECONDS}
+        # Every receipt is kept for its whole window (RECEIPT_SECONDS), and none is evicted before: a retry within
+        # seven days always finds its message, as the README says. What it costs is bounded by the session's sends.
+        keep[_receipt_key(rid, by)] = {"n": m["n"], "at": now}
+        r["receipts"] = keep
+        _put(c, SESSION_PREFIX + r["session_id"], r, who, now)
+    if extra:
+        m |= extra
+        _put(c, _msg_key(r["session_id"], m["n"]), m, who, now)
 
 
 def list_sessions(board: Board, p: Principal, include_ended: bool = False) -> dict:
@@ -645,6 +790,7 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     # A node that speaks the spawn protocol (`tree` 2): each session's binding, a child of an interactive session,
     # and the messages whose turn their starter cancelled. Nothing of it for an earlier node, or with spawn off.
     spawns = spawn and int(tree) >= hosted_tree.SPAWN_PROTOCOL
+    restarts = int(tree) >= hosted_tree.RESTART_PROTOCOL   # a node that restarts: a message's mode and turn
     out, mark = [], []
     every = _sessions(board.conn)
     for r in sorted(every, key=lambda r: r["session_id"]):
@@ -656,6 +802,10 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
             if m.get("state") in SETTLED:
                 continue
             item = {"n": m["n"], "kind": m.get("kind"), "state": m.get("state")}
+            if restarts and m.get("mode") == "restart":
+                # Sent to replace the turn in flight `into`: the node interrupts that turn while it is in flight there.
+                # Otherwise an ordinary queued message, listed and handed over by its place in the queue (R7).
+                item |= {"mode": m["mode"], "into": m.get("into")}
             if spawns and m.get("cancel") is not None:
                 item["cancel"] = True       # its starter cancelled it: the node stops it, or never hands it over
             elif m.get("state") == "queued" and first:
@@ -785,6 +935,9 @@ def _events(events: Any) -> list[dict]:
         if not isinstance(ev, dict) or ev.get("kind") not in (*EVENT_KINDS, WORKTREE_REMOVED):
             raise Invalid("each event needs a kind: " + ", ".join(EVENT_KINDS))
         n, detail, text = ev.get("message"), ev.get("detail", ""), ev.get("text", "")
+        restarted_by = ev.get("restarted_by")
+        if restarted_by is not None and (type(restarted_by) is not int or restarted_by < 1):
+            raise Invalid("restarted_by must be a message number")
         denials, meta, ok = ev.get("denials", []), ev.get("meta", {}), ev.get("ok")
         if n is not None and (type(n) is not int or n < 1):
             raise Invalid("message must be a message number")
@@ -809,7 +962,7 @@ def _events(events: Any) -> list[dict]:
                     "detail": detail, "text": cap_reply(text), "denials": denials, "meta": meta,
                     # turn_ended: the provider itself ended the turn (session_host.HostEvent.answered); a node
                     # from before the field says nothing, which counts as not known
-                    "answered": answered})
+                    "answered": answered, "restarted_by": restarted_by})
     return out
 
 
@@ -841,6 +994,14 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
     was = m["state"]
     if m["state"] == "queued":      # whichever event comes first takes it out of the queue
         r["queued"] = max(0, int(r.get("queued") or 0) - 1)
+    if kind == "turn_ended" and type(ev.get("restarted_by")) is int:
+        # The provider said the restart's interrupt ended this turn: the link both ways (never on a turn that
+        # finished by itself first: the node says it only when the provider confirmed the interruption).
+        m["restarted_by"] = ev["restarted_by"]
+        new = _get(c, _msg_key(sid, ev["restarted_by"]))
+        if isinstance(new, dict) and new.get("mode") == "restart" and new.get("into") == n:
+            new |= {"replaced": n, "updated_at": now}
+            _put(c, _msg_key(sid, ev["restarted_by"]), new, by, now)
     if kind in ("delivered", "turn_started"):
         if m["state"] == "queued":
             m |= {"state": "delivered", "delivered_at": now, "text": ""}    # the node has it: the hub lets go of it
@@ -885,8 +1046,10 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
 
 def report(board: Board, p: Principal, session_id: Any, events: Any = None, state: Any = None, pid: Any = None,
            resume: Any = None, seq: Any = None, provider_id: Any = None, access: Any = None,
-           worktree: Any = None, ceiling: Any = None, checkout: Any = None) -> dict:
-    """The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
+           worktree: Any = None, ceiling: Any = None, checkout: Any = None, modes: Any = None) -> dict:
+    """`modes`: what the session's adapter on the node can do with a turn in flight (providers.MODES: restart, and
+    steer, which no adapter says yet), as the node says; `restart_target` reads it, and nothing else decides it.
+    The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
     turn_ended, approval_requested, ended), and how the session stands now (`state`, `pid`, `resume`: the provider
     confirmed its session exists). Only the node the session is assigned to may; a repeated report changes nothing.
     `seq` orders a node's reports on one session (it grows with every report the node sends, across its restarts):
@@ -919,6 +1082,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         raise Invalid("access must be one of " + ", ".join(session_access.LEVELS))
     if ceiling is not None and ceiling not in session_access.LEVELS:
         raise Invalid("ceiling must be one of " + ", ".join(session_access.LEVELS))
+    if modes is not None and (not isinstance(modes, list) or len(modes) > 2
+                              or any(x not in ("steer", "restart") for x in modes) or len(set(modes)) != len(modes)):
+        raise Invalid("modes must list what the session can do with a turn in flight: steer, restart")
     for what, path in (("worktree", worktree), ("checkout", checkout)):
         if path is not None and (not isinstance(path, str) or not path.startswith("/") or len(path) > 1024
                                  or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)):
@@ -964,6 +1130,8 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
             elif resume is False:
                 r.pop("provider_id", None)      # the node starts the provider's session anew: the old id is history
             hosted_tree.reported(r, access, worktree, ceiling, checkout)
+            if modes is not None:
+                r["modes"] = list(modes)
         r |= {"updated_at": now, "node_reported_at": now}
         _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
     if r["state"] == "ended":

@@ -21,6 +21,18 @@ Code 2.1.322 (DESIGN_NOTES "Session host (PR 1)"):
 - With `--permission-prompts none` anything that would ask is refused on the spot, so the process never waits for an
   answer. A `control_request` asking to use a tool should therefore never arrive; if one does it is reported and left
   unanswered (nothing is approved), and the host's turn timeout ends the turn.
+Restart (measured on Claude Code 2.1.330, DESIGN_NOTES "Restarting a running turn"):
+- A user line written while a turn runs is queued by the process and read at the turn's next tool boundary, or, if
+  it misses the last one, run by the process as its own next turn: the CLI decides alone. This adapter does not steer
+  (`steers` False): its turns are the lines they always were.
+- `control_request` `interrupt` ends the turn in flight at once: a `control_response` for that request (`success`,
+  with `still_queued`), then the turn's `result` with `subtype: error_during_execution` (terminal_reason
+  `aborted_tools`), and the process stays (`interrupt_turn`, `interrupted`; a restart writes its message afterwards,
+  as an ordinary turn). An abort counts as the interrupt's only once the process answered THAT request with success:
+  one it answered with an error (or not at all) interrupted nothing, and a later abort is the turn's own.
+- Every `init` lists the process's `capabilities` (`interrupt_receipt_v1` among them) and `claude_code_version`. This
+  process restarts only once an `init` of its own said `interrupt_receipt_v1` (`restarts`): a CLI that does not, or a
+  process that has not started a turn yet, reports no restart.
 """
 from __future__ import annotations
 
@@ -39,6 +51,8 @@ NO_PROMPTS = ("--permission-prompts", "none")
 TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 MAX_DENIALS = 50
 MAX_TOOLS = 2000        # tool names taken from one `init`
+INTERRUPT_RECEIPT = "interrupt_receipt_v1"  # an `init` capability: a receipt for the in-band interrupt
+MAX_CAPS = 200
 # The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
 # (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
@@ -112,9 +126,21 @@ def _bypass_off(answer: dict) -> bool:
     return isinstance(permissions, dict) and permissions.get("disableBypassPermissionsMode") == "disable"
 
 
+def _user_line(text: str) -> bytes:
+    # json.dumps escapes every line break inside the text: one turn is exactly one line.
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"
+
+
 class ClaudeSession:
     waits_for_ready = False     # `init` only arrives once the first turn has been written
     verifies_mode = True        # ... and says what the turn really runs with: the host's kill switch reads it
+
+    steers = False      # R6: no mid-turn steering (the CLI alone decides which turn takes a mid-turn line)
+
+    @property
+    def restarts(self) -> bool:
+        """This process said in an `init` that it acknowledges the in-band interrupt."""
+        return INTERRUPT_RECEIPT in self._caps and not self._dead
 
     def __init__(self):
         self.session_id: str | None = None
@@ -125,6 +151,13 @@ class ClaudeSession:
         self._ask = False               # this process is asked whether bypass is switched off in it (`on_open`)
         self._asked: str | None = None  # the id of that request, until it is answered
         self._starts = 0
+        self._reset_turns()
+
+    def _reset_turns(self) -> None:
+        self._open = False              # a turn is running in this process (written or begun, its result not yet)
+        self._caps: frozenset[str] = frozenset()   # what this process's `init` said it can (module text)
+        self._interrupt_id: str | None = None    # the request id of the interrupt written for the turn in flight
+        self._interrupt_ok = False      # ... which the process answered with success
 
     def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
         """What the host decided for this session (session_access.prepare), before any `argv`. `access` "full":
@@ -138,6 +171,7 @@ class ClaudeSession:
         import os
         self.session_id = validate_session_id(session_id)
         self._ready = self._dead = False
+        self._reset_turns()
         model = validate_model(model)
         if not template or os.path.basename(template[0]) != "claude":
             raise ValueError("not a Claude runner")
@@ -210,12 +244,31 @@ class ClaudeSession:
                            "bypass_disabled": _bypass_off(answer)}).encode()
 
     def turn(self, text: str, kind: str = "user") -> list[bytes]:
-        # json.dumps escapes every line break inside the text: one turn is exactly one line. `kind` has no place in
-        # Claude's stream-json input (a user message is the one kind of turn it takes): the text is all it gets.
-        return [json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"]
+        # `kind` has no place in Claude's stream-json input (a user message is the one kind of turn it takes): the
+        # text is all it gets.
+        self._open = True
+        self._interrupt_id, self._interrupt_ok = None, False
+        return [_user_line(text)]
 
     def interrupt(self) -> list[bytes] | None:
         return None
+
+    def interrupt_turn(self) -> list[bytes] | None:
+        """The in-band interrupt of the turn in flight (a restart's first step): the turn's `result` follows."""
+        if not self._open or not self.restarts:
+            return None
+        self._starts += 1
+        self._interrupt_id = "interrupt-%s-%d" % ((self.session_id or "")[:8], self._starts)
+        self._interrupt_ok = False
+        return [json.dumps({"type": "control_request", "request": {"subtype": "interrupt"},
+                            "request_id": self._interrupt_id}).encode() + b"\n"]
+
+    def interrupted(self, ev: Event) -> bool:
+        """The interrupt ended the turn: the process answered that very request with success, and the turn's result
+        is an error whose terminal reason is an abort (`aborted_tools` when it came during a tool call, as measured).
+        """
+        reason = ev.meta.get("terminal_reason")
+        return self._interrupt_ok and not ev.ok and isinstance(reason, str) and reason.startswith("aborted")
 
     def session_exists(self, stderr: str) -> bool | None:
         """Claude Code 2.1.322 refuses a start in the wrong mode before any turn and exits 1 (DESIGN_NOTES "Session
@@ -244,6 +297,9 @@ class ClaudeSession:
         if init:
             events = [] if self._ready else [Event("ready", provider_id=sid)]
             self._ready = True
+            self._open = True
+            caps = ev.get("capabilities")
+            self._caps = frozenset(c for c in (caps if isinstance(caps, list) else [])[:MAX_CAPS] if isinstance(c, str))
             mode, tools = ev.get("permissionMode"), ev.get("tools")
             # A name that is not a plain tool name still counts as a tool the session has: "unknown", never dropped.
             named = tuple(t if isinstance(t, str) and TOOL_NAME_RE.fullmatch(t) else "unknown"
@@ -251,12 +307,18 @@ class ClaudeSession:
             return events + [Event("turn_started", mode=mode if isinstance(mode, str) and len(mode) <= 40 else None,
                                    tools=named)], []
         if kind == "result":
+            self._open = False
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
             # Claude's own end of the turn, a success or an error: it took the turn (Event.answered).
             return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),
                           text=cap_reply(ev.get("result")), answered=True)], []
         if kind == "control_response":
             answer = ev.get("response")
+            if (self._interrupt_id is not None and isinstance(answer, dict)
+                    and answer.get("request_id") == self._interrupt_id):
+                # The receipt for the interrupt of the turn in flight: only `success` counts (`interrupted`).
+                self._interrupt_ok = answer.get("subtype") == "success"
+                return [], []
             if self._asked is None or not isinstance(answer, dict) or answer.get("request_id") != self._asked:
                 return [], []
             self._asked = None

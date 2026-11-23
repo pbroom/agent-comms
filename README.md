@@ -568,8 +568,9 @@ for the agent. The node starts it with its own settings and reports back. See DE
 
 A dispatched run is one process per prompt: once it is going you cannot tell it anything. A hosted session is one
 long-lived agent process on a node that takes your messages as turns. A message to an idle session starts a turn
-within a second or so; a message to a busy one waits and runs as the next turn; nothing running is interrupted.
-Claude runners, and Codex runners on a node that turns them on (`codex = true`, below).
+within a second or so; a message to a busy one waits and runs as the next turn; nothing running is interrupted
+unless you say so (`--mode`, "Sending", below). Claude runners, and Codex runners on a node that turns them on
+(`codex = true`, below).
 
 Turn it on, per machine, in the node's board.local.toml, and restart `board node`:
 
@@ -596,6 +597,31 @@ uv run board session close <id>
 `start` takes `--agent NAME` (default: the one agent with a Claude runtime, if there is only one) and `--model M`;
 every command takes `--json`. One session per agent and project at a time (child sessions, below, do not count).
 `board serve` must be running: the CLI talks to it on the local port.
+
+**Sending.** `send` takes `--mode` (DESIGN_NOTES "Restarting a running turn"):
+
+| mode | what the message does | Claude Code | Codex |
+| --- | --- | --- | --- |
+| `queue` (default) | its own turn: at once if the session is idle, after the turns ahead of it otherwise | yes | yes |
+| `steer` | (into the turn in flight) not available yet: refused, "mid-turn steering is not available yet; use restart to redirect a running turn, or queue" | not yet | not yet |
+| `restart` | interrupts the turn in flight and runs your message next; refused while other messages are queued for the session; the interrupted turn ends `failed`, "interrupted by a restart: message N replaced it" (one that finished by itself first, or whose CLI refused the interrupt, keeps its own outcome) | yes | yes |
+| `auto` | starts at once when the session is idle, else queues behind the turn in flight; it never restarts; the answer's `why` says which | yes | yes |
+
+```bash
+uv run board session send <id> "Stop; do the README first" --mode restart --wait
+uv run board session send <id> "..." --mode auto --request-id fix-1      # a retry with the same id sends nothing new
+```
+
+A restart is refused with the reason when no turn is in flight, when the turn in flight is a wake or a
+result-delivery turn (the session finishes those untouched), when it is being cancelled, when other messages are
+already queued for the session (a restart never jumps them: cancel them or send with queue), when the session's
+agent CLI cannot (its node says what each session's process can: a Claude process says it when its first turn
+starts, so a session that has not run a turn yet only queues) or when its node is older than this version (session
+protocol 4). Its message is otherwise an ordinary queued message, the session's next: one whose turn ended before
+its node could interrupt it simply runs next; it is never lost or written twice. `show`
+marks each message sent with a mode and its links, as does the dashboard's Sessions tab. A request id is remembered
+for seven days, every one of them, also after its message's own record is gone (`state: settled`; `--wait` then
+says its reply is no longer kept).
 
 What to know:
 
@@ -1076,6 +1102,14 @@ max_turns_without_human = 40        # its children's turns there since you last 
   ending a session ends everything under it. A child of another agent starts helpers under its own agent's grant
   and budget. A child may start the same agent and model as itself: that is bounded by the depth and the budget,
   like any other start.
+- **Restarting a child.** `board_session_send` takes `mode` as `board session send --mode` does (queue,
+  restart, auto; steer is refused for now), and `request_id` (a retry returns the first call's message; nothing is
+  sent or charged again). A parent restarts only a turn it gave the child (its own task, never a turn you started
+  there), and only while nothing else is queued for it; the new message runs next, in the same server frame as any
+  follow-up. Every message is a child turn of the
+  budget, restarted or not. A restart's interrupted turn has a result with the outcome `interrupted`: kept, but not
+  sent as another turn of yours when you restarted it yourself (a wait for that turn still gets it), sent when the
+  human did; the new message's result comes as its own.
 - **Results** come back as for any child (a turn of the parent's), except that `wait=true` on `spawn` or `send`
   (up to 45 seconds) returns the reply in the tool's answer instead, and then it is never also a turn. A result
   whose earlier delivery is not settled cannot be taken that way. A turn the caller cancelled is a result with the
