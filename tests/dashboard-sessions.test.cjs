@@ -543,3 +543,32 @@ test('a kept or interrupted result says so in words', async () => {
   assert.match(line, /kept, not sent as a turn \(its parent restarted the turn itself\)/);
   dom.window.close();
 });
+
+test('a verdict on a result as data is plain text beside its message and result, never markup', async () => {
+  // DESIGN_NOTES "Structured results": the verdict of a message that asked, and of a child's result its parent asked
+  // for (`verdict`), as the server words it; the reply stays the session's own `output`, unchanged.
+  const spoof = 'name ‮<img src=x onerror="window.pwned = 4">';
+  const intercept = (u, answer) => {
+    if (u !== `/api/hosted-trees/${ROOT}`) return answer();
+    const d = detailOf(ROOT);
+    d.messages = [{ n: 1, kind: 'user', state: 'done', detail: '', output: { state: 'accepted', schema_sha: 'ab12',
+      reply: "in this answer: the session's reply to this message (the block it was read from ends it)" } },
+    { n: 2, kind: 'task', state: 'done', detail: '', output: { state: 'missing', schema_sha: 'ab12', code: 'shape',
+      words: 'the block does not fit the schema you gave', reasons: [`at $.verdict: required property "${spoof}" is missing`],
+      reply: 'not in this view: a verdict only' } }];
+    d.results = [{ n: 8, child: KID, name: 'general-1', message: 2, outcome: 'completed', state: 'delivered',
+      verdict: { state: 'missing', code: 'no_block', schema_sha: 'ab12', reasons: [], reply: 'not in this view: a verdict only' } }];
+    return ok(d);
+  };
+  const { dom, document, win } = await setup({ intercept });
+  const detail = document.getElementById('session-detail');
+  const lines = [...detail.querySelectorAll('.lin-verdict')].map(n => n.textContent);
+  assert.equal(lines.length, 3);
+  assert.match(lines[0], /^result as data: accepted \(the agent's claim; only its shape was checked\); the reply: in this answer/);
+  assert.match(lines[1], /^result as data: missing \(shape\): the block does not fit the schema you gave; why: at \$\.verdict/);
+  assert.ok(lines[1].includes('<img src=x'), 'the text as text');
+  assert.match(lines[2], /^result as data: missing \(no_block\)/);
+  assert.equal(detail.querySelectorAll('img').length, 0);
+  assert.equal(win.pwned, undefined);
+  dom.window.close();
+});

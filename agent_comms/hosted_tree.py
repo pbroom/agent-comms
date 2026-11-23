@@ -547,7 +547,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
                  request_id: Any = None, allowed: dict[str, dict] | None = None, spawn: Any = None,
                  kind: str = "user", spawned_by: dict | None = None, ceiling: str | None = None,
                  interactive: bool = False, check=None, hook=None, tx=None, allowance: dict | None = None,
-                 pool: dict | None = None, at: float | None = None, placed: str | None = None) -> dict:
+                 pool: dict | None = None, at: float | None = None, placed: str | None = None,
+                 output: dict | None = None, refusal: str | None = None, output_schema: Any = None) -> dict:
     """Start a session under `parent_id` with its first message. Returns {"session": its record, "message": its
     first message's record, "created": False when (parent, request_id) had made it already}. `by` is recorded as
     who created it; whether `by` MAY is the caller's to have decided (see the module text). `agent`: default the
@@ -562,7 +563,10 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
     caller's own (on `board.conn`), in which all of this then runs, reads included (hosted_spawn.spawn decides a
     spawn in one). `pool`: how `agent` was chosen from a pool (account_pools.Choice.record, decided by the caller in
     `tx`), kept on the child's record. `at` and `placed`: the moment and the node (an interactive child's) that
-    choice judged the agent by, so that this start judges the same (hosted_tree.member_problem)."""
+    choice judged the agent by, so that this start judges the same (hosted_tree.member_problem).
+    `output`: the first message's request for a result as data (hosted.ask: `text` already carries its ask);
+    `refusal`: why the caller's schema was refused, raised only once a retry with `request_id` was looked for.
+    (`output_schema` is the human's body field, decided by `start_child`: ignored here.)"""
     spawn = spawn if spawn is not None else spawn_config(board)
     if not spawn.enabled:
         raise Conflict(OFF)
@@ -589,6 +593,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         done = _existing(c, pid, request_id, spawned_by)
         if done is not None:
             return done
+        if refusal:
+            raise Invalid(refusal)      # only now: a retry (also one a concurrent call just made) got its child
         if parent["state"] == "ended":
             raise Conflict(f"session {pid} has ended: nothing can be started under it")
         if parent.get("stop"):
@@ -629,7 +635,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
         if spawned_by is not None:
             # What it may start itself: on, and (`allowance`, the spawn tool's) no share above its starter's own.
             r |= {"spawned_by": dict(spawned_by), "allowance": dict(allowance or {"may_spawn": True, "share": None})}
-        m = hosted._enqueue(c, r, kind, text, by, now)
+        m = hosted._enqueue(c, r, kind, text, by, now, output=output)
         parent["child_counts"] = counts         # a name is unique under the parent, also once a child's record is gone
         if interactive:
             from . import hosted_spawn
@@ -645,6 +651,15 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
 def start_child(board: Board, p: Principal, parent_id: Any, text: Any, **kw) -> dict:
     """The human starts a session under one of theirs (`board session start --parent`)."""
     hosted._human(board, p, "start a child session")
+    schema = kw.pop("output_schema", None)
+    if schema is not None:
+        # The ORIGINAL message first, with main's refusal and words (R4-02): never a frame around a blank or an
+        # oversized one. Then the schema, decided now; its refusal waits until a retry with the request id has been
+        # looked for (create_child). Given but empty is decided too (R4-01): refused, never an ordinary turn.
+        text = hosted._text(text)
+        output, asked, why = hosted.ask(text, schema, "human")
+        kw |= {"output": output, "refusal": why}
+        text = asked or text
     from . import account_pools
     if not account_pools.maybe_pool(board, kw.get("agent")):
         out = create_child(board, p.name, parent_id, text, **kw)    # an agent (or none): main's path, untouched
@@ -674,9 +689,19 @@ def start_child(board: Board, p: Principal, parent_id: Any, text: Any, **kw) -> 
                 choice = account_pools.choose(board, c, pool, parent["project"], eligible, spawn)
                 kw = kw | {"agent": choice.agent, "pool": choice.record(), "at": at}
             out = done or create_child(board, p.name, parent_id, text, **kw)
-    return {"session": hosted._human_view(board, out["session"]),
-            "message": hosted._msg_view(out["message"]) if out["message"] is not None else None,
-            "created": out["created"]}
+    if schema is not None and not out["created"] and out["message"] is not None:
+        # A retry (a pool's too): its original first message and the child's record read in ONE snapshot, so a
+        # settlement that commits meanwhile is either in both or in neither (R5-01, R6-01); then labelled, with the
+        # derived data when the reply is still that message's.
+        kid, n = out["session"]["session_id"], out["message"]["n"]
+        return hosted.in_snapshot(board, lambda c: hosted.retried_answer(
+            board, c, hosted._session(c, kid), hosted._get(c, hosted._msg_key(kid, n)) or out["message"]))
+    answer = {"session": hosted._human_view(board, out["session"]),
+              "message": hosted._msg_view(out["message"]) if out["message"] is not None else None,
+              "created": out["created"]}
+    if schema is not None:
+        answer["output_request"] = hosted.acknowledged(out["message"], out["created"])
+    return answer
 
 
 def cascade(c, parent: dict, by: str, now: float) -> None:

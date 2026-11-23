@@ -66,7 +66,7 @@ import secrets
 import time
 from typing import Any
 
-from . import db, hosted, hosted_tree
+from . import db, hosted, hosted_tree, output_schema
 from .config import NAME_RE
 from .core import Board, Conflict, Invalid, NotFound
 from .nodes import _get, _put
@@ -257,6 +257,10 @@ def turn(c, child: dict, m: dict, *, ok: bool, delivered: bool, detail: str, tex
     fields = {"message": m["n"], "started_by": STARTED_BY.get(m.get("kind"), m.get("kind")),
               "outcome": outcome(ok, delivered, detail), "ok": bool(ok), "detail": detail,
               "denials": [d for d in denials if isinstance(d, str)][:50], "text": text if isinstance(text, str) else ""}
+    o = m.get("output")
+    if m.get("kind") == "task" and isinstance(o, dict) and o.get("by") == "parent" and o.get("state") != "asked":
+        # The verdict of a request the PARENT made: for it alone (a turn the human asked for carries none, R2-05).
+        fields["output"] = {k: o.get(k) for k in ("state", "code", "reasons", "schema_sha")}
     # The parent restarted this turn itself: the result is kept (for the lineage, and for a call of the parent's still
     # waiting for this turn), but it is not delivered as another turn of the parent's, decided before any limit of the
     # automatic delivery. A restart by the human still is delivered: the parent learns its task was interrupted.
@@ -353,6 +357,7 @@ def render(results: list[dict], token: str | None = None, header: str | None = N
     variant of HEADER with the same {token})."""
     def clash(t: str) -> bool:
         return any(t in str(x.get("text") or "") or t in str(x.get("detail") or "") or t in str(x.get("title") or "")
+                   or (isinstance(x.get("output"), dict) and t in json.dumps(x["output"].get("reasons") or []))
                    for x in results)
 
     token = token or secrets.token_hex(8)
@@ -367,6 +372,8 @@ def render(results: list[dict], token: str | None = None, header: str | None = N
         denied = [d for d in x.get("denials") or [] if isinstance(d, str) and hosted._TOOL_NAME.fullmatch(d)]
         if denied:
             out.append("Tools refused in that turn: " + ", ".join(denied) + ".")
+        if isinstance(x.get("output"), dict):
+            out.append(output_schema.result_line(x["output"]))      # the one hub line; the reply below it
         out += [f"<<<child-output {token}>>>", str(x.get("text") or "") or "(no output)",
                 f"<<<end child-output {token}>>>"]
     return "\n".join(out)
@@ -464,6 +471,12 @@ def _deliver(c, r: dict, now: float) -> dict | None:
         batch.append(x)
     if not batch:
         return None
+    if len(batch) == 1 and isinstance(batch[0].get("output"), dict) and len(render(batch).encode()) > BATCH_BYTES:
+        # One result with a verdict line that cannot be a turn (unreachable within the bounds: kept, not enqueued).
+        x = batch[0]
+        x |= _undelivered("too large to deliver as a turn", now)
+        _put(c, _key(pid, x["n"]), x, HUB, now)
+        return None
     m = hosted._enqueue(c, r, KIND, render(batch), HUB, now)
     m["results"] = [x["n"] for x in batch]
     m["shown_at"] = now     # reserved, as an agent's task is: shown to the node in this transaction (hosted.shown_task)
@@ -547,8 +560,32 @@ _VIEW = ("n", "child", "name", "agent", "title", "message", "started_by", "outco
          "state", "carrier", "attempts", "why", "created_at", "updated_at", "settled_at")
 
 
+REPLY_IN_VIEW = "in this view, whole: the child's reply (`text`)"
+REPLY_IN_VIEW_BLOCK = REPLY_IN_VIEW + ", which ends with the result-data block that was checked"
+REPLY_CUT = "in this view only in part: the child's reply is cut here before its end; `board session show` has it"
+REPLY_WENT = ("not in this result any more: it went to the parent with the result (delivered or claimed); the "
+              "child keeps its own latest reply")
+REPLY_NOT_IN_VIEW = "not in this view: a verdict only; the reply waits with the result"
+
+
+def reply_label(x: dict, shown: str | None) -> str:
+    """Where the reply a result's verdict was made from is, for a view that holds it `shown` ("whole", "cut") or
+    not at all (None)."""
+    if shown == "whole":
+        return REPLY_IN_VIEW_BLOCK if (x.get("output") or {}).get("state") == "accepted" else REPLY_IN_VIEW
+    if shown == "cut":
+        return REPLY_CUT
+    return REPLY_WENT if x.get("state") in ("delivered", "claimed") else REPLY_NOT_IN_VIEW
+
+
 def view_one(x: dict, text: bool = False) -> dict:
     out = {k: x.get(k) for k in _VIEW}
+    if isinstance(x.get("output"), dict):
+        # A verdict only (a whitelist: no schema, no token), with the code's fixed words and where the reply it was
+        # made from is (R3-01, R4-04).
+        f = output_schema.facts(x["output"])
+        out["output"] = f | ({"words": output_schema.WORDS.get(f.get("code"), "")} if f["state"] == "missing"
+                             else {}) | {"reply": reply_label(x, "whole" if text else None)}
     if text:
         out["text"] = x.get("text") or ""
     return out

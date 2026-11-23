@@ -14,6 +14,8 @@ What a turn does is in its text:
 - `crash ...`: the process exits (code 3) at once, before anything of the turn is written.
 - `deny ...`: the result lists a refused Write (the turn itself succeeds, as Claude's does).
 - `big ...`: the reply is 40 KB.
+- a turn that asks for a result as data (its text has the frame's `<<<output-schema T>>>` line) and says `data-valid`,
+  `data-invalid`, `data-two` or `data-none`: the reply ends with the result-data block of review data (`data_reply`).
 - `usage N ...`: before its result the turn writes a `rate_limit_event` saying the account's five-hour window is at
   N percent (`rejected` at 100 or more), as Claude Code's SDK schema describes it.
 - `write NAME`: the turn tries to create the file NAME in its working directory with the Write tool.
@@ -69,6 +71,27 @@ import subprocess
 import sys
 import threading
 import time
+
+
+# A turn that asks for a result as data (DESIGN_NOTES "Structured results": the frame's `<<<output-schema T>>>` line)
+# and names `data-valid`, `data-invalid`, `data-two` or `data-none` in its text: the reply ends as the frame asks
+# (or deliberately does not), with the review data.
+REVIEW_DATA = {"verdict": "changes", "findings": [{"file": "src/pager.py", "line": 3, "note": "off by one"}]}
+
+
+def data_reply(text: str):
+    asked = re.search(r"<<<output-schema ([0-9a-f]{16})>>>", text)
+    want = re.search(r"\bdata-(valid|invalid|two|none)\b", text)
+    if not asked or not want:
+        return None
+    t, kind = asked.group(1), want.group(1)
+    good = json.dumps(REVIEW_DATA)
+    bad = json.dumps({"verdict": "maybe", "findings": []})
+    one = f"<<<result-data {t}>>>\n{{body}}\n<<<end result-data {t}>>>"
+    return {"valid": "Reviewed: one bug.\n" + one.format(body=good),
+            "invalid": "Reviewed.\n" + one.format(body=bad),
+            "two": "Draft:\n" + one.format(body=good) + "\nFinal:\n" + one.format(body=good),
+            "none": "Reviewed, but no block."}[kind]
 
 
 def flag_values(args, *names):
@@ -367,7 +390,7 @@ def main() -> None:
                 "resetsAt": int(time.time()) + 3600, "rateLimitType": "five_hour", "utilization": pct / 100,
                 "unifiedWindows": {"five_hour": {"utilization": pct / 100, "resetsAt": int(time.time()) + 3600}}}})
         failed = text.startswith("fail")
-        reply = "x" * 40_000 if text.startswith("big") else f"turn {turn}: {text.upper()}"
+        reply = "x" * 40_000 if text.startswith("big") else data_reply(text) or f"turn {turn}: {text.upper()}"
         reply += "".join("; STEERED: " + m["message"]["content"].upper() for m in steered)
         denials = ([{"tool_name": "Write", "tool_use_id": "toolu_01", "tool_input": {"file_path": "/tmp/x"}}]
                    if text.startswith("deny") else [])

@@ -254,7 +254,7 @@ class Server:
             k = thread["turns"]
             reply = ("x" * 40_000 if text.startswith("big")
                      else f"turn {k}: FIRST WAS {thread['first'].upper()}" if text.startswith("recall")
-                     else f"turn {k}: {text.upper()}")
+                     else data_reply(text) or f"turn {k}: {text.upper()}")
             wrote = re.match(r"write ([A-Za-z0-9._-]+)$", text)
             if wrote:
                 sandbox, cwd = self.places.get(tid, (None, os.getcwd()))
@@ -267,6 +267,27 @@ class Server:
         self.active = None
         self.notify("thread/status/changed", threadId=tid, status={"type": "idle"})
         self.notify("turn/completed", threadId=tid, turn=done)
+
+
+# A turn that asks for a result as data (DESIGN_NOTES "Structured results": the frame's `<<<output-schema T>>>` line)
+# and names `data-valid`, `data-invalid`, `data-two` or `data-none` in its text: the reply ends as the frame asks
+# (or deliberately does not), with the review data.
+REVIEW_DATA = {"verdict": "changes", "findings": [{"file": "src/pager.py", "line": 3, "note": "off by one"}]}
+
+
+def data_reply(text: str):
+    asked = re.search(r"<<<output-schema ([0-9a-f]{16})>>>", text)
+    want = re.search(r"\bdata-(valid|invalid|two|none)\b", text)
+    if not asked or not want:
+        return None
+    t, kind = asked.group(1), want.group(1)
+    good = json.dumps(REVIEW_DATA)
+    bad = json.dumps({"verdict": "maybe", "findings": []})
+    one = f"<<<result-data {t}>>>\n{{body}}\n<<<end result-data {t}>>>"
+    return {"valid": "Reviewed: one bug.\n" + one.format(body=good),
+            "invalid": "Reviewed.\n" + one.format(body=bad),
+            "two": "Draft:\n" + one.format(body=good) + "\nFinal:\n" + one.format(body=good),
+            "none": "Reviewed, but no block."}[kind]
 
 
 def main() -> None:

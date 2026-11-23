@@ -304,6 +304,11 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--request-id", metavar="X", help="idempotency: the same id under the same parent returns the "
                                                      "child it made the first time instead of another")
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
+    x.add_argument("--output-schema", metavar="S", help="ask this message's turn for its result as data: S is a JSON "
+                   "Schema (a small subset; README \"Results as data\"), as a file's path or as JSON text starting with "
+                   "{. The session ends its reply with a result-data block and the board records whether it fits "
+                   "(shape only). With --wait: exit 3 when the turn completed without valid data, 4 when no verdict is "
+                   "known")
     raw(x)
     x = ssub.add_parser("send", help="send a message: the next turn if the session is idle, queued behind the "
                                      "turns ahead of it otherwise (--mode restart replaces the turn in flight)")
@@ -316,6 +321,11 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--request-id", metavar="X", help="idempotency: a retry with the same id returns the message the "
                                                      "first call sent instead of sending another")
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
+    x.add_argument("--output-schema", metavar="S", help="ask this message's turn for its result as data: S is a JSON "
+                   "Schema (a small subset; README \"Results as data\"), as a file's path or as JSON text starting with "
+                   "{. The session ends its reply with a result-data block and the board records whether it fits "
+                   "(shape only). With --wait: exit 3 when the turn completed without valid data, 4 when no verdict is "
+                   "known")
     raw(x)
     x = ssub.add_parser("show", help="one session: state, queue, last result and last reply")
     x.add_argument("session_id")
@@ -969,6 +979,8 @@ def _fmt_hosted_detail(s: dict) -> str:
                                                               " (results of its child sessions)"
                                                               if m.get("kind") == "child" else "")
                      + _fmt_mode(m) + (f" {m['detail']}" if m.get("detail") else ""))
+        if isinstance(m.get("output"), dict):
+            lines.append("    " + _fmt_verdict(m["output"]))
     if s.get("results") or s.get("results_dropped"):
         lines.append("  results from its children:")
         lines += ["    " + line for x in s.get("results", []) for line in _fmt_result(x)]
@@ -997,10 +1009,59 @@ def _fmt_result(x: dict) -> list[str]:
     out = [head]
     if x.get("waiting_because"):
         out.append(f"  waits: {x['waiting_because']}")       # the hub's words (hosted_results.waiting_because)
+    if isinstance(x.get("output"), dict):
+        out.append("  " + _fmt_verdict(x["output"]))
     if x["state"] == "undelivered":
         out.append(f"  not delivered: {x.get('why') or 'no reason given'}")
         out += ["  | " + line for line in (x.get("text") or "(no output)").splitlines()]
     return out
+
+
+def _fmt_verdict(o: dict) -> str:
+    """A request for a result as data: its verdict (the agent's claim; shape only), and where the reply it was made
+    from is. Every piece is the hub's words, or ASCII-escaped names inside them: one line."""
+    state = o.get("state")
+    head = f"result as data: {state}" + (f" ({o.get('code')}): {o.get('words')}" if state == "missing" else
+                                         f": {o.get('words')}" if state == "unchecked" else
+                                         " (the agent's claim; the board checked its shape only)"
+                                         if state == "accepted" else "")
+    if o.get("reasons"):
+        head += "; why: " + "; ".join(str(r) for r in o["reasons"])
+    if o.get("reply"):
+        head += f"; the reply: {o['reply']}"
+    return json.dumps(head, ensure_ascii=True)[1:-1]
+
+
+def _read_schema(value: str) -> str:
+    """--output-schema: JSON text starting with `{`, or a file's path, read with a bound before anything decodes it
+    (the hub decodes it strictly; output_schema.py)."""
+    from .output_schema import SCHEMA_MAX_BYTES
+    if not value.strip():
+        # Given, but empty (R4-01): refused here, before any request, never sent on as an ordinary turn.
+        raise SystemExit("error: --output-schema is empty: give a schema file's path or the schema's JSON text")
+    if value.lstrip().startswith("{"):
+        return value
+    try:
+        with open(os.path.expanduser(value), "rb") as f:
+            data = f.read(SCHEMA_MAX_BYTES + 1)
+    except OSError as e:
+        raise SystemExit(f"error: cannot read the output schema file {value}: {e.strerror or e}") from None
+    if len(data) > SCHEMA_MAX_BYTES:
+        raise SystemExit(f"error: the output schema file is over {SCHEMA_MAX_BYTES:,} bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit("error: the output schema file is not UTF-8 text") from None
+    if not text.strip():
+        raise SystemExit(f"error: the output schema file {value} is empty")
+    return text
+
+
+def _fmt_ack(ack: dict) -> str:
+    if ack.get("stored"):
+        return (f"result as data: asked (schema {ack.get('schema_sha')})"
+                + (", by the original message of this request id" if ack.get("original") else ""))
+    return "result as data: not asked: " + str(ack.get("why"))
 
 
 def _fmt_mode(m: dict) -> str:
@@ -1064,18 +1125,21 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
             raise SystemExit("error: --" + ", --".join(k.replace("_", "-") for k in given)
                              + " apply to a child session only (--parent ID)")
     text = sys.stdin.read() if a.message == "-" else a.message
+    schema = _read_schema(a.output_schema) if getattr(a, "output_schema", None) is not None else None
+    with_schema = {"output_schema": schema} if schema is not None else {}
     if a.session_cmd == "start" and a.parent:
         body = {"message": text} | {k: v for k, v in (("agent", a.agent), ("model", a.model), *child_only.items())
                                     if v is not None}
-        r = _api(settings, token, "POST", f"/api/hosted-sessions/{quote(a.parent, safe='')}/children", body)
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{quote(a.parent, safe='')}/children",
+                 body | with_schema)
     elif a.session_cmd == "start":
         body = {"project": os.path.abspath(os.path.expanduser(a.project)), "message": text}
         body |= {k: v for k, v in (("agent", a.agent), ("model", a.model)) if v}
-        r = _api(settings, token, "POST", "/api/hosted-sessions", body)
+        r = _api(settings, token, "POST", "/api/hosted-sessions", body | with_schema)
     else:
         body = {"message": text} | ({"mode": a.mode} if a.mode != "queue" else {})
         body |= {"request_id": a.request_id} if a.request_id else {}
-        r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", body)
+        r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", body | with_schema)
     s, m = r["session"], r["message"]
     if a.session_cmd == "send" and (r.get("created") is False or m.get("mode") or r.get("why")):
         who = f"child {_fmt_child(s)} of {s['parent']}" if s.get("parent") else f"session {_fmt_hosted(s)}"
@@ -1086,7 +1150,12 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
             if m.get("mode") == "restart" else f"message {m['n']}: {r['why']}")
     elif s.get("parent"):
         if m is None:       # --request-id found the child it made before, and its first message is no longer on record
-            return out(r, f"child {_fmt_child(s)} of {s['parent']}: already started for this request id")
+            out(r, f"child {_fmt_child(s)} of {s['parent']}: already started for this request id"
+                + (f"\n{_fmt_ack(r['output_request'])}" if schema is not None else ""))
+            if schema is not None and a.wait:
+                print("no verdict: the first message is no longer kept on the hub", file=sys.stderr)
+                raise SystemExit(4)
+            return
         info = (f"child {_fmt_child(s)} of {s['parent']}; "
                 + (f"message {m['n']} queued" if r.get("created", True) else
                    f"already started for this request id (message {m['n']}: {m['state']}); nothing new was sent"))
@@ -1094,6 +1163,8 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
         info = f"session {_fmt_hosted(s)}; message {m['n']} queued"
     if s.get("pool") and a.session_cmd == "start":
         info += "\n" + _fmt_pool(s["pool"])
+    if schema is not None and isinstance(r.get("output_request"), dict):
+        info += "\n" + _fmt_ack(r["output_request"])
     if not s["node_live"]:
         info += f"\nnote: node {s['node']} is not connected; the message waits until it is"
     if not a.wait:
@@ -1105,19 +1176,34 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
             print(json.dumps({"session": s, "message": m, "reply": None, "note": note}, indent=2))
         else:
             print(info + f"\nnote: {note}", file=sys.stderr)
+        if schema is not None:
+            print("no verdict: the message is no longer kept on the hub", file=sys.stderr)
+            raise SystemExit(4)
         return
     if not a.json:
         print(info, file=sys.stderr)
     path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{m['n']}?wait=25"
-    while True:
-        r = _api(settings, token, "GET", path, timeout=60)
+    # A structured retry whose message had already ended: its verdict came with the POST, so nothing is polled for it
+    # (the record may be pruned before a poll could read it: R4-06). Schema-free waits poll as they always did.
+    while not (schema is not None and m.get("state") in ("done", "failed")):
+        try:
+            r = _api(settings, token, "GET", path, timeout=60)
+        except SystemExit as e:
+            gone = (isinstance(e.code, str) and e.code.startswith("error (not_found)")
+                    and ("has no message" in e.code or "no such hosted session" in e.code))
+            if schema is None or not gone:
+                raise
+            print("no verdict: the message is no longer kept on the hub", file=sys.stderr)
+            raise SystemExit(4) from None
         if r["message"]["state"] in ("done", "failed"):
             break
     s, m = r["session"], r["message"]
     reply = s["reply"] if s.get("reply_for") == m["n"] else None   # the hub keeps only the last reply
     failed = m["state"] != "done"
     if a.json:
-        print(json.dumps({"session": s, "message": m, "reply": reply}, indent=2))
+        print(json.dumps({"session": s, "message": m, "reply": reply}
+                         | ({"result_data": r["result_data"]} if "result_data" in r and schema is not None else {}),
+                         indent=2))
     else:
         if failed:
             print(f"turn failed: {m['detail'] or 'no reason given'}", file=sys.stderr)
@@ -1129,6 +1215,16 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
             print(f"(a later turn's reply replaced this one; the transcript has it: {s['transcript']})")
     if failed:
         raise SystemExit(1)
+    if schema is not None:
+        verdict = m.get("output") if isinstance(m.get("output"), dict) else None
+        if not a.json:
+            print(_fmt_verdict(verdict) if verdict else "no verdict: this message asked for no result as data",
+                  file=sys.stderr)
+        state = verdict.get("state") if verdict else None
+        if state == "missing":
+            raise SystemExit(3)
+        if state != "accepted":
+            raise SystemExit(4)     # unchecked, or the message asked for none (a retry's original)
 
 
 def _login_link(settings: Settings, token: str) -> str:
