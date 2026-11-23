@@ -271,6 +271,27 @@ class SessionRunner:
                 self.handed[sid] = int(turn)
                 self._save_handed()
 
+    def usage_report(self) -> dict[str, list[dict]]:
+        """For the node's hello, to a hub that asked (account_pools.py): per runner, each window's latest plan usage
+        its sessions' providers reported, with that window's own age in seconds (never a time of this machine's
+        clock), at most a day old, each through providers.clean_usage. It never raises: advisory."""
+        from .providers import clean_usage
+        try:
+            now = self.clock()
+            with self.host.usage_lock:
+                seen = {k: dict(v) for k, v in self.host.usage.items()}
+            out = {}
+            for key, windows in sorted(seen.items()):
+                # (clean_usage drops one older than providers.USAGE_MAX_AGE)
+                kept = [c for c in (clean_usage(o | {"age": max(0.0, now - o["at"])}, age=True)
+                                    for o in windows.values()) if c is not None]
+                if kept:
+                    out[key] = kept
+            return out
+        except Exception:
+            log.debug("the usage report could not be made; it is advisory and is left out", exc_info=True)
+            return {}
+
     # ------------------------------------------------------------ hub calls
 
     def _call(self, method: str, path: str, **kw) -> Any:

@@ -173,6 +173,18 @@ A2. A session of claude-work in the second temp checkout is refused with the rea
 A3. The spawning agent's session in the temp checkout sees claude-work among its targets and starts a child of it,
     whose process gets the folder too; an interactive caller of the spawning agent in the second checkout is not
     offered claude-work there, and its spawn of it is refused with the reason.
+P1-P4 (stand-ins only). An account pool (README "Balancing between accounts"): the hub's settings get
+`pools = {"e2e-pool" = ["claude-work", "claude"]}` while it runs.
+P1. The spawning agent's session spawns `child_agent = "e2e-pool"`: the child is claude-work's (the first member),
+    and its audit post says so ("first choice").
+P2. The work child is sent `usage 95`: the stand-in writes a `rate_limit_event` saying its five-hour window is at 95%,
+    the node's next hello carries it to the hub (which asked for it), and the next spawn of the pool goes to claude,
+    with `show` saying why (overflow, the first member at 95%).
+P3. A rule `only = ["claude-work"]` for the temp checkout: the next spawn is claude-work's again, though it is near
+    its limit (the other member is refused there; headroom never refuses work). The same rule for the second
+    checkout, where claude-work is not opted in, leaves nothing: refused with the reason.
+P4. A rule `never = ["claude-work"]` (and the work account back at 10%): the spawn goes to claude, and so does the
+    human's `board session start --parent ... --agent e2e-pool`, whose output says how it was chosen.
 The settings fixtures live in the temp directory only. They are loaded with `--settings` because Claude Code
 ignores an untrusted directory's own `.claude/settings.json` in print mode (it says so on stderr), and trusting the
 temp checkout would mean writing the user's `~/.claude.json`. With the real CLI those two runners also pass
@@ -215,6 +227,7 @@ RESTRICTED_AGENT = "claude-restricted"      # ... a fifth: --restricted beside t
 SPAWN_AGENT = "claude-spawner"  # ... a sixth: its runner has the temp board's MCP tools, so it can start children itself
 WORK_AGENT = "claude-work"      # ... a seventh: another account's runner (an account folder of its own), opted in to
                                 # the temp checkout only (A1-A3)
+POOL = "e2e-pool"               # P1-P4: an account pool of the work agent first, then the first agent
 STEER_AGENT = "claude-steer"    # the send-mode scenario's Claude agent: its runner may also run `sleep` (a long call)
 NO_BYPASS = "disableBypassPermissionsMode"  # the settings key (under permissions) a node adds to every launch but full
 GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit", "Read"]}}     # ... and two hooks (enable_tree)
@@ -2233,6 +2246,112 @@ max_live = 8
             self.check(self.wait_ended(x)["state"] == "ended", f"closing {x} ends it")
         self.check(self.wait_ended(kid)["state"] == "ended", "and the child under it")
 
+    def pool_settings(self, rules: dict | None = None) -> None:
+        """P1-P4: the hub's board.toml with the account pool (and, from P3 on, a rule for the temp checkout), written
+        while the hub runs: it takes it at its next reload, as any settings edit. Its spawn budget is raised for
+        these extra starts."""
+        path = self.hub_home / "board.toml"
+        if not hasattr(self, "hub_toml_before_pools"):
+            self.hub_toml_before_pools = path.read_text()
+        text = self.hub_toml_before_pools
+        lines = [f"pools = {{ {json.dumps(POOL)} = {toml_list([WORK_AGENT, AGENT])} }}",
+                 "max_spawns_per_hour = 100", "max_live_children = 20"]
+        if rules:
+            lines.append("pool_rules = { " + ", ".join(
+                f"{json.dumps(p)} = {{ " + ", ".join(f"{k} = {toml_list(v)}" for k, v in r.items()) + " }"
+                for p, r in rules.items()) + " }")
+        head, sep, tail = text.partition("[dispatch.sessions.spawn]\nenabled = true\n")
+        if not sep:
+            raise SystemExit("the hub's board.toml has no [dispatch.sessions.spawn] table to add the pool to")
+        path.write_text(head + sep + "\n".join(lines) + "\n" + tail)
+
+    def usage_seen(self) -> dict:
+        """What the hub keeps of the usage the node reported (account_pools.USAGE_PREFIX), read from its database by
+        another process."""
+        code = ("import json\nfrom agent_comms import account_pools\nfrom agent_comms.config import Settings\n"
+                "from agent_comms.core import Board\nb = Board(Settings.load())\n"
+                f"print(json.dumps(account_pools.usage_view(b.conn, {NODE!r})))")
+        r = subprocess.run([sys.executable, "-c", code], cwd=str(self.tmp), capture_output=True, text=True,
+                           timeout=60, env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home)})
+        if r.returncode != 0:
+            raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
+        return json.loads(r.stdout)
+
+    def pool_spawn(self, rid: str, project: str | None = None) -> dict:
+        args = {"task": "ready", "child_agent": POOL, "access": "read-only"} | ({"project": project} if project else {})
+        [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", args]], None if project else rid)
+        return made
+
+    def pools_scenario(self) -> None:
+        """P1-P4: an account pool of two agents (account_pools.py), the stand-in reporting the first one's usage."""
+        print(f"\n[P1] an account pool: {POOL} = {WORK_AGENT} first, then {AGENT}")
+        if self.real:
+            print("  (stand-in runs only: the first account would have to be near its real limit)")
+            return
+        self.pool_settings()
+        out, _, _ = self.board("session", "start", str(self.project), "ready", "--agent", SPAWN_AGENT, "--wait",
+                               "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.show(rid)
+        made = self.pool_spawn(rid)
+        self.check(not made["error"], f"the session started a child of pool {POOL}"
+                   + (f": {made['text'][:300]}" if made["error"] else ""))
+        first = json.loads(made["text"])["child"]
+        self.check(first["agent"] == WORK_AGENT and first.get("pool") == POOL,
+                   f"the first spawn went to the first member, {WORK_AGENT}")
+        self.wait_for("the audit post", lambda: len(self.tree_thread_posts(rid)["posts"]) >= 1)
+        audit = self.tree_thread_posts(rid)["posts"][-1]["body"]
+        self.check(f"agent {WORK_AGENT}" in audit and f"Its agent was asked for as pool {POOL} and chosen by the hub "
+                   "(first choice); `board session show` gives the full reason." in audit,
+                   "its audit post says which member and, in brief, why (first choice)")
+        print(f"\n[P2] the stand-in reports {WORK_AGENT}'s account at 95%")
+        out, _, _ = self.board("session", "send", first["id"], "usage 95 and reply", "--wait")
+        self.wait_for("the usage report at the hub",
+                      lambda: (self.usage_seen().get(WORK_AGENT) or {}).get("five_hour", {}).get("percent") == 95.0, seconds=40)
+        made = self.pool_spawn(rid)
+        second = json.loads(made["text"])["child"] if not made["error"] else {}
+        self.check(second.get("agent") == AGENT, f"the next spawn went to the second member, {AGENT}")
+        view = self.show(second["id"])
+        print(f"  {view['pool']['why']}")
+        self.check(f"overflow, because {WORK_AGENT} was at 95% of its five_hour window" in view["pool"]["why"],
+                   "and `show` says why: overflow, with the first member's usage")
+        detail, _, _ = self.board("session", "show", second["id"])
+        self.check(f"asked for as pool {POOL}; the hub chose {AGENT} from pool {POOL}: overflow" in detail,
+                   "`board session show` says it too")
+        print(f"\n[P3] a project rule: only {WORK_AGENT} in the temp checkout")
+        self.pool_settings({str(self.project): {"only": [WORK_AGENT]}, str(self.project_mode): {"only": [WORK_AGENT]}})
+        made = self.pool_spawn(rid)
+        third = json.loads(made["text"])["child"] if not made["error"] else {}
+        why = self.show(third["id"])["pool"]["why"] if third else ""
+        print(f"  {why}")
+        self.check(third.get("agent") == WORK_AGENT and f"only {WORK_AGENT}" in why
+                   and "headroom never refuses work" in why,
+                   f"{AGENT} is refused there: {WORK_AGENT} is taken although it is near its limit, and the reason "
+                   "says so")
+        made = self.pool_spawn(rid, project=str(self.project_mode))
+        print(f"  in the second checkout: {made['text'][:240]}")
+        self.check(made["error"] and f"no member of pool {POOL} can be started in {self.project_mode}" in made["text"]
+                   and f"{WORK_AGENT} is not opted in" in made["text"],
+                   f"where {WORK_AGENT} may not run, `only` leaves nothing: refused with the reason")
+        print(f"\n[P4] a project rule: never {WORK_AGENT}")
+        self.pool_settings({str(self.project): {"never": [WORK_AGENT]}})
+        out, _, _ = self.board("session", "send", first["id"], "usage 10 and reply", "--wait")
+        self.wait_for("the new usage report", lambda: (self.usage_seen().get(WORK_AGENT) or {}).get("five_hour", {}).get("percent") == 10.0,
+                      seconds=40)
+        made = self.pool_spawn(rid)
+        fourth = json.loads(made["text"])["child"] if not made["error"] else {}
+        why = self.show(fourth["id"])["pool"]["why"] if fourth else ""
+        self.check(fourth.get("agent") == AGENT and f"never {WORK_AGENT}" in why,
+                   f"{WORK_AGENT} is skipped although it has room now: {why}")
+        out, _, _ = self.board("session", "start", "--parent", rid, "ready", "--agent", POOL, "--access", "read-only")
+        print(f"  {out.strip()[:300]}")
+        self.check(f"asked for as pool {POOL}; the hub chose {AGENT} from pool {POOL}" in out,
+                   "the human's `start --parent ... --agent <pool>` is decided the same way, and says so")
+        self.board("session", "close", rid)
+        self.check(self.wait_ended(rid)["state"] == "ended", f"closing {rid} ends it")
+        for kid in (first, second, third, fourth):
+            self.check(self.wait_ended(kid["id"])["state"] == "ended", "and every child under it")
+
     def deep_scenario(self) -> None:
         """T11: a deeper tree (max_depth 2, shipped): a hosted session starts a child that starts a grandchild, and the
         results come back up level by level (DESIGN_NOTES "Session host: deeper trees")."""
@@ -2515,6 +2634,7 @@ def main() -> int:
             run.spawn_scenario()
             run.deep_scenario()
             run.accounts_scenario()
+            run.pools_scenario()
             print("\n[T8] stopping the node (SIGTERM) and the hub")
             run.stop()
             run.check(run.leftovers() == [], "no session process is left behind")

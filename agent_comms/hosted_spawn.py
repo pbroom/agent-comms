@@ -948,10 +948,72 @@ def _target_ok(cfg, caller: Caller, agent: str, model: str | None) -> str | None
     return None
 
 
-def _node_for(board: Board, caller: Caller, agent: str, runtime: str | None, allowed: dict) -> str | None:
+def _node_for(board: Board, caller: Caller, agent: str, runtime: str | None, allowed: dict,
+              at: float | None = None) -> str | None:
     if caller.kind == "hosted":
         return caller.node
-    return hosted_tree.place_interactive(board, caller.project, agent, runtime, allowed)
+    return hosted_tree.place_interactive(board, caller.project, agent, runtime, allowed, at)
+
+
+def _placed(board: Board, caller: Caller, agent: str, runtime: str | None, ceiling: str | None, allowed: dict,
+            isolation: str = "shared") -> tuple[str | None, list[str], str | None]:
+    """(the node, the access words within `ceiling`, None) where a child of `agent` could be placed under this caller
+    now, else (None, [], why not): the node it would run on (the caller's own, or one an interactive caller's child
+    is placed on), the hub's grant for that node, the spawn protocol there, a word within the ceiling on offer, and the
+    placement checks the start makes (hosted_tree.placement_problem). What `_offered` lists, one agent at a time; also
+    each member's check when a pool is named (`_spawn_in`)."""
+    conn = board.conn
+    node = _node_for(board, caller, agent, runtime, allowed)
+    if node is None:
+        return None, [], (f"no connected node that hosts child sessions for this project has a runner for {agent} "
+                          "the hub allows")
+    grant = allowed.get(node)
+    if (not isinstance(grant, dict) or not nodes.grant_covers(grant, caller.project)
+            or (agent not in grant.get("agents", []) and runtime not in grant.get("agents", []))):
+        return None, [], f"the hub's [dispatch.nodes.{node}] does not list {caller.project} and {agent}"
+    if not hosted_tree.node_spawns(conn, node):
+        return None, [], f"node {node} runs a version of agent-comms from before agent-started child sessions"
+    words = [w for w in hosted_tree._offers(conn, node, agent, runtime)
+             if ceiling is None or session_access.within(w, ceiling)]
+    if not words:
+        return None, [], f"node {node} offers no access word for {agent} within {ceiling}"
+    parent = dict(caller.record or {"kind": "interactive", "session_id": None}) | {"node": node,
+                                                                                   "project": caller.project}
+    why = hosted_tree.placement_problem(board, conn, parent, agent, runtime, allowed, isolation)
+    if why is not None:
+        return None, [], why
+    return node, words, None
+
+
+def _default_access(conn, node: str | None, agent: str, runtime: str | None, ceiling: str) -> str:
+    """The access a child gets when none is asked: the highest word within the ceiling that the node the child would
+    run on can start it at; with none, the ceiling itself, which the node refuses with its reason."""
+    offers = [w for w in hosted_tree._offers(conn, node, agent, runtime) if session_access.within(w, ceiling)] \
+        if node else []
+    return _highest(offers) or ceiling
+
+
+def _member_problem(board: Board, c, caller: Caller, agent: str, runtime: str | None, *, model: str | None,
+                    access: str | None, isolation: str, ceiling: str | None, allowed: dict, cfg,
+                    targets: bool = True, at: float | None = None) -> tuple[str | None, str | None, str | None]:
+    """(the node, the effective access, None) when this caller's spawn of `agent` would pass the start's own checks
+    for that agent, else (None, None, why not): the targets list (`_target_ok`, unless `targets` is False: a caller
+    that has applied it already, with its models), the access the spawn would give (`_default_access` when none is
+    asked, as `_spawn_in` computes it), and create_child's own checks at that access (hosted_tree.member_problem),
+    every node judged live at `at`. The one definition of an eligible pool member for an agent's spawn
+    (account_pools.py), also behind what capabilities and the frame list."""
+    if targets:
+        why = _target_ok(cfg, caller, agent, model)
+        if why:
+            return None, None, why
+    interactive = caller.kind == "interactive"
+    if ceiling not in session_access.LEVELS:
+        return None, None, "the access a child may have here is not known yet"
+    if access is None:
+        access = _default_access(c, _node_for(board, caller, agent, runtime, allowed, at), agent, runtime, ceiling)
+    parent = dict(caller.record or {"kind": "interactive", "session_id": None}) | {"project": caller.project}
+    return hosted_tree.member_problem(board, c, parent, agent, runtime, access=access, isolation=isolation,
+                                      allowed=allowed, ceiling=ceiling, interactive=interactive, spawned=True, at=at)
 
 
 def _offered(board: Board, caller: Caller, ceiling: str | None, allowed: dict) -> list[dict]:
@@ -961,22 +1023,8 @@ def _offered(board: Board, caller: Caller, ceiling: str | None, allowed: dict) -
     child, hosted_spawn._spawn_line)."""
     conn, cfg, out = board.conn, config(board), []
     for agent, runtime in _agents(conn).items():
-        node = _node_for(board, caller, agent, runtime, allowed)
-        if node is None:
-            continue
-        grant = allowed.get(node)
-        if (not isinstance(grant, dict) or not nodes.grant_covers(grant, caller.project)
-                or (agent not in grant.get("agents", []) and runtime not in grant.get("agents", []))):
-            continue
-        if not hosted_tree.node_spawns(conn, node):
-            continue
-        words = [w for w in hosted_tree._offers(conn, node, agent, runtime)
-                 if ceiling is None or session_access.within(w, ceiling)]
-        if not words:
-            continue
-        parent = dict(caller.record or {"kind": "interactive", "session_id": None}) | {"node": node,
-                                                                                       "project": caller.project}
-        if hosted_tree.placement_problem(board, conn, parent, agent, runtime, allowed) is not None:
+        node, words, why = _placed(board, caller, agent, runtime, ceiling, allowed)
+        if why is not None:
             continue
         if cfg.targets:
             models = [t.partition("/")[2] or None for t in cfg.targets if t.partition("/")[0] == agent
@@ -1004,8 +1052,53 @@ def _who(caller: Caller) -> str:
             else f"hosted session {caller.id} (agent {agent})")
 
 
+def _pool_words_for(board: Board, c, caller: Caller, targets: list[dict], ceiling: str | None, allowed: dict,
+                    cfg) -> dict[str, list[str]]:
+    """Per agent among `targets` (what `_offered` lists for this caller), the access words a spawn of it asking for
+    that word would pass the start's own checks at (`_member_problem`): for capabilities and the frame, so that a
+    pool is shown where an explicit word works although its default would not (a one-slot node and `full`)."""
+    out: dict[str, list[str]] = {}
+    for t in targets:
+        words = [w for w in t.get("access", []) if _member_problem(
+            board, c, caller, t["agent"], t["runtime"], model=None, access=w, isolation="shared", ceiling=ceiling,
+            allowed=allowed, cfg=cfg, targets=False)[2] is None]
+        if words:
+            out[t["agent"]] = words
+    return out
+
+
+POOL_SLOT = "\x00"     # where `_spawn_line` leaves room for the pool words (nothing it writes holds one)
+
+
+def _frame(who: str, task: str, line: str, pools: list[dict]) -> str:
+    """The task's message, with the spawn line `line` (from ONE evaluation: `_spawn_line`) and, where it left
+    POOL_SLOT, the pool words fitted to the bytes the message has left once everything else of it is measured
+    (hosted.MESSAGE_MAX_BYTES; render_task's token is the same length every time). Nothing is evaluated again after
+    the measure. A line without the slot is rendered as it is (main's)."""
+    if POOL_SLOT not in line:
+        return render_task(who, task, line)
+    head, _, rest = line.partition(POOL_SLOT)
+    # Measured as hosted._text and _task_text measure a message (UTF-8, errors replaced): any text they take fits.
+    room = hosted.MESSAGE_MAX_BYTES - len(render_task(who, task, head + rest).encode("utf-8", "replace"))
+    return render_task(who, task, head + _fit_pools(pools, room) + rest)
+
+
+def _fit_pools(pools: list[dict], room: int | None) -> str:
+    """The frame's words for the pools a child could name, the longest that fits in `room` bytes (None: any): each
+    pool's line of order; else their names; else a pointer to capabilities; else nothing. A frame never makes a
+    valid task fail (hosted.MESSAGE_MAX_BYTES)."""
+    if not pools:
+        return ""
+    forms = ["; or, as child_agent, a pool of accounts, whose member the board picks when the session starts (the "
+             "order is not a promise): " + "; ".join(p["about"] for p in pools),
+             "; or, as child_agent, a pool of accounts (board_session_capabilities gives each one's order): "
+             + ", ".join(p["pool"] for p in pools),
+             "; or, as child_agent, a pool of accounts (board_session_capabilities lists them)", ""]
+    return next((f for f in forms if room is None or len(f.encode("utf-8", "replace")) <= room), "")
+
+
 def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, depth: int, cfg, *,
-                node: str | None, access: str, ceiling: str, allowed: dict) -> str:
+                node: str | None, access: str, ceiling: str, allowed: dict, pools_out: list | None = None) -> str:
     """The server's line telling a child (at `depth`, of `agent` and `model`, at `access`, on `node`) whether it may
     start helper sessions of its own, true at the moment it is written: how many levels remain below it, the targets
     it could start on its own node (within what it could give: its own access, `ceiling` above it, its agent's grant;
@@ -1059,6 +1152,17 @@ def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, 
     else:
         targets = ("agents " + ", ".join(names) + " on your node" + (", your own among them" if mine else "")
                    + " (any model they offer; prefer the cheapest that can do the work)")
+    if cfg.pools and pools_out is not None:
+        from . import account_pools
+        wanted = set(n.partition("/")[0] for n in names)
+        # A member counts only if the would-be child's own spawn of it would pass the start's checks for it, at some
+        # access word it may ask for (`_pool_words_for`, the one definition the choice uses).
+        works = _pool_words_for(board, c, me, [t for t in offered if t["agent"] in wanted], reach, allowed, cfg)
+        pools = account_pools.offered(board, caller.project, list(works), cfg)
+        if pools:
+            # Where the pool words go: the caller fits them to the bytes the message has left (`_frame`).
+            pools_out.extend(pools)
+            targets += POOL_SLOT
     below = cfg.max_depth - depth
     levels = (f"you are at depth {depth} of at most {cfg.max_depth}, so the sessions you start cannot start any of "
               "their own" if below == 1 else
@@ -1121,7 +1225,9 @@ def _child_view(conn, r: dict, caller_id: str | None, board: Board | None = None
             # turn of the caller's that its node has not started (a full-access confirmation it waits for, say).
             **({"results_waiting_because": {str(x["n"]): hosted_results.waiting_because(board, conn, x)
                                             for x in outstanding}} if outstanding and board is not None else {}),
-            "ended_at": r.get("ended_at")}
+            "ended_at": r.get("ended_at"),
+            # The pool its agent was chosen from (account_pools.py), only for a child asked for by a pool's name.
+            **({"pool": r["pool"].get("name")} if isinstance(r.get("pool"), dict) else {})}
 
 
 def capabilities(board: Board, p: Principal, ident: Ident, project: Any = None) -> dict:
@@ -1187,6 +1293,19 @@ def capabilities(board: Board, p: Principal, ident: Ident, project: Any = None) 
             _, runtime = hosted._agent(board, caller.agent)
             why = hosted_tree.placement_problem(board, board.conn, caller.record, caller.agent, runtime, _nodes(board))
         out["why_not"].append(why or "no node that hosts sessions for this project offers a target you may start")
+    if cfg.pools:
+        # Account pools (account_pools.py): a pool is a target only where a member of it is one, in the order the
+        # project's rule leaves; which member a start gets is the hub's to decide then, by headroom.
+        from . import account_pools
+        # A member counts only if a spawn of it would pass the start's own checks for it (`_member_problem`, the
+        # one definition the choice uses), at the access it would get.
+        works = _pool_words_for(board, board.conn, caller, out["targets"], ceiling, _nodes(board), cfg)
+        out["pools"] = [p | {"access": [w for w in session_access.LEVELS
+                                        if any(w in works[a] for a in p["agents"])]}
+                        for p in account_pools.offered(board, caller.project, list(works), cfg)]
+        bad = account_pools.problems(board, cfg)
+        if bad:
+            out["pool_problems"] = bad
     out["may_spawn"] = not out["why_not"]
     return out
 
@@ -1279,22 +1398,35 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
     agent = agent if agent is not None else caller.agent
     if not isinstance(agent, str) or not NAME_RE.fullmatch(agent):
         raise Invalid("agent must be an agent name")
-    why = _target_ok(cfg, caller, agent, model)
-    if why:
-        raise Conflict(why)
+    from . import account_pools
+    pool = account_pools.pool_for(board, agent, cfg)    # a pool's name: its member is decided below, in this write
+    if pool is None:
+        why = _target_ok(cfg, caller, agent, model)
+        if why:
+            raise Conflict(why)
     ceiling = _ceiling(caller, g)
     if access is not None and not session_access.within(access, ceiling):
         raise Conflict(f"access {access} is above what you may give a child now ({ceiling}: the narrowest of the "
                        f"grant's {g['access']}" + (f" and your own {caller.ceiling}" if caller.ceiling else "") + ")")
     allowed = _nodes(board)
+    choice, at = None, None
+    if pool is not None:
+        where = hosted_tree._word(isolation, session_access.ISOLATIONS, "isolation", "shared")
+        at = board.now()    # the one moment the choice and the start judge every node's liveness by
+
+        def eligible(a: str, rt: str) -> tuple[str | None, str | None, str | None]:
+            node, effective, why = _member_problem(board, c, caller, a, rt, model=model, access=access,
+                                                   isolation=where, ceiling=ceiling, allowed=allowed, cfg=cfg, at=at)
+            return node, why, effective
+        choice = account_pools.choose(board, c, pool, caller.project, eligible, cfg)
+        agent = choice.agent
     _, runtime = hosted._agent(board, agent)
-    node = _node_for(board, caller, agent, runtime, allowed)
+    if choice is not None:
+        node, access = choice.node, choice.access   # what the choice checked, carried through the start
+    else:
+        node = _node_for(board, caller, agent, runtime, allowed)
     if access is None:
-        # The highest word within the ceiling that the node the child would run on can start it at; with none,
-        # the ceiling itself, which the node refuses with its reason.
-        offers = [w for w in hosted_tree._offers(c, node, agent, runtime) if session_access.within(w, ceiling)] \
-            if node else []
-        access = _highest(offers) or ceiling
+        access = _default_access(c, node, agent, runtime, ceiling)
     try:
         _check_limits(c, caller, cfg, board.now())
     except LimitReached as e:
@@ -1303,8 +1435,10 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
     if caller.kind == "interactive" and caller.id is None:
         root = _make_iroot_in(c, p.name, caller.project, now)
         caller.id, caller.root, caller.record = root["session_id"], root["session_id"], root
-    text = render_task(_who(caller), task, _spawn_line(c, board, caller, agent, model, caller.depth + 1, cfg,
-                                                       node=node, access=access, ceiling=ceiling, allowed=allowed))
+    pools: list = []
+    text = _frame(_who(caller), task, _spawn_line(c, board, caller, agent, model, caller.depth + 1, cfg, node=node,
+                                                  access=access, ceiling=ceiling, allowed=allowed,
+                                                  pools_out=pools if cfg.pools else None), pools)
     spawned_by = {"kind": caller.kind, "session": caller.id, "agent": p.name}
 
     def final(c2) -> None:
@@ -1339,7 +1473,9 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
         isolation=isolation, access=access, request_id=rid, allowed=allowed, spawn=cfg, kind="task",
         spawned_by=spawned_by, ceiling=ceiling, interactive=caller.kind == "interactive", hook=hook, tx=c,
         check=final, allowance={"may_spawn": True,
-                                "share": _allowance(caller.record)["share"] if caller.kind == "hosted" else None})
+                                "share": _allowance(caller.record)["share"] if caller.kind == "hosted" else None},
+        pool=choice.record() if choice is not None else None,
+        **({"at": at, "placed": node if caller.kind == "interactive" else None} if choice is not None else {}))
     r, m = out["session"], out["message"]
     return {"child": _child_view(c, r, caller.id), "created": out["created"],
             "message": {"n": m["n"], "state": m["state"]} if isinstance(m, dict) else None, "notice": NOTICE}
@@ -1604,16 +1740,53 @@ def _desc(caller_kind: str, caller_id: str, agent: str, name: Any = None) -> str
     return f"session {caller_id} ({agent}" + (f", child {name}" if name else "") + ")"
 
 
-def _audit_spawn(caller: Caller, r: dict) -> str:
+def _audit_spawn(caller: Caller, r: dict) -> str | dict:
+    """The spawn's audit entry for the tree's queue: main's line (`base`, with the title and its untrusted marker),
+    and, for a child asked for by a pool's name, the hub's own words of how it was chosen kept APART from it
+    ({"base", "pool", "pool_short"}: `_pool_words`), so nothing ever has to find hub text inside text an agent wrote.
+    `compose_audit` puts them together when the post is made, under the body limit in force then; the full reason
+    stays on the record for `board session show`. A child named directly: the line itself, as on main."""
     model = r.get("model") if isinstance(r.get("model"), str) and MODEL_RE.fullmatch(r["model"]) else None
     title = (f", titled {_quoted(r['title'])} (the title is that agent's own words: untrusted data)"
              if isinstance(r.get("title"), str) and r["title"] else "")
-    return (f"Automatic audit (posted by the board server; not a human click): "
+    head = (f"Automatic audit (posted by the board server; not a human click): "
             f"{_desc(caller.kind, caller.id, caller.agent, (caller.record or {}).get('name'))} started child session "
             f"{r.get('name')} (id {r['session_id']}, agent {r.get('agent')}" + (f", model {model}" if model else "")
             + f", access {r.get('access')}, isolation {r.get('isolation')}, on node {r.get('node')}, depth "
-            f"{r.get('depth')} under parent {r.get('parent')} in tree {r.get('root')}){title}. The task is not copied "
-            f"here; `board session show {r['session_id']}` shows the session.")
+            f"{r.get('depth')} under parent {r.get('parent')} in tree {r.get('root')}){title}.")
+    tail = f" The task is not copied here; `board session show {r['session_id']}` shows the session."
+    words = _pool_words(r)
+    return head + tail if words is None else {"base": head + tail, "pool": words[0], "pool_short": words[1]}
+
+
+def _pool_words(r: dict) -> tuple[str, str] | None:
+    """How a child's agent was chosen from a pool (account_pools.py), for its audit entry: (the hub's summary, bounded:
+    a few words and counts, never the members' reasons; a fixed shorter form, the pool's name only), or None for a
+    child named directly. The hub's own words from its settings, its agents and what nodes reported (advisory
+    usage), never an agent's text."""
+    pool = r.get("pool") if isinstance(r.get("pool"), dict) else None
+    if pool is None:
+        return None
+    name = pool.get("name") if isinstance(pool.get("name"), str) and NAME_RE.fullmatch(pool["name"]) else "(unknown)"
+    summary = pool.get("summary") if isinstance(pool.get("summary"), str) else ""
+    summary = summary[:200]
+    return (f" Its agent was asked for as pool {name} and chosen by the hub ({summary or 'see show'}); `board session "
+            "show` gives the full reason. (Usage is what nodes reported and is advisory; the board cannot verify which "
+            "subscription a process used.)",
+            f" Its agent was chosen by the hub from pool {name} (`board session show` says why).")
+
+
+def compose_audit(entry: Any, limit: int | None) -> str:
+    """The body of a queued audit entry, under `limit` (the board's body_max_bytes in force when it is posted): a
+    plain line as it is (main's); an entry with pool words: its base followed by the pool words if that fits, else
+    by their fixed shorter form if that fits, else the base alone. The base is never edited."""
+    if not isinstance(entry, dict):
+        return entry
+    base = entry.get("base") if isinstance(entry.get("base"), str) else ""
+    for words in (entry.get("pool"), entry.get("pool_short")):
+        if isinstance(words, str) and (limit is None or len((base + words).encode()) <= limit):
+            return base + words
+    return base
 
 
 HOW = {"caller": "closed by the session that started it", "human": "closed by the human",
@@ -1774,7 +1947,8 @@ def _post_audit(board: Board, human: Principal, root: str, thread: int) -> bool:
         _put(board.conn, TREE_PREFIX + root, cur, HUB, now)
 
     try:
-        human_actions.post_as_human(board, human, thread_id=thread, type="status", to=[], body=line,
+        human_actions.post_as_human(board, human, thread_id=thread, type="status", to=[],
+                                    body=compose_audit(line, board.s.body_max_bytes),   # the limit in force now
                                     needs_response=False, post_check=still, post_hook=hook)
     except Conflict as e:
         if e.message == "posted meanwhile":

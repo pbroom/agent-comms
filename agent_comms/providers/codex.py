@@ -32,6 +32,18 @@ Restart (measured on codex-cli 0.171.0, DESIGN_NOTES "Restarting a running turn"
   success and the turn that ended is the one it named (R5-01): Codex ends a turn `interrupted` for other causes too,
   and a rejected or unanswered request interrupted nothing. `turn/steer` was measured too (DESIGN_NOTES) but is not
   used: no adapter steers yet (R6).
+Plan usage (account_pools.py; from the protocol schema codex-cli 0.171.0 generates, `codex app-server
+generate-json-schema`, and checked against lines recorded from real hosted sessions on 2026-11-22/23,
+tests/fixtures/rate_limit_samples.jsonl: `limitId` "codex", `primary` a 10080-minute window, `secondary` null:
+DESIGN_NOTES "Account pools"). `primary` and `secondary` may each be null:
+- The server notification `account/rateLimits/updated` (`{"rateLimits": {...}}`, a sparse rolling update to merge
+  into the last one; no `threadId`: it is the account's): `primary` and `secondary` windows, each `usedPercent`
+  (0-100), `resetsAt` (epoch seconds) and `windowDurationMins`; `limitId` names the bucket; `rateLimitReachedType`
+  says a limit is reached. It is not among the notifications this client opts out of. `account/rateLimits/read`
+  would ask for the same; this adapter makes no such request. Each window it carries is one observation (the host
+  merges them, each keeping its own time); its percentage, however high, is only a percentage.
+- A turn that fails on the plan's limit: `turn/completed` with `turn.error.codexErrorInfo` `usageLimitExceeded`. This,
+  and nothing else (not `rateLimitReachedType`, not 100%), marks the account exhausted (the owner's ruling).
 """
 from __future__ import annotations
 
@@ -39,7 +51,7 @@ import json
 import os
 import re
 
-from . import Event, cap_reply, validate_model, validate_session_id
+from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
 
 THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -225,6 +237,20 @@ def _name(value) -> str:
     return value if isinstance(value, str) and NAME_RE.fullmatch(value) else "unknown"
 
 
+def _window_key(limit_id: str, slot: str) -> str:
+    """A rate-limit window's identity (DESIGN_NOTES "Account pools", the usage record's rules): its bucket
+    (`limitId`, as a plain word; `codex` when none) and its slot (primary, secondary). Its length is how it is shown
+    (`_window_label`), never part of what it is: an update that leaves the length out is the same window."""
+    bucket = re.sub(r"[^a-z0-9_]", "_", limit_id.lower())[:24] if limit_id else "codex"
+    return f"{bucket}_{slot}"
+
+
+def _window_label(minutes: float | None) -> str | None:
+    """How a window is shown: by its length (five_hour, seven_day, else <minutes>_min), or nothing."""
+    known = {300.0: "five_hour", 10080.0: "seven_day"}
+    return known.get(minutes) or (f"{int(minutes)}_min" if minutes is not None and 0 < minutes < 1e7 else None)
+
+
 def _error_text(error) -> str:
     """A JSON-RPC error's or a turn error's message as one short line."""
     message = error.get("message") if isinstance(error, dict) else None
@@ -248,6 +274,7 @@ class CodexSession:
         self._start_id: int | None = None       # the id of the turn/start request of the turn in flight
         self._access: str | None = None         # the access word whose sandbox the host decided on (`configure`)
         self._effort: str | None = None
+        self._limits: dict[str, dict] = {}      # window -> its last observation (`_rate_limits`), for `_exhausted`
         self._reset()
 
     def _reset(self) -> None:
@@ -464,6 +491,8 @@ class CodexSession:
         return [], [_line({"id": rid, "error": {"code": -32601, "message": NO_SURFACE}})]
 
     def _notified(self, method: str, params: dict) -> tuple[list[Event], list[bytes]]:
+        if method == "account/rateLimits/updated":     # the account's, not a thread's (module text): advisory
+            return self._rate_limits(params.get("rateLimits")), []
         # Only this session's thread. A sub-agent's thread reports its own turns and answers on this connection.
         if not self._ready or params.get("threadId") != self.thread_id:
             return [], []
@@ -494,8 +523,51 @@ class CodexSession:
                 return [], []
             if self._turn_id is not None and turn.get("id") != self._turn_id:
                 return [], []
-            return [self._ended(turn)], []
+            ended = self._ended(turn)
+            if ended.meta.get("error_info") == "usageLimitExceeded":
+                # The one thing that marks the account exhausted (the owner's ruling): a turn that failed on it.
+                return [Event("usage", usage=[self._exhausted()]), ended], []
+            return [ended], []
         return [], []
+
+    def _rate_limits(self, snap) -> list[Event]:
+        """One `account/rateLimits/updated`: an observation for each window it carries (a sparse update; a window it
+        leaves out, or gives as null, is not touched, and keeps its own time where it is kept: the host). A high
+        `usedPercent`, or `rateLimitReachedType`, is a high usage, never an exhausted mark. It cannot raise
+        (account_pools.py, rule (b))."""
+        try:
+            if not isinstance(snap, dict):
+                return []
+            lid = snap.get("limitId") if isinstance(snap.get("limitId"), str) else ""
+            out = []
+            for slot in ("primary", "secondary"):
+                win = snap.get(slot)
+                # A number is a reading, an explicit null the provider's clear; omitted or malformed is no information.
+                if not isinstance(win, dict) or "usedPercent" not in win:
+                    continue
+                raw = win["usedPercent"]
+                if raw is not None and number(raw) is None:
+                    continue
+                key = _window_key(lid, slot)
+                rec = usage_record(key, number(raw), number(win.get("resetsAt")),
+                                   label=_window_label(number(win.get("windowDurationMins"))))
+                if rec is None:
+                    continue        # malformed: dropped, never replacing what was seen of that window
+                if len(self._limits) < 20 or key in self._limits:
+                    self._limits[key] = rec         # for the reset of a later exhausted mark
+                out.append(rec)
+            return [Event("usage", usage=out)] if out else []
+        except Exception:
+            return []
+
+    def _exhausted(self) -> dict | None:
+        """The FAILED_TURN mark of a turn that failed on the limit, with the reset of a window this process last saw
+        at 100% or more (the hub counts it until then only if that is after the mark was seen, else for the
+        cool-down)."""
+        full = [r for r in self._limits.values() if (r["percent"] or 0) >= 100 and r["resets_at"] is not None]
+        last = max(full, key=lambda r: r["resets_at"], default=None)
+        return usage_record(FAILED_TURN, None, last["resets_at"] if last else None, True,
+                            label=(last["label"] or last["window"]) if last else None)
 
     def _between_turns(self, method: str, params: dict) -> None:
         """This thread, with no message's turn in flight: Codex may begin a turn by itself (it goes on with a goal,

@@ -14,6 +14,8 @@ What a turn does is in its text:
 - `crash ...`: the process exits (code 3) at once, before anything of the turn is written.
 - `deny ...`: the result lists a refused Write (the turn itself succeeds, as Claude's does).
 - `big ...`: the reply is 40 KB.
+- `usage N ...`: before its result the turn writes a `rate_limit_event` saying the account's five-hour window is at
+  N percent (`rejected` at 100 or more), as Claude Code's SDK schema describes it.
 - `write NAME`: the turn tries to create the file NAME in its working directory with the Write tool.
 - `touch NAME`: the turn tries to run `touch NAME` with the Bash tool.
 - `try A B`: both, one after the other: Write A, then `touch B`.
@@ -355,6 +357,15 @@ def main() -> None:
             steered, stdin.queued = stdin.queued, []
             for m in steered:
                 stdin.lifecycle(m, "started")
+        usage = re.match(r"usage (\d+(?:\.\d+)?)\b", text)
+        if usage:
+            # The account's plan usage, as Claude Code 2.1.330's `rate_limit_event` carries it (DESIGN_NOTES "Account
+            # pools"): the five-hour window at N percent, resetting in an hour; `rejected` at 100 or more.
+            pct = float(usage.group(1))
+            emit({"type": "rate_limit_event", "session_id": sid, "uuid": f"rl-{turn}", "rate_limit_info": {
+                "status": "rejected" if pct >= 100 else "allowed_warning" if pct >= 75 else "allowed",
+                "resetsAt": int(time.time()) + 3600, "rateLimitType": "five_hour", "utilization": pct / 100,
+                "unifiedWindows": {"five_hour": {"utilization": pct / 100, "resetsAt": int(time.time()) + 3600}}}})
         failed = text.startswith("fail")
         reply = "x" * 40_000 if text.startswith("big") else f"turn {turn}: {text.upper()}"
         reply += "".join("; STEERED: " + m["message"]["content"].upper() for m in steered)

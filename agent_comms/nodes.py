@@ -94,7 +94,7 @@ def _access_levels() -> tuple[str, ...]:
 
 def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurrent: Any,
           headless_browser: Any = None, checkout_roots: Any = None, access: Any = None,
-          sessions: Any = None, session_host: Any = None, homes: Any = None) -> dict:
+          sessions: Any = None, session_host: Any = None, homes: Any = None, usage: Any = None) -> dict:
     """A node's heartbeat: what it can run now. Returns the hub's time and the node's view of itself.
     `headless_browser`: the runner keys (a subset of `runners`) the node can give a scoped headless browser.
     `checkout_roots`: the node's own `[dispatch] checkout_roots`; it runs any Git checkout it finds inside them.
@@ -105,7 +105,10 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
     (session_access.LEVELS). Optionally `dirs`: {key: directory} for a runner that can be a session in that one
     directory only. A node that does not say so gets no child sessions.
     `homes`: runner key (one the node offers) -> the account folder that runner's processes use there
-    ([dispatch.runner_homes], agent_accounts.py): a path, for the human's view only. The hub never acts on it."""
+    ([dispatch.runner_homes], agent_accounts.py): a path, for the human's view only. The hub never acts on it.
+    `usage`: runner key -> each window's latest plan usage its hosted sessions saw (account_pools.clean_report), sent
+    only after this hub's answer asked for it (`report_usage`, while it has account pools). Advisory: it orders a
+    pool's eligible members and decides nothing else; what cannot be used is dropped, never a refusal."""
     _require_node(board, p)
     projects = _strings(projects, "projects", lambda v: v.startswith("/"))
     runners = _strings(runners, "runners", lambda v: _NAME.fullmatch(v) is not None)
@@ -157,6 +160,12 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
             k not in runners or not isinstance(v, str) or not v.startswith("/") or len(v) > 1024
             or any(ord(ch) < 32 or ord(ch) == 127 for ch in v) for k, v in homes.items())):
         raise Invalid("homes maps runner keys the node offers to the account folder (an absolute path) each uses")
+    from . import account_pools
+    # Usage is advisory (account_pools.py, rule (b)): what cannot be used is dropped, never a refusal of the hello, and
+    # nothing is kept while the hub has no pools.
+    spawn = account_pools._spawn(board)     # one reading of the hub's pools and pool_headroom for this hello
+    pooled = account_pools.configured(board, spawn)
+    usage = account_pools.clean_report(usage, runners) if pooled else {}
     now = board.now()
     info = {"projects": [x.rstrip("/") or "/" for x in projects], "runners": runners,
             "headless_browser": headless, "checkout_roots": [x.rstrip("/") for x in roots], "access": held,
@@ -169,6 +178,11 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         info["homes"] = dict(homes)
     with db.write_tx(board.conn) as c:
         _put(c, NODE_PREFIX + p.name, info, p.name, now)
+        if pooled:      # every hello while pools are configured: what it carries kept, the record pruned
+            try:
+                account_pools.store_usage(c, p.name, usage, runners, now, spawn.pool_headroom)
+            except Exception:
+                account_pools._once("the hub could not keep a node's usage report; it is advisory and was dropped")
         # A node that does not (or no longer) host child sessions is listed none, so it can never report on one
         # or end it; one that no longer speaks the level a child there needs must not run it: the hub ends those it
         # had there, in this transaction (hosted_tree.end_orphans, which ends nothing for a node that is as it was).
@@ -178,7 +192,8 @@ def hello(board: Board, p: Principal, projects: Any, runners: Any, max_concurren
         c.execute("""DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ?
                      AND json_valid(value) AND json_extract(value, '$.state') = 'ended'""",
                   (RUN_PREFIX, RUN_PREFIX[:-1] + chr(ord(RUN_PREFIX[-1]) + 1), now - 86400))
-    return {"node": p.name, "hub_time": now, **info}
+    # Only a hub with account pools asks for usage (`report_usage`): without them the answer is what it always was.
+    return {"node": p.name, "hub_time": now, **info} | ({"report_usage": True} if pooled else {})
 
 
 def nodes(board: Board) -> list[dict]:
@@ -229,14 +244,16 @@ def runner_key(info: dict, agent: str, runtime: str | None) -> str | None:
 
 def node_for(board: Board, project: str, agent: str, runtime: str | None,
              allowed: dict[str, dict] | None = None, *, headless_browser: bool = False,
-             room: bool = True, browser_origins: list[str] | None = None, sessions: bool = False) -> str | None:
+             room: bool = True, browser_origins: list[str] | None = None, sessions: bool = False,
+             at: float | None = None) -> str | None:
     """The live node that offers this project and a runner for this agent (its name, else its runtime), that the hub
     allows to take both (`allowed`: [dispatch.nodes]), and that has room; the most recently seen first. With
     `headless_browser`, only a node that offers a scoped headless browser for that runner. With `room=False`, a full
     node counts too. With `browser_origins`, only a node whose runner for this agent declares a signed-in browser for
     each of them (access.py) and whose hub grant lists that access too. With `sessions`, only a node that hosts
-    sessions (hosted.py)."""
-    now = board.now()
+    sessions (hosted.py). `at`: the moment liveness is judged at (default: now), so that a choice and the start it
+    makes judge one node by one moment (account_pools.py)."""
+    now = board.now() if at is None else at
     project = project.rstrip("/") or "/"
     keys = {agent} | ({runtime} if runtime else set())
     for info in sorted(nodes(board), key=lambda i: -float(i.get("last_seen") or 0)):

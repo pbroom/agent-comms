@@ -25,7 +25,8 @@ true`; with it off no child can be created and nothing else changes.
   returns the child it made the first time.
 - *Accounts.* An agent the hub's `[dispatch.agent_projects]` lists is started as a child only in a project listed
   for it (agent_accounts.py): in `_target`, so neither capabilities nor the spawn frame offer it elsewhere, and
-  again inside `create_child`'s transaction.
+  again inside `create_child`'s transaction. A child asked for by an account pool's name (account_pools.py) is
+  that pool's member chosen in the transaction that makes it (`start_child`; the spawn tool's own), and keeps `pool`.
 - *Not for children.* "One session per (agent, project)" (roots only), board wakes (hosted_wake.py: a child has no
   watcher record) and a project's busy directory when the child has its own worktree.
 - *Ending.* A parent that ends or is closed takes its whole subtree with it, every level marked in that one
@@ -299,7 +300,8 @@ def end_orphans(c, node: str, by: str, now: float, results: bool = False) -> Non
             _put(c, hosted.SESSION_PREFIX + r["session_id"], r, by, now)
 
 
-def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[str, dict] | None) -> None:
+def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[str, dict] | None,
+            at: float | None = None) -> None:
     """The child's agent on the PARENT'S node: the hub's grant for that node must cover the project and the agent
     (as for a root), and the node must be connected as a session host with a runner for the agent, speak the
     child-session protocol NOW (its latest hello), and be able to start a child session from that runner at all
@@ -313,7 +315,7 @@ def _target(board: Board, parent: dict, agent: str, runtime: str, allowed: dict[
             or (agent not in grant.get("agents", []) and runtime not in grant.get("agents", []))):
         raise Conflict(f"node {node} may not run {agent} in {project}: a child session runs on its parent's node, "
                        f"and the hub's [dispatch.nodes.{node}] must list the project and the agent or its runtime")
-    if nodes.node_for(board, project, agent, runtime, {node: grant}, room=False, sessions=True) != node:
+    if nodes.node_for(board, project, agent, runtime, {node: grant}, room=False, sessions=True, at=at) != node:
         raise Conflict(f"node {node}, which hosts the parent session, is not connected as a session host with a "
                        f"runner for {agent} (a child session runs on its parent's node)")
     if not node_supports(board.conn, node):
@@ -347,16 +349,16 @@ def _max_live(conn, node: str) -> int:
 
 
 def place_interactive(board: Board, project: str, agent: str, runtime: str | None,
-                      allowed: dict[str, dict] | None) -> str | None:
+                      allowed: dict[str, dict] | None, at: float | None = None) -> str | None:
     """The node a child of an interactive session runs on: a live one the hub allows the project and the agent,
     that hosts sessions, has a runner for the agent it can start a child from, and speaks the spawn protocol. The
-    most recently seen first."""
+    most recently seen first. `at`: the moment liveness is judged at (nodes.node_for)."""
     allowed = allowed or {}
     for info in sorted(nodes.nodes(board), key=lambda i: -float(i.get("last_seen") or 0)):
         name = info["node"]
         grant = allowed.get(name)
         if (isinstance(grant, dict) and nodes.node_for(board, project, agent, runtime, {name: grant}, room=False,
-                                                       sessions=True) == name
+                                                       sessions=True, at=at) == name
                 and node_spawns(board.conn, name) and _offers(board.conn, name, agent, runtime)):
             return name
     return None
@@ -421,6 +423,109 @@ def placement_problem(board: Board, conn, parent: dict, agent: str, runtime: str
     return None
 
 
+# ---------------------------------------------------------------- one child's own checks (create_child's, in its order)
+#
+# `create_child` makes these checks for the agent it starts, and `member_problem` makes the very same ones for each
+# member of an account pool (account_pools.choose): one definition of "this agent can be started here, at this
+# access", so a member the choice passes is one the creation accepts, and one it would refuse is passed over with
+# the reason the creation would give.
+
+
+def _place_child(board: Board, parent: dict, agent: str, runtime: str | None, allowed: dict[str, dict] | None,
+                 interactive: bool, spawned: bool, at: float | None = None, node: str | None = None) -> dict:
+    """Before the write: the opt-in list (its reason beats placement's), the node (an interactive root's child is
+    placed on one of its own: `node` when the caller placed it already, account_pools' choice), `_target`, and the
+    spawn protocol for an agent-started child. Returns the parent with that node. `at`: the one moment every node's
+    liveness is judged at (default: now)."""
+    from . import agent_accounts
+    agent_accounts.check(board, agent, parent["project"])   # the hub's opt-in list, before placement's reasons
+    if interactive:
+        node = node or place_interactive(board, parent["project"], agent, runtime, allowed, at)
+        if node is None:
+            raise Conflict(f"no connected node hosts child sessions for {agent} in {parent['project']}: it needs "
+                           "`board node` running (this version or later), [dispatch.sessions] enabled = true, a "
+                           "checkout of the project and a runner for the agent, and the hub's [dispatch.nodes.<name>] "
+                           "must list the project and the agent")
+        parent = parent | {"node": node}
+    _target(board, parent, agent, runtime, allowed, at)
+    if spawned and not node_spawns(board.conn, parent["node"]):
+        raise Conflict(f"node {parent['node']} runs a version of agent-comms from before agent-started child sessions "
+                       "(it would not give the child its binding, or stop a turn its starter cancels). Update it and "
+                       "start `board node` again")
+    return parent
+
+
+def _recheck(board: Board, c, parent: dict, agent: str, spawned: bool) -> None:
+    """In the write: the opt-in list again, the node's protocol on its latest hello as stored now (one rolled back
+    between the check before the transaction and here would otherwise be given the child: the hello's orphan sweep
+    ran before it), and the hold a session under a full-access child needs."""
+    from . import agent_accounts
+    agent_accounts.check(board, agent, parent["project"])   # ... and in the write that makes the child
+    if not node_supports(c, parent["node"]) or (spawned and not node_spawns(c, parent["node"])):
+        raise Conflict(f"node {parent['node']} no longer speaks the child-session protocol this session needs (its "
+                       "latest hello came while the session was being started). Update it and start `board node` "
+                       "again")
+    _holds_for(c, parent)
+
+
+def _admit(c, parent: dict, agent: str, runtime: str | None, access: str | None, isolation: str,
+           ceiling: str | None, interactive: bool) -> str:
+    """In the write: the child's EFFECTIVE access (the word asked, else the most its parent and `ceiling` allow) and
+    whether its node admits it there: within the parent's, within what the parent's process confirmed, a full child
+    on a node with room for its parent beside it, a runner held to its own directory (`_fits`), and the word on offer
+    for that runner. Returns the access."""
+    pid = parent.get("session_id")
+    limit = ceiling if interactive else parent.get("access")
+    if limit not in session_access.LEVELS:
+        raise Conflict(f"the access level of session {pid} is not known yet: its node reports it once it has "
+                       "opened the session (a node from before child sessions never does). Try again in a moment")
+    if ceiling in session_access.LEVELS:
+        limit = min(limit, ceiling, key=lambda w: session_access.RANK[w])
+    access = access or limit
+    if not session_access.within(access, limit):
+        raise Conflict(f"access {access} is above the parent's ({limit}): a child session never gets more access "
+                       "than its parent")
+    if not interactive and not session_access.within(access, _limit(parent)):
+        # The parent was STARTED as full; whether its CLI took that is known once its process says so.
+        raise Conflict(f"session {pid} was started as a full-access session, but its process has not confirmed "
+                       f"that (it has no process now, or one that has not said so yet), so a child can have at "
+                       f"most {_limit(parent)} under it now. Its node confirms it when the session's next turn "
+                       "starts: send it a message and try again, or give a narrower --access")
+    if access == "full" and not interactive and _max_live(c, parent["node"]) < 2:
+        # A full child takes turns only while its parent's process is up beside its own.
+        raise Conflict(f"node {parent['node']} runs at most {_max_live(c, parent['node'])} session process at a "
+                       "time ([dispatch.sessions] max_live there): a full-access child needs its parent's "
+                       "process up beside its own, so max_live must be at least 2. Raise it, or give a "
+                       "narrower --access")
+    _fits(c, parent, agent, runtime, isolation)
+    offered = _offers(c, parent["node"], agent, runtime)
+    if access not in offered:
+        # What the node itself says it can start from that runner: `full` only where it allows full access, not
+        # `workspace` from a Claude runner that bypasses, and so on. Refused here, not made and then ended.
+        raise Conflict(f"node {parent['node']} cannot start a session of {agent} at {access} access (it can at: "
+                       f"{', '.join(offered) or 'none'}). `full` needs [dispatch.sessions] allow_full_access = "
+                       "true on the node")
+    return access
+
+
+def member_problem(board: Board, conn, parent: dict, agent: str, runtime: str | None, *, access: str | None,
+                   isolation: str, allowed: dict[str, dict] | None, ceiling: str | None = None,
+                   interactive: bool = False, spawned: bool = False,
+                   at: float | None = None) -> tuple[str | None, str | None, str | None]:
+    """(the node, the effective access, None) when `create_child` would accept a child of `agent` under `parent` as
+    asked (`access` and `isolation` already valid words; `access` None: its default), else (None, None, why not):
+    exactly its own checks for the agent (`_place_child`, `_recheck`, `_admit`), in its order, on `conn`, every node
+    judged live at `at`. A caller that creates the child after it passes that node, access and `at` to
+    `create_child`, so the creation judges what the choice judged."""
+    try:
+        placed = _place_child(board, parent, agent, runtime, allowed, interactive, spawned, at)
+        _recheck(board, conn, placed, agent, spawned)
+        effective = _admit(conn, placed, agent, runtime, access, isolation, ceiling, interactive)
+    except Conflict as e:
+        return None, None, e.message
+    return placed["node"], effective, None
+
+
 def _offers(conn, node: str, agent: str, runtime: str | None) -> list[str]:
     """The access words the node's latest hello says a child session of this agent's runner can be started at."""
     info = _get(conn, nodes.NODE_PREFIX + node)
@@ -441,7 +546,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
                  effort: Any = None, title: Any = None, role: Any = None, isolation: Any = None, access: Any = None,
                  request_id: Any = None, allowed: dict[str, dict] | None = None, spawn: Any = None,
                  kind: str = "user", spawned_by: dict | None = None, ceiling: str | None = None,
-                 interactive: bool = False, check=None, hook=None, tx=None, allowance: dict | None = None) -> dict:
+                 interactive: bool = False, check=None, hook=None, tx=None, allowance: dict | None = None,
+                 pool: dict | None = None, at: float | None = None, placed: str | None = None) -> dict:
     """Start a session under `parent_id` with its first message. Returns {"session": its record, "message": its
     first message's record, "created": False when (parent, request_id) had made it already}. `by` is recorded as
     who created it; whether `by` MAY is the caller's to have decided (see the module text). `agent`: default the
@@ -454,7 +560,9 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
     limits, its counters and its audit queue). Depth: a child's is its parent's plus one, at most
     [dispatch.sessions.spawn] max_depth, and its root is its parent's root. `tx`: a write transaction of the
     caller's own (on `board.conn`), in which all of this then runs, reads included (hosted_spawn.spawn decides a
-    spawn in one)."""
+    spawn in one). `pool`: how `agent` was chosen from a pool (account_pools.Choice.record, decided by the caller in
+    `tx`), kept on the child's record. `at` and `placed`: the moment and the node (an interactive child's) that
+    choice judged the agent by, so that this start judges the same (hosted_tree.member_problem)."""
     spawn = spawn if spawn is not None else spawn_config(board)
     if not spawn.enabled:
         raise Conflict(OFF)
@@ -472,22 +580,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
     if done is not None:
         return done
     agent, runtime = hosted._agent(board, agent if agent is not None else parent.get("agent"))
-    from . import agent_accounts
-    agent_accounts.check(board, agent, parent["project"])   # the hub's opt-in list, before placement's reasons
-    node = None
-    if interactive:
-        node = place_interactive(board, parent["project"], agent, runtime, allowed)
-        if node is None:
-            raise Conflict(f"no connected node hosts child sessions for {agent} in {parent['project']}: it needs "
-                           "`board node` running (this version or later), [dispatch.sessions] enabled = true, a "
-                           "checkout of the project and a runner for the agent, and the hub's [dispatch.nodes.<name>] "
-                           "must list the project and the agent")
-        parent = parent | {"node": node}
-    _target(board, parent, agent, runtime, allowed)
-    if spawned_by is not None and not node_spawns(board.conn, parent["node"]):
-        raise Conflict(f"node {parent['node']} runs a version of agent-comms from before agent-started child sessions "
-                       "(it would not give the child its binding, or stop a turn its starter cancels). Update it and "
-                       "start `board node` again")
+    parent = _place_child(board, parent, agent, runtime, allowed, interactive, spawned_by is not None, at, placed)
+    node = parent["node"] if interactive else None
     with (contextlib.nullcontext(tx) if tx is not None else db.write_tx(board.conn)) as c:
         now = board.now()       # read under the write lock
         parent = _parent(c, parent_id, interactive) | ({"node": node} if interactive else {})
@@ -499,14 +593,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
             raise Conflict(f"session {pid} has ended: nothing can be started under it")
         if parent.get("stop"):
             raise Conflict(f"session {pid} is being closed: nothing can be started under it")
-        agent_accounts.check(board, agent, parent["project"])   # ... and in the write that makes the child
-        # The node's protocol again, on its latest hello as stored now: one rolled back between the check before
-        # this transaction and here would otherwise be given the child (the hello's orphan sweep ran before it).
-        if not node_supports(c, parent["node"]) or (spawned_by is not None and not node_spawns(c, parent["node"])):
-            raise Conflict(f"node {parent['node']} no longer speaks the child-session protocol this session needs (its "
-                           "latest hello came while the session was being started). Update it and start `board node` "
-                           "again")
-        _holds_for(c, parent)
+        _recheck(board, c, parent, agent, spawned_by is not None)
         depth = 0 if interactive else int(parent.get("depth") or (1 if is_child(parent) else 0))
         if depth + 1 > spawn.max_depth:
             if spawn.max_depth == 1:
@@ -514,36 +601,7 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
                                f"one level deep). Start it under its parent, {parent['parent']}")
             raise Conflict(f"depth limit: session {pid} is at depth {depth}, and [dispatch.sessions.spawn] "
                            f"max_depth is {spawn.max_depth}")
-        limit = ceiling if interactive else parent.get("access")
-        if limit not in session_access.LEVELS:
-            raise Conflict(f"the access level of session {pid} is not known yet: its node reports it once it has "
-                           "opened the session (a node from before child sessions never does). Try again in a moment")
-        if ceiling in session_access.LEVELS:
-            limit = min(limit, ceiling, key=lambda w: session_access.RANK[w])
-        access = access or limit
-        if not session_access.within(access, limit):
-            raise Conflict(f"access {access} is above the parent's ({limit}): a child session never gets more access "
-                           "than its parent")
-        if not interactive and not session_access.within(access, _limit(parent)):
-            # The parent was STARTED as full; whether its CLI took that is known once its process says so.
-            raise Conflict(f"session {pid} was started as a full-access session, but its process has not confirmed "
-                           f"that (it has no process now, or one that has not said so yet), so a child can have at "
-                           f"most {_limit(parent)} under it now. Its node confirms it when the session's next turn "
-                           "starts: send it a message and try again, or give a narrower --access")
-        if access == "full" and not interactive and _max_live(c, parent["node"]) < 2:
-            # A full child takes turns only while its parent's process is up beside its own.
-            raise Conflict(f"node {parent['node']} runs at most {_max_live(c, parent['node'])} session process at a "
-                           "time ([dispatch.sessions] max_live there): a full-access child needs its parent's "
-                           "process up beside its own, so max_live must be at least 2. Raise it, or give a "
-                           "narrower --access")
-        _fits(c, parent, agent, runtime, isolation)
-        offered = _offers(c, parent["node"], agent, runtime)
-        if access not in offered:
-            # What the node itself says it can start from that runner: `full` only where it allows full access, not
-            # `workspace` from a Claude runner that bypasses, and so on. Refused here, not made and then ended.
-            raise Conflict(f"node {parent['node']} cannot start a session of {agent} at {access} access (it can at: "
-                           f"{', '.join(offered) or 'none'}). `full` needs [dispatch.sessions] allow_full_access = "
-                           "true on the node")
+        access = _admit(c, parent, agent, runtime, access, isolation, ceiling, interactive)
         if check is not None:
             # The caller's checks (hosted_spawn: the grant and its limits, whose refusal raises the budget's Needs-you
             # item) before the per-parent cap below, so that a cap reached at the same time never hides a limit.
@@ -566,6 +624,8 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
              "isolation": isolation, "access": access, "effort": effort, "request_id": request_id}
         if interactive:
             r["parent_kind"] = "interactive"
+        if pool is not None:
+            r["pool"] = dict(pool)
         if spawned_by is not None:
             # What it may start itself: on, and (`allowance`, the spawn tool's) no share above its starter's own.
             r |= {"spawned_by": dict(spawned_by), "allowance": dict(allowance or {"may_spawn": True, "share": None})}
@@ -585,7 +645,35 @@ def create_child(board: Board, by: str, parent_id: Any, text: Any, *, agent: Any
 def start_child(board: Board, p: Principal, parent_id: Any, text: Any, **kw) -> dict:
     """The human starts a session under one of theirs (`board session start --parent`)."""
     hosted._human(board, p, "start a child session")
-    out = create_child(board, p.name, parent_id, text, **kw)
+    from . import account_pools
+    if not account_pools.maybe_pool(board, kw.get("agent")):
+        out = create_child(board, p.name, parent_id, text, **kw)    # an agent (or none): main's path, untouched
+    else:
+        # Perhaps a pool's name (account_pools.py): recognised and decided in the write that makes the child, on ONE
+        # reading of the settings taken there, and create_child runs in that write too. Each member is held to
+        # create_child's own checks (`member_problem`), at the access it would really get.
+        with db.write_tx(board.conn) as c:
+            spawn = spawn_config(board)
+            kw = kw | {"tx": c, "spawn": spawn}
+            pool = account_pools.pool_for(board, kw.get("agent"), spawn) if spawn.enabled else None
+            parent = hosted._session(c, parent_id) if pool is not None else None
+            done = _existing(c, parent["session_id"], _request_id(kw.get("request_id"))) if parent else None
+            if pool is not None and done is None:
+                try:
+                    access = session_access.level(kw.get("access"))
+                except ValueError as e:
+                    raise Invalid(str(e)) from None
+                isolation = _word(kw.get("isolation"), session_access.ISOLATIONS, "isolation", "shared")
+
+                at = board.now()    # the one moment the choice and the start judge the node's liveness by
+
+                def eligible(a: str, rt: str) -> tuple[str | None, str | None, str | None]:
+                    node, effective, why = member_problem(board, c, parent, a, rt, access=access,
+                                                          isolation=isolation, allowed=kw.get("allowed"), at=at)
+                    return node, why, effective
+                choice = account_pools.choose(board, c, pool, parent["project"], eligible, spawn)
+                kw = kw | {"agent": choice.agent, "pool": choice.record(), "at": at}
+            out = done or create_child(board, p.name, parent_id, text, **kw)
     return {"session": hosted._human_view(board, out["session"]),
             "message": hosted._msg_view(out["message"]) if out["message"] is not None else None,
             "created": out["created"]}

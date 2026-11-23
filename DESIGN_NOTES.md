@@ -6933,6 +6933,184 @@ generated browser output directory, both true.
 - Mutation check after round 7: 97 of 98 applied mutants caught (97 single mutations and the reservation-order one;
   the sweep's retired with it); the one not caught is round 6's equivalent guard.
 
+## Account pools (2026-11-23)
+
+The owner has two Claude subscriptions on one Mac as two board agents (`claude-work`, `claude-code`: "Agent
+accounts" above). His decision: the work account first, the personal one as overflow when work nears its limit, as a
+blanket; and per project, settings to prefer an account and overflow to the others, or to take only from one, or
+never from one. `account_pools.py` builds that.
+
+*Settings* (all on the HUB, under `[dispatch.sessions.spawn]`, validated by `SpawnConfig.from_dict` when the settings
+load, so a broken edit keeps the last good settings as any other): `pools` (name -> members in preference order; a
+member at most once per pool; a pool name never a member), `pool_rules` (project, normalized as
+`agent_accounts.project_id` -> `prefer`/`only`/`never`, each a list of names that must be members of some pool; a name
+in `never` and in `prefer` or `only` too loads, and `never` wins), `pool_headroom` (`skip_at_percent` 90,
+`stale_minutes` 60, `cooldown_minutes` 30). What only the board can say is checked at each start: the pool's name not
+an agent's (then the name is the agent, as on main: a configuration can never shadow an agent) and its active members
+of one runtime family (`problem`, the pool as a whole); a member that is not an active agent is that member's problem
+only, passed over with the reason after the rule has been applied.
+
+*Two rules, each kept in one place.* (a) ELIGIBLE has one definition: the creating path's own checks for that agent,
+and the choice calls them. The root start's are `hosted._root_problem` (the opt-in list, then `_place`). A child's are
+create_child's own, which it runs through three helpers (`_place_child` before the write: the opt-in list, an
+interactive child's node, `_target`, the spawn protocol; `_recheck` in it: the opt-in list, the node's protocol, the
+hold; `_admit` in it: the EFFECTIVE access, the word asked or else the most the parent and ceiling allow, held to the
+parent, to what its process confirmed, to a one-slot node for `full`, to `_fits` and to the node's offer), and
+`hosted_tree.member_problem` runs the same three, in that order, without raising. An agent's spawn adds its own
+before them (`hosted_spawn._member_problem`: the targets list, and the access the spawn would give,
+`_default_access`, which `_spawn_in` uses too). Capabilities and the spawn frame list a pool's members by that same
+function. So a member the choice passes is one the creation accepts, and one it would refuse is passed over with the
+reason it would give. (b) USAGE IS ADVISORY AND TOTAL: every usage value, wherever it is read (the adapters, the host's
+`note_usage`, the node's `usage_report`, the hub's `clean_report` on a hello and `_observations` on its own record), goes
+through `providers.clean_usage`, which cannot raise (`providers.number` turns an integer no float can hold, NaN and
+the infinities into nothing); what it cannot use is dropped and said once in the log, never a refusal of the hello
+(the API takes `usage` as any value), never an error of a turn or a session.
+
+*Where each decision is made.* A name that is an agent's (or none) takes main's path untouched. Otherwise, while pools
+are configured (`maybe_pool`), the creating path reads `[dispatch.sessions.spawn]` ONCE inside its write and uses that
+one reading to recognise the pool (`pool_for`) and to choose (`choose`); a name that is no pool on that reading is
+handled as on main (an unknown agent: 404), so a reload in between can never leave a half-recognised pool:
+- the human's `start` (hosted.py): per member `_root_problem`, in the same `write_tx` that then checks the opt-in list
+  again and makes the record. The one-root-per-(agent, project) rule runs after the choice, for the chosen member, as
+  for a named one: a refusal, never a reason to move to the next member (the owner's ruling), and it says which member
+  was chosen and why.
+- the human's `start --parent` (hosted_tree.start_child): the reading, a request id that made a child already
+  (returned first), the access and isolation words checked as create_child checks them, `member_problem` per member,
+  and `create_child` in that same transaction (`tx`, and that reading as `spawn`).
+- an agent's `board_session_spawn` (hosted_spawn._spawn_in, already one transaction on one reading, `cfg`): after the
+  caller, the request id, the gate, the grant, the allowance, the ceiling and the access check; per member
+  `_member_problem`. Then everything after it runs for the chosen member: the limits, the frame, `create_child` and its
+  `final` check. The budget is charged to the caller's agent, as ever (a budget refusal makes nothing).
+Order: the pool's members, then the project's rule (`only` cuts, `never` removes and wins, `prefer` moves to the front
+in its order), then those that fail a check are dropped with their reasons, then headroom picks: the first member with
+room or unknown usage; if none, the first eligible member, with a reason that says so (headroom never refuses work).
+The record keeps `pool: {name, why, summary}`. `why` is the full reason (each member's reason bounded, 300 characters,
+the whole 4000), printed by `board session show` and the CLI's start output. The spawn audit post carries only the
+short `summary` (first choice; by a project rule; N member(s) could not be started; overflow past N member(s); every
+member near its limit), and shortens it, then leaves it out, rather than make the post longer than the board's
+`body_max_bytes` (a post over it would stay at the head of the tree's queue and hold every later audit). The child's
+view for its starter names the pool. Capabilities (`pools`) and the frame list a pool as a line of order, never a
+promise of a member.
+
+*The owner's rulings (2026-11-23).* An `only` list that names none of a pool's members is ignored for that pool. The
+one-root refusal stays a refusal after the choice and names the member chosen. Pools apply to the human's root
+starts whether or not child sessions are enabled. Only Codex's `usageLimitExceeded` marks an account exhausted
+(not `rateLimitExceeded`, not `rateLimitReachedType`, not a window at 100%: a high percentage is a high percentage).
+
+*Usage: what is trusted, and from whom.* Only what a node reports in its hello, for a runner it offers: per runner a
+list of readings, one per window (at most `USAGE_WINDOWS_MAX`, 16, per runner, and a hello's own limit of runners,
+200). The hub keeps them only while it has pools, per node, runner key and window (`host.usage.<node>`), in ITS time
+(`observed_at` = now - age, so the node's clock never matters). A member's usage is the record of the node it would
+run on for its runner there. It is advisory: it is read only after a member passed every check, and can only change
+which of those is taken; a node that lies can make the hub prefer another eligible member, never place a session it
+would otherwise refuse. The board cannot verify which subscription a process used; every surface that shows a pool's
+reason says so.
+
+*The usage record's rules.* One table, which `providers.clean_usage`, the adapters, `SessionHost.note_usage`,
+`account_pools.store_usage` and `account_pools.standing_of` follow, and which one table-driven test walks
+(tests/test_account_pools.py, `USAGE_RULES`):
+
+| Rule | What holds |
+|---|---|
+| Identity | A reading is of one window of one account: (node, runner key, window). The window is the provider's stable name for it: Claude's `unifiedWindows` name (the top-level fields alone: the window `rateLimitType` names, else `limiting`); Codex's bucket and slot (`<limitId>_primary`, `<limitId>_secondary`; `codex_...` when it names none). A window's length is a `label`, for display only, never part of its identity. A turn that failed on the limit leaves a mark under `failed_turn`. |
+| Shape | `clean_usage`: a valid window, a percent, a reset time (epoch seconds; a malformed one is left out), `exhausted` a bool, and (in a report) an age from 0 to a day. The percent is one of three things, kept apart from the provider's line to the hub: a number from 0 to 1000 (a reading); an explicit null from the provider (the intentional clear: nothing is known of that window now); anything else, or omitted (no information: no reading, dropped where it is read, replacing nothing). A valid rejection on the same event is read on its own and is not lost because the percent was unusable. |
+| Replacing | A reading replaces the kept one of the same window when it is newer (the hub: by `observed_at`; the host: by arrival). An older one, and a dropped one, replace nothing. A sparse update replaces only the windows it carries. |
+| Expiry | A percent counts while it is at most `stale_minutes` old and its window's reset (believed up to 8 days after it was seen) has not passed. A reset already past when the reading was seen means the window has reset: room. |
+| Exhausted | Only two things: a provider's own refusal of a window (Claude's top-level `status: rejected`, on the limiting window), which lasts until that window's own reset (one already past: room), else `cooldown_minutes`; and a `failed_turn` mark (Claude's `rate_limit` error, Codex's `usageLimitExceeded`), which lasts until its reset only if that is after the moment the mark was seen (a reset inherited from an earlier refusal, already past, says nothing about this one), else `cooldown_minutes`. A high percent, Codex's `rateLimitReachedType` and a window's own `rejected` are not exhaustion. |
+| Standing | A member's standing is its worst window: exhausted > over (a percent at or above `skip_at_percent`) > room > unknown. Unknown counts as room. |
+| Pruning | On every hello from the node while pools are configured, whether or not it carries usage: runners it no longer offers; readings that have expired by their own rule (`account_pools.expires`, the one rule the standing follows too: stale, their window's reset passed, exhausted-until or the cool-down over), so a configured cool-down of several days is kept for all of it; beyond 16 windows per runner (the newest kept). A reading pruned as expired stays gone if the settings are lengthened later. Nothing is kept while no pool is configured. |
+
+*Review round 1 (2026-11-23)*, each verified before it was changed: AP-1 (screening missed the effective access and
+node admission: true; one definition now, rule (a)), AP-2 (the audit could pass the body limit: true; a bounded
+summary), AP-3 (Codex's reached flag and 100% were exhaustion: true; removed), AP-4 (an integer beyond float range
+raised `OverflowError` on both sides: true; rule (b)), AP-5 (a reset already past when seen was dropped, and a Claude
+rejection could take the weekly reset: true; both fixed), AP-6 (a sparse Codex update refreshed an untouched
+window's age: true; per-window times), AP-7 (51 runners broke a hello with a 400, the record grew without bound, and
+usage was kept without pools: true; aligned limits, dropped not refused, pruned, nothing kept without pools), AP-8
+(the pool was recognised before the write: true; one reading inside it), AP-9 (a contradictory rule was refused at
+load and one inactive member broke the whole pool: true; `never` wins, the member is passed over).
+
+*Review round 2 (2026-11-23)*, each verified: AP-10 (the frame's pool lines were unbounded and could push a valid
+48 KiB task over the 64 KiB message limit: true; they are fitted to what the message has left, the longest form
+that fits: each pool's order, else the names, else a pointer to `board_session_capabilities`, else nothing), AP-1
+remainder (an interactive pool spawn placed its member again after the choice: true; the choice's node, access and
+one placement moment, `at`, are carried to `create_child`, and every liveness check of the choice and the start
+reads that moment), AP-2 remainder (a body limit lowered between queueing and posting could block the queue: true;
+`fit_audit` runs again when the post is made, on the limit then), AP-4 remainder (a malformed percent replaced a
+usable reading: true; such a reading is dropped, a null percent is the intentional clear), AP-5 remainder (a fresh
+failed turn inherited an expired reset; Claude lost a rejected window's reset when it carried no utilization: true;
+the `failed_turn` rule, and each window's reset read on its own), AP-6 remainder (a Codex update without a duration
+renamed the window: true; bucket and slot are the identity, the duration a label), AP-7 remainder (pruning ran only
+on hellos with usage: true; every hello while pools are configured), AP-11 (capabilities checked the default access
+only: true; each offered word is checked, and a pool lists the words that work for it, `access`), AP-12 (the docs
+said the Claude adapter takes the tightest window: true; corrected).
+
+*Review round 3 (2026-11-23)*, each verified: AP-13 (the audit fitter searched the finished text, so a match could
+start inside an agent-written title and swallow the hub's words and the untrusted-title marker: true; the queued
+entry now holds main's line, `base`, and the hub's words, `pool` and the fixed `pool_short`, apart, and
+`compose_audit` adds them to the base when the post is made, under the limit in force then; nothing searches text
+for the hub's words, and the base is never edited), AP-10 remainder (the frame was evaluated twice, and a budget
+that changed between the two could make the measured line shorter than the one rendered: true; `_spawn_line` runs
+once, leaves a slot for the pool words, and `_frame` fits them to that very line), AP-4 remainder (a malformed Claude
+utilization became a null, and an omitted percent counted as the clear: true; number, explicit null and anything
+else are kept apart from the adapter to the hub, the table's Shape row), AP-7 remainder (pruning ended readings after a
+day whatever their own expiry, so a three-day cool-down ended after one: true; retention follows `expires`).
+
+*What the CLIs expose* (codex-cli 0.171.0, Claude Code 2.1.330). Running the real CLIs for this was refused by this
+session's permission policy (it would have used the owner's own sign-in), so the fields were first read from what the
+CLIs themselves ship. The field shapes were then checked against lines recorded from real hosted sessions on
+2026-11-22/23 (Claude Code 2.1.3xx, codex-cli 0.171.0), taken from the board's own session logs with ids and the
+credits balance removed: ten of them are the parser's fixtures (tests/fixtures/rate_limit_samples.jsonl). What they
+show: every Claude `rate_limit_event` had `unifiedWindows` (`seven_day` alone, or `five_hour` and `seven_day`), the
+top-level `utilization` was in two of six only, utilization is a fraction 0..1 (0.40, 0.41, 0.76, 0.77, and 0 right
+after a reset), and overage fields (`overageStatus`, `overageDisabledReason`, `isUsingOverage`, `overageEnabled`)
+come beside them; every Codex update had `limitId: "codex"`, a `primary` window of 10080 minutes (`usedPercent` 57)
+and `secondary: null`. `unifiedWindows` is marked internal in Claude's schema, so the parser must keep working if it
+disappears: without it (or with nothing usable in it) the top-level `utilization`, `resetsAt` and `rateLimitType`
+are read, and a missing or null field, a window of an unknown name or a new key never fails. `primary` and
+`secondary` may each be null.
+- Codex: `codex app-server generate-json-schema` (offline). The server notification `account/rateLimits/updated`,
+  `{rateLimits: RateLimitSnapshot}` ("Sparse rolling rate-limit update. Clients should merge available values into the
+  most recent `account/rateLimits/read` response"): `primary` and `secondary` (`RateLimitWindow`: `usedPercent`
+  int32 required, `resetsAt` epoch seconds, `windowDurationMins`), `limitId`, `limitName`, `planType`,
+  `rateLimitReachedType` (rate_limit_reached, workspace_*_credits_depleted, workspace_*_usage_limit_reached),
+  `credits`, `individualLimit`, `spendControlReached`. It has no `threadId` and is not among the notifications the
+  adapter opts out of. `account/rateLimits/read` returns the same snapshot; the adapter does NOT call it (no extra
+  request). A turn failing on the limit: `turn/completed` with `turn.error.codexErrorInfo` `usageLimitExceeded`
+  (also listed: `rateLimitExceeded`, not taken as the plan's limit).
+- Claude Code: its SDK message schema, which the CLI binary carries as data. `{type: "rate_limit_event",
+  rate_limit_info, uuid, session_id}`, "emitted when rate limit info changes": `status` (allowed, allowed_warning,
+  rejected), `resetsAt` (epoch seconds), `rateLimitType` (five_hour, seven_day, seven_day_opus, seven_day_sonnet,
+  seven_day_overage_included, overage), `utilization` (a fraction of the limiting window), `surpassedThreshold`,
+  overage fields, and, marked internal, `unifiedWindows` (`five_hour`, `seven_day`, `seven_day_overage_included`, each
+  `utilization`, `resetsAt`, `status`, `surpassedThreshold`): "absent for API-key, Bedrock, and Vertex sessions". An
+  assistant message's `error` can be `rate_limit`. The adapter emits one reading per window (`unifiedWindows`, else
+  the top-level `utilization`, else `surpassedThreshold` as a lower bound, for the window `rateLimitType` names), the
+  hub ranks them (the table: the worst window decides); `status: rejected` marks the limiting window exhausted until
+  its own reset, and a `rate_limit` error leaves a `failed_turn` mark. Nothing reads a private file or calls an
+  endpoint of its own: both come on the stream the host already reads.
+
+*Node and hub of different versions* (as #102's `homes` and #103's `features`). The hub's hello answer says
+`report_usage: true` only while it has pools; a node sends `usage` only after such an answer, only what it has
+seen, and reads the flag from every answer. A hub that refuses the field (422: rolled back) gets the hello again
+without it and no usage until it asks again; a node with folders as well drops `usage` first, then `homes`. An
+older hub never asks; an older node never sends, and its members are taken in order. With no pools the hub's
+answer, every record, capabilities, the frame, the audit text and the node's hello are exactly main's.
+
+*Not done.* No switch of a running session to another account, and no fallback when a running session hits its
+limit (its turn fails as before; the next new session overflows). No pools for dispatched launches or for wakes:
+a launch is for an agent a request names, decided by the dispatcher's own reservation, and a wake goes to a session
+that exists; making either choose would mean a second decision point in code that #102 made the only one for the
+opt-in list, which is not trivial. No `account/rateLimits/read` request, and no usage from dispatched runs (their
+output is not read for it). Usage is per node and runner: the same subscription signed in on two machines is two
+accounts to the hub.
+
+*Follow-ups (review round 4).* Pruning a window's expired reading also drops the time that reading was seen, which is
+what rejects an older report of that window; so a delayed report carrying a reading older than the pruned one, but
+not itself expired, can restore usage that had already expired. Not fixed here (advisory usage, and bounded by the
+reading's own expiry). The frame is measured with the task validators' own UTF-8 policy (errors replaced, as
+`hosted._text` and `_task_text`), so any task they accept is framed.
+
 ## Restarting a running turn; mid-turn steering deferred (2026-11-22)
 
 **Why.** Parity with T3 Code Orchestrator V2's send modes (`t3_thread_send`: auto, queue, steer, restart). Until now

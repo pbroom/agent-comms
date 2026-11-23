@@ -425,6 +425,12 @@ class SessionHost:
         self.may_start: Callable[[], bool] | None = None
         self._recovered = False
         self._next_message = 0
+        # Runner key -> window -> the latest plan usage a session of that runner's provider reported for it (`usage`
+        # events), with when (`at`, this host's clock). Read by the node's hello from another thread: under
+        # `usage_lock` (`note_usage`).
+        import threading
+        self.usage: dict[str, dict] = {}
+        self.usage_lock = threading.Lock()
 
     # ------------------------------------------------------------ local state (survives a host restart)
 
@@ -928,6 +934,11 @@ class SessionHost:
             s.denials, s.waiting = ev.denials, True
             out.append(HostEvent(s.session_id, "approval_requested", s.in_flight.id if s.in_flight else None,
                                  denials=ev.denials))
+        elif ev.kind == "usage":
+            # What the provider said about its plan's usage (providers.KINDS): each window's latest per runner, with
+            # its own time, for the node's hello (account_pools.py). Advisory: nothing about the session or its turn
+            # changes, and nothing here can fail (`note_usage`).
+            self.note_usage(self.config.runner_key(s.agent, s.runtime), ev.usage, now)
         elif ev.kind == "fatal":
             self._end(s, ev.detail or "the provider reported a fatal error", now, out)
         elif ev.kind == "start_failed":
@@ -940,6 +951,24 @@ class SessionHost:
             self._save_state()
             self._fail_start(s, ev.detail or "the agent process refused to start the session", out)
             self._stop(s, now)
+
+    def note_usage(self, key: str | None, observations, now: float) -> None:
+        """Keep each window's newest observation for runner `key` (`usage`: key -> window -> observation | {at}),
+        each through providers.clean_usage, at most providers.USAGE_WINDOWS_MAX windows (the newest). It never
+        raises: usage is advisory (account_pools.py, rule (b))."""
+        try:
+            if key is None or not isinstance(observations, list):
+                return
+            with self.usage_lock:
+                windows = dict(self.usage.get(key) or {})
+                for obs in observations[:providers.USAGE_WINDOWS_MAX]:
+                    clean = providers.clean_usage(obs)
+                    if clean is not None:
+                        windows[clean["window"] or "-"] = clean | {"at": now}
+                newest = sorted(windows.items(), key=lambda kv: -kv[1]["at"])[:providers.USAGE_WINDOWS_MAX]
+                self.usage[key] = dict(newest)
+        except Exception:
+            log.debug("a usage observation could not be kept; it is advisory and was dropped", exc_info=True)
 
     def _reap(self, s: Session, now: float, out: list[HostEvent]) -> None:
         """The process is let go of only once its whole process group is gone, however its leader ended: stopped by

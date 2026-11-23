@@ -1337,6 +1337,90 @@ add `[dispatch.runner_homes]` to a machine only once it runs this version: an ol
 and does not start. A node of this version whose hub is older still works; that hub just does not show the folder.
 See DESIGN_NOTES "Agent accounts".
 
+## Balancing between accounts
+
+With two accounts as two agents (above), you can let the hub pick the account for a new session: name a **pool** of
+interchangeable agents instead of one agent, and the hub takes its first member that can be started, skipping one
+that is near its plan's usage limit (overflow). Three settings, all in the HUB's board.local.toml under
+`[dispatch.sessions.spawn]`. Despite the table's name, pools apply to your own root starts (`board session start
+<project> --agent <pool>`) whether or not child sessions are enabled; a child session, yours or an agent's, needs
+them enabled as always.
+
+- **`pools`**: a pool name and its members, in preference order: `"claude" = ["claude-work", "claude-code"]`. Name
+  the pool wherever you name the agent of a NEW session: `board session start <project> ... --agent claude`,
+  `board session start --parent <id> ... --agent claude`, and an agent's `board_session_spawn(child_agent:
+  "claude")`. The session is then that member's for good: its record, `board session list`, the dashboard's
+  Sessions tab, the spawn audit post and the spawn budget all name the real agent, and `board session show` says
+  how it was chosen ("asked for as pool claude; the hub chose claude-code from pool claude: overflow, because
+  claude-work was at 95% of its five_hour window until 2026-11-23T14:00:00Z"). A member that is not an active
+  agent is passed over with that reason, like any member that cannot be started there; the members that are must
+  all be one CLI's (all Claude or all Codex), else a start naming the pool is refused with the reason. A pool
+  may not have an agent's name (the name then means the agent, as before, and `board_session_capabilities` says
+  why the pool is not offered); an unknown name is refused as an unknown agent.
+- **`pool_rules`**: per project (spelled exactly as the board shows it, as in `[dispatch.agent_projects]`), any of
+  three lists of members: `prefer` (tried first, in that order, then the rest of the pool in its order), `only`
+  (the pool is cut down to these there) and `never` (taken out there, and it wins: a name in `never` and in
+  `prefer` or `only` too is simply out). They narrow and reorder a pool; they never
+  add a member, and never get past `[dispatch.agent_projects]`, what a node offers, access, the spawn grant or any
+  other check. An `only` that names none of a pool's members does not apply to that pool (it is about another
+  pool). A member is eligible exactly when starting it by name would pass every check there, at the access it
+  would really get. A rule that leaves no member refuses the start, with the reason. A rule shapes pools only: naming
+  `claude-work` itself still starts `claude-work`; to keep an agent out of a project altogether use
+  `[dispatch.agent_projects]`.
+- **`pool_headroom`**: `skip_at_percent` (default 90: a member with a usage window at or above it is
+  skipped), `stale_minutes` (60: older usage is ignored) and `cooldown_minutes` (30: how long an account that hit
+  its limit is skipped when no reset time is known; with one, until then).
+
+**Headroom.** The hub learns an account's usage from what that account's hosted sessions say, through their node:
+Claude Code's `rate_limit_event` (percent of the five-hour and weekly windows, when they reset, whether requests are
+refused) and Codex's `account/rateLimits/updated` (its primary and secondary windows), and a turn that fails on the
+limit (Claude's `rate_limit` error or a `rejected` status, Codex's `usageLimitExceeded` and nothing else: a high
+percentage is only a high percentage), which marks the account exhausted until that window's reset (or for the
+cool-down). The node keeps each window's latest per runner, with its own age, and sends it with its hello, only to a
+hub that asks (one with pools); the window most used decides. Usage that cannot be read is dropped, never an error:
+it cannot affect a turn, a session or a node's heartbeat. Usage the hub has not seen counts as room, so a pool works from the first start: before any
+session of an account has run, its members are taken in order. If every member that can be started is near its
+limit, the first is taken anyway and the reason says so: headroom never refuses work. Usage is ADVISORY: it only
+decides which of the members that pass every check is taken, never whether one may be started. The board cannot
+verify which subscription a process used (it sets the account folder; the CLI decides).
+
+`board_session_capabilities` lists each pool a caller could name, only where at least one member could be started
+for it, as one line of order ("claude: claude-work first, claude-code when it is near its limit"), never a promise
+of a member, with the access words a start of it may ask for (`access`: those at which at least one of its members
+passes every check); the spawn frame a child is given says the same, as much of it as fits beside the task (else the
+pools' names, else a pointer to `board_session_capabilities`).
+
+A blanket work-first pool, and three projects with rules of their own:
+
+```toml
+# board.local.toml on the hub
+[dispatch.sessions.spawn.pools]
+"claude" = ["claude-work", "claude-code"]       # the company account first; the personal one when it is near its limit
+
+[dispatch.sessions.spawn.pool_rules."/Users/you/personal-app"]
+prefer = ["claude-code"]        # your own project: the personal account first, the company one as overflow
+
+[dispatch.sessions.spawn.pool_rules."/Users/you/project-a"]
+only = ["claude-work"]          # company code: only ever the company account, even near its limit
+
+[dispatch.sessions.spawn.pool_rules."/Users/you/open-source"]
+never = ["claude-work"]         # never on the company account
+
+[dispatch.sessions.spawn.pool_headroom]
+skip_at_percent = 90
+```
+
+Then `board session start /Users/you/project-b "..." --agent claude` runs on the company account until it is at
+90% of a window, then on the personal one; a session's `board_session_spawn(child_agent: "claude")` does the same
+for its helpers (charged, as ever, to the calling agent's spawn budget). In personal-app the personal account comes
+first; in project-a only the company account is used; in open-source only the personal one.
+
+What this does not do: it never moves a session that is running to another account, and a running session that
+hits its limit simply fails its turn as before (the next NEW session overflows). Pools are for new hosted and
+child sessions only: dispatched runs and wakes keep naming their agent. Upgrade the hub first: a node of this
+version sends usage only to a hub that asks, and an older node sends none (its members are then taken in order).
+See DESIGN_NOTES "Account pools".
+
 ## ChatGPT / remote connectors
 
 The recommended path is **native ChatGPT MCP through OpenAI Secure MCP Tunnel**. The
