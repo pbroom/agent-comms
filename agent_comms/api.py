@@ -565,6 +565,9 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
             # For the thread status dots: automatic recoveries pending or escalated to the human (autorecover.py).
             from . import autorecover
             out["auto_recovery"] = autorecover.list_records(board, p)
+            # The Sessions tab's count: hosted sessions that have not ended (hosted_lineage.py).
+            from . import hosted_lineage
+            out["hosted_live"] = hosted_lineage.live_count(board)
         return out
 
     # ---------------------------------------------------------------- sessions
@@ -946,6 +949,18 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
     def hosted_sessions(all: bool = False, p: Principal = P):
         from . import hosted
         return hosted.list_sessions(board, p, include_ended=all)
+
+    @app.get("/api/hosted-trees")
+    def hosted_trees(all: bool = False, p: Principal = P):
+        # The dashboard's lineage view (hosted_lineage.py): every session tree, read-only, human only.
+        from . import hosted_lineage
+        return hosted_lineage.trees(board, p, include_ended=all)
+
+    @app.get("/api/hosted-trees/{session_id}")
+    def hosted_tree_detail(session_id: str, p: Principal = P):
+        # ... and its details panel for one session: read-only and capped (`board session show` is unchanged).
+        from . import hosted_lineage
+        return hosted_lineage.detail(board, p, session_id)
 
     @app.post("/api/hosted-sessions")
     def hosted_start(body: HostedStartIn, p: Principal = P):
