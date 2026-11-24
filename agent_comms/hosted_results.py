@@ -261,6 +261,12 @@ def turn(c, child: dict, m: dict, *, ok: bool, delivered: bool, detail: str, tex
     if m.get("kind") == "task" and isinstance(o, dict) and o.get("by") == "parent" and o.get("state") != "asked":
         # The verdict of a request the PARENT made: for it alone (a turn the human asked for carries none, R2-05).
         fields["output"] = {k: o.get(k) for k in ("state", "code", "reasons", "schema_sha")}
+    from . import hosted_steer
+    s = hosted_steer.get(c, child["session_id"], m["n"]) if m.get("kind") == "task" else None
+    if s is not None and s.get("kind") == "task" and s.get("outcome") is not None:
+        # The parent's own steer into this turn, settled with it (hosted_steer.settle, in this transaction): its
+        # outcome as a field, never added to the reply (H, "One result for N").
+        fields["steer"] = {"outcome": s["outcome"], "why": s.get("why")}
     # The parent restarted this turn itself: the result is kept (for the lineage, and for a call of the parent's still
     # waiting for this turn), but it is not delivered as another turn of the parent's, decided before any limit of the
     # automatic delivery. A restart by the human still is delivered: the parent learns its task was interrupted.
@@ -352,6 +358,14 @@ def _line(i: int, count: int, x: dict) -> str:
             f"{PHRASES.get(x.get('outcome'), PHRASES['failed'])}.{again}")
 
 
+# The hub's line about a parent's steer into the turn a result is for (hosted_steer.py; DESIGN_NOTES part H). Never
+# inside the child-output markers: only the structured field carries the outcome's authority.
+STEER_LINES = {"in_turn": "Your steer into this turn: taken into it.",
+               "not_delivered": "Your steer into this turn: not delivered: send it again if you still want it.",
+               "unconfirmed": ("Your steer into this turn: not confirmed: delivery could not be confirmed, and the agent "
+                               "may have read it.")}
+
+
 def render(results: list[dict], token: str | None = None, header: str | None = None) -> str:
     """The whole text of a turn that carries these results (or of what a claim hands its caller: `header`, a
     variant of HEADER with the same {token})."""
@@ -374,6 +388,9 @@ def render(results: list[dict], token: str | None = None, header: str | None = N
             out.append("Tools refused in that turn: " + ", ".join(denied) + ".")
         if isinstance(x.get("output"), dict):
             out.append(output_schema.result_line(x["output"]))      # the one hub line; the reply below it
+        steer = x.get("steer") if isinstance(x.get("steer"), dict) else None
+        if steer is not None and steer.get("outcome") in STEER_LINES:
+            out.append(STEER_LINES[steer["outcome"]])       # the hub's line, outside the child's markers (H)
         out += [f"<<<child-output {token}>>>", str(x.get("text") or "") or "(no output)",
                 f"<<<end child-output {token}>>>"]
     return "\n".join(out)
@@ -586,6 +603,8 @@ def view_one(x: dict, text: bool = False) -> dict:
         f = output_schema.facts(x["output"])
         out["output"] = f | ({"words": output_schema.WORDS.get(f.get("code"), "")} if f["state"] == "missing"
                              else {}) | {"reply": reply_label(x, "whole" if text else None)}
+    if isinstance(x.get("steer"), dict):
+        out["steer"] = {"outcome": x["steer"].get("outcome"), "why": x["steer"].get("why")}    # the parent's steer
     if text:
         out["text"] = x.get("text") or ""
     return out

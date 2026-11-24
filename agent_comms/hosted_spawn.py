@@ -1204,13 +1204,17 @@ def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, 
 
 
 def render_task(who: str, text: str, spawn_line: str = "", follow_up: bool = False, token: str | None = None,
-                schema: str | None = None, check: bool = False) -> str:
+                schema: str | None = None, check: bool = False, steer: bool = False) -> str:
     """`schema` (its rendered text; hosted.ask): the task also asks for its result as data, with the ask line after
-    the spawn line and the schema block after the task. Without it, the frame is what it always was."""
+    the spawn line and the schema block after the task. Without it, the frame is what it always was. `steer`: a
+    message the parent sent into the child's turn in flight (hosted_steer.py), with what that is and the steer line."""
     token = token or secrets.token_hex(8)
     while token in text or (schema is not None and token in schema):
         token = secrets.token_hex(8)
-    what = "A follow-up message" if follow_up else "A task"
+    from . import hosted_steer
+    what = hosted_steer.STEER_WHAT if steer else "A follow-up message" if follow_up else "A task"
+    if steer:
+        spawn_line = hosted_steer.STEER_LINE
     head = TASK_HEADER.format(what=what, who=who, who_cap="That session", token=token)
     if schema is None:
         return "\n".join([head] + ([spawn_line] if spawn_line else []) + [f"<<<task {token}>>>", text,
@@ -1270,6 +1274,7 @@ def _child_view(conn, r: dict, caller_id: str | None, board: Board | None = None
                                             for x in outstanding}} if outstanding and board is not None else {}),
             "ended_at": r.get("ended_at"),
             **_in_flight_request(conn, r),
+            **_own_steer(conn, r, caller_id),
             # The pool its agent was chosen from (account_pools.py), only for a child asked for by a pool's name.
             **({"pool": r["pool"].get("name")} if isinstance(r.get("pool"), dict) else {})}
 
@@ -1287,6 +1292,16 @@ def _verdict_of(m: Any) -> dict:
     if v["state"] == "asked" and m.get("state") in hosted.SETTLED:
         v["state"] = "unchecked"
     return {"output": v | {"reply": STATUS_REPLY}}
+
+
+def _own_steer(conn, r: dict, caller_id: str | None) -> dict:
+    """The latest steer this caller sent into one of its turns of this child (hosted_steer.view): its terminal
+    status, while N's message is kept. Nothing for a child that took no steer of the caller's."""
+    from . import hosted_steer
+    mine = [s for s in hosted_steer.steers(conn, r["session_id"])
+            if s.get("kind") == "task" and isinstance(s.get("by"), dict) and s["by"].get("session") == caller_id
+            and caller_id is not None]
+    return {"steer": hosted_steer.view(mine[-1])} if mine else {}
 
 
 def _in_flight_request(conn, r: dict) -> dict:
@@ -1634,15 +1649,26 @@ def _resent(board: Board, p: Principal, ident: Ident, child: Any, project: Any, 
     returned at once, whatever has changed since (as for spawn: nothing charged or sent again). Only ever returns."""
     if rid is None:
         return None
+    from . import hosted_steer
     try:
         caller = resolve(board, p, ident, project)
         kid = _own_child(board.conn, caller, child)
+        was, steer = hosted_steer.sent_before(board.conn, kid, rid, {"session": caller.id, "agent": p.name},
+                                              board.now())
+        if was:
+            return _steer_view(board.conn, kid, caller, steer, False)
         m = hosted.sent_before(board.conn, kid, rid, {"session": caller.id, "agent": p.name}, board.now())
     except BoardError:
         return None
     if m is None:
         return None
     return _sent_view(board.conn, kid, caller, m, False, {"mode": m.get("mode") or "queue", "why": None})
+
+
+def _steer_view(conn, kid: dict, caller: Caller, s: dict, created: bool) -> dict:
+    """A parent's steer send answer (hosted_steer.answer), with the child as the parent sees it."""
+    from . import hosted_steer
+    return {"child": _child_view(conn, kid, caller.id), "notice": NOTICE} | hosted_steer.answer(s, created)
 
 
 def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = None, may_spawn: Any = None,
@@ -1652,8 +1678,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
     or a change that widens the allowance, needs a live grant; a change that only narrows it does not.
     `mode` (hosted.SEND_MODES): queue (the next turn, the default), restart (interrupt the child's turn in flight,
     which must be one this caller gave it, and run this one next instead) or auto (start at once if the child is
-    idle, else queue); steer is refused for now (R6). Every one is a child turn of the budget. `request_id`: a
-    retry returns the first call's message (`created` false), and nothing is charged or sent again."""
+    idle, else queue) or steer (put it into the child's turn in flight, one this caller gave it: hosted_steer.py; no
+    message of its own, refused with the reason when it cannot be). Every one is a child turn of the budget.
+    `request_id`: a retry returns the first call's message or steer (`created` false), and nothing is charged or sent
+    again."""
     mode = hosted._mode(mode)
     rid = hosted_tree._request_id(request_id)
     if message is None and (mode != "queue" or rid is not None):
@@ -1682,7 +1710,11 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
         # the caller's own checks above still come first: a retry with the same arguments passes them as before.)
         if rid is None:
             _grant_for(board.conn, caller, board.now())
-        if output_schema is not None:
+        if mode == "steer":
+            # Into the turn in flight: the follow-up frame, saying what it is (never a request for data: refused below,
+            # after the retry lookup, as every steer refusal is).
+            text = render_task(_who(caller), _task_text(message), steer=True)
+        elif output_schema is not None:
             # Decided now; refused only once the retry lookup in the transaction below has missed (R2-10).
             who, task_text = _who(caller), _task_text(message)
             output, text, why = hosted.ask(task_text, output_schema, "parent", frame=lambda token, shown, check:
@@ -1706,6 +1738,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
                 raise Conflict("the calling session changed meanwhile; try again")
             kid = _own_child(c, again, child)
             by = {"session": again.id, "agent": p.name}
+            from . import hosted_steer
+            was, steered = hosted_steer.sent_before(c, kid, rid, by, now)
+            if was:
+                return _acked(board, _steer_view(c, kid, again, steered, False), None)
             hit = hosted.sent_before(c, kid, rid, by, now)
             if hit is not None:
                 return _acked(board, _sent_view(c, kid, again, hit, False, {"mode": hit.get("mode") or "queue",
@@ -1720,8 +1756,24 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
                 _not_above_own(c, again, new)
             if may_spawn is not None or spawn_share is not None:
                 kid["allowance"] = new
-            m = None
-            if text is not None:
+            m = steer = None
+            if text is not None and mode == "steer":
+                ceiling = _ceiling(again, grant)
+                offered = hosted_tree._offers(c, kid["node"], kid["agent"], kid.get("runtime"))
+                if not session_access.within(kid.get("access") or "full", ceiling) or kid.get("access") not in offered:
+                    raise Conflict(ABOVE_NOW.format(sid=kid["session_id"], access=kid.get("access"),
+                                                    ceiling=ceiling if kid.get("access") in offered
+                                                    else f"its node offers {', '.join(offered) or 'none'}"))
+                _check_limits(c, again, cfg, now, ("turns",))
+                into, refused = hosted_steer.target(board, c, kid, True, text, schema=output_schema is not None,
+                                                    spawn=may_spawn is not None or spawn_share is not None)
+                if refused:
+                    raise hosted_steer.refuse(kid, refused)
+                steer = hosted_steer.accept(c, kid, into, text, "task", by, p.name, rid, now)
+                b = _budget(c, caller.agent, caller.project)
+                _charge(b)          # one child turn of the budget, at acceptance
+                _save_budget(c, b, now)
+            elif text is not None:
                 ceiling = _ceiling(again, grant)
                 offered = hosted_tree._offers(c, kid["node"], kid["agent"], kid.get("runtime"))
                 if not session_access.within(kid.get("access") or "full", ceiling) or kid.get("access") not in offered:
@@ -1742,11 +1794,42 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
         _intend_alert(board, caller, e.reached)
         raise
     flush(board)
+    if steer is not None:
+        return _steer_view(board.conn, kid, caller, steer, True)
     if m is not None and (mode != "queue" or rid is not None):
         return _acked(board, _sent_view(board.conn, kid, caller, m, True, how), output_schema)
     return _acked(board, {"child": _child_view(board.conn, kid, caller.id),
                           "message": {"n": m["n"], "state": m["state"]} if m else None, "notice": NOTICE},
                   output_schema)
+
+
+STEER_UNSETTLED = ("not settled within the wait: the turn's result, with the steer's outcome, comes later (as a turn of "
+                   "yours if you are a hosted session; board_session_status shows the steer's outcome either way)")
+STEER_WENT = ("the child finished, and its result (result {n}) went to you as a turn: the steer's outcome is with it "
+              "and in `steer` here")
+
+
+def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: dict | None) -> dict:
+    """What a `wait=true` steer answer says once its one wait for N's result is over (H): the terminal steer status
+    from the record, read FIRST; then, without the result, where it went (a turn of the caller's, another call), or
+    only if the steer is still unsettled, that it is."""
+    from . import hosted_steer
+    status = hosted_steer.view(hosted_steer.get(board.conn, child, n))
+    out: dict = {"steer_status": status}
+    if taken is not None:
+        return out
+    if parent is not None:
+        x = hosted_results.claimed(board.conn, parent, child, n)
+        if x is not None:
+            return out | {"note": CLAIMED_ELSEWHERE.format(n=x["n"])}
+        went = [x for x in hosted_results._results(board.conn, parent) if x.get("child") == child
+                and x.get("message") == n and x.get("state") in ("queued", "delivered")]
+        if went:
+            return out | {"note": STEER_WENT.format(n=went[-1]["n"])}
+    if status is None or status.get("outcome") is None:
+        return out | {"note": STEER_UNSETTLED}
+    return out | {"note": "the steer is settled; the turn's result was not taken within the wait (it comes as a turn "
+                          "of yours, or through board_session_status)"}
 
 
 def _owner_or_grant(board: Board, caller: Caller) -> None:
@@ -1784,6 +1867,8 @@ def taken(x: dict | None) -> dict | None:
                                    "denials", "attempts")}
     if isinstance(x.get("output"), dict):
         facts["output"] = output_schema.facts(x["output"])     # the verdict; the reply in `text` carries the block
+    if isinstance(x.get("steer"), dict):
+        facts["steer"] = {"outcome": x["steer"].get("outcome"), "why": x["steer"].get("why")}   # the caller's steer
     return {"result": facts, "text": hosted_results.render([x], header=CLAIM_HEADER)}
 
 
@@ -1808,10 +1893,13 @@ def cancel(board: Board, p: Principal, ident: Ident, child: Any, close: Any = Fa
             if m.get("kind") == "task" and m.get("state") in ("queued", "delivered") and m.get("cancel") is None:
                 m |= {"cancel": now, "updated_at": now}
                 _put(c, hosted._msg_key(kid["session_id"], m["n"]), m, p.name, now)
+                from . import hosted_steer
+                hosted_steer.cancel(c, kid["session_id"], m["n"], now, p.name)     # with N's cancel (never offered again)
                 flagged.append(m["n"])
     return {"child": _child_view(board.conn, kid, caller.id), "closed": False, "cancelled": flagged,
-            "note": ("its node stops a turn in flight (and drops the messages not yet started) on its next pass; the "
-                     "turn's result, outcome cancelled, says how far it got") if flagged else "nothing of yours was "
+            "note": ("cancellation requested; a turn that had already completed keeps its result. Its node stops a "
+                     "turn in flight (and drops the messages not yet started) on its next pass; the turn's result, "
+                     "outcome cancelled, says how far it got") if flagged else "nothing of yours was "
                                                                                               "running or waiting",
             "notice": NOTICE}
 

@@ -1161,6 +1161,9 @@ class SessionsConfig:
     interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
     idle_hours: float = 8.0     # a session's process idle this long is stopped; its next message resumes it
     max_live: int = 4           # session processes at once; one more stops the longest-idle one, or waits
+    # Mid-turn steering (hosted_steer.py); read on the hub. Off (for a drain before installing an older hub): every new
+    # steer is refused; one already accepted is offered and settled as ever.
+    steer: bool = True
     # Waking a session for board posts addressed to its agent (hosted_wake.py). These four apply on the hub.
     wake_min_interval_seconds: float = 30.0   # at most one wake per session in this many seconds
     max_wakes_per_hour: int = 12              # per session
@@ -1174,7 +1177,7 @@ class SessionsConfig:
             raise ValueError(f"{where} must be a table")
         c = cls()
         for k, v in d.items():
-            if k in ("enabled", "codex", "allow_full_access"):
+            if k in ("enabled", "codex", "allow_full_access", "steer"):
                 if not isinstance(v, bool):
                     raise ValueError(f"{where} {k} must be true or false")
                 setattr(c, k, v)

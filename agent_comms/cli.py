@@ -317,7 +317,9 @@ def main(argv: list[str] | None = None) -> None:
     x.add_argument("--mode", choices=("auto", "queue", "steer", "restart"), default="queue",
                    help="queue (default): its own turn, after those ahead of it; restart: interrupt the turn in "
                         "flight and run this one next instead; auto: start at once if the session is idle, else "
-                        "queue (it never restarts); steer: not available yet (refused)")
+                        "queue (it never restarts); steer: put it into the turn in flight (one of yours, with nothing "
+                        "queued behind it; one steer per turn), whose result says whether it was taken in. With "
+                        "--wait and steer: exit 5 when it was not delivered (send it again), 6 when not confirmed")
     x.add_argument("--request-id", metavar="X", help="idempotency: a retry with the same id returns the message the "
                                                      "first call sent instead of sending another")
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
@@ -881,7 +883,9 @@ def _fmt_hosted(s: dict) -> str:
     return (f"{s['session_id']} [{s['state']}{', closing' if s.get('stop') and s['state'] != 'ended' else ''}] "
             f"{s['agent']}" + (f" (account folder {s['account_home']})" if s.get("account_home") else "")
             + f" in {s['project']} on node {s['node']}{where}, turns {s['turns']}, queued {s['queued']}"
-            + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else ""))
+            + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else "")
+            + (f", steer unsettled (into message {s['steer_unsettled'].get('into')})"
+               if isinstance(s.get("steer_unsettled"), dict) else ""))
 
 
 def _fmt_access(s: dict) -> str:
@@ -1124,6 +1128,9 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
         if given:
             raise SystemExit("error: --" + ", --".join(k.replace("_", "-") for k in given)
                              + " apply to a child session only (--parent ID)")
+    if a.session_cmd == "send" and a.mode == "steer" and getattr(a, "output_schema", None) is not None:
+        raise SystemExit("error: --output-schema does not go with --mode steer: a steer is answered by the turn it goes "
+                         "into (restart it, or queue the message, to ask for data)")
     text = sys.stdin.read() if a.message == "-" else a.message
     schema = _read_schema(a.output_schema) if getattr(a, "output_schema", None) is not None else None
     with_schema = {"output_schema": schema} if schema is not None else {}
@@ -1140,6 +1147,8 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
         body = {"message": text} | ({"mode": a.mode} if a.mode != "queue" else {})
         body |= {"request_id": a.request_id} if a.request_id else {}
         r = _api(settings, token, "POST", f"/api/hosted-sessions/{sid}/messages", body | with_schema)
+    if a.session_cmd == "send" and isinstance(r.get("steer"), dict):
+        return _steer_sent(a, out, settings, token, r, text)
     s, m = r["session"], r["message"]
     if a.session_cmd == "send" and (r.get("created") is False or m.get("mode") or r.get("why")):
         who = f"child {_fmt_child(s)} of {s['parent']}" if s.get("parent") else f"session {_fmt_hosted(s)}"
@@ -1225,6 +1234,59 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
             raise SystemExit(3)
         if state != "accepted":
             raise SystemExit(4)     # unchecked, or the message asked for none (a retry's original)
+
+
+STEER_EXIT = {"not_delivered": 5, "unconfirmed": 6}     # `send --mode steer --wait` (DESIGN_NOTES part H)
+STEER_WORDS = {"in_turn": "taken into the turn", "not_delivered": "not delivered: send it again if you still want it",
+               "unconfirmed": "not confirmed: delivery could not be confirmed, and the agent may have read it"}
+
+
+def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> None:
+    """`board session send --mode steer`: the steer's answer, and with --wait the result of the turn it went into
+    (message N) and the steer's outcome: exit 0 when that turn completed, 1 when not, 5 when the steer was not
+    delivered (this call's text is printed, never a retry's), 6 when it is not confirmed."""
+    from urllib.parse import quote
+    s, st = r["session"], r["steer"]
+    created = r.get("created") is not False
+    info = f"session {_fmt_hosted(s)}; " + (
+        f"steer into message {st['into']}: {r.get('why')}" if created else
+        f"already sent for this request id (a steer into message {st['into']}: {st.get('state')}); nothing new was "
+        "sent")
+    if not a.wait:
+        return out(r, info)
+    if st.get("state") == "expired":
+        note = "the steer is no longer kept on the hub, and neither is the outcome it had"
+        if a.json:
+            print(json.dumps({"session": s, "steer": st, "reply": None, "note": note}, indent=2))
+        else:
+            print(info + f"\nnote: {note}", file=sys.stderr)
+        raise SystemExit(6)
+    if not a.json:
+        print(info, file=sys.stderr)
+    path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{st['into']}?wait=25&steer=1"
+    while True:
+        got = _api(settings, token, "GET", path, timeout=60)
+        if got["message"]["state"] in ("done", "failed"):
+            break
+    s, m, sv = got["session"], got["message"], got.get("steer") or {}
+    reply = s["reply"] if s.get("reply_for") == m["n"] else None
+    outcome = sv.get("outcome")
+    if a.json:
+        print(json.dumps({"session": s, "message": m, "reply": reply, "steer": sv}, indent=2))
+    else:
+        if m["state"] != "done":
+            print(f"turn failed: {m['detail'] or 'no reason given'}", file=sys.stderr)
+        if reply is not None:
+            print(reply)
+        elif m["state"] == "done":
+            print(f"(a later turn's reply replaced this one; the transcript has it: {s['transcript']})")
+        print(f"steer: {STEER_WORDS.get(outcome, outcome or 'not settled')}", file=sys.stderr)
+        if outcome == "not_delivered" and created:
+            print("the steer's text, to send again:\n" + text, file=sys.stderr)
+    if outcome in STEER_EXIT:
+        raise SystemExit(STEER_EXIT[outcome])
+    if m["state"] != "done":
+        raise SystemExit(1)
 
 
 def _login_link(settings: Settings, token: str) -> str:
