@@ -453,6 +453,50 @@ def test_o_n_ended_with_the_process_after_a_byte_is_unconfirmed_even_with_a_matc
     assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"} and not end.ok
 
 
+# The slot's states x N's ends (as tests/test_session_restart.py's CELLS): (state, end) -> (outcome, why).
+STEER_CELLS = {
+    ("unproved", "native"): ("not_delivered", "not_owned"),
+    ("unproved", "exit"): ("not_delivered", "not_owned"),
+    ("unauthorized", "native"): ("not_delivered", "not_written"),
+    ("queued", "native"): ("not_delivered", "not_written"),
+    ("queued", "exit"): ("not_delivered", "not_written"),
+    ("written", "native"): ("unconfirmed", "no_answer"),
+    ("written", "native_ok"): ("in_turn", "answered"),
+    ("written", "native_refused"): ("not_delivered", "refused"),
+    ("written", "native_other"): ("unconfirmed", "other_answer"),
+    ("written", "exit"): ("unconfirmed", "turn_cut"),
+    ("written", "exit_ok"): ("unconfirmed", "turn_cut"),
+    ("partial", "native"): ("unconfirmed", "partial"),
+    ("partial", "exit"): ("unconfirmed", "partial"),
+}
+
+
+@pytest.mark.parametrize("state, end", sorted(STEER_CELLS))
+def test_cells_every_slot_state_by_every_end_of_n(henv, state, end):
+    host, s, child, _ = host_n(henv, prove=state != "unproved")
+    if state == "queued":
+        child.accept = 0
+    if state == "partial":
+        child.accept = 10
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=state != "unauthorized")
+    host.tick()
+    if state == "partial":
+        child.accept = 0        # the rest waits
+    reqs = steers_of(child)
+    if end in ("native_ok", "exit_ok"):
+        answer_steer(child, reqs[0], {"turnId": cx.TURN})
+    elif end == "native_refused":
+        answer_steer(child, reqs[0], error={"code": -32600, "message": "no active turn to steer"})
+    elif end == "native_other":
+        answer_steer(child, reqs[0], error={"code": -32603, "message": "internal error"})
+    if end.startswith("native"):
+        child.emit(cx.message("done"), cx.completed())
+    else:
+        child.code = 1
+    [ended] = ended_of(host.tick())
+    assert (ended.steer["outcome"], ended.steer["why"]) == STEER_CELLS[(state, end)]
+
+
 def test_host_drain_reads_a_native_end_before_a_shutdowns_signal(henv):
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
@@ -844,6 +888,32 @@ def test_e_the_status_is_posted_at_least_every_20_s_while_a_steer_is_held(env):
     tick(env)
     tick(env)
     assert runner.report_ack[sid][0] > first and runner.report_ack[sid][1] == 1
+
+
+def test_o_a_hellos_contact_counts_from_when_it_was_sent_not_when_its_answer_came(env):
+    """Part O: node.py's `last_hello` is a receipt time; the steer's clock takes the hello's SEND time, and a
+    report's, so a slow hub never makes the node's authority look younger than the hub's evidence."""
+    runner = env.node.sessions
+
+    class Slow:
+        def __init__(self, hub, clock):
+            self.hub, self.clock = hub, clock
+
+        def request(self, method, path, **kw):
+            sent = self.clock()
+            out = self.hub.request(method, path, **kw)
+            self.clock.advance(30)          # the answer comes 30 s after the request was sent
+            self.sent = sent
+            return out
+    slow = Slow(env.laptop, env.clock)
+    env.node.client = slow
+    env.node.hello()
+    assert runner.hello_ack == slow.sent and env.node.last_hello == slow.sent + 30
+    sid, child = codex_turn_in_flight(env, prove=False)
+    runner.client = slow
+    runner.reported.clear()
+    runner._flush()
+    assert runner.report_ack[sid][0] == slow.sent, "a report's contact is its send time too"
 
 
 def test_e_the_watchdog_revokes_on_acknowledged_send_times(env):
