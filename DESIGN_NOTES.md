@@ -9127,15 +9127,18 @@ notes are closed in one commit on top of the reviewed one.
 
 ## Mid-turn steering, loose contract: design (2026-11-24)
 
-Status: design only, round 8. R6 ("Restarting a running turn") still holds on main: `steer` is refused for every
+Status: design only, round 9. R6 ("Restarting a running turn") still holds on main: `steer` is refused for every
 session. History: the first attempt ("Mid-turn steering: design (2026-11-23)", parked on `claude/mid-turn-steer`,
-review S-01..S-10 in docs/mid-turn-steer-review.md) used a Stop hook and a spool. This design has had seven reviews
-(L-, M2-, R3-, R4-, R5-, R6-, R7- findings, mapped in P). The owner ruled **"Claude too, T3's way"** after M2-01
+review S-01..S-10 in docs/mid-turn-steer-review.md) used a Stop hook and a spool. This design has had eight reviews
+(L-, M2-, R3-, R4-, R5-, R6-, R7-, R8- findings, mapped in P). The owner ruled **"Claude too, T3's way"** after M2-01
 showed that
 Claude Code cannot be made to put a steer only into the turn it targets: a Claude steer that misses may run as the
 process's next turn, and some Claude steers will be reported `unconfirmed` after Claude may already have acted on
 them. Since round 4 the host **holds N's end** while a written Claude steer is unresolved (T3 Code's `heldResult`),
-so on the hub a steer lives exactly as long as its turn. Rulings are cited by letter and number (C- to H-).
+so on the hub a steer lives exactly as long as its turn. On 2026-11-24 the owner decided the eight questions of
+round 8 as recommended (M) and chose to **build an independent guard** (E): a small per-process guard fences the
+provider if the node stops, so a timed release of a checkout is safe. Rulings are cited by letter and number (C- to
+J-). Part C (step 1) is being built on `claude/turn-correlation` and is unchanged in this round.
 
 **In one paragraph.** A steer S is sent with `mode: steer` by the sender of the turn N in flight, and is bound to N:
 it is stored apart from messages, is first shown to the node only while N's checkout is provably still N's, has
@@ -9163,7 +9166,7 @@ model read or followed S (both positive outcomes are evidence of admission); tha
 `unconfirmed` steer was not acted on; any automatic retry. `auto` never steers. An outcome comes when N settles; where
 main can leave N unsettled, S waits with it and is not written.
 
-**Three stated exceptions to "N's result is never lost"**, each for the owner to accept (open questions 6 to 8):
+**Three stated exceptions to "N's result is never lost"**, each accepted by the owner (M, decisions 6 to 8):
 - **Before the checkpoint** (E-1): until a checkpoint of N's held result has been committed at the hub,
   a node crash, a partition, or the hub settling N by itself (close, cascade, orphan, lost node) loses N's native
   result exactly as main loses any end the node has not yet reported: N is recorded failed (lost, closed), S
@@ -9292,7 +9295,7 @@ host completes the frame while authority lasts, for at most 5 s; otherwise it st
 has written (`_read`; `_reap` returns at once for a live child), and stops the process. That can cut a running N that
 main would have let finish (main's partial-write checks apply only while it writes an ordinary turn); N is reported
 honestly (its native result if it had one, else failed: "the session's process was stopped: a steer to it could not be
-written whole"), S `unconfirmed`. Open question 7. If N's native end comes before any byte was written, S is
+written whole"), S `unconfirmed` (decided, M 7). If N's native end comes before any byte was written, S is
 `not_delivered`.
 
 **At N's native end**, mutually exclusive (F-4):
@@ -9337,86 +9340,160 @@ process must stop: `_stop`, then wait for confirmed process-group exit (`group_a
 quiet; (4) **emit** the cached end of N exactly once, before any session `ended`. Hooks: `_hold_to_timeout` (bound),
 `_reap` (exit), `cancel` (N's cancel: "cancellation requested; a turn that had already completed keeps its result":
 N reports its native result), the host's `_end` (close, cascade; it emits `ended` today right after `_stop`, so a
-session whose host holds a steer, in any state, defers `ended` to confirmed exit: E's checkout rule), `stop_turns`
+session whose host holds a steer, in any state, defers `ended` to confirmed exit; the hold itself is released by
+E's rule), `stop_turns`
 (self-stop), each pass's authority and contact checks,
 and shutdown: `node_sessions.signal()` sends SIGTERM before `stop_all`'s bookkeeping, so it first drains each holding
 session (steps 1 and 2), and `stop_all` emits the decided end in place of its `_fail` once the group is gone.
 
-### E. One contact clock, and the fence
-
-**Authority uses the hub's own evidence** (E-2): the newer of the node's last acknowledged hello and its last
-acknowledged report for the session, by SEND time, must be under `NODE_LOST_SECONDS` minus the node's shutdown bound
-(180 - 105 = 75 s) old. Listing GETs alone do not renew it. While a steer is written or a hold runs, the session loop
-posts the session's status at least every 20 s (it sets the hub's `node_reported_at`, which `_lost` reads), so a
-healthy node never nears the margin. The watchdog (`enforce_deadlines`) drives the check, off the hub-I/O path. When
-the clock goes stale, authority is lost for good and the finalizer runs.
-
-**The bounds, sending apart from confirming** (R4-09): SIGTERM is sent at most 75 s after the last acknowledged
-evidence plus the watchdog's slack (`watch_seconds` + LOCK_SLACK_SECONDS, 2.5 s); SIGKILL at most `kill_grace_seconds`
-(10 s) plus the slack after that; both before the hub's 180 s. Confirmed exit normally follows SIGKILL at once, but a
-group that outlives SIGKILL (session_host `_lingering`) has no bound.
+### E. The contact clock, the checkout hold, and the guard
 
 **What main does today for any running turn** (hosted.py `may_still_run` line 925, `_lost` lines 1021 and 1031;
 hosted_wake `turn_sessions` lines 865 and 875; session_host `_end` line 1171, `_lingering` line 1018; node_sessions
-`_call` line 297, `_renew_contact` line 310). An ended session's checkout is freed once its node's loop has applied a
-listing built after the end, "though the old process may still be inside its kill grace"; a group that survives
-SIGKILL is not waited for; `_lost` reads only the node's hello and the session's report, while the node's own
-self-stop clock is renewed by listing GETs too, so a lease the hub expired can be revived by a later hello; and the
-dispatcher's launch check reads `turn_sessions` fail-open (dispatch.py line 2287: "a failing hosted pass never stops
-the dispatcher", pinned by tests/test_hosted_wake.py's
-`test_a_failing_wake_pass_fails_neither_the_nodes_fetch_nor_the_dispatcher`). For ordinary turns all of that stays
-as it is (N); steering adds one rule of its own.
+`_call` line 297, `_renew_contact` line 310, `_watch` line 1066; dispatch.py `_launch_check` line 2287). An ended
+session's checkout is freed once its node's loop has applied a listing built after the end, "though the old process
+may still be inside its kill grace"; a group that survives SIGKILL is not waited for; `_lost` reads only the node's
+hello and the session's report, while the node's own self-stop clock is renewed by listing GETs too; the launch check
+reads `turn_sessions` fail-open (pinned by tests/test_hosted_wake.py's
+`test_a_failing_wake_pass_fails_neither_the_nodes_fetch_nor_the_dispatcher`); the self-stop watchdog runs inside the
+node process, so a frozen or crashed node fences nothing (R8-02); and the node's clocks are `time.monotonic`, which on
+macOS is `mach_absolute_time()` and does not advance while the machine sleeps, so after a sleep longer than the hub's
+180 s a running turn's self-stop deadline has not moved at all. For ordinary turns all of that stays as it is (N);
+steering adds the evidence, the hold and the guard below, and the guard ships first (L).
 
-**The one checkout rule** (H-1). An attempt (N in this session, in the process incarnation that ran it: N is handed
-once, so N's message identifies it) that has an EXPOSED, UNRESOLVED steer holds its checkout against dispatch, fail
-closed.
-- **Exposed** means an offer of S was committed (`listed_at` set). From that commit N's message carries
-  `steer_hold` (set in the same transaction), and the hold outlives the steer's own settlement: occupancy is never
-  read off the verdict.
-- **The launch check** (dispatch `_launch_check`, in the claim's own transaction) reads the hold directly, apart from
-  `turn_sessions`: a live `steer_hold` on a message whose session runs in that checkout (the same node-and-directory
-  identity `turn_sessions` uses) refuses the claim (CHECKOUT_BUSY), and so does a failure to read it. This is
-  deliberately fail-closed and separate; the fail-open read of `turn_sessions` and its test are unchanged.
-- **Released only by positive end evidence for the attempt**: N's end from the owning host (an ordinary end, or the
-  finalizer's, which already means confirmed process-group exit whenever the process was stopped), or the node's own
-  `ended` for the session (`report`'s `node_ended_at` for a session the hub ended first). For a session whose attempt
-  holds a `steer_hold`, the host sends `ended` only after confirmed group exit, whether or not the hold had begun.
-- **For a node that never reports again**: released when the hub counts the node lost (`_lost`: `NODE_LOST_SECONDS`,
-  180 s after the later of its last received hello and the session's last received report), which is main's rule for
-  a dead node. By then the node has fenced itself: authority lapses 75 s after its last acknowledged send, SIGTERM
-  follows within the watchdog's slack (2.5 s) and SIGKILL within `kill_grace_seconds` plus the slack (12.5 s more), so
-  the group is killed at most about 90 s after that send, and every receipt comes at or after its send. **So dispatch
-  can be kept off the checkout at most 180 s after the hub's last receipt of a hello or report**, and, while the node
-  lives, for the hold's bound plus the fence (I). Groups that outlive SIGKILL stay unbounded, as on main.
-- **The void lives on N's attempt** (H-1d): `steer_void_at` on N's message, set irreversibly by a dispatch claim or
-  launch that takes N's checkout while N is delivered. With the launch check above, that can happen only before any
-  steer is exposed (N counted lost and later revived by a hello, or the fail-open `turn_sessions` read failing): it
-  bars any later steer into that N for good. The triggers on settlement or loss of N are dropped as unneeded: an offer
-  needs N delivered and not expired, so a settled or lost N is never offered.
+**The evidence, one for both sides** (R8-01). Each hosted provider process has a process id `proc` (a random token the
+host draws at spawn) and each node process a run id `node_run`. A node names its live, guarded processes (`procs:
+[{session, proc, armed}]`) in its hellos and in its session reports, sent only to a hub that names the feature
+`guard`. **`a`** is the SEND time, on the node's sleep-inclusive clock (the guard's clock, below), of the node's latest
+hub-acknowledged hello or report that names `proc`; **`alive_at`** is the hub's RECEIPT time of the latest such
+hello or report from the same `node_run`; every receipt is at or after its send. A replacement node process (another
+`node_run`) never names an old `proc`, so its hellos can neither keep an old attempt's hold alive nor release it.
+
+**The checkout hold** (H-1, R8-01, R8-04). An attempt (N in this session, run by `proc`) holds its checkout against
+dispatch, fail closed, from the first committed offer of a steer into it until the hold is released. The hold is a
+record of its own, `host.hold.<session>.<N>`: `node`, the checkout's identity (as `turn_sessions` and `_checkout_busy`
+name it: node and project path, or the child's own worktree), `proc`, `node_run`, `alive_at`, `guard` (`armed` or
+`lost`), `released_at`, `how`. It is independent of N's and the session's state: neither `_lost` (false once a turn is
+settled or a session ended) nor pruning (settled messages, ended sessions: `_prune` skips hold records until released)
+touches it. The launch check (dispatch `_launch_check`, in the claim's own transaction) reads hold records directly,
+apart from `turn_sessions`: a live hold on that checkout refuses the claim (CHECKOUT_BUSY), and so does a failure to
+read them; the fail-open read of `turn_sessions` and its test are unchanged. Release is irreversible (`released_at`
+set once) and also voids N's attempt for steering (`steer_void_at`).
+
+**The one release rule** (J-5). A hold is released by the first of:
+1. **quiet, from the owning host**: N's end from the owning `node_run`, carrying the steer extension with `quiet:
+   true`, which the host sets only when S is resolved with the process still under the host's control and nothing of
+   S can still run (S in N's result; zero bytes written; S's own turn ended; a bracket proved to have consumed S). It
+   is never set on an end the host makes before signalling the process (a cancel's or a close's synthetic
+   `turn_ended`), nor when the outcome needed a stop: then only 2 releases it (R8-03);
+2. **exit evidence for `proc`**: a confirmation, written after confirmed process-group exit, that names this `proc`
+   (the guard's durable file, or the owning host's own after a confirmed exit when its guard was gone), reported by
+   any process of that node, the replacement included, through the exits route (below), which is handled apart from
+   result settlement and is never suppressed by `dropped` or by the session having ended;
+3. **timed**, for a node that never reports again: `alive_at` + `NODE_LOST_SECONDS` (180 s), unless the hold's guard
+   was reported `lost` (then only 1, 2 or an operator's clear release it: open question I-2).
+Nothing else releases it: not a fresh hello, not N's settlement, not the session's end, not a replacement's generic
+LOST or `ended`.
+
+**Why the timed release is safe: the guard** (J-1, R8-02). Each hosted provider process (Claude and Codex) has a
+guard: a small separate process that fences the provider's process group when the node can no longer show that the
+hub still counts it alive, whether the node is healthy, crashed or frozen.
+- **Launch** (J-2): in session_host `_spawn`, right after `dispatch.spawn_piped` (line 1657, `start_new_session=True`:
+  the provider leads its own group) and before the host writes anything but the provider's own handshake, the host
+  starts `python -I -S agent_comms/session_guard.py` by path (stdlib only, no site), with `start_new_session=True`,
+  `close_fds=True`, stdin and stdout as pipes, cwd the node's log directory, argv: the provider's pgid, its leader's
+  start time (as `dispatch.process_start` reads it), `session`, `proc`, the evidence directory. Its own session means
+  a node crash, a signal to the node's group or a frozen node leaves it running; it does not touch the node's event
+  loop. It is not a node_groups entry (it does no work in the checkout).
+- **Armed**: the guard checks that the pgid's leader has that start time, then writes `armed` on its stdout. The host
+  writes no turn to the provider before `armed` (as it waits for `sealed` today), and stops the provider if it does not
+  come within 5 s. While armed the host checks the guard's liveness every pass (its `poll()`); `procs` names a process
+  `armed` only while its guard is live. **No live guard, no steer authority**: no offer is made for an attempt whose
+  `proc` is not armed, and `steer_for` refuses.
+- **Heartbeat** (a pipe, the guard's stdin): every 5 s the node's watchdog thread (`_watch`, off the loop's lock and
+  off hub I/O) writes one line `beat <busy> <age>`, where `age` is now minus `a` on the node's sleep-inclusive clock and
+  `busy` says whether the process has a turn in flight, a hold, or a written steer. A pipe, rather than a socket or a
+  file's mtime, because it needs no files or ports, its EOF tells the guard at once that the node process is gone, and
+  it carries the age the deadline is computed from.
+- **Deadline**: while the last beat said `busy`, the guard's deadline is `a` + 150 s (beat receipt time plus 150 s
+  minus its `age`); an idle process has none (a frozen node's idle process can do on its own only what main already
+  lets it do: a CLI-started turn). At the deadline, or at once on EOF, it fences: SIGTERM to the group, SIGKILL after
+  `kill_grace_seconds` (10 s), each only after re-checking the leader's start time (a reused pid is never signalled),
+  then polls until the group is gone (`killpg(pgid, 0)` fails).
+- **Evidence** (J-1): whenever it sees the group gone, fenced or not, the guard writes
+  `<log dir>/sessions/<session>.<proc>.exit.json` (mode 600, written to a temporary file and renamed: atomic):
+  `session`, `proc`, `pgid`, the leader's start time, `exited_at` (wall clock), `how` (`exited`, `sigterm`,
+  `sigkill`). Then it exits. The host reaps it. A node process, the replacement included, reports each such file
+  through the exits route and deletes it only after the hub acknowledged it.
+- **The guard lost**: if the guard dies while its provider lives, the host starts a new guard for the same group (the
+  leader's start time checked again); if that fails, the host stops steering that process, finalizes any hold with a
+  fence, and reports `guard: lost` for it, which turns off the timed release of its holds. If the node and the guard
+  both die, nothing reports that, and the timed release proceeds unfenced: a residual of two independent failures
+  (N).
+
+**The arithmetic** (R8-02). All node-side times are on the node's sleep-inclusive clock, anchored at `a`; the hub's on
+its own clock, anchored at the receipt `alive_at` ≥ `a`. No time is compared across machines.
+
+| event | at most |
+| --- | --- |
+| steer writes allowed (authority) | while now − `a` < 75 s |
+| healthy node, hub unreachable: the finalizer's SIGTERM / SIGKILL (watchdog slack 2.5 s each) | `a` + 77.5 s / `a` + 90 s |
+| node crashed (EOF): the guard's SIGTERM / SIGKILL | 1 s / 11 s after the crash |
+| node frozen or asleep, busy process: the guard's SIGTERM / SIGKILL / confirmed exit (1 s polls) | `a` + 151 s / `a` + 161 s / `a` + 162 s |
+| the hub's timed release | `alive_at` + 180 s ≥ `a` + 180 s |
+| margin between the guard's confirmed exit and the hub's release | at least 18 s |
+
+A heartbeat every 5 s against a 150 s deadline tolerates a node loop stalled for minutes; the deadline only bites when
+the hub's evidence is itself old. The 150 s also costs something: a machine that sleeps between about 150 and 180 s
+with a turn in flight loses that turn on wake, although the hub would have kept it (N). Residuals: a group that
+outlives SIGKILL (no exit evidence; the timed release proceeds, as main frees a dead node's checkout); the guard and
+the node both killed (above).
+
+**The sleep case** (J-3). The main laptop is a node, the hub runs on the server Mac. A sleeping machine runs neither the
+node, nor the guard, nor Claude.
+- **The guard's clock**: `time.clock_gettime(time.CLOCK_MONOTONIC)` on macOS, which Apple documents as continuing to
+  advance while the system sleeps and which no one can set (`time.monotonic` there is `mach_absolute_time()`, which
+  stops during sleep; the wall clock can be set); `CLOCK_BOOTTIME` on Linux. The node computes `age` on the same clock.
+  Release gate M9 confirms it on the laptop with a real sleep.
+- **Sleep under 150 s after `a`**: on wake nothing has passed any deadline; the node's next hello renews `a`; nothing
+  changes, as on main.
+- **Sleep past 180 s**: the hub has counted the node lost and released the hold (rule 3). On wake the guard's first poll
+  (within 1 s) finds its deadline long past and fences. Whether the guard's SIGTERM lands before Claude, which wakes at
+  the same moment, starts S cannot be guaranteed: the kernel resumes all three together. What makes it safe is where
+  other work for that checkout could run. A checkout is identified across hub and nodes by node and directory: a
+  dispatched run for a node's checkout runs on that node (its record holds the node's name and the project path), and
+  a hub-local run uses the hub's own run directory for the project (`_checkout_busy` counts it as colliding with any
+  node's session of that project "on the safe side", although it is another machine's directory). So while the laptop
+  sleeps, nothing can run in its checkout anywhere; a hub-local run on the server Mac works in another filesystem. On
+  wake, a run the hub let dispatch claim for the laptop's checkout is started by the laptop's node, through
+  node_groups: the host registers the provider group of an attempt with an exposed steer as `held`, a state that, like
+  `stopping`, refuses any start in its directory until the group is gone. So the only thing that can run in that
+  checkout after wake, before the fence completes, is S (and N's tail) in the old process, for at most the guard's
+  grace; its outcome is `unconfirmed`, as the hub already settled it.
+- **Sleep between 150 and 180 s**: the guard fences on wake; the hub has not released; the node reports the fenced
+  attempt's exit evidence, which releases the hold by rule 2.
 
 **Walks.**
-- **R7-02: a hub-first close with S already in Claude's queue.** S is exposed (`steer_hold` set). The hub ends the
-  session (node not connected): N and S settle by G's rule, but `steer_hold` stays. The node reconnects, closes the
-  session (SIGTERM) and applies the listing that omits it; on main that acknowledgement frees the checkout
-  (`may_still_run`), but the launch check still refuses on `steer_hold`. During the old process's kill grace Claude
-  finishes N and starts S as its own turn: it runs under the hold. The finalizer drains, fences, and only after
-  confirmed group exit the node reports N's end (ignored for settlement: N is settled) and `ended`; `node_ended_at`
-  releases the hold; only then may dispatch claim.
-- **R7-01: an offer in transit while `turn_sessions` fails.** The offer commits (`steer_hold` set); the response is in
-  transit; `turn_sessions` raises in a launch transaction; the launch check reads `steer_hold` and refuses (a failed
-  read refuses too). The node writes S under a checkout nobody else holds.
-- **R6-01's walk: listed, response lost, N expires, a claim, a later hello.** The claim's launch check sees
-  `steer_hold` and refuses, so no claim is made until N's end evidence or the node is lost; if the node is lost, the
-  claim (allowed then) sets `steer_void_at`, and N, revived by a later hello, is never offered again.
-- **A claim before any steer** (N lost, a run, then a hello): `steer_void_at` is set; a later steer into N is refused
-  at acceptance ("this turn's checkout was taken while it ran").
+- **R7-02 and R8-03: a hub-first close with S queued in Claude.** The hub ends the session (node not connected); N and
+  S settle by G's rule; the hold record stays. The node reconnects and closes the session (SIGTERM; synthetic ends
+  are no release evidence); its session is `dropped` for ordinary reports, but exits are not. Claude may start S in
+  the old process during the grace: the hold and node_groups' `held` state keep everything else out. After confirmed
+  exit the guard writes its file; the node reports it; rule 2 releases the hold.
+- **R7-01: an offer in transit while `turn_sessions` fails.** The offer commits (the hold record is written); the
+  launch check reads the hold and refuses (a failed read refuses too).
+- **R6-01: listed, response lost, N expires, a claim, a later hello.** The launch check refuses while the hold lives;
+  if the owning node goes silent, the guard fences by `a` + 162 s, and only at `alive_at` + 180 s may dispatch claim;
+  the claim voids N's attempt, and N, revived by a later hello, is never offered again.
+- **R8-01: a lost turn, then a replacement node.** `_lost` settles N and clears `in_flight`; the hold does not read
+  `_lost` and lives on. The replacement node's hellos name only its own processes; it reports the old guard's exit
+  file, which releases the hold; failing that, `alive_at` + 180 s does.
+- **A claim before any steer** (N counted lost, a run, then a hello): `steer_void_at` is set on N's attempt; a later
+  steer into N is refused ("this turn's checkout was taken while it ran").
 
-**An offer in transit** (G-1). The node also uses an offer only if (i) the listing request that returned it was SENT
-while the node's contact clock was fresh (its last acknowledged hello, or report naming the current N, sent under 75 s
-before), (ii) the clock has not gone stale since that send (staleness revokes a held offer for good, written or not),
-(iii) it is fresh at write time, and (iv) the request's age, measured on a monotonic clock, is under 20 s when the
-answer is read (the HTTP timeout is not a wall-clock limit). With the checkout rule these are belt and braces: they
-keep a node that lost contact from writing at all.
+**An offer in transit** (G-1). The node also uses an offer only if (i) the request that returned it was SENT while
+authority held (now − `a` < 75 s), (ii) authority has not lapsed since that send (a lapse revokes a held offer for
+good), (iii) it holds at write time, and (iv) the request's age, on a monotonic clock, is under 20 s when its answer is
+read. With the hold these keep a node that lost contact from writing at all.
 
 ### F. Codex steering
 
@@ -9442,20 +9519,21 @@ Codex, in step 2); a zero-byte frame is removed and its request id retired befor
 key for repeats); `text` (until settled); `listed_at` (set once, below); `cancel` (with N's cancel); `outcome`, `why`,
 `settled_at` (null until set once, at N's end); for `next_turn` a `result` (S's `ok`, `detail`, `denials`, its own
 `meta`, kept apart from N's and never added, and its reply); `request_id`, `sent_by` (the session's receipts gain
-`{"steer": N, "at"}`, seven days from acceptance). N's message gains `held` (the checkpoint) during a hold,
-`steer_hold` (E's checkout rule) from S's first offer until positive end evidence, and `steer_void_at` (E) when its
-attempt is void. No session field is added. One steer per N, one unsettled per session, no checkout reservation of its own.
+`{"steer": N, "at"}`, seven days from acceptance). N's message gains `held` (the checkpoint) during a hold, `proc` (E)
+from its `delivered`, and `steer_void_at` (E) when its attempt is void; the checkout hold is a record of its own
+(`host.hold.<session>.<N>`, E). No session field is added. One steer per N, one unsettled per session, no checkout
+reservation of its own.
 
 **Every offer** (G-1, H-1). EVERY offer of S, not only the first, is made in the listing's write transaction
 (`hosted_wake.listing`'s `deliver`, made due by an eligible steer), which first revalidates: S unsettled; N's attempt
 not void (`steer_void_at`, E); N delivered to this node, not cancelled, not expired (`_lost`, `may_still_run`); no
 dispatch claim or run holds the checkout (the inverse of `_checkout_busy`). A failed check means S is never rendered
-again. The first offer sets `listed_at` (the evidence of possible exposure) and N's `steer_hold` (E's checkout rule)
-in that transaction. Another hosted session's turn does not take N's checkout: main lets sessions share one (a child in
-the shared checkout runs beside its parent; `_checkout_busy` reads dispatched runs and claims only). The renderer
-shows S only from a committed offer, on every path, the wake-listing fallback included; eligible steers are part of
-the listing `version`; the commit precedes the answer. Each offer carries N's number and S's uuid (the host dedupes
-repeats by uuid); the node's own checks are in E.
+again. An offer needs N's `proc` known and `armed` (E). The first offer sets `listed_at` (the evidence of possible
+exposure) and writes N's hold record (E) in that transaction. Another hosted session's turn does not take N's
+checkout: main lets sessions share one (a child in the shared checkout runs beside its parent; `_checkout_busy` reads
+dispatched runs and claims only). The renderer shows S only from a committed offer, on every path, the wake-listing
+fallback included; eligible steers are part of the listing `version`; the commit precedes the answer. Each offer
+carries N's number and S's uuid (the host dedupes repeats by uuid); the node's own checks are in E.
 
 **The node** (protocol 5) passes a listed S, and an authoritative omission, to the host. N's end is never held for
 feature discovery: to a hub that names `steer` it carries the `steer` object (`outcome`, `why`, and for `next_turn`
@@ -9489,7 +9567,7 @@ that are gone.
 
 ### H. What the sender sees, and who may steer
 
-**Who.** Only N's own sender (open question 2): the human into a `user` turn; a parent into a `task` turn it started in
+**Who.** Only N's own sender (decided, M 2): the human into a `user` turn; a parent into a `task` turn it started in
 its own child (`_own_child`), under its grant and ceiling (`ABOVE_NOW`), charged ONE child turn at acceptance. Never
 into a wake or result-delivery turn, nor while Codex runs a turn of its own.
 
@@ -9562,8 +9640,9 @@ A steer is invisible to older builds: not a message, so never listed as text or 
 | hub downgraded with a steer unsettled | not supported (the deploy rule); if it happens, the old hub strips the field: N's own result is intact, S's outcome and reply are lost; on re-upgrade the sweep settles S, leaving N as the old hub settled it |
 
 **The deploy rule** (README deploy notes): "Before installing an older hub over one with mid-turn steering, set
-`[dispatch.sessions] steer = false` on the hub, wait until `board session list` shows no session with a steer
-unsettled (each settles when its turn ends), then downgrade. A steer left unsettled through a downgrade is settled
+`[dispatch.sessions] steer = false` on the hub, wait until `board session list --all` shows no session with a steer
+unsettled and no checkout held (ended sessions included: a hold outlives its session until released, E), then
+downgrade. A steer left unsettled through a downgrade is settled
 `unconfirmed`, or `not_delivered` if it never reached a node, when the newer hub returns." Hubs before nodes.
 
 ### K. With no steer sent: the named changes, and the proof
@@ -9574,11 +9653,16 @@ result turns and claims, and CLI text. The named changes:
   `user_message_uuid(s)` fields on existing `init` and `result` frames; the settings-answer redaction
   (`transcript_line`) is kept.
 - **Claude attribution** (step 1, verified incarnations): C's bracket table and the barrier during a CLI-started turn.
-- **Codex wire** (step 2): `turn/start.params.clientUserMessageId`, echoed as the `userMessage` item's `clientId`.
-- **Protocol, listing, records, settings** (step 2): `tree` 5 on fetch and hello, stored by the hub; `features` adds
+- **Codex wire** (step 3): `turn/start.params.clientUserMessageId`, echoed as the `userMessage` item's `clientId`.
+- **Protocol, listing, records, settings** (step 3): `tree` 5 on fetch and hello, stored by the hub; `features` adds
   `steer`; `modes` add `steer` where the CLI can; the listing `version` covers steers; `[dispatch.sessions] steer`
   (default on); the status posts of E, only while a steer is active.
-- **Text** (step 2): the `board_session_send` description, `--mode` help, and the parent cancel's words ("cancellation
+- **The guard** (step 2, every hosted Claude and Codex process): one more process per provider process (launched by
+  the session host, not through `session_spawner`, so the provider spawn calls the golden recording reads are
+  unchanged; the guard's own calls are asserted apart); the host waits for its `armed` before the first turn; hellos
+  and session reports carry `procs` and `node_run`, `delivered` carries `proc`, only to a hub that names `guard`; the
+  exits route and the exit files; no hub rule changes for ordinary turns (open question I-1).
+- **Text** (step 3): the `board_session_send` description, `--mode` help, and the parent cancel's words ("cancellation
   requested; a turn that had already completed keeps its result").
 
 **The proof.** The golden recording (tests/golden_schema_free.py, fixtures/schema_free_main.json) is re-pinned to main
@@ -9612,12 +9696,25 @@ stand-in only: a CLI-started turn taking S, the bound, a cancel and a close duri
 partition during a hold with and without a committed checkpoint, Codex refusal and internal error; the user's Codex
 config.toml unchanged. Real runs cannot force where Claude puts S, a CLI-started turn, or node silence.
 
-**Build order** (provisional: open question 1; each a reviewed PR; hubs before nodes):
-1. **Claude turn correlation** (C), node only; gates M3, M6, M7.
-2. **Codex steering**, with the shared authority, contact clock, cap and partial-write protection: the hub (store,
+**The guard's tests.** Unit: the guard alone (armed only for the right leader start time; the deadline from `age`;
+EOF; SIGTERM then SIGKILL; no signal to a reused pid; the evidence file written atomically on every kind of exit); the
+host waiting for `armed`, respawning a dead guard, reporting `guard: lost`; the hub's hold record through every
+release rule, pruning and the deploy check; the launch check against hold records. Stand-in e2e: a provider turn
+running when the node process is killed (`kill -9`: the guard fences within about 11 s and its evidence releases the
+hold) and when it is frozen (`kill -STOP` on the node's own test process: the guard fences at `a` + 150 s, the hub's
+timed release follows, no dispatched run starts in that checkout before the group is gone); the sleep case as far as
+it can be simulated (the whole test tree stopped with SIGSTOP and resumed with a clock that is advanced; the real
+clock across a real sleep is release gate M9).
+
+**Build order** (decided by the owner, 1; each a reviewed PR; hubs before nodes):
+1. **Claude turn correlation** (C), node only; gates M3, M6, M7. In progress on `claude/turn-correlation`.
+2. **The guard** (E), for every hosted Claude and Codex process, with the exits route, `procs`, `node_run`, the hold
+   records and the launch check's fail-closed read (unused until steering exists); no behaviour change while the node
+   is healthy; gate M9.
+3. **Codex steering**, with the shared authority, contact clock, cap and partial-write protection: the hub (store,
    `steer_target`, first exposure, listing, settling, views, CLI, API, MCP, the setting), the node, the host slot, the
    Codex proof; gate M5. Claude keeps `steers` false.
-3. **Claude steering**: the hold, the finalizer, the checkpoint, S's turn; gate M8, with its two results: (i) if M8
+4. **Claude steering**: the hold, the finalizer, the checkpoint, S's turn; gate M8, with its two results: (i) if M8
    fails to prove a distinct S turn, Claude steering still ships with three outcomes (`in_turn`, `not_delivered`,
    `unconfirmed`) and the hold; (ii) if M8 leaves N's result ambiguous (an S-only frame whose bracket ownership the
    format cannot establish without S), Claude steering does not ship for that format.
@@ -9627,18 +9724,27 @@ atomic durable write keyed to N and the process attempt, recovery before ordinar
 the hub acknowledges N's settlement, and no resend of S, and it still could not restore a result the hub had already
 settled. Also not done: buffering Codex frames that arrive before the start reply (R3-06), a follow-up of its own.
 
-### M. Open questions for the owner
+### M. Decided by the owner, and open
 
-| # | question | recommended | alternative, and its cost | agreement |
-| --- | --- | --- | --- | --- |
-| 1 | build order | (a) correlation, then Codex, then Claude steering | (b) Codex first: the Claude misattribution stays longer | builder and Sol agree |
-| 2 | a human steer into a turn the parent started | (b) refuse: steering stays with N's sender | (a) allow with a disclosure line: the parent's task gets two authors and its result a human's turn | builder and Sol agree |
-| 3 | a Codex steer refused because N had just ended | (a) `not_delivered`; the sender may resend | (b) the hub queues it as the next message: a steer is sometimes a message | builder and Sol agree |
-| 4 | the hold's bound | (a) the turn timeout from N's native end, then a fresh one once S's turn is proved; the fence timed apart (E) | (b) a short fixed bound: it stops CLI-started work the contract allows to come first | builder and Sol agree |
-| 5 | the hold and the single result | (a) as designed: on Claude, N's result (and any wait on it) comes after S's turn too, up to I's bound | (b) round 3's shape (N at once, S tracked on the hub): the hub-side gap and round 3's blockers | builder and Sol agree |
-| 6 | the loss exception (A) | (a) accept it: before a checkpoint is committed (including when one is dropped and the whole hold stays exposed), a crash, partition or hub-side settlement loses N's native result as main loses any unreported end; after commit, every settlement of N keeps it | (b) also defer the hub's own settlement of a delivered N on a steered session until the node reports or a longer bound passes: a close or lost node takes longer to settle, and a dead node still loses the result | builder and Sol agree on (a) |
-| 7 | the cut (D, A's second exception) | (a) a partial steer frame that loses authority or is not whole within 5 s stops the process, which can cut a running N (rare: the 12 KB cap, both CLIs read stdin); N's native result is kept if it had one | (b) never cut N: leave the part line and write nothing more to that process until N ends: the session can take nothing meanwhile, and a lost authority does not stop the process at once | builder and Sol agree |
-| 8 | the unattributable result (A's third exception, D) | (a) accept: after a steer, a runtime format deviation that leaves N's result unattributable reports N failed at the bound, S `unconfirmed`, the ambiguous reply published as nobody's | (b) fall back to order as main does: the steer's own reply can then be published as N's, with N's verdict made on it | builder and Sol agree on (a) |
+**Decided** (the owner, 2026-11-24, "accept all eight" as recommended; the round-8 reviewer agreed with each):
+1. Build order: correlation, then the guard, then Codex steering, then Claude steering (L).
+2. A human steer into a turn the parent started is refused; steering stays with N's sender.
+3. A Codex steer refused because N had just ended stays `not_delivered`; the sender may resend.
+4. The hold's bound is the session's turn timeout from N's native end, then a fresh one once S's own turn is proved;
+   the fence is timed apart (E).
+5. The hold and the single combined result (D, H).
+6. The loss exception before a checkpoint is committed, including a dropped checkpoint (A).
+7. The partial-write cut (D, A).
+8. The unattributable-result exception (D, A).
+And the release rule: an independent guard makes the timed release safe (E).
+
+**Open, raised by this round:**
+
+| # | question | recommended | alternative, and its cost |
+| --- | --- | --- | --- |
+| I-1 | the guard and ordinary turns | (a) the guard PR changes no hub rule for ordinary turns: they keep main's release on acknowledgement, and the follow-up "release a checkout on confirmed exit, not on acknowledgement" becomes a later, small change that reads the guard's exit evidence | (b) switch ordinary turns to release on exit evidence in the guard PR: one rule for all turns at once, but a behaviour change in the PR meant to change none, and dispatch waits a little longer after every stopped turn |
+| I-2 | what releases a hold whose guard was reported lost | (a) only quiet or exit evidence, or a human clearing it with a new `board session release-checkout <session> <N>` after checking the machine | (b) the timed release anyway: no human step, but a checkout can be reused while the unguarded process may still run S |
+| I-3 | the guard's deadline | (a) `a` + 150 s: an 18 s margin before the hub's release; a turn in flight is lost on wake after a sleep of 150 to 180 s | (b) `a` + 170 s: a sleep of up to 170 s keeps its turn, but the margin falls to about 0 s once SIGKILL and the exit poll are counted |
 
 ### N. Known limits
 
@@ -9654,14 +9760,19 @@ What the owner accepted, in plain words:
 And: both positive outcomes are evidence of admission, not of what the model did; `next_turn` waits for M8, Codex
 steering for M5, Claude steering for verified incarnations; one steer per turn, one unsettled per session, no restart
 meanwhile; no steer into a turn asked for data (F-5); steer text is capped at 12 KB encoded; S's reply is kept as long
-as N's message; a hub downgrade with steers unsettled is not supported. **The cost of the checkout rule** (E):
-while a steer is exposed and unresolved, dispatched work for that checkout waits, for at most the hold's bound plus the
-fence while the node lives, and at most 180 s after the hub last heard from a node that never reports again; a read
-failure of the steer hold makes dispatch wait too (fail closed). **Existing limits of main, unchanged for ordinary
-turns** (E): a checkout is released on the node's acknowledgement while the process may still be in its kill grace; a
-group that outlives SIGKILL is not waited for; a lease the hub expired can be revived by a later hello; the launch
-check's `turn_sessions` read fails open. Follow-up for all turns: "release a checkout on confirmed process-group exit,
-not on acknowledgement; an expired lease is not revived by a later hello".
+as N's message; a hub downgrade with steers unsettled is not supported. **The guard** (E): one extra stdlib Python
+process (about 10 MB) per live provider process, about 40 ms more per provider start; a turn in flight is fenced on
+wake after a sleep of 150 to 180 s that the hub would have survived; residuals: a group that outlives SIGKILL, and a
+guard and node both killed (the timed release then proceeds unfenced). **The cost of the checkout rule** (E): while a
+steer is exposed and unresolved, dispatched work for that checkout waits, for at most the hold's bound plus the fence
+while the node lives, and at most 180 s after the hub last heard, naming that process, from a node that never reports
+again; a read failure of the steer hold makes dispatch wait too (fail closed). **Existing limits of main, unchanged
+for ordinary turns** (E): a checkout is released on the node's acknowledgement while the process may still be in its
+kill grace; a group that outlives SIGKILL is not waited for; a lease the hub expired can be revived by a later hello;
+the launch check's `turn_sessions` read fails open; the node's self-stop clock (`time.monotonic`,
+`mach_absolute_time()` on macOS) does not run while the machine sleeps, so after a long sleep an ordinary turn the hub
+counted lost goes on (the guard fences it on wake once its deadline has passed). Follow-up for all turns: "release a
+checkout on confirmed process-group exit, not on acknowledgement; an expired lease is not revived by a later hello".
 
 ### O. Conditions for code review, and release gates
 
@@ -9689,9 +9800,19 @@ Design-level questions are closed; these go to code review (F-6, the round-5 rev
   a stale interval;
 - (R7-02) a hub-first close with S already queued in Claude, and S starting in the OLD process after the listing
   acknowledgement: dispatch stays refused until `ended` after confirmed group exit;
-- (R7-01) the launch check refusing on a live `steer_hold`, and on a failed read of it, while `turn_sessions` fails.
+- (R7-01) the launch check refusing on a live hold, and on a failed read of hold records, while `turn_sessions`
+  fails;
+- (R8-05) the check stays at dispatch reservation: a live hold leaves hosted sends and unrelated checkouts alone,
+  including shared hosted children and dispatch into a separate worktree; fail-closed applies only when dispatch cannot
+  establish that its destination is free; and an unattributed bracket that mentions S before its terminal result
+  cannot release a three-outcome hold;
+- the exits route: idempotent, accepted for ended and pruned sessions, never touching N's or S's settlement, a file
+  deleted only after acknowledgement.
 
 Release gates (each in the step that needs it, L):
+- **M9** (step 2): on the main laptop, a real sleep longer than 180 s with a stand-in turn in flight:
+  `CLOCK_MONOTONIC` advanced across it and `time.monotonic` did not; the guard fenced within a second of wake; no
+  dispatched run started in that checkout before its exit evidence;
 - **M3** (step 1): the first turns of a `--resume`d process echo (the real e2e, reading its own node's transcripts;
   main writes no uuids, so it cannot be measured earlier);
 - **M5** (step 2): the `userMessage` item with N's `clientId` and N's `turnId`, on a real Codex fresh start and a join;
@@ -9739,11 +9860,21 @@ findings.
 
 | finding | now |
 | --- | --- |
-| R7-01 dispatch can take a fresh offer's checkout | met (H-1): the launch check reads `steer_hold` directly and fails closed; the void lives on N's attempt and bars a later steer after a claim made before any steer |
-| R7-02 close releases the checkout before a queued S starts | met (H-1b): `steer_hold` outlives settlement and is released only by N's end or `ended` sent after confirmed group exit; the walk is in E |
+| R7-01 dispatch can take a fresh offer's checkout | met (H-1): the launch check reads the hold directly and fails closed; the void lives on N's attempt and bars a later steer after a claim made before any steer |
+| R7-02 close releases the checkout before a queued S starts | met (H-1b, redone in round 9): the hold outlives settlement and is released by E's rule; the walk is in E |
 | R7-03 the M8 fallback releases the hold without proof | met (H-2): in three-outcome mode only a result listing S, or a confirmed exit, ends the hold |
 | R7-04 the settlement rules disagree | met (H-3): one precedence for S, the owning host's extension first; the contrary sentence removed |
 | R7-05 the elapsed-time check | met: a monotonic age check (E), with its tests in O |
+
+**Round 8** (R8-01..R8-05, on bc79302):
+
+| finding | now |
+| --- | --- |
+| R8-01 a settled turn strands the checkout; fresh hellos keep an old hold | met (E): the hold is its own record with an attempt-scoped deadline (`alive_at`, from the owning `node_run` naming `proc`), independent of `_lost`; the same evidence drives node authority and hub expiry; release is irreversible |
+| R8-02 silence does not prove the watchdog ran | met (E): the guard fences without the node; the arithmetic, the residuals and the sleep case are stated |
+| R8-03 an end event is not release evidence | met (E): only `quiet` from the owning host, exit evidence for the exact `proc`, or the timed release; synthetic ends never; exits bypass `dropped` and settlement; a replacement counts only through the guard's evidence |
+| R8-04 pruning and the downgrade bypass a live hold | met (E, J): hold records survive both pruners until released; the deploy check counts live holds, ended sessions included |
+| R8-05 the scope of the check | carried into O |
 
 **The parked review's S-01..S-10**: S-01, S-08, S-09 gone (no hook, no spool, `auto` unchanged); S-02 is A's rule;
 S-03 and S-04 are met by the hold (a distinct state, an immutable copy, a bound, the finalizer) and the checkpoint,
