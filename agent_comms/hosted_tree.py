@@ -41,7 +41,7 @@ import uuid
 from typing import Any
 
 from . import db, hosted, nodes, session_access
-from .core import Board, Conflict, Invalid, Principal
+from .core import Board, BoardError, Conflict, Invalid, Principal
 from .nodes import _get, _put
 from .providers import validate_model
 
@@ -657,7 +657,13 @@ def start_child(board: Board, p: Principal, parent_id: Any, text: Any, **kw) -> 
         # oversized one. Then the schema, decided now; its refusal waits until a retry with the request id has been
         # looked for (create_child). Given but empty is decided too (R4-01): refused, never an ordinary turn.
         text = hosted._text(text)
-        output, asked, why = hosted.ask(text, schema, "human")
+        agent = kw.get("agent")
+        if agent is None:
+            try:
+                agent = hosted._session(board.conn, parent_id).get("agent")     # a child's default: its parent's
+            except BoardError:
+                agent = None
+        output, asked, why = hosted.ask(text, schema, "human", check=hosted.check_hint(board, agent))
         kw |= {"output": output, "refusal": why}
         text = asked or text
     from . import account_pools

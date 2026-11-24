@@ -218,7 +218,7 @@ def test_no_tool_takes_the_callers_session_as_an_argument(senv):
     tools = {t.name: t for t in asyncio.run(build_mcp(senv.board, "stdio").list_tools())}
     mine = {n: t for n, t in tools.items() if n.startswith("board_session_")}
     assert set(mine) == {"board_session_capabilities", "board_session_spawn", "board_session_send",
-                         "board_session_status", "board_session_cancel"}
+                         "board_session_status", "board_session_cancel", "board_session_check_result"}
     for t in mine.values():
         props = set((t.input_schema or {}).get("properties", {}))
         assert not props & {"session_id", "parent", "caller", "hosted", "key", "binding", "root"}, t.name

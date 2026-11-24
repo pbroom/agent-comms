@@ -7637,11 +7637,15 @@ session emitted.
 - The path is `$`, array indices, and property names taken from the ASKER's schema (ASCII-escaped, quoted, cut to 64
   characters). A name from the child's instance is never shown: "a property the schema does not name".
 - Each reason is the path plus a fixed phrase with types or counts: "expected integer, got string", "required
-  property "line" is missing", "not one of the enum's values", "longer than maxLength 500", "below minimum 1".
+  property "line" is missing", "not one of the enum's values", "longer than maxLength 500: it has 512 characters",
+  "below minimum 1". Since the in-turn check (2026-11-23, RC-07), the four length and count phrases add the
+  instance's own COUNT (a string's length in code points, an array's number of items), never a value.
 - A name is cut by whole characters (never inside an escape), with `...` inside its closing quote. A path drops
   whole leading parts (shown as `$...`), so it never splits a name.
 - The phrase is at most about 120 bytes. Every reason is built to fit in 150 bytes, never cut afterwards.
-- At most 10 reasons (the tenth "(and N more)"), capped while the walk runs, so 1,500 bytes in all.
+- At most 10 reasons (the tenth "(and N more)"), capped while the walk runs, so 1,500 bytes in all. The walk stops
+  once 1,000 more than those kept are counted (the tenth is then "(and at least 1000 more)"), so a block of 1,000
+  empty objects against 50 required properties costs 1,000 counts, not 50,000 (RC-03).
 - Every reason is ASCII, controls are escaped, and the separators are fixed: `; ` between reasons, after ` Why: ` in
   the hub line.
 
@@ -7702,7 +7706,8 @@ this message's frame. It does not prove which provider turn produced the reply. 
 A stronger guarantee would need provider turn correlation or verified exclusion of overlapping turns. Neither is part
 of this change.
 
-**No correction within the turn, and no automatic nudge.** The asker may send a follow-up with the schema again: an
+**No correction by the hub, and no automatic nudge.** (A session can now correct its own block inside its turn: "In-turn
+result check".) The asker may send a follow-up with the schema again: an
 ordinary turn of its budget.
 
 **Retries (first write wins).** A request-id retry is resolved BEFORE any schema refusal is returned. The schema may
@@ -8009,7 +8014,8 @@ A request closes exactly once, in its settlement transaction; from a closed stat
 
 ### Deliberately left out
 
-- **A submit tool and in-turn correction** (the first design, below).
+- **A submit tool** (the first design, below). In-turn correction is the check ("In-turn result check"), which
+  stores nothing.
 - **An automatic nudge turn.**
 - **Lifting the block out of the reply, a stored copy of the data, and any confidentiality** for asked data.
 - **Keeping the tail of an asked reply over 16 KiB.** That needs a node change.
@@ -8346,8 +8352,6 @@ commit on top of the reviewed one; its test is named in brackets.
 
 ### Follow-ups
 
-- **A submit tool and in-turn correction** (the first design, below): a rejection the session could fix before its
-  turn ends. It needs a per-attempt credential, node-side fencing and submission ids.
 - **The tail of an over-long reply.** A reply over 16 KiB loses its end, block included (`truncated`). Keeping the
   tail of an asked turn's reply needs a node change.
 - **Provider turn correlation.** The verdict reads the reply the host attributed to the message (D, "what the host
@@ -8375,7 +8379,718 @@ The second version moved the data into the reply but lifted the accepted block o
 showed that lifting created audience rules (R2-05) and a rollback that could consume prose and lose data (R2-06). This
 version records only a verdict and leaves the reply as main's.
 
-The tool approach stays on record in case in-turn correction is ever worth its cost:
+The tool approach stays on record. It was dropped from the follow-ups on 2026-11-23 (the owner's ruling): in-turn
+correction is now the check ("In-turn result check"), which stores nothing. What a stored submission would have
+cost and bought:
 - **What it would need:** a per-attempt submission credential with no other rights, node-side attempt fencing,
   submission request ids, and an explicit board MCP config in the reviewer setup.
 - **What it would buy:** a rejection the session can fix before its turn ends.
+
+## In-turn result check (2026-11-23)
+
+As built (agent_comms/output_schema.py, hosted.py, spawn_mcp.py and their callers), after one design review. Its
+findings RC-01 to RC-08 were requirements of the build; "Review findings" says where each is met and tested. The
+owner's rulings on the design's five questions: the frame RECOMMENDS checking, qualified on being able to call the
+tool, and keeps the truthful-result instruction; Codex gets the tool opt-in and no frame sentence; the stored
+submission is dropped from the follow-ups (kept on record under "Structured results", "First design"); reasons gain
+counts at settlement and in the check alike; the same-agent rule stays.
+
+**Why.** The one gap against T3 Code's `t3_submit_output`. In T3 a rejected submission names what did not fit, and
+the agent corrects it inside the same turn. Before this, a session learned nothing until its turn was over, and the
+asker had to spend another turn asking again.
+
+**In one paragraph.** A board tool, `board_session_check_result(block)`, CHECKS a candidate. The session passes the
+block it means to end its reply with, or its whole reply. The board reads the tokens of the text's opening marker
+lines, finds the open request among the caller agent's asked messages, and runs the settlement verdict itself on the
+text, capped as a reply is capped. It answers with that verdict's state, code and reasons. The board does not save
+this as a result or send it to the asker. The session's result is still, and only, the block at the end of its
+reply; the verdict is still, and only, made at settlement from that reply. A session without the tool works exactly
+as before.
+
+**Why this avoids the hazard of the first design** (SR-01 to SR-05, SR-11). There is no second data channel: the
+check carries nothing to the asker and leaves nothing behind for settlement to race or reconcile.
+- No result, field, record, counter or audit post is written, so nothing needs to be idempotent and no rollback has
+  anything to reconcile.
+- No credential is minted, and no attempt is fenced at the node: a check from a stale attempt, or from the wrong
+  process, changes nothing.
+- The answer is advice. The worst a wrong or stale answer can do is lead a session to end with a block that settles
+  `missing`, which is what happens without the check.
+
+**What is NOT claimed** (RC-02). The check sends the candidate to the board server to be validated. What the board
+does not do is save it as a result, write a record or post about it, or send anything to the asker. Other things
+happen as for any tool call:
+- the session's own transcript on its node keeps the call and the answer (the e2e reads them there);
+- authentication is the board's usual one: it re-reads agents.toml when the file changed and can then write identity
+  rows, and a worker thread's first connection runs its WAL set-up;
+- the MCP SDK answers a malformed argument (a `block` that is not a string) with its own validation error, to the
+  caller only, and logs the field name, never the value;
+- the board does not forward a check to the asker or notify the asker about it;
+- the MCP SDK logs a whole inbound frame at DEBUG, before any handler sees it, in two places of the pinned SDK
+  (2.2.0): the dispatcher's "transport yielded exception: %r" for a malformed raw stdio line, and the runner's
+  "dropped a frame received before the first request: %r" once its pre-request replay buffer (eight frames) is full.
+  The board's server keeps both lines and replaces the frame with its type's name (`mcp_server._NoRawEnvelope`, a
+  filter on exactly those two loggers, `RAW_FRAME_LOGGERS`, that rewrites exactly those two messages; round 1 R2-08,
+  round 2 R3-02). It applies process-wide to those loggers. A later SDK that logs a frame elsewhere is not covered
+  until the filter names it.
+
+### A. What the check is checked against
+
+The block names its own request. The tool takes one argument, `block`.
+- `output_schema.check_tokens(text)` reads the tokens of the lines that are opening markers at column zero (the
+  settlement grammar, `_marker`), distinct, the LAST line's first. More than 4 is refused before any lookup with a
+  fixed answer that asks for this turn's block alone (round 2, R3-01): cutting the list at four could drop the very
+  request the reply's own settlement reads.
+- `hosted.open_request(board, agent, tokens)` looks them up. Which request is checked is the CHECKER's choice, made
+  from the text alone: exactly one of the tokens must name an OPEN request, and that one is checked. Settlement is
+  pinned to its own message's token, and treats any other token's markers as quoted material. So a reply quoting an
+  earlier turn's (closed) block before its own is checked against its own, and a reply whose only opening line for
+  this turn's token comes before a quoted marker of a closed request is still checked against this turn's
+  (`test_the_last_opening_line_names_the_request`).
+- Two tokens that BOTH name open requests (a turn in flight and a queued one of the same agent) are **ambiguous**:
+  nothing is checked, and the answer asks for the block with this turn's token alone (round 1, R2-02). Checking
+  either could give advice that reads as this turn's and is not: the reviewer's two examples, B's opening marker
+  inside A's payload (the check would say `form` while A settles `not_json`) and a complete B block after a complete
+  A block (the check would say `accepted` while A settles `form`), are both tested
+  (`test_two_open_requests_named_in_one_text_are_ambiguous`). A caller that passes B's block alone still checks B:
+  the boundary is the agent.
+
+Why this, and not the alternatives the design weighed:
+- *(2) the caller passes the schema:* up to 8 KB more per call, and a schema copied with a change is checked against
+  the wrong schema with no warning.
+- *(3) the hub infers the request from a binding:* only sessions with a spawn grant (or open children) hold one
+  (`gives_binding`); the commonest asked sessions, a human's root or a reviewer in an ungranted project, do not.
+- *(1) a separate token argument:* one more thing to copy. Reading the tokens from the block checks the token the
+  reply will actually carry (measured: a Codex run miscopied its token and settled `no_block`; a check of that block
+  says "no open request has this token").
+
+**The lookup** (RC-01) is ONE SQL statement (`hosted._LOOKUP`), the same text for any tokens:
+- it reads only rows in the `host.session.` key range whose `$.agent` is the caller's and whose `$.output_asked` is
+  set, joined to their own `host.msg.<id>.` key range (both index range scans, `EXPLAIN QUERY PLAN`), where
+  `$.output.token` is one of the tokens (`json_each`). Another agent's messages are never in it (RC-04);
+- it projects five fields only (the key, the message's state, the request's state, schema and token);
+- it stops after 9 rows across all sessions (`LIMIT 9`: two per token and one more), and 9 rows is SATURATION: a
+  row beyond the cap could change the answer, so it is the fixed "could not look the request up" answer, never a
+  verdict (round 1, R2-03; `test_a_saturated_lookup_fails_closed`);
+- a progress handler gives it a work budget (20,000 calls, each after 1,000 SQLite VM steps) and a time budget
+  (0.5 s; cooperative, checked at each call, tested on its own), and the connection's busy timeout is 250 ms for it.
+  The connection's PRIOR busy timeout is read first and restored after (not a default), and the progress handler is
+  set and cleared by the lookup itself; nothing else on the board sets one. Out of budget, or busy: the fixed "could
+  not look the request up" answer. The budget is independent of retention, which depends on later writes;
+- one statement is one snapshot, and the cursor is drained and closed before anything is validated, so no settlement
+  can fall between two reads and the snapshot pins no WAL page while the check validates: a writer commits and a
+  TRUNCATE checkpoint completes while validation is paused
+  (`test_a_writer_commits_and_a_checkpoint_completes_while_validation_is_paused`).
+
+Its answer, per token, in the order above:
+- **open**: exactly one row, the request `asked`, the message `queued` or `delivered`, the schema a string. A
+  `queued` one counts: the node may have written the turn before its `delivered` report reached the hub;
+- **closed**: exactly one row, and the message settled or the request no longer `asked`. A message an older hub
+  settled (no verdict, the request still `asked`) is closed;
+- **none**: anything else: no row (an unknown, miscopied, pruned or another agent's token, or a message that asked
+  for nothing), or two rows for one token.
+
+Exactly one open token is checked; two or more are "ambiguous"; else "closed" if any token was closed; else "none".
+
+**What a holder of a token can learn** (RC-04). A token is a correlation, not proof ("Structured results", D). While
+a request is open its token is in its frame, so it is held by the session's process and transcript, the node, and the
+hub's record, each of which also holds the schema; the asker is never told it. After settlement the reply, token
+included, goes to the asker and the human, and the check then answers "closed". So:
+- a caller of the SAME agent holding an open token (another session of that agent, an interactive root, a dispatched
+  run) can learn that the request is open or closed, the verdict of the hub's validator on text of its choosing, the
+  asker's property names and bounds in the reasons, and, by repeated checks, whether a guessed enum or const value
+  fits. That is within the chosen boundary, the agent: the agent check is the authorization boundary;
+- a caller of ANOTHER agent gets "none", the same answer body as an unknown token, from the same statement (only the
+  bound parameters differ: tested by tracing the SQL on the connection that runs it). No constant time is claimed;
+- the HUMAN principal gets "none" before any lookup (round 1, R2-04), so even a retained session whose agent name an
+  identity refresh gave to the human is never checked for it
+  (`test_a_human_principal_gets_none_before_any_lookup_even_with_a_matching_row`);
+- blind guessing is no route: a token is 64 random bits, and at 60 calls a minute one eligible token has about a
+  1.7e-12 chance of being hit in a process-year.
+
+### B. Parity with settlement
+
+The check IS the settlement function on the checked text:
+
+```python
+output_schema.checked(request, text)
+  = answer_of(safe_verdict({"token", "schema", "state": "asked"}, ok=True, code=None, reply=cap_reply(text)))
+```
+
+`cap_reply` is the very cap the provider adapters and the hub apply to a reply (16,384 bytes, then the truncation
+marker). The strict decode, the 8,192-byte block cap, the nesting bounds, the number rules, the validator, its
+reasons and their caps, and the `internal` fail-open are all the same code.
+
+**What is promised** (RC-05). For the SAME request, and the COMPLETE provider-normalized reply of a successful turn
+attributed to that request, the check's `would_be`, `code` and `reasons` equal the verdict's `state`, `code` and
+`reasons`. Anything else can disagree, and the answer tells the caller what it can do about it:
+- a valid block for one open request passes the check and settles `no_block` on another: the answer and the
+  description say to use this turn's token;
+- a block checked alone can settle `form` if the rest of the reply quotes its marker or joins its opening line, and
+  `truncated` if the whole reply is over 16 KB: the answer says "pass your whole reply to check where the block sits
+  and the 16 KB size too";
+- the turn did not complete (any turn code); the host attributed another turn's reply (a self-turn); the session
+  changed the block after checking it.
+
+**Refusals give no verdict**, and are tested apart from parity: no opening marker at column zero (bare JSON, an
+indented block, a closing line alone, markers inline, a marker after a BOM), a text over 16,384 characters, none,
+closed, the limits, a failed lookup. None of them is a verdict code: the shipped codes are exactly
+`output_schema.CODES`.
+
+**How a test holds them together.**
+- `test_the_check_is_the_settlement_verdict_on_the_same_complete_reply`: 38 replies (every completed-turn code a
+  check can reach, the grammar's edges, the near-cap adversarial replies of "Structured results", a multibyte reply
+  over 16,384 bytes, and generated instances), each asked as its own message, checked through the MCP tool, then
+  reported through the node's real report route (which caps it), and compared field by field.
+- `test_a_fault_inside_the_verdict_is_internal_for_the_check_and_for_settlement`: `validate` (a stage inside
+  `safe_verdict`) raises, and both paths say `internal`.
+- `test_the_tool_runs_the_shared_settlement_function_on_the_capped_text`: the tool calls `safe_verdict` once, with
+  `reply=cap_reply(text)` (a path that stops using it fails here; the mutation table has it).
+- `test_the_four_count_reasons_say_the_instances_count_and_never_a_value` pins the wording itself, since parity
+  alone would pass if both paths forgot the counts (RC-07).
+
+### C. The tool and its answers
+
+```python
+async def board_session_check_result(block: str, ctx: Context = None) -> dict      # spawn_mcp.py
+```
+
+`block: str` exactly, as `output_schema` is: any other annotation makes the SDK pre-parse a JSON-looking string,
+collapsing duplicate keys before the strict decoder sees them (`test_the_block_is_taken_as_text_exactly`). The tool
+is not behind the spawn gate, and calls no `ident`, `resolve` or grant check: a human-asked root works with child
+sessions off.
+
+**The description** (`spawn_mcp.CHECK`, plus the board's DATA_WARNING):
+
+> Check a result-data block before you end your turn, when your turn's frame asks for this turn's result as data.
+> block: the block exactly as you will end your reply with it (the line <<<result-data T>>>, the JSON object, the
+> line <<<end result-data T>>>, with T this turn's token); pass your whole reply instead to check where the block
+> sits and the reply's size too. The board checks it against that message's schema with the same checks it makes
+> when your turn ends, and says whether it would be accepted or what does not fit. It is only a check: the board does
+> not save it as a result or send it to the asker, so this is NOT how you give your result. Your result is only the
+> block at the end of your reply, so after checking, end your reply with the block. Optional; at most 20 checks per
+> message.
+
+**The answer** is a dict of these keys only (`output_schema.CHECK_KEYS`): `checked`; `would_be` (`accepted` or
+`missing`, when checked); `code` and `reasons` (for `missing`); `result_saved` (always `false`); `next`, one fixed
+sentence. The reasons are the settlement reasons, byte for byte. Nothing of the candidate is echoed.
+
+The `next` sentences (`output_schema.CHECK_FITS`, `CHECK_MISSING`, `CHECK_NOT`):
+- fits: "Checked only: the board did not save this as your result or send it to the asker. This block fits the
+  schema, but your result is only the block at the end of your reply: end your reply with exactly this block (its
+  opening line, the JSON, its closing line), with this turn's token, and write nothing after it. This check saw only
+  the text you passed: pass your whole reply to check where the block sits and the 16 KB size too."
+- does not fit: "Checked only: the board did not save this as your result or send it to the asker. This block would
+  be missing (<code>): <words>. Fix what the reasons name; you may check again. Then end your reply with the
+  corrected block and write nothing after it: the board reads only the block at the end of your reply."
+- not checked: "Not checked: <why>. The board did not save anything as your result or send it to the asker. End your
+  reply with the block as your frame asks; the board checks it there when your turn ends."
+
+`<words>` are `output_schema.WORDS` with two written for the session (`CHECK_WORDS`): `shape` "the block does not fit
+the schema in your frame"; `truncated` "the text is over 16 KB or ends with the hub's truncation marker: a reply like
+it is cut and loses its end, where the block goes". The `<why>`s are `output_schema.WHY_*`: no marker, too long, none,
+closed, ambiguous ("the text holds opening marker lines of more than one open request: pass the block with this
+turn's token alone (the one in this turn's frame)"), too many ("the text holds opening marker lines of more than 4
+requests: pass this turn's block alone (with the token in this turn's frame)"), limit, rate, busy, failed.
+
+**Order**, each step bounded before the next reads anything (round 1, R2-01):
+1. the concurrency limit, on the event loop, before any worker is taken: a fifth call while four run is answered
+   "busy" at once;
+2. then ONE worker, under this tool's own `anyio.CapacityLimiter` (as many as the concurrency limit; never AnyIO's
+   shared one, so slow authentication cannot queue other tools' work): the caller's principal (the board's own errors
+   for a bad token or a node identity, unchanged), and the human principal answered "none" there, before any lookup;
+3. the per-agent rate, reserved before any read (`spawn_mcp.check_block` from here);
+4. `len(block)` in characters: over 16,384, not checked, and nothing else is read (R4-03's rule);
+5. the tokens, from one scan of at most 16,384 characters; more than 4 distinct ones: not checked, no lookup;
+6. the lookup;
+7. the per-request count, keyed by the request found (its message key), never the token text;
+8. `cap_reply` (it encodes at most 16,384 characters) and the verdict.
+
+Every step after admission runs off the event loop. Any exception after the principal becomes the fixed
+"could not look the request up" answer, logged as one fixed line with the exception's class name only
+(`spawn_mcp.CHECK_LOG`): never the block, its values or a trace (RC-02).
+
+### D. The frame
+
+One sentence (`output_schema._CHECK`) in the ask line, after "...indent each of its lines.", in `TASK_ASK_CHECK` and
+`HUMAN_ASK_CHECK`; the untrusted-data and truthful-result sentences follow it unchanged:
+
+> Before you end your turn, check your block with the board tool board_session_check_result (if it is not loaded
+> yet, search for it by that name with ToolSearch) and fix what it names. If you have no such tool or cannot call it,
+> skip this step; you need not say in your reply that you skipped it. It checks the block against this schema with
+> the board's own checks. It is only a check: the board does not save it as a result or send it to that session, and
+> it never replaces the block: your result is still only the block at the end of your reply, as described above.
+
+(The human's form says "the human" for "that session".) It adds 566 bytes to an agent's ask line, 563 to the human's.
+Round 1 (R2-06) qualified it three ways: the skip covers a tool that is listed but cannot be called (a selective
+allow list); the silence it allows concerns the skipped check only ("you need not say ... that you skipped it"), so it
+does not override a task that asks about tools; and "whatever it says, your reply must still end with the block"
+became "it never replaces the block: your result is still only the block at the end of your reply, as described
+above", which keeps the truthful-result sentence (leave the block out unless the schema lets you say so truthfully)
+in force.
+It names no server: "mcp__agent-comms__..." would be a guess, since the hub cannot know what a session's runner calls
+the board's server, and ToolSearch finds the tool by its own name. The wording was chosen by measurement in hosted
+sessions (Measured, "Choosing the sentence"): the first build's conditional form ("If you have the board tool ... and
+can call it") was used in 1 of 10 hosted runs, this one in 10 of 10, and a session without the tool mentioned the
+skipped check in 1 of 5 replies.
+
+**Who gets it** (`hosted.tells_check`, a hint, RC-06). The hub cannot see a session's tools: the node sees Claude's
+tool list only in each turn's `init`, after the frame was written, Codex reports none, and runner approvals are in the
+node's template. So:
+- a session whose agent's runtime starts with `claude` gets it, unless the hub's own `[dispatch]` runner for the
+  agent is known to be Codex's (`dispatch.uses_codex`: the node picks the adapter from the runner's executable, so a
+  Claude-labelled agent can run Codex);
+- a Codex runtime never does (open question 2 of the design, ruled: opt-in tool, no sentence);
+- a start that may name a pool before its member is chosen (`hosted.start`, the human's child start) gets it only
+  when every active member would (`hosted.check_hint`); the agent path knows the member when it frames.
+- The sentence is conditional ("If you have no such tool or cannot call it, skip this step"): a Claude session with
+  no board server, or with a board server older than this change, or with a selective allow list that leaves the tool
+  out, skips it (measured in hosted read-only children with no MCP server: 5 of 5 ended with an accepted block, 1 of
+  5 said it had skipped the check; with no word on silence at all, 4 of 5 did).
+- A real pool start is tested both ways (`test_a_pool_gets_the_sentence_only_when_every_member_would`): an
+  all-Claude pool's root frame has the sentence; once the hub maps its Claude-labelled member to a Codex runner, it
+  has none. A pool of TWO Claude-labelled members, only the second mapped to a Codex runner, has none either, though
+  the member chosen is the Claude one (`test_a_pool_of_two_claude_members_one_mapped_to_codex_gets_no_sentence`;
+  round 2, R3-03).
+
+**Fit** (RC-06). The sentence is never what makes a message fail:
+- the agent path (`hosted_spawn._frame_asked`) fits pools and targets exactly as before, then adds the sentence only
+  if the whole message still fits;
+- the human's paths (`hosted.ask`) render with it, and without it when it alone would push the message over 65,536
+  bytes. A message main accepts is accepted;
+- every path keeps its retry-before-refusal order (the existing race tests pass unchanged);
+- measured with `render_task`: the worst asked task frame (a 48 KiB task, an 8,116-byte rendered schema, the spawn
+  line cut to its pointer) is 60,102 bytes without the sentence and 60,668 with it, 4,868 under 65,536.
+  `test_the_sentence_is_left_out_where_it_alone_would_not_fit` shows it left out, on the human's path and the agent's
+  own, where it alone would not fit.
+
+A schema-free frame is byte for byte as before (`tests/golden_schema_free.py`, untouched, passes).
+
+### E. Who may call it, and the limits
+
+**One rule for every caller.** An agent principal whose name is the asked session's agent; anything else gets
+"none". Hosted sessions are the purpose. Interactive roots, interactive sessions and dispatched runs are neither
+refused nor distinguished: refusing them would need `ident()`, and tie the tool to bindings most asked sessions lack.
+The rule's cost: a runner whose board server signs in as another agent always gets "none".
+
+**Limits** (`spawn_mcp.CheckBounds`), in the serving process's memory: per stdio server (one per session's process
+on the hub's machine) and per hub process for bridged sessions, so they are PROCESS-LOCAL AND BEST EFFORT. Eviction
+and restarts reset them; same-agent callers share the hub's rate budget; a same-agent caller that knows a request's
+token can spend that request's check budget.
+- *Concurrency:* at most 4 checks at once; one more is answered "busy" at once, never queued (RC-03). The SDK parses
+  a request before the tool sees it and the remote bridge starts a worker per call, so the character bound bounds the
+  handler's work only.
+- *Per agent:* at most 60 ADMITTED calls (past the concurrency limit) in any 60 seconds, any outcome, reserved under
+  one lock on a monotonic clock; each can look up at most four candidate tokens. Expired windows are dropped on every
+  reservation; the map holds at most 1,024 agent names, the stalest dropped.
+- *Per request:* at most 20 counted checks (one that reached the verdict), keyed by the message key the lookup found;
+  at most 4,096 requests, the oldest dropped.
+- *The validator's worst case* is bounded during the walk: it stops once 1,000 reasons beyond the ten it keeps are
+  counted (the reviewer's sample: 1,000 empty objects against 50 required properties made 50,000 violations).
+
+**Codex.** The tool is in `dispatch.CODEX_OPT_IN_TOOLS`. Pre-approving it would make every existing Codex runner fail
+preflight until edited (`codex_approval_reminder`). A hosted Codex session whose runner lists the board server but
+does not approve the tool has it in its list; a call is refused ("MCP tool call requires approval, but approval
+policy is never") and the node records it as a denial, so the session shows `waiting` and its result lists the
+refused tool. The README therefore documents a task-level instruction to check only for a runner whose approval is
+confirmed.
+
+### F. Records and views
+
+Nothing new: no record, field, counter or audit post on the hub (`test_a_fitting_block_...` compares every durable
+row, through another connection, around the checks of one held turn), and
+nothing new in listings, `show`, status, claims, result turns, the dashboard or the lineage view. A schema-free
+session gets nothing new, and neither does an asked one. The dashboard is unchanged.
+
+### G. Compatibility
+
+- **With no schema** the one visible change is one more tool in every MCP client's `tools/list`
+  (`tests/test_identity.py`, `tests/test_channel.py`, `tests/test_hosted_spawn.py`'s list and the Codex
+  classification test say so). Frames, records, tool results, listings and CLI output are as before: the golden test
+  passes with its fixture untouched.
+- **Asked results' diagnostics differ across versions** (round 1, R2-05), at settlement too, in their hub lines and
+  `output.reasons`: the four length and count phrases gain the count ("shorter than minLength N: it has M
+  characters", "longer than maxLength N: it has M characters", "fewer than minItems N items: it has M", "more than
+  maxItems N items: it has M"), and a walk that finds 1,000 more violations than it keeps ends with "(and at least
+  1000 more)" where main counted them all ("(and N more)"). The verdict and the first nine reasons are the same. A
+  message settled by an older hub keeps its older reasons; a newer hub's reasons shown by an older reader are just
+  longer strings.
+- **An older MCP server without the tool** (a stdio server started before an upgrade on the hub's machine): the
+  sentence is conditional, so the session writes its block as before (`test_an_older_server_lists_no_check_tool`
+  lists main's own tools, and the e2e's Claude runs without the tool).
+- **An older hub** writes no request, or no sentence: every check answers "none", or works on its records.
+- **A rollback with an outstanding ask**: a hub from before results as data settles the message as `unchecked`, and
+  the check then says "closed"; while it is open, a newer checker still checks it
+  (`test_rollback_with_an_outstanding_ask`). A rollback to main (e923bd4, results as data without the check) settles
+  the outstanding ask with its own verdict, run for real from main's exported code, and the check then says closed
+  (`test_a_rollback_to_main_with_an_outstanding_ask_still_settles_it`).
+
+### H. What this does not give, compared with T3's stored submission
+
+- The result still depends on the reply's last lines. A session can check a block and then forget it, change it, or
+  write text after it; the verdict is then `missing`, as before (measured: none of 44 runs that checked forgot it).
+- A check proves nothing to the asker: it is not recorded, and the asker never learns a check happened.
+- A reply over 16 KB still loses its block; the check warns only when the whole reply is passed.
+- Codex sessions are not told about the tool, and get it only when their runner approves it.
+
+The stored submission is dropped from the follow-ups (owner's ruling) and stays on record under "Structured results",
+"First design and why it was dropped".
+
+### Every case
+
+The caller is an agent principal unless the row says otherwise. Same agent: the caller's name is the asked session's
+agent.
+
+| caller | request named by the text's tokens | input | answer |
+| --- | --- | --- | --- |
+| a node identity | | | refused by `principal`, as for every board tool |
+| any | (not read) | a 5th check while 4 run in this process (before authentication) | not checked: busy |
+| the human principal | (not read) | anything | not checked: none (before any lookup) |
+| any | (not read) | the 61st call in 60 s from this agent in this process | not checked: rate |
+| any | (not read) | over 16,384 characters | not checked: too long |
+| any | (not read) | no opening marker at column zero (bare JSON, indented, a closing line alone, inline, after a BOM) | not checked: no marker |
+| same agent | open | a block that fits | checked, `would_be: accepted` |
+| same agent | open | JSON that does not fit | checked, `missing`, `shape`, reasons with counts |
+| same agent | open | not strict JSON (fence, duplicate key, NaN, unsafe number, surrogate, depth, width) | checked, `missing`, `not_json`, label |
+| same agent | open | JSON that is not an object | checked, `missing`, `not_object` |
+| same agent | open | the block's JSON over 8,192 bytes | checked, `missing`, `too_big` |
+| same agent | open | a second opening line for the token, a lone marker, out of order, text after the close | checked, `missing`, `form`, label |
+| same agent | open | over 16,384 bytes in UTF-8, or ending with the truncation marker | checked, `missing`, `truncated` |
+| same agent | open | a stage inside the verdict raises | checked, `missing`, `internal` |
+| same agent | open | the 21st counted check of this request in this process | not checked: limit |
+| any | (not read) | more than 4 distinct opening-marker tokens (e.g. blocks A, U1, U2, U3, B) | not checked: too many (no lookup) |
+| same agent | two or more open requests | e.g. B's opening marker inside A's payload, or a B block after an A block | not checked: ambiguous |
+| same agent | closed (settled, or settled by an older hub) | a block | not checked: closed |
+| same agent | none (never asked, wrong or miscopied token, pruned, two matches, asked without a schema) | a block | not checked: none |
+| another agent | any | a block | not checked: none (the same body, the same statement) |
+| any | the lookup ran out of budget or time, was busy, hit its row cap (saturated), or anything raised | a block | not checked: failed (a fixed log line) |
+| any | | `block` not a string | the SDK's own argument error, to the caller only |
+
+### Measured (before the build, and again with the built words)
+
+Real CLIs, one-shot, not hosted (Claude Code 2.1.330 `claude -p --model haiku`; codex-cli 0.171.0 `codex exec -m
+gpt-6-luna`, low effort unless noted).
+- *Private config:* no `AGENT_COMMS_`/`BOARD_` variable, and an empty scratch directory per run.
+- *Claude:* `--setting-sources=`, `--strict-mcp-config` naming only a stub, `--tools=`, `dontAsk`, and
+  `--no-session-persistence`.
+- *Codex:* `--ephemeral --ignore-user-config --ignore-rules`, `-s read-only`, and the stub as its only MCP server.
+- *The stub* is a stand-in MCP server named `agent-comms` with the one tool. It answers with the real `output_schema`
+  functions and the words above. It is not the board, and the real board was never reachable.
+- *The frame* is the real `render_task` with the sentence added.
+- *The schema* invites a first try that does not fit: `summary` at most 20 characters, `issue` at most 30, an
+  integer `confidence`, `additionalProperties: false`.
+
+Every run was scored by the real `safe_verdict` on its final reply.
+
+Frame wordings:
+- A: "...you may pass it your block before you end your turn...", in the middle;
+- B: the design's first sentence ("If you have the board tool board_session_check_result, check your block with it
+  before you end your turn, and fix what it names ..."), in the same place;
+- C: "Before you end your turn, if your tools include board_session_check_result, call it with your block...", at
+  the end of the ask line;
+- D: the same without "if your tools include", at the end.
+
+"Draft" tasks hand over a draft result object that breaks three rules. "Told" tasks say in the TASK to check. Counts
+reasons are answer A with the instance's count in length and item-count reasons. All runs used schema v3 except the
+first Claude A and B runs (v1, v2: looser lengths and no `confidence`).
+
+| CLI | tool | frame | task | runs | checked | a check said missing | final verdict accepted | checked, then forgot the block |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude | stub | A | plain | 5 | 1 | 0 | 4 (1 `shape`) | 0 |
+| Claude | stub | B | plain | 11 | 11 | 2, both then fixed | 11 | 0 |
+| Claude | stub | B | draft | 6 | 6 | 0 (fixed before checking) | 6 | 0 |
+| Claude | stub | B | draft, told to check it as it is | 4 | 4 | 1 (3 fixed it first anyway) | 4 | 0 |
+| Claude | stub | C | plain | 4 | 4 | 0 | 4 | 0 |
+| Claude | no MCP server | A or B | plain or draft | 6 | - | - | 6 | - |
+| Codex | stub, approved | A, B or C | plain or draft; low or medium effort | 24 | 0 | - | 1 (22 `shape`, 1 `no_block`: a miscopied token) | - |
+| Codex | stub, approved | C | told | 3 | 3 | 3 | 3 | 0 |
+| Codex | stub, approved | D | plain or draft | 7 | 7 | 7 | 4 (3 `shape`) | 0 |
+| Codex | stub, approved | D, with counts in the reasons | plain or draft | 8 | 8 | 7 | 8 | 0 |
+| Codex | stub, unapproved | A, B or C | plain | 9 | 0 | - | 0 (9 `shape`) | - |
+
+What was tried, and what it showed:
+- *Uptake.* The optional wording (A) was used by Claude in 1 run of 5 and by Codex in none. The recommending wording
+  (B) and the end-placed one (C) were used by Claude every time, 25 of 25. Codex used no conditional wording, in 24
+  runs. It used the imperative D every time, and an instruction in the TASK every time.
+- *The answer.* No run forgot the block after a check, so the stronger "NOT SUBMITTED" answer prepared as a fallback
+  was not needed, and the answer stays as measured.
+- *Faults the check exists for.*
+  - A bare JSON object passed without its markers (1 Claude run) was answered "no marker"; the model sent the block
+    again, and it was accepted.
+  - Three Claude runs were told `shape` and fixed the block.
+  - With the D wording, 3 of 7 Codex runs were told `longer than maxLength N` again and again, and ended with a block
+    still too long. The reasons give the limit but not the length. With the count added, 8 of 8 ended accepted (open
+    question 4).
+- *Without the tool.* Claude with no MCP server and the sentence ended with an accepted block in 6 of 6 runs, and
+  never mentioned the tool. Codex with the tool unapproved never tried it in these runs. Asked outright to call it
+  (a probe), Codex got "MCP tool call requires approval, but approval policy is never".
+
+
+**Again with the built words** (the sentence with "and can call it", the human's and the agent's frames as built, the
+same stub and draft task, haiku, one-shot): the human's block 3 of 4 runs checked, the agent's task frame 3 of 3; every
+reply ended with an accepted block.
+
+**Choosing the sentence, in hosted sessions** (after the first build). In hosted Claude Code 2.1.330 sessions the MCP
+tools are DEFERRED: the model must call `ToolSearch` before it can call the check, which the one-shot runs above never
+needed. The first build's sentence, "If you have the board tool board_session_check_result and can call it, check your
+block ...", got the check used in only 1 of 10 hosted runs, so it was re-measured.
+- *Set-up:* sessions made as D7 makes them (scripts/session-host-e2e.py's `Run`: a temp hub and node, the spawning
+  agent's runner with the temp board's `board mcp`, real Claude Code with haiku, none of the user's settings). Each
+  wording went into the hub through a measurement-only `sitecustomize`, never the product code. The task was the
+  review with a broken draft, and it does NOT name the tool. Per wording: 5 human roots (the human's frame) and 5
+  children spawned through `board_session_spawn` (the agent's task frame).
+- *Without board tools:* 5 stock read-only children (no MCP server at all; the human's child frame), whole replies
+  kept.
+
+| wording | with the tool: searched / checked (of 10) | settled accepted (of 10) | without the tool: accepted / mentioned the tool or the skipped check (of 5) | turn seconds (with) |
+| --- | --- | --- | --- | --- |
+| (a) the first build: "If you have the board tool ... and can call it, check your block ..." | 1 / 1 | 9 | not measured hosted (one-shot: 6 of 6 accepted, 0 mentions) | 4.4-10.6 |
+| (b) "Before you end your turn, check your block with the board tool ... (in Claude Code it is mcp__agent-comms__...; if it is not loaded yet, find it with ToolSearch) ...; if you have no such tool, skip this." | 10 / 10 | 10 | not measured | 6.8-9.5 |
+| (c) as (b), without the server name ("search for it by that name with ToolSearch") | 10 / 10 | 10 | 9 of 10 / 4 of 5 (in the 5 whose replies were kept) | 7.4-12.7 |
+| (d) as (c), "skip this step and do not mention it in your reply" (built before round 1) | 10 / 10 | 10 | 5 of 5 / 0 of 5 | 9.3-11.6 |
+| (f) round 1's qualified form: "... and fix what it names. If you have no such tool or cannot call it, skip this step; you need not say in your reply that you skipped it. ... it never replaces the block: your result is still only the block at the end of your reply, as described above." (built) | 10 / 10 | 10 | 5 of 5 / 1 of 5 | 7.4-13.4 |
+
+- Every check called in these runs was answered `accepted`: the models fixed the broken draft before checking, so no
+  hosted correction was seen (the stand-in D7 proves reject, fix and settle).
+- *The one (a) run that settled `missing`* is the case the check is for: a human root that never looked for the tool
+  ended with `"summary":"Page slice is off by one"`, 24 characters against `maxLength` 20, and settled `shape`.
+- *The no-tools miss under (c)* was the same kind: a child that cannot check settled `shape` once in 10, as it would
+  on main.
+- *The mentions under (c):* "I don't have the board check tool in this session, so I couldn't run the schema check
+  on the result block below", and three like it: the asker would have read that noise in the reply. (d) adds "and do
+  not mention it in your reply", and none did.
+- *The cost:* the search and the check add about 2 to 5 seconds to a turn (a: 4.4-10.6 s; d: 9.3-11.6 s; f: 7.4-13.4
+  s; without the tool, f: 5.6-7.0 s).
+- *Round 1's re-measure* (R2-06): (f) narrows the silence to the skipped check and drops "whatever it says". It met
+  the gate (at least 9 of 10 checked with the tool, at most 1 of 5 mentions without it, no stall): 10 of 10 checked,
+  all accepted; without the tool, 5 of 5 accepted and 1 reply said it "did not run the board check". The (f) runs
+  ran the same harness on a snapshot of the code as committed, with only the sentence swapped in.
+
+### As built
+
+**Files:**
+- `agent_comms/output_schema.py`: `CHECK_TOOL`, the sentence (`TASK_ASK_CHECK`, `HUMAN_ASK_CHECK`,
+  `human_block(check=)`); the count phrases and `VIOLATIONS_MAX` in `validate`; `CHECK_TEXT_MAX`,
+  `CHECKS_PER_REQUEST`, `CHECK_WORDS`, the `next` sentences and `WHY_*`, `CHECK_KEYS`, `check_tokens`, `checked`,
+  `not_checked`.
+- `agent_comms/hosted.py`: `tells_check`, `check_hint`, `open_request` and its budget (`LOOKUP_*`, `_LOOKUP`);
+  `ask(check=)`, with the sentence left out where it alone would not fit; `start` and `send` pass the hint.
+- `agent_comms/hosted_tree.py`: `start_child` passes the hint (the named agent, the parent's, or a pool's members).
+- `agent_comms/hosted_spawn.py`: `render_task(check=)`, `_frame(check=)`, `_frame_asked(check=)` (the sentence last,
+  only where it fits); `spawn` and `send` pass `tells_check` of the child.
+- `agent_comms/spawn_mcp.py`: the tool, `CHECK`, `CHECK_LOG`, `CheckBounds`, `check_block`.
+- `agent_comms/dispatch.py`: `CODEX_OPT_IN_TOOLS` gains the tool.
+- `agent_comms/mcp_server.py`: `_NoRawEnvelope`, the filter that keeps the SDK's raw-envelope DEBUG line without its
+  payload (round 1).
+- `tests/stand_in_codex.py`: `mcp SERVER/TOOL` refuses that named tool (round 1, D8).
+- `scripts/session-host-e2e.py`: D7 (spawning off and on, stand-ins and real CLIs) and D8; two Codex agents whose
+  runners reach the temp board's own `board mcp` under the server name `e2e-board` (the user's own `agent-comms`
+  entry stays disabled), one approving the tool and one not.
+- `README.md`: "Results as data" (the check, what it does and does not do, its limits, the frame, Codex) and the
+  Codex opt-in list.
+- No new runtime dependency.
+
+**Tests:** `tests/test_result_check.py` (38), and updates to `tests/test_structured_results.py` (the frame's ask line
+for a Claude child, two `ask` stubs), `tests/test_dispatch.py`, `tests/test_identity.py`, `tests/test_channel.py`,
+`tests/test_hosted_spawn.py` and `tests/test_hosted_results.py` (the tool in tool lists; it reads no result).
+
+**The mutation rule** was checked mechanically: each of these mutations of a check was applied alone, its test run
+against it with `-x`, and the file restored. All 46 were caught, rounds 1 and 2's new and changed checks included.
+Before round 1, two survivors (the request count keyed by the text, a partly expired rate window) led to stronger tests,
+and so did a fit check that the human path's fallback had masked.
+
+| mutation | caught by |
+| --- | --- |
+| rate bound | `test_through_the_tool_the_request_count_the_rate_and_saturation` |
+| character bound before reading | `test_a_text_over_the_character_bound_is_refused_before_anything_reads_it` |
+| concurrency limit | `test_through_the_tool_the_request_count_the_rate_and_saturation` |
+| per-request count | `test_through_the_tool_the_request_count_the_rate_and_saturation` |
+| count keyed by the request, not the token | `test_through_the_tool_the_request_count_the_rate_and_saturation` |
+| rate reserved atomically | `test_the_rate_bound_reserves_atomically_and_expires` |
+| rate window expiry | `test_the_rate_bound_reserves_atomically_and_expires` |
+| agent map bounded | `test_the_agent_map_and_the_request_map_are_bounded` |
+| request map bounded | `test_the_agent_map_and_the_request_map_are_bounded` |
+| fixed answer on any fault | `test_no_path_logs_or_returns_the_draft_in_process_and_over_the_remote_bridge` |
+| markers from column zero | `test_lookup_refusals_are_fixed_answers` |
+| an open token is preferred | `test_the_last_opening_line_names_the_request` |
+| two open requests are ambiguous | `test_two_open_requests_named_in_one_text_are_ambiguous` |
+| a saturated lookup fails closed | `test_a_saturated_lookup_fails_closed` |
+| the lookup's deadline | `test_the_lookup_restores_the_connections_own_busy_timeout_and_its_deadline_fails` |
+| the prior busy timeout | `test_the_lookup_restores_the_connections_own_busy_timeout_and_its_deadline_fails` |
+| agents only, before the lookup | `test_a_human_principal_gets_none_before_any_lookup_even_with_a_matching_row` |
+| admission before authentication | `test_admission_comes_before_any_worker_and_a_fifth_call_is_busy_at_once` |
+| the dedicated limiter | `test_admission_comes_before_any_worker_and_a_fifth_call_is_busy_at_once` |
+| the raw-envelope log filter | `test_a_malformed_raw_stdio_line_is_logged_without_its_payload` |
+| the skip covers a tool that cannot be called | `test_an_older_server_lists_no_check_tool` |
+| same agent | `test_lookup_refusals_are_fixed_answers` |
+| settled is closed | `test_states_open_closed_and_none_from_the_stored_records` |
+| schema present | `test_states_open_closed_and_none_from_the_stored_records` |
+| one match per token | `test_states_open_closed_and_none_from_the_stored_records` |
+| lookup work budget | `test_the_lookup_has_a_work_budget_independent_of_retention` |
+| busy timeout restored | `test_the_lookup_has_a_work_budget_independent_of_retention` |
+| cap_reply before the verdict | `test_the_tool_runs_the_shared_settlement_function_on_the_capped_text` |
+| the shared verdict function | `test_a_fault_inside_the_verdict_is_internal_for_the_check_and_for_settlement` |
+| no candidate echoed | `test_no_path_logs_or_returns_the_draft_in_process_and_over_the_remote_bridge` |
+| reads only | `test_the_check_reads_only_and_a_held_write_lock_does_not_delay_it` |
+| frame: Claude runtime only | `test_the_sentence_is_in_asked_frames_for_claude_sessions_only_and_never_without_a_schema` |
+| frame: a hub-known Codex runner | `test_the_runtime_is_a_hint_a_known_codex_runner_and_pools` |
+| frame: human fit fallback | `test_the_sentence_is_left_out_where_it_alone_would_not_fit` |
+| frame: agent fit | `test_the_sentence_is_left_out_where_it_alone_would_not_fit` |
+| block: str exactly | `test_the_block_is_taken_as_text_exactly` |
+| validator violation cap | `test_the_validators_violation_work_is_capped` |
+| count in maxLength | `test_the_four_count_reasons_say_the_instances_count_and_never_a_value` |
+| count in minLength | `test_the_four_count_reasons_say_the_instances_count_and_never_a_value` |
+| count in minItems | `test_the_four_count_reasons_say_the_instances_count_and_never_a_value` |
+| count in maxItems | `test_the_four_count_reasons_say_the_instances_count_and_never_a_value` |
+| code points, not bytes | `test_the_four_count_reasons_say_the_instances_count_and_never_a_value` |
+| R3-01 a fifth token refused before lookup | `test_a_fifth_opening_token_is_refused_before_any_lookup` |
+| R3-02 the runner's pre-handshake diagnostic | `test_a_malformed_raw_stdio_line_is_logged_without_its_payload` |
+| R3-03 every pool member, not any | `test_a_pool_of_two_claude_members_one_mapped_to_codex_gets_no_sentence` |
+| Codex opt-in classification | `test_every_served_tool_is_classified_for_codex_exactly_once` |
+
+**Proof run after code review round 2** (no real runs this round): `uv run pytest -q` 3870 passed, 10 skipped;
+`tests/test_result_check.py` alone 40 passed; the mutation run 46 of 46 caught (R3-01, R3-02 and R3-03 each caught);
+the stand-in `scripts/session-host-e2e.py --only check` PASS (14 checks).
+
+**Proof run after code review round 1** (Claude Code 2.1.330 with haiku; codex-cli 0.171.0 with gpt-6-luna, low
+effort):
+- `uv run pytest -q`: 3868 passed, 10 skipped. `tests/test_result_check.py` alone: 38 passed.
+- The mutation run: 43 of 43 caught (the table above).
+- `scripts/session-host-e2e.py` with the stand-ins: PASS in full (269 checks), and PASS for `--only check`, the new
+  scenarios alone (14 checks).
+  - D7, child sessions off: a human root's held turn was checked (accepted), and it settled accepted.
+  - D7, child sessions on, twice: a block that did not fit was answered missing (`shape`) with the settlement's exact
+    three reasons (the count reason included), and the fixed block was answered accepted. One turn then settled
+    accepted. The other's reply had no block, and it settled missing (`no_block`).
+  - D8: the stand-in Codex's refused call was recorded as a denial of exactly
+    `mcp__e2e-board__board_session_check_result`, the session showed `waiting`, and the verdict was the reply's
+    (accepted). Every asked frame to a Claude process had the sentence; asked frames were written to Codex processes,
+    and none had it.
+- Real CLIs, `--only structured`: PASS (30 checks: D1-D6 as before, then D7 and D8).
+  - The Claude root with board tools, the frame alone (recorded): `ToolSearch`, then the check, answered accepted;
+    settled accepted.
+  - The same root, told in the task (required): the same, with the answer parsed and matched to its call by id.
+  - The approved Codex child, told in the task (required): one check, answered accepted; settled accepted.
+  - The listed-but-unapproved Codex child, told in the task (recorded): its call was refused, recorded as the denial
+    `mcp__e2e-board__board_session_check_result`, the session showed `waiting`, and it settled accepted from its
+    reply.
+  - No first draft needed correction: each model fixed the broken draft before its first check (recorded).
+- Before round 1 (the same feature, the earlier sentence): real `--only tree` PASS (101 checks), real `--with-board`
+  PASS (12 checks), `scripts/interactive-wake-e2e.py --claude-bin` all checks passed, and
+  `scripts/interactive-wake-codex-e2e.py` PASS. In every real run the user's `~/.codex/config.toml` and Claude
+  settings files were unchanged.
+- The dashboard is unchanged, so its jsdom tests were not run for this change.
+
+### Review findings (2026-11-23), and where each is met
+
+- **RC-01, a bounded lookup.** One statement with a work budget, a time budget and a 250 ms busy timeout, a fixed
+  match limit, five projected fields, released before validation (A). Tests: `test_the_lookup_has_a_work_budget_...`,
+  `test_a_settlement_right_after_the_lookup_gives_a_stale_answer_that_changes_nothing` (one statement, so no
+  settlement can fall between reads; one after it makes the answer stale and the next check says closed),
+  `test_the_check_reads_only_and_a_held_write_lock_does_not_delay_it` (a WAL checkpoint after the check is not busy).
+- **RC-02, scoped claims.** The words say "the board does not save this as a result or send it to the asker" (the
+  sentence, the description, every answer), and "What is NOT claimed" says what does happen. Fixed, payload-free
+  answers and log lines on every path. Tests: `test_no_path_logs_or_returns_the_draft_in_process_and_over_the_remote_
+  bridge` (a planted string in values and names, on success, malformed JSON, a non-string argument and an injected
+  fault, in process and over the bridge to the hub's HTTP MCP, at the hub's log levels and every `agent_comms` level),
+  `test_over_a_real_stdio_server_with_child_sessions_off` (its stderr at DEBUG); SQL traced on the worker connection
+  that runs the lookup is SELECT and PRAGMA only, and every durable row (`iterdump` through another connection) is
+  equal before and after (`test_a_fitting_block_...`, `test_the_check_reads_only_...`). (The e2e no longer claims
+  this from key names: round 1, R2-07.)
+- **RC-03, bounded work.** `CheckBounds` (concurrency, rate with atomic reservations, a monotonic clock and bounded
+  expiry, request counts by the request found) and the validator's violation cap (E). Tests:
+  `test_the_rate_bound_reserves_atomically_and_expires` (150 simultaneous threads reserve exactly 60),
+  `test_the_agent_map_and_the_request_map_are_bounded`, `test_concurrency_fails_fast`,
+  `test_through_the_tool_the_request_count_the_rate_and_saturation`, `test_the_validators_violation_work_is_capped`.
+- **RC-04, the same-agent disclosure** is written down (A), another agent's messages are never in the statement, and
+  `test_a_foreign_token_and_an_unknown_one_take_the_same_lookup_path` compares the answers and the traced SQL.
+- **RC-05, parity defined** for the same request and the complete normalized reply of a successful turn, the answer
+  tells the caller to use this turn's token and pass the whole reply, refusals are tested apart, truncation goes
+  through the real report route, and the fault is injected inside `safe_verdict` (B).
+- **RC-06, frame fit and runner hints.** The sentence never makes a message fail, on the human's root start, send and
+  child start (pool hint included) and both agent tools; the runtime is a hint, a hub-known Codex runner gets none,
+  the sentence is qualified on being able to call the tool (D). Tests:
+  `test_the_sentence_is_in_asked_frames_for_claude_sessions_only_and_never_without_a_schema`,
+  `test_the_runtime_is_a_hint_a_known_codex_runner_and_pools`, `test_the_sentence_is_left_out_where_it_alone_would_
+  not_fit`; the existing retry-before-refusal race tests pass.
+- **RC-07, count wording.** All four phrases with non-ASCII text whose byte and code-point lengths differ, no numeric
+  value and no enum or const content in any reason, the ASCII, 150-byte and ten-reason bounds, the hub line under
+  1,700 bytes and the SDK-serialized claim within 7,000 bytes of the same claim without a verdict (three tests named
+  `test_..._count_reasons_...`); the golden fixture untouched.
+- **RC-08, deterministic D7 as the gate**, with real stdio (the e2e's `board mcp` processes) and the remote bridge
+  (the unit test), a human root with spawning off, an older stdio server, a listed-but-denied Codex runner and a
+  rollback with an outstanding ask; real runs REQUIRE a tool call and an accepted settlement and RECORD whether the
+  first draft needed correction (the e2e results below).
+
+### Code review round 1 (2026-11-23)
+
+Two blockers and six shoulds, all fixed; each fix's test is named in brackets. The mutation table above has a row per
+new or changed check, and every mutation in it is caught.
+- **R2-01 (blocker), admission before shared worker work.** Authentication used to run in AnyIO's shared worker pool
+  BEFORE the four-check gate, so calls stuck in authentication (identity refresh waiting on its lock or a writer)
+  could fill that pool with none admitted. Now admission comes first, on the event loop, and authentication and the
+  check run in ONE worker under the tool's own `anyio.CapacityLimiter`. Authentication errors are the board's own, as
+  before. [`test_admission_comes_before_any_worker_and_a_fifth_call_is_busy_at_once`: four real calls paused inside
+  authentication; the fifth is answered busy within 2 s, AnyIO's shared limiter has nothing borrowed, unrelated
+  worker work runs, and a bad token still gets the board's "unauthorized"]
+- **R2-02 (blocker), an ambiguous request.** With A in flight and B queued for the same agent, the checker could pick
+  B and advise on it while A settles differently. Two open candidates are now refused with the fixed "ambiguous"
+  answer, which asks for the block with this turn's token alone; exactly one open candidate is still checked.
+  [`test_two_open_requests_named_in_one_text_are_ambiguous`: B's opening marker inside A's payload, and a complete B
+  block after a complete A block; then, A closed, B alone is checked]
+- **R2-03, saturation and cleanup.** Nine rows (the statement's cap) is saturation and fails closed; the connection's
+  prior busy timeout is restored; the time budget is tested on its own; the progress handler is the lookup's own.
+  [`test_a_saturated_lookup_fails_closed`, `test_the_lookup_restores_the_connections_own_busy_timeout_and_its_deadline_
+  fails`, `test_a_writer_commits_and_a_checkpoint_completes_while_validation_is_paused`]
+- **R2-04, agents only.** The human principal is answered "none" before any lookup.
+  [`test_a_human_principal_gets_none_before_any_lookup_even_with_a_matching_row`]
+- **R2-05, a real `shape` in the serialized claim.** The old fixture's payload, escaped, was over 42 KB: the reply was
+  cut, the reasons were empty, and `all(...)` passed. Now the payload is within 8,192 bytes, and the test asserts
+  `shape`, ten reasons and a count reason in the SDK-serialized claim. The mixed-version differences are in G.
+  [`test_count_reasons_in_a_claim_stay_within_the_sdk_serialized_bound`]
+- **R2-06, the frame sentence.** It covers a tool that cannot be called, narrows the silence to the skipped check,
+  and keeps the truthful-result rule (D). It was re-measured, and passed the gate (Measured, (f)). A real pool start
+  is tested both ways. [`test_an_older_server_lists_no_check_tool` (the wording), `test_a_pool_gets_the_sentence_
+  only_when_every_member_would`]
+- **R2-07, D7 and D8 prove what they state.**
+  - Real D7: the frame-only run is RECORDED (an optional step is flaky by construction). The run told in the task is
+    REQUIRED, and each check call is matched to its result by tool-use id, its answer parsed: `?` and `not-checked`
+    do not count.
+  - D8: no "call the tool" is added to a task that forbids tools (the check task drops "Do not use any tools"). The
+    stand-in Codex now refuses a NAMED tool (`mcp SERVER/TOOL`), and D8 asserts the denial of exactly
+    `mcp__e2e-board__board_session_check_result` and `waiting`. Codex frames must exist when D8 runs.
+  - The e2e no longer claims "no durable write" from key names: that claim lives with the unit test that compares
+    every durable row.
+  - [`test_a_rollback_to_main_with_an_outstanding_ask_still_settles_it`: main's own code (e923bd4, exported from git)
+    settles an ask this hub made, with its own verdict]
+- **R2-08, the stated boundaries.**
+  - The SDK's DEBUG line for a malformed raw stdio envelope is kept without its payload.
+    [`test_a_malformed_raw_stdio_line_is_logged_without_its_payload`]
+  - The README and these notes say: the board does not forward or notify the asker; transcripts keep tool calls;
+    which request is checked is the checker's choice, while settlement is pinned to its own token; and the 60-call
+    window counts admitted calls, each probing up to four tokens.
+
+### Code review round 2 (2026-11-23)
+
+One blocker and two shoulds, all fixed; the mutation table has a row for each, all caught.
+- **R3-01 (blocker), the four-token cut.** With A delivered and B queued, a reply with blocks A, U1, U2, U3, B (U
+  unknown) used to lose A from the scan, and the check said `accepted` for B while A's settlement says `form`. A
+  fifth distinct opening token is now refused before any lookup ("too many"), and the answer asks for this turn's
+  block alone. [`test_a_fifth_opening_token_is_refused_before_any_lookup`: that exact reply, no lookup made, A's
+  settlement `form`; four tokens are still looked up]
+- **R3-02, the runner's pre-handshake log.** The SDK's runner logs a dropped pre-request frame at DEBUG once eight
+  are buffered; the filter now covers that logger and message too (F, "What is NOT claimed").
+  [`test_a_malformed_raw_stdio_line_is_logged_without_its_payload`: ten malformed frames before any request; both
+  lines appear with the type's name, the payload nowhere] The README no longer says the asker "never learns" of a
+  check: the board does not forward it or notify the asker, and the session's transcript keeps the call.
+- **R3-03, the pool hint.** A pool of two Claude-labelled members, one mapped to a Codex runner, gets no hint
+  (`all`, not `any`). [`test_a_pool_of_two_claude_members_one_mapped_to_codex_gets_no_sentence`]
+
+### Follow-ups
+
+- **Node-reported approval for Codex.** `session_host` in the node's hello could list the runner keys that approve
+  the tool (a field sent only to a hub that asks for it, like the report features); the hub would then give those
+  Codex sessions an imperative sentence (measured: 15 of 15 Codex runs checked with one, 0 of 24 with a conditional
+  one).
+- **The tail of an over-long reply** ("Structured results", Follow-ups): the check can warn, not keep it.
+- **Limits across processes.** The bounds are per process; a shared bound would need a store, which this change
+  deliberately does not add.

@@ -1002,7 +1002,9 @@ def test_only_the_human_sees_results_and_no_agent_route_or_tool_reaches_them(sen
     for method in ("GET", "POST"):
         assert not gateway.allowed(method, f"/api/hosted-sessions/{sid}")
     tools = asyncio.run(build_mcp(senv.board, "stdio").list_tools())
-    assert not [t.name for t in tools if "result" in t.name or "hosted" in t.name or "child" in t.name]
+    # (The in-turn check reads no result: only the caller agent's own open requests, and returns no reply.)
+    assert not [t.name for t in tools if ("result" in t.name or "hosted" in t.name or "child" in t.name)
+                and t.name != "board_session_check_result"]
     listed = fetch(senv)["sessions"]
     holding = [(s["session_id"], m["kind"]) for s in listed for m in s["messages"]
                if "PRIVATE-RESULT-7f3e" in (m.get("text") or "")]

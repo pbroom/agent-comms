@@ -352,7 +352,7 @@ def test_the_childs_frame_has_the_ask_line_then_the_task_then_the_schema(senv):
     [text] = kid_turns(senv, kid)
     lines = text.split("\n")
     i = lines.index(f"<<<task {t}>>>")
-    assert lines[i - 1] == o.TASK_ASK.format(t=t) and lines[i - 2].startswith("You may start helper sessions")
+    assert lines[i - 1] == o.TASK_ASK_CHECK.format(t=t) and lines[i - 2].startswith("You may start helper sessions")
     assert lines[-3:] == [f"<<<output-schema {t}>>>", o.prepare_schema(SCHEMA)[1], f"<<<end output-schema {t}>>>"]
 
 
@@ -484,7 +484,7 @@ def test_a_frame_that_fits_only_once_the_targets_are_cut_is_accepted_and_one_tha
     assert len(shown) <= o.SCHEMA_MAX_BYTES
 
     def asked(task):
-        return hosted.ask(task, json.dumps(schema), "parent", frame=lambda token, s: hs._frame(
+        return hosted.ask(task, json.dumps(schema), "parent", frame=lambda token, s, *_: hs._frame(
             "hosted session x (agent claude)", task, line, [], schema=s, token=token, targets=targets))
 
     short_room = len(hs._frame("hosted session x (agent claude)", "", line.replace(targets, o.SHORT_TARGETS), [],
@@ -967,8 +967,8 @@ def test_a_human_send_retry_that_loses_the_race_gets_the_winners_message(senv, m
     real = hosted.ask
     won = {}
 
-    def asking(text, schema, by, frame=None):
-        out = real(text, schema, by, frame)
+    def asking(text, schema, by, frame=None, check=False):
+        out = real(text, schema, by, frame, check)
         if not won:
             won["first"] = None
             monkeypatch.setattr(hosted, "ask", real)

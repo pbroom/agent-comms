@@ -744,6 +744,46 @@ acknowledgement no verdict comes.
   - at most 8 KB as given and 8 KB as shown.
 
   Anything else is refused with the reason. DESIGN_NOTES "Structured results" has the whole contract.
+- **Checking a block before the turn ends.** A session that has the board tool `board_session_check_result` can
+  pass it the block it means to end its reply with (or its whole reply) and learn, inside its turn, whether the
+  block would be accepted or what does not fit: the same verdict, code and reasons the board records at the end of
+  the turn, from the same code. It is only a check:
+  - the board does not save it as a result, and does not forward it to the asker or notify the asker about it. The
+    session's own transcript on its node keeps the tool call and its answer, as for any tool call, so a check is not
+    secret from whoever can read that transcript;
+  - the result is still only the block at the end of the reply, so a session that checks and then leaves the block
+    out gets `missing` (`no_block`), as today;
+  - it is advice for that turn: the verdict is still made at the end of the turn, from the reply;
+  - which request it checks against is the checker's own choice: the open request named by the tokens of the
+    text's opening marker lines, for the session's own agent only (another agent's token, and a human's call, get the
+    same answer as an unknown token). When two open requests are named it checks nothing and asks for the block with
+    this turn's token alone. Settlement itself is pinned to its own message's token. It needs no grant, no binding
+    and no child sessions;
+  - the reasons name the asker's property names and give counts (a string's length in characters, an array's
+    number of items), never a value from the block;
+  - nothing of the block is logged by the board, on any path. One boundary: the MCP SDK logs a malformed raw stdio
+    line, and a frame it drops before the first request, at DEBUG before any handler sees them; the board server
+    keeps those two lines and replaces each frame with its type's name.
+
+  Limits, per board server process and best effort (a restart resets them): 4 checks at once (a fifth is answered
+  at once that the server is busy), 60 admitted calls a minute per agent (each looks up at most four tokens), 20
+  checks per message, and a text of at most 16,384 characters.
+
+  The frame of an asked turn recommends the check ("Before you end your turn, check your block with the board tool
+  board_session_check_result (if it is not loaded yet, search for it by that name with ToolSearch) and fix what it
+  names. If you have no such tool or cannot call it, skip this step; you need not say in your reply that you skipped
+  it. ... it never replaces the block") to sessions of a Claude agent, unless the hub's
+  own runner for that agent is a Codex one; the sentence is left out when it alone would push the message over
+  64 KB. Hosted Claude sessions load board tools on demand (ToolSearch), which is why the sentence says how to find
+  it: measured with haiku, sessions with the tool checked in 10 of 10 runs, and a session without it mentioned the
+  skipped check in 1 of 5 replies; a check costs a few seconds of the turn. Codex sessions are not told: the tool is opt-in for Codex (below). For a Codex
+  runner you have confirmed approves it, an asker may say so in the task ("Before you answer, check your
+  result-data block with the board tool board_session_check_result"). Do that only for such a runner: a Codex
+  session whose runner lists the tool but does not approve it has its call refused ("MCP tool call requires
+  approval"), and the node records that as a denial, so the session shows `waiting` and its result lists the
+  refused tool.
+
+  DESIGN_NOTES "In-turn result check" has the whole contract.
 
 #### Seeing session trees
 
@@ -2033,6 +2073,12 @@ launch it, recording a preflight failure that names the missing tools on the req
 MCP server is named `agent-comms`, as `integrations/codex/install.sh` names it. The list has one source,
 `CODEX_PREAPPROVED_TOOLS` in `agent_comms/dispatch.py`; a test builds the real MCP server and fails when it
 serves a tool that is in neither that list nor the opt-in list.
+
+The opt-in list (`CODEX_OPT_IN_TOOLS`) holds `board_resolve_attention`, the five spawn tools and the in-turn
+result check, `board_session_check_result` (README "Results as data"). A Codex runner that should let its
+sessions check their result-data blocks adds one more pair, `-c
+'mcp_servers.agent-comms.tools.board_session_check_result.approval_mode="approve"'`. It is not pre-approved because
+the dispatcher would then refuse every Codex runner that does not list it.
 
 Optional: to let interactive Codex sessions use the board tools without asking as well, pre-approve
 them globally in `~/.codex/config.toml` (after the `[mcp_servers.agent-comms]` table):
