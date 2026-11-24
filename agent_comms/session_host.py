@@ -47,8 +47,19 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   comes through `send` like any other, once the turn has ended. The interrupt is written only while the turn it names
   is the one in flight here and the provider says it can (`providers.modes`); otherwise nothing happens and the turn
   ends by itself. The turn's end says `restarted_by` (labelled INTERRUPTED) only when the interrupt was written
-  whole, the provider did not refuse it, and the provider says it ended the turn. Mid-turn steering is not offered
-  (R6): no adapter steers.
+  whole, the provider did not refuse it, and the provider says it ended the turn.
+- Mid-turn steering (DESIGN_NOTES "Mid-turn steering, loose contract", parts D-F; step 2: Codex only, Claude's adapter
+  says it cannot). One steer slot per session (`SteerSlot`), bound to the turn in flight N, written at most once, by
+  this host, into this process: the caller offers it (`steer_offer`: the hub's offer, with whether the node's write
+  authority held for it) and revokes it for good (`steer_revoke`: an authoritative omission, or the node's contact
+  lost). It is written while N is in flight here, the process is live and not stopping, its binding is the
+  session's, the turn gate and `may_start` allow it, the node's authority holds at write time (`steer_authority`)
+  and the provider has proved the turn N's (Codex: `owns`). A frame the pipe took in part is completed while all of
+  that lasts, for at most STEER_PARTIAL_SECONDS; otherwise the host stops writing, reads what the process wrote and
+  stops it (the cut: STEER_CUT). N's end, however it comes, carries the steer's outcome (`HostEvent.steer`), decided
+  there once: `in_turn` (Codex's valid answer to that very `turn/steer` before N's own end), `not_delivered` (not one
+  byte written, a frame not one byte of which went is taken back, or Codex refused it), `unconfirmed` (anything
+  else, also every end the host makes itself once a byte was written).
 """
 from __future__ import annotations
 
@@ -80,6 +91,8 @@ TURN_WITHDRAWN = ("the message was not delivered: before all of it was written t
                   "process was stopped, so the part already written is never completed or acted on")
 MESSAGE_ID_MAX = 200
 INTERRUPTED = "interrupted by a restart: message {n} replaced it"
+STEER_PARTIAL_SECONDS = 5.0         # the most a steer frame the pipe took in part is given to be completed (part D)
+STEER_CUT = "the session's process was stopped: a steer to it could not be written whole"
 
 
 def group_alive(pgid: int) -> bool:
@@ -124,6 +137,27 @@ class HostEvent:
     # ever read it is not known. Never read off `ok`.
     answered: bool = False
     restarted_by: str | None = None     # turn_ended: the restart whose interrupt the provider said ended this turn
+    # turn_ended: the outcome of the steer into this turn, decided here once ({"outcome", "why"}); None: it took none
+    steer: dict | None = None
+
+
+@dataclass
+class SteerSlot:
+    """The one steer attempt of a session (the module text). `mark`: where its frame sits in `outbuf` while not all
+    of it reached the process; `sent`: its bytes the pipe took. Once N's outcome is decided (`outcome`) nothing about
+    it changes; a frame that was taken in part is still completed, or the process stopped."""
+    uuid: str
+    into: str                       # the message id of N, the turn it is bound to
+    text: str
+    authorized: bool = False        # an offer the node's write authority held for (part E)
+    revoked: str | None = None      # its authority is lost for good (why): it is never written from then on
+    refused: str | None = None      # never writable here (why): the node's own cap
+    proved: bool = False            # the provider proved N's turn its own at some pass (Codex: `owns`)
+    mark: Any = None
+    sent: int = 0
+    length: int = 0
+    partial_since: float | None = None
+    outcome: dict | None = None
 
 
 @dataclass
@@ -213,6 +247,10 @@ class Session:
     restart_written: bool = False
     restart_mark: Any = None
     begun: bool = False         # the provider said the turn in flight began (`turn_started`)
+    # Mid-turn steering (the module text): the slot of the steer bound to the turn in flight, and every steer uuid
+    # this host ever took (a repeated offer of one is never a second attempt).
+    steer: SteerSlot | None = None
+    steered: set = field(default_factory=set)
 
     @property
     def unbound(self) -> bool:
@@ -456,6 +494,9 @@ class SessionHost:
         # would not (review round 13). Not set: `may_start` is read instead (a test's, with no side effect).
         self.may_start_query: Callable[[], bool] | None = None
         self._in_tick = False       # `tick` is not re-entrant
+        # Asked before every write of a steer's bytes (node_sessions sets it: the node's write authority, part E, for
+        # this session and its turn in flight). False: nothing of the steer is written now.
+        self.steer_authority: Callable[[Session], bool] | None = None
         self._recovered = False
         self._next_message = 0
         # Runner key -> window -> the latest plan usage a session of that runner's provider reported for it (`usage`
@@ -792,6 +833,67 @@ class SessionHost:
             return
         s.restart_by, s.restart_into, s.restart_sent, s.restart_written = by, into, False, False
 
+    def steer_offer(self, session_id: str, into: str, uuid: str, text: str, *, authorized: bool,
+                    refused: str | None = None) -> None:
+        """The hub offers steer `uuid` into the turn in flight `into` (part G). A slot is made only for the turn in
+        flight here, of a provider that steers, and only for a steer this host never took; a repeated offer of the
+        same steer adds only that an offer held authority (never once it was revoked)."""
+        s = self._session(session_id)
+        for v in (into, uuid):
+            if not isinstance(v, str) or not 0 < len(v) <= MESSAGE_ID_MAX:
+                raise ValueError("a steer's ids must be short strings")
+        slot = s.steer
+        if slot is not None:
+            if slot.uuid == uuid and slot.revoked is None and slot.refused is None and slot.outcome is None:
+                slot.authorized = slot.authorized or bool(authorized)
+            elif slot.uuid != uuid:
+                log.info("session %s: a second steer offered while one is held: not taken", s.session_id)
+            return
+        if uuid in s.steered or s.ended or s.in_flight is None or s.in_flight.id != into:
+            return
+        if "steer" not in providers.modes(s.provider) or not isinstance(text, str):
+            return
+        s.steer = SteerSlot(uuid, into, text, authorized=bool(authorized) and refused is None, refused=refused)
+        s.steered.add(uuid)
+
+    def steer_revoke(self, session_id: str, uuid: str, why: str) -> None:
+        """Steer `uuid` loses its authority for good (part E): an authoritative listing no longer lists it, or the
+        node lost contact. Nothing more of it is written; one fully written keeps its outcome to be decided."""
+        s = self.sessions.get(session_id)
+        if s is not None and s.steer is not None and s.steer.uuid == uuid and s.steer.revoked is None:
+            s.steer.revoked = why[:40]
+
+    def steer_live(self, session_id: str) -> tuple[str, str] | None:
+        """(N, the steer's uuid) while the session holds a steer whose outcome is open or whose frame is still being
+        written, else None."""
+        s = self.sessions.get(session_id)
+        if s is None or s.steer is None:
+            return None
+        return s.steer.into, s.steer.uuid
+
+    def steer_deadlines(self) -> list[HostEvent]:
+        """A partial steer frame whose authority is gone or whose time is up is cut now (`_steer_pass`), also between
+        passes: the node's deadline watchdog calls this."""
+        out: list[HostEvent] = []
+        now = self.clock()
+        for s in list(self.sessions.values()):
+            slot = s.steer
+            if (slot is not None and slot.mark is not None and slot.sent > 0 and s.child is not None
+                    and s.stopping_since is None and not self._steer_completes(s, slot, now)):
+                self._steer_cut(s, now, out)
+        return out
+
+    def drain(self) -> list[HostEvent]:
+        """Before a shutdown's SIGTERM: what each session holding a steer attempt has written is read (across reads),
+        so a native end already in its pipe settles N with its own outcome."""
+        out: list[HostEvent] = []
+        now = self.clock()
+        for s in list(self.sessions.values()):
+            if s.steer is not None and s.child is not None and s.stopping_since is None and not s.ended:
+                for _ in range(16):
+                    self._read(s, now, out)
+        return out
+
     def modes(self, session_id: str) -> tuple[str, ...]:
         """What this session's LIVE process can do with a turn in flight (providers.MODES), as its adapter says now
         (Claude: what this process's `init` said). Nothing while it has no process, or one going down."""
@@ -898,6 +1000,9 @@ class SessionHost:
             return gates    # the budget stopped its process (or failed it) in this pass: what comes next, the next
         if not s.ended:
             self._restart_pass(s, now, out)
+            self._steer_pass(s, now, out)
+            if s.child is not None and s.stopping_since is not None:
+                return gates    # a steer frame was cut: the process goes down, nothing more is written to it
             self._write(s, now, out)
             if s.child is not None and s.stopping_since is not None:
                 self._reap(s, now, out)     # a write that failed stopped it
@@ -1000,7 +1105,8 @@ class SessionHost:
             out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=ok, denials=ev.denials, meta=dict(ev.meta),
                                  detail=detail, text=ev.text,
                                  answered=bool(ev.answered),     # the adapter's word: the provider took the turn
-                                 restarted_by=s.restart_by if by_restart else None))
+                                 restarted_by=s.restart_by if by_restart else None,
+                                 steer=self._steer_end(s, msg.id, native=bool(ev.answered))))
             self._forget_restart(s)     # the old turn has settled: the restart's message is the next ordinary one
             self._save_state()
         elif ev.kind == "approval_requested":
@@ -1074,6 +1180,8 @@ class SessionHost:
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
         s.outbuf.clear()
+        if s.steer is not None and s.steer.outcome is not None:
+            s.steer = None          # its turn is decided and its process is gone: nothing more of it is written
         close = getattr(child, "close", None)
         if close is not None:
             close()
@@ -1082,6 +1190,8 @@ class SessionHost:
             s.transcript_fd = None
         if not stopped:
             self._went_by_itself(s, code, was_ready, was_checking, out)
+        if s.steer is not None and s.steer.outcome is not None:
+            s.steer = None
         self._forget_restart(s)     # nothing is left to interrupt
         s.held_since = None
         self._save_state()
@@ -1207,6 +1317,8 @@ class SessionHost:
         del s.outbuf[start:start + length]
         s.restart_mark = None
         s.restart_written = False
+        if s.steer is not None and s.steer.mark is not None and s.steer.mark[0] > start:
+            s.steer.mark = (s.steer.mark[0] - length, s.steer.mark[1])
 
     @staticmethod
     def _forget_restart(s: Session) -> None:
@@ -1218,7 +1330,8 @@ class SessionHost:
         msg, delivered = (s.in_flight, True) if s.in_flight is not None else (s.writing, False)
         s.in_flight = s.writing = s.busy_since = None
         if msg is not None:
-            out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=False, delivered=delivered, detail=detail))
+            out.append(HostEvent(s.session_id, "turn_ended", msg.id, ok=False, delivered=delivered, detail=detail,
+                                 steer=self._steer_end(s, msg.id, native=False) if delivered else None))
         self._forget_restart(s)
 
     def _fail_start(self, s: Session, detail: str, out: list[HostEvent]) -> None:
@@ -1501,6 +1614,102 @@ class SessionHost:
             s.outbuf += b
         s.restart_sent, s.restart_mark = True, (start, len(s.outbuf) - start)
 
+    def _steer_writable(self, s: Session, slot: SteerSlot) -> bool:
+        """The steer may be written NOW: exactly while N's attempt may run in this process (part D's authority)."""
+        return (slot.revoked is None and slot.refused is None and slot.authorized and slot.outcome is None
+                and s.in_flight is not None and s.in_flight.id == slot.into and s.child is not None
+                and s.stopping_since is None and not s.ended and not s.unbound
+                and "steer" in providers.modes(s.provider)
+                and (self.may_start is None or self.may_start())
+                and (self.turn_gate is None or self.turn_gate(s))
+                and (self.steer_authority is not None and self.steer_authority(s)))
+
+    def _steer_completes(self, s: Session, slot: SteerSlot, now: float) -> bool:
+        """A frame taken in part may go on being written: its authority still holds and its time is not up."""
+        return (slot.revoked is None and s.child is not None and s.stopping_since is None and not s.unbound
+                and (self.steer_authority is not None and self.steer_authority(s))
+                and now - (slot.partial_since if slot.partial_since is not None else now) < STEER_PARTIAL_SECONDS)
+
+    def _steer_pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """Write the steer while it may be written (`_steer_writable`), once; complete a frame taken in part, or cut
+        it; take back a frame not one byte of which went, once its authority is lost."""
+        slot = s.steer
+        if slot is None or s.child is None or s.stopping_since is not None:
+            return
+        owns = getattr(s.provider, "owns", None)
+        if slot.outcome is None and owns is not None and owns():
+            slot.proved = True
+        if slot.mark is not None:
+            if slot.sent > 0:
+                if not self._steer_completes(s, slot, now):
+                    self._steer_cut(s, now, out)
+            elif slot.outcome is None and not self._steer_writable(s, slot):
+                self._steer_unqueue(s, slot)    # not one byte of it went: it never will
+            return
+        if slot.sent > 0 or slot.outcome is not None or not self._steer_writable(s, slot):
+            return
+        data = s.provider.steer(slot.text)
+        if not data:
+            return      # the provider cannot yet (Codex: N's turn is not proved its own)
+        start = len(s.outbuf)
+        for b in data:
+            s.outbuf += b
+        slot.mark, slot.length = (start, len(s.outbuf) - start), len(s.outbuf) - start
+
+    def _steer_unqueue(self, s: Session, slot: SteerSlot) -> None:
+        """A queued steer frame not one byte of which reached the process is taken out of the buffer, and its request
+        retired: it is never written."""
+        start, length = slot.mark
+        del s.outbuf[start:start + length]
+        slot.mark = None
+        if s.restart_mark is not None and s.restart_mark[0] > start:
+            s.restart_mark = (s.restart_mark[0] - length, s.restart_mark[1])
+        retire = getattr(s.provider, "steer_retire", None)
+        if retire is not None:
+            retire()
+
+    def _steer_cut(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """The cut (part D): a steer frame taken in part cannot be completed. Writing stops, what the process wrote
+        is read (N's own end may be there), N is reported honestly (its native result if it had one, else failed with
+        STEER_CUT) and the process is stopped."""
+        slot = s.steer
+        log.warning("session %s: a steer to its process could not be written whole: the process is stopped",
+                    s.session_id)
+        s.outbuf.clear()
+        self._read(s, now, out)
+        if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into:
+            self._fail(s, STEER_CUT, out)
+        s.steer = None
+        self._stop(s, now)
+        self._save_state()
+
+    def _steer_end(self, s: Session, msg_id: str, native: bool) -> dict | None:
+        """N (`msg_id`) ended, natively (the provider's own end of it) or not (the host gave it up): the outcome of the
+        steer into it, decided now, once (part F's table)."""
+        slot = s.steer
+        if slot is None or slot.into != msg_id or slot.outcome is not None:
+            return None
+        if slot.mark is not None and slot.sent == 0:
+            self._steer_unqueue(s, slot)
+            outcome = {"outcome": "not_delivered", "why": "not_written"}
+        elif slot.sent == 0:
+            outcome = {"outcome": "not_delivered", "why": "not_written" if slot.proved else "not_owned"}
+        elif slot.mark is not None:
+            outcome = {"outcome": "unconfirmed", "why": "partial"}
+        elif not native:
+            outcome = {"outcome": "unconfirmed", "why": "turn_cut"}     # N ended with the process, or was given up
+        else:
+            said = getattr(s.provider, "steer_result", lambda: None)()
+            outcome = ({"outcome": "in_turn", "why": "answered"} if said == "ok" else
+                       {"outcome": "not_delivered", "why": "refused"} if said == "refused" else
+                       {"outcome": "unconfirmed", "why": "no_answer" if said is None else "other_answer"})
+        slot.outcome = outcome
+        if slot.mark is None or s.child is None:
+            s.steer = None      # decided, and nothing of it is left to write
+        log.info("session %s: the steer into message %s: %s (%s)", s.session_id, msg_id, outcome["outcome"],
+                 outcome["why"])
+        return dict(outcome)
+
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
         try:
             # Account folders at every process start, not only at `open`: the folder as it is now, and the directory
@@ -1584,6 +1793,7 @@ class SessionHost:
                 self._stop(s, now)
             return
         if (not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not s.checking
+                and not (s.steer is not None and s.steer.mark is not None)     # a steer frame first, whole
                 and (self.may_start is None or self.may_start())      # ... and no new turn is written
                 and (self.turn_gate is None or self.turn_gate(s))
                 and not (self._barrier(s, now, out) if self._correlated(s) else self._held(s, now, out))):
@@ -1653,6 +1863,18 @@ class SessionHost:
             if s.restart_mark is not None:
                 start, length = s.restart_mark
                 s.restart_mark = (start - n, length)    # where its bytes are now; below zero: some are written
+            if s.steer is not None and s.steer.mark is not None:
+                start, length = s.steer.mark
+                start -= n
+                if start + length <= 0:
+                    s.steer.mark, s.steer.sent = None, length     # the whole frame is in the pipe
+                    if s.steer.outcome is not None:
+                        s.steer = None      # its turn was already decided: the frame is whole, nothing is left
+                else:
+                    s.steer.mark = (start, length)
+                    if start < 0:       # some of it is in the pipe: completed within STEER_PARTIAL_SECONDS, or cut
+                        s.steer.sent = -start
+                        s.steer.partial_since = now if s.steer.partial_since is None else s.steer.partial_since
         if s.restart_mark is not None and s.restart_mark[0] + s.restart_mark[1] <= 0:
             s.restart_written = True    # the whole interrupt is in the pipe: an abort from now on is its doing
             s.restart_mark = None

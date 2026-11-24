@@ -48,8 +48,9 @@ KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "
 # the id of the host's line); `other`, NOT the turn in flight (a turn the CLI started itself, or a frame that belongs
 # to no message): the host never settles a message by it, and only checks an `init`'s access.
 OWNERS = ("order", "own", "other")
-# What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"). No
-# adapter steers yet (R6): `steers` is False on both, for a later change to implement.
+# What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"; steering:
+# "Mid-turn steering, loose contract"). Codex's adapter steers (`turn/steer` into a turn proved to be the message's);
+# Claude's `steers` stays False until its own step (the design's step 3).
 MODES = ("steer", "restart")
 TURN_KINDS = ("user", "wake", "child", "task")   # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
@@ -187,7 +188,9 @@ class ProviderSession(Protocol):
     # turn in flight in-band, keeping the process, and its end then says whether it was interrupted (`interrupted`).
     # Read anew whenever it is reported (Claude learns it from its process's `init`): an adapter without it, or with it
     # False, is never asked, and the hub is told it cannot (`modes`). `steers`: putting a message into the turn in
-    # flight; False on every adapter for now (R6, the follow-ups in DESIGN_NOTES).
+    # flight (session_host's steer slot): an adapter that steers has `steer(text)` (the bytes, or None while it cannot
+    # yet), `steer_retire()` and `steer_result()`, and may have `owns()` (the turn in flight is proved its message's).
+    # True on Codex's; False on Claude's.
     steers: bool
     restarts: bool
 
