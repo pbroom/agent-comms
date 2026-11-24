@@ -159,7 +159,11 @@ CODEX_PREAPPROVED_TOOLS = (
 # without a binding, or a board session registered with a dispatch_run_id), and a hosted Codex session that is to
 # start child sessions gets them approved in its own runner, one -c override each.
 CODEX_OPT_IN_TOOLS = ("board_resolve_attention", "board_session_capabilities", "board_session_spawn",
-                      "board_session_send", "board_session_status", "board_session_cancel")
+                      "board_session_send", "board_session_status", "board_session_cancel",
+                      # The in-turn result check: harmless, but pre-approving it would make every existing Codex
+                      # runner fail preflight (codex_approval_reminder) until edited. A hosted Codex session whose
+                      # runner does not approve it has it listed; a call is refused and recorded as a denial.
+                      "board_session_check_result")
 CODEX_SERVER = "agent-comms"
 
 

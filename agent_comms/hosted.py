@@ -53,12 +53,13 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 import uuid
 from typing import Any, Callable
 
 from . import db, nodes, output_schema
-from .core import Board, Conflict, Invalid, NotFound, Principal
+from .core import Board, BoardError, Conflict, Invalid, NotFound, Principal
 from .nodes import _get, _put
 from .providers import SESSION_ID_RE, cap_reply, valid_provider_id, validate_model
 
@@ -348,15 +349,24 @@ def _labelled(conn, r: dict, msgs: list[dict], projection: str | None, box=None)
             for m in msgs]
 
 
-def ask(text: str, schema_text: Any, by: str, frame=None) -> tuple[dict | None, str | None, str | None]:
+def ask(text: str, schema_text: Any, by: str, frame=None, check: bool = False
+        ) -> tuple[dict | None, str | None, str | None]:
     """A message's request for a result as data: (its `output` record, the message text with the ask in it, None),
     or (None, None, the refusal's words). Nothing is raised, so a caller can resolve a retry first (R2-10).
-    `frame(token, shown)`: the agent path's own rendering of the whole message (hosted_spawn); by default the
-    human's text with the hub's block appended."""
+    `frame(token, shown, check)`: the agent path's own rendering of the whole message (hosted_spawn); by default the
+    human's text with the hub's block appended. `check` (`tells_check`): the ask line also recommends the in-turn
+    check, but only where that sentence fits: a message that fits without it never fails because of it (RC-06)."""
     try:
         _, shown, sha = output_schema.prepare_schema(schema_text)
         token = output_schema.fresh_token(text, shown)
-        full = frame(token, shown) if frame is not None else text + output_schema.human_block(token, shown)
+
+        def render(with_check: bool) -> str:
+            if frame is not None:
+                return frame(token, shown, with_check)
+            return text + output_schema.human_block(token, shown, with_check)
+        full = render(check)
+        if check and len(full.encode("utf-8", "replace")) > MESSAGE_MAX_BYTES:
+            full = render(False)
     except output_schema.SchemaError as e:
         return None, None, str(e)
     except Invalid as e:
@@ -402,6 +412,117 @@ def _closed(m: dict, now: float, *, ok: bool, code: str | None = None, reply: An
     if not isinstance(o, dict) or o.get("state") != "asked":
         return None
     return output_schema.safe_verdict(o, ok=ok, code=code, reply=reply) | {"closed_at": now}
+
+
+# ---------------------------------------------------------------- the in-turn check (DESIGN_NOTES "In-turn result check")
+
+
+def tells_check(board: Board, agent: Any, runtime: Any) -> bool:
+    """Whether an asked frame for a session of `agent` recommends the in-turn check. A HINT, since the hub cannot see
+    the session's tools: a Claude runtime (as account_pools.family reads it), unless the hub's own [dispatch] runner
+    for the agent is known to be Codex's (the node picks the adapter from the runner's executable). Never for Codex:
+    its runner approves board tools one by one, and the check is opt-in there (dispatch.CODEX_OPT_IN_TOOLS)."""
+    if not isinstance(runtime, str) or not runtime.lower().startswith("claude"):
+        return False
+    try:
+        from .dispatch import DispatchConfig, uses_codex
+        template = DispatchConfig.from_dict(board.s.dispatch, settings=board.s).runner_for(agent, runtime)
+    except Exception:
+        template = None
+    return not uses_codex(template)
+
+
+def check_hint(board: Board, name: Any) -> bool:
+    """`tells_check` for a start that names `name` before its agent is decided (a root start, the human's child start,
+    either of which may name a pool): the named agent's, or, for a pool, true only when it is true for every member."""
+    try:
+        agent, runtime = _agent(board, name)
+        return tells_check(board, agent, runtime)
+    except BoardError:
+        pass
+    try:
+        from . import account_pools
+        pool = account_pools.pool_for(board, name)
+        if pool is None:
+            return False
+        agents = account_pools._agents(board.conn)
+        members = [m for m in account_pools._spawn(board).pools[pool] if m in agents]
+        return bool(members) and all(tells_check(board, m, agents[m]) for m in members)
+    except Exception:
+        return False
+
+
+LOOKUP_STEPS = 20_000           # progress-handler calls: the lookup's work budget (RC-01) ...
+LOOKUP_EVERY = 1000             # ... each after this many SQLite VM steps
+LOOKUP_SECONDS = 0.5            # ... and its time budget
+LOOKUP_BUSY_MS = 250            # its busy timeout (the connection's own is 30 s)
+_LOOKUP = """
+SELECT m.key AS key, json_extract(m.value, '$.state') AS state, json_extract(m.value, '$.output.state') AS asked,
+       json_extract(m.value, '$.output.schema') AS schema, json_extract(m.value, '$.output.token') AS token
+  FROM board_state AS s
+  JOIN board_state AS m
+    ON m.key >= 'host.msg.' || substr(s.key, length('host.session.') + 1) || '.'
+   AND m.key <  'host.msg.' || substr(s.key, length('host.session.') + 1) || '/'
+ WHERE s.key >= 'host.session.' AND s.key < 'host.session/'
+   AND json_valid(s.value) AND json_extract(s.value, '$.agent') = :agent
+   AND json_extract(s.value, '$.output_asked') IS NOT NULL
+   AND json_valid(m.value)
+   AND json_extract(m.value, '$.output.token') IN (SELECT value FROM json_each(:tokens))
+ LIMIT 9"""
+LOOKUP_ROWS = 9                 # = the statement's LIMIT: as many rows as that is saturation, and fails closed
+
+
+def open_request(board: Board, agent: str, tokens: list[str]) -> tuple[str, dict | None]:
+    """The request a check is checked against (DESIGN_NOTES "In-turn result check", A): ("open", {"id", "token",
+    "schema"}), ("closed", None), ("none", None), or ("failed", None) when the lookup ran out of its budget or the
+    database was busy. `tokens`: the text's opening-marker tokens, the last line's first (output_schema.check_tokens);
+    exactly one of them must name an OPEN request (settlement, pinned to its own token, reads only that token's
+    markers); two open ones are "ambiguous", and nothing is checked.
+    ONE statement, the same for any tokens, so one snapshot, released before anything is validated: it reads only
+    `agent`'s sessions that ever asked (another agent's messages are never in it), projects only the fields needed,
+    and stops at a fixed number of matches across all sessions; reaching that number is "failed" (indeterminate).
+    It writes nothing and takes no write lock."""
+    tokens = [t for t in tokens if isinstance(t, str) and output_schema.TOKEN_RE.fullmatch(t)] \
+        if isinstance(tokens, list) else []
+    if not isinstance(agent, str) or not tokens:
+        return "none", None
+    c = board.conn
+    steps, deadline = [0], time.monotonic() + LOOKUP_SECONDS
+
+    def budget() -> int:
+        steps[0] += 1
+        return 1 if steps[0] > LOOKUP_STEPS or time.monotonic() > deadline else 0
+    # This connection's own busy timeout is restored as it was; the progress handler is this lookup's alone (nothing
+    # else on the board sets one), set here and cleared here.
+    prior = c.execute("PRAGMA busy_timeout").fetchone()[0]
+    c.execute(f"PRAGMA busy_timeout={LOOKUP_BUSY_MS}")
+    try:
+        c.set_progress_handler(budget, LOOKUP_EVERY)
+        try:
+            rows = c.execute(_LOOKUP, {"agent": agent, "tokens": json.dumps(tokens)}).fetchall()
+        finally:
+            c.set_progress_handler(None, 0)
+    except sqlite3.Error:
+        return "failed", None
+    finally:
+        c.execute(f"PRAGMA busy_timeout={int(prior)}")
+    if len(rows) >= LOOKUP_ROWS:
+        return "failed", None   # saturated: a row beyond the cap could change the answer, so nothing is said (RC-01)
+    closed, found = False, []
+    for t in tokens:
+        mine = [r for r in rows if r["token"] == t]
+        if len(mine) != 1:
+            continue            # none, or two messages with one token: nothing to check against
+        row = mine[0]
+        if row["state"] in SETTLED or row["asked"] != "asked":
+            closed = True
+        elif row["state"] in ("queued", "delivered") and isinstance(row["schema"], str):
+            found.append({"id": row["key"], "token": t, "schema": row["schema"]})
+    if len(found) > 1:
+        return "ambiguous", None    # two open requests named: advice for either could be read as this turn's (R2-02)
+    if found:
+        return "open", found[0]
+    return ("closed", None) if closed else ("none", None)
 
 
 def _node_view(r: dict) -> dict:
@@ -456,7 +577,7 @@ def start(board: Board, p: Principal, project: Any, text: Any, *, agent: Any = N
     project, text = _project(project), _text(text)
     output = None
     if output_schema is not None:   # given, even empty: decided (a root's start has no request id: refused at once)
-        output, text_asked, why = ask(text, output_schema, "human")
+        output, text_asked, why = ask(text, output_schema, "human", check=check_hint(board, agent))
         if why:
             raise Invalid(why)
         text = text_asked
@@ -528,7 +649,12 @@ def send(board: Board, p: Principal, session_id: Any, text: Any, mode: Any = "qu
     text, mode = _text(text), _mode(mode)
     output = why = None
     if output_schema is not None:   # decided now (empty too), refused only once a retry has been looked for
-        output, text_asked, why = ask(text, output_schema, "human")
+        try:
+            known = _session(board.conn, session_id)
+            check = tells_check(board, known.get("agent"), known.get("runtime"))
+        except BoardError:
+            check = False       # (the session's own refusal comes below, as on main)
+        output, text_asked, why = ask(text, output_schema, "human", check=check)
         text = text_asked or text
     from . import hosted_spawn, hosted_tree
     rid = hosted_tree._request_id(request_id)

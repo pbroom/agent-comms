@@ -8,6 +8,9 @@ interactive root it acts for (its board session's project by default); the grant
 """
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from typing import Any, Callable, Literal
 
 import anyio
@@ -15,8 +18,10 @@ import anyio.to_thread
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import hosted_results, hosted_spawn
+from . import hosted, hosted_results, hosted_spawn, output_schema
 from .core import BoardError
+
+log = logging.getLogger("agent_comms.spawn_mcp")
 
 EFFORT = Literal["low", "medium", "high", "xhigh", "max"]
 ROLE = Literal["implementation", "research", "review", "design", "test", "general"]
@@ -36,7 +41,115 @@ OUTPUT = (" output_schema: the JSON TEXT of a JSON Schema (a small subset: type,
           "without it no verdict comes.")
 
 
+CHECK = ("Check a result-data block before you end your turn, when your turn's frame asks for this turn's result as "
+         "data. block: the block exactly as you will end your reply with it (the line <<<result-data T>>>, the JSON "
+         "object, the line <<<end result-data T>>>, with T this turn's token); pass your whole reply instead to check "
+         "where the block sits and the reply's size too. The board checks it against that message's schema with the "
+         "same checks it makes when your turn ends, and says whether it would be accepted or what does not fit. It "
+         "is only a check: the board does not save it as a result or send it to the asker, so this is NOT how you "
+         "give your result. Your result is only the block at the end of your reply, so after checking, end your "
+         "reply with the block. Optional; at most 20 checks per message.")
+CHECK_LOG = "board_session_check_result: %s"     # fixed words and a class name only: never the block (RC-02)
+
+
+class CheckBounds:
+    """The in-turn check's limits (DESIGN_NOTES "In-turn result check", E), in this serving process's memory only:
+    process-local and best effort (a stdio server per session's process; the hub's process for bridged sessions; a
+    restart resets them). Every reservation is made under one lock (atomic), on a monotonic clock.
+    - `enter`/`leave`: at most CONCURRENT checks at once; one more is refused at once (fail fast), never queued.
+    - `rate(agent)`: at most RATE calls by one agent name in any RATE_SECONDS, any outcome, reserved before any read.
+      The map holds at most AGENTS names, and an expired window is dropped.
+    - `count(request)`: at most output_schema.CHECKS_PER_REQUEST counted checks per request identity (the session
+      and message the lookup found, never the token text), in a map of at most REQUESTS entries, oldest dropped."""
+
+    CONCURRENT, RATE, RATE_SECONDS, AGENTS, REQUESTS = 4, 60, 60.0, 1024, 4096
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        import collections
+        self.clock, self.lock = clock, threading.Lock()
+        self.busy = 0
+        self._limiter = None
+        self.calls: dict[str, collections.deque] = {}
+        self.counts: collections.OrderedDict = collections.OrderedDict()
+
+    def limiter(self):
+        """This tool's own worker limiter (as many workers as checks may run): made on first use, in the event loop."""
+        if self._limiter is None:
+            self._limiter = anyio.CapacityLimiter(self.CONCURRENT)
+        return self._limiter
+
+    def enter(self) -> bool:
+        with self.lock:
+            if self.busy >= self.CONCURRENT:
+                return False
+            self.busy += 1
+            return True
+
+    def leave(self) -> None:
+        with self.lock:
+            self.busy = max(0, self.busy - 1)
+
+    def rate(self, agent: str) -> bool:
+        import collections
+        with self.lock:
+            now = self.clock()
+            for name in [k for k, q in self.calls.items() if not q or q[-1] <= now - self.RATE_SECONDS]:
+                del self.calls[name]         # every expired window goes (bounded expiry)
+            q = self.calls.get(agent)
+            if q is None:
+                if len(self.calls) >= self.AGENTS:
+                    del self.calls[min(self.calls, key=lambda k: self.calls[k][-1])]
+                q = self.calls[agent] = collections.deque()
+            while q and q[0] <= now - self.RATE_SECONDS:
+                q.popleft()
+            if len(q) >= self.RATE:
+                return False
+            q.append(now)
+            return True
+
+    def count(self, request: str) -> bool:
+        with self.lock:
+            n = self.counts.pop(request, 0)
+            if n >= output_schema.CHECKS_PER_REQUEST:
+                self.counts[request] = n
+                return False
+            self.counts[request] = n + 1
+            while len(self.counts) > self.REQUESTS:
+                self.counts.popitem(last=False)
+            return True
+
+
+def check_block(board, agent: str, block: Any, bounds: CheckBounds) -> dict:
+    """The in-turn check's whole work, off the event loop: the bounds, the token, the lookup, then the settlement
+    verdict on the text. Every refusal is a fixed answer; nothing of the block is logged, raised or returned."""
+    if not isinstance(block, str):
+        return output_schema.not_checked(output_schema.WHY_NO_MARKER)
+    if not bounds.rate(agent):
+        return output_schema.not_checked(output_schema.WHY_RATE.format(n=bounds.RATE))
+    if len(block) > output_schema.CHECK_TEXT_MAX:     # characters first: nothing longer is read (R4-03's rule)
+        return output_schema.not_checked(output_schema.WHY_TOO_LONG)
+    tokens = output_schema.check_tokens(block)
+    if not tokens:
+        return output_schema.not_checked(output_schema.WHY_NO_MARKER)
+    if len(tokens) > output_schema.CHECK_TOKENS_MAX:      # before any lookup: one cut off could be the open one
+        return output_schema.not_checked(output_schema.WHY_TOO_MANY)
+    state, request = hosted.open_request(board, agent, tokens)
+    if state == "failed":
+        return output_schema.not_checked(output_schema.WHY_FAILED)
+    if state == "closed":
+        return output_schema.not_checked(output_schema.WHY_CLOSED)
+    if state == "ambiguous":
+        return output_schema.not_checked(output_schema.WHY_AMBIGUOUS)
+    if state != "open":
+        return output_schema.not_checked(output_schema.WHY_NONE)
+    if not bounds.count(request["id"]):
+        return output_schema.not_checked(output_schema.WHY_LIMIT)
+    return output_schema.checked(request, block)
+
+
 def install(mcp, board, principal: Callable, ident: Callable, run: Callable, warning: str) -> None:
+    bounds = CheckBounds()
+    mcp.check_bounds = bounds      # (the tests' handle on this server's bounds)
     async def threaded(fn: Callable[[], Any]) -> Any:
         def go():
             try:
@@ -158,6 +271,32 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
         out = await threaded(lambda: hosted_spawn.status(board, p, who, child, project))
         out["result"] = result
         return out
+
+    @mcp.tool(description=CHECK + warning)
+    async def board_session_check_result(block: str, ctx: Context = None) -> dict:
+        # `block: str` exactly (as output_schema): any other annotation makes the SDK pre-parse a JSON-looking string,
+        # collapsing duplicate keys before the strict decoder sees them. Not behind the spawn gate: a human-asked
+        # root works with child sessions off. Who may check is the agent token alone (the same agent as the asked
+        # session's, in the lookup); no binding, grant or child sessions are needed.
+        # Admission comes FIRST, before any worker is taken (R2-01): a fifth call while four run is answered at once.
+        # Then authentication and the check run in ONE worker, under this tool's own limiter (never AnyIO's shared
+        # one), so slow authentication cannot queue other tools' work behind it. Authentication errors are the
+        # board's own, as for every tool.
+        if not bounds.enter():
+            return output_schema.not_checked(output_schema.WHY_BUSY)
+        try:
+            def go() -> dict:
+                p = principal(ctx)          # raises the board's ToolError for a bad token or a node identity
+                if p.is_human:              # agents only (R2-04): before any lookup, whatever rows are retained
+                    return output_schema.not_checked(output_schema.WHY_NONE)
+                try:
+                    return check_block(board, p.name, block, bounds)
+                except Exception as e:      # a fixed answer and a fixed log line: never the block, never a trace
+                    log.warning(CHECK_LOG, type(e).__name__)
+                    return output_schema.not_checked(output_schema.WHY_FAILED)
+            return await anyio.to_thread.run_sync(go, limiter=bounds.limiter())
+        finally:
+            bounds.leave()
 
     @mcp.tool(description=(
         "Stop work you gave a child session you started: by default its turn in flight is interrupted (its node stops "

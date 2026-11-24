@@ -20,7 +20,8 @@ What a turn does is in its text:
 - `crash ...`: the process exits (code 3) at once, before any answer or event for the turn.
 - `deny ...`: the server asks to run a command (`item/commandExecution/requestApproval`), waits for the answer and
   reports the command `declined` unless it was accepted.
-- `mcp ...`: an MCP tool call fails because it would need approval (as under approvalPolicy never).
+- `mcp ...`: an MCP tool call fails because it would need approval (as under approvalPolicy never); `mcp SERVER/TOOL
+  ...` names the tool (default agent-comms/board_post).
 - `big ...`: the reply is 40 KB.
 - `recall ...`: the reply names the first message of the THREAD, whichever process took it.
 - `write NAME`: the turn tries to create the file NAME in the thread's `cwd`. Under the `read-only` sandbox nothing
@@ -238,8 +239,10 @@ class Server:
                 "type": "commandExecution", "id": item_id, "command": "/bin/zsh -lc 'touch /stand-in/secret/path.txt'",
                 "status": "completed" if decision == "accept" else "declined", "exitCode": None})
         if text.startswith("mcp"):
+            named = re.match(r"mcp ([A-Za-z0-9_-]+)/([A-Za-z0-9_]+)\b", text)    # `mcp SERVER/TOOL ...`: that one
+            server, tool = named.groups() if named else ("agent-comms", "board_post")
             self.notify("item/completed", threadId=tid, turnId=turn_id, completedAtMs=0, item={
-                "type": "mcpToolCall", "id": "exec-" + str(uuid.uuid4()), "server": "agent-comms", "tool": "board_post",
+                "type": "mcpToolCall", "id": "exec-" + str(uuid.uuid4()), "server": server, "tool": tool,
                 "status": "failed", "arguments": {"body": "STAND-IN-TOOL-ARGUMENT"}, "result": None,
                 "error": {"message": "MCP tool call requires approval, but approval policy is never"}})
 

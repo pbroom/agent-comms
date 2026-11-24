@@ -8,6 +8,7 @@ the token to the agent; tools never accept a sender name.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import sys
 from typing import Annotated, Any, Literal
@@ -76,7 +77,38 @@ class RequestReplyIn(BaseModel):
     completion: dict[str, Any] | None = None
 
 
+class _NoRawEnvelope(logging.Filter):
+    """The MCP SDK logs, at DEBUG and before any handler, two diagnostics whose argument is a whole inbound frame (a
+    result-data block, say): the dispatcher's "transport yielded exception" for a malformed stdio line, and the
+    runner's "dropped a frame received before the first request" once its pre-request replay buffer is full. Each
+    is kept, its argument replaced by its type's name; every other record passes as it is."""
+
+    RAW = {"transport yielded exception: %r": "transport yielded exception: %s",
+           "dropped a frame received before the first request: %r":
+               "dropped a frame received before the first request: %s"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Never raises, and changes only what it recognises: a string message that is one of the two, with exactly
+        # one positional argument. A non-string message (a dict is unhashable), a dict as the only argument (logging
+        # keeps a lone mapping as `args` itself), no argument, or any other message passes through untouched.
+        if (isinstance(record.msg, str) and record.msg in self.RAW and isinstance(record.args, tuple)
+                and len(record.args) == 1):
+            record.msg, record.args = self.RAW[record.msg], (type(record.args[0]).__name__,)
+        return True
+
+
+RAW_FRAME_LOGGERS = ("mcp.shared.jsonrpc_dispatcher", "mcp.server.runner")     # the pinned SDK's (2.2.0)
+
+
+def _quiet_raw_envelopes() -> None:
+    for name in RAW_FRAME_LOGGERS:
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _NoRawEnvelope) for f in lg.filters):
+            lg.addFilter(_NoRawEnvelope())
+
+
 def build_mcp(board: Board, transport: Literal["stdio", "http"], *, instructions: str = INSTRUCTIONS) -> MCPServer:
+    _quiet_raw_envelopes()
     mcp = MCPServer("agent-comms", instructions=instructions)
     # stdio: one process == one agent connection, so remember the registered session for convenience.
     state: dict[str, Any] = {"session_id": None,

@@ -1071,13 +1071,13 @@ POOL_SLOT = "\x00"     # where `_spawn_line` leaves room for the pool words (not
 
 
 def _frame(who: str, task: str, line: str, pools: list[dict], schema: str | None = None, token: str | None = None,
-           targets: str | None = None) -> str:
+           targets: str | None = None, check: bool = False) -> str:
     """The task's message, with the spawn line `line` (from ONE evaluation: `_spawn_line`) and, where it left
     POOL_SLOT, the pool words fitted to the bytes the message has left once everything else of it is measured
     (hosted.MESSAGE_MAX_BYTES; render_task's token is the same length every time). Nothing is evaluated again after
     the measure. A line without the slot is rendered as it is (main's)."""
     if schema is not None:
-        return _frame_asked(who, task, line, pools, schema, token, targets)
+        return _frame_asked(who, task, line, pools, schema, token, targets, check)
     if POOL_SLOT not in line:
         return render_task(who, task, line)
     head, _, rest = line.partition(POOL_SLOT)
@@ -1087,23 +1087,30 @@ def _frame(who: str, task: str, line: str, pools: list[dict], schema: str | None
 
 
 def _frame_asked(who: str, task: str, line: str, pools: list[dict], schema: str, token: str,
-                 targets: str | None) -> str:
+                 targets: str | None, check: bool = False) -> str:
     """A task that asks for a result as data (DESIGN_NOTES "Structured results", F): the WHOLE message, ask line
     and schema included, measured; the pool words fitted first, then the spawn line's targets cut to a pointer to
-    board_session_capabilities. What still does not fit is refused by the caller (hosted.ask measures the result)."""
-    def full(spawn_line: str) -> str:
-        return render_task(who, task, spawn_line, token=token, schema=schema)
+    board_session_capabilities. What still does not fit is refused by the caller (hosted.ask measures the result).
+    `check`: the in-turn check's sentence is added only once everything else is fitted, and only if it fits too, so
+    it never cuts a pool or a target and never makes a frame fail (RC-06)."""
+    def full(spawn_line: str, with_check: bool = False) -> str:
+        return render_task(who, task, spawn_line, token=token, schema=schema, check=with_check)
 
     def size(text: str) -> int:
         return len(text.encode("utf-8", "replace"))
 
     head, _, rest = line.partition(POOL_SLOT)
     room = hosted.MESSAGE_MAX_BYTES - size(full(head + rest))
-    out = full(head + _fit_pools(pools, room) + rest)
-    if size(out) <= hosted.MESSAGE_MAX_BYTES or not targets or targets not in line:
-        return out
-    short = line.replace(targets, output_schema.SHORT_TARGETS, 1).replace(POOL_SLOT, "")
-    return full(short)
+    chosen = head + _fit_pools(pools, room) + rest
+    out = full(chosen)
+    if size(out) > hosted.MESSAGE_MAX_BYTES and targets and targets in line:
+        chosen = line.replace(targets, output_schema.SHORT_TARGETS, 1).replace(POOL_SLOT, "")
+        out = full(chosen)
+    if check:
+        with_check = full(chosen, True)
+        if size(with_check) <= hosted.MESSAGE_MAX_BYTES:
+            return with_check
+    return out
 
 
 def _fit_pools(pools: list[dict], room: int | None) -> str:
@@ -1197,7 +1204,7 @@ def _spawn_line(c, board: Board, caller: Caller, agent: str, model: str | None, 
 
 
 def render_task(who: str, text: str, spawn_line: str = "", follow_up: bool = False, token: str | None = None,
-                schema: str | None = None) -> str:
+                schema: str | None = None, check: bool = False) -> str:
     """`schema` (its rendered text; hosted.ask): the task also asks for its result as data, with the ask line after
     the spawn line and the schema block after the task. Without it, the frame is what it always was."""
     token = token or secrets.token_hex(8)
@@ -1208,7 +1215,8 @@ def render_task(who: str, text: str, spawn_line: str = "", follow_up: bool = Fal
     if schema is None:
         return "\n".join([head] + ([spawn_line] if spawn_line else []) + [f"<<<task {token}>>>", text,
                                                                           f"<<<end task {token}>>>"])
-    return "\n".join([head] + ([spawn_line] if spawn_line else []) + [output_schema.TASK_ASK.format(t=token)]
+    ask = output_schema.TASK_ASK_CHECK if check else output_schema.TASK_ASK
+    return "\n".join([head] + ([spawn_line] if spawn_line else []) + [ask.format(t=token)]
                      + [f"<<<task {token}>>>", text, f"<<<end task {token}>>>",
                         output_schema.schema_block(token, schema)])
 
@@ -1520,8 +1528,9 @@ def _spawn_in(c, board: Board, p: Principal, ident: Ident, *, task: Any, agent: 
     if output_schema is not None:
         # Refused only here, after the retry lookup above (`_handle`): a retry gets its child first (R2-10).
         who = _who(caller)
-        output, text, why = hosted.ask(task, output_schema, "parent", frame=lambda token, shown: _frame(
-            who, task, line, pools, schema=shown, token=token, targets=targets[0] if targets else None))
+        output, text, why = hosted.ask(task, output_schema, "parent", frame=lambda token, shown, check: _frame(
+            who, task, line, pools, schema=shown, token=token, targets=targets[0] if targets else None, check=check),
+            check=hosted.tells_check(board, agent, runtime))
         if why:
             raise Invalid(why)
     else:
@@ -1676,8 +1685,10 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
         if output_schema is not None:
             # Decided now; refused only once the retry lookup in the transaction below has missed (R2-10).
             who, task_text = _who(caller), _task_text(message)
-            output, text, why = hosted.ask(task_text, output_schema, "parent", frame=lambda token, shown: render_task(
-                who, task_text, follow_up=True, token=token, schema=shown))
+            output, text, why = hosted.ask(task_text, output_schema, "parent", frame=lambda token, shown, check:
+                                           render_task(who, task_text, follow_up=True, token=token, schema=shown,
+                                                       check=check),
+                                           check=hosted.tells_check(board, kid.get("agent"), kid.get("runtime")))
         else:
             text = render_task(_who(caller), _task_text(message), follow_up=True)
         if rid is None:

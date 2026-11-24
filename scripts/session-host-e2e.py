@@ -185,6 +185,24 @@ P3. A rule `only = ["claude-work"]` for the temp checkout: the next spawn is cla
     checkout, where claude-work is not opted in, leaves nothing: refused with the reason.
 P4. A rule `never = ["claude-work"]` (and the work account back at 10%): the spawn goes to claude, and so does the
     human's `board session start --parent ... --agent e2e-pool`, whose output says how it was chosen.
+D7-D8 (`--only structured`, or alone with `--only check`): the in-turn result check (DESIGN_NOTES "In-turn result
+check"), through real `board mcp` processes on the temp hub's database.
+D7. With the stand-ins, deterministically (the correction gate): a human root with child sessions OFF has a held
+    turn checked (accepted) and settles accepted; with them on, a root of the spawning agent has a held turn checked
+    twice (a block that does not fit: missing, shape, the settlement's exact reasons; the fixed one: accepted) and
+    settles accepted, and a second one whose accepted check is followed by a reply with no block settles missing
+    (no_block): a check is not a result. (That the board writes no durable row is tests/test_result_check.py's, which
+    compares the whole database around the checks.) With real CLIs: a root of the spawning agent (board tools)
+    reviews with a broken draft, first with the frame's recommendation alone (the task does not name the tool:
+    RECORDED), then told in the task to check too: a check answered by the validator (each tool call matched to its
+    result by id, the answer parsed) and an accepted settlement REQUIRED; a Codex child whose runner reaches the temp
+    board (`e2e-board`, never the user's own `agent-comms` entry) and approves the tool, told in the task: REQUIRED
+    the same. Whether a first draft needed correction is recorded.
+D8. A Codex runner that lists the tool but does not approve it: with the stand-in, deterministically, its refused call
+    is recorded as a denial of exactly that tool and the session shows `waiting`, while the verdict is still the
+    reply's; with the real Codex, told to check: recorded, and no check may reach the validator. The frames: every
+    asked frame written to a Claude process recommends the check; asked frames were written to Codex processes, and
+    none of them does.
 The settings fixtures live in the temp directory only. They are loaded with `--settings` because Claude Code
 ignores an untrusted directory's own `.claude/settings.json` in print mode (it says so on stderr), and trusting the
 temp checkout would mean writing the user's `~/.claude.json`. With the real CLI those two runners also pass
@@ -225,6 +243,9 @@ GRANT_AGENT = "claude-granted"  # ... a third: its runner loads a settings file 
 MODE_AGENT = "claude-defmode"   # ... a fourth: its runner loads a settings file whose defaultMode is bypassPermissions
 RESTRICTED_AGENT = "claude-restricted"      # ... a fifth: --restricted beside the bypass mode, which Claude refuses
 SPAWN_AGENT = "claude-spawner"  # ... a sixth: its runner has the temp board's MCP tools, so it can start children itself
+CHECK_CODEX = "codex-checker"   # D7: a Codex agent whose runner has the temp board's server AND approves the check
+DENIED_CODEX = "codex-denied"   # D8: a Codex agent whose runner lists the temp board's server but approves nothing
+CHECK_SERVER = "e2e-board"      # the temp board's server as those two runners name it (never the user's agent-comms)
 WORK_AGENT = "claude-work"      # ... a seventh: another account's runner (an account folder of its own), opted in to
                                 # the temp checkout only (A1-A3)
 POOL = "e2e-pool"               # P1-P4: an account pool of the work agent first, then the first agent
@@ -299,6 +320,28 @@ is all you need.
 +    start = (n - 1) * size
 +    return items[start:start + size + 1]
 """
+
+# The in-turn check (D7-D8): a schema whose length bounds a first draft is likely to miss, and a review task that hands
+# over such a draft. The stand-ins take the review schema and their `data-*` turns instead.
+CHECK_SCHEMA = {"type": "object", "required": ["verdict", "summary", "findings"], "additionalProperties": False,
+                "properties": {"verdict": {"enum": ["ok", "changes"]},
+                               "summary": {"type": "string", "maxLength": 20},
+                               "findings": {"type": "array", "items": {
+                                   "type": "object", "required": ["file", "line", "note"],
+                                   "additionalProperties": False,
+                                   "properties": {"file": {"type": "string"},
+                                                  "line": {"type": "integer", "minimum": 1},
+                                                  "note": {"type": "string", "maxLength": 30}}}}}}
+CHECK_TASK = REVIEW_TASK.replace("Do not use any tools: the diff is all you need.",       # (the check is a tool)
+                                 "You need no file or shell tool: the diff is all you need.") + """
+A colleague already drafted the result object for this review; start from it, and check it before you use it:
+{"verdict": "changes", "summary": "The end index of the page slice includes one item too many", "findings": [{"file": \
+"src/pager.py", "line": 3, "note": "start + size + 1 returns size + 1 items on every page"}]}
+"""
+CHECK_TELL = ("\nBefore you answer, check your result-data block with the board tool board_session_check_result, and "
+              "fix what it names.")
+# The board's answers in a transcript: a check's JSON answer names `would_be` (checked) or `checked: false`.
+D7_RECORD = []
 
 BOARD_GRACE = 5                 # --with-board: the hub's wake_grace_seconds, short so `holds` is asked after it
 BOARD_BOUND = 90                # --with-board: most seconds from the post to the session's delivery receipt
@@ -425,7 +468,7 @@ class Run:
     def write_settings(self) -> None:
         agents = self.hub_home / "agents.toml"
         self.human_token = create_agent(agents, "human", "human", is_human=True)
-        agent_token = create_agent(agents, AGENT, "claude-code")
+        agent_token = self.agent_token = create_agent(agents, AGENT, "claude-code")
         self.poster_token = create_agent(agents, POSTER, "codex-cli")
         create_agent(agents, CODEX_AGENT, "codex-cli")
         create_agent(agents, STEER_AGENT, "claude-code")
@@ -526,6 +569,22 @@ codex = true
             runner += ["-c", 'mcp_servers.agent-comms.tools.board_post.approval_mode="approve"']
         self.codex_template = runner + ["{prompt}"]
         return self.codex_template
+
+    def board_codex_runner(self, agent: str, approve: bool) -> list[str]:
+        """D7-D8: the Codex runner with the temp board's own `board mcp` as one more MCP server (named CHECK_SERVER,
+        so the user's own `agent-comms` entry stays disabled), signed in as `agent` from a token file in the temp
+        directory; `approve`: the runner approves the check tool (and only it)."""
+        base = self.codex_runner()[:-1]          # without "{prompt}"
+        env = {"AGENT_COMMS_HOME": str(self.hub_home), "AGENT_COMMS_TOKEN_DIR": str(self.tmp / "tokens"),
+               "PYTHONPATH": str(ROOT), "PYTHONUNBUFFERED": "1"}
+        out = base + ["-c", f"mcp_servers.{CHECK_SERVER}.command={json.dumps(sys.executable)}",
+                      "-c", f"mcp_servers.{CHECK_SERVER}.args=" + json.dumps(["-m", "agent_comms.cli", "mcp",
+                                                                              "--agent", agent]),
+                      *[x for k, v in env.items()        # one dotted key each: a runner's argv holds no braces
+                        for x in ("-c", f"mcp_servers.{CHECK_SERVER}.env.{k}={json.dumps(v)}")]]
+        if approve:
+            out += ["-c", f'mcp_servers.{CHECK_SERVER}.tools.board_session_check_result.approval_mode="approve"']
+        return out + ["{prompt}"]
 
     def codex_quiet(self) -> list[str]:
         """`-c` overrides that disable every MCP server the user's Codex configuration names, for the processes this
@@ -1234,6 +1293,13 @@ codex = true
         agents = self.hub_home / "agents.toml"
         for name in (FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, WORK_AGENT):
             create_agent(agents, name, "claude-code")
+        # D7-D8: two Codex agents whose runners reach the temp board's own `board mcp` (by token file, below).
+        check_tokens = self.tmp / "tokens"
+        check_tokens.mkdir(exist_ok=True)
+        for name in (CHECK_CODEX, DENIED_CODEX):
+            f = check_tokens / f"{name}.token"
+            f.touch(mode=0o600)
+            f.write_text(create_agent(agents, name, "codex-cli") + "\n")
         # A1: the work account's folder (an empty one: the stand-in reads nothing there) and its recording wrapper.
         self.work_home = self.tmp / "claude-work-home"
         self.work_home.mkdir(exist_ok=True)
@@ -1281,7 +1347,8 @@ codex = true
             (directory / ".claude" / "settings.json").write_text(json.dumps(fixture, indent=2) + "\n")
         hub = (self.hub_home / "board.toml").read_text()
         hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT])}", "agents = " + toml_list(
-            [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT, WORK_AGENT]))
+            [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT, WORK_AGENT,
+             CHECK_CODEX, DENIED_CODEX]))
         hub = hub.replace(f"projects = {toml_list([str(self.project)])}",
                           f"projects = {toml_list([str(self.project), str(self.project_mode)])}")
         (self.hub_home / "board.toml").write_text(hub + "\n[dispatch.sessions.spawn]\nenabled = true\n"
@@ -1333,6 +1400,8 @@ worktree_dir = {json.dumps(str(self.worktrees))}
 {SPAWN_AGENT} = {toml_list(spawner)}
 {WORK_AGENT} = {toml_list(work)}
 {CODEX_AGENT} = {toml_list(self.codex_runner())}
+{CHECK_CODEX} = {toml_list(self.board_codex_runner(CHECK_CODEX, approve=True))}
+{DENIED_CODEX} = {toml_list(self.board_codex_runner(DENIED_CODEX, approve=False))}
 
 [dispatch.runner_homes]
 {json.dumps(WORK_AGENT)} = {json.dumps(str(self.work_home))}
@@ -2179,6 +2248,36 @@ max_live = 8
         self.check(rc == 0 and "result as data" not in err, "a message without a schema: exit and output as ever")
         self.board("session", "close", sid)
         self.wait_ended(sid)
+        if not self.real:
+            self.check_off_scenario(review)
+
+    def check_off_scenario(self, review: Path) -> None:
+        """D7 with child sessions OFF (as shipped): a human root's held turn is checked through a real `board mcp`
+        process as its agent (no binding, no grant, no child sessions: none is needed), and settles accepted."""
+        from agent_comms import output_schema
+        print("\n[D7] the in-turn check with child sessions off: a human root")
+        token_file = self.tmp / "tokens" / f"{AGENT}.token"
+        if not token_file.exists():
+            token_file.touch(mode=0o600)
+            token_file.write_text(self.agent_token + "\n")
+        hold = self.tmp / "d7-off-release"
+        out, _, _ = self.board("session", "start", str(self.project), f"hold {hold} data-valid", "--agent", AGENT,
+                               "--output-schema", str(review), "--json")
+        sid = json.loads(out)["session"]["session_id"]
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 60)
+        t = self.asked_token(sid, 1)
+        good = {"verdict": "changes", "findings": [{"file": "src/pager.py", "line": 3, "note": "off by one"}]}
+        [answer] = self.mcp_calls(AGENT, [[output_schema.CHECK_TOOL, {
+            "block": f"Reviewed.\n<<<result-data {t}>>>\n{json.dumps(good)}\n<<<end result-data {t}>>>"}]])
+        got = json.loads(answer["text"])
+        print(f"  check: {got.get('would_be')}")
+        self.check(got.get("would_be") == "accepted", "D7 (spawning off): the human root's block is checked: accepted")
+        hold.write_text("go")
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 60)
+        self.check(((m or {}).get("output") or {}).get("state") == "accepted",
+                   "D7 (spawning off): the turn settled accepted, from its reply")
+        self.board("session", "close", sid)
+        self.wait_ended(sid)
 
     def structured_scenario(self) -> None:
         """D3-D6: children asked for a result as data (child sessions on)."""
@@ -2264,6 +2363,248 @@ max_live = 8
         for s in (root, sroot):
             self.board("session", "close", s)
             self.wait_ended(s)
+
+    # ------------------------------------------------------------ the in-turn check (DESIGN_NOTES "In-turn result check")
+
+    def asked_token(self, sid: str, n: int) -> str:
+        """The token of message n's request, as the hub stored it (what the session's frame shows), read by another
+        process on the hub's database."""
+        code = ("import json, sys\nfrom agent_comms import hosted\nfrom agent_comms.config import Settings\n"
+                "from agent_comms.core import Board\nfrom agent_comms.nodes import _get\nb = Board(Settings.load())\n"
+                "print(_get(b.conn, hosted._msg_key(sys.argv[1], int(sys.argv[2])))['output']['token'])")
+        r = subprocess.run([sys.executable, "-c", code, sid, str(n)], cwd=str(self.tmp), capture_output=True,
+                           text=True, timeout=60, env=self.env | {"AGENT_COMMS_HOME": str(self.hub_home)})
+        if r.returncode != 0:
+            raise SystemExit(f"could not read the hub's database:\n{r.stderr[-2000:]}")
+        return r.stdout.strip()
+
+    def check_calls(self, sid: str) -> list[str]:
+        """The check calls in a session's transcript on its node, in order, each as the board's PARSED answer:
+        `accepted`, `missing:<code>` (a shipped code), `not-checked`, `refused` (Codex declined the call: no
+        approval), or `?` (an answer that does not parse as the check's). Claude: each `tool_use` of the check is
+        matched to its `tool_result` by id; Codex: the check's `mcpToolCall` item and its result."""
+        out, names = [], {}
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("type") == "assistant":
+                    for part in (ev.get("message") or {}).get("content") or []:
+                        if isinstance(part, dict) and part.get("type") == "tool_use":
+                            names[part.get("id")] = part.get("name") or ""
+                if ev.get("type") == "user":            # Claude: the tool's answer comes back as a tool_result
+                    for part in (ev.get("message") or {}).get("content") or []:
+                        if (isinstance(part, dict) and part.get("type") == "tool_result"
+                                and names.get(part.get("tool_use_id"), "").endswith("__board_session_check_result")):
+                            out.append(self.answer_word(part.get("content")))
+                item = (ev.get("params") or {}).get("item") if ev.get("method") == "item/completed" else None
+                if isinstance(item, dict) and item.get("type") == "mcpToolCall" and \
+                        item.get("tool") == "board_session_check_result":
+                    out.append("refused" if item.get("status") != "completed" else
+                               self.answer_word((item.get("result") or {}).get("content")))
+        return out
+
+    @staticmethod
+    def answer_word(content) -> str:
+        """The check's answer from a tool result's content (a string, or a list of text parts), parsed as JSON."""
+        from agent_comms import output_schema
+        texts = [content] if isinstance(content, str) else [
+            p.get("text") for p in content or [] if isinstance(p, dict) and isinstance(p.get("text"), str)]
+        for text in texts:
+            try:
+                answer = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(answer, dict) or answer.get("result_saved") is not False:
+                continue
+            if answer.get("checked") is True and answer.get("would_be") == "accepted":
+                return "accepted"
+            if answer.get("checked") is True and answer.get("would_be") == "missing" and \
+                    answer.get("code") in output_schema.CODES:
+                return "missing:" + answer["code"]
+            if answer.get("checked") is False:
+                return "not-checked"
+        return "?"
+
+    @staticmethod
+    def validated(seen: list[str]) -> bool:
+        """At least one check reached the validator and was answered with a verdict (not `?`, not refused, not
+        `not-checked`)."""
+        return any(x == "accepted" or x.startswith("missing:") for x in seen)
+
+    def transcript_tools(self, sid: str) -> tuple[list[str], list[str]]:
+        """(the board tools the session's process listed in its last `init`, the tools it called), from its node's
+        transcript: what a check scenario prints, to tell "not called" from "not there"."""
+        listed, called = [], []
+        for path in self.node_home.rglob(f"{sid}.jsonl"):
+            for line in path.read_text().splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("type") == "system" and ev.get("subtype") == "init":
+                    listed = [t for t in ev.get("tools") or [] if isinstance(t, str) and t.startswith("mcp__")]
+                if ev.get("type") == "assistant":
+                    called += [p.get("name") for p in (ev.get("message") or {}).get("content") or []
+                               if isinstance(p, dict) and p.get("type") == "tool_use"]
+                item = (ev.get("params") or {}).get("item") if ev.get("method") == "item/completed" else None
+                if isinstance(item, dict) and item.get("type") == "mcpToolCall":
+                    called.append(f"{item.get('server')}/{item.get('tool')} ({item.get('status')})")
+        return listed, called
+
+    def check_scenario(self) -> None:
+        """D7-D8: the in-turn check. D7 with the stand-ins is the correction gate, deterministically: a block that
+        does not fit is checked (missing, shape, exact reasons), the fixed one is checked (accepted), and the turn
+        settles accepted; a check that was accepted and then an omitted block settles missing (nothing was saved as
+        a result: the durable-state comparison itself is tests/test_result_check.py's). With real CLIs: a root with
+        board tools and a Codex child whose runner approves the tool, each told in the task to check a broken
+        draft: a check answered by the validator and an accepted settlement are REQUIRED; the frame's sentence
+        alone, and whether the first draft needed correction, are RECORDED. D8: the approval denial and `waiting`
+        of a Codex runner that lists the tool but does not approve it, deterministically with the stand-in (with
+        the real Codex: recorded), and the frames."""
+        from agent_comms import output_schema
+        review = self.tmp / "review-schema.json"
+        review.write_text(json.dumps(REVIEW_SCHEMA))
+        strict = self.tmp / "check-schema.json"
+        strict.write_text(json.dumps(CHECK_SCHEMA))
+        model = ["--model", "haiku"]
+        print("\n[D7] the in-turn check: reject, fix, settle accepted; and an accepted check, then no block")
+        if not self.real:
+            for kind, want in (("valid", "accepted"), ("none", "missing")):
+                hold = self.tmp / f"d7-release-{kind}"
+                out, _, _ = self.board("session", "start", str(self.project), f"hold {hold} data-{kind}", "--agent",
+                                       SPAWN_AGENT, "--output-schema", str(review), "--json")
+                sid = json.loads(out)["session"]["session_id"]
+                self.message(sid, 1, lambda m: m["state"] == "delivered", 60)
+                t = self.asked_token(sid, 1)
+                bad = {"verdict": "maybe", "findings": [{"file": "src/pager.py", "line": "3", "note": "x" * 501}]}
+                good = {"verdict": "changes", "findings": [{"file": "src/pager.py", "line": 3, "note": "off by one"}]}
+                block = "Reviewed.\n<<<result-data {t}>>>\n{v}\n<<<end result-data {t}>>>"
+                calls = self.mcp_calls(SPAWN_AGENT, [
+                    [output_schema.CHECK_TOOL, {"block": block.format(t=t, v=json.dumps(bad))}],
+                    [output_schema.CHECK_TOOL, {"block": block.format(t=t, v=json.dumps(good))}]], sid)
+                first, second = (json.loads(c["text"]) for c in calls)
+                print(f"  {kind}: first check {first.get('would_be')} {first.get('reasons')}; second "
+                      f"{second.get('would_be')}")
+                self.check(first.get("would_be") == "missing" and first.get("code") == "shape" and first["reasons"] == [
+                    "at $.verdict: not one of the enum's values", "at $.findings[0].line: expected integer, got string",
+                    "at $.findings[0].note: longer than maxLength 500: it has 501 characters"],
+                    f"D7 ({kind}): the block that does not fit is missing (shape), with the settlement's exact reasons")
+                self.check(second == {"checked": True, "would_be": "accepted", "result_saved": False,
+                                      "next": output_schema.CHECK_FITS}, f"D7 ({kind}): the fixed block is accepted")
+                hold.write_text("go")
+                m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 60)
+                verdict = (m or {}).get("output") or {}
+                print(f"  {kind}: settled {verdict.get('state')} {verdict.get('code') or ''}")
+                self.check(verdict.get("state") == want and (want == "accepted" or verdict.get("code") == "no_block"),
+                           f"D7 ({kind}): the verdict is the reply's: {want}"
+                           + ("" if want == "accepted" else " (no_block): an accepted check is not a result"))
+                self.board("session", "close", sid)
+                self.wait_ended(sid)
+        else:
+            # The frame's sentence alone (the task does not name the tool): RECORDED, since that step is optional by
+            # construction. Told in the task too: a check answered by the validator, and an accepted settlement,
+            # REQUIRED.
+            for how, text, required in (("the frame only", CHECK_TASK, False),
+                                        ("told in the task too", CHECK_TASK + CHECK_TELL, True)):
+                out, _, _ = self.board("session", "start", str(self.project), text, "--agent", SPAWN_AGENT, *model,
+                                       "--output-schema", str(strict), "--wait", "--json", ok=False)
+                data = json.loads(out)
+                sid = data["session"]["session_id"]
+                seen = self.check_calls(sid)
+                verdict = data["message"].get("output") or {}
+                D7_RECORD.append({"who": f"Claude root (board tools), {how}", "checks": seen,
+                                  "verdict": verdict.get("state"), "code": verdict.get("code")})
+                listed, called = self.transcript_tools(sid)
+                print(f"  Claude root, {how}: checks {seen}; verdict {verdict.get('state')} "
+                      f"{verdict.get('code') or ''}; tools called {called}")
+                if required:
+                    self.check(self.validated(seen) and verdict.get("state") == "accepted",
+                               "D7 (Claude, board tools, told in the task): a check answered by the validator, and "
+                               "the turn settled accepted")
+                print(f"  recorded: {'no check' if not seen else 'the first draft needed correction' if seen[0] != 'accepted' else 'the first check was accepted'}")
+                self.board("session", "close", sid)
+                self.wait_ended(sid)
+        if self.real_codex:
+            out, _, _ = self.board("session", "start", str(self.project), "Reply with exactly the word: ready",
+                                   "--agent", AGENT, *model, "--wait", "--json")
+            root = json.loads(out)["session"]["session_id"]
+            rc, out, err = self.board_rc("session", "start", "--parent", root, "--agent", CHECK_CODEX,
+                                         "--output-schema", str(strict), CHECK_TASK + CHECK_TELL, "--wait", "--json")
+            data = json.loads(out)
+            kid = data["session"]["session_id"]
+            seen = self.check_calls(kid)
+            verdict = data["message"].get("output") or {}
+            D7_RECORD.append({"who": "Codex child (approved)", "checks": seen, "verdict": verdict.get("state")})
+            print(f"  Codex child (approved): checks {seen}; verdict {verdict.get('state')} "
+                  f"{verdict.get('code') or ''}; tools called {self.transcript_tools(kid)[1]}")
+            self.check(self.validated(seen) and "refused" not in seen and verdict.get("state") == "accepted",
+                       "D7 (Codex, approved, told in the task): a check answered by the validator, and the turn "
+                       "settled accepted")
+            print(f"  recorded: the first draft {'needed' if seen and seen[0] != 'accepted' else 'did not need'} "
+                  "correction")
+            print("\n[D8] a Codex runner that lists the check tool but does not approve it (recorded)")
+            rc, out, err = self.board_rc("session", "start", "--parent", root, "--agent", DENIED_CODEX,
+                                         "--output-schema", str(strict), CHECK_TASK + CHECK_TELL, "--wait", "--json")
+            data = json.loads(out)
+            kid8 = data["session"]["session_id"]
+            seen8 = self.check_calls(kid8)
+            verdict = data["message"].get("output") or {}
+            view = self.show(kid8)
+            denials = (view.get("last_result") or {}).get("denials")
+            print(f"  checks {seen8}; verdict {verdict.get('state')} {verdict.get('code') or ''}; denials {denials}; "
+                  f"state {view.get('state')}; tools called {self.transcript_tools(kid8)[1]}")
+            self.check(not self.validated(seen8) and verdict.get("state") in ("accepted", "missing"),
+                       "D8 (real Codex): no check reached the validator without the approval; the verdict is still "
+                       "made from the reply")
+            D7_RECORD.append({"who": "Codex child (listed, not approved)", "checks": seen8,
+                              "verdict": verdict.get("state"), "denials": denials, "state": view.get("state")})
+            self.board("session", "close", root)
+            self.wait_ended(root)
+        else:
+            print("\n[D8] a Codex runner that lists the check tool but does not approve it (the stand-in)")
+            out, _, _ = self.board("session", "start", str(self.project), "ready", "--agent", AGENT, "--wait",
+                                   "--json")
+            root = json.loads(out)["session"]["session_id"]
+            rc, out, err = self.board_rc("session", "start", "--parent", root, "--agent", DENIED_CODEX,
+                                         "--output-schema", str(review),
+                                         f"mcp {CHECK_SERVER}/{output_schema.CHECK_TOOL} data-valid", "--wait",
+                                         "--json")
+            data = json.loads(out)
+            kid8 = data["session"]["session_id"]
+            deadline = time.monotonic() + 20
+            while True:         # the node reports the state with or right after the turn's end
+                view = self.show(kid8)
+                if view.get("state") == "waiting" or time.monotonic() > deadline:
+                    break
+                time.sleep(0.2)
+            denials = (view.get("last_result") or {}).get("denials") or []
+            verdict = data["message"].get("output") or {}
+            print(f"  denials {denials}; state {view.get('state')}; verdict {verdict.get('state')}")
+            self.check(denials == [f"mcp__{CHECK_SERVER}__{output_schema.CHECK_TOOL}"] and view.get("state") == "waiting",
+                       "D8: the refused check is recorded as a denial of exactly that tool, and the session shows "
+                       "waiting")
+            self.check(verdict.get("state") == "accepted", "D8: the verdict is still the reply's: accepted")
+            self.board("session", "close", root)
+            self.wait_ended(root)
+        print("\n[D8] the frames: the sentence for a Claude session, none for a Codex one")
+        lines = self.stdin_lines()
+        claude_frames = [x for x in lines if "<<<output-schema " in x]
+        sentence = output_schema._CHECK.format(asker="that session")[:60]      # (a Codex TASK may name the tool)
+        human = output_schema._CHECK.format(asker="the human")[:60]
+        self.check(bool(claude_frames) and all(sentence in x or human in x for x in claude_frames),
+                   "D8: every asked frame written to a Claude process recommends the check (read-only children too)")
+        codex_frames = [json.dumps(x) for x in self.codex_stdin() if "output-schema " in json.dumps(x)]
+        self.check(bool(codex_frames) and all(sentence not in x and human not in x for x in codex_frames),
+                   "D8: asked frames were written to Codex processes, and none of them recommends the check")
+        if D7_RECORD:
+            print("  record: " + json.dumps(D7_RECORD))
 
     def spawn_scenario(self) -> None:
         """T10: an agent session starts child sessions itself (hosted_spawn.py), through the board's tools."""
@@ -2776,9 +3117,10 @@ def main() -> int:
     ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
                     help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
                          "one codex-cli 0.171.0 lists)")
-    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured"),
+    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured", "check"),
                     help="run only that scenario: one agent's, parent and child sessions, the send modes on a "
-                         "running turn, or results as data (D1-D6) (default: all)")
+                         "running turn, results as data (D1-D8), or the in-turn check alone (D7-D8) "
+                         "(default: all)")
     ap.add_argument("--max-latency", type=float, default=2.0, metavar="SECONDS",
                     help="most seconds from a message being sent to it being written to the process (default 2)")
     ap.add_argument("--max-wake", type=float, default=3.0, metavar="SECONDS",
@@ -2799,18 +3141,19 @@ def main() -> int:
         args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
         if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
             ap.error("--codex-bin must be an executable named codex")
-    if args.with_board and args.only in ("codex", "tree", "steer", "structured"):
+    if args.with_board and args.only in ("codex", "tree", "steer", "structured", "check"):
         ap.error("--with-board is a Claude scenario")
     codex, claude = args.only in (None, "codex") and not args.with_board, args.only in (None, "claude")
     tree = args.only in (None, "tree") and not args.with_board
     steer = args.only in (None, "steer") and not args.with_board
     structured = args.only in (None, "structured") and not args.with_board
+    check = args.only == "check"        # the in-turn check's scenarios alone (D7-D8; structured runs them too)
     run = Run(args)
-    if claude or tree or steer or structured:
+    if claude or tree or steer or structured or check:
         print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
                            else "stand-in (tests/stand_in_claude.py), no model")
               + (", with the temp board's MCP tools" if args.with_board else ""))
-    if codex or tree or steer or structured:
+    if codex or tree or steer or structured or check:
         print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
@@ -2824,11 +3167,11 @@ def main() -> int:
     try:
         signal.signal(signal.SIGTERM, terminated)
         config_before, claude_before = None, run.claude_settings() if run.real else None
-        if (codex or tree or steer or structured) and run.real_codex:
+        if (codex or tree or steer or structured or check) and run.real_codex:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
-        if codex or claude or args.with_board or steer or structured:
+        if codex or claude or args.with_board or steer or structured or check:
             run.start_services()
             if codex:
                 run.codex_scenario()
@@ -2840,6 +3183,8 @@ def main() -> int:
                 run.steer_scenario()
             if structured:
                 run.structured_off_scenario()
+            if check and not run.real:
+                run.check_off_scenario(run.review_files()[0])
             print("\n[3] stopping the node (SIGTERM) and the hub" if args.with_board
                   else "\n[8] stopping the node (SIGTERM) and the hub" if claude
                   else "\n[C6] stopping the node (SIGTERM) and the hub" if codex
@@ -2851,7 +3196,7 @@ def main() -> int:
             run.check(run.leftovers() == [], "no session process is left behind")
             if (codex or steer) and run.real_codex:
                 run.check_codex_config(config_before)
-        if tree or structured:
+        if tree or structured or check:
             run.enable_tree()
             run.start_services()
             if tree:
@@ -2863,6 +3208,8 @@ def main() -> int:
                 run.pools_scenario()
             if structured:
                 run.structured_scenario()
+            if structured or check:
+                run.check_scenario()
             print("\n[T8] stopping the node (SIGTERM) and the hub")
             run.stop()
             run.check(run.leftovers() == [], "no session process is left behind")
