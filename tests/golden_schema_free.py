@@ -10,8 +10,9 @@ line had a uuid, none when it had not: measured on 2.1.330), every process's raw
 host's events in order and the board's log lines. It promises two cases (`record(verified=...)`):
 - no version VERIFIED (production): byte for byte main's, everything, with no allowance at all;
 - a version VERIFIED that these processes do not report (an explicitly unverified baseline): main's but for the
-  allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines written before each
-  process's first `init`, and the echo fields and lifecycle rows the process wrote for them.
+  allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines STAGED before each
+  process's first `init` (a line staged then may be written after that init, as the zero-byte case's is, still
+  carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them.
 
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
 """

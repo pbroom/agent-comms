@@ -935,15 +935,16 @@ def test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh(henv, mo
 
 
 def test_r4_a_an_init_first_read_on_the_old_deadline_unstages_before_any_timeout(henv, monkeypatch):
+    """Review round 5 (C5-01) edited this replay: M's one no-progress budget began at its staging (t=0), so at t=60,
+    when the init is first read, M is unstaged and its budget is spent: the 7b restart, not a failure (and not the
+    t=120 of round 4, which gave the inbox a fresh interval). The next process gives it one fresh budget."""
     short_host(henv, monkeypatch)
     s, child = staged_zero(henv)
     henv.clock.advance(60)                              # the old write deadline, and only now the CLI's init is read
     child.emit(vinit())
-    assert henv.host.tick() == [] and child.terminated == 0 and [m.id for m in s.inbox] == ["1"]
-    henv.clock.advance(59)
-    assert henv.host.tick() == [] and child.terminated == 0, "the inbox's hold, from t=60"
-    henv.clock.advance(1)
-    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "7b at t=120"
+    evs = henv.host.tick()
+    assert not settled(evs, "1") and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "7b at t=60"
+    assert s.inbox[0].recovered and s.inbox[0].blocked_since is None
     assert b'"next"' not in child.stdin
 
 
@@ -1077,7 +1078,7 @@ def test_r4_f_7b_for_an_unstaged_m_and_its_count_survives_the_unstage(henv):
     s, child = staged_zero(henv)
     emit(henv, child, vinit())                          # unstaged: the inbox's hold from now
     henv.clock.advance(30 * 60)
-    assert henv.host.tick() == [] and child.terminated == 1 and "1" in s.recovered, "7b, once"
+    assert henv.host.tick() == [] and child.terminated == 1 and s.inbox[0].recovered, "7b, once"
     henv.spawner.child = _ZeroPipe
     henv.host.tick()
     fresh = henv.spawner.children[-1]
@@ -1116,6 +1117,121 @@ def test_r4_g_parity_no_unstage_with_verified_empty_or_for_codex(henv, monkeypat
     host.tick()
     host.tick()
     assert cs.turn_at is None
+
+
+# --- review round 5: one no-progress budget per message (C5-01), exact-bytes unstage (R-1)
+
+
+def test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written(henv, monkeypatch):
+    """Sol's sequence: timeout 60 s, M staged at t=0 (the pipe takes nothing), the CLI's own turn from t=45 to t=90,
+    then again, and again. M's one budget runs from t=0 across unstages, restagings and the brackets' ends: at t=60
+    the 7b restart (M first in the inbox, nothing failed); the next process, its pipe taking nothing too and its
+    turns of its own alternating the same way, gives M ONE fresh budget, from its staging: spent at t=120+, and M
+    fails as main's `_held` fails it. Not one byte of M ever reached a process; every stdin line is whole."""
+    short_host(henv, monkeypatch)
+    t0 = henv.clock()
+    s, child = staged_zero(henv)
+
+    def cycle(proc, start):
+        """From `start`: the CLI's turn opens 45 s later and closes at 90 s; ticks every 5 s, until a stop or 120 s."""
+        events = []
+        while henv.clock() < start + 120 and proc.terminated == 0:
+            henv.clock.advance(5)
+            k = henv.clock() - start
+            if k % 90 == 45:
+                proc.emit(vinit())
+            elif k % 90 == 0:
+                proc.emit(foreign())
+            events += henv.host.tick()
+        return events
+
+    evs = cycle(child, t0)
+    assert child.terminated == 1 and henv.clock() - t0 == 60 and not settled(evs, "1"), "7b at the budget, t=60"
+    assert [m.id for m in s.inbox] == ["1"] and s.inbox[0].recovered
+    henv.spawner.child = _ZeroPipe
+    staged_at = henv.clock()
+    evs = henv.host.tick()                              # the old group is gone: the next process, M staged at once
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and s.writing.id == "1" and s.writing.blocked_since == staged_at
+    fresh.emit(vinit())                                 # its first init: verified, a turn of its own
+    evs += henv.host.tick()
+    evs += cycle(fresh, henv.clock())
+    [end] = settled(evs, "1")
+    assert (end.delivered, end.ok) == (False, False) and "busy with a turn of its own" in end.detail
+    assert henv.clock() - staged_at >= 60 and henv.clock() - staged_at < 70, "the second budget, from its staging"
+    assert b'"next"' not in child.stdin and b'"next"' not in fresh.stdin
+    valid_stdin(child, fresh)
+
+
+@pytest.mark.usefixtures("verified")
+def test_c5_01_the_budget_is_spent_while_m_is_staged_again_with_no_byte_accepted(henv):
+    """Blocked from t=0 by the CLI's turn, released at t=10 and staged again into a pipe that takes nothing: the
+    budget from t=0 (not the new staging's write clock) is spent at t=30 min: 7b, M unstaged exactly and first in
+    the inbox, nothing failed."""
+    s, child = idle_host(henv)
+    t0 = henv.clock()
+    emit(henv, child, vinit())
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(10)
+    child.accept = 0
+    assert emit(henv, child, foreign()) == [] and s.writing.id == "1" and s.busy_since == henv.clock()
+    henv.clock.advance(30 * 60 - 10 - 1)
+    assert henv.host.tick() == [] and child.terminated == 0
+    henv.clock.advance(1)
+    evs = henv.host.tick()
+    assert not settled(evs, "1") and child.terminated == 1 and henv.clock() - t0 == 30 * 60
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and ("delivered", "1") in [(e.kind, e.message_id) for e in evs], (
+        "the old process went at once: the next one took M in the same pass")
+    assert b'"next"' not in child.stdin
+    valid_stdin(child, fresh, once=["next"])
+
+
+@pytest.mark.usefixtures("verified")
+def test_c5_01_a_successors_budget_starts_when_it_becomes_the_head(henv):
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    henv.host.send(SID, "first", message_id="1")
+    henv.host.send(SID, "second", message_id="2")
+    henv.host.tick()
+    henv.clock.advance(20 * 60)
+    henv.host.cancel(SID, "1", "cancelled")
+    henv.host.tick()
+    assert s.inbox[0].blocked_since == henv.clock(), "its budget starts now, as the head"
+    henv.clock.advance(29 * 60)
+    assert henv.host.tick() == [] and child.terminated == 0
+    henv.clock.advance(60)
+    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["2"]
+
+
+@pytest.mark.usefixtures("verified")
+def test_c5_01_an_accepted_byte_ends_the_budget(henv):
+    """Progress: once a byte of M's line is accepted the write owns it, and no budget runs for it."""
+    s, child = idle_host(henv)
+    child.accept = 5
+    henv.host.send(SID, "partial", message_id="1")
+    henv.host.tick()
+    assert s.writing.blocked_since is None and s.turn_at is None
+
+
+@pytest.mark.usefixtures("verified")
+def test_r1_an_unstage_removes_exactly_the_staged_lines_bytes(henv):
+    """Pre-merge review R-1: bytes queued AFTER the staged line (nothing appends there today; a later change may)
+    survive an unstage, as do the bytes before it."""
+    s, child = staged_zero(henv)
+    before, line = bytes(s.outbuf[:s.turn_at]), bytes(s.outbuf[s.turn_at:])
+    after = b'{"type": "control_request", "request_id": "later", "request": {"subtype": "interrupt"}}\n'
+    s.outbuf += after
+    child.emit(vinit())
+    henv.host.tick()
+    assert s.writing is None and bytes(s.outbuf) == before + after and line not in bytes(s.outbuf)
+
+
+def test_r3_event_turn_takes_no_part_in_equality():
+    """Pre-merge review R-3: like the other added fields, `turn` is compare=False."""
+    from agent_comms.providers import Event
+    assert Event("turn_started", turn="own") == Event("turn_started", turn="other") == Event("turn_started")
 
 
 # --- the barrier, its bound and its clock, the access check, interrupt readiness
@@ -1247,21 +1363,21 @@ def test_c2_03_the_deadline_belongs_to_the_continuously_blocked_message(henv):
 
 
 @pytest.mark.usefixtures("verified")
-def test_c2_03_after_a_write_opportunity_the_clock_starts_again(henv):
-    """A pass at which the barrier did not hold was a write opportunity (here the pipe still took nothing): the
-    next wait, behind the CLI's next turn, has its own clock."""
+def test_c5_01_a_write_opportunity_with_no_byte_accepted_does_not_restart_the_budget(henv):
+    """Review round 5 (C5-01) replaces round 2's `test_c2_03_after_a_write_opportunity_the_clock_starts_again`: a
+    pass at which the barrier lifted, and a write was tried that the pipe did not take, is no progress. The message
+    keeps its one budget from t=0: the 7b restart at t=30, though the CLI's second turn began at t=29."""
     s, child = idle_host(henv)
     child.accept = 0
     henv.host.send(SID, "wait", message_id="1")
     henv.host.tick()
-    emit(henv, child, vinit())                      # held from t=0
+    emit(henv, child, vinit())                      # staged at t=0, unstaged: blocked from t=0
     henv.clock.advance(29 * 60)
     assert emit(henv, child, foreign()) == []       # the barrier lifted: a write was tried (nothing taken)
-    assert emit(henv, child, vinit()) == []         # held again from t=29
-    henv.clock.advance(2 * 60)
-    assert henv.host.tick() == [] and child.terminated == 0, "a fresh clock"
-    henv.clock.advance(28 * 60)
-    assert henv.host.tick() == [] and child.terminated == 1, "... which runs out 30 minutes after t=29"
+    assert emit(henv, child, vinit()) == []         # unstaged again at t=29
+    henv.clock.advance(60)
+    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "7b at t=30"
+    assert b'"wait"' not in child.stdin
 
 
 @pytest.mark.usefixtures("verified")
