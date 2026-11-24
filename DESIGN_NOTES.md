@@ -9127,14 +9127,14 @@ notes are closed in one commit on top of the reviewed one.
 
 ## Mid-turn steering, loose contract: design (2026-11-24)
 
-Status: design only, round 6. R6 ("Restarting a running turn") still holds on main: `steer` is refused for every
+Status: design only, round 7. R6 ("Restarting a running turn") still holds on main: `steer` is refused for every
 session. History: the first attempt ("Mid-turn steering: design (2026-11-23)", parked on `claude/mid-turn-steer`,
-review S-01..S-10 in docs/mid-turn-steer-review.md) used a Stop hook and a spool. This design has had five reviews
-(L-, M2-, R3-, R4-, R5- findings, mapped in Q). The owner ruled **"Claude too, T3's way"** after M2-01 showed that
+review S-01..S-10 in docs/mid-turn-steer-review.md) used a Stop hook and a spool. This design has had six reviews
+(L-, M2-, R3-, R4-, R5-, R6- findings, mapped in P). The owner ruled **"Claude too, T3's way"** after M2-01 showed that
 Claude Code cannot be made to put a steer only into the turn it targets: a Claude steer that misses may run as the
 process's next turn, and some Claude steers will be reported `unconfirmed` after Claude may already have acted on
 them. Since round 4 the host **holds N's end** while a written Claude steer is unresolved (T3 Code's `heldResult`),
-so on the hub a steer lives exactly as long as its turn. Rulings are cited by letter and number (C- to F-).
+so on the hub a steer lives exactly as long as its turn. Rulings are cited by letter and number (C- to G-).
 
 **In one paragraph.** A steer S is sent with `mode: steer` by the sender of the turn N in flight, and is bound to N:
 it is stored apart from messages, is first shown to the node only while N's checkout is provably still N's, has
@@ -9162,13 +9162,21 @@ model read or followed S (both positive outcomes are evidence of admission); tha
 `unconfirmed` steer was not acted on; any automatic retry. `auto` never steers. An outcome comes when N settles; where
 main can leave N unsettled, S waits with it and is not written.
 
-**The one exception the owner must accept** (E-1): until a checkpoint of N's held result has been committed at the
-hub, a node crash, a partition, or the hub settling N by itself (close, cascade, orphan, lost node) loses N's native
-result exactly as main loses any end the node has not yet reported: N is recorded failed (lost, closed), S
-`unconfirmed`. The checkpoint is sent in the first report after N's native end, so the window is normally one host
-pass and one POST (a fraction of a second) and lasts as long as the hub is unreachable. A checkpoint that is dropped
-(rejected, or its one POST failed) is not resent, so the whole hold then stays inside this exception, even after
-contact returns. Once a checkpoint is committed, every settlement of N uses N's native result (G). Open question 6.
+**Three stated exceptions to "N's result is never lost"**, each for the owner to accept (open questions 6 to 8):
+- **Before the checkpoint** (E-1): until a checkpoint of N's held result has been committed at the hub,
+  a node crash, a partition, or the hub settling N by itself (close, cascade, orphan, lost node) loses N's native
+  result exactly as main loses any end the node has not yet reported: N is recorded failed (lost, closed), S
+  `unconfirmed`. The checkpoint is sent in the first report after N's native end, so the window is normally one host
+  pass and one POST (a fraction of a second) and lasts as long as the hub is unreachable. A dropped checkpoint
+  (rejected, or its one POST failed) is not resent, so the whole hold then stays inside this exception. Once one is
+  committed, every settlement of N uses N's native result (G).
+- **The cut** (D): a partial steer frame that cannot be completed stops the process; an N that had no native result
+  yet is reported failed.
+- **An unattributable result** (G-3): after a steer was written in a process incarnation, N's result is never taken
+  by order. If the incarnation deviates so that no result can be attributed to N independently of S (a competing
+  `init` for S inside N's bracket, a plain `result` where an echo was due), N is reported failed at the bound ("the
+  turn's result could not be attributed after a steer"), S `unconfirmed`, and the ambiguous reply is published as
+  nobody's. This needs a runtime format deviation on a version that passed the release gates.
 
 ### B. What was measured
 
@@ -9291,11 +9299,17 @@ written whole"), S `unconfirmed`. Open question 7. If N's native end comes befor
 - S never written → `not_delivered`; N ends at once;
 - a result listing only S, inside N's owned bracket: it is N's result only if N's ownership of that bracket stands
   without reference to S (N's owned `init` opened it and no competing `init` was noted). Then it is N's native result,
-  the steer can only be `unconfirmed`, and N ends at once: its containing bracket has ended. If a competing `init` was
-  noted, ownership is ambiguous: the frame settles N by order as main would, no checkpoint is sent for it, the steer
-  is `unconfirmed`, and the incarnation is unverified from now on. A format that can produce that ambiguity has not
-  passed M8, and Claude steering is off for it;
+  the steer can only be `unconfirmed`, and N ends at once: its containing bracket has ended;
 - anything else with S written → **the hold**.
+
+**No order fallback for N after a steer** (G-3). Once S has been written in a process incarnation, C's order fallback
+never attributes a result to N; the ordinary fallback for turns with no steer (C, F-3) is unchanged. N gets only a
+result listing N's own uuid, or the S-only result above. If, instead, ownership is ambiguous (a competing `init` was
+noted, or a plain `result` came where C would fall back to order), that frame is published as nobody's, no checkpoint
+is sent, the incarnation is unverified from now on, and the host keeps waiting within N's bound for an independently
+attributed N result: `init[N]`, `init[S]`, `result[S]` and no N result ends, at the bound, with the finalizer and N
+FAILED ("the turn's result could not be attributed after a steer"), S `unconfirmed` (A's third exception). A format
+that produces such ambiguity in its fixtures has not passed M8, and Claude steering is off for it.
 A standalone `completed(S)` lifecycle line is never an exit: the hold ends only when the containing bracket has ended
 or the process is fenced.
 
@@ -9311,7 +9325,7 @@ turn timeout counted from N's native end, and a fresh turn timeout once S's own 
 | S's proved turn is cut (exit, its timeout, cancel, close, cascade, self-stop, shutdown, lost contact) | the finalizer: `next_turn` with S failed ("its own turn was cut: <why>") |
 | an `init` echoing [S] where M8 has not passed | `unconfirmed`; the hold ends at that bracket's `result` |
 | an unattributed bracket opens | keep holding through its `result` (the barrier), then keep waiting; if its frames list S, `unconfirmed`, and the hold ends at that `result` |
-| a deviation (C) | `unconfirmed`; the hold ends when the bracket in question has ended, or by the finalizer |
+| a deviation (anything that unverifies the incarnation, C), or an unattributed bracket that ends with a plain `result` | nothing later can prove S quiet (G-2): the hold ends only when a bracket PROVED to have consumed S (its `result` lists S) ends, or, at once, by the finalizer (drain, stop, confirmed group exit); S `unconfirmed`. It never ends merely because some bracket ended |
 | the bound passes, the process exits, a cancel, close, cascade, loss of authority or contact, self-stop, shutdown | the finalizer |
 
 **The finalizer** (E-3), in this order: (1) **drain** with `_read` BEFORE `_stop` sets `stopping_since` (after which
@@ -9355,11 +9369,29 @@ group that outlives SIGKILL (session_host `_lingering`) has no bound.
    875) counts N's checkout busy only while that holds; the node's own self-stop clock is renewed by every successful
    call, listing GETs included (node_sessions `_call` line 297, `_renew_contact` line 310). So an ordinary N can run on
    after the hub has freed its checkout, and a later hello makes `_lost` false again, reviving a lease dispatch may
-   already have taken. Steering does not widen it: the first exposure of S revalidates the checkout in its own
-   transaction (G), S's writes and the hold need E's clock, which goes stale at 75 s, well before the hub's 180 s, and
-   that loss is one-way, so a revived lease never re-arms S.
+   already have taken. Steering does not widen it, by three rules together (G-1, G): the hub voids steering for N's
+   attempt irreversibly when a dispatch claim or run takes the checkout, or N's session is settled or found lost;
+   every offer of S revalidates the checkout and the void flag before S is rendered; and the node acts on an offer only
+   inside one unbroken fresh-clock interval (below).
 
-Both stay **existing limits of main** (P), with a follow-up for all turns: "release a checkout on confirmed process-
+**An offer in transit** (G-1). The node uses an offer of S only if (i) the listing request that returned it was SENT
+while the node's contact clock was fresh (its last acknowledged hello, or report naming the current N, sent under 75 s
+before), (ii) the clock has not gone stale at any moment since that send (staleness revokes a held offer for good,
+written or not), and (iii) it is fresh at write time. A response cannot arrive later than the client's call timeout
+(20 s) after its request was sent. The hub can count N lost only 180 s after its last received hello or report, and
+every acknowledged contact was received no later than it was acknowledged; so during an unbroken fresh interval the
+hub cannot have found N lost, and no expiry-based claim can have happened in it. A claim while N is not lost is
+refused by dispatch (`turn_sessions` counts N's checkout busy). Two walks:
+- **listed, response lost, then a claim, then a later hello, then a re-list**: `listed_at` commits; the response never
+  arrives (the node has no offer); N expires; the dispatch claim's transaction voids N's steering; a later hello makes
+  `_lost` false; the next listing's revalidation sees the void flag and never renders S. At N's end S is
+  `unconfirmed` (`listed_at` is set). No path writes S.
+- **a delayed first response**: the response arrives within the call timeout; if it arrived after the node's clock
+  went stale at any point since the request was sent, (ii) drops it; if the clock stayed fresh, the hub cannot have
+  expired N meanwhile, so no claim exists to conflict with. Otherwise it is a failed call and is discarded. No path
+  writes S into a checkout dispatch has taken.
+
+Both stay **existing limits of main** (N), with a follow-up for all turns: "release a checkout on confirmed process-
 group exit, not on acknowledgement; an expired lease is not revived by a later hello".
 
 ### F. Codex steering
@@ -9389,15 +9421,19 @@ key for repeats); `text` (until settled); `listed_at` (set once, below); `cancel
 `{"steer": N, "at"}`, seven days from acceptance). N's message gains `held` (the checkpoint) during a hold. No session
 field is added. One steer per N, one unsettled per session, no checkout reservation of its own.
 
-**First exposure** (F-2, R5-03). A steer is shown to a node only after `listed_at` is set, and it is set in the
-listing's write transaction (`hosted_wake.listing`'s `deliver`, made due by an unmarked eligible steer), which in the
-same transaction revalidates that N's checkout is still this session's: N is delivered to this node and not expired
-(`_lost`, `may_still_run`), and no dispatch claim or run, and no other session's turn, holds the checkout now (the
-inverse of `_checkout_busy` and `turn_sessions`). A fresh hello alone never reacquires a checkout. If the check fails,
-S is not shown and settles `not_delivered` at N's end. The renderer shows S only once its stored `listed_at` is set,
-on every path, the wake-listing fallback included; eligible steers are part of the listing `version`; the commit
-precedes the answer. An absent `listed_at` proves S was never shown to a node. Later listings show S again
-(repeats are no-ops: the host dedupes by uuid) while N is delivered, not cancelled, not expired, and S unsettled.
+**Eligibility and every offer** (G-1, R6-01). The steer record has a `void_at`, set irreversibly, in the same
+transaction, by anything that takes N's checkout (the dispatcher's claim or launch transaction, for a run whose
+checkout is N's) or settles N's session or finds it lost in a write (`_settle`, `_end`, a dispatch decision that
+counts N lost). A later hello never clears it. EVERY offer of S, not only the first, is made in the listing's write
+transaction (`hosted_wake.listing`'s `deliver`, made due by an eligible steer), which first revalidates: S unsettled
+and not void; N delivered to this node, not cancelled, not expired (`_lost`, `may_still_run`); no dispatch claim or run
+holds the checkout (the inverse of `_checkout_busy`). A failed check sets `void_at`, and S is never rendered again.
+Another hosted session's turn does not take N's checkout: main lets sessions share one (a child in the shared
+checkout runs beside its parent; `_checkout_busy` reads dispatched runs and claims only), so it voids nothing.
+`listed_at` is set by the first offer and kept as evidence of possible exposure: a voided steer that was ever listed
+settles `unconfirmed`, never `not_delivered`. The renderer shows S only from a committed offer, on every path, the
+wake-listing fallback included; eligible steers are part of the listing `version`; the commit precedes the answer.
+Each offer carries N's number and S's uuid (the host dedupes repeats by uuid); the node's own checks are in E.
 
 **The node** (protocol 5) passes a listed S, and an authoritative omission, to the host. N's end is never held for
 feature discovery: to a hub that names `steer` it carries the `steer` object (`outcome`, `why`, and for `next_turn`
@@ -9574,7 +9610,8 @@ settled. Also not done: buffering Codex frames that arrive before the start repl
 | 4 | the hold's bound | (a) the turn timeout from N's native end, then a fresh one once S's turn is proved; the fence timed apart (E) | (b) a short fixed bound: it stops CLI-started work the contract allows to come first | builder and Sol agree |
 | 5 | the hold and the single result | (a) as designed: on Claude, N's result (and any wait on it) comes after S's turn too, up to I's bound | (b) round 3's shape (N at once, S tracked on the hub): the hub-side gap and round 3's blockers | builder and Sol agree |
 | 6 | the loss exception (A) | (a) accept it: before a checkpoint is committed (including when one is dropped and the whole hold stays exposed), a crash, partition or hub-side settlement loses N's native result as main loses any unreported end; after commit, every settlement of N keeps it | (b) also defer the hub's own settlement of a delivered N on a steered session until the node reports or a longer bound passes: a close or lost node takes longer to settle, and a dead node still loses the result | builder and Sol agree on (a) |
-| 7 | the cut (D) | (a) a partial steer frame that loses authority or is not whole within 5 s stops the process, which can cut a running N (rare: the 12 KB cap, both CLIs read stdin); N's native result is kept if it had one | (b) never cut N: leave the part line and write nothing more to that process until N ends: the session can take nothing meanwhile, and a lost authority does not stop the process at once | builder and Sol agree |
+| 7 | the cut (D, A's second exception) | (a) a partial steer frame that loses authority or is not whole within 5 s stops the process, which can cut a running N (rare: the 12 KB cap, both CLIs read stdin); N's native result is kept if it had one | (b) never cut N: leave the part line and write nothing more to that process until N ends: the session can take nothing meanwhile, and a lost authority does not stop the process at once | builder and Sol agree |
+| 8 | the unattributable result (A's third exception, D) | (a) accept: after a steer, a runtime format deviation that leaves N's result unattributable reports N failed at the bound, S `unconfirmed`, the ambiguous reply published as nobody's | (b) fall back to order as main does: the steer's own reply can then be published as N's, with N's verdict made on it | builder and Sol agree on (a) |
 
 ### N. Known limits
 
@@ -9609,7 +9646,15 @@ Design-level questions are closed; these go to code review (F-6, the round-5 rev
 - the steer deadline is driven from the watchdog on acknowledged SEND times (node.py's `last_hello`, line 264, is a
   receipt time: the send time is taken before the call);
 - the shared authority, the cap and the partial-write protection ship with Codex in step 2;
-- on a wait timeout, the terminal steer status is read before the sender is told it is unsettled.
+- on a wait timeout, the terminal steer status is read before the sender is told it is unsettled;
+- (R6-04) the sequence `unattributed init -> owned init[M] -> plain result`; the non-turn predicate against a zero-turn
+  ERROR result as well as the empty successful notification; report acknowledgements used to renew the contact clock
+  identify the current N; Codex's contact cut before any native result is cached, including a valid matched
+  `turn/steer` receipt immediately before the process exits;
+- a fully written S still queued in the CLI when a close is acknowledged: main's hand-over already skips a stopping
+  session (node_sessions `_hand_over`), so no ordinary message follows; the host's close runs the finalizer (drain,
+  stop, confirmed exit, N's end, then `ended`), so the queued S can never become a turn of a new process; S is
+  `unconfirmed` unless drained evidence settles it.
 
 Release gates (each in the step that needs it, L):
 - **M3** (step 1): the first turns of a `--resume`d process echo (the real e2e, reading its own node's transcripts;
@@ -9645,6 +9690,15 @@ findings.
 | R5-06 legacy combined text breaks structured N | met: no steer into a turn asked for data (F-5); the separator carries no authority in legacy text (H) |
 | R5-07 checkpoint identity, visibility, priority | carried as conditions for code review (O); the dropped-checkpoint case is in the exception (A) |
 | R5-08 integration edges | carried as conditions for code review (O) |
+
+**Round 6** (R6-01..R6-04, on 3dcc19d):
+
+| finding | now |
+| --- | --- |
+| R6-01 a marked steer first reaches the node after dispatch took the checkout | met (G-1): irreversible `void_at` on any claim, run, settlement or loss; every offer revalidates; the node uses an offer only in one unbroken fresh-clock interval; both walks in E |
+| R6-02 an unrelated bracket ends the hold while S is queued | met (G-2): after a deviation the hold ends only by a bracket proved to consume S, or by a prompt fence (D's hold table) |
+| R6-03 the fallback publishes S's reply as N's | met (G-3): no order fallback for N once S is written; at the bound N fails and the ambiguous reply is nobody's; A's third exception and question 8 |
+| R6-04 adjacent cases | carried into O, with the queued-S-at-close case |
 
 **The parked review's S-01..S-10**: S-01, S-08, S-09 gone (no hook, no spool, `auto` unchanged); S-02 is A's rule;
 S-03 and S-04 are met by the hold (a distinct state, an immutable copy, a bound, the finalizer) and the checkpoint,
