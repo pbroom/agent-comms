@@ -1329,3 +1329,117 @@ def test_k_an_older_hub_takes_ns_stripped_end_behind_its_real_report_route_and_t
     rec = steer_rec(env, kid)
     assert (rec["outcome"], rec["why"]) == ("unconfirmed", "no_word")
     assert hosted._get(env.board.conn, hosted._msg_key(kid, 1)) == m, "N stays as the older hub settled it"
+
+
+# ------------------------------------------------------------ the checks the mutation check found untested
+
+
+def test_h_refused_once_the_session_has_ended(env):
+    sid, child = codex_turn_in_flight(env)
+    with hosted.db.write_tx(env.board.conn) as c:
+        r = hosted._session(c, sid)
+        hosted._end(c, r, "ended here", "hub", env.clock())
+        hosted._put(c, hosted.SESSION_PREFIX + sid, r | {"stop": None}, "hub", env.clock())
+    refusal(env, sid, hosted_steer.REFUSED["ended"])
+
+
+def test_h_refused_while_the_record_names_a_turn_in_flight_that_is_settled(env):
+    """A racy read: the session names message 1 in flight, and that message is already settled: no turn is in
+    flight."""
+    sid, child = codex_turn_in_flight(env)
+    with hosted.db.write_tx(env.board.conn) as c:
+        m = hosted._get(c, hosted._msg_key(sid, 1))
+        hosted._put(c, hosted._msg_key(sid, 1), m | {"state": "done"}, "hub", env.clock())
+    refusal(env, sid, hosted.REFUSED["idle"])
+
+
+def test_h_refused_while_the_turn_is_being_cancelled(env):
+    sid, kid, child = codex_child(env)
+    hs.cancel(env.board, env.p["claude"], bound(env, sid), kid)
+    with pytest.raises(Conflict, match=re.escape(hosted.REFUSED["cancelled"].format(n=1))):
+        hs.send(env.board, env.p["claude"], bound(env, sid), kid, message="x", mode="steer")
+
+
+def test_g_a_steer_into_a_session_being_closed_is_withdrawn_at_its_next_offer(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    env.human.post(f"/api/hosted-sessions/{sid}/close")
+    assert "steer" not in entry(env, sid)
+    assert steer_rec(env, sid)["withdrawn"] == "ended"
+
+
+def test_g_a_steer_whose_n_is_no_longer_the_turn_in_flight_is_withdrawn(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    with hosted.db.write_tx(env.board.conn) as c:
+        r = hosted._session(c, sid)
+        hosted._put(c, hosted.SESSION_PREFIX + sid, r | {"in_flight": None}, "hub", env.clock())
+    assert "steer" not in entry(env, sid)
+    assert steer_rec(env, sid)["withdrawn"] == "not_in_flight"
+
+
+def test_g_an_offer_whose_transaction_fails_after_it_was_made_is_shown_by_no_later_build(env, monkeypatch):
+    """The build inside the listing's write transaction fails after the offer was made: the transaction rolls back
+    and the wake fallback builds the answer again, without that offer (and listed_at is not set)."""
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    real = hosted._listed
+    calls = []
+
+    def once(board, p, tree=False, shown=None):
+        calls.append(shown)
+        if len(calls) == 1:
+            raise RuntimeError("the first build fails")
+        return real(board, p, tree, shown)
+    monkeypatch.setattr(hosted, "_listed", once)
+    got = entry(env, sid)
+    assert calls[0] and "steer" not in got and steer_rec(env, sid)["listed_at"] is None
+
+
+def test_g_settle_never_revises_a_settled_steer(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    with hosted.db.write_tx(env.board.conn) as c:
+        r = hosted._session(c, sid)
+        first = dict(hosted_steer.settle(c, r, 1, None, env.clock()))
+        again = hosted_steer.settle(c, r, 1, {"outcome": "in_turn", "why": "answered"}, env.clock() + 5)
+    assert (first["outcome"], again["outcome"], again["settled_at"]) == ("not_delivered", "not_delivered",
+                                                                         first["settled_at"])
+
+
+def test_h_a_parents_retry_inside_the_transaction_answers_the_same_steer(env, monkeypatch):
+    """The retry lookup in the write transaction (after the fast path missed, as for a concurrent retry)."""
+    sid, kid, child = codex_child(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer", request_id="p2")
+    used = budget(env)["seq"]
+    monkeypatch.setattr(hs, "_resent", lambda *a, **kw: None)
+    again = hs.send(env.board, env.p["claude"], bound(env, sid), kid, message="other", mode="steer", request_id="p2")
+    assert again["created"] is False and again["steer"]["into"] == 1 and budget(env)["seq"] == used
+
+
+def test_e_the_node_watchdog_cuts_a_half_written_frame_past_its_limit(env):
+    sid, child = codex_turn_in_flight(env)
+    child.accept = 10
+    post_steer(env, sid)
+    tick(env)
+    s = env.node.sessions.host.sessions[sid]
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length
+    env.clock.advance(STEER_PARTIAL_SECONDS)
+    env.node.sessions.enforce_deadlines()
+    assert s.stopping_since is not None and any(e.detail == STEER_CUT for e in env.node.sessions.watched)
+
+
+def test_d_the_watchdogs_cut_reads_what_the_process_wrote_first(henv):
+    """Between passes (the watchdog's `steer_deadlines`), a native end already in the pipe is read before the
+    process is stopped: N keeps its own result."""
+    host, s, child, _ = partial(henv)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    child.emit(cx.message("finished first"), cx.completed())
+    [end] = ended_of(host.steer_deadlines())
+    assert end.ok and end.text == "finished first" and s.stopping_since is not None
+
+
+def test_the_cells_table_is_the_one_in_design_notes():
+    from pathlib import Path
+    notes = (Path(__file__).resolve().parents[1] / "DESIGN_NOTES.md").read_text()
+    assert f"Steer cells: {len(STEER_CELLS)}" in notes
