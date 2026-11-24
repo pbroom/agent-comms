@@ -27,7 +27,16 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   `<log dir>/node-session-providers.json` (mode 600) before the first turn is written to that session, and is
   handed it again (`adopt`) when the session is opened after a restart: a recorded id is resumed, whatever the
   caller knows. The id never comes from the hub. It is dropped when the provider refuses to resume it.
-- A message waits while the provider runs something of its own in the session (`holds_turns`).
+- A message waits while the provider runs something of its own in the session (`holds_turns`): Codex's own turn,
+  or a turn Claude Code started itself in a process the adapter verified (DESIGN_NOTES "Claude turn correlation").
+  A turn's frames that the adapter says are no message's (`Event.turn` "other") never settle the turn in flight.
+  Every other behaviour of turn correlation is scoped to a VERIFIED Claude incarnation (`_correlated`), the write
+  barrier's own rules (`_barrier`) included: with no Claude version verified, and for Codex always, the host is
+  main's. In a verified incarnation a message is never held while staged: the inbox owns the hold. A staged turn
+  not one byte of which was accepted when the CLI is seen to begin a turn of its own is taken back (`_unstage`:
+  only its own bytes leave the buffer) and put first in the inbox again; once any byte of it is accepted the write
+  owns it, as on main. The hold's deadline belongs to the continuously blocked message, and at that deadline a
+  message none of whose bytes was ever written is not failed but kept for the next process, once.
 - A provider with a handshake (`waits_for_ready`) gets `handshake_seconds` for it, not the turn timeout.
 - Restart (DESIGN_NOTES "Restarting a running turn"): the caller asks for the turn in flight to be interrupted in-band
   for the message that replaces it (`interrupt_for`); that message itself is the caller's next ordinary message and
@@ -142,6 +151,12 @@ class Session:
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
     held_since: float | None = None     # since when the next message waits for a turn of the provider's own
+    # Turn correlation (`_barrier`, a verified Claude incarnation only): the message `held_since` is for; where the
+    # staged turn starts in `outbuf` while none of it is accepted (only for an adapter that asks,
+    # `barrier_before_first_byte`); the messages already kept once for a new process (it survives an unstage).
+    held_for: str | None = None
+    turn_at: int | None = None
+    recovered: set = field(default_factory=set)
     fresh_start: bool = False           # the provider refused to resume its session: the next process starts a new one
     interrupted_at: float | None = None
     stopping_since: float | None = None
@@ -892,6 +907,11 @@ class SessionHost:
                 return
             if s.access == "full" and ev.mode == "bypassPermissions":
                 s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
+            if ev.turn == "other":
+                # Not the turn in flight (the adapter's evidence, providers.OWNERS: a turn the CLI started itself, or
+                # another `init` inside the turn's own bracket): its access was checked above, and that is all.
+                log.info("session %s: an init that is no message's turn (checked, nothing started)", s.session_id)
+                return
             if s.in_flight is not None:
                 s.begun = True      # the provider began the turn in flight (its `init`: Claude's capabilities)
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
@@ -908,6 +928,11 @@ class SessionHost:
             if not s.busy:
                 s.busy_since = None     # the check is over; the turn's own clock starts when it is written
         elif ev.kind == "turn_ended":
+            if ev.turn == "other":
+                # A turn the CLI started itself ended, or a result that is no message's (providers.OWNERS): the turn
+                # in flight, if any, is not settled by it (Claude turn correlation).
+                log.info("session %s: a turn that is no message's ended; the turn in flight goes on", s.session_id)
+                return
             if s.in_flight is None:
                 log.warning("session %s: a turn ended that the host did not start", s.session_id)
                 return
@@ -1072,6 +1097,11 @@ class SessionHost:
         return f"timed out after {self.timeout_minutes:g} minutes"
 
     def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        if s.writing is not None and s.turn_at is not None and self.holding(s):
+            # A message is never held while staged (a verified Claude incarnation; `turn_at` is tracked for no other):
+            # not one byte of it accepted and the CLI runs a turn of its own, so it goes back to the inbox. Seen here,
+            # after the pass's reads and before any timeout is looked at or anything is written (`_pass`).
+            self._unstage(s, now, out)
         if s.busy_since is None:
             return
         if s.interrupted_at is not None:
@@ -1158,6 +1188,59 @@ class SessionHost:
                           "message was not written", out)
             self._stop(s, now)
         return True
+
+    @staticmethod
+    def _correlated(s: Session) -> bool:
+        """The session's live process is a Claude incarnation its adapter verified (turn correlation): the only one
+        whose host behaviour differs from main's."""
+        return s.child is not None and getattr(s.provider, "verified", False) is True
+
+    HELD = "the agent was busy with a turn of its own for {m:g} minutes; the message was not written"
+
+    def _barrier(self, s: Session, now: float, out: list[HostEvent]) -> bool:
+        """The write barrier of a verified Claude incarnation (`holds_turns`: a turn the CLI started itself runs),
+        owned by the inbox: True, its first message waits (never one being written: `_unstage`). The deadline is the
+        turn timeout, and belongs to the continuously blocked message: it starts again only for another message, or
+        after a write opportunity (a pass at which the barrier did not hold). At the deadline the message, not one
+        byte of which was ever written, is not failed: it stays first in the inbox for the next process, and this
+        one is stopped (a stuck bracket costs a restart, never the message), once per message; the second time it
+        fails as main's `_held` fails it."""
+        if not self.holding(s):
+            s.held_since = s.held_for = None        # a write opportunity
+            return False
+        msg = s.inbox[0]
+        if s.held_since is None or s.held_for != msg.id:
+            s.held_since, s.held_for = now, msg.id
+        if now - s.held_since < self.timeout_minutes * 60:
+            return True
+        s.held_since = s.held_for = None
+        if msg.id not in s.recovered:
+            s.recovered.add(msg.id)
+            log.warning("session %s: the agent was busy with a turn of its own for %g minutes; its process is "
+                        "stopped and message %s, never written, waits for the next one", s.session_id,
+                        self.timeout_minutes, msg.id)
+            self._stop(s, now)
+            self._save_state()
+            return True
+        s.writing = s.inbox.popleft()
+        self._fail(s, self.HELD.format(m=self.timeout_minutes), out)
+        self._stop(s, now)
+        return True
+
+    def _unstage(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """A staged turn not one byte of which was accepted, and the CLI is seen to run a turn of its own: the
+        message goes back FIRST in the inbox, ahead of any successor, and only its own bytes leave the buffer (the
+        rest of a partly written control frame before it stays exactly as it was, and still goes). The adapter
+        keeps no trace of it (`unstaged`), so a later staging is a first one, with its own write clock; the inbox
+        owns the wait from now (`_barrier`, at the pass's write decision, as for any message in the inbox)."""
+        msg = s.writing
+        del s.outbuf[s.turn_at:]
+        s.writing = s.busy_since = s.turn_at = None
+        s.inbox.appendleft(msg)
+        s.provider.unstaged()
+        log.info("session %s: message %s, not one byte of it written, waits again: the agent began a turn of its own",
+                 s.session_id, msg.id)
+        self._save_state()
 
     def _stop(self, s: Session, now: float) -> None:
         if s.child is not None and s.stopping_since is None:
@@ -1327,13 +1410,18 @@ class SessionHost:
             # the session has now (or with one it no longer has), also one that came into the inbox during the
             # process's handshake. The process is stopped (not while its provider runs a turn of its own) and the
             # message stays in the inbox for the next one, which gets the binding as it is then.
-            if not self.holding(s):
+            if self._correlated(s):
+                if not self._barrier(s, now, out):      # with its deadline (main's path below has none)
+                    log.info("session %s: its process is restarted to take its binding as it is now", s.session_id)
+                    self._stop(s, now)
+            elif not self.holding(s):
                 log.info("session %s: its process is restarted to take its binding as it is now", s.session_id)
                 self._stop(s, now)
             return
         if (not s.busy and s.inbox and (s.ready or not s.provider.waits_for_ready) and not s.checking
                 and (self.may_start is None or self.may_start())      # ... and no new turn is written
-                and (self.turn_gate is None or self.turn_gate(s)) and not self._held(s, now, out)):
+                and (self.turn_gate is None or self.turn_gate(s))
+                and not (self._barrier(s, now, out) if self._correlated(s) else self._held(s, now, out))):
             s.writing = s.inbox.popleft()
             s.waiting, s.denials, s.busy_since = False, (), now
             if s.provider.waits_for_ready and not s.resume:
@@ -1343,6 +1431,9 @@ class SessionHost:
                 # restart). If the provider never got the turn, the resume is refused and that is said out loud.
                 s.resume, s.fresh_start = True, False
                 self._record_provider_id(s.session_id, s.provider_id)
+            # Where the turn starts, while none of it is written: only for an adapter that asks (Claude while it
+            # can be verified), so main's write path is untouched otherwise.
+            s.turn_at = len(s.outbuf) if getattr(s.provider, "barrier_before_first_byte", False) else None
             for data in s.provider.turn(s.writing.text, kind=s.writing.kind):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
@@ -1383,6 +1474,9 @@ class SessionHost:
                 self._stop(s, now)
                 return
             del s.outbuf[:n]
+            if s.turn_at is not None:
+                # None once any byte of the turn is accepted: from then on the write owns it, as on main
+                s.turn_at = s.turn_at - n if n <= s.turn_at else None
             if s.restart_mark is not None:
                 start, length = s.restart_mark
                 s.restart_mark = (start - n, length)    # where its bytes are now; below zero: some are written
@@ -1390,7 +1484,9 @@ class SessionHost:
             s.restart_written = True    # the whole interrupt is in the pipe: an abort from now on is its doing
             s.restart_mark = None
         if not s.outbuf and s.writing is not None:
-            s.in_flight, s.writing, s.begun = s.writing, None, False
+            s.in_flight, s.writing, s.begun, s.turn_at = s.writing, None, False, None
+            if getattr(s.provider, "barrier_before_first_byte", False):
+                s.provider.delivered()      # every byte of it is in the pipe: only now can rule 10 settle it
             out.append(HostEvent(s.session_id, "delivered", s.in_flight.id))
 
     # ------------------------------------------------------------ stopping a process, keeping the session

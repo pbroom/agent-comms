@@ -682,19 +682,109 @@ def test_wait_exits_0_3_and_4_with_their_words(offenv, monkeypatch, capsys):
 # ------------------------------------------------------------ with no schema, byte for byte as on main
 
 
-def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(tmp_path):
-    """tests/fixtures/schema_free_main.json is golden_schema_free.py's recording of main's code (a8b90cc): frames,
-    result turns, a claim, spawn and send answers and their retries, status, show, a message poll, list, the node's
-    listing, the lineage view, CLI text and every hosted record. This checkout's run must be the same, byte for
-    byte (time stamps and the temporary directory aside)."""
-    from pathlib import Path
+BASELINE = frozenset({"0.0.0-golden-baseline"})    # a version VERIFIED that the recorded processes do not report
 
-    import golden_schema_free
-    main = json.loads((Path(__file__).parent / "fixtures" / "schema_free_main.json").read_text())
-    ours = json.loads(json.dumps(golden_schema_free.record(tmp_path), sort_keys=True))
+
+def _main_fixture():
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / "fixtures" / "schema_free_main.json").read_text())
+
+
+def _same(ours, main):
+    ours = json.loads(json.dumps(ours, sort_keys=True))
     for key in sorted(main):
         assert ours[key] == main[key], key
     assert set(ours) == set(main)
+
+
+def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(tmp_path):
+    """tests/fixtures/schema_free_main.json is golden_schema_free.py's recording of main's code (d4b92e5): frames,
+    result turns, a claim, spawn and send answers and their retries, status, show, a message poll, list, the node's
+    listing, the lineage view, CLI text and every hosted record; and (Claude turn correlation) every bracket sequence
+    through the node with a source-faithful stream, a timeout, a launch refusal, a resumed process, a restart, an
+    `auto` send and a Codex turn, every process's raw stdin, every raw transcript, the host's events in order and the
+    board's log lines. With no version VERIFIED (production) this checkout's run is the same, byte for byte (time
+    stamps and the temporary directory aside), with NO allowance at all."""
+    import golden_schema_free
+    _same(golden_schema_free.record(tmp_path, verified=frozenset()), _main_fixture())
+
+
+def test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for_the_allowance(tmp_path):
+    """An explicitly unverified baseline (VERIFIED names a version these processes do not report): main's run, raw
+    bytes, host events and logs included, once the allowance is taken out of the raw stdin and transcripts
+    (golden_schema_free.allowed); the next test asserts the allowance is there, and is only that."""
+    import golden_schema_free
+    _same(golden_schema_free.record(tmp_path, verified=BASELINE, allow=True), _main_fixture())
+
+
+def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_and_lifecycle_rows(tmp_path):
+    """In the baseline run: each Claude process's first user line (written before its first init) carries a fresh
+    uuid and no later line does (the first init shows the process cannot be verified); every echo field and lifecycle
+    row names one of those very lines; what the allowance took out is exactly those fragments and rows. With no
+    version VERIFIED nothing carries a uuid, and main's recording has none either."""
+    import golden_schema_free as g
+    rec = g.record(tmp_path / "raw", verified=BASELINE)
+    ids = []
+    for lines in rec["stdin"] + [x for case in rec["host_cases"].values() for x in case["stdin"]]:
+        users = [json.loads(x) for x in lines if x.startswith('{"type": "user"')]
+        if users:
+            assert ["uuid" in u for u in users] == [True] + [False] * (len(users) - 1), lines
+            ids.append(users[0]["uuid"])
+            assert all(list(u)[-1] == "uuid" for u in users[:1]), "the key is the last one"
+        assert not any('"uuid"' in x for x in lines if x and not x.startswith('{"type": "user"'))
+    assert len(ids) == len(set(ids)) > 3, "one fresh uuid per process's first line"
+    named = set()
+    for lines in rec["transcripts"].values():
+        for x in lines:
+            ev = json.loads(x) if x.startswith("{") else {}
+            named |= ({ev["command_uuid"]} if ev.get("type") == "command_lifecycle" else set())
+            named |= {v for k in ("user_message_uuid",) if isinstance(ev.get(k), str) for v in [ev[k]]}
+            named |= set(ev.get("user_message_uuids") or [])
+    assert named and named <= set(ids), "every echo and lifecycle row is for a line that carried a uuid"
+    g.record(tmp_path / "allowed", verified=BASELINE, allow=True)
+    kinds = {k for k, _ in g.REMOVED}
+    assert kinds == {"stdin", "echo", "lifecycle"} and sum(k == "stdin" for k, _ in g.REMOVED) == len(ids)
+    taken = {u for k, u in g.REMOVED if k == "stdin"}
+    assert {u for k, u in g.REMOVED if k != "stdin"} <= taken, "each echo or lifecycle row names a line taken"
+    none = g.record(tmp_path / "empty", verified=frozenset())
+    assert "user_message_uuid" not in json.dumps(none["transcripts"]) and "command_lifecycle" not in json.dumps(
+        none["transcripts"]) and '\\"uuid\\"' not in json.dumps(none["stdin"])
+    main = _main_fixture()
+    assert "user_message_uuid" not in json.dumps(main) and "command_lifecycle" not in json.dumps(main)
+
+
+def test_the_allowance_takes_only_valid_envelopes_for_the_right_line():
+    """C1-06: anything that only looks like the allowance is kept (so it differs from main's)."""
+    import golden_schema_free as g
+    u, v = "1e64c1ac-3dc2-45ff-bad6-ee954a1892a1", "2f75d2bd-4ed3-46a0-8be7-ff065b2a93b2"
+    removed: list = []
+    g.SEEN.clear()
+    good = json.dumps({"type": "user", "message": {"role": "user", "content": "x"}, "uuid": u})
+    assert g.allowed("stdin", good, removed) == '{"type": "user", "message": {"role": "user", "content": "x"}}'
+    assert g.allowed("stdin", good, removed) == good, "a uuid already taken once is not fresh"
+    for bad in ({"type": "user", "message": {"role": "user", "content": "x"}, "uuid": v, "extra": 1},
+                {"type": "user", "message": {"role": "user", "content": ["x"]}, "uuid": v},
+                {"type": "assistant", "message": {"role": "user", "content": "x"}, "uuid": v}):
+        assert g.allowed("stdin", json.dumps(bad), removed) == json.dumps(bad)
+    frame = "00000001-0000-4000-8000-000000000001"
+    life = json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued", "uuid": frame,
+                       "session_id": "s"})
+    assert g.allowed("transcript", life, removed, u) is None
+    for line, expected in ((life, v), (life, None),
+                           (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "odd",
+                                        "uuid": frame, "session_id": "s"}), u),
+                           (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued",
+                                        "session_id": "s"}), u),
+                           (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued",
+                                        "uuid": u, "session_id": "s"}), u)):
+        assert g.allowed("transcript", line, removed, expected) == line
+    res = {"type": "result", "subtype": "success", "result": "ok"}
+    echo = json.dumps(res | {"user_message_uuid": u, "user_message_uuids": [u]})
+    assert g.allowed("transcript", echo, removed, u) == json.dumps(res)
+    for line, expected in ((echo, v), (json.dumps(res | {"user_message_uuid": u, "user_message_uuids": [u, v]}), u),
+                           (json.dumps({"type": "rate_limit_event", "user_message_uuid": u}), u),
+                           (json.dumps(res | {"user_message_uuids": [u], "user_message_uuid": u, "x": 1}), u)):
+        assert g.allowed("transcript", line, removed, expected) == line
 
 
 def test_a_later_reply_that_repeats_the_block_derives_nothing_for_the_earlier_message(offenv):

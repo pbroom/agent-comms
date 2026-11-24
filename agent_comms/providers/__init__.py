@@ -42,6 +42,12 @@ from typing import Any, Callable, Protocol
 # `account/rateLimits/updated`, or a turn that failed on the limit. The host keeps each window's latest per runner,
 # with its own time, for the hub's account pools (account_pools.py); it is advisory and never ends or changes a turn.
 KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "start_failed", "sealed", "usage")
+# Whose turn a `turn_started` or `turn_ended` is, as the adapter attributes it (`Event.turn`; DESIGN_NOTES "Claude turn
+# correlation"): `order`, the host's turn in flight by order (what every adapter did before, and what Claude's still
+# does in any process it has not verified); `own`, the turn in flight by the process's own evidence (its frames echo
+# the id of the host's line); `other`, NOT the turn in flight (a turn the CLI started itself, or a frame that belongs
+# to no message): the host never settles a message by it, and only checks an `init`'s access.
+OWNERS = ("order", "own", "other")
 # What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"). No
 # adapter steers yet (R6): `steers` is False on both, for a later change to implement.
 MODES = ("steer", "restart")
@@ -136,10 +142,13 @@ class Event:
     tools: tuple[str, ...] = field(default=(), compare=False)
     answered: bool = field(default=False, compare=False)     # turn_ended: the provider took the turn (above)
     usage: list[dict[str, Any]] | None = field(default=None, compare=False)     # `usage` only (above)
+    turn: str = "order"     # turn_started / turn_ended: whose turn (OWNERS, above)
 
     def __post_init__(self):
         if self.kind not in KINDS:
             raise ValueError(f"unknown provider event kind {self.kind!r}")
+        if self.turn not in OWNERS:
+            raise ValueError(f"unknown turn owner {self.turn!r}")
 
 
 class ProviderSession(Protocol):
@@ -222,7 +231,8 @@ class ProviderSession(Protocol):
 
     def holds_turns(self) -> bool:
         """True while the provider's session is busy with something no message of the host's started (Codex running
-        a turn of its own): a turn written now would not be a turn of its own. The host keeps the next message
+        a turn of its own; Claude Code running one it started itself, in a process its adapter verified): a turn
+        written now would not be a turn of its own. The host keeps the next message
         until this is False again, for at most the turn timeout. Optional."""
         ...
 
