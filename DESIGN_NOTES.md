@@ -9127,488 +9127,444 @@ notes are closed in one commit on top of the reviewed one.
 
 ## Mid-turn steering, loose contract: design (2026-11-24)
 
-Status: design only, for review before any code. R6 ("Restarting a running turn") still holds on main: `steer` is
+Status: design only, round 2. Rewritten after the round-1 review (findings L-01 to L-12, "Design review round 1" at
+the end) and the coordinator's rulings on it (R-A to R-K, cited by letter below). R6 ("Restarting a running turn") still holds on main: `steer` is
 refused for every session. The first attempt ("Mid-turn steering: design (2026-11-23)", parked on the branch
-`claude/mid-turn-steer`, with its review in docs/mid-turn-steer-review.md, findings S-01 to S-10) promised every
-steer a definite, exactly-once fate and forced same-turn delivery on Claude with a Stop hook and a file spool. The
-review found eight blockers, most from that promise meeting the hub/node split. The owner has accepted a looser
-contract for this second attempt: a steer may end "unconfirmed", said plainly, and that is a legitimate final outcome.
+`claude/mid-turn-steer`, review in docs/mid-turn-steer-review.md, S-01 to S-10) used a Stop hook and a file spool and
+promised an exactly-once fate. Its review found eight blockers. This design keeps the looser contract the owner
+accepted ("unconfirmed" is a legitimate final outcome) and makes three cuts that round 1 showed were the source of
+most of what remained: no automatic next turn, no steer living past the turn it targets, and no steer stored as a
+session message.
 
-**In one paragraph.** A steer is a message sent with `mode: steer` while the session has a turn in flight (N). It is
-accepted only when nothing is queued behind N (R7, as for a restart), so it is always the session's next message. Its
-node writes it to the session's LIVE provider process, tagged so the provider's own answer can be recognised: for
-Claude Code a stdin user line with a `uuid` of its own; for Codex `turn/steer` with `expectedTurnId` set to N's turn
-id. No hook, no spool file, no settings change. The provider then says, in its own stream, what it did with it, and
-the steer gets exactly one recorded outcome, which never changes: `in_turn` (the provider took it into N: N's reply
-answers it, and the steer has no result of its own), `next_turn` (it ran as the session's next turn, an ordinary turn
-with its own result), or `unconfirmed` (neither could be confirmed: the sender is told why, and that it was not sent
-again). The hub never sends a steer twice and never guesses. For Claude this needs one thing first: the host must
-attribute every `init` and `result` to the message whose uuid it echoes, not to whatever is next in order (provider
-turn correlation, which also closes the follow-up "Structured results" left open). That is step 1, and it ships on
-its own.
+**In one paragraph.** A steer S is sent with `mode: steer` while the session has a turn N in flight. It is bound to
+N and lives exactly as long as N: it is stored apart from the session's messages, reaches the node only as a steer
+for N, and is written to the provider only while that very process is running N. Claude Code gets it as a stdin user
+line with a uuid of its own, written during one of N's foreground tool calls; Codex gets `turn/steer` with
+`expectedTurnId`, for a turn the host has proved is N's. S's outcome is decided by the host when N ends, rides on N's
+ordinary end report, and is recorded in the same transaction as N's end: `in_turn` (the provider's own evidence ties
+S to N), `not_delivered` (no byte of it reached the provider, or the provider refused it: safe to send again), or
+`unconfirmed` (written, with no evidence either way: never sent again). For Claude this needs the host to attribute a
+`result` to a message only when it echoes that message's uuid (step 1, turn correlation), which also fixes an
+existing misattribution.
 
 ### A. The contract
 
 | the sender IS promised | the sender is NOT promised |
 | --- | --- |
-| The steer is accepted or refused at once, in the transaction that enqueues it, with the reason. A refusal creates nothing and is never re-decided by a later fetch. | That the model read it, followed it or acted on it. `in_turn` is the provider's receipt that it put the steer into turn N, nothing more. |
-| It is written to the provider at most once, ever. Nothing (hub, node, host, a retry, a rollback) writes it again. A retry with the same request id returns the same message. | That it lands in N. Claude reads it at N's next tool boundary if N has one; a turn that only writes text never takes it (measured). Codex reads it at N's next model request. |
-| It ends with exactly one of three recorded outcomes, set once: `in_turn`, `next_turn`, `unconfirmed`. | When it is read, or how much of N had been done by then. |
-| It never runs out of order: when accepted it is the session's next message, and a later message never runs before it. | That N's reply answers it separately: N has one reply, the provider's own (Claude's `result` text, Codex's last `final_answer`). |
-| `unconfirmed` says why, in fixed words, and that the steer was not sent again; the CLI and a waiting tool call show the sender's text so it can be resent. | That an `unconfirmed` steer was not seen. It may have been. |
-| The same grant, access ceiling, budget and ownership checks as a follow-up message. A steer grants nothing and widens nothing. | Delivery across a node silence, a process exit, a cancel, a close or a version rollback: those end `unconfirmed` (or `next_turn` when the steer had not reached the process yet: E). |
-| With no steer sent, every frame, record, answer and turn is as on main (H). | That `auto` steers. It never does. |
+| Accepted or refused at once, in the send's transaction, with the reason. A refusal creates nothing. | That the model read, followed or acted on it. `in_turn` means the provider took S into N (its own evidence), nothing more. |
+| Written to the provider at most once, ever, and only into N. Nothing (hub, node, host, a retry, a restart or rollback of either) writes it again or into another turn. | That it reaches N at all. Claude takes it only at a foreground tool boundary of N; Codex only while it can prove N's turn is the host's (E). Otherwise it is `not_delivered`. |
+| Exactly one outcome, set once, in the transaction that records N's end: `in_turn`, `not_delivered` or `unconfirmed`. | That N's reply addresses it. N has one reply, the provider's own; if N fails, there is none (H). |
+| `not_delivered` means no byte of it reached the agent's process, or the provider refused it: sending it again (as a queued message) cannot deliver it twice. | That an `unconfirmed` steer was not seen. It may have been, also in the conversation the next turn resumes (L). |
+| The same grant, ceiling, budget and ownership checks as a follow-up. A steer grants nothing. | Any automatic retry or fallback. Running the text as a new turn is the sender's choice, after `not_delivered`. |
+| With no steer sent, everything is as on main except the changes named in J. | That `auto` steers. It never does. |
+
+The owner's earlier wording had three outcomes: read in the turn, ran as the next turn, unconfirmed. "Ran as the next
+turn" is replaced by `not_delivered`; open question 1 says why and what the alternative costs.
 
 ### B. What was measured
 
-**Measured on 2026-11-24, Claude Code 2.1.330.** A probe (session scratchpad `steer2/probe_claude.py`, run with
-`python3 -I`) started
+All Claude runs: Claude Code 2.1.330, the probes in this session's scratchpad (`steer2/probe_claude.py`,
+`steer2/probe_claude2.py`, run with `python3 -I`), each starting
 
     claude -p --model haiku --permission-mode dontAsk --setting-sources= --strict-mcp-config
       --allowedTools 'Bash(sleep:*)' --no-session-persistence --input-format stream-json
       --output-format stream-json --verbose --permission-prompts none --session-id <uuid>
 
-in a private cwd (no hooks, no settings, no MCP) and wrote each turn and each steer as
-`{"type": "user", "message": {"role": "user", "content": "<text>"}, "uuid": "<its own uuid>"}`. The steer text was
-"Change of plan from me: when you write your final line, include the codeword W after DONE." Four runs, a few cents
-of haiku.
+in a private cwd with no hooks, settings or MCP (`Bash(sleep:*),Agent,Task` for the background-agent runs), and
+writing every turn and steer as `{"type": "user", "message": {"role": "user", "content": "<text>"}, "uuid": "<own
+uuid>"}`. The steer asked for a codeword in the final line. Seven runs, a few cents of haiku.
 
-| run | the turn N | steer(s) written | the steer's `command_lifecycle` | N's `result` | after it |
-| --- | --- | --- | --- | --- | --- |
-| tool | `sleep 8`, then a line; its `init` at 0.43 s echoes `user_message_uuids: [N]` | at 2.94 s, during the tool call | `queued` 2.94; `started` 12.06, in the same instant as the tool result, before N's result; `completed` 16.69 | 16.70: success, `num_turns` 2, `user_message_uuid` N, `user_message_uuids` [N, S], "DONE PINEAPPLE" | N `completed`; nothing else |
-| two | `sleep 8` | S1 at 2.74 s, S2 at 5.24 s | both `started` at 11.04, at the one boundary | 15.00: `user_message_uuids` [N, S1, S2], "DONE LIME" | nothing else |
-| text | about 250 words, no tool | at 1.44 s | `queued` 1.45; `started` 13.169, right after N's result | 13.17: `num_turns` 1, `user_message_uuids` [N], no codeword | `init` 13.169 with `user_message_uuids` [S]; `result` 17.32 echoing [S], "DONE MANGO" |
-| text, `"priority": "next"` on the steer line | the same | at 1.25 s | `started` 21.255, after N's result | echoes [N] only | its own `init` [S] and `result` [S]: the field changed nothing here |
+| run | what N did | the steer S | N's `result` | after it |
+| --- | --- | --- | --- | --- |
+| tool | `sleep 8` | written during the tool call; `started` at the tool result, before N's result | `user_message_uuid` N, `user_message_uuids` [N, S]; "DONE PINEAPPLE" | nothing |
+| two | `sleep 8` | two steers in one tool call; both `started` at the one boundary | [N, S1, S2]; "DONE LIME" | nothing |
+| text | 250 words, no tool | written mid-turn; `started` in the same millisecond as N's result | [N]; no codeword | the CLI ran S as a turn of its own at once: `init` [S], `result` [S], "DONE MANGO" |
+| text, `"priority": "next"` | the same | the same | [N] | the same: the field changed nothing |
+| bg (M1) | a background Agent (`sleep 6`), then a foreground `sleep 10` | written 0.5 s after the foreground Bash `tool_use`; the Agent's three `task_notification`s came during the same tool call | [N, S]; "DONE PLUM"; the notifications were folded into N | no turn of the CLI's own in the next 30 s |
+| bg-late (M1) | a background Agent (`sleep 15`), a foreground `sleep 4` | as above; the Agent's first notification came at the same boundary | [N, S]; "DONE PLUM" | 8 s later the CLI ran a turn of its own: its `init` lists `msg_lifecycle_v1` but has no `user_message_uuids` key; its `result` has no echo field and `origin.kind` `task-notification` |
+| interrupt | `sleep 8`, the in-band `interrupt` 1 s into the tool | none | `error_during_execution`, `aborted_tools`, echoing [N] | nothing |
 
-So, on 2.1.330:
-- A steer read inside N says so twice: its `started` comes before N's `result`, and N's `result` lists its uuid.
-- A steer that missed N runs as the process's next turn, by itself, at once: `started`, then an `init` and a
-  `result` that echo its uuid and only its uuid.
-- Every `init` and `result` of a turn the host started echoes the host's uuid(s). Lines without a uuid get none of
-  this (the restart measurements; and the recorded 2026-11-23 runs, whose results have no `user_message_uuid` key).
-- A turn the CLI starts by itself is recognisable: the recorded 2026-11-23 background-Agent run (pr19, `subagent`)
-  ended the host's turn, then ran a turn of its own whose `result` carries `origin: {"kind": "task-notification",
-  ...}` and no `user_message_uuid`. (Its lines carried no uuid; what such a turn echoes when the host's lines DO carry
-  one is measurement M1, below.)
+So, on 2.1.330: every `init` and `result` of a host turn echoes the host's uuids (`init` also lists
+`msg_lifecycle_v1`); a steer written during a foreground tool call is taken at that boundary and listed in N's own
+`result`; one that misses every boundary of N runs as the CLI's next turn the instant N ends (the reason for the
+fence in D); an interrupted turn's result still echoes N; a turn the CLI starts by itself echoes nothing, and its `init` has no
+`user_message_uuids` key at all (so echo capability is read from the capability, C).
 
-**Measured earlier, Codex 0.171.0** ("Restarting a running turn" and the parked design): `turn/steer {threadId,
-expectedTurnId, input}` is answered `{turnId}` at once and adds a `userMessage` item to the turn in flight, which the
-model reads at its next request, also when the steer comes right after the turn's `final_answer` (Codex then runs
-another request in the same turn, and its one `turn/completed` covers the steer). It is refused with -32600 ("no
-active turn to steer", "expected active turn id `X` but found `Y`") once the turn has ended or for another turn, so
-it can never land in a later turn.
+Found in the 2.1.330 binary's protocol descriptions, not measured: `cancel_async_message {message_uuid}` (removes a
+queued user message, answering `cancelled` true or false) and `interrupt` with `cancel_queued: true` (capability
+`interrupt_cancel_queued_v1`). A cheaper fence than stopping the process, for later (L).
 
-**Not measured yet, and what the design does meanwhile.** None of these changes a rule below; each is listed with
-the measurement that would settle it.
-- **M1 (needed before Claude steering ships, step 3).** A CLI-started turn (a backgrounded Agent finishing) while host
-  lines carry uuids: does its `init`/`result` echo any host uuid, and can a queued steer be read inside it? The design
-  does not depend on the answer: such a turn is never any message's (C), and a steer whose `started` comes after N's
-  result is `next_turn` whichever turn reads it, ending at the `result` that echoes it. Probe: the pr19 `subagent`
-  scenario with uuid lines and a steer written after N's result.
-- **M2 (optional).** When Claude emits `cancelled`, `discarded` or `refused` for a queued line other than after an
-  interrupt (the host never interrupts while a steer waits: R7). Treated as `unconfirmed`.
-- **M3 (cheap, with step 1).** Echo on the first turn of a `--resume`d process. The design asks no assumption: a
-  process offers steering only once one of its own `init`s echoed a host uuid (C).
-- **M4 (optional).** The order of Codex's answer to `turn/steer` and `turn/completed` when the steer races the end.
-  Every order is handled (D).
-- Not pursued: `"priority": "next"` (T3 Code sets it; it changed nothing in the text run, and this design does not
-  need it); compaction inside a turn with a steer queued (attribution is by echo, so it is covered either way).
+**Codex 0.171.0**, measured earlier ("Restarting a running turn"; the parked design): `turn/steer {threadId,
+expectedTurnId, input}` is answered `{turnId}` at once and the turn reads it at its next model request, also right
+after its final answer; it is refused (-32600) once the turn has ended or for another turn id, so it never lands in
+a later turn. From its source (the round-1 review's checkout of 0.171.0, `turn_processor.rs`; not run here): a
+`turn/start` while a turn is active is a start-or-steer and answers the same shape either way (L-04); `turn/start`
+and `turn/steer` take a `clientUserMessageId`, which becomes the `clientId` of the `userMessage` item Codex adds to
+the turn that took the input.
+
+**Not measured, and needed before the step that relies on it** (no Codex probe was run in this round: running Codex
+writes under `~/.codex`, outside this round's rules):
+- M3 (step 1): echo on the first turn of a `--resume`d process. A probe needs a persisted session under `~/.claude`,
+  so it runs in the step-1 e2e. The design assumes nothing: echo is read from each `init` (C).
+- M5 (step 2): on 0.171.0, `item/started` or `item/completed` for the `userMessage` item carries `clientId` and
+  `turnId`, for a started turn and for a turn N's input joined. Until it is seen, Codex reports no `steer` mode.
+- M6 (step 1, optional): what Claude writes around an automatic compaction inside a host turn. Handled by a trace and
+  the turn timeout (C).
 
 ### C. Step 1: Claude turn correlation (a prerequisite, and a fix on its own)
 
-**Why it comes first.** Today the Claude adapter writes user lines with no uuid and takes the next `init` and
-`result` as the turn in flight's. Two things break that:
-- a steer that misses N runs as a turn the host did not write (B, `text`): by order, its `init` and `result` would be
-  taken for whatever the host writes next;
-- a turn the CLI starts by itself (a backgrounded Agent finishing after the host's turn ended) is taken today for the
-  next message's turn: its reply is attributed to that message, and that message's own result is then dropped as "a
-  turn ended that the host did not start" ("Structured results", D, "what the host attributed"; the parked review's
-  note).
+Today the Claude adapter writes user lines with no uuid and takes the next `init` and `result` for the turn in
+flight. A turn the CLI starts by itself (a backgrounded Agent's notification after the host's turn ended) is then
+taken for the next message's, and that message's own result is dropped ("Structured results", D, "what the host
+attributed"). Steering would add more such turns (B, `text`). The rules (providers/claude.py, session_host.py; node
+only):
+- **Every host user line carries a fresh random `uuid`** (uuid4, never reused). The adapter keeps the uuid of the turn
+  in flight.
+- **Positive ownership.** A process is echo-capable from the first `init` that lists `msg_lifecycle_v1` or carries
+  `user_message_uuids`. In such a process a `result` is message M's only if its `user_message_uuid` or
+  `user_message_uuids` holds M's uuid, and an `init` is M's start only if its `user_message_uuids` does. Anything
+  else is a turn the CLI started itself: no message's start or end.
+- **The access check runs on EVERY `init`**, owned or not (session_host's kill switch, `session_access.verify`): the
+  adapter passes every `init`'s permission mode and tools to the host, and marks only owned ones as a message's
+  start.
+- **Launch errors.** A `result` read before this process wrote any `init` is the CLI refusing the launch (measured:
+  `--resume` of an unknown session gives one `result`, `error_during_execution`, `num_turns` 0, and stderr "No
+  conversation found"). It fails the message that started the process, and `session_exists` reads stderr, as today.
+- **A trace and a bound for the unclear cases.** An unowned `init` or `result` is logged on the node (its `origin.kind`,
+  `subtype`, `num_turns`; never text). While a host turn is in flight such a frame changes nothing: the turn ends by
+  its own `result` or, failing that, by the turn timeout, as today (the bound for a compaction or anything else M6
+  might show).
+- **Legacy.** A process that is not echo-capable (an older CLI) is attributed by order exactly as today, and never
+  steers.
+- Restarts and timeouts are unchanged: an interrupted turn's result echoes it (measured), and a Claude timeout stops
+  the process.
 
-**What changes** (providers/claude.py, session_host.py; node only, no hub change):
-- Every user line the host writes carries a fresh random `uuid` (uuid4, never reused, never derived from the hub's
-  ids). The adapter remembers the uuid of the turn in flight.
-- `turn_started` is an `init` whose `user_message_uuids` holds that uuid; `turn_ended` is a `result` whose
-  `user_message_uuid` or `user_message_uuids` holds it.
-- An `init` or `result` that echoes no uuid of this host is a turn the CLI started itself. It is no message's: no
-  event, an info line in the node's log with its `origin.kind` if it has one, and the adapter notes that such a turn
-  is running until its `result` (`foreign`). The host's next message, already written or not, keeps waiting for its
-  own `init` and `result`.
-- **Echo is proved per process.** The adapter attributes by echo only once an `init` of THIS process has echoed a
-  host uuid. Before that (the first `init` of each process) and in a process that never echoes (an older CLI), it
-  attributes by order, exactly as today. A `result` with `num_turns` 0 that echoes nothing is dropped as foreign.
-- `msg_lifecycle_v1` (in the `init`'s capabilities, as on 2.1.330) plus a proved echo is what lets a process steer
-  (D). Correlation itself needs only the echo.
+Codex needs none of this for attribution (turn ids); its ownership proof for steering is in E.
 
-**Unchanged with it:** the hub, every record and every answer, except in the one case it fixes (a CLI-started turn no
-longer settles the next message). The stdin line gains one key; the message content is the same bytes. The
-transcript gains the `command_lifecycle` lines the CLI writes for uuid lines. Codex needs nothing: it already
-correlates by turn id and holds the next message while it runs a turn of its own (`holds_turns`).
+### D. Claude steering
 
-This closes the "provider turn correlation" follow-up for Claude.
+**When S is written.** The host holds an accepted S in memory and writes it only while all of these hold:
+- the process is echo-capable (C) and its `init` listed `msg_lifecycle_v1` (`steers`, reported in `modes`);
+- N is the host's turn in flight in THIS process, and N's own `init` has come;
+- a top-level foreground tool call of N is open: an `assistant` line with `parent_tool_use_id` null holding a
+  `tool_use` was read, and the `user` line with its `tool_result` was not (a background Agent or Bash answers at once,
+  so it opens no window);
+- the session's write gates hold: the process has the session's binding (`unbound` false), the parent still vouches
+  (`turn_gate`), the node may start work (`may_start`). They are checked before every write of S's bytes, not only
+  the first (L-07).
 
-### D. Per provider: what is written, and what marks each outcome
+**What N's end decides** (in the host, while reading N's `result` or noticing N's end):
 
-**When the host writes a steer at all.** Only while N is the host's turn in flight in the session's live process,
-the provider can take it now (`takes_steer`), no other steer of this session is unresolved, and the same write gates
-as a turn hold (the process's binding is the session's, `unbound` false; the child's parent still vouches for it,
-`turn_gate`; the node may start work, `may_start`). The gates are checked before every write of its bytes, as for a
-turn (`_write`).
-
-**Claude Code** (`steers`: this process's `init` listed `msg_lifecycle_v1`, an `init` of this process echoed a host
-uuid, and no CLI-started turn is running; `takes_steer`: N's own `init` came).
-
-| | evidence (read in stream order) |
-| --- | --- |
-| written | `{"type": "user", "message": {"role": "user", "content": "<text>"}, "uuid": "<S's own uuid>"}`, one line |
-| `in_turn` | `command_lifecycle` `started` for S's uuid before N's `result`; or N's `result` lists S's uuid. Measured: both, in the `tool` and `two` runs. |
-| `next_turn` | `started` for S's uuid after N's `result` (measured: `text` run, the same millisecond as an `init` echoing S). S is then the host's turn in flight: its `init` is its `turn_started`, the `result` that echoes S is its `turn_ended`. |
-| `unconfirmed` | the process exits or is stopped (N's timeout, a cancel of N, a close, the node's self-stop, a failed write, a gate) with S written and not started; `cancelled`, `discarded` or `refused` for S's uuid (M2); S not started within the turn timeout after N's `result` (the host then stops the process, so it can never run later). |
-
-**Codex** (`steers`: the thread is ready and the process alive; `takes_steer`: Codex named N's turn, as for an
-interrupt).
-
-| | evidence |
-| --- | --- |
-| written | `{"id": k, "method": "turn/steer", "params": {"threadId": T, "expectedTurnId": "<N's turn id>", "input": [{"type": "text", "text": "<text>"}]}}`. Its request is NOT retired with N (`_end_turn` keeps it until answered or timed out). |
-| `in_turn` | the answer to request k is a result whose `turnId` is N's id, read before N's `turn/completed` (measured: at once, also at the final answer). |
-| `next_turn` | the answer is an error (Codex refused it: it is in no turn, measured). The host runs S as the next ordinary turn (`turn/start`) once N has ended. |
-| `unconfirmed` | no answer before the process exits, or within STEER_ANSWER_SECONDS (30 s) after N's `turn/completed`; a success read after N's `turn/completed`, or naming another turn (never seen; never claimed as `in_turn`). A late answer is logged and changes nothing: `expectedTurnId` keeps the request out of any later turn. |
-
-**A steer that never reached the process.** If N ends (in any way) before one byte of S was written, or Codex
-refused it, the host knows the provider never had it. It then runs S as the session's next ordinary turn, through the
-ordinary write path and its gates: outcome `next_turn`. This is the first delivery, not a second one, and it is in
-order (R7: nothing was queued behind N, and the node hands nothing else meanwhile). It keeps the rule "never deliver
-twice on the hub's own initiative": the hub decides nothing here, and the host acts on the provider's definite word
-that it never had the steer. (Open question 1 offers the alternative.) A Claude line written only in part when N ends is
-simply finished: the CLI then runs it as its next turn (`next_turn` by the evidence above).
-
-### E. Records and states
-
-**The host** (session_host.py; one session). A steer has one slot beside the turn in flight: `steer` (the message: id,
-text, kind), `steer_into` (N's id), `steer_state`, `steer_mark` (where its bytes are in `outbuf`, as `restart_mark`),
-`steer_since` (when N ended with S unresolved). States: **A** asked (handed by the node, no byte written); **W**
-written, N still in flight; **P** pending, N over and S unresolved. While a steer is in A, W or P the session is BUSY
-for every rule that reads it: no other message is written, the turn timeout runs (from N's write; in P from N's end),
-`stop_turns` and the node's self-stop stop it, `park` leaves it, the state is `running`.
-
-| state x event | what happens |
-| --- | --- |
-| A x N in flight, `steers`, `takes_steer`, gates hold | written -> W |
-| A x not yet (`takes_steer` false, a CLI-started turn running, `unbound`) | waits in A |
-| A x N ends (result, failure, timeout, exit, cancel of N) | S goes to the front of the inbox as an ordinary message -> its `delivered` says `next_turn` |
-| A x cancel of S | dropped, never written: `turn_ended` S failed, not delivered, CANCELLED (hub: `unconfirmed`, "cancelled before it was sent") |
-| A x close / session end | listed in `undelivered`, as an inbox message (hub: `unconfirmed`, the session's end) |
-| W x Claude `started` for S, or Codex `{turnId}` = N | `in_turn`, reported at once (below) |
-| W x Codex error answer | refused: S to the front of the inbox, written after N ends -> `next_turn` |
-| W x N's `result` echoing S (no `started` seen) | `in_turn`, then N ends |
-| W x N's end, no evidence for S | N ends as it ends (reported at once, never held) -> P |
-| W x process exit or stop (any cause) | `unconfirmed` ("the agent process ended before the steer was confirmed"); N ends as it ends |
-| W x a gate fails before S's bytes are all written | the process is stopped, as for a turn (`_write`): N fails as it does today, S `unconfirmed` ("withdrawn while being written") |
-| W x cancel of S | nothing: it is already written (logged); its outcome comes from the evidence. (A parent's cancel also stops N: then "process exit".) |
-| P x Claude `started` for S | `next_turn`: S is the turn in flight (`delivered` with `next_turn`), its `init` and echoing `result` its own turn |
-| P x Codex error answer | `next_turn`: S to the front of the inbox, written on the next pass |
-| P x Codex success answer (late) | `unconfirmed` ("Codex accepted it only after the turn had ended"), logged |
-| P x Claude `cancelled` / `discarded` / `refused` for S | `unconfirmed` ("the agent CLI dropped it without reading it") |
-| P x the bound passes (Claude: the turn timeout since N's end; Codex: STEER_ANSWER_SECONDS) | Claude: the process is stopped, as a timeout stops it, so S can never run later; Codex: the request is retired. `unconfirmed` |
-| P x process exit | `unconfirmed` |
-| P x cancel of S | Claude: the process is stopped (nothing else is in flight; the next message resumes the session); Codex: retired. `unconfirmed` ("cancelled") |
-| P x close / session end | stopped with the session: `unconfirmed` |
-
-Host cells: 20. No state is on disk: what the host knows of a steer is the provider's stream, and a node restart loses
-it (the watermark then decides: the node below).
-
-What the host reports (HostEvent, with a new field `steer`):
-- `in_turn`: `turn_ended` for S with `steer: "in_turn"`, `ok` False, `delivered` False, detail "taken into message N's
-  turn: that turn's reply answers it". (`ok` and `delivered` are false so that a hub that does not read `steer` records
-  no turn, no reply and no completed result for it: G.)
-- `next_turn`: S's ordinary `delivered`, carrying `steer: "next_turn"`, then its ordinary `turn_started` and
-  `turn_ended`.
-- `unconfirmed`: `turn_ended` for S with `steer: "unconfirmed"`, `ok` False, `delivered` False, detail
-  "steer not confirmed: <why>".
-
-**The node** (node_sessions.py; session protocol 5, `tree` 5).
-- A listed message with `mode: steer` and `into: N` is handed as a steer when it is the session's first queued
-  message with its text (the ordinary listing rule: a parent's is shown with its text only once reserved), the host's
-  turn in flight is N, the host holds no steer, and the ordinary parent checks pass (`_parent_problem`,
-  `_awaits_parent`). Exactly as for any message, the WATERMARK is written first: `handed[sid] = S`, saved to
-  HANDED_FILE, then `host.steer_for(sid, text, message_id=S, into=N, kind=...)`. A crash between the two loses the
-  steer (reported lost), never writes it twice.
-- When the host's turn in flight is not N (N already ended here, or never ran here), the steer goes into the ordinary
-  queue and is handed by `_hand_over` when the host is idle: an ordinary next turn, `next_turn`.
-- A steer the host holds (slot, or inbox as a former steer) that the hub no longer lists unsettled is withdrawn from
-  the host before anything else is written: in A or in the inbox it is dropped; in P its process is stopped; in W it
-  is left to N (its later events are ignored by the hub, which settled it). This runs in `_reconcile`, which
-  `_may_start` already requires after a silence.
-- A node restarted with a steer handed: the ordinary rule. The steer is at or below the watermark, the hub still lists
-  it, the host does not hold it: `turn_ended` failed, LOST. The hub records `unconfirmed` ("the node restarted while
-  the steer was pending"). Nothing is replayed.
-- Reports: `steer` is an optional field (`OPTIONAL_FIELDS`: `steer` -> feature `steer`), sent only to a hub whose
-  listing names the feature, and an event carrying it waits while what the hub takes is not known (`_takes`, as
-  `restarted_by`). `modes` lists `steer` when the adapter says so.
-
-**The hub** (hosted.py and its callers). Minimum new fields, each written by the hub only:
-
-| record | field | when |
+| at N's end | outcome | what the host does |
 | --- | --- | --- |
-| the steer S (`host.msg.<sid>.<S>`) | `mode: "steer"`, `into: N` | at acceptance (the existing MODE_FIELDS) |
-| the steer S | `steer`: `in_turn`, `next_turn` or `unconfirmed` | once, in the transaction that settles or delivers S; never changed |
-| the steered turn N | `steered`: the list of steers taken into it (at most 10) | when a steer settles `in_turn` |
-| the session | `steering`: S, or absent | set at acceptance, removed when S settles or is delivered |
+| S never written (no window came, a gate held it back, N ended first) | `not_delivered` | drops it |
+| S written whole and N's `result` lists S's uuid | `in_turn` | nothing more (`started` before the result is supporting only) |
+| S written whole, N's `result` does not list it | `unconfirmed` | stops the process right after reading N's `result`, before anything else is written, so the queued line cannot run as a turn of its own |
+| S written in part | `unconfirmed` | stops the process (a part line must never be completed or joined to the next) |
+| N ended with the process (timeout, a cancel of N, close, self-stop, a failed write, an exit) and S was written | `unconfirmed` | the process is already going |
 
-Transitions at the hub, all forward only (a message never moves back, so a late or repeated report changes nothing):
+**What a stop costs today** (the timed-out-turn path, session_host `_stop` and `_reap`): the process group gets
+SIGTERM, SIGKILL after `kill_grace_seconds`; nothing new starts in that checkout until the group is gone; the session
+stays, dormant, and its next message starts a new process that resumes the conversation (`--resume`), with the
+settings question first when the session runs from a merged settings file. N is not affected: its `result` was read
+first, and `_reap` reads whatever a process wrote before it went. The CLI may already have started S's own turn in
+that instant (the `text` run: the same millisecond): the stop lands within the same host pass, and the measured
+first model output of a new turn came 1.1 to 1.4 s after its `init`, but S's text may already be in the resumed
+conversation. That is part of why S is `unconfirmed`, never `not_delivered`.
 
-| event | S becomes |
+Not used: `started` alone (the CLI also takes lines into turns it starts itself), Claude's terminal lifecycle states
+(R-J: not needed), `priority`.
+
+### E. Codex steering
+
+**Ownership of N's turn** (L-04). The host writes N's `turn/start` with `clientUserMessageId` set to N's own fresh
+uuid. N's provider turn T is DEFINED as the turn that accepted N's input, and it is proved by two facts read from the
+process: the answer to N's `turn/start` names T, and a `userMessage` item whose `clientId` is N's uuid was reported in
+turn T (M5). Whether Codex started T for N or N's input joined a turn Codex was running by itself (start-or-steer),
+T is the turn whose `turn/completed` the adapter already reports as N's end, so a steer into T is a steer into what
+answers N. Without both facts `takes_steer` is false; a turn id adopted from `turn/started` alone never counts.
+
+**What is written.** `{"method": "turn/steer", "params": {"threadId", "expectedTurnId": "<T>", "input": [{"type":
+"text", "text": "<text>"}], "clientUserMessageId": "<S's uuid>"}}`, only while N is in flight with T proved, under
+the same write gates as D. Its request is not retired by the adapter until N's end.
+
+| at N's end | outcome |
 | --- | --- |
-| send accepted (F) | queued, `mode` steer, `into` N; the session's `steering` = S; one child turn charged (a parent's), the human's count reset (the human's) |
-| `turn_ended` S with `steer: in_turn`, while N is delivered | done, `steer: in_turn`, detail as above, text dropped; N gains `steered`; no `turns` counted, no `reply`, no `last_result`, no result for a parent |
-| the same, while N is not in flight on the hub | failed, `unconfirmed` ("the node said it was taken into a turn that had already ended here") |
-| `delivered` or `turn_started` for S | delivered, `steer: next_turn`; from then on an ordinary turn (its own reply, result and verdict rules) |
-| any other settlement of S before it was delivered (the node's `unconfirmed`, LOST, CANCELLED, a refusal, a withdrawal) | failed, `steer: unconfirmed`, with that detail |
-| node silence (`_settle`; `_lost` is also true while `steering` is set) | in the transaction that settles N `node_lost`, S fails `unconfirmed` ("its node went silent before the steer was confirmed"); a later report about either changes nothing |
-| close, cascade (`_end`) | failed, `unconfirmed` ("session ended: ..."); a parent's result as below |
-| hub restart | nothing: every state is a record |
-| pruning | as any settled message: after KEEP_SETTLED_SECONDS (a day); its receipt keeps the number for seven days, not the outcome |
+| S never written | `not_delivered` (`why`: `not_owned` when T was never proved, else `not_written`) |
+| the answer to S's request is `{turnId}` equal to T, read before N's `turn/completed` | `in_turn` |
+| the answer is an error (Codex refused it) | `not_delivered` (`why`: `refused`) |
+| written whole, no answer by N's `turn/completed` | `unconfirmed`; the request is retired, with no wait (`expectedTurnId` keeps it out of any later turn); a late answer is logged |
+| written in part | `unconfirmed`; the process is stopped (a part line would corrupt the next request) |
+| N ended with the process | `unconfirmed` if written, `not_delivered` if not |
 
-A restart arriving while a steer is unresolved is refused by R7 (S is queued), and a steer while a restart waits is
-refused the same way. Once S is settled `in_turn`, another steer or a restart into N is accepted again.
+### F. The host, one session
 
-**The listing.** To a fetch at protocol 5 a steer is listed with `mode` and `into` (as a restart is at 4), and the
-listing names the feature `steer`. To an older fetch it is listed as the ordinary queued message it also is; that node
-runs it as the next ordinary turn once N ends (`next_turn`), or reports it lost if it was handed before a rollback.
+The steer slot: `steer` (S's text, kind and uuid), `steer_into` (N's id), `steer_mark` (where S's bytes sit in
+`outbuf`, as `restart_mark`), and the evidence read so far. Two states only: **held** (no byte written) and
+**written** (some or all). The slot does not make the session busy beyond N (whose turn it already is): `busy`,
+`_save_state`, timeouts and `park` read only the turn in flight, as on main. At N's end the slot is emptied in the
+same call that reports N's end, with the outcome of D or E on that `turn_ended`.
 
-### F. What the sender sees
+| held / written x event | what happens |
+| --- | --- |
+| held x a write window opens and the gates hold | written |
+| held x cancel of S, close, or N ends in any way | `not_delivered`, dropped |
+| written x evidence (Claude: N's result lists S; Codex: `{turnId}` = T) | `in_turn` at N's end |
+| written x Codex error answer | `not_delivered` at N's end |
+| written x a gate fails, or the write fails, with S in part | the process is stopped (as `_write` does for a turn): N fails as it does today; S `unconfirmed` |
+| written x N's end with no evidence | Claude: the process is stopped; S `unconfirmed`. Codex: `unconfirmed`, request retired |
+| written x cancel of N, timeout, close, self-stop, exit | the process goes; S `unconfirmed` (or `in_turn` if Codex had answered) |
+| either x node restart | the slot is memory only and goes with the process; the new host never had N, so it can never write S (G) |
 
-**Acceptance** (`steer_target`, beside `restart_target`, the same checks in the same order, in the send's
-transaction). Refused as "cannot steer into session {id}: {why}" (Conflict), with {why}:
-- protocol: "its node {node} speaks session protocol {tree}; steering needs 5 (update the node: `board node` from this
-  version)";
-- cli: "this session's agent CLI cannot take a message into a running turn (its node says so; a Claude process says
-  so once it has shown it echoes the host's message ids)";
-- idle, kind, foreign, cancelled: restart's words;
-- queued: "{k} message(s) are already queued for this session; a steer would have to jump them: cancel them or send
-  with queue" (this also refuses a second steer before the first is settled, and a steer behind a restart);
-- schema: "output_schema cannot be given with a steer: a steer read in the turn in flight has no result of its own";
-- limit: "the turn in flight (message {n}) has taken 10 steers already; send with queue".
-A retry with the same request id is looked up first and never refused (AC-10).
+`steer_for(session, into, text, kind, uuid)` refuses (returns False) unless `into` is the turn in flight in the
+process the host has now. A parent's cancel flags N and S together (hosted_spawn.cancel): the host applies the
+whole cancel before any write.
 
-**`board_session_send(child, message, mode="steer")`.** The answer is the message (`n`, `mode: steer`, `into: N`,
-`state: queued`) with `why`: "sent into the turn in flight (message N): read there at its next tool call (Claude) or
-model request (Codex) if one comes, else run as the next turn; the outcome is on this message". With `wait=true` it
-waits up to 45 s, as for any send:
-- `in_turn`: it waits for N's result and returns it (claimed by message N: it does not also come as a turn), with
-  `steer: {"outcome": "in_turn", "into": N}`; if N's result already went as a turn or to another call, the answer
-  says so (as `not_taken`'s note does today);
-- `next_turn`: S's own result, as for a follow-up;
-- `unconfirmed`: `steer: {"outcome": "unconfirmed", "why": "..."}`, `note` "your steer (message S) was not confirmed:
-  <why>. It was not sent again; send it again if you still want it.", and `message` (the text of this call) back.
-Without `wait`, a parent learns as it learns of any turn: nothing for an `in_turn` steer beyond N's own result (which
-carries one hub line, below); S's own result for `next_turn`; for `unconfirmed`, a result for S with the new outcome
-word `unconfirmed` and that detail (none for a steer cancelled before it was sent: the cancel call said so, as today).
+### G. Records, the node and the hub
 
-**N's result to a parent**, when N took steers, gains one hub line after the existing server lines: "This turn took
-message(s) S... sent into it while it ran (a steer of yours | a steer from the human): its reply answers them too."
-A result with no steer is byte for byte as on main.
+**The steer store** (R-E). One record per steered turn, apart from the messages: `host.steer.<session>.<N>`, which
+no listing, report or retention rule of an older build reads. Fields, all written by the hub:
 
-**`board session send <id> <msg> --mode steer [--wait]`.** Without `--wait`: "session ...; message S is sent into the
-turn in flight (message N): ..." (the `why`). With `--wait` it polls S, then:
-- `in_turn`: on stderr "steer taken into message N's turn; this is that turn's reply", then it polls N and prints N's
-  reply (when the session's reply is still N's); exit 0 if N completed, 1 if N failed;
-- `next_turn`: on stderr "the steer ran as its own turn", then S's reply as for any message; exit 0 or 1;
-- `unconfirmed`: on stderr "steer not confirmed: <why>. It was not sent again; your text was:" and the text the
-  CLI sent; exit 5 (new: "send it again if you still want it", apart from 1, a turn that failed);
-- `--json`: the usual object plus `steer: {"outcome", "into", "why"?}` and, for `unconfirmed`, `text`.
-`--output-schema` with `--mode steer` is refused by the CLI before sending, with the hub's words.
+| field | meaning |
+| --- | --- |
+| `into`, `kind` (`user` or `task`), `by`, `created_at` | N; whose steer; when accepted |
+| `text` | the steer's text, until it is settled |
+| `listed_at` | when it was first listed to the node (set in a write transaction before it is ever shown: below) |
+| `outcome`, `why`, `settled_at` | null until set once: `in_turn`, `not_delivered` or `unconfirmed` |
+| `request_id`, `sent_by` | for a retry; the session's receipt map gets `{"steer": N, "at"}`, kept seven days from acceptance |
 
-**Status and claims.** `board_session_status` and the message views show `mode`, `into` and `steer` on a steer
-(MODE_FIELDS), and `steered` on N; `show` prints "(steer into message N: taken into that turn | ran as its own turn |
-not confirmed: <why> | waiting)" and on N "(took steers S...)". Nothing changes for a message that is not a steer.
+One steer per N (Sol's cut), so `(session, N)` is its identity. It has no checkout reservation of its own: it is
+shown only while N is `delivered` (in flight) at the hub, under whatever holds N's checkout.
 
-**The Sessions tab** shows the same words beside the message and the link both ways. It stays read-only: no control.
+**The listing.** To a fetch at session protocol 5 (`tree` 5), while N is in flight and S unsettled, the session's
+entry carries `steer: {"into": N, "text", "kind", "uuid"}`. `listed_at` is set inside the listing's write
+transaction (the one that reserves tasks, `hosted_wake.listing`'s `deliver`), and an unlisted steer makes the listing
+due, so the text is never exposed by the read-only path before `listed_at` is committed. An older fetch never sees
+it.
 
-**Audit posts:** none. Sends post no audit line today, and a steer is a send.
+**The node** (node_sessions.py, protocol 5). For a listed steer it calls `host.steer_for(...)`. If the host refuses
+(N is not its turn in flight: N ended here, or this node process never had it), the node adds `steer:
+"not_delivered"` to N's end event if that event is still waiting to be posted; otherwise it does nothing. The steer is
+not a message: the watermark, the queue and `_hand_over` never see it. Reports: `steer` (the outcome) and `steer_why`
+are optional fields of N's own `turn_ended`, sent only to a hub whose listing names the feature `steer`
+(`OPTIONAL_FIELDS`), and an end carrying them waits while what the hub takes is unknown, as `restarted_by` does
+(`_takes`). Stripped for an older hub, N's end is exactly today's (R-F). `modes` lists `steer` when the adapter says
+so.
 
-**What the steered child sees.**
-- The human's steer: its text as it is, as the human's follow-ups go (Claude: the user line's content; Codex: the
-  steer's input). A user message arriving mid-turn is what a Claude or Codex user does at a keyboard.
-- A parent's steer: the follow-up frame (TASK_HEADER, its token rules unchanged) with `what` "A message sent while
-  your turn was running", and one more sentence before the markers: "If you are still working on that turn, take this
-  into account there and answer both in one reply; if it reaches you as a new turn, do the work it asks." That is true
-  in both cases (S-10's point: the parked frame said "it is not a new turn" even when it was). The text stays the
-  agent's: untrusted data, never the human's.
+**The hub: settling S with N** (R-A, R-F). Every path that settles N settles an unsettled S bound to it, in the same
+transaction:
 
-### G. Who may steer what, and versions
+| how N settles | S's outcome |
+| --- | --- |
+| the node's `turn_ended` for N with `steer` | that outcome (`in_turn` only if `listed_at` is set; else `unconfirmed`) |
+| the node's `turn_ended` for N without it (a node-made end: lost after a node restart, a parent problem; or a stripped field) | `unconfirmed` if `listed_at` is set, else `not_delivered` |
+| `_settle` (node silence: `node_lost`), `_end` (close, cascade, orphan), pruning | the same rule: `unconfirmed` if listed, else `not_delivered` |
+| N settled by an older hub (after a rollback) | the same rule, applied by the first transaction of this hub that reads the session (its listing or `_settle`) |
 
-**Who.** The same checks as a follow-up, in the same transaction (`hosted_spawn.send`, `hosted.send`):
-- a parent: only its own child (`_own_child`), only a turn it started (`kind: task`), under its grant and the current
-  access ceiling (`ABOVE_NOW`), charged one child turn of `max_turns_without_human` like any message (an `in_turn` steer
-  is not refunded, a `next_turn` one is not charged again);
-- the human: any session's turn of the human's or of the session's parent (`user`, `task`), as for a restart. A human
-  steer into a parent's task changes the reply that goes to that parent; the parent is told by the hub line in N's
-  result (F). (Open question 2 offers refusing it.)
-- never a `wake` or a result-delivery (`child`) turn: their text is the hub's and their outcome is what the hub waits
-  for;
-- never a turn Codex runs by itself (`holds_turns`): the hub sees no turn in flight, "no turn is in flight".
-Nothing in a steer changes a session's access, allowance or budget.
+`in_turn` never changes N: N's reply, `turns`, `last_result` and result to a parent are exactly what N's end makes
+them. S's text is dropped when it settles. A settled steer is pruned with N's message (KEEP_SETTLED_SECONDS) or with
+the session.
 
-**Mixed versions and rollback** (S-06). The invariant everywhere is the node's watermark: a message handed to a host
-is never handed again by any node version, and every node version that hosts sessions honours HANDED_FILE.
+**The crash limit** (main's, unchanged). If the node process dies after N ended and before its report committed, N
+is reported lost by the next node process (main's recovery) and S is `unconfirmed`. Nothing writes S again: the new
+process never had N.
 
-| hub | node | what happens |
-| --- | --- | --- |
-| new | protocol 5 | steers as above |
-| new | protocol 4 or older | refused (protocol words); `auto` queues as today |
-| old | any | refused (R6's words) |
-| new hub rolled back, steer handed (new node) | the node keeps resolving it; its events go to the old hub without `steer`: `in_turn` and `unconfirmed` arrive as a failed, undelivered end of S with the detail that says which (no turn counted, no reply replaced, N untouched); a parent gets one `withdrawn` result for S carrying that detail (documented degradation, as R4-02 for a restart); `next_turn` is an ordinary turn there |
-| new hub rolled back, steer not handed | the old hub lists S as an ordinary queued message; the node runs it after N as an ordinary turn (`next_turn`, read so on re-upgrade) |
-| node rolled back to 4, steer handed | at or below the watermark: reported lost, never written again; `unconfirmed` |
-| node rolled back to 4, steer not handed | listed to it as ordinary; it runs it after N: `next_turn` |
-| both rolled back | the two rows above combine: handed means lost, not handed means the next ordinary turn; never twice |
-| re-upgrade | records read as they are: a steer that was delivered is `next_turn`, one that settled undelivered is `unconfirmed`; nothing is migrated |
+### H. What the sender sees, and who may steer
 
-No `steer_shown`, journal or spool is needed: what proves a steer was handed is the same file that proves it for any
-message. Hubs before nodes, as always.
+**Who.** A steer goes only into a turn of the sender's own (open question 2): the human into a `user` turn; a parent
+into a `task` turn it started in its own child (`_own_child`), under its grant and the current ceiling
+(`ABOVE_NOW`), charged one child turn like any message. Never into a wake or result-delivery turn, nor while Codex
+runs a turn of its own (the hub then sees no turn in flight).
 
-### H. How the parked review's findings are answered
+**Refused** as "cannot steer into session {id}: {why}" (Conflict), checked in the send's transaction after the
+request-id lookup: the node's protocol is below 5; the session's `modes` lack `steer`; no turn is in flight; the turn
+is a wake or result turn, or not the sender's own, or being cancelled; anything is queued behind N (R7, which also
+covers a waiting restart); N already has a steer ("message N already took a steer: one per turn"); `output_schema`
+was given ("a steer has no result of its own"); `may_spawn` or `spawn_share` was given with it ("mode applies to a
+message alone"). A restart is refused while N's steer is unsettled ("message N has a steer that settles when the turn
+ends; send with queue"). Queued messages behind N are still accepted after a steer: S settles with N, before any of
+them runs.
+
+**`board_session_send(child, message, mode="steer")`** answers `{"steer": {"into": N, "outcome": null}, "message":
+null, "mode": "steer", "why": "bound to the turn in flight (message N): taken into it at its next tool call (Claude)
+or model request (Codex) if the agent can, else not delivered; the outcome is set when that turn ends"}`. A retry
+with the same request id answers the same steer (`created: false`), never with the retry's text. With `wait=true`,
+ONE 45 s budget covers both waits: first S's outcome (which comes with N's end), then N's result:
+- `in_turn`: N's result, claimed for this call; if it already went to the parent as a turn, or another call claimed
+  it, the answer says which;
+- `not_delivered`: "nothing of it reached the agent; send it again (mode queue) if you still want it";
+- `unconfirmed`: "it was written to the agent but not confirmed; it is not sent again";
+- not settled within the budget: the note that N is still running and the outcome comes with its result.
+A parent that does not wait learns it from N's own result, which gains one hub line only when N had a steer: "Your
+steer into this turn: taken into it | not delivered (send it again if you still want it) | not confirmed."
+
+**What `in_turn` gives when N does not complete** (R-D). `in_turn` stays: the provider took S into N. The sender then
+gets N's outcome: N failed or timed out, no reply (main keeps no reply of a failed turn without text); N was cut by a
+close or cascade, the session's end. When N is lost to a node silence or restart, the hub never had the node's word,
+so S is `unconfirmed`, not `in_turn`. A restart cannot interrupt a steered N (refused, above).
+
+**`board session send <id> <msg> --mode steer [--wait]`.** Without `--wait`: the `why`. With it, the CLI polls
+`GET /api/hosted-sessions/{id}/steers/{N}` (long-poll, as the message poll) until S is settled, then:
+- `in_turn`: on stderr "steer taken into message N's turn", then N's reply when the session's reply is still N's
+  (else main's line that a later turn's reply replaced it); exit 0 if N completed, 1 if not;
+- `not_delivered`: on stderr the words above and the text this call sent (not for a retry); exit 5;
+- `unconfirmed`: on stderr the words above; exit 6;
+- `--json`: the usual object with `steer: {"into", "outcome", "why"}`.
+`--output-schema` with `--mode steer` is refused before sending.
+
+**Views.** `show` and `board_session_status` list a session's steers (target, outcome) beside its messages; the
+message views of N are unchanged. The Sessions tab shows the same, read-only. No audit post (sends post none).
+
+**What the steered agent sees.** The human's text as it is (a user line on Claude, the steer's input on Codex). A
+parent's text in the follow-up frame (TASK_HEADER, its token rules unchanged) with `what` "A message sent while your
+turn was running" and one sentence before the markers: "Take it into account in the work you are doing now; your
+reply to this turn answers it too." That is true whenever the agent reads it, because it can only be read inside N.
+
+### I. Versions and rollback
+
+A steer is invisible to every older build: it is not a message, so no older hub lists it as text and no older node
+can hand it over (L-08, L-09).
+
+| situation | what happens |
+| --- | --- |
+| new hub, node below protocol 5 | refused (protocol words) |
+| older hub | refused (R6's words) |
+| hub rolled back with S unsettled | the old hub never lists it; a node that holds it applies D/E's rules and fences; N's end reaches the old hub without the field, exactly as today. On re-upgrade S settles by the G rule (`unconfirmed` if listed) |
+| node rolled back or restarted with S unsettled | the new process has no N, so it never writes S; N is reported lost (or by the old node as it reports any turn); S settles by the G rule |
+| re-upgrade | nothing to migrate; an unsettled steer whose N is settled is settled at the next read or listing |
+
+Hubs before nodes, as always.
+
+### J. With no steer sent: the changes, named, and the proof
+
+Unchanged: every frame the hub writes, the records and views of messages and sessions, the tool and API answers,
+result turns and claims, and CLI text. A steer record exists only for a steered turn.
+
+The named changes without any steer (L-11):
+- **Claude wire** (step 1): every stdin user line gains a `uuid` key, the message content being the same bytes; the
+  transcript therefore gains `command_lifecycle` lines and the `user_message_uuid(s)` fields on the existing `init`
+  and `result` frames.
+- **Claude attribution** (step 1): a `result` that echoes no host uuid no longer ends the message in flight (the fix);
+  launch errors before any `init`, timeouts and restarts are attributed as today (C).
+- **Protocol** (step 2): the node fetches and says hello with `tree` 5, and the hub stores protocol 5 for it.
+- **Listing and records** (step 2): the listing's `features` adds `steer`; a session's reported and stored `modes` add
+  `steer` where the CLI can.
+- **Text** (step 2): the `board_session_send` description and `--mode` help say what `steer` does.
+
+**The proof.** Re-pin the golden recording (tests/golden_schema_free.py, fixtures/schema_free_main.json) to main at
+d4b92e5 and extend it: listings at protocol 4 and 5, Claude and Codex sessions, a restart and an `auto` send, and the
+Claude stand-in's foreign-turn, resume and no-echo cases. The comparison allows exactly the paths named above
+(a whitelist; any other difference fails). Raw-stream assertions: the bytes written to each stand-in's stdin are
+main's bytes plus exactly the `uuid` key, and the transcript keeps every stdout line. The older-hub case runs main's
+own code (d4b92e5, exported from git) behind the real report route and checks the full message, session and result
+state and the parent's turn text for a stripped report.
+
+### K. Tests, and the order of the build
+
+**Unit** (fixtures cut from the recorded streams of B):
+- correlation: owned and unowned `init`/`result`; the access check on an unowned `init`; the launch-error `result`;
+  the legacy order path; an unowned `result` while a turn is in flight ending nothing;
+- Claude steer: the window from `tool_use` to `tool_result`; each row of D (the `tool`, `two`, `bg` and `text`
+  fixtures); the stop after an unlisted result;
+- Codex steer: the ownership proof (`clientId` item and answer), refusal without it, each row of E;
+- host: one table-driven test over F's cells (`CELLS`, as tests/test_session_restart.py);
+- hub: acceptance and every refusal; restart both ways; each row of G's settling table, through `_apply`, `_settle`,
+  `_end` and the re-upgrade read; `listed_at` committed before any listing shows the text; the one 45 s wait;
+  receipts; the line in N's result;
+- node: `steer_for` refused, then `not_delivered` on N's pending end; the field stripped for an older hub and held
+  while features are unknown.
+
+**Stand-ins.** Claude: echo `user_message_uuids` on `init` and `result`; a `background N` turn that runs a turn of its
+own N seconds after its result, with `origin: task-notification`; a resume-refusal launch. Codex: `turn/steer` with
+`expectedTurnId` (accepted into the active turn, refused otherwise), `clientId` on `userMessage` items, and
+`refuse-steer`, `no-steer-answer` and `autonomous-turn` knobs.
+
+**e2e** (scripts/session-host-e2e.py, stand-ins first, then `--claude-bin` / `--codex-bin`; the S1-S6 block's R6
+check is changed):
+1. A human steer into a Claude `sleep 12` tool turn: `in_turn`, the codeword in N's reply.
+2. A human steer into a Claude text-only turn: `not_delivered` (no window), nothing written.
+3. A human steer into a Codex turn: `in_turn` (real Codex only once M5 is seen).
+4. A parent steers its Claude and Codex child with `wait=true`: N's result comes back with the outcome.
+5. Refusals with their words (a second steer, a restart after a steer, a schema, an idle session, a wake turn, a
+   protocol-4 node, a human into a parent's task).
+6. Stand-ins: an `unconfirmed` Claude steer (written as the tool ends) fences the process, and the next message
+   resumes; a node restart with a steer held never writes it; Codex `refuse-steer` and `autonomous-turn`.
+7. Correlation (stand-in `background`): two messages keep their own replies around a CLI-started turn.
+8. As before: the user's Codex config.toml unchanged.
+Real runs cannot force which boundary Claude takes, a CLI-started turn, the Codex race at the end, or node silence:
+those cells are proved by the unit and stand-in tests.
+
+**Build order** (provisional ruling, open question 3; each its own PR, reviewed before merge; hubs before nodes):
+1. Claude turn correlation (C), node only, with M3. It fixes a live misattribution and closes the "provider turn
+   correlation" follow-up.
+2. Codex steering: the hub (steer store, `steer_target`, listing at 5, settling with N, views, CLI, API, MCP), the
+   node, the host slot, the Codex adapter with its ownership proof (M5 first). Claude keeps `steers` false.
+3. Claude steering (D): the window, the fence, the stand-in, real e2e 1 and 2.
+
+### L. Open questions for the owner, and known limits
+
+Each question has a provisional ruling in this draft (the coordinator's, R-H), for the owner to confirm or change.
+
+1. **"Ran as the next turn" is replaced by `not_delivered`.** Provisional: (b).
+   - (a) What the owner first accepted: a steer that misses N runs as the next turn by itself. Cost: round 1 showed
+     it cannot be confirmed honestly. A pipe write is no evidence a turn ran (L-01); the CLI may run the line inside
+     a turn it started itself (L-02); a Codex retry as `turn/start` writes the text twice; the steer then outlives N
+     and must be a queued message, which older builds would list as plain text (L-08, L-09).
+   - (b) The steer's life ends with N's. A steer that missed is `not_delivered` (provably never reached the agent),
+     and the sender may send it again as an ordinary message. Cost: one more send by the sender. On Claude, a steer
+     into a turn with no foreground tool call is always `not_delivered`.
+2. **A human steer into a turn the session's parent started.** Provisional: (b) refuse it for now.
+   - (a) Allow it, with a line in N's result telling the parent. Cost: the parent's task result is shaped by text it
+     did not write, and its instructions have two authors.
+   - (b) Refuse it ("the turn in flight is not one you started"); the human can restart or queue instead. Cost: the
+     human cannot redirect a child's task without losing the turn.
+3. **Build order.** Provisional: (a) correlation, then Codex, then Claude (K). (b) Codex steering first. Cost of (b):
+   the Claude misattribution stays until the last PR.
+
+**Known limits.**
+- `in_turn` is the provider's evidence that it took S into N, not proof the model read or followed it.
+- Claude takes a steer only during a foreground tool call; a text-only turn never does.
+- An `unconfirmed` Claude steer costs a process stop and a resume; its text may be in the resumed conversation.
+  `cancel_async_message` or `interrupt` with `cancel_queued` (B) could fence it without a stop: a later saving, once
+  measured.
+- Codex steers only once the ownership proof is seen (M5); until then no Codex session reports `steer`.
+- One steer per turn and one unsettled per session.
+- A steer whose turn is lost to a node silence or restart is `unconfirmed`, even if it was taken.
+- The outcome is kept as long as N's message (a day after it settles); the receipt keeps only the target, for seven
+  days from acceptance.
+- If the session loop is dead while the node's hellos go on, N is not settled and neither is S (main's limit for N);
+  S cannot be written meanwhile, since only that loop writes.
+
+### M. Design review round 1 (2026-11-24)
+
+The round-1 review (gpt-6.2-sol, of commit 6221a7d) found L-01 to L-12. Where each stands:
 
 | finding | now |
 | --- | --- |
-| S-01 the hook can inject into the wrong turn | **Gone.** No hook. The steer is a stdin line; which turn took it is the CLI's own word (`started` before N's `result`, or N's `result` echoing it). A turn the CLI starts by itself is never any message's (C), and a steer read after N's result is `next_turn`, never `in_turn`. Its reply may then include the CLI's own work (a known limit, K). |
-| S-02 `taken` promises more than the receipt proves | **A rule.** `in_turn` is DEFINED as the receipt: Claude started it before N's result, or N's result lists it; Codex answered `{turnId}` = N before N's end. The words never say the model acted. N's outcome is the steer's outcome: if N then fails or is interrupted, the sender sees N failed. Codex's `expectedTurnId` names the host's own turn id only; a turn Codex runs by itself refuses it (`next_turn`), and `holds_turns` already keeps a `turn/start` out of such a turn. |
-| S-03 the Codex hold strands the session or turns a completion into a timeout | **Gone.** N's end is never held: it is reported the moment it is read, with its own outcome. The steer's own wait is bounded (30 s after N's end) and has no effect on N; the timeout and cancel paths are unchanged. A wholly unwritten steer becomes the next turn; one written and unanswered ends `unconfirmed` and its request is retired. |
-| S-04 recovery on both sides of the report | **Gone or covered.** No held result, so nothing must survive a crash between completion and report. Node crash: the watermark, reported lost, `unconfirmed`. Hub-declared silence: N `node_lost` and S `unconfirmed` in one transaction; what the node says later is ignored, as for any settled message. A parent then gets N failed and S unconfirmed, nothing in between. |
-| S-05 the state table loses evidence; no path for permanent node loss | **Covered by `unconfirmed`.** The host's states are A, W, P, in memory; any loss of evidence is `unconfirmed` and never re-sent. There are no files, so no rename errors and no publication states. Permanent node loss: the hub settles at NODE_LOST_SECONDS (`steering` makes `_lost` see it). Close, cascade and orphaning go through `_end`: `unconfirmed`. An outcome is set once ("late -> withdrawn" is gone). |
-| S-06 rollback covers one side at a time | **Covered by the watermark** (G): every node version honours it, so both-sides rollback cannot write a handed steer again. An older hub gets events it records harmlessly (failed, undelivered: no reply replaced, no turn counted). |
-| S-07 a stale checkout reservation or binding authorizes a later write | **A rule, and the ordinary path.** A steer is listed with its text only as the first queued message, under the ordinary reservation in the listing's transaction. After a silence the hub settles it with N, so it is never listed again, and the node withdraws a held steer the hub no longer lists before `_may_start` lets it write anything. Every write of a steer's bytes is under the turn's gates (`unbound`, `turn_gate`, `may_start`); one failing mid-write stops the process (`unconfirmed`). A steer that runs as the next turn goes through the ordinary write path, gates included. |
-| S-08 the spool is part of the trust boundary | **Gone.** No spool, no hook, no settings change, also for read-only Claude children: a steer is a user line like any turn. A parent's text keeps the agent-authored frame (F). |
-| S-09 Stop re-entry, limits, coexistence; `auto`; cost at every turn end | **Gone.** No hook: nothing runs at a turn's end, and the runner's own hooks are untouched. One steer at a time per session, at most 10 into one turn. The reply is the provider's own (no joining). `auto` is unchanged. |
-| S-10 what senders can retrieve | **A rule.** A parent's `wait` on an `in_turn` steer returns N's result and says so; the human's `--wait` follows N; the frame is true either way; the outcome lives on the message record (a day after it settles), while the receipt keeps only the number (seven days): stated in K. A human steer into a parent's task is disclosed in N's result (F). |
+| L-01 a pipe write is no evidence for `next_turn`; the Codex retry writes twice | no longer applies: no `next_turn`, no fallback (A, L1) |
+| L-02 Claude's `started` does not identify the turn | no longer applies to steering: `in_turn` needs N's own `result` to list S, and S never outlives N (D). M1 run twice: a notification at the same boundary was folded into N and N's result still listed S; a later CLI-started turn echoed nothing |
+| L-03 order fallback, the access check, resume refusal, compaction | met in C: positive ownership, order only for a CLI that does not echo (no steering), the check on every `init`, the launch-error rule, a trace and the turn-timeout bound |
+| L-04 Codex ownership of N unproven | met in E: T is the turn that accepted N's input, proved by the answer and the `clientId` item; no proof, no write (`not_delivered`, `not_owned`) |
+| L-05 an optional S event can hold or lose N | met: the outcome is a field of N's own end, applied in one transaction; stripped, N is as today; the crash limit is stated (G) |
+| L-06 silence, deadline, stale checkout | met: no reservation of its own; shown only while N is in flight; written only into N in the same process; settled by whatever settles N, so N's own deadline is S's (G, L) |
+| L-07 the pending slot's stop and withdrawal rules | met: no pending state; held or written; unwritten dropped, part-written and unconfirmed Claude steers fenced by a stop; gates before every write; `busy` and `_save_state` untouched (F) |
+| L-08 the watermark's narrower guarantee | no longer applies: a steer is not a message and is never handed by the watermark path; a new node process cannot write it (F, I) |
+| L-09 the legacy end event changes N's state | no longer applies: no event for S; N's stripped end is today's; nothing is inferred from a legacy delivery (G, I) |
+| L-10 sender-visible failure cases | met in H: N's outcome when S is `in_turn`; one 45 s wait; delivered or claimed elsewhere; replaced replies; seven days from acceptance; a retry never echoes its own text; `may_spawn`/`spawn_share` refused with a steer |
+| L-11 the no-steer list and the proof | met in J |
+| L-12 M2 and M4 optional | taken: Claude's lifecycle states are not used; a late Codex answer is `unconfirmed` with no wait |
 
-### I. With no steer sent, nothing changes, and how that is proven
+**The parked review's S-01 to S-10, against this design.**
 
-Unchanged byte for byte: frames, records, listings' messages, tool and API answers, result turns, claims, CLI text.
-`steer`, `steered` and `steering` exist only on records a steer touched; MODE_FIELDS show only when set.
-
-The intended differences without any steer, all named:
-- (step 1) every Claude stdin line has a `uuid` key, and transcripts carry `command_lifecycle` lines; a CLI-started
-  turn no longer settles the next message (the fix);
-- (step 2) the node fetches with `tree` 5; the listing's `features` adds `steer`; a session's reported `modes` (and so
-  its record) adds `steer` where the CLI can; the `board_session_send` description and `--mode` help replace "steer is
-  not available yet" with what it does.
-
-The proof follows the structured-results pattern (tests/golden_schema_free.py and
-`test_structured_results`'s golden comparison): the steer-free run is recorded against main and against this
-change, and the test asserts the two are equal except for exactly the named keys above (a whitelist of paths, so any
-other difference fails). A provider test pins the Claude line: main's line plus exactly the `uuid` key. A test runs
-main's own `_apply` (exported from git, as `test_mains_own_reader_claims_an_asked_result_whole_block_included` does)
-on the degraded events an older hub would get, and checks the session's reply, turn count and N untouched.
-
-### J. Tests, and the order of the build
-
-**Unit** (fixtures cut from the recorded streams, B):
-- Claude correlation: attribution by echo; a CLI-started `init`/`result` (the recorded task-notification lines)
-  ignored while the next message stays in flight; echo proved per process; a process that never echoes attributes by
-  order and never steers; a `result` with `num_turns` 0 and no echo dropped.
-- Claude steer: `tool` -> `in_turn` (by `started`, and by echo alone); `two`; `text` -> `next_turn` with its own init
-  and result; `cancelled` -> `unconfirmed`.
-- Codex steer: the request's bytes; `{turnId}` = N -> `in_turn`; an error -> `next_turn`; an answer after
-  `turn/completed` -> `unconfirmed`; the request survives `_end_turn`.
-- Host: tests/test_session_steer.py, one table-driven test over the 20 cells (`CELLS`, as test_session_restart.py).
-- Hub: tests/test_session_steer_hub.py: acceptance and every refusal with its words; R7 both ways with restart; the
-  schema refusal; budget and the human's reset; request-id retries; each transition of E's hub table; node silence
-  through `_settle` with `steering` set; close and cascade; the parent's wait on an `in_turn` steer claiming N's result;
-  the parent result lines; the degraded events through main's `_apply`.
-- Node: the watermark written before `steer_for` (a crash between them: lost, `unconfirmed`); a steer handed as such
-  only while N is in flight here, else queued; withdrawal of a steer the hub no longer lists; `steer` stripped for a
-  hub without the feature and held while features are unknown; `modes`; rollback rows of G.
-- Golden comparison (I).
-
-**Stand-ins.** tests/stand_in_claude.py: echo `user_message_uuids` on `init` and `result` (it already writes
-`command_lifecycle` and runs a line that missed a tool turn as its own next turn); a `background N` turn that, N
-seconds after its result, runs a turn of its own with `origin: task-notification` and no echo; a knob that drops a
-queued line with `discarded`. tests/stand_in_codex.py: `turn/steer` with `expectedTurnId` (accepted into the active
-turn, also after its final answer; refused otherwise); `refuse-steer` and `late-steer-answer` knobs.
-
-**e2e** (scripts/session-host-e2e.py; stand-ins first, then `--claude-bin` / `--codex-bin`; the S1-S6 block that now
-checks the R6 refusal is changed):
-1. Human steer into a Claude tool turn (`sleep 12`): `in_turn`; one result; the reply has the codeword.
-2. Human steer into a Claude text-only turn: `next_turn`; its own result.
-3. Human steer into a Codex turn (`hold`/`sleep`): `in_turn`.
-4. A Codex steer refused (stand-in `refuse-steer`): `next_turn`.
-5. A parent steers its Claude and its Codex child (`board_session_send`, `mode="steer"`, `wait=true`): N's result
-   comes back, labelled.
-6. Refusals with their words: a second steer while one is unresolved; a restart while a steer is unresolved; a steer
-   with `--output-schema`; into an idle session; into a wake turn (stand-in); a node at protocol 4.
-7. The node restarted with a steer handed (stand-in `hold`): `unconfirmed`; the steer never runs.
-8. Correlation (stand-in `background`): two messages keep their own replies around a CLI-started turn.
-9. A human steer into a parent's task: N's result to the parent carries the disclosure line.
-10. As before: the user's Codex config.toml unchanged.
-
-What real runs cannot force, honestly: which boundary Claude takes (a `sleep 12` tool turn and a text-only turn are
-reliable in practice, not guaranteed); a CLI-started turn (a backgrounded Agent may be tried, not forced: stand-in
-only); Claude dropping a queued line; the Codex race at the very end; node silence and the self-stop (stand-ins with
-short timers). Those cells are proved by the unit and stand-in tests.
-
-**Build order** (smallest useful slice first; each its own PR, reviewed before merge; hubs before nodes):
-1. **Claude turn correlation** (C): providers/claude.py, session_host.py, the stand-in's echo and `background`
-   turn, unit tests, e2e 8. Node only; fixes the live misattribution and closes its follow-up. M3 with it.
-2. **Steering for Codex**: the hub (`steer_target`, records, listing at 5, the feature, `_apply`, `_settle`/`_lost`,
-   `_end`, results and their line, views), the node (protocol 5, hand-over, withdrawal, the report field), the host
-   slot (A/W/P), the Codex adapter, the CLI, API, MCP words and the Sessions tab; Claude keeps `steers` False. Codex
-   first because its precondition makes `in_turn` atomic and it needs no correlation.
-3. **Steering for Claude**: the adapter's `steers` (the echo proof and `msg_lifecycle_v1`), the P wait with its bound,
-   the stand-in, e2e 1, 2 and 5 on real Claude. M1 first.
-
-### K. Open questions for the owner
-
-1. **A steer the provider never had (the host had written none of it when N ended, or Codex refused it).**
-   - (a) Recommended: run it as the session's next ordinary turn (`next_turn`). The provider's own word says it was
-     never delivered, so this is its first delivery, and R7 keeps it in order. T3 Code does the same. Cost: one more
-     host path (the steer goes to the front of the inbox), and a sender who meant it only for N gets a turn anyway.
-   - (b) Record it `unconfirmed` ("it arrived after the turn ended") and drop it. Simpler words, one path fewer.
-     Cost: a Codex steer that just misses the end (common for short turns) is lost, and the sender must resend.
-2. **A human steer into a turn the session's parent started.**
-   - (a) Recommended: allow it, as for a restart, with the hub line in N's result that tells the parent. Cost: the
-     parent's result is shaped by text it did not write (it is told so).
-   - (b) Refuse it ("the turn in flight is the parent's"); the human can still restart it or send with queue. Cost:
-     the human cannot redirect a child's task without throwing away the turn.
-3. **Build order.**
-   - (a) Recommended: correlation first (step 1 alone), then Codex, then Claude. Step 1 fixes a bug every Claude
-     session has today and carries no new interface. Cost: steering arrives one PR later.
-   - (b) Codex steering first, correlation and Claude after. Cost: the Claude misattribution stays until the third
-     PR, and the hub's steer interface ships while half the providers refuse it.
-
-### L. Known limits
-
-- `in_turn` is the provider's receipt, not proof the model read or followed the steer.
-- Claude takes a steer only at a tool boundary: a turn that only writes text runs it as the next turn.
-- The reply of a steered turn is the provider's own: Claude's `result` is the text after the last tool call; Codex
-  keeps the last `final_answer`, so an answer written before a steer that came at the very end is only in the
-  transcript (measured: the parked design's `at-final`).
-- A steer read by a turn the CLI started by itself (M1) is `next_turn`, and its reply may include that turn's own
-  work.
-- A Claude steer pending after N's end waits at most the turn timeout; past it the process is stopped, which also
-  stops a CLI-started turn running then.
-- A Claude message written while a CLI-started turn runs has that turn's time counted against its own timeout
-  (correlation, C): as before, but now its reply is its own.
-- One unresolved steer per session, at most 10 into one turn.
-- The outcome is kept on the message record for a day after it settles; the seven-day receipt keeps only the
-  message number, so a retry after that says "settled", as for any message.
-- After a hub rollback a parent may get one `withdrawn` result for a steer that was in fact taken (its detail says
-  so).
-- `unconfirmed` covers every case the evidence does not settle, including some where the steer was in fact read. That
-  is the contract.
-
-### M. Where this departs from the brief's starting points
-
-- Adopted: R7 for steers; a missed steer as its own ordinary turn with no held result; `output_schema` refused;
-  `auto` unchanged; `steers` in `modes` and refusal otherwise; correlation as step 1 (a prerequisite for Claude only;
-  Codex correlates by turn id already).
-- Refined: `in_turn` is defined as the provider's receipt (S-02); a steer the provider never had runs as the next turn
-  instead of ending `unconfirmed` (open question 1); a Claude process offers steering only after proving it echoes
-  (B, C).
-- Added: the hub settles an unresolved steer itself on node silence, in the transaction that settles N, and the node
-  withdraws one the hub no longer lists (S-07); the `steering` field so `_lost` sees a steer pending after N's end;
-  N's `steered` link and its line in the parent's result (S-10); the 10-steer cap; CLI exit 5 for `unconfirmed`. The
-  sender's text for a resend comes from the call that holds it (the CLI, a waiting tool call), never from a new stored
-  copy.
+| finding | now |
+| --- | --- |
+| S-01 the hook injects into the wrong turn | gone: no hook; S is written only into N in the same process, and only N's own `result` can make it `in_turn` |
+| S-02 receipts prove less than "taken" | a rule: `in_turn` is defined as that evidence and worded so (A, H); Codex steers only a proved turn (E) |
+| S-03 the Codex hold strands the session | gone: N is never held; the outcome is decided at N's end |
+| S-04 recovery across report and crash | gone: one event, one transaction; the crash limit is main's (G) |
+| S-05 lost evidence, permanent node loss | covered: two in-memory states; anything unclear is `unconfirmed`; every way N settles settles S (G) |
+| S-06 rollback on both sides | gone: older builds never see a steer (I) |
+| S-07 stale reservation or binding | gone: no reservation of its own; written only under N's, under the turn's gates, in the same process |
+| S-08 the spool's trust boundary | gone: no spool, hook or settings change |
+| S-09 Stop re-entry, coexistence, `auto` | gone: no hook; one steer per turn; `auto` unchanged; the uuid and lifecycle overhead is named in J |
+| S-10 what senders can retrieve | a rule: H (the wait, N's outcome, the CLI, the receipt) |
