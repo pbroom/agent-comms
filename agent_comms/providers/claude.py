@@ -464,10 +464,20 @@ class ClaudeSession:
 
     @property
     def barrier_before_first_byte(self) -> bool:
-        """The host tracks where a staged turn starts, rechecks `holds_turns` before its first byte and tells this
-        adapter when it is delivered: only while this incarnation can still be verified (some version VERIFIED, and
+        """The host tracks where a staged turn starts, takes it back (`unstaged`) if this adapter `holds_turns`
+        before any byte of it was accepted, and tells this adapter when it is delivered: only while this
+        incarnation can still be verified (some version VERIFIED, and
         no `init` or deviation said otherwise). With VERIFIED empty the host's write path is main's, untouched."""
         return bool(VERIFIED) and self._verified is not False and not self._dead
+
+    def unstaged(self) -> None:
+        """The host took the turn last staged back before any byte of it was accepted (it waits in the inbox
+        again): no trace of it stays here, no turn in flight, no uuid outstanding, so rule 10 cannot fire for it and
+        its next staging is a first one, with a fresh uuid."""
+        if self._current is not None:
+            self._written.discard(self._current)
+        self._current, self._open, self._begun, self._delivered = None, False, False, False
+        self._interrupt_id, self._interrupt_ok = None, False
 
     def delivered(self) -> None:
         """The host wrote every byte of the turn last staged (`turn`): only now can an error that does not list it

@@ -748,9 +748,12 @@ def test_c2_01_sols_sequence_an_error_never_lets_a_staged_m_into_the_clis_turn(h
     child.accept = None
     frames = [vinit()] + ([{"type": "assistant", "session_id": SID, "message": {"content": []}}] if activity else [])
     assert emit(henv, child, *frames, nonturn(error=True)) == []
-    assert b'"next"' not in child.stdin and s.writing.id == "1" and s.provider.verified and s.provider.holds_turns()
-    assert emit(henv, child, failed()) == [] and b'"next"' not in child.stdin, "an ambiguous error: inert"
+    assert b'"next"' not in child.stdin and s.writing is None and [m.id for m in s.inbox] == ["1"], (
+        "back in the inbox: a message is never held while staged")
+    assert s.provider.verified and s.provider.holds_turns() and s.provider._current is None
+    assert emit(henv, child, nonturn(error=True)) == [] and b'"next"' not in child.stdin, "still inert"
     assert emit(henv, child, foreign()) == [("delivered", "1")], "the CLI's turn really ended: now it goes"
+    valid_stdin(child, once=["next"])
 
 
 @pytest.mark.usefixtures("verified")
@@ -762,46 +765,6 @@ def test_c2_01_rule_10_needs_a_delivered_m(henv):
     child.emit(nonturn(error=True))
     [end] = henv.host.tick()
     assert (end.message_id, end.ok) == ("1", False) and not s.provider.verified
-
-
-def test_c2_02_the_write_timer_is_suspended_while_a_staged_turn_is_held(henv, monkeypatch):
-    """Timeout 60 s: staged at t=0 (the pipe takes nothing), the hold opens at t=45 (the CLI's own turn). At t=60 the
-    ordinary write timer would have failed it; it is suspended. The hold's own deadline is t=105: there the message,
-    never written, is kept for the next process (7b). Without the hold it would be the generic timeout."""
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
-    henv.host = make_host(henv, timeout_minutes=1)
-    s, child = idle_host(henv)
-    child.accept = 0
-    henv.host.send(SID, "next", message_id="1")
-    assert henv.host.tick() == [] and s.writing.id == "1"
-    henv.clock.advance(45)
-    child.accept = None
-    assert emit(henv, child, vinit()) == [] and s.writing.id == "1"
-    henv.clock.advance(15)                              # t=60
-    assert henv.host.tick() == [] and child.terminated == 0, "the write timer is suspended"
-    henv.clock.advance(44)                              # t=104
-    assert henv.host.tick() == [] and child.terminated == 0
-    henv.clock.advance(1)                               # t=105: the hold's deadline
-    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"]
-    assert s.writing is None and b'"next"' not in child.stdin
-
-
-def test_c2_02_the_write_timer_starts_again_when_writing_resumes(henv, monkeypatch):
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
-    henv.host = make_host(henv, timeout_minutes=1)
-    s, child = idle_host(henv)
-    child.accept = 0
-    henv.host.send(SID, "next", message_id="1")
-    henv.host.tick()
-    henv.clock.advance(45)
-    emit(henv, child, vinit())                          # held from t=45
-    henv.clock.advance(50)                              # t=95: the barrier lifts, the pipe still takes nothing
-    assert emit(henv, child, foreign()) == [] and s.writing.id == "1" and s.busy_since == henv.clock()
-    henv.clock.advance(59)
-    assert henv.host.tick() == [] and child.terminated == 0, "a fresh write timer"
-    henv.clock.advance(1)
-    [end] = henv.host.tick()
-    assert (end.message_id, end.delivered, end.detail) == ("1", False, "timed out after 1 minutes")
 
 
 @pytest.mark.usefixtures("verified")
@@ -858,93 +821,7 @@ def test_c3_01_sols_sequence_a_foreign_error_lifts_the_barrier_for_a_staged_m(he
     assert [(e.kind, e.message_id, e.text) for e in henv.host.tick()] == [
         ("turn_started", "1", ""), ("turn_ended", "1", "mine")]
     assert child.stdin.count(b'"next"') == 1 and len(henv.spawner.children) == 1 and s.provider.verified
-
-
-def held_staged(henv, monkeypatch):
-    """Timeout 60 s; message 1 staged at t=0 with the pipe taking nothing; the CLI's own turn from t=45."""
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
-    henv.host = make_host(henv, timeout_minutes=1)
-    s, child = idle_host(henv)
-    child.accept = 0
-    henv.host.send(SID, "next", message_id="1")
-    henv.host.tick()
-    henv.clock.advance(45)
-    assert emit(henv, child, vinit()) == [] and s.held_staged == "1"
-    return s, child
-
-
-def test_c3_02_a_downgrade_ending_the_hold_renews_the_write_clock(henv, monkeypatch):
-    """Sol's timings: staged at t=0, held from t=45, a plain result at t=95 ends the hold and downgrades the
-    incarnation. M does not fail on the t=0 clock: its write clock starts at t=95, and M is written once the pipe
-    takes it."""
-    s, child = held_staged(henv, monkeypatch)
-    henv.clock.advance(50)                              # t=95
-    assert emit(henv, child, plain()) == [] and not s.provider.verified, "by order now, and M is no one's to end"
-    assert s.writing.id == "1" and s.busy_since == henv.clock() and s.held_staged is None
-    henv.clock.advance(59)                              # t=154
-    assert henv.host.tick() == []
-    child.accept = None
-    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
-
-
-def test_c3_02_an_init_first_read_on_the_old_deadline_does_not_lose_to_the_write_timer(henv, monkeypatch):
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
-    henv.host = make_host(henv, timeout_minutes=1)
-    s, child = idle_host(henv)
-    child.accept = 0
-    henv.host.send(SID, "next", message_id="1")
-    henv.host.tick()
-    henv.clock.advance(60)                              # the old deadline, and only now the CLI's init is read
-    child.emit(vinit())
-    assert henv.host.tick() == [] and child.terminated == 0 and s.writing.id == "1" and s.held_staged == "1"
-    henv.clock.advance(59)
-    assert henv.host.tick() == [] and child.terminated == 0, "the hold's own deadline is t=120"
-    henv.clock.advance(1)
-    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "7b at t=120"
-
-
-def test_c3_02_every_end_of_the_hold_renews_the_write_clock(henv, monkeypatch):
-    """The CLI's turn ending (a foreign result) is another end of the hold: the write clock starts again there."""
-    s, child = held_staged(henv, monkeypatch)
-    henv.clock.advance(50)                              # t=95
-    assert emit(henv, child, foreign()) == [] and s.busy_since == henv.clock() and s.provider.verified
-    henv.clock.advance(59)
-    assert henv.host.tick() == []
-    henv.clock.advance(1)
-    [end] = henv.host.tick()
-    assert (end.message_id, end.detail) == ("1", "timed out after 1 minutes"), "60 s after the hold ended"
-
-
-@pytest.mark.usefixtures("verified")
-def test_c3_04_a_binding_change_while_an_untouched_staged_m_is_held_requeues_it(henv):
-    """Not one byte of M was written: it goes back to the front of the inbox and the binding path restarts the
-    process once the CLI's turn has ended; the new process (with the binding as it is now) writes M once."""
-    s, child = idle_host(henv)
-    child.accept = 0
-    henv.host.send(SID, "next", message_id="1")
-    henv.host.send(SID, "after", message_id="2")
-    henv.host.tick()
-    child.accept = None
-    emit(henv, child, vinit())
-    s.bind = "b" * 64
-    assert henv.host.tick() == [] and s.writing is None and [m.id for m in s.inbox] == ["1", "2"]
-    assert child.terminated == 0 and b'"next"' not in child.stdin, "not failed, not written, nothing stopped yet"
-    assert emit(henv, child, foreign()) == [] and child.terminated == 1, "the turn ended: the binding restart"
-    henv.host.tick()
-    fresh = henv.spawner.children[-1]
-    assert fresh is not child and fresh.turns() == ["next"]
-
-
-@pytest.mark.usefixtures("verified")
-def test_c3_04_a_partly_written_m_still_fails_on_a_binding_change(henv):
-    s, child = idle_host(henv)
-    child.accept = 5
-    henv.host.send(SID, "partial", message_id="1")
-    henv.host.tick()
-    emit(henv, child, vinit())
-    s.bind = "b" * 64
-    [end] = henv.host.tick()
-    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and "binding changed" in end.detail
+    valid_stdin(child, once=["next"])
 
 
 @pytest.mark.usefixtures("verified")
@@ -967,6 +844,7 @@ def test_gate_shape_1_a_no_query_notification_then_m_written_and_settled_without
     assert [(e.kind, e.message_id, e.text) for e in henv.host.tick()] == [
         ("turn_started", "1", ""), ("turn_ended", "1", "mine")]
     assert child.stdin.count(b'"next"') == 1 and len(henv.spawner.children) == 1 and child.terminated == 0
+    valid_stdin(child, once=["next"])
 
 
 @pytest.mark.usefixtures("verified")
@@ -996,6 +874,248 @@ def test_gate_shape_2_a_foreign_quota_error_after_model_activity_then_m_written_
     assert [(e.kind, e.message_id, e.text) for e in henv.host.tick()] == [
         ("turn_started", "1", ""), ("turn_ended", "1", "mine")]
     assert child.stdin.count(b'"next"') == 1 and len(henv.spawner.children) == 1 and child.terminated == 0
+    valid_stdin(child, once=["next"])
+
+
+# --- review round 4: the inbox owns the hold (a message is never held while staged)
+
+
+def valid_stdin(*children, once=()):
+    """Every line written to these processes is a whole JSON object (nothing appended to an unfinished one), and
+    each text in `once` was written as exactly one user line, across them all."""
+    texts = []
+    for child in children:
+        assert child.stdin == b"" or child.stdin.endswith(b"\n"), "only whole lines"
+        for line in child.stdin.split(b"\n")[:-1]:
+            ev = json.loads(line)
+            assert isinstance(ev, dict) and ev.get("type") in ("user", "control_request"), line
+            if ev["type"] == "user":
+                texts.append(ev["message"]["content"])
+    for text in once:
+        assert texts.count(text) == 1, (text, texts)
+
+
+def settled(events, mid):
+    return [e for e in events if e.kind == "turn_ended" and e.message_id == mid]
+
+
+def staged_zero(henv, text="next", mid="1"):
+    """A verified idle session; message `mid` staged, the pipe taking nothing."""
+    s, child = idle_host(henv)
+    child.accept = 0
+    henv.host.send(SID, text, message_id=mid)
+    assert henv.host.tick() == [] and s.writing.id == mid and s.turn_at is not None
+    return s, child
+
+
+def short_host(henv, monkeypatch):
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+
+
+def test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh(henv, monkeypatch):
+    """Timeout 60 s: staged at t=0 with zero bytes; the CLI's turn opens at t=45, so M goes back to the inbox (no
+    trace in the adapter); a plain result at t=95 downgrades the incarnation; M is staged afresh, with its own write
+    clock from t=95, written once, and settles once by its own result. It never fails on the t=0 clock."""
+    short_host(henv, monkeypatch)
+    s, child = staged_zero(henv)
+    staged_id = json.loads(bytes(s.outbuf[s.turn_at:]))["uuid"]
+    henv.clock.advance(45)
+    assert emit(henv, child, vinit()) == [] and s.writing is None and [m.id for m in s.inbox] == ["1"]
+    assert s.busy_since is None and s.provider._current is None and not s.provider._open
+    assert staged_id not in s.provider._written, "no uuid outstanding for it"
+    child.accept = None
+    henv.clock.advance(50)                              # t=95
+    assert emit(henv, child, plain()) == [("delivered", "1")] and not s.provider.verified
+    assert s.busy_since == henv.clock(), "a fresh write clock, from this staging"
+    child.emit(vinit(), plain(text="mine"))
+    evs = henv.host.tick()
+    assert [(e.kind, e.message_id, e.text) for e in settled(evs, "1")] == [("turn_ended", "1", "mine")]
+    valid_stdin(child, once=["next"])
+
+
+def test_r4_a_an_init_first_read_on_the_old_deadline_unstages_before_any_timeout(henv, monkeypatch):
+    short_host(henv, monkeypatch)
+    s, child = staged_zero(henv)
+    henv.clock.advance(60)                              # the old write deadline, and only now the CLI's init is read
+    child.emit(vinit())
+    assert henv.host.tick() == [] and child.terminated == 0 and [m.id for m in s.inbox] == ["1"]
+    henv.clock.advance(59)
+    assert henv.host.tick() == [] and child.terminated == 0, "the inbox's hold, from t=60"
+    henv.clock.advance(1)
+    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "7b at t=120"
+    assert b'"next"' not in child.stdin
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_b_a_binding_change_and_the_turns_end_in_one_pass_take_m_to_the_newly_bound_process(henv):
+    s, child = staged_zero(henv)
+    assert emit(henv, child, vinit()) == [] and [m.id for m in s.inbox] == ["1"]
+    s.bind = "b" * 64
+    child.emit(foreign())                               # the CLI's turn ends in the same pass as the binding change
+    evs = henv.host.tick()
+    assert not settled(evs, "1") and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "not failed"
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    call = henv.spawner.calls[-1]
+    assert fresh is not child and call["env"].get("AGENT_COMMS_HOSTED_KEY") == "b" * 64
+    assert fresh.turns() == ["next"] and s.in_flight.id == "1"
+    valid_stdin(child, fresh, once=["next"])
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_c_the_rest_of_a_partly_written_control_frame_stays_and_m_follows_as_its_own_line(henv):
+    """A partly written interrupt control frame is in the buffer, M staged behind it with zero bytes; the CLI's turn
+    opens (M goes back: only its own bytes leave the buffer); the binding changes and reverts before any restart:
+    the control frame completes intact, M follows as its own line, and no `delivered` for M before its bytes."""
+    s, child = idle_host(henv)
+    _, _, m0 = started(henv, "zero-two", "a")
+    emit(henv, child, vinit(m0))
+    henv.host.interrupt_for(SID, "a", "b")
+    child.accept = 10
+    henv.host.tick()                                    # 10 bytes of the interrupt's line in the pipe
+    child.accept = 0
+    child.emit(owned(m0))                               # the turn ends by itself; the interrupt is half written
+    assert [e.kind for e in henv.host.tick()] == ["turn_ended"]
+    henv.host.send(SID, "next", message_id="1")
+    assert henv.host.tick() == [] and s.writing.id == "1"
+    rest = bytes(s.outbuf[:s.turn_at])
+    child.emit(vinit())
+    evs = henv.host.tick()
+    assert not [e for e in evs if e.kind == "delivered"] and bytes(s.outbuf) == rest, "only M's bytes left the buffer"
+    s.bind = "c" * 64
+    henv.host.tick()
+    s.bind = None                                       # it reverts before any restart
+    child.accept = None
+    evs = emit(henv, child, foreign())
+    assert ("delivered", "1") in evs and child.terminated == 0
+    valid_stdin(child, once=["next"])
+    lines = [json.loads(x) for x in child.stdin.split(b"\n")[:-1]]
+    assert [x["type"] for x in lines][-2:] == ["control_request", "user"] and lines[-2]["request"]["subtype"] == (
+        "interrupt")
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_d_a_replacement_process_whose_pipe_takes_nothing_gets_no_extra_interval(henv):
+    """After 7b the next process's pipe takes nothing and it, too, begins a turn of its own: M goes back to the
+    inbox at once, and its (second) hold deadline is 30 minutes from there, not later; then main's failure."""
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(30 * 60)
+    assert henv.host.tick() == [] and child.terminated == 1, "7b, the first time"
+    henv.spawner.child = _ZeroPipe
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert s.writing.id == "1" and fresh.stdin == b""
+    fresh.emit(vinit())
+    assert henv.host.tick() == [] and s.writing is None and [m.id for m in s.inbox] == ["1"]
+    henv.clock.advance(30 * 60 - 1)
+    assert henv.host.tick() == [] and fresh.terminated == 0
+    henv.clock.advance(1)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and fresh.terminated == 1
+    valid_stdin(child, fresh)
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_d_a_staged_m_with_no_bracket_keeps_mains_write_timer(henv):
+    """No turn of the CLI's own: a pipe that takes nothing is main's write timeout, from the staging."""
+    s, child = staged_zero(henv)
+    henv.clock.advance(30 * 60)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.detail) == ("1", "timed out after 30 minutes")
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_f_fifo_an_unstaged_m_goes_first_ahead_of_its_successor(henv):
+    s, child = staged_zero(henv)
+    henv.host.send(SID, "after", message_id="2")
+    child.accept = None
+    assert emit(henv, child, vinit()) == [] and [m.id for m in s.inbox] == ["1", "2"]
+    assert emit(henv, child, foreign()) == [("delivered", "1")]
+    m = uuid_of(child)
+    child.emit(vinit(m), owned(m, text="one"))
+    evs = henv.host.tick()
+    assert [(e.kind, e.message_id) for e in evs] == [("turn_started", "1"), ("turn_ended", "1"), ("delivered", "2")]
+    valid_stdin(child, once=["next", "after"])
+    users = [json.loads(x)["message"]["content"] for x in child.stdin.split(b"\n")[:-1]
+             if json.loads(x)["type"] == "user"]
+    assert users[-2:] == ["next", "after"]
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_f_a_cancel_while_an_unstaged_m_waits_in_the_inbox(henv):
+    s, child = staged_zero(henv)
+    henv.host.send(SID, "after", message_id="2")
+    child.accept = None
+    emit(henv, child, vinit())
+    [end] = henv.host.cancel(SID, "1", "cancelled")
+    assert (end.message_id, end.delivered) == ("1", False) and [m.id for m in s.inbox] == ["2"]
+    assert child.terminated == 0, "it was in the inbox: nothing to stop"
+    assert emit(henv, child, foreign()) == [("delivered", "2")]
+    valid_stdin(child, once=["after"])
+    assert b'"next"' not in child.stdin
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_f_a_restart_into_an_unstaged_m_interrupts_nothing(henv):
+    """The restart interlock: a restart asked for the turn of M, which is back in the inbox, writes no interrupt
+    (nothing of M is in flight); M runs later as an ordinary turn."""
+    s, child = staged_zero(henv)
+    child.accept = None
+    emit(henv, child, vinit())
+    henv.host.interrupt_for(SID, "1", "2")
+    assert henv.host.tick() == [] and b"interrupt" not in child.stdin and s.restart_by is None
+    assert emit(henv, child, foreign()) == [("delivered", "1")]
+    valid_stdin(child, once=["next"])
+
+
+@pytest.mark.usefixtures("verified")
+def test_r4_f_7b_for_an_unstaged_m_and_its_count_survives_the_unstage(henv):
+    s, child = staged_zero(henv)
+    emit(henv, child, vinit())                          # unstaged: the inbox's hold from now
+    henv.clock.advance(30 * 60)
+    assert henv.host.tick() == [] and child.terminated == 1 and "1" in s.recovered, "7b, once"
+    henv.spawner.child = _ZeroPipe
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    fresh.emit(vinit())
+    henv.host.tick()                                    # unstaged again
+    henv.clock.advance(30 * 60)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.delivered) == ("1", False), "the second time: main's failure"
+    valid_stdin(child, fresh)
+
+
+def test_r4_g_parity_no_unstage_with_verified_empty_or_for_codex(henv, monkeypatch):
+    from agent_comms.session_host import SessionHost
+    monkeypatch.setattr(SessionHost, "_unstage", lambda *a: (_ for _ in ()).throw(AssertionError("unstaged")))
+    s, child, _ = started(henv, "zero", "0")            # VERIFIED empty: by order, as on main
+    emit(henv, child, vinit(), plain())
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    emit(henv, child, vinit(), foreign())
+    assert s.turn_at is None
+    from test_session_host import codex_host, codex_ready
+    import test_providers_codex as cx
+    host, cs = codex_host(henv)
+    host.send(SID, "first", message_id="c")
+    host.tick()
+    cchild = henv.spawner.children[-1]
+    codex_ready(host, cchild)
+    host.tick()
+    cchild.emit(cx.reply(3, cx.TURN_REPLY), cx.TURN_STARTED, cx.message("one"), cx.completed())
+    host.tick()
+    cchild.accept = 0
+    host.send(SID, "second", message_id="d")
+    host.tick()
+    cchild.emit(cx.own_turn("turn/started"))
+    host.tick()
+    host.tick()
+    assert cs.turn_at is None
 
 
 # --- the barrier, its bound and its clock, the access check, interrupt readiness
@@ -1042,13 +1162,15 @@ def test_the_barrier_is_bounded_then_a_never_written_message_waits_for_the_next_
 @pytest.mark.usefixtures("verified")
 def test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte(henv):
     """A pipe that took nothing; then the CLI begins a turn of its own before the next attempt: the staged message
-    is not written into that turn. It waits (its own clock), and goes once the turn ended; or fails at the bound."""
+    is not written into that turn. It goes back to the inbox (review round 4) and waits there, and goes once the turn
+    ended; or, at the bound, is kept for the next process."""
     s, child = idle_host(henv)
     child.accept = 0
     henv.host.send(SID, "next", message_id="1")
     assert henv.host.tick() == [] and s.writing.id == "1" and b'"next"' not in child.stdin
     child.accept = None
-    assert emit(henv, child, vinit()) == [] and b'"next"' not in child.stdin and s.writing.id == "1"
+    assert emit(henv, child, vinit()) == [] and b'"next"' not in child.stdin and s.writing is None
+    assert [m.id for m in s.inbox] == ["1"]
     henv.clock.advance(60)
     assert henv.host.tick() == [] and b'"next"' not in child.stdin
     assert emit(henv, child, foreign()) == [("delivered", "1")] and child.turns()[-1] == "next"
@@ -1065,6 +1187,7 @@ def test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte(henv):
     assert [m.id for m in s.inbox] == ["2"] and s.writing is None
     henv.host.tick()
     assert henv.spawner.children[-1].turns() == ["later"]
+    valid_stdin(*henv.spawner.children, once=["next", "later"])
 
 
 @pytest.mark.usefixtures("verified")
