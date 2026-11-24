@@ -985,8 +985,11 @@ def test_a_fifth_opening_token_is_refused_before_any_lookup(offenv, monkeypatch)
     refused with a fixed answer, and no lookup is made."""
     sid = asked_root(offenv)
     a = tok(offenv, sid)
+    report(offenv, sid, {"kind": "delivered", "message": 1})       # A delivered (in flight) before the check
+    assert record(offenv, sid, 1)["state"] == "delivered"
     n = ask_again(offenv, sid)
     b = tok(offenv, sid, n)
+    assert record(offenv, sid, n)["state"] == "queued", "B queued behind A"
     unknown = ["1111111111111111", "2222222222222222", "3333333333333333"]
     reply = "\n".join(blk(x) for x in [a, *unknown, b])
     assert len(o.check_tokens(reply)) == 5 and o.check_tokens(reply)[0] == b
@@ -1004,3 +1007,29 @@ def test_a_fifth_opening_token_is_refused_before_any_lookup(offenv, monkeypatch)
         "four tokens are still looked up (the unknown ones' blocks are quoted material, as at settlement)"
     monkeypatch.undo()
     assert settle(offenv, sid, 1, reply)["code"] == "form", "what A's settlement says of that reply"
+
+
+# ------------------------------------------------------------ review after the PR (R4-01)
+
+
+def test_the_log_filter_never_raises_and_passes_through_what_it_does_not_recognise():
+    """R4-01: the raw-frame filter changes only a recognised string message with exactly one positional argument.
+    A non-string (unhashable) message, a dict as the only argument, no argument, and an unrelated message pass through
+    untouched and without an exception; the two redactions still hold."""
+    from agent_comms.mcp_server import _NoRawEnvelope
+    f = _NoRawEnvelope()
+
+    def rec(msg, *args):
+        return logging.LogRecord("mcp.server.runner", logging.DEBUG, __file__, 1, msg, args, None)
+    odd = rec({"unhashable": PLANTED})
+    assert f.filter(odd) and odd.msg == {"unhashable": PLANTED} and odd.args == ()
+    mapped = rec("transport yielded exception: %r", {"x": PLANTED})
+    assert isinstance(mapped.args, dict), "logging keeps a lone mapping as args itself"
+    assert f.filter(mapped) and mapped.args == {"x": PLANTED} and mapped.msg == "transport yielded exception: %r"
+    bare = rec("transport yielded exception: %r")
+    assert f.filter(bare) and bare.args == () and bare.msg == "transport yielded exception: %r"
+    other = rec("dropped %r: not defined at %s", "x/y", "2025")
+    assert f.filter(other) and other.args == ("x/y", "2025") and other.getMessage() == "dropped 'x/y': not defined at 2025"
+    for msg in ("transport yielded exception: %r", "dropped a frame received before the first request: %r"):
+        r = rec(msg, ValueError(PLANTED))
+        assert f.filter(r) and PLANTED not in r.getMessage() and r.getMessage().endswith(": ValueError")

@@ -9085,6 +9085,30 @@ One blocker and two shoulds, all fixed; the mutation table has a row for each, a
 - **R3-03, the pool hint.** A pool of two Claude-labelled members, one mapped to a Codex runner, gets no hint
   (`all`, not `any`). [`test_a_pool_of_two_claude_members_one_mapped_to_codex_gets_no_sentence`]
 
+### Review after the PR (2026-11-23)
+
+PR #107 was approved (Sol) and judged OK to merge with notes only (the independent review). The two nits and three
+notes are closed in one commit on top of the reviewed one.
+- **R4-01, the log filter never raises.** It changes only a string message that is one of its two, with exactly one
+  positional argument. A non-string message (a dict is unhashable, so the old `in` test raised), a dict as the only
+  argument (logging keeps a lone mapping as `args` itself), no argument, and any other message pass through
+  untouched. [`test_the_log_filter_never_raises_and_passes_through_what_it_does_not_recognise`; each of the three
+  guards removed alone is caught by it]
+- **R4-02.** The fifth-token test now reports A delivered before the check (and asserts B queued), as the scenario it
+  names. [`test_a_fifth_opening_token_is_refused_before_any_lookup`]
+- **Note: the lookup's cost grows with the agent's history.** The statement range-scans every `host.session.` row for
+  `$.agent`, then the caller's own asked sessions' messages. Measured by the reviewer in memory (about 2 KB a record):
+  about 0.2 s at 2,000 own asked sessions beside 5,000 other agents' (20 messages each), and the 0.5 s budget reached
+  at 5,000 own beside 10,000 others, which fails CLOSED with the fixed "could not look the request up" answer, never a
+  wrong verdict. Ended sessions go after 7 days, so this is unlikely at one owner's scale.
+- **Note: the hub's slots are shared.** The hub's HTTP MCP server has one set of bounds for every bridged caller, and
+  its 4 concurrent check slots are taken before authentication (the per-agent rate only after it). So a burst from one
+  agent, or calls with a bad token, can make other agents' checks answer "busy" for a moment: advisory, within the
+  stated per-process, best-effort limits.
+- **Note: the Claude hint is the hub's.** `tells_check` reads the hub's own configuration. A node whose runner for a
+  Claude-labelled agent really runs Codex, which the hub cannot see, would get the sentence and could meet the same
+  approval denial a Codex session does.
+
 ### Follow-ups
 
 - **Node-reported approval for Codex.** `session_host` in the node's hello could list the runner keys that approve
@@ -9094,3 +9118,9 @@ One blocker and two shoulds, all fixed; the mutation table has a row for each, a
 - **The tail of an over-long reply** ("Structured results", Follow-ups): the check can warn, not keep it.
 - **Limits across processes.** The bounds are per process; a shared bound would need a store, which this change
   deliberately does not add.
+- **The lookup's cost at a large history** ("Review after the PR"): an index on the session rows' agent (or a per-agent
+  key range) would keep it flat; today it fails closed at the budget.
+- **Per-caller check slots on the hub**: slots taken after authentication, or per agent, so one agent's burst does not
+  make another's checks busy.
+- **The node's word on its runners**: the node could say which runners are Codex's and which approve the tool (the
+  node-reported approval follow-up above), so the Claude hint and a Codex hint both rest on what really runs.

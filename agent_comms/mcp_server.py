@@ -88,7 +88,11 @@ class _NoRawEnvelope(logging.Filter):
                "dropped a frame received before the first request: %s"}
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.msg in self.RAW and record.args:
+        # Never raises, and changes only what it recognises: a string message that is one of the two, with exactly
+        # one positional argument. A non-string message (a dict is unhashable), a dict as the only argument (logging
+        # keeps a lone mapping as `args` itself), no argument, or any other message passes through untouched.
+        if (isinstance(record.msg, str) and record.msg in self.RAW and isinstance(record.args, tuple)
+                and len(record.args) == 1):
             record.msg, record.args = self.RAW[record.msg], (type(record.args[0]).__name__,)
         return True
 
