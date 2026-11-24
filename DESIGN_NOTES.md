@@ -9127,15 +9127,19 @@ notes are closed in one commit on top of the reviewed one.
 
 ## Mid-turn steering, loose contract: design (2026-11-24)
 
-Status: design only, round 12. R6 ("Restarting a running turn") still holds on main: `steer` is refused for every
-session. History: the first attempt ("Mid-turn steering: design (2026-11-23)", parked on `claude/mid-turn-steer`,
-review S-01..S-10 in docs/mid-turn-steer-review.md) used a Stop hook and a spool. This design had eleven reviews
-(mapped in P). The owner ruled **"Claude too, T3's way"** after M2-01 showed that Claude Code cannot be made to put a
-steer only into the turn it targets. Since round 4 the host **holds N's end** while a written Claude steer is
-unresolved (T3 Code's `heldResult`), so on the hub a steer lives exactly as long as its turn. Rounds 8 to 10 grew a
-guard and a checkout hold to keep dispatched work out of a checkout while a written steer could still start there; on
-2026-11-24 the owner moved that protection out of steering into a project of its own for all turns (M, Q). Part C
-(step 1) is being built on `claude/turn-correlation` and is unchanged.
+**Review status:** reviewed by gpt-6.2-sol over 12 design rounds; verdict SOUND at 597391d, plus a final wording tidy.
+The owner's decisions are recorded in part M. Awaiting the owner's approval before any steering code; step 1 (turn
+correlation, part C) is being built separately.
+
+Status: design only, round 12 (final). R6 ("Restarting a running turn") still holds on main: `steer` is refused for
+every session. History: the first attempt ("Mid-turn steering: design (2026-11-23)", parked on
+`claude/mid-turn-steer`, review S-01..S-10 in docs/mid-turn-steer-review.md) used a Stop hook and a spool. This design
+had eleven reviews (mapped in P). The owner ruled **"Claude too, T3's way"** after M2-01 showed that Claude Code
+cannot be made to put a steer only into the turn it targets. Since round 4 the host **holds N's end** while a written
+Claude steer is unresolved (T3 Code's `heldResult`), so on the hub a steer lives exactly as long as its turn. Rounds 8
+to 10 grew a guard and a checkout hold to keep dispatched work out of a checkout while a written steer could still
+start there; on 2026-11-24 the owner moved that protection out of steering into a project of its own for all turns (M,
+Q). Part C (step 1) is being built on `claude/turn-correlation` and is unchanged.
 
 **In one paragraph.** A steer S is sent with `mode: steer` by the sender of the turn N in flight, and is bound to N:
 it is stored apart from messages, is shown to the node only while N is still delivered there and not expired, has
@@ -9291,8 +9295,9 @@ such a turn began is not taken back. Codex attribution is not changed (D-5).
 process: N is the turn in flight with its owned bracket; the incarnation is verified and steers; the binding is the
 session's (`unbound` false); the parent still vouches (`turn_gate`); the node may start work (`may_start`); N is not
 cancelled; the contact clock of E holds; and the latest authoritative listing (protocol 5, from a hub that names
-`steer`) still lists S. The only path that revokes S alone is that omission, which only a hub fault produces (the hub
-omits S only when it settles, cancels or expires N); it revokes S, not N. Authority is checked before every write of
+`steer`) still lists S. The only paths that revoke S alone are that omission and the hub's failed eligibility check
+for an offer, which sets `withdrawn_at` and omits S from then on (G); otherwise the hub omits S only when it settles,
+cancels or expires N. Either way it revokes S, not N. Authority is checked before every write of
 S's bytes, and its loss is one-way: S never regains it (E).
 
 **The write.** At once, while authority holds. The hub caps a steer so its line fits the pipe at once: its text, after
@@ -9658,7 +9663,7 @@ Design-level questions are closed; these go to code review (F-6, the round-5 rev
   `turn/steer` receipt immediately before the process exits;
 - a fully written S still queued in the CLI when a close is acknowledged: main's hand-over already skips a stopping
   session (node_sessions `_hand_over`), so no ordinary message follows; the host's close runs the finalizer (drain,
-  stop, confirmed exit, N's end, then `ended`), so the queued S can never become a turn of a new process; S is
+  bounded stop, N's end, then `ended`), so the queued S can never become a turn of a new process; S is
   `unconfirmed` unless drained evidence settles it;
 - (R7-05) the listing request's age checked on a monotonic clock, and a test that a late acknowledgement cannot erase
   a stale interval;
@@ -9669,6 +9674,9 @@ Design-level questions are closed; these go to code review (F-6, the round-5 rev
 - (R11-04) shutdown before the hold exists: `signal()` drains every live steer attempt first, including one still
   waiting for N's result, and a native result larger than one `read_lines()` budget (dispatch.py line 1613) is drained
   across reads, since one `_read` does not necessarily empty the pipe;
+- (round 12) the stop deadline while the process is already marked stopping, with an overlapping timeout, close
+  and late reap: one native N end, no later outcome revision, and no same-session hand-over while the stopping barrier
+  remains; a sent signal alone never establishes that S was cut;
 - (R11-01) a group member that outlives SIGKILL: N's native result is published once after the bounded stop, S
   `unconfirmed`, the process unwritable, the local barrier in place.
 
@@ -9721,7 +9729,7 @@ findings.
 | finding | now |
 | --- | --- |
 | R7-01 dispatch can take a fresh offer's checkout | covered by A's fourth exception since round 11; the launch-check change moved to Q |
-| R7-02 close releases the checkout before a queued S starts | covered by A's fourth exception since round 11; release on confirmed exit moved to Q |
+| R7-02 close releases the checkout before a queued S starts | covered by A's fourth exception since round 11; release on confirmed exit, for all turns, moved to Q |
 | R7-03 the M8 fallback releases the hold without proof | met (H-2, N-2): in either mode only a bracket's terminal result listing S, or the finalizer, ends the hold |
 | R7-04 the settlement rules disagree | met (H-3): one precedence for S, the owning host's extension first; the contrary sentence removed |
 | R7-05 the elapsed-time check | met: a monotonic age check (E), with its tests in O |
@@ -9734,6 +9742,9 @@ R7-01 and R7-02, met in round 8 by the checkout hold, are now covered by that ex
 
 **Round 11** (R11-01..R11-04, on 9ffe1bd): R11-01 met by the bounded stop that publishes N's result (D, I); R11-02
 by the terminal-result rule in both modes (D); R11-03 and R11-04 carried into O; the same-session case to N and Q.
+
+**Round 12** (597391d): SOUND. Design rounds stopped. Release gates: M3 resume echoes, M5 Codex ownership, M6
+compaction, M7 failure frames, M8 Claude steer ownership and distinct-turn proof.
 
 **The parked review's S-01..S-10**: S-01, S-08, S-09 gone (no hook, no spool, `auto` unchanged); S-02 is A's rule;
 S-03 and S-04 are met by the hold (a distinct state, an immutable copy, a bound, the finalizer) and the checkpoint,
