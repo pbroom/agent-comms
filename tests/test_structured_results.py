@@ -682,45 +682,73 @@ def test_wait_exits_0_3_and_4_with_their_words(offenv, monkeypatch, capsys):
 # ------------------------------------------------------------ with no schema, byte for byte as on main
 
 
-def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(tmp_path):
-    """tests/fixtures/schema_free_main.json is golden_schema_free.py's recording of main's code (d4b92e5): frames,
-    result turns, a claim, spawn and send answers and their retries, status, show, a message poll, list, the node's
-    listing, the lineage view, CLI text and every hosted record; and (Claude turn correlation) every bracket sequence
-    of the steering design's C through the node, a timeout, a launch refusal, a resumed process, a restart, an
-    `auto` send and a Codex turn, with every process's stdin and transcript. This checkout's run must be the same,
-    byte for byte (time stamps and the temporary directory aside), but for the named changes the recording takes
-    out (golden_schema_free.LINE_UUID, ECHO_FIELDS): the next test asserts they are there, and only there."""
-    from pathlib import Path
+BASELINE = frozenset({"0.0.0-golden-baseline"})    # a version VERIFIED that the recorded processes do not report
 
-    import golden_schema_free
-    main = json.loads((Path(__file__).parent / "fixtures" / "schema_free_main.json").read_text())
-    ours = json.loads(json.dumps(golden_schema_free.record(tmp_path), sort_keys=True))
+
+def _main_fixture():
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / "fixtures" / "schema_free_main.json").read_text())
+
+
+def _same(ours, main):
+    ours = json.loads(json.dumps(ours, sort_keys=True))
     for key in sorted(main):
         assert ours[key] == main[key], key
     assert set(ours) == set(main)
 
 
-def test_the_golden_runs_named_changes_are_there_and_nothing_else_is_taken_out(tmp_path, monkeypatch):
-    """The whitelist is exactly the named paths. This checkout's raw stdin has the uuid key on every Claude user line,
-    as its last key, and on no other line; its transcripts have the echo fields on `init` and `result` frames only,
-    echoing those very uuids. Main's recording (the fixture) has neither."""
-    from pathlib import Path
+def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(tmp_path):
+    """tests/fixtures/schema_free_main.json is golden_schema_free.py's recording of main's code (d4b92e5): frames,
+    result turns, a claim, spawn and send answers and their retries, status, show, a message poll, list, the node's
+    listing, the lineage view, CLI text and every hosted record; and (Claude turn correlation) every bracket sequence
+    through the node with a source-faithful stream, a timeout, a launch refusal, a resumed process, a restart, an
+    `auto` send and a Codex turn, every process's raw stdin, every raw transcript, the host's events in order and the
+    board's log lines. With no version VERIFIED (production) this checkout's run is the same, byte for byte (time
+    stamps and the temporary directory aside), with NO allowance at all."""
+    import golden_schema_free
+    _same(golden_schema_free.record(tmp_path, verified=frozenset()), _main_fixture())
 
+
+def test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for_the_allowance(tmp_path):
+    """An explicitly unverified baseline (VERIFIED names a version these processes do not report): main's run, raw
+    bytes, host events and logs included, once the allowance is taken out of the raw stdin and transcripts
+    (golden_schema_free.allowed); the next test asserts the allowance is there, and is only that."""
+    import golden_schema_free
+    _same(golden_schema_free.record(tmp_path, verified=BASELINE, allow=True), _main_fixture())
+
+
+def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_and_lifecycle_rows(tmp_path):
+    """In the baseline run: each Claude process's first user line (written before its first init) carries a fresh
+    uuid and no later line does (the first init shows the process cannot be verified); every echo field and lifecycle
+    row names one of those very lines; what the allowance took out is exactly those fragments and rows. With no
+    version VERIFIED nothing carries a uuid, and main's recording has none either."""
     import golden_schema_free as g
-    stdin, frames = [], []
-    line, echo = g._main_stdin_line, g._without_echo
-    monkeypatch.setattr(g, "_main_stdin_line", lambda x: stdin.append(x) or line(x))
-    monkeypatch.setattr(g, "_without_echo", lambda x: frames.append(x) or echo(x))
-    g.record(tmp_path)
-    users = [x for x in stdin if x.startswith('{"type": "user"')]
-    assert users and all(g.LINE_UUID.search(x) for x in users), "every Claude user line carries the uuid, last"
-    assert not any('"uuid"' in x for x in stdin if not x.startswith('{"type": "user"')), "and no other line"
-    ids = {json.loads(x)["uuid"] for x in users}
-    echoing = [json.loads(x) for x in frames if any(f in x for f in g.ECHO_FIELDS)]
-    assert echoing and all(e.get("type") == "result" or e.get("subtype") == "init" for e in echoing)
-    assert all(set(e.get("user_message_uuids", [])) <= ids for e in echoing)
-    fixture = (Path(__file__).parent / "fixtures" / "schema_free_main.json").read_text()
-    assert "user_message_uuid" not in fixture and "uuid" not in json.dumps(json.loads(fixture)["stdin"]), "main: none"
+    rec = g.record(tmp_path / "raw", verified=BASELINE)
+    ids = []
+    for lines in rec["stdin"]:
+        users = [json.loads(x) for x in lines if x.startswith('{"type": "user"')]
+        if users:
+            assert ["uuid" in u for u in users] == [True] + [False] * (len(users) - 1), lines
+            ids.append(users[0]["uuid"])
+            assert all(list(u)[-1] == "uuid" for u in users[:1]), "the key is the last one"
+        assert not any('"uuid"' in x for x in lines if x and not x.startswith('{"type": "user"'))
+    assert len(ids) == len(set(ids)) > 3, "one fresh uuid per process's first line"
+    named = set()
+    for lines in rec["transcripts"].values():
+        for x in lines:
+            ev = json.loads(x) if x.startswith("{") else {}
+            named |= ({ev["command_uuid"]} if ev.get("type") == "command_lifecycle" else set())
+            named |= {v for k in ("user_message_uuid",) if isinstance(ev.get(k), str) for v in [ev[k]]}
+            named |= set(ev.get("user_message_uuids") or [])
+    assert named and named <= set(ids), "every echo and lifecycle row is for a line that carried a uuid"
+    g.record(tmp_path / "allowed", verified=BASELINE, allow=True)
+    kinds = {k for k, _ in g.REMOVED}
+    assert kinds == {"stdin", "echo", "lifecycle"} and sum(k == "stdin" for k, _ in g.REMOVED) == len(ids)
+    none = g.record(tmp_path / "empty", verified=frozenset())
+    assert "user_message_uuid" not in json.dumps(none["transcripts"]) and "command_lifecycle" not in json.dumps(
+        none["transcripts"]) and '\\"uuid\\"' not in json.dumps(none["stdin"])
+    main = _main_fixture()
+    assert "user_message_uuid" not in json.dumps(main) and "command_lifecycle" not in json.dumps(main)
 
 
 def test_a_later_reply_that_repeats_the_block_derives_nothing_for_the_earlier_message(offenv):

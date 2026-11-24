@@ -21,7 +21,6 @@ from agent_comms.providers import Event
 from agent_comms.session_host import PROVIDER_FILE, STATE_FILE, SessionHost
 
 import test_providers_codex as cx
-from test_providers_claude import main_bytes
 from conftest import PROJECT, FakeClock
 from test_claude_transcripts import tool_result, tool_use
 from test_dispatch import FakeChild, FakeProcs, FakeSpawner
@@ -158,7 +157,7 @@ def test_a_turn_is_one_json_line_whatever_the_text_holds(henv):
     henv.host.tick()
     [child] = henv.spawner.children
     assert child.stdin.count(b"\n") == 1 and child.stdin.endswith(b"\n")
-    assert json.loads(main_bytes(child.stdin)) == {"type": "user", "message": {"role": "user", "content": text}}
+    assert json.loads(child.stdin) == {"type": "user", "message": {"role": "user", "content": text}}
 
 
 def test_a_message_is_delivered_only_once_its_bytes_are_written(henv):

@@ -3,7 +3,6 @@ means. The event shapes are the ones Claude Code 2.1.322 wrote in the live check
 cut down to the fields that matter."""
 
 import json
-import re
 
 import pytest
 
@@ -36,17 +35,6 @@ PERMISSION_DENIED = {"type": "system", "subtype": "permission_denied", "tool_nam
 
 def line(event) -> bytes:
     return json.dumps(event).encode()
-
-
-UUID_KEY = re.compile(rb', "uuid": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"\}\n')
-
-
-def main_bytes(data: bytes) -> bytes:
-    """A user line as main (d4b92e5) wrote it: this build's line with its one named change, the `uuid` key it adds
-    last (DESIGN_NOTES "Claude turn correlation"), taken out. Raises when the line does not end in exactly that key."""
-    found = UUID_KEY.findall(data)
-    assert len(found) == 1 and data.endswith(found[0]), data
-    return data[:-len(found[0])] + b"}\n"
 
 
 def session(resume=False, model=None, template=SHIPPED):
@@ -83,10 +71,7 @@ def test_a_turn_is_one_user_line_and_nothing_is_written_on_open():
     assert p.on_open() == [] and p.interrupt() is None and p.waits_for_ready is False
     [data] = p.turn("two\nlines")
     assert data.endswith(b"\n") and data.count(b"\n") == 1
-    assert json.loads(main_bytes(data)) == {"type": "user", "message": {"role": "user", "content": "two\nlines"}}
-    assert main_bytes(data) == b'{"type": "user", "message": {"role": "user", "content": "two\\nlines"}}\n'
-    [again] = p.turn("two\nlines")
-    assert main_bytes(again) == main_bytes(data) and again != data, "the same bytes, a fresh uuid each time"
+    assert json.loads(data) == {"type": "user", "message": {"role": "user", "content": "two\nlines"}}
 
 
 def test_init_makes_the_session_ready_once_and_starts_every_turn():

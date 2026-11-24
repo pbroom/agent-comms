@@ -30,6 +30,9 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
 - A message waits while the provider runs something of its own in the session (`holds_turns`): Codex's own turn,
   or a turn Claude Code started itself in a process the adapter verified (DESIGN_NOTES "Claude turn correlation").
   A turn's frames that the adapter says are no message's (`Event.turn` "other") never settle the turn in flight.
+  For an adapter that asks (`barrier_before_first_byte`: Claude) the wait is rechecked before the FIRST byte of a
+  staged turn on every write; a line already partly written is completed. The wait's clock is per waiting message
+  and per turn of the provider's own (`holding_key`), and it bounds a message waiting for a binding restart too.
 - A provider with a handshake (`waits_for_ready`) gets `handshake_seconds` for it, not the turn timeout.
 - Restart (DESIGN_NOTES "Restarting a running turn"): the caller asks for the turn in flight to be interrupted in-band
   for the message that replaces it (`interrupt_for`); that message itself is the caller's next ordinary message and
@@ -144,6 +147,8 @@ class Session:
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
     held_since: float | None = None     # since when the next message waits for a turn of the provider's own
+    held_for: Any = None                # ... which message, behind which of the provider's own turns (`_held`)
+    turn_at: int | None = None          # where the staged turn starts in `outbuf` while none of it is written
     fresh_start: bool = False           # the provider refused to resume its session: the next process starts a new one
     interrupted_at: float | None = None
     stopping_since: float | None = None
@@ -1022,7 +1027,7 @@ class SessionHost:
         if not stopped:
             self._went_by_itself(s, code, was_ready, was_checking, out)
         self._forget_restart(s)     # nothing is left to interrupt
-        s.held_since = None
+        s.held_since = s.held_for = None
         self._save_state()
 
     LINGER_LOG_SECONDS = 60.0       # how often a process group that outlives its SIGKILL is said again
@@ -1156,16 +1161,25 @@ class SessionHost:
         holds = getattr(s.provider, "holds_turns", None)
         return s.child is not None and holds is not None and bool(holds())
 
-    def _held(self, s: Session, now: float, out: list[HostEvent]) -> bool:
+    def _held(self, s: Session, now: float, out: list[HostEvent], staged: bool = False) -> bool:
         """The provider's session is busy with something of its own (`holds_turns`): the next message waits, for at
-        most the turn timeout. Past that the message fails and the process is stopped (the next one resumes)."""
+        most the turn timeout. Past that the message fails and the process is stopped (the next one resumes). The
+        message is the inbox's first, or (`staged`) the one being written, none of whose bytes reached the process
+        yet. The clock is the waiting message's behind the provider's present turn of its own (`holding_key`): a
+        different message, or another such turn, starts it again, so a message never inherits another's wait."""
         if not self.holding(s):
-            s.held_since = None
+            s.held_since = s.held_for = None
             return False
-        if s.held_since is None:
-            s.held_since = now
+        key = getattr(s.provider, "holding_key", None)
+        held_for = ((s.writing if staged else s.inbox[0]).id, key() if key is not None else None)
+        if s.held_since is None or s.held_for != held_for:
+            s.held_since, s.held_for = now, held_for
         if now - s.held_since >= self.timeout_minutes * 60:
-            s.writing, s.held_since = s.inbox.popleft(), None
+            if staged:
+                s.outbuf.clear()        # none of it was written
+            else:
+                s.writing = s.inbox.popleft()
+            s.held_since = s.held_for = None
             self._fail(s, f"the agent was busy with a turn of its own for {self.timeout_minutes:g} minutes; the "
                           "message was not written", out)
             self._stop(s, now)
@@ -1339,7 +1353,8 @@ class SessionHost:
             # the session has now (or with one it no longer has), also one that came into the inbox during the
             # process's handshake. The process is stopped (not while its provider runs a turn of its own) and the
             # message stays in the inbox for the next one, which gets the binding as it is then.
-            if not self.holding(s):
+            # While its provider runs a turn of its own the message waits, for at most the turn timeout (`_held`).
+            if not self._held(s, now, out):
                 log.info("session %s: its process is restarted to take its binding as it is now", s.session_id)
                 self._stop(s, now)
             return
@@ -1355,6 +1370,7 @@ class SessionHost:
                 # restart). If the provider never got the turn, the resume is refused and that is said out loud.
                 s.resume, s.fresh_start = True, False
                 self._record_provider_id(s.session_id, s.provider_id)
+            s.turn_at = len(s.outbuf)       # none of the turn is written yet
             for data in s.provider.turn(s.writing.text, kind=s.writing.kind):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
@@ -1379,9 +1395,18 @@ class SessionHost:
             self._fail(s, TURN_WITHDRAWN, out)
             self._stop(s, now)
             return
-        if s.outbuf:
+        limit = len(s.outbuf)
+        if (s.writing is not None and s.turn_at is not None
+                and getattr(s.provider, "barrier_before_first_byte", False) and self._held(s, now, out, staged=True)):
+            # The write barrier before the FIRST byte of a staged turn, on every attempt (a pipe that took nothing
+            # before the provider began a turn of its own): the turn waits, the bytes before it still go. A line
+            # already partly written is completed: it cannot be taken back.
+            if s.writing is None:
+                return          # it waited out the turn timeout: failed, never written, the process is stopping
+            limit = s.turn_at
+        if s.outbuf and limit > 0:
             try:
-                n = s.child.write(bytes(s.outbuf))
+                n = s.child.write(bytes(s.outbuf[:limit]))
             except OSError as e:
                 # The process no longer reads. A message that was not fully written never reached it; a turn in
                 # flight (an answer to the process could not be written) is lost with the process. During a
@@ -1395,6 +1420,8 @@ class SessionHost:
                 self._stop(s, now)
                 return
             del s.outbuf[:n]
+            if s.turn_at is not None:
+                s.turn_at = s.turn_at - n if n <= s.turn_at else None     # None: some of the turn is written
             if s.restart_mark is not None:
                 start, length = s.restart_mark
                 s.restart_mark = (start - n, length)    # where its bytes are now; below zero: some are written

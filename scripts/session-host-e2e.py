@@ -71,17 +71,20 @@ S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long tu
 S3/S6. `--mode auto` on the idle session: a turn of its own, written within --max-latency.
 With --claude-bin and --codex-bin those sessions are real (three small turns each).
 Then Claude turn correlation (`--only correlation` runs nothing else; DESIGN_NOTES "Claude turn correlation"), for a
-Claude session of its own agent (its runner may run `sleep`). Every user line the node writes carries a fresh uuid;
-the release gates for attributing a process by that evidence are measured here on the real CLI:
+Claude session of its own agent (its runner may run `sleep`). VERIFIED ships empty, so a node writes no uuid at all;
+for these steps only the node is restarted with the CLI's own version (`claude --version`; the stand-in's
+"2.1.330-stand-in") put in VERIFIED in that node process alone (NODE_VERIFIED), so its lines carry a fresh uuid and
+its processes are attributed by evidence. The release gates are measured here on the real CLI:
 X1. `start --wait`: the line written (the wrapper's stdin log) carries a uuid, and the node's transcript shows the
     turn's `init` echoing it in `user_message_uuids` and its `result` in `user_message_uuid(s)`.
-X2. M3: the node is restarted, so the session's next process is started with `--resume`: its first turn, and a
-    second one, echo their lines' uuids the same way.
+X2. M3: the node is restarted, so the session's next process is started with `--resume` (exactly one new resume):
+    its first turn, and a second one in the SAME process, echo their lines' uuids the same way, and that process's
+    `init` names the expected version and `msg_lifecycle_v1`.
 X3. M7 (in part): a long turn (`sleep 12`) restarted with `--mode restart --wait`: its aborted `result`
     (`aborted_tools`) still echoes the interrupted line's uuid; the restart's message is answered.
-X4. (stand-ins only) VERIFIED ships empty, so a process is still attributed by order exactly as on main: a turn
-    the CLI starts itself (`bg`) right after one turn is taken for the next message's, as before (a measured bug
-    that turn correlation fixes once a version is verified: tests/test_claude_correlation.py).
+X4. (stand-ins only) The fix: a turn the CLI starts itself (`bg`) right after one turn is NOT taken for the next
+    message's; that message gets its own reply. (With VERIFIED empty, as shipped, it would be, exactly as on main:
+    tests/test_claude_correlation.py.)
 With --claude-bin: five small haiku turns.
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
@@ -270,6 +273,15 @@ BYPASS_BY_SETTINGS = {"permissions": {"defaultMode": "bypassPermissions"}}
 WAKE_INTERVAL = 6               # the hub's [dispatch.sessions] wake_min_interval_seconds for this run
 MARKER = "E2E-BODY-MARKER-4c1e9a"
 BODY_WORDS = ("zebra", "quartz", "lantern")
+
+# The turn-correlation steps' node (X1-X4): the node, with VERIFIED set to argv[1] in this process only.
+NODE_VERIFIED = """
+import sys
+from agent_comms.providers import claude
+claude.VERIFIED = frozenset(sys.argv[1].split(","))
+from agent_comms.cli import main
+main(sys.argv[2:])
+"""
 
 # The session's process, wrapped: every stdin line is appended to a log before the real program gets it.
 WRAPPER = """#!{python}
@@ -628,7 +640,9 @@ codex = true
 
     def spawn(self, name: str, home: Path, *argv: str, **extra_env: str) -> subprocess.Popen:
         log = open(self.tmp / "logs" / f"{name}.log", "a")     # a restarted node goes on in the same file
-        proc = subprocess.Popen([sys.executable, "-m", "agent_comms.cli", *argv], cwd=str(self.tmp), stdout=log,
+        verified = getattr(self, "node_verified", None) if name == "node" else None
+        start = ["-c", NODE_VERIFIED, ",".join(sorted(verified))] if verified else ["-m", "agent_comms.cli"]
+        proc = subprocess.Popen([sys.executable, *start, *argv], cwd=str(self.tmp), stdout=log,
                                 stderr=subprocess.STDOUT, env=self.env | {"AGENT_COMMS_HOME": str(home)} | extra_env)
         self.procs.append((name, proc))
         return proc
@@ -1126,14 +1140,18 @@ codex = true
             f.get("user_message_uuid") == u or u in (f.get("user_message_uuids") or []))]
         return u, inits, results
 
-    def check_echo(self, sid: str, text: str, what: str) -> dict:
+    def check_echo(self, sid: str, text: str, what: str) -> tuple[dict, dict]:
         u, inits, results = self.echoed(sid, text)
         version = next((f.get("claude_code_version") for f in inits), None)
         print(f"  line uuid {u}; init echoes: {len(inits)}; result echoes: {len(results)}; version {version}")
         self.check(isinstance(u, str) and len(u) == 36, f"{what}: the line written carries a uuid")
         self.check(len(inits) == 1 and len(results) == 1,
                    f"{what}: its init lists it in user_message_uuids and its result in user_message_uuid(s)")
-        return results[0]
+        return inits[0], results[0]
+
+    def resumes(self, sid: str) -> int:
+        starts = [json.loads(x) for x in Path(str(self.stdin_log) + ".argv").read_text().splitlines()]
+        return sum(1 for a in starts if sid in a and "--resume" in a)
 
     def correlation_scenario(self) -> None:
         """X1-X4 (the module text)."""
@@ -1142,6 +1160,15 @@ codex = true
         words = {k: (f"Reply with exactly the word: {k}" if real else k) for k in ("alpha", "beta", "gamma", "kiwi")}
         long = ("Run this exact shell command once, with your shell or Bash tool, and nothing else first: `sleep 12`. "
                 "When it has finished, reply with exactly the word: done") if real else "sleep 12 for the restart"
+
+        if real:
+            version = subprocess.run([self.args.claude_bin, "--version"], capture_output=True, text=True,
+                                     timeout=60).stdout.split()[0]
+        else:
+            version = "2.1.330-stand-in"
+        print(f"\n[X0] the node restarted with {version} in VERIFIED (in that node process only)")
+        self.node_verified = {version}
+        self.restart_node()
 
         print("\n[X1] a Claude session: the line carries a uuid; the turn's init and result echo it")
         out, _, _ = self.board("session", "start", str(self.project), words["alpha"], "--agent", CORR_AGENT, *model,
@@ -1153,17 +1180,23 @@ codex = true
         self.check_echo(sid, words["alpha"], "the first turn")
 
         print("\n[X2] M3: the node is restarted; the session's next process resumes it, and its turns echo")
-        before = self.show(sid)["pid"]
+        before, resumes = self.show(sid)["pid"], self.resumes(sid)
         self.restart_node()
         out, _, _ = self.board("session", "send", sid, words["beta"], "--wait")
-        starts = [json.loads(x) for x in Path(str(self.stdin_log) + ".argv").read_text().splitlines()]
-        resumed = [a for a in starts if sid in a and "--resume" in a]
-        self.check(bool(resumed) and self.show(sid)["pid"] != before,
-                   "the turn ran in a new process started with --resume")
+        pid = self.show(sid)["pid"]
+        self.check(self.resumes(sid) == resumes + 1 and pid != before and alive(pid),
+                   "the turn ran in ONE new process, started with --resume")
         self.check("beta" in out.lower(), "the resumed process's first turn was answered")
-        self.check_echo(sid, words["beta"], "M3, a resumed process's first turn")
-        out, _, _ = self.board("session", "send", sid, words["gamma"], "--wait")
-        self.check_echo(sid, words["gamma"], "M3, the resumed process's second turn")
+        for word, what in (("beta", "first"), ("gamma", "second")):
+            if word == "gamma":
+                out, _, _ = self.board("session", "send", sid, words["gamma"], "--wait")
+                self.check("gamma" in out.lower(), "the resumed process's second turn was answered")
+            init, _ = self.check_echo(sid, words[word], f"M3, the resumed process's {what} turn")
+            self.check(init.get("claude_code_version") == version
+                       and "msg_lifecycle_v1" in (init.get("capabilities") or []),
+                       f"... its init names {version} and msg_lifecycle_v1")
+        self.check(self.show(sid)["pid"] == pid and self.resumes(sid) == resumes + 1,
+                   f"both turns ran in the same resumed process (pid {pid}), and no other was started")
 
         print("\n[X3] M7: a long turn restarted in-band; its aborted result echoes the interrupted line")
         self.board("session", "send", sid, long)
@@ -1179,19 +1212,18 @@ codex = true
         old = next(x for x in self.show(sid)["messages"] if x["n"] == n)
         self.check(old["state"] == "failed" and old.get("restarted_by") == n + 1,
                    "the long turn was interrupted by the restart, as the provider said")
-        aborted = self.check_echo(sid, long, "M7, an interrupted turn")
+        _, aborted = self.check_echo(sid, long, "M7, an interrupted turn")
         self.check(aborted.get("terminal_reason") == "aborted_tools" and aborted.get("is_error") is True,
                    "... and that result is the abort (error_during_execution, aborted_tools)")
         self.check("kiwi" in (data["reply"] or "").lower(), "the restart's message was answered")
         self.check_echo(sid, words["kiwi"], "the restart's message")
 
         if not real:
-            print("\n[X4] VERIFIED is empty: a turn the CLI starts itself is still attributed by order, as on main")
+            print("\n[X4] a turn the CLI starts itself right after a turn is no message's")
             self.board("session", "send", sid, "bg 2 1 one", "--wait")
             out, _, _ = self.board("session", "send", sid, "two", "--wait")
-            self.check(out.strip() == "background: FINISHED",
-                       "the CLI's own turn was taken for the next message's, exactly as main does (no version is "
-                       "verified yet)")
+            self.check(out.strip().endswith(": TWO"),
+                       f"the next message got its own reply ({out.strip()!r}), not the CLI's own turn's")
         self.board("session", "close", sid)
         deadline = time.monotonic() + 20
         while self.show(sid)["state"] != "ended" and time.monotonic() < deadline:

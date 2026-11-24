@@ -1,15 +1,17 @@
 """Claude turn correlation (DESIGN_NOTES "Claude turn correlation (2026-11-24)"; the steering design on branch
-claude/steer-loose, its part C, step 1): every host user line carries a fresh uuid, and in a VERIFIED process
-incarnation the adapter attributes each `init` and `result` by the evidence it carries (the bracket table), not by
-order. VERIFIED ships empty, so every real Claude process today is attributed by order, as on main.
+claude/steer-loose, its part C, step 1, with the review's rule changes): while some Claude Code version is VERIFIED,
+host user lines carry a fresh uuid, and in a verified process incarnation the adapter attributes each `init` and
+`result` by the evidence it carries (the bracket table), not by order. VERIFIED ships empty, so every real Claude
+process today gets main's bytes and is attributed by order, as on main.
 
-The frames are the shapes Claude Code 2.1.330 was measured to write (the steering design's part B): an owned `init`
-lists the line's uuid in `user_message_uuids`; an owned `result` in `user_message_uuid` and `user_message_uuids` and
-has no `origin`; a turn the CLI started itself has an `init` with no echo and a `result` with no echo, `num_turns` 1
-and `origin.kind` `task-notification`. Adapter rows from strings, the host with fake processes (test_session_host),
-and the stand-in (tests/stand_in_claude.py) through real pipes. Never a real agent CLI."""
+The frames are the shapes Claude Code 2.1.330 was measured to write (the steering design's part B and this change's
+probes): an owned `init` lists the line's uuid in `user_message_uuids`; an owned `result` in `user_message_uuid` and
+`user_message_uuids` and has no `origin`; a turn the CLI started itself has an `init` with no echo and a `result` with
+no echo, `num_turns` 1 and `origin.kind` `task-notification`. Adapter rows from strings, the host with fake processes
+(test_session_host), and the stand-in (tests/stand_in_claude.py) through real pipes. Never a real agent CLI."""
 
 import json
+import re
 import time
 
 import pytest
@@ -24,6 +26,7 @@ from test_session_host import ROOT, SID, henv, open_session, real_host, result  
 V = "2.1.330"                                       # the version the tests verify (VERIFIED itself ships empty)
 CAPS = ["msg_lifecycle_v1", "interrupt_receipt_v1"]
 NOTIFY = {"kind": "task-notification", "producer": "session-task"}
+UUID_KEY = re.compile(rb', "uuid": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"\}\n$')
 
 
 @pytest.fixture
@@ -32,39 +35,47 @@ def verified(monkeypatch):
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
 
 
-# ------------------------------------------------------------ frames (the steering design's part B)
+# ------------------------------------------------------------ frames
 
 
 def vinit(*uuids, version=V, caps=CAPS, mode="dontAsk") -> dict:
     """An `init`: owned when it lists uuids, unmarked (no `user_message_uuids` key at all, as measured) when not."""
-    ev = {"type": "system", "subtype": "init", "session_id": SID, "permissionMode": mode, "tools": ["Read"],
-          "claude_code_version": version, "capabilities": list(caps)}
+    ev = {"type": "system", "subtype": "init", "session_id": SID, "permissionMode": mode, "tools": ["Read"]}
+    ev |= ({"claude_code_version": version} if version is not None else {})
+    ev |= ({"capabilities": list(caps)} if caps is not None else {})
     return ev | ({"user_message_uuids": list(uuids)} if uuids else {})
 
 
-def owned(*uuids, **kw) -> dict:
-    """An owned `result`: it echoes these lines (the first is the turn's own)."""
-    return result(**kw) | {"user_message_uuid": uuids[0], "user_message_uuids": list(uuids)}
+def owned(*uuids, field=None, **kw) -> dict:
+    """An owned `result` echoing these lines (the first is the turn's own); `field`: only that one echo field."""
+    echo = {"user_message_uuid": uuids[0], "user_message_uuids": list(uuids)}
+    return result(**kw) | (echo if field is None else {field: echo[field]})
 
 
 def plain(**kw) -> dict:
-    """A `result` with no evidence: no echo, no origin (what main's lines got, and a deviation in a verified one)."""
+    """A `result` with no evidence: no echo, no origin."""
     return result(**kw)
 
 
-def foreign(text="background: FINISHED") -> dict:
+def failed(**kw) -> dict:
+    """A plain error `result` (what a turn that failed on its own might write with no echo)."""
+    return result(subtype="error_during_execution", is_error=True, text="", **kw)
+
+
+def foreign(text="background: FINISHED", error=False) -> dict:
     """The `result` of a turn the CLI started itself (bg-late, measured): no echo, num_turns 1, a notification."""
-    return result(text=text) | {"origin": NOTIFY}
+    return result(text=text, subtype="error_during_execution" if error else "success", is_error=error) | {
+        "origin": NOTIFY}
 
 
 def nonturn(error=False) -> dict:
-    """A zero-turn task notification's `result`: no echo, num_turns 0, a notification origin; a success or an error."""
+    """A zero-turn task notification's `result`: no echo, num_turns 0, a notification origin."""
     return result(subtype="error_during_execution" if error else "success", is_error=error, text="") | {
         "num_turns": 0, "origin": NOTIFY}
 
 
 def refusal() -> dict:
-    """What a refused `--resume` writes before any `init` (an error, num_turns 0)."""
+    """What a refused `--resume` writes before any `init` (measured on 2.1.330: an error, num_turns 0, no echo)."""
     return {"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 0,
             "session_id": SID, "permission_denials": [], "errors": [f"No conversation found with session ID: {SID}"]}
 
@@ -84,31 +95,36 @@ def adapter() -> ClaudeSession:
     return p
 
 
-def write(p, text="go") -> str:
-    """The host writes a turn: its uuid."""
+def write(p, text="go") -> str | None:
+    """The host writes a turn: its uuid (None: the line has none)."""
     [data] = p.turn(text)
-    return json.loads(data)["uuid"]
+    return json.loads(data).get("uuid")
+
+
+def raw(p, ev) -> tuple[list, list]:
+    return p.feed(json.dumps(ev).encode())
 
 
 def fed(p, ev) -> list[tuple[str, str]]:
-    """(kind, turn) of the turn events one line means."""
-    events, _ = p.feed(json.dumps(ev).encode())
-    return [(e.kind, e.turn) for e in events if e.kind in ("turn_started", "turn_ended")]
+    """(kind, turn) of every event one line means (nothing filtered out)."""
+    events, replies = raw(p, ev)
+    assert replies == []
+    return [(e.kind, e.turn) for e in events]
 
 
 def idle_verified() -> ClaudeSession:
     """A verified process after one ordinary turn: no bracket open, no turn in flight."""
     p = adapter()
     m0 = write(p)
-    assert fed(p, vinit(m0)) == [("turn_started", "own")] and p.verified
+    assert fed(p, vinit(m0)) == [("ready", "order"), ("turn_started", "own")] and p.verified
     assert fed(p, owned(m0)) == [("turn_ended", "own")]
     return p
 
 
-def bracket(state: str):
-    """(adapter, M's uuid) with M written and the bracket in this state: none, own (M's) or unattributed."""
+def bracket(state: str, written=True):
+    """(adapter, M's uuid or None) with M written (unless not `written`) and the bracket in this state."""
     p = idle_verified()
-    m = write(p)
+    m = write(p) if written else None
     if state == "own":
         fed(p, vinit(m))
     elif state == "unattributed":
@@ -117,76 +133,105 @@ def bracket(state: str):
     return p, m
 
 
-def test_verified_ships_empty_so_every_real_process_is_attributed_by_order():
-    assert claude.VERIFIED == frozenset(), "a version goes in only once M3, M6 and M7 passed on it"
+def settled_uuid(p, m):
+    [old] = list(p._written - {m})
+    return old
+
+
+# --- C1-05: a uuid only while verification is possible
+
+
+def test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order():
+    assert claude.VERIFIED == frozenset(), "a version goes in only once its release gates passed"
     p = adapter()
-    m = write(p)
-    assert fed(p, vinit()) == [("turn_started", "order")], "an unmarked init: by order, as on main"
+    assert p.turn("hello\nthere") == [b'{"type": "user", "message": {"role": "user", "content": "hello\\nthere"}}\n']
+    assert fed(p, vinit()) == [("ready", "order"), ("turn_started", "order")]
     assert fed(p, foreign()) == [("turn_ended", "order")], "a foreign result: by order, as on main (the old bug)"
-    assert not p.verified and p.holds_turns() is False
-    assert fed(p, vinit(m)) == [("turn_started", "order")] and fed(p, nonturn()) == [("turn_ended", "order")]
+    assert write(p) is None and not p.verified and p.holds_turns() is False
 
 
-def test_every_user_line_carries_a_fresh_random_uuid_and_the_same_content_bytes():
-    from test_providers_claude import main_bytes
+@pytest.mark.usefixtures("verified")
+def test_lines_carry_a_fresh_uuid_until_the_first_init_shows_the_process_cannot_be_verified():
     p = adapter()
     a, b = p.turn("same"), p.turn("same")
-    assert main_bytes(a[0]) == main_bytes(b[0]) == b'{"type": "user", "message": {"role": "user", "content": "same"}}\n'
-    ids = [json.loads(x[0])["uuid"] for x in (a, b)]
-    assert ids[0] != ids[1] and all(len(u) == 36 and u[14] == "4" for u in ids)
+    for data in (a[0], b[0]):
+        assert UUID_KEY.search(data) and data[:-len(UUID_KEY.search(data).group(0))] + b"}\n" == (
+            b'{"type": "user", "message": {"role": "user", "content": "same"}}\n')
+    assert json.loads(a[0])["uuid"] != json.loads(b[0])["uuid"]
+    fed(p, vinit(version="2.1.999"))
+    assert write(p) is None, "this incarnation cannot be verified: main's bytes from now on"
+    q = idle_verified()
+    assert write(q) is not None
+    fed(q, plain())                         # a deviation
+    assert write(q) is None, "nor after verification is lost"
 
 
 def test_the_uuid_does_not_come_from_uuid4(monkeypatch):
-    """tests/golden_schema_free.py makes uuid4 (and token_hex) deterministic from one counter: a line's uuid must
-    not draw from it, or every id after it in the recording would shift."""
+    """tests/golden_schema_free.py makes uuid4 (and token_hex) deterministic from one counter."""
     import uuid
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
     monkeypatch.setattr(uuid, "uuid4", lambda: (_ for _ in ()).throw(AssertionError("uuid4 called")))
-    write(adapter())
+    assert write(adapter()) is not None
+
+
+# --- the gate
 
 
 @pytest.mark.usefixtures("verified")
 def test_the_gate_is_a_verified_version_that_lists_msg_lifecycle_in_its_first_init():
     for init in (vinit(version="2.1.331"), vinit(caps=["interrupt_receipt_v1"]), vinit(version=None)):
         p = adapter()
-        write(p)
-        assert fed(p, init) == [("turn_started", "order")] and not p.verified
+        m = write(p)
+        assert fed(p, init)[-1] == ("turn_started", "order") and not p.verified
+        # Pinned: a qualifying init after a bad first one changes nothing.
+        assert fed(p, vinit(m)) == [("turn_started", "order")] and not p.verified
     p = adapter()
     write(p)
-    assert fed(p, vinit()) == [("turn_started", "other")] and p.verified
+    assert fed(p, vinit())[-1] == ("turn_started", "other") and p.verified
 
 
 @pytest.mark.usefixtures("verified")
 def test_verification_is_lost_for_good_at_the_first_deviation_and_a_new_process_is_asked_again():
     p, m = bracket("none")
-    assert fed(p, plain()) == [("turn_ended", "order")], "none | plain while M in flight: by order"
-    assert not p.verified and p.deviation
-    m2 = write(p)
-    assert fed(p, vinit()) == [("turn_started", "order")] and fed(p, owned(m2)) == [("turn_ended", "order")]
-    assert not p.verified, "never again in this incarnation, whatever its frames show"
+    assert fed(p, plain()) == [("turn_ended", "order")] and not p.verified and p.deviation
+    write(p)
+    assert fed(p, vinit()) == [("turn_started", "order")] and fed(p, foreign()) == [("turn_ended", "order")]
+    assert not p.verified
     p.argv(["claude", "-p", "{prompt}"], session_id=SID, resume=True, model=None)     # the next process
     m3 = write(p)
-    assert fed(p, vinit(m3)) == [("turn_started", "own")] and p.verified
+    assert fed(p, vinit(m3))[-1] == ("turn_started", "own") and p.verified
 
 
 @pytest.mark.usefixtures("verified")
-def test_an_init_that_no_longer_qualifies_is_a_deviation():
+@pytest.mark.parametrize("field", ["user_message_uuid", "user_message_uuids"])
+def test_each_echo_field_alone_is_evidence_with_m_after_an_older_uuid(field):
     p, m = bracket("own")
-    assert fed(p, vinit(version="2.1.999")) == [("turn_started", "order")] and not p.verified
+    old = settled_uuid(p, m)
+    ev = result() | ({field: m} if field == "user_message_uuid" else {field: [old, m]})
+    assert fed(p, ev) == [("turn_ended", "own")] and p.verified
+    q, m2 = bracket("none")
+    assert fed(q, vinit(settled_uuid(q, m2), m2))[-1] == ("turn_started", "own"), "M after an older uuid"
 
 
-# --- the bracket table, row by row (the steering design's C; named in DESIGN_NOTES' mutation table)
+# --- the bracket table, row by row
 
 
 @pytest.mark.usefixtures("verified")
 @pytest.mark.parametrize("state", ["none", "own", "unattributed"])
-@pytest.mark.parametrize("error", [False, True])
-def test_row_any_non_turn_is_inert_in_every_bracket(state, error):
-    """Any bracket | non-turn: nothing. The zero-turn ERROR result as well as the empty successful notification
-    (the condition for code review, part O)."""
+def test_row_any_non_turn_success_is_inert_in_every_bracket(state):
     p, m = bracket(state)
     before = (p._bracket, p._current, p.holds_turns())
-    assert fed(p, nonturn(error)) == []
+    assert raw(p, nonturn()) == ([], [])
     assert (p._bracket, p._current, p.holds_turns()) == before and p.verified
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("state", ["none", "unattributed"])
+def test_row_any_non_turn_error_with_nothing_in_flight_is_inert(state):
+    """The non-turn predicate against a zero-turn ERROR result (part O): inert when nothing is in flight."""
+    p, _ = bracket(state, written=False)
+    before = (p._bracket, p.holds_turns())
+    assert raw(p, nonturn(error=True)) == ([], []) and (p._bracket, p.holds_turns()) == before and p.verified
 
 
 @pytest.mark.usefixtures("verified")
@@ -198,22 +243,35 @@ def test_row_none_owned_init_for_m_opens_ms_owned_bracket():
 @pytest.mark.usefixtures("verified")
 @pytest.mark.parametrize("m_written", [True, False])
 def test_row_none_unmarked_init_opens_an_unattributed_bracket_and_the_barrier_holds(m_written):
-    p = idle_verified()
-    if m_written:
-        write(p)
+    p, _ = bracket("none", written=m_written)
     assert fed(p, vinit()) == [("turn_started", "other")]
     assert p._bracket == UNATTRIBUTED and p.holds_turns() is True
 
 
 @pytest.mark.usefixtures("verified")
-@pytest.mark.parametrize("which", ["m", "unmarked", "other"])
-def test_row_owned_a_second_init_never_replaces_the_bracket(which):
+@pytest.mark.parametrize("state", ["none", "unattributed"])
+def test_row_an_init_listing_only_settled_lines_changes_no_bracket(state):
+    """C1-03: a late init[A] after A settled opens no barrier against B, and closes none."""
+    p, m = bracket(state)
+    before = (p._bracket, p.holds_turns(), p._brackets)
+    assert fed(p, vinit(settled_uuid(p, m))) == [("turn_started", "other")]
+    assert (p._bracket, p.holds_turns(), p._brackets) == before and p.verified
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("which", ["m", "unmarked", "settled", "no_version", "no_caps", "other_version"])
+def test_row_owned_a_second_init_is_access_checked_only(which):
+    """C1-04: inside M's owned bracket a re-init never replaces the bracket, never starts M again and replaces no
+    capability, whatever it carries; one that no longer qualifies downgrades the process when the bracket closes."""
     p, m = bracket("own")
-    others = list(p._written - {m})
-    init = {"m": vinit(m), "unmarked": vinit(), "other": vinit(others[0])}[which]
+    init = {"m": vinit(m), "unmarked": vinit(), "settled": vinit(settled_uuid(p, m)), "no_version": vinit(version=None),
+            "no_caps": vinit(caps=None), "other_version": vinit(m, version="2.1.999")}[which]
     assert fed(p, init) == [("turn_started", "other")]
-    assert p._bracket == OWN and p._current == m
-    assert p._competing is (which != "m"), "a competing init is noted (the steering design's F-4)"
+    assert p._bracket == OWN and p._current == m and p.verified and p.restarts and p.takes_interrupt()
+    assert p._competing is (which not in ("m", "other_version"))
+    assert fed(p, foreign()) == [("turn_ended", "other")], "a foreign result still settles nothing"
+    assert fed(p, owned(m)) == [("turn_ended", "own")]
+    assert p.verified is (which in ("m", "unmarked", "settled")), "the downgrade comes only once the bracket closed"
 
 
 @pytest.mark.usefixtures("verified")
@@ -235,13 +293,13 @@ def test_row_owned_foreign_result_is_nothing_and_the_bracket_stays_ms():
 
 
 @pytest.mark.usefixtures("verified")
-def test_row_owned_result_listing_only_other_host_uuids_is_nothing():
-    """Also where a result listing only a steer S written into M's bracket would go (F-4's case, the steering
-    design's D): no steer is written in this build, and the seam says so."""
-    p, m = bracket("own")
-    [other] = list(p._written - {m})
-    assert p._steer_only(owned(other)) is False
-    assert fed(p, owned(other)) == [("turn_ended", "other")] and p._bracket == OWN and p._current == m
+@pytest.mark.parametrize("state", ["none", "own", "unattributed"])
+def test_row_a_result_listing_only_settled_lines_changes_no_bracket(state):
+    """C1-03: a late result[A] does not close a live CLI-started bracket (nor M's): logged, no message's."""
+    p, m = bracket(state)
+    before = (p._bracket, p.holds_turns(), p._current)
+    assert fed(p, owned(settled_uuid(p, m))) == [("turn_ended", "other")]
+    assert (p._bracket, p.holds_turns(), p._current) == before and p.verified
 
 
 @pytest.mark.usefixtures("verified")
@@ -259,12 +317,15 @@ def test_row_unattributed_owned_result_listing_m_is_ms():
 
 
 @pytest.mark.usefixtures("verified")
+def test_row_unattributed_owned_init_for_m_makes_the_bracket_ms():
+    p, m = bracket("unattributed")
+    assert fed(p, vinit(m)) == [("turn_started", "own")] and p._bracket == OWN and p._competing
+
+
+@pytest.mark.usefixtures("verified")
 @pytest.mark.parametrize("m_written", [True, False])
 def test_row_unattributed_plain_result_is_a_deviation_by_order(m_written):
-    p = idle_verified()
-    if m_written:
-        write(p)
-    fed(p, vinit())
+    p, _ = bracket("unattributed", written=m_written)
     assert fed(p, plain()) == [("turn_ended", "order")], "the host's turn in flight if any (as main), else logged"
     assert not p.verified and p.deviation and not p.holds_turns()
 
@@ -282,6 +343,12 @@ def test_row_none_plain_result_with_m_in_flight_is_ms_by_order_and_a_deviation()
 
 
 @pytest.mark.usefixtures("verified")
+def test_row_none_plain_result_with_nothing_in_flight_is_a_deviation():
+    p, _ = bracket("none", written=False)
+    assert fed(p, plain()) == [("turn_ended", "order")] and not p.verified, "by order: only logged, as main"
+
+
+@pytest.mark.usefixtures("verified")
 def test_row_none_foreign_result_is_the_clis_own():
     p, m = bracket("none")
     assert fed(p, foreign()) == [("turn_ended", "other")] and p.verified and p._current == m
@@ -291,8 +358,36 @@ def test_row_none_foreign_result_is_the_clis_own():
 def test_row_before_any_init_a_launch_refusal_fails_the_message_as_today():
     p = adapter()
     write(p)
-    [ev], _ = p.feed(json.dumps(refusal()).encode())
+    [ev], _ = raw(p, refusal())
     assert (ev.kind, ev.turn, ev.ok, ev.answered) == ("turn_ended", "order", False, True)
+
+
+# --- rule 10 (the review's departure from C): an error result that does not list M, while M is in flight
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("state", ["none", "own", "unattributed"])
+@pytest.mark.parametrize("frame", ["plain", "zero_turn", "foreign", "settled"])
+def test_rule_an_error_result_not_listing_m_while_m_is_in_flight_is_ms_by_order(state, frame):
+    """Before the non-turn and foreign classes, in every bracket: M's by order, exactly as main settles it, and the
+    incarnation is attributed by order from then on."""
+    p, m = bracket(state)
+    ev = {"plain": failed(), "zero_turn": nonturn(error=True), "foreign": foreign(error=True),
+          "settled": owned(settled_uuid(p, m), subtype="error_during_execution", is_error=True)}[frame]
+    assert fed(p, ev) == [("turn_ended", "order")]
+    assert not p.verified and p.deviation and not p.holds_turns() and p._current is None
+
+
+@pytest.mark.usefixtures("verified")
+def test_rule_an_error_with_nothing_in_flight_settles_nothing_as_before():
+    p, _ = bracket("unattributed", written=False)
+    assert fed(p, foreign(error=True)) == [("turn_ended", "other")] and p.verified and not p.holds_turns()
+
+
+@pytest.mark.usefixtures("verified")
+def test_rule_an_interrupts_aborted_result_lists_its_line_and_is_ms_by_evidence():
+    p, m = bracket("own")
+    assert fed(p, aborted(m)) == [("turn_ended", "own")] and p.verified
 
 
 @pytest.mark.usefixtures("verified")
@@ -303,19 +398,32 @@ def test_interrupt_readiness_needs_ms_owned_bracket():
     assert not p.takes_interrupt()
     fed(p, vinit(m))
     assert p.takes_interrupt()
-    # Unverified (as main): any init of the turn makes it ready.
-    q = adapter()
+    q = adapter()                       # unverified (as main): any init of the turn makes it ready
     write(q)
-    q.feed(json.dumps(vinit(version="9")).encode())
+    raw(q, vinit(version="9"))
     assert q.takes_interrupt()
+
+
+def test_lifecycle_and_replayed_user_lines_mean_nothing_to_the_adapter(monkeypatch):
+    """The real CLI writes `command_lifecycle` lines for lines with a uuid, and with --replay-user-messages each line
+    back as a `user` frame (`isReplay`, measured): no event, no reply, in either kind of process."""
+    for verified in (frozenset(), frozenset({V})):
+        monkeypatch.setattr(claude, "VERIFIED", verified)
+        p = adapter()
+        u = write(p) or "1e64c1ac-3dc2-45ff-bad6-ee954a1892a1"
+        for state in ("queued", "started", "completed", "cancelled"):
+            assert raw(p, {"type": "command_lifecycle", "command_uuid": u, "state": state, "session_id": SID,
+                           "uuid": "0d1d6a3c-7f61-4b47-9c8e-2a1b3c4d5e6f"}) == ([], [])
+        assert raw(p, {"type": "user", "message": {"role": "user", "content": "go"}, "isReplay": True,
+                       "parent_tool_use_id": None, "session_id": SID, "uuid": u}) == ([], [])
 
 
 # ------------------------------------------------------------ the host, with fake processes
 
 
-def uuid_of(child, k=-1) -> str:
+def uuid_of(child, k=-1) -> str | None:
     users = [json.loads(x) for x in child.stdin.split(b"\n") if x and json.loads(x).get("type") == "user"]
-    return users[k]["uuid"]
+    return users[k].get("uuid")
 
 
 def emit(henv, child, *events):
@@ -344,7 +452,7 @@ def ends(events, mid):
     return [e for e in events if e.kind == "turn_ended" and e.message_id == mid]
 
 
-# --- the 11 ordinary sequences the steering design's C checks, each settling M once with none stranded
+# --- the ordinary sequences part C checks, each settling M once with none stranded, and rule 10's
 
 
 @pytest.mark.usefixtures("verified")
@@ -358,23 +466,60 @@ def test_seq_owned_init_then_owned_result(henv):
 
 
 @pytest.mark.usefixtures("verified")
-def test_seq_owned_init_then_a_plain_failure_result(henv):
+def test_seq_owned_init_then_a_plain_failure_result_is_ms(henv):
+    """Rule 10 applies too (an error not listing M): M's by order, the same outcome; by order from then on."""
     s, child = idle_host(henv)
     _, _, m = started(henv)
     child.emit(vinit(m), plain(subtype="error_during_execution", is_error=True, text="broke"))
     [st, end] = henv.host.tick()
-    assert (end.message_id, end.ok, end.text, end.answered) == ("1", False, "broke", True) and s.provider.verified
+    assert (end.message_id, end.ok, end.text, end.answered) == ("1", False, "broke", True)
+    assert not s.provider.verified
 
 
 @pytest.mark.usefixtures("verified")
-@pytest.mark.parametrize("error", [False, True])
-def test_seq_owned_init_a_zero_turn_notification_then_owned_result(henv, error):
+def test_seq_owned_init_a_zero_turn_notification_then_owned_result(henv):
     s, child = idle_host(henv)
     _, _, m = started(henv)
-    assert emit(henv, child, vinit(m), nonturn(error)) == [("turn_started", "1")]
+    assert emit(henv, child, vinit(m), nonturn()) == [("turn_started", "1")]
     child.emit(owned(m, text="mine"))
     [end] = henv.host.tick()
     assert (end.kind, end.message_id, end.text) == ("turn_ended", "1", "mine")
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("frame", ["zero_turn_error", "foreign_error"])
+def test_seq_owned_bracket_then_an_error_that_does_not_list_m_settles_m_at_once(henv, frame):
+    s, child = idle_host(henv)
+    _, _, m = started(henv)
+    child.emit(vinit(m), nonturn(error=True) if frame == "zero_turn_error" else foreign(error=True))
+    evs = henv.host.tick()
+    assert [(e.kind, e.message_id, e.ok) for e in evs] == [("turn_started", "1", None), ("turn_ended", "1", False)]
+    assert not s.busy and not s.provider.verified
+
+
+@pytest.mark.usefixtures("verified")
+def test_seq_unattributed_bracket_then_an_error_result_with_m_in_flight(henv):
+    """Sol's case: a CLI-started turn consumed M and failed terminally without M's uuid, keeping its notification
+    origin: M settles at once with that failure, as on main, and the next message proceeds."""
+    s, child = idle_host(henv)
+    _, _, m = started(henv)
+    assert emit(henv, child, vinit()) == []
+    henv.host.send(SID, "next", message_id="2")
+    child.emit(foreign(error=True, text="usage limit reached"))
+    evs = henv.host.tick()
+    assert [(e.kind, e.message_id) for e in evs] == [("turn_ended", "1"), ("delivered", "2")]
+    assert (ends(evs, "1")[0].ok, ends(evs, "1")[0].text) == (False, "usage limit reached")
+    assert not s.provider.verified
+
+
+@pytest.mark.usefixtures("verified")
+def test_seq_an_error_result_with_nothing_in_flight_settles_nothing(henv):
+    s, child = idle_host(henv)
+    assert emit(henv, child, vinit(), foreign(error=True)) == []
+    assert emit(henv, child, nonturn(error=True)) == [] and s.provider.verified
+    _, _, m = started(henv)
+    child.emit(vinit(m), owned(m, text="mine"))
+    assert [e.text for e in henv.host.tick() if e.kind == "turn_ended"] == ["mine"]
 
 
 @pytest.mark.usefixtures("verified")
@@ -402,24 +547,23 @@ def test_seq_an_unattributed_turn_before_ms_own_pair(henv):
 
 
 def test_seq_unverified_an_unattributed_turn_before_ms_own_pair_is_mains(henv):
-    """VERIFIED empty: the same frames are attributed by order, exactly as on main (the CLI's frames taken for M,
-    M's own result dropped)."""
-    s, child, _ = started(henv, "zero", "0")
+    """VERIFIED empty: the same frames are attributed by order, exactly as on main."""
+    s, child, m0 = started(henv, "zero", "0")
+    assert m0 is None
     emit(henv, child, vinit(), plain())
-    _, _, m = started(henv)
-    evs = []
+    started(henv)
     child.emit(vinit(), foreign())
-    evs += henv.host.tick()
+    evs = henv.host.tick()
     assert [(e.kind, e.message_id) for e in evs] == [("turn_started", "1"), ("turn_ended", "1")]
     assert ends(evs, "1")[0].text == "background: FINISHED", "main's behaviour, unchanged while VERIFIED is empty"
-    child.emit(vinit(m), owned(m, text="mine"))
+    child.emit(vinit(), plain(text="mine"))
     assert henv.host.tick() == []
 
 
 @pytest.mark.usefixtures("verified")
 def test_seq_unmarked_init_then_plain_result_with_m_in_flight_lost_echoes(henv):
     s, child = idle_host(henv)
-    _, _, m = started(henv)
+    started(henv)
     child.emit(vinit(), plain(text="whose"))
     [end] = henv.host.tick()
     assert (end.kind, end.message_id, end.text) == ("turn_ended", "1", "whose"), "by order, as main"
@@ -457,6 +601,7 @@ def test_seq_an_interrupt_owned_init_then_aborted_owned_result(henv):
                                                          "response": {"still_queued": []}}}, aborted(m))
     [end] = henv.host.tick()
     assert (end.message_id, end.restarted_by, end.detail) == ("1", "2", INTERRUPTED.format(n="2"))
+    assert s.provider.verified, "an aborted result lists its line: unaffected by rule 10"
 
 
 @pytest.mark.usefixtures("verified")
@@ -481,9 +626,8 @@ def test_seq_a_zero_turn_notification_with_nothing_open(henv):
 
 @pytest.mark.usefixtures("verified")
 def test_review_condition_unattributed_init_then_owned_init_then_plain_result(henv):
-    """Part O (R6-04): an unmarked init, then M's own init, then a plain result: the evidence makes the bracket M's
-    (an unattributed bracket is no owned one, so it is not 'never replaced'); the competing init is noted; the plain
-    result is M's, settled once; the incarnation stays verified (a plain result in an owned bracket is no deviation)."""
+    """Part O (R6-04): an unmarked init, then M's own init, then a plain result: the evidence makes the bracket M's;
+    the competing init is noted; the plain result is M's, settled once; no deviation."""
     s, child = idle_host(henv)
     _, _, m = started(henv)
     assert emit(henv, child, vinit()) == []
@@ -496,7 +640,25 @@ def test_review_condition_unattributed_init_then_owned_init_then_plain_result(he
     assert henv.host.tick() == []
 
 
-# --- the barrier, the access check, interrupt readiness
+@pytest.mark.usefixtures("verified")
+def test_a_late_init_of_a_settled_line_opens_no_barrier_against_the_next_message(henv):
+    s, child, a = started(henv, "a", "a")
+    emit(henv, child, vinit(a), owned(a))
+    assert emit(henv, child, vinit(a)) == []
+    henv.host.send(SID, "b", message_id="b")
+    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "b")]
+
+
+@pytest.mark.usefixtures("verified")
+def test_a_late_result_of_a_settled_line_does_not_release_a_cli_started_bracket(henv):
+    s, child, a = started(henv, "a", "a")
+    emit(henv, child, vinit(a), owned(a))
+    emit(henv, child, vinit())
+    henv.host.send(SID, "b", message_id="b")
+    assert emit(henv, child, owned(a)) == [] and s.provider.holds_turns() and b'"b"' not in child.stdin
+
+
+# --- the barrier, its bound and its clock, the access check, interrupt readiness
 
 
 @pytest.mark.usefixtures("verified")
@@ -524,13 +686,97 @@ def test_the_barrier_is_bounded_by_the_turn_timeout_then_the_message_fails_and_t
 
 
 @pytest.mark.usefixtures("verified")
+def test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte(henv):
+    """A pipe that took nothing; then the CLI begins a turn of its own before the next attempt: the staged message
+    is not written into that turn. It waits (its own clock), and goes once the turn ended; or fails at the bound."""
+    s, child = idle_host(henv)
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    assert henv.host.tick() == [] and s.writing.id == "1" and b'"next"' not in child.stdin
+    child.accept = None
+    assert emit(henv, child, vinit()) == [] and b'"next"' not in child.stdin and s.writing.id == "1"
+    henv.clock.advance(60)
+    assert henv.host.tick() == [] and b'"next"' not in child.stdin
+    assert emit(henv, child, foreign()) == [("delivered", "1")] and child.turns()[-1] == "next"
+    # ... and the bound
+    child.emit(vinit(uuid_of(child)), owned(uuid_of(child)))
+    henv.host.tick()
+    child.accept = 0
+    henv.host.send(SID, "later", message_id="2")
+    henv.host.tick()
+    child.accept = None
+    emit(henv, child, vinit())
+    henv.clock.advance(30 * 60)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.delivered, end.ok) == ("2", False, False) and b'"later"' not in child.stdin
+    assert child.terminated == 1
+
+
+@pytest.mark.usefixtures("verified")
+def test_c1_01_a_line_already_partly_written_is_completed(henv):
+    """It cannot be taken back: once its first byte is in the pipe, the rest follows even behind the barrier."""
+    s, child = idle_host(henv)
+    child.accept = 5
+    henv.host.send(SID, "partial", message_id="1")
+    assert henv.host.tick() == [] and 0 < len(child.stdin.split(b"\n")[-1]) == 5
+    child.accept = None
+    assert emit(henv, child, vinit()) == [("delivered", "1")] and child.turns()[-1] == "partial"
+
+
+@pytest.mark.usefixtures("verified")
+def test_c1_02_a_changed_binding_does_not_let_a_message_wait_without_bound(henv):
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    s.bind = "a" * 64                   # given since the process started: it must be restarted for the message
+    henv.host.send(SID, "wait", message_id="1")
+    assert henv.host.tick() == [] and child.terminated == 0, "not stopped while the CLI runs its own turn"
+    henv.clock.advance(30 * 60)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and child.terminated == 1
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("same_bracket", [True, False])
+def test_c1_02_a_cancelled_waiter_leaves_no_clock_for_the_next_message(henv, same_bracket):
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    henv.host.send(SID, "first", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(29 * 60)
+    henv.host.cancel(SID, "1", "cancelled")
+    if not same_bracket:
+        emit(henv, child, foreign(), vinit())       # another turn of the CLI's own
+    henv.host.send(SID, "second", message_id="2")
+    assert henv.host.tick() == []
+    henv.clock.advance(2 * 60)
+    assert henv.host.tick() == [], "its own clock: it does not fail at once"
+    assert [m.id for m in s.inbox] == ["2"]
+
+
+@pytest.mark.usefixtures("verified")
+def test_c1_02_the_same_waiter_behind_another_cli_turn_gets_a_fresh_clock(henv):
+    """The CLI's turn ends and another begins before the waiting message could be written: its wait starts again."""
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    henv.host.send(SID, "wait", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(29 * 60)
+    assert emit(henv, child, foreign(), vinit()) == []
+    henv.clock.advance(2 * 60)
+    assert henv.host.tick() == [] and [m.id for m in s.inbox] == ["1"]
+    henv.clock.advance(28 * 60)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.delivered) == ("1", False)
+
+
+@pytest.mark.usefixtures("verified")
 def test_a_message_written_just_before_such_a_turn_began_is_not_taken_back(henv):
     s, child = idle_host(henv)
-    _, _, m = started(henv)
+    started(henv)
     emit(henv, child, vinit())
     assert s.in_flight.id == "1" and s.provider.holds_turns()
     henv.host.send(SID, "next", message_id="2")
-    assert henv.host.tick() == [] and list(m.id for m in s.inbox) == ["2"]
+    assert henv.host.tick() == [] and [m.id for m in s.inbox] == ["2"]
 
 
 @pytest.mark.usefixtures("verified")
@@ -588,13 +834,16 @@ def transcript(tmp_path) -> list[dict]:
     return [json.loads(x) for x in path.read_text().splitlines() if x]
 
 
+STAND_IN_V = frozenset({"2.1.330-stand-in"})
+
+
 @pytest.mark.parametrize("verify", [True, False])
 def test_real_pipes_a_turn_the_cli_starts_itself_is_no_messages(tmp_path, monkeypatch, verify):
     """bg-late through the stand-in: message 1's turn is followed by a turn the CLI starts itself; message 2 is
     written right after 1 ends, before that turn begins, and runs after it. Verified: 2's result is its own. With
     VERIFIED empty (as shipped): main's behaviour, unchanged (the CLI's frames are taken for 2, 2's own dropped)."""
     if verify:
-        monkeypatch.setattr(claude, "VERIFIED", frozenset({"2.1.330-stand-in"}))
+        monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
     host, s = real_host(tmp_path, monkeypatch, stand_in(), timeout_seconds=30, grace=2)
     try:
         first = host.send(SID, "bg 0.4 0.3 one")
@@ -602,19 +851,15 @@ def test_real_pipes_a_turn_the_cli_starts_itself_is_no_messages(tmp_path, monkey
         second = host.send(SID, "two")
         got = ends_of(host, [second])[second]
         assert got.text == ("turn 2: TWO" if verify else "background: FINISHED")
-        if verify:
-            assert s.provider.verified
-            lines = transcript(tmp_path)
-            inits = [x for x in lines if x.get("subtype") == "init"]
-            assert [bool(x.get("user_message_uuids")) for x in inits] == [True, False, True]
-            assert any(x.get("origin", {}).get("kind") == "task-notification" for x in lines)
+        inits = [x for x in transcript(tmp_path) if x.get("subtype") == "init"]
+        assert [bool(x.get("user_message_uuids")) for x in inits] == ([True, False, True] if verify
+                                                                      else [False, False, False])
     finally:
         host.stop_all()
 
 
 def test_real_pipes_echo_fields_reach_the_transcript_and_every_line_carries_a_uuid(tmp_path, monkeypatch):
-    """Part K's named change on the transcript: the echo fields on init and result, and the lifecycle lines, as the
-    CLI writes them; every user line carries the uuid its frames echo."""
+    monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
     host, s = real_host(tmp_path, monkeypatch, stand_in(), timeout_seconds=30, grace=2)
     try:
         ends_of(host, [host.send(SID, "hello")])
@@ -629,7 +874,7 @@ def test_real_pipes_echo_fields_reach_the_transcript_and_every_line_carries_a_uu
 
 
 def test_real_pipes_a_refused_resume_fails_its_message_as_today(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({"2.1.330-stand-in"}))
+    monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
     host, s = real_host(tmp_path, monkeypatch, stand_in(STAND_IN_REFUSE_RESUME="1"), timeout_seconds=30, grace=2)
     s.resume = True
     try:
@@ -641,20 +886,22 @@ def test_real_pipes_a_refused_resume_fails_its_message_as_today(tmp_path, monkey
 
 
 def test_real_pipes_zero_turn_notifications_and_a_reinit_settle_nothing(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({"2.1.330-stand-in"}))
+    monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
     host, s = real_host(tmp_path, monkeypatch, stand_in(), timeout_seconds=30, grace=2)
     try:
         a = host.send(SID, "notify-in notify-after reinit one")
         assert ends_of(host, [a])[a].text == "turn 1: NOTIFY-IN NOTIFY-AFTER REINIT ONE"
-        b = host.send(SID, "notify-error-in two")
-        assert ends_of(host, [b])[b].text == "turn 2: NOTIFY-ERROR-IN TWO"
         assert s.provider.verified
+        b = host.send(SID, "notify-error-in two")
+        got = ends_of(host, [b])[b]
+        assert (got.ok, got.text) == (False, ""), "rule 10: the zero-turn error is the turn's by order"
+        assert not s.provider.verified
     finally:
         host.stop_all()
 
 
 def test_real_pipes_a_process_that_stops_echoing_falls_back_to_order(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({"2.1.330-stand-in"}))
+    monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
     host, s = real_host(tmp_path, monkeypatch, stand_in(STAND_IN_ECHO="1"), timeout_seconds=30, grace=2)
     try:
         a = host.send(SID, "one")
@@ -671,7 +918,7 @@ def test_real_pipes_a_process_that_stops_echoing_falls_back_to_order(tmp_path, m
 
 
 def test_real_pipes_a_restart_interrupt_in_a_verified_process(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude, "VERIFIED", frozenset({"2.1.330-stand-in"}))
+    monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
     host, s = real_host(tmp_path, monkeypatch, stand_in(), timeout_seconds=30, grace=2)
     try:
         a = host.send(SID, "sleep 20")
@@ -689,43 +936,3 @@ def test_real_pipes_a_restart_interrupt_in_a_verified_process(tmp_path, monkeypa
 def test_the_modes_of_a_verified_process_are_still_restart_only():
     """No steering in step 1: `steers` stays False on Claude, and `steer` is refused exactly as on main."""
     assert ClaudeSession.steers is False and "steer" not in providers.modes(ClaudeSession())
-
-
-# --- rows C's table leaves open (DESIGN_NOTES "Claude turn correlation", choices where C's table is silent)
-
-
-@pytest.mark.usefixtures("verified")
-def test_open_row_none_init_listing_only_settled_lines_is_unattributed():
-    p, m = bracket("none")
-    [old] = list(p._written - {m})
-    assert fed(p, vinit(old)) == [("turn_started", "other")] and p._bracket == UNATTRIBUTED and p.holds_turns()
-
-
-@pytest.mark.usefixtures("verified")
-def test_open_row_unattributed_result_listing_only_settled_lines_closes_it_as_no_messages():
-    p, m = bracket("unattributed")
-    [old] = list(p._written - {m})
-    assert fed(p, owned(old)) == [("turn_ended", "other")]
-    assert p._bracket is None and not p.holds_turns() and p._current == m and p.verified
-
-
-@pytest.mark.usefixtures("verified")
-def test_open_row_none_result_listing_only_settled_lines_is_no_messages():
-    p, m = bracket("none")
-    [old] = list(p._written - {m})
-    assert fed(p, owned(old)) == [("turn_ended", "other")] and p._current == m and p.verified
-
-
-@pytest.mark.usefixtures("verified")
-def test_open_row_none_plain_result_with_nothing_in_flight_is_a_deviation():
-    p = idle_verified()
-    assert fed(p, plain()) == [("turn_ended", "order")] and not p.verified, "by order: only logged, as main"
-
-
-def test_lifecycle_lines_mean_nothing_to_the_adapter():
-    """The real CLI writes `command_lifecycle` lines for lines with a uuid (the transcript gains them)."""
-    p = adapter()
-    u = write(p)
-    for state in ("queued", "started", "completed", "cancelled"):
-        assert p.feed(json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": state,
-                                  "session_id": SID}).encode()) == ([], [])

@@ -1,10 +1,17 @@
 """A schema-free run of hosted sessions, recorded: every frame, result turn, claim, tool answer, record, listing and
 CLI text it produces, normalized (ids and tokens made deterministic). Structured results promise all of it byte for
-byte as on main when no schema is given, and Claude turn correlation promises the same with no steer sent, but for its
-named changes (the uuid key on Claude user lines, the echo fields on the frames a process writes: `_sequences`
-takes exactly those out): tests/fixtures/schema_free_main.json was recorded by THIS module run against main's code
-(re-pinned to d4b92e5 for turn correlation; first recorded at a8b90cc), and test_structured_results compares this
-checkout's run with it. Only APIs main has are used.
+byte as on main when no schema is given. tests/fixtures/schema_free_main.json was recorded by THIS module run against
+main's code (re-pinned to d4b92e5 for Claude turn correlation; first recorded at a8b90cc), and test_structured_results
+compares this checkout's run with it. Only APIs main has are used.
+
+Claude turn correlation (DESIGN_NOTES, 2026-11-24) adds every bracket sequence through the hub and the node, with a
+source-faithful stream (lifecycle rows and echo fields on init, assistant, thinking and result frames whenever the
+line had a uuid, none when it had not: measured on 2.1.330), every process's raw stdin, every raw transcript, the
+host's events in order and the board's log lines. It promises two cases (`record(verified=...)`):
+- no version VERIFIED (production): byte for byte main's, everything, with no allowance at all;
+- a version VERIFIED that these processes do not report (an explicitly unverified baseline): main's but for the
+  allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines written before each
+  process's first `init`, and the echo fields and lifecycle rows the process wrote for them.
 
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
 """
@@ -17,24 +24,58 @@ import uuid
 from pathlib import Path
 
 
-def record(tmp_path: Path) -> dict:
+def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
+    """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
+    `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`)."""
+    import logging
+    from agent_comms.providers import claude
     counter = itertools.count(1)
     real_hex, real_uuid4 = secrets.token_hex, uuid.uuid4
     secrets.token_hex = lambda n=32: format(next(counter), "x").rjust(2 * n, "0")[-2 * n:]
     uuid.uuid4 = lambda: uuid.UUID(int=next(counter))
+    had, before = hasattr(claude, "VERIFIED"), getattr(claude, "VERIFIED", None)
+    if verified is not None:
+        claude.VERIFIED = frozenset(verified)
+    logs: list = []
+
+    class Keep(logging.Handler):
+        def emit(self, rec):
+            logs.append([rec.name, rec.levelname, rec.getMessage()])
+
+    keep, board = Keep(logging.INFO), logging.getLogger("agent_comms")
+    level = board.level
+    board.addHandler(keep)
+    board.setLevel(logging.INFO)
     try:
-        return _run(tmp_path)
+        return _run(tmp_path, logs, allow)
     finally:
+        board.removeHandler(keep)
+        board.setLevel(level)
         secrets.token_hex, uuid.uuid4 = real_hex, real_uuid4
+        if had:
+            claude.VERIFIED = before
+        elif hasattr(claude, "VERIFIED"):
+            del claude.VERIFIED
 
 
-def _run(tmp_path: Path) -> dict:
+def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
+    import dataclasses
     from agent_comms import cli, hosted, hosted_results, hosted_spawn as hs
     from test_hosted_sessions import session_env, show, start, tick, written
     from test_hosted_tree import TREE, answer, child, tree_config
 
     env = session_env(tmp_path, dispatch=TREE, config=tree_config)
     out: dict = {}
+    events: list = []
+    host = env.node.sessions.host
+    real_tick = host.tick
+
+    def recorded_tick():
+        got = real_tick()
+        events.extend(dataclasses.asdict(e) for e in got)
+        return got
+
+    host.tick = recorded_tick
 
     def turns(sid):
         got = []
@@ -98,7 +139,9 @@ def _run(tmp_path: Path) -> dict:
     out["records"] = {k: json.loads(v) for k, v in env.board.conn.execute(
         "SELECT key, value FROM board_state WHERE key LIKE 'host.session.%' OR key LIKE 'host.msg.%' OR key LIKE "
         "'host.result.%' OR key LIKE 'host.outbox.%' ORDER BY key")}
-    _sequences(env, out)
+    _sequences(env, out, allow)
+    out["host_events"] = events
+    out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:")]
     return normalized(out, tmp_path)
 
 
@@ -106,20 +149,40 @@ def _run(tmp_path: Path) -> dict:
 
 CAPS = ["msg_lifecycle_v1", "interrupt_receipt_v1"]     # what Claude Code 2.1.330's `init` lists, among others
 NOTIFY = {"kind": "task-notification", "producer": "session-task"}
-# The one named change on the wire with no steer sent: every user line Claude gets carries a `uuid` key, last.
-LINE_UUID = re.compile(r', "uuid": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"\}$')
-# ... and on the transcript, the echo fields a process adds to its existing `init` and `result` frames.
-ECHO_FIELDS = ("user_message_uuid", "user_message_uuids")
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+# The allowance, on raw bytes (`allowed`): the uuid key a user line carries, last ...
+LINE_UUID = re.compile(r', "uuid": "' + UUID + r'"\}$')
+# ... the echo fields a frame carries for it, last ...
+ECHO = re.compile(r', "user_message_uuid": "' + UUID + r'"|, "user_message_uuids": \[(?:"' + UUID + r'"(?:, )?)+\]')
+# ... and the lifecycle rows Claude writes for it.
+LIFECYCLE = '{"type": "command_lifecycle", '
 
 
-def _sequences(env, out: dict) -> None:
-    """Every bracket sequence of the steering design's C (its checked list, branch claude/steer-loose) through the
-    hub and the node, with frames as Claude Code 2.1.330 writes them (a version that is not VERIFIED: VERIFIED ships
-    empty), echo fields included whenever the line written had a uuid to echo; then a timeout, a launch refusal, a
-    resumed process, a restart, an `auto` send and a Codex turn. Recorded: what the hub shows after each step, the
-    records, every process's stdin (the uuid key taken out of user lines: the one wire change) and every transcript
-    (the echo fields taken out: the one transcript change). Main's code (d4b92e5) writes no uuid, so its processes
-    echo nothing; this checkout's echo, and are still attributed by order: everything else must be main's."""
+def allowed(kind: str, line: str, removed: list) -> str | None:
+    """A raw line with the allowance taken out (`removed` keeps every fragment taken), or None: a whole row taken."""
+    if kind == "stdin":
+        m = LINE_UUID.search(line) if line.startswith('{"type": "user"') else None
+        if m:
+            removed.append(("stdin", m.group(0)))
+            return line[:m.start()] + "}"
+        return line
+    if line.startswith(LIFECYCLE):
+        removed.append(("lifecycle", line))
+        return None
+    for m in ECHO.finditer(line):
+        removed.append(("echo", m.group(0)))
+    return ECHO.sub("", line)
+
+
+REMOVED: list = []      # what the last run with `allow` took out (for the test that the allowance is only that)
+
+
+def _sequences(env, out: dict, allow: bool) -> None:
+    """Every bracket sequence of the steering design's C (its checked list, branch claude/steer-loose) and rule 10's
+    error cases through the hub and the node, with frames as Claude Code 2.1.330 writes them; then a timeout, a launch
+    refusal, a resumed process, a restart, an `auto` send and a Codex turn. Recorded: what the hub shows after each
+    step, the records, every process's raw stdin and every raw transcript. A frame carries echo fields, and a turn
+    lifecycle rows, only for a line that had a uuid (measured): main's lines have none."""
     from test_hosted_sessions import P2, P3, codex_handshake, codex_turn, show, start, tick
     from test_hosted_tree import as_started, began, proc_of
     from test_session_host import result
@@ -128,19 +191,46 @@ def _sequences(env, out: dict) -> None:
         users = [json.loads(x) for x in proc.stdin.split(b"\n") if x and json.loads(x).get("type") == "user"]
         return users[-1].get("uuid") if users else None
 
-    def init(sid, echo=True):
+    def u_of(sid):
+        return line_id(proc_of(env, sid)[1])
+
+    def echo(sid, list_too=True):
+        u = u_of(sid)
+        return ({"user_message_uuid": u} if not list_too else {"user_message_uuid": u, "user_message_uuids": [u]}
+                ) if u else {}
+
+    def life(state):
+        def frame(sid):
+            u = u_of(sid)
+            return {"type": "command_lifecycle", "command_uuid": u, "state": state, "session_id": sid} if u else None
+        return frame
+
+    def init(sid, echo_=True):
         call, proc = proc_of(env, sid)
         ev = began(sid, *as_started(call["argv"])) | {"claude_code_version": "2.1.330", "capabilities": CAPS}
         u = line_id(proc)
-        return ev | ({"user_message_uuids": [u]} if echo and u else {})
+        return ev | ({"user_message_uuids": [u]} if echo_ and u else {})
 
-    def res(sid, text, echo=True, **kw):
-        u = line_id(proc_of(env, sid)[1])
-        return result(sid, text=text, **kw) | ({"user_message_uuid": u, "user_message_uuids": [u]} if echo and u
-                                               else {})
+    def thinking(sid):
+        return {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 50, "session_id": sid} | echo(
+            sid, list_too=False)
 
-    def foreign(sid):
-        return result(sid, text="background: FINISHED") | {"origin": NOTIFY}
+    def assistant(text):
+        return lambda sid: {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": text}]}, "parent_tool_use_id": None, "session_id": sid} | echo(sid)
+
+    def res(sid, text, echo_=True, **kw):
+        return result(sid, text=text, **kw) | (echo(sid) if echo_ else {})
+
+    def turn(text, *middle, end=None):
+        """A whole turn as 2.1.330 writes it: lifecycle queued and started, init, thinking, the reply, (middle),
+        result, lifecycle completed."""
+        return [life("queued"), life("started"), init, thinking, assistant(text), *middle,
+                end or (lambda s: res(s, text)), life("completed")]
+
+    def foreign(sid, error=False):
+        return result(sid, text="background: FINISHED", subtype="error_during_execution" if error else "success",
+                      is_error=error) | {"origin": NOTIFY}
 
     def note(sid, error=False):
         return result(sid, text="", subtype="error_during_execution" if error else "success", is_error=error) | {
@@ -157,56 +247,64 @@ def _sequences(env, out: dict) -> None:
     def step(name, *frames):
         proc = proc_of(env, sid)[1]
         for f in frames:
-            proc.emit(f(sid) if callable(f) else f)
-            tick(env)
+            ev = f(sid) if callable(f) else f
+            if ev is not None:
+                proc.emit(ev)
+                tick(env)
         seq[name] = show(env, sid)
 
-    step("owned_pair", lambda s: init(s), lambda s: res(s, "pair"))
-    send(sid, "seq plain failure")
-    tick(env)
-    step("plain_failure", lambda s: init(s), lambda s: res(s, "broke", echo=False, subtype="error_during_execution",
-                                                           is_error=True))
-    for error in (False, True):
-        send(sid, f"seq notification inside {error}")
+    def next_message(text, **body):
+        got = send(sid, text, **body)
         tick(env)
-        step(f"notification_inside_{error}", lambda s: init(s), lambda s: note(s, error), lambda s: res(s, "after"))
-    send(sid, "seq reinit")
-    tick(env)
-    step("reinit", lambda s: init(s), lambda s: init(s, echo=False), lambda s: res(s, "reinit"))
-    send(sid, "seq unattributed first")
-    tick(env)
-    step("unattributed_first", lambda s: init(s, echo=False), foreign, lambda s: init(s), lambda s: res(s, "own"))
-    send(sid, "seq lost echoes")
-    tick(env)
-    step("lost_echoes", lambda s: init(s, echo=False), lambda s: res(s, "whose", echo=False))
-    for echo in (True, False):
-        send(sid, f"seq no init {echo}")
-        tick(env)
-        step(f"no_init_{echo}", lambda s, e=echo: res(s, "no init", echo=e))
-    step("notification_idle", note, lambda s: note(s, True))
-    send(sid, "seq restart me")
-    tick(env)
-    step("restart_begun", lambda s: init(s))
+        return got
+
+    # First the sequences that keep a verified process verified, then those that end its verification (rule 10, a
+    # plain result where the table falls back to order): with a version VERIFIED each step then shows its own rule.
+    step("owned_pair", *turn("pair"))
+    next_message("seq notification inside")
+    step("notification_inside", *turn("after", note))
+    next_message("seq reinit")
+    step("reinit", *turn("reinit", {"type": "system", "subtype": "compact_boundary", "session_id": sid},
+                         lambda s: init(s, echo_=False)))
+    next_message("seq unattributed first")
+    step("unattributed_first", lambda s: init(s, echo_=False), foreign, *turn("own"))
+    next_message("seq no init")
+    step("no_init_owned", lambda s: res(s, "no init"))
+    step("notification_idle", note, lambda s: note(s, True), lambda s: foreign(s, error=True))
+    next_message("seq restart me")
+    step("restart_begun", life("queued"), life("started"), init)
     seq["restart_send"] = send(sid, "seq the restart", mode="restart")
     tick(env)
     proc = proc_of(env, sid)[1]
     [req] = [json.loads(x) for x in proc.stdin.split(b"\n") if x and json.loads(x).get("type") == "control_request"]
     step("restart_aborted", {"type": "control_response", "response": {
         "subtype": "success", "request_id": req["request_id"], "response": {"still_queued": []}}},
-        lambda s: res(s, None, subtype="error_during_execution", is_error=True) | {"terminal_reason": "aborted_tools"})
-    step("restart_message", lambda s: init(s), lambda s: res(s, "replaced"))
+        lambda s: res(s, None, subtype="error_during_execution", is_error=True) | {"terminal_reason": "aborted_tools"},
+        life("cancelled"))
+    step("restart_message", *turn("replaced"))
     seq["auto_send"] = send(sid, "seq auto", mode="auto")
     tick(env)
-    step("auto", lambda s: init(s), lambda s: res(s, "auto"))
-    send(sid, "seq timeout")
-    tick(env)
-    step("timeout_begun", lambda s: init(s))
+    step("auto", *turn("auto"))
+    next_message("seq unattributed error")
+    step("unattributed_error", lambda s: init(s, echo_=False), lambda s: foreign(s, error=True), *turn("own"))
+    next_message("seq plain failure")
+    step("plain_failure", life("queued"), life("started"), init,
+         lambda s: res(s, "broke", echo_=False, subtype="error_during_execution", is_error=True))
+    next_message("seq notification error inside")
+    step("notification_error_inside", *turn("after", lambda s: note(s, True)))
+    next_message("seq foreign error inside")
+    step("foreign_error_inside", init, lambda s: foreign(s, error=True), lambda s: res(s, "late"))
+    next_message("seq lost echoes")
+    step("lost_echoes", lambda s: init(s, echo_=False), lambda s: res(s, "whose", echo_=False))
+    next_message("seq no init plain")
+    step("no_init_plain", lambda s: res(s, "no init", echo_=False))
+    next_message("seq timeout")
+    step("timeout_begun", life("queued"), life("started"), init)
     env.clock.advance(30 * 60 + 1)
     env.node.hello()            # the node is connected still (its hello renews it at the hub)
     tick(env, times=3)
     seq["timeout"] = show(env, sid)
-    send(sid, "seq refused start")
-    tick(env)
+    next_message("seq refused start")
     proc = proc_of(env, sid)[1]
     proc.emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 0,
                "session_id": sid, "permission_denials": [],
@@ -214,9 +312,10 @@ def _sequences(env, out: dict) -> None:
     proc.code = 1
     tick(env, times=3)
     seq["launch_refusal"] = show(env, sid)
-    send(sid, "seq resumed")
-    tick(env)
-    step("resumed", lambda s: init(s), lambda s: res(s, "resumed"))
+    next_message("seq resumed")
+    step("resumed", *turn("resumed"))
+    next_message("seq resumed again")
+    step("resumed_again", *turn("again"))
     # A Codex root: its attribution and wire are not changed (its stdin is recorded with the rest).
     cid = start(env, "seq codex", project=P3, agent="codex")["session_id"]
     tick(env)
@@ -230,27 +329,17 @@ def _sequences(env, out: dict) -> None:
         "SELECT key, value FROM board_state WHERE key LIKE 'host.session.%' OR key LIKE 'host.msg.%' ORDER BY key")
         if any(i in k for i in ids)}
     out["seq_listing"] = env.laptop.get("/api/nodes/sessions", params={"tree": 4}).json()
-    out["stdin"] = [[_main_stdin_line(x) for x in proc.stdin.decode().split("\n")]
-                    for proc in env.node.session_spawner.children]
+    REMOVED.clear()
+
+    def raw_lines(kind, data: bytes) -> list:
+        lines = data.decode().split("\n")
+        if allow:
+            lines = [x for x in (allowed(kind, line, REMOVED) for line in lines) if x is not None]
+        return lines
+
+    out["stdin"] = [raw_lines("stdin", proc.stdin) for proc in env.node.session_spawner.children]
     sessions = env.node.log_dir / "sessions"
-    out["transcripts"] = {p.name: [_without_echo(x) for x in p.read_text().splitlines()]
-                          for p in sorted(sessions.glob("*.jsonl"))}
-
-
-def _main_stdin_line(line: str) -> str:
-    """A line a process got, without the uuid key of a Claude user line (the one named wire change)."""
-    return LINE_UUID.sub("}", line) if line.startswith('{"type": "user"') else line
-
-
-def _without_echo(line: str) -> str:
-    try:
-        ev = json.loads(line)
-    except ValueError:
-        return line
-    if not isinstance(ev, dict) or not set(ECHO_FIELDS) & set(ev):
-        return line
-    return json.dumps({k: v for k, v in ev.items() if k not in ECHO_FIELDS})
-
+    out["transcripts"] = {p.name: raw_lines("transcript", p.read_bytes()) for p in sorted(sessions.glob("*.jsonl"))}
 
 def normalized(value, tmp: Path) -> dict:
     """The run's temporary directory and time stamps out (both differ by run), everything else as it is."""
