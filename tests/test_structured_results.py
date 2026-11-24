@@ -709,9 +709,12 @@ def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(
     through the node with a source-faithful stream, a timeout, a launch refusal, a resumed process, a restart, an
     `auto` send and a Codex turn, every process's raw stdin, every raw transcript, the host's events in order and the
     board's log lines. With no version VERIFIED (production) this checkout's run is the same, byte for byte (time
-    stamps and the temporary directory aside), with NO allowance at all."""
+    stamps and the temporary directory aside), with NO allowance of turn correlation; only what mid-turn steering's
+    step 2 names for a run with no steer (the design's K: golden_schema_free.step2_named) is taken out, and the next
+    tests assert it is there and only that. The fixture was re-recorded against d4b92e5 for step 2 only to add the
+    protocol-5 listing (`listing_p5`): every other key is the recording as it was."""
     import golden_schema_free
-    _same(golden_schema_free.record(tmp_path, verified=frozenset()), _main_fixture())
+    _same(golden_schema_free.record(tmp_path, verified=frozenset(), named=True), _main_fixture())
 
 
 def test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for_the_allowance(tmp_path):
@@ -721,7 +724,7 @@ def test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for
     from agent_comms.providers import claude
     assert claude.VERIFIED and golden_other_version() not in claude.VERIFIED, "production: another version"
     import golden_schema_free
-    _same(golden_schema_free.record(tmp_path, verified=BASELINE, allow=True), _main_fixture())
+    _same(golden_schema_free.record(tmp_path, verified=BASELINE, allow=True, named=True), _main_fixture())
 
 
 def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_and_lifecycle_rows(tmp_path):
@@ -761,6 +764,53 @@ def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_an
         none["transcripts"]) and '\\"uuid\\"' not in json.dumps(none["stdin"])
     main = _main_fixture()
     assert "user_message_uuid" not in json.dumps(main) and "command_lifecycle" not in json.dumps(main)
+
+
+def test_step2s_named_changes_are_each_there_and_are_only_what_k_names(tmp_path):
+    """Mid-turn steering, step 2, with no steer sent (the design's K): in the raw run every Codex turn/start carries
+    one fresh `clientUserMessageId` as its last key, every listing names `steer` last among its features, a Codex
+    session's `modes` start with `steer`, and every host event's `steer` is None; what `named` takes is exactly those,
+    each kind at least once; main's recording has none of them."""
+    import golden_schema_free as g
+    raw = g.record(tmp_path / "raw", verified=frozenset())
+    starts = [json.loads(x) for lines in raw["stdin"] + [x for c in raw["host_cases"].values() for x in c["stdin"]]
+              for x in lines if '"method": "turn/start"' in x]
+    assert starts and all(list(s["params"])[-1] == "clientUserMessageId" for s in starts)
+    ids = [s["params"]["clientUserMessageId"] for s in starts]
+    assert len(set(ids)) == len(ids), "a fresh id for every turn"
+    assert all(raw[k]["features"][-1] == "steer" for k in ("listing", "seq_listing", "listing_p5"))
+    events = [e for got in raw["host_events"] for e in got] + [e for c in raw["host_cases"].values()
+                                                               for got in c["passes"] for e in got]
+    assert events and all(e["steer"] is None for e in events), "no steer was sent: no outcome on any end"
+    codex = [r for k, r in raw["seq_records"].items() if k.startswith("host.session.") and r["runtime"] == "codex-cli"]
+    assert codex and all(r["modes"] == ["steer", "restart"] for r in codex)
+    g.record(tmp_path / "named", verified=frozenset(), named=True)
+    kinds = {k for k, _ in g.NAMED}
+    assert kinds == {"client_id", "features", "host_event", "modes"}
+    assert sum(k == "client_id" for k, _ in g.NAMED) == len(starts) and sum(
+        k == "host_event" for k, _ in g.NAMED) == len(events)
+    main = json.dumps(_main_fixture())
+    assert "clientUserMessageId" not in main and '"steer"' not in main
+
+
+def test_step2s_allowance_takes_only_the_adapters_own_turn_start_line():
+    """Anything that only looks like the named Codex key is kept (so it differs from main's)."""
+    import golden_schema_free as g
+    g.CLIENT_IDS.clear()
+    u = "1e64c1ac-3dc2-45ff-bad6-ee954a1892a1"
+    good = json.dumps({"id": 3, "method": "turn/start", "params": {"threadId": "t", "input": [], "clientUserMessageId": u}})
+    assert g._codex_line(good) == json.dumps({"id": 3, "method": "turn/start", "params": {"threadId": "t", "input": []}})
+    assert g._codex_line(good) == good, "an id already taken once is not fresh"
+    for bad in ({"id": 3, "method": "turn/steer", "params": {"threadId": "t", "clientUserMessageId": u.replace("1", "2")}},
+                {"id": 3, "method": "turn/start", "params": {"clientUserMessageId": "not-a-uuid"}},
+                {"id": 3, "method": "turn/start", "params": {"clientUserMessageId": u.replace("4", "1", 1)}},
+                {"id": 3, "method": "turn/start", "params": {"threadId": "t"}, "extra": 1,
+                 "clientUserMessageId": u.replace("e", "f")}):
+        assert g._codex_line(json.dumps(bad)) == json.dumps(bad)
+    passes = [[{"kind": "delivered", "steer": None}, {"kind": "turn_ended", "steer": {"outcome": "in_turn"}}]]
+    g.NAMED.clear()
+    g._events_named(passes, "x")
+    assert passes == [[{"kind": "delivered"}, {"kind": "turn_ended", "steer": {"outcome": "in_turn"}}]]
 
 
 def test_the_allowance_takes_only_valid_envelopes_for_the_right_line():

@@ -15,6 +15,14 @@ host's events in order and the board's log lines. It promises two cases (`record
   carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them; and,
   in the logs, the one INFO line per process saying that turn correlation is off for it (`told`).
 
+Mid-turn steering, step 2 (DESIGN_NOTES "Mid-turn steering, step 2: Codex steering, as built"; the design's K) adds
+what K names for a run in which no steer is sent, and nothing else: `named` (`record(named=True)`, `step2_named`)
+takes out of the RAW run, before anything is normalized, exactly these and records what it took (`NAMED`):
+- the Codex wire: `clientUserMessageId` (a fresh uuid4), the last key of each `turn/start` line's params;
+- the protocol: `steer` at the end of a listing's `features`, and `steer` in a Codex session record's `modes`;
+- the host's events: a `steer` key whose value is None (the field of a turn's end that carries a steer's outcome).
+Anything else that looks similar stays, and differs. The run also fetches the listing at protocol 5 (`listing_p5`).
+
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
 """
 import itertools
@@ -26,9 +34,10 @@ import uuid
 from pathlib import Path
 
 
-def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
+def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False) -> dict:
     """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
-    `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`)."""
+    `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`).
+    `named`: take out what mid-turn steering's step 2 names for a run with no steer (`step2_named`), likewise."""
     import logging
     from agent_comms.providers import claude
     counter = itertools.count(1)
@@ -49,7 +58,7 @@ def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
     board.addHandler(keep)
     board.setLevel(logging.INFO)
     try:
-        return _run(tmp_path, logs, allow)
+        return _run(tmp_path, logs, allow, named)
     finally:
         board.removeHandler(keep)
         board.setLevel(level)
@@ -60,7 +69,7 @@ def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
             del claude.VERIFIED
 
 
-def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
+def _run(tmp_path: Path, logs: list, allow: bool, named: bool = False) -> dict:
     import dataclasses
     from agent_comms import cli, hosted, hosted_results, hosted_spawn as hs
     from test_hosted_sessions import session_env, show, start, tick, written
@@ -145,6 +154,11 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
     _host_cases(tmp_path, out, allow)
     out["host_events"] = events
     out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:") and not (allow and told(x, REMOVED))]
+    # The listing at protocol 5 (step 2's): with no steer, what a protocol-4 fetch gets (main's code answers it so).
+    out["listing_p5"] = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json()
+    NAMED.clear()
+    if named:
+        step2_named(out)
     return normalized(out, tmp_path)
 
 
@@ -160,6 +174,65 @@ def told(entry: list, removed: list) -> bool:
         removed.append(("log", entry[2]))
         return True
     return False
+
+
+# ------------------------------------------------------------ mid-turn steering, step 2 (the design's K)
+
+NAMED: list = []        # what the last run with `named` took out: (kind, where)
+CLIENT_ID = re.compile(r', "clientUserMessageId": "(' + r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+                       + r')"\}\}$')
+CLIENT_IDS: set = set()
+
+
+def _codex_line(line: str) -> str:
+    """A Codex `turn/start` line without its `clientUserMessageId`, only when it is exactly that line of the adapter:
+    the key last in its params, a fresh uuid4, the rest a turn/start of main's shape."""
+    m = CLIENT_ID.search(line)
+    if not m or m.group(1) in CLIENT_IDS:
+        return line
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return line
+    params = ev.get("params") if isinstance(ev, dict) else None
+    if (not isinstance(params, dict) or ev.get("method") != "turn/start" or list(ev) != ["id", "method", "params"]
+            or list(params)[-1] != "clientUserMessageId" or params["clientUserMessageId"] != m.group(1)):
+        return line
+    stripped = line[:m.start()] + "}}"
+    if json.loads(stripped) != {**ev, "params": {k: v for k, v in params.items() if k != "clientUserMessageId"}}:
+        return line
+    CLIENT_IDS.add(m.group(1))
+    NAMED.append(("client_id", m.group(1)))
+    return stripped
+
+
+def _events_named(passes: list, where: str) -> None:
+    for got in passes:
+        for e in got:
+            if isinstance(e, dict) and "steer" in e and e["steer"] is None and list(e)[-1] == "steer":
+                del e["steer"]
+                NAMED.append(("host_event", where))
+
+
+def step2_named(out: dict) -> None:
+    """Take K's named changes out of the raw run, in place (module text), each recorded in NAMED."""
+    CLIENT_IDS.clear()
+    out["stdin"] = [[_codex_line(x) for x in lines] for lines in out.get("stdin", [])]
+    for name, case in (out.get("host_cases") or {}).items():
+        case["stdin"] = [[_codex_line(x) for x in lines] for lines in case["stdin"]]
+        _events_named(case["passes"], name)
+    _events_named(out.get("host_events") or [], "host_events")
+    for key in ("listing", "seq_listing", "listing_p5"):
+        features = (out.get(key) or {}).get("features")
+        if isinstance(features, list) and features[-1:] == ["steer"]:
+            features.pop()
+            NAMED.append(("features", key))
+    for key in ("records", "seq_records"):
+        for k, rec in (out.get(key) or {}).items():
+            if (k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "codex-cli"
+                    and isinstance(rec.get("modes"), list) and rec["modes"][:1] == ["steer"]):
+                rec["modes"] = rec["modes"][1:]
+                NAMED.append(("modes", k))
 
 
 # ------------------------------------------------------------ Claude turn correlation (DESIGN_NOTES, 2026-11-24)

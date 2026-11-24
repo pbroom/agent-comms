@@ -1,8 +1,11 @@
 """Restarting a running turn, hub and node (DESIGN_NOTES "Restarting a running turn"): the human's sends with a mode
 through the real routes and `board session send --mode`, the node's protocol and its races, and a parent agent's
-`board_session_send(mode=...)` with its budget and its results. `steer` is refused for every session (R6). Fake
+`board_session_send(mode=...)` with its budget and its results. `steer` is refused for Claude sessions (its adapter does
+not steer in step 2; tests/test_codex_steering.py has the rest of steering). Fake
 processes speaking what Claude Code 2.1.330 and codex-cli 0.171.0 were measured to write (test_session_restart),
 never a real agent CLI."""
+
+import re
 
 import httpx
 import pytest
@@ -19,7 +22,9 @@ from test_hosted_tree import as_started, began, proc_of, senv, stored  # noqa: F
 from test_session_host import result
 from test_session_restart import CAPS, aborted, receipt
 
-STEER_NO = "mid-turn steering is not available yet; use restart to redirect a running turn, or queue"
+# Step 2 (DESIGN_NOTES "Mid-turn steering"): R6's refusal is gone; a Claude session is refused because its adapter
+# does not say it steers.
+STEER_NO = "this session's agent CLI cannot steer into a running turn (its node says so)"
 
 
 # ------------------------------------------------------------ helpers
@@ -60,7 +65,7 @@ def c_turn(env, text="first", **kw) -> tuple[str, object]:
     tick(env)
     child.emit(cx.reply(3, cx.TURN_REPLY), cx.TURN_STARTED)
     tick(env)
-    assert show(env, sid)["in_flight"] == 1 and stored(env, sid)["modes"] == ["restart"]
+    assert show(env, sid)["in_flight"] == 1 and stored(env, sid)["modes"] == ["steer", "restart"]
     return sid, child
 
 
@@ -130,9 +135,9 @@ def test_the_node_says_what_each_session_can_do_now_and_the_hub_keeps_it(senv):
     tick(senv)
     assert stored(senv, sid).get("modes") == [], "a Claude process says what it can only when its turn begins"
     begin(senv, sid)
-    assert stored(senv, sid)["modes"] == ["restart"], "no adapter steers (R6)"
+    assert stored(senv, sid)["modes"] == ["restart"], "Claude's adapter does not steer (step 2)"
     cid, _ = c_turn(senv, project="/work/second")
-    assert stored(senv, cid)["modes"] == ["restart"]
+    assert stored(senv, cid)["modes"] == ["steer", "restart"], "Codex's steers (K: `modes` add steer where it can)"
     assert "restart" in senv.laptop.get("/api/nodes/sessions", params={"tree": 4}).json()["features"]
     r = senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"modes": ["restart", "fly"]})
     assert r.status_code == 400 and "modes must list" in r.text
@@ -173,13 +178,16 @@ def test_a_node_rolled_back_to_protocol_3_with_a_restart_pending_runs_it_once_as
 # ------------------------------------------------------------ the human's modes
 
 
-def test_steer_is_refused_for_every_session_with_one_reason(senv):
-    """R6: nothing is enqueued for it."""
+def test_steer_is_refused_for_a_claude_session_with_its_reason_and_enqueues_nothing_for_either(senv):
+    """Step 2 replaces R6: a Claude session is refused (its adapter does not steer), a Codex one takes the steer as a
+    steer; neither enqueues a message for it."""
     sid, _ = a_turn(senv)
     cid, _ = c_turn(senv, project="/work/second")
+    r = post_send(senv, sid, "x", expect=409, mode="steer")
+    assert r["message"] == f"cannot steer into session {sid}: {STEER_NO}"
+    out = post_send(senv, cid, "x", mode="steer")
+    assert out["message"] is None and out["steer"]["into"] == 1 and out["steer"]["state"] == "accepted"
     for s in (sid, cid):
-        r = post_send(senv, s, "x", expect=409, mode="steer")
-        assert r["message"] == f"cannot steer into session {s}: {STEER_NO}"
         assert show(senv, s)["queued"] == 0
 
 
@@ -360,7 +368,7 @@ def test_the_cli_sends_with_a_mode_and_says_what_happened(clienv, capsys):
     assert "message 3: queued behind the turn in flight (message 1)" in capsys.readouterr().out
     cli.main(["session", "send", sid, "behind", "--mode", "auto", "--request-id", "r1"])
     assert "already sent for this request id (message 3: queued); nothing new was sent" in capsys.readouterr().out
-    with pytest.raises(SystemExit, match=STEER_NO.replace("(", "\\(")):
+    with pytest.raises(SystemExit, match=re.escape(STEER_NO)):
         cli.main(["session", "send", sid, "x", "--mode", "steer"])
     cli.main(["session", "show", sid])
     assert "message 2 [queued] (restart of message 1)" in capsys.readouterr().out
@@ -661,9 +669,9 @@ def test_a_parents_restart_whose_interrupt_was_refused_still_tells_the_parent(se
     assert x["outcome"] == "failed" and x["state"] != "kept"
 
 
-def test_a_parent_may_restart_only_its_own_task_steers_never_and_auto_says_what_it_did(senv):
+def test_a_parent_may_restart_only_its_own_task_steers_never_into_claude_and_auto_says_what_it_did(senv):
     sid, kid, proc = child_in_turn(senv)
-    with pytest.raises(Conflict, match=STEER_NO):
+    with pytest.raises(Conflict, match=re.escape(STEER_NO)):
         hs.send(senv.board, senv.p["claude"], bound(senv, sid), kid, message="x", mode="steer")
     proc.emit(result(kid, text="done"))
     tick(senv)

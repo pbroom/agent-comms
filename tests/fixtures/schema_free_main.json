@@ -2118,6 +2118,107 @@
   ],
   "version": "0000000000000018"
  },
+ "listing_p5": {
+  "features": [
+   "answered",
+   "restart"
+  ],
+  "node": "laptop",
+  "sessions": [
+   {
+    "access": null,
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000014",
+    "messages": [
+     {
+      "kind": "user",
+      "n": 3,
+      "state": "delivered"
+     }
+    ],
+    "model": null,
+    "project": "/work/repo",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": "workspace",
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000015",
+    "effort": null,
+    "isolation": "shared",
+    "messages": [],
+    "model": null,
+    "parent": "00000000-0000-0000-0000-000000000001",
+    "project": "/work/repo",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000004",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": "workspace",
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000016",
+    "effort": null,
+    "isolation": "shared",
+    "messages": [],
+    "model": null,
+    "parent": "00000000-0000-0000-0000-000000000001",
+    "project": "/work/repo",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000003",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": "workspace",
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000017",
+    "effort": null,
+    "isolation": "shared",
+    "messages": [],
+    "model": null,
+    "parent": "00000000-0000-0000-0000-000000000001",
+    "project": "/work/repo",
+    "resume": false,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000002",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": null,
+    "agent": "claude",
+    "messages": [],
+    "model": null,
+    "project": "/work/second",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000007",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": null,
+    "agent": "codex",
+    "messages": [],
+    "model": null,
+    "project": "/work/third",
+    "resume": true,
+    "runtime": "codex-cli",
+    "session_id": "00000000-0000-0000-0000-000000000008",
+    "status_seq": 0,
+    "stop": null
+   }
+  ],
+  "version": "0000000000000019"
+ },
  "logs": [
   [
    "agent_comms.session_host",
