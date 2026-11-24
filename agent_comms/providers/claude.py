@@ -295,14 +295,21 @@ def result_class(ev: dict, written: set[str], current: str | None, delivered: bo
     settled); NON_TURN: no host uuid, an `origin` that is not human, `num_turns` 0 (a zero-turn task notification);
     FOREIGN: the same with `num_turns` 1 or more (a turn the CLI started itself); PLAIN: anything else."""
     host = echoed(ev, "user_message_uuid", "user_message_uuids") & written
+    turns = ev.get("num_turns")
+    counted = isinstance(turns, int) and not isinstance(turns, bool)
+    foreign = not host and origin_not_human(ev) and counted and turns >= 1
     if current is not None and current in host:
         return OWNED
     if current is not None and ev.get("is_error") is True:
-        return FAILED if delivered else HELD_ERROR
+        if delivered:
+            return FAILED
+        if not foreign:
+            return HELD_ERROR
+        # Positive foreign terminal evidence (a notification's turn of one or more turns ending, in error too) while
+        # M is not delivered: the CLI's own turn ended, whatever its outcome (C3-01).
     if host:
         return SETTLED
-    turns = ev.get("num_turns")
-    if origin_not_human(ev) and isinstance(turns, int) and not isinstance(turns, bool):
+    if origin_not_human(ev) and counted:
         if turns == 0:
             return NON_TURN
         if turns >= 1:
@@ -455,7 +462,12 @@ class ClaudeSession:
         """This process incarnation is attributed by evidence (module text)."""
         return self._verified is True and not self._dead
 
-    barrier_before_first_byte = True    # the host rechecks `holds_turns` before a staged turn's first byte
+    @property
+    def barrier_before_first_byte(self) -> bool:
+        """The host tracks where a staged turn starts, rechecks `holds_turns` before its first byte and tells this
+        adapter when it is delivered: only while this incarnation can still be verified (some version VERIFIED, and
+        no `init` or deviation said otherwise). With VERIFIED empty the host's write path is main's, untouched."""
+        return bool(VERIFIED) and self._verified is not False and not self._dead
 
     def delivered(self) -> None:
         """The host wrote every byte of the turn last staged (`turn`): only now can an error that does not list it
@@ -593,7 +605,8 @@ class ClaudeSession:
                      self.session_id)
             return None
         if cls == NON_TURN:
-            if self._bracket == UNATTRIBUTED and not self._activity and ev.get("is_error") is False:
+            if (self._bracket == UNATTRIBUTED and not self._activity and ev.get("subtype") == "success"
+                    and ev.get("is_error") is False and ev.get("num_turns") == 0):
                 # An unmarked `init` and a successful zero-turn notification with no model activity between them: a
                 # no-query notification (a background Agent's quota denial, say), not a turn. It ends the bracket.
                 self._bracket, self._competing = None, False

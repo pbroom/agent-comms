@@ -766,11 +766,17 @@ def test_the_allowance_takes_only_valid_envelopes_for_the_right_line():
                 {"type": "user", "message": {"role": "user", "content": ["x"]}, "uuid": v},
                 {"type": "assistant", "message": {"role": "user", "content": "x"}, "uuid": v}):
         assert g.allowed("stdin", json.dumps(bad), removed) == json.dumps(bad)
-    life = json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued", "session_id": "s"})
+    frame = "00000001-0000-4000-8000-000000000001"
+    life = json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued", "uuid": frame,
+                       "session_id": "s"})
     assert g.allowed("transcript", life, removed, u) is None
     for line, expected in ((life, v), (life, None),
                            (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "odd",
-                                        "session_id": "s"}), u)):
+                                        "uuid": frame, "session_id": "s"}), u),
+                           (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued",
+                                        "session_id": "s"}), u),
+                           (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued",
+                                        "uuid": u, "session_id": "s"}), u)):
         assert g.allowed("transcript", line, removed, expected) == line
     res = {"type": "result", "subtype": "success", "result": "ok"}
     echo = json.dumps(res | {"user_message_uuid": u, "user_message_uuids": [u]})

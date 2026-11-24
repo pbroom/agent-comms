@@ -193,8 +193,10 @@ def allowed(kind: str, line: str, removed: list, expected: str | None = None) ->
     if expected is None:
         return line
     if ev.get("type") == "command_lifecycle":
-        if (list(ev) == ["type", "command_uuid", "state", "session_id"] and ev["command_uuid"] == expected
-                and ev["state"] in STATES and isinstance(ev["session_id"], str)):
+        # the native envelope (2.1.330, the probe runs): its five keys in this order, its own frame uuid
+        if (list(ev) == ["type", "command_uuid", "state", "uuid", "session_id"] and ev["command_uuid"] == expected
+                and ev["state"] in STATES and isinstance(ev["session_id"], str)
+                and re.fullmatch(UUID, ev["uuid"] or "") and ev["uuid"] != expected):
             removed.append(("lifecycle", expected))
             return None
         return line
@@ -234,15 +236,24 @@ def _sequences(env, out: dict, allow: bool) -> None:
     def u_of(sid):
         return line_id(proc_of(env, sid)[1])
 
-    def echo(sid, list_too=True):
-        u = u_of(sid)
+    def echo(sid, list_too=True, u=None):
+        u = u or u_of(sid)
         return ({"user_message_uuid": u} if not list_too else {"user_message_uuid": u, "user_message_uuids": [u]}
                 ) if u else {}
 
-    def life(state):
+    frames = iter(range(1, 10 ** 6))
+
+    def life(state, u=None):
+        """A lifecycle row as 2.1.330 writes it (its own frame uuid, made here: never from uuid4, which the
+        recording makes deterministic for the board's ids). `u`: the line it is for, when it is not the latest."""
         def frame(sid):
-            u = u_of(sid)
-            return {"type": "command_lifecycle", "command_uuid": u, "state": state, "session_id": sid} if u else None
+            line = u or u_of(sid)
+            if not line:
+                return None
+            k = next(frames)
+            ev = {"type": "command_lifecycle", "command_uuid": line, "state": state,
+                  "uuid": "%08x-0000-4000-8000-%012x" % (k, k), "session_id": sid}
+            return ev, line
         return frame
 
     def init(sid, echo_=True):
@@ -259,8 +270,8 @@ def _sequences(env, out: dict, allow: bool) -> None:
         return lambda sid: {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "text", "text": text}]}, "parent_tool_use_id": None, "session_id": sid} | echo(sid)
 
-    def res(sid, text, echo_=True, **kw):
-        return result(sid, text=text, **kw) | (echo(sid) if echo_ else {})
+    def res(sid, text, echo_=True, u=None, **kw):
+        return result(sid, text=text, **kw) | (echo(sid, u=u) if echo_ else {})
 
     def turn(text, *middle, end=None):
         """A whole turn as 2.1.330 writes it: lifecycle queued and started, init, thinking, the reply, (middle),
@@ -288,9 +299,10 @@ def _sequences(env, out: dict, allow: bool) -> None:
         proc = proc_of(env, sid)[1]
         for f in frames:
             ev = f(sid) if callable(f) else f
+            ev, line = ev if isinstance(ev, tuple) else (ev, line_id(proc))     # (the frame, the line it is for)
             if ev is not None:      # (a lifecycle row exists only for a line with a uuid: the pass is taken anyway)
                 proc.emit(ev)
-                EMITTED.setdefault(sid, []).append((json.dumps(ev), line_id(proc)))
+                EMITTED.setdefault(sid, []).append((json.dumps(ev), line))
             tick(env)
         seq[name] = show(env, sid)
 
@@ -318,10 +330,12 @@ def _sequences(env, out: dict, allow: bool) -> None:
     tick(env)
     proc = proc_of(env, sid)[1]
     [req] = [json.loads(x) for x in proc.stdin.split(b"\n") if x and json.loads(x).get("type") == "control_request"]
+    interrupted = line_id(proc)     # captured BEFORE the abort: its passes may write the replacement's line
     step("restart_aborted", {"type": "control_response", "response": {
         "subtype": "success", "request_id": req["request_id"], "response": {"still_queued": []}}},
-        lambda s: res(s, None, subtype="error_during_execution", is_error=True) | {"terminal_reason": "aborted_tools"},
-        life("cancelled"))
+        lambda s: (res(s, None, u=interrupted, subtype="error_during_execution", is_error=True)
+                   | {"terminal_reason": "aborted_tools"}, interrupted),
+        life("cancelled", u=interrupted))
     step("restart_message", *turn("replaced"))
     seq["auto_send"] = send(sid, "seq auto", mode="auto")
     tick(env)

@@ -155,6 +155,7 @@ class Session:
     held_for: str | None = None
     turn_at: int | None = None
     recovered: set = field(default_factory=set)
+    held_staged: str | None = None      # the staged message the barrier held (its write timer then starts again)
     fresh_start: bool = False           # the provider refused to resume its session: the next process starts a new one
     interrupted_at: float | None = None
     stopping_since: float | None = None
@@ -1097,8 +1098,8 @@ class SessionHost:
     def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent]) -> None:
         if s.busy_since is None:
             return
-        if self._staged_held(s):
-            return      # its own deadline is the barrier's (`_barrier`); the write timer starts again when it goes
+        if self._staged_hold(s, now):
+            return      # its own deadline is the barrier's (`_barrier`); the write timer starts again when it ends
         if s.interrupted_at is not None:
             if now - s.interrupted_at >= self.kill_grace:     # the provider's own interrupt did not end the turn
                 self._fail(s, self._timeout_detail(), out)
@@ -1190,10 +1191,21 @@ class SessionHost:
         whose host behaviour differs from main's."""
         return s.child is not None and getattr(s.provider, "verified", False) is True
 
-    def _staged_held(self, s: Session) -> bool:
-        """A staged turn none of whose bytes is written waits behind the barrier (`_barrier`, staged)."""
-        return (s.writing is not None and s.turn_at is not None and s.held_for == s.writing.id
-                and self._correlated(s))
+    def _staged_hold(self, s: Session, now: float) -> bool:
+        """A staged turn none of whose bytes is written, behind the barrier as the LIVE bracket says (`holding`, a
+        verified Claude incarnation only): True, its ordinary write timer is suspended, and the message is marked
+        held (`held_staged`). However the hold ends (the CLI's turn ended, the process lost its verification, ...),
+        the write timer starts again from that moment, before any timeout is looked at. `turn_at` is tracked only
+        for an adapter that asks (`barrier_before_first_byte`): never for Codex, nor for Claude with VERIFIED
+        empty."""
+        if s.writing is None or s.turn_at is None:
+            return False
+        if self.holding(s):
+            s.held_staged = s.writing.id
+            return True
+        if s.held_staged == s.writing.id:
+            s.busy_since, s.held_staged = now, None
+        return False
 
     HELD = "the agent was busy with a turn of its own for {m:g} minutes; the message was not written"
 
@@ -1423,10 +1435,22 @@ class SessionHost:
                 # restart). If the provider never got the turn, the resume is refused and that is said out loud.
                 s.resume, s.fresh_start = True, False
                 self._record_provider_id(s.session_id, s.provider_id)
-            s.turn_at = len(s.outbuf)       # none of the turn is written yet
+            # Where the turn starts, while none of it is written: only for an adapter that asks (Claude while it
+            # can be verified), so main's write path is untouched otherwise.
+            s.turn_at = len(s.outbuf) if getattr(s.provider, "barrier_before_first_byte", False) else None
             for data in s.provider.turn(s.writing.text, kind=s.writing.kind):
                 s.outbuf += data
             self._save_state()      # the turn is on record before its first byte is written
+        if s.writing is not None and s.unbound and s.turn_at is not None and self.holding(s):
+            # The binding changed while the staged turn, not one byte of which is written, waits behind the barrier:
+            # it goes back, untouched, to the front of the inbox, and the binding path above restarts the process
+            # when it may (C3-04). Nothing of it reached the process, so it cannot arrive twice.
+            log.info("session %s: its binding changed while a held turn waited; it waits for the restart",
+                     s.session_id)
+            s.outbuf.clear()
+            s.inbox.appendleft(s.writing)
+            s.writing = s.busy_since = s.turn_at = s.held_staged = None
+            return
         if s.writing is not None and s.unbound:
             # The binding changed between two writes of one turn (a pipe can take a turn in pieces, over several
             # passes): the rest never goes to the process started with the old one. As for the turn gate below: the
@@ -1454,16 +1478,13 @@ class SessionHost:
             # The barrier again before the FIRST byte of a staged turn, on every attempt (a pipe that took nothing
             # before the CLI began a turn of its own): the turn waits, the bytes before it still go. A line already
             # partly written is completed: it cannot be taken back.
-            was_held = s.held_for == s.writing.id
             if self._barrier(s, now, out, staged=True):
                 if s.writing is None:
                     return      # kept for the next process, or failed: this process is stopping
                 limit = s.turn_at
-            elif was_held:
-                s.busy_since = now      # writing goes on: the write timer starts again
         if s.outbuf and limit > 0:
             try:
-                n = s.child.write(bytes(s.outbuf[:limit]))
+                n = s.child.write(bytes(s.outbuf) if limit == len(s.outbuf) else bytes(s.outbuf[:limit]))
             except OSError as e:
                 # The process no longer reads. A message that was not fully written never reached it; a turn in
                 # flight (an answer to the process could not be written) is lost with the process. During a
@@ -1487,9 +1508,8 @@ class SessionHost:
             s.restart_mark = None
         if not s.outbuf and s.writing is not None:
             s.in_flight, s.writing, s.begun, s.turn_at = s.writing, None, False, None
-            delivered = getattr(s.provider, "delivered", None)
-            if delivered is not None:
-                delivered()     # every byte of it is in the pipe (Claude: only now can rule 10 settle it)
+            if getattr(s.provider, "barrier_before_first_byte", False):
+                s.provider.delivered()      # every byte of it is in the pipe: only now can rule 10 settle it
             out.append(HostEvent(s.session_id, "delivered", s.in_flight.id))
 
     # ------------------------------------------------------------ stopping a process, keeping the session
