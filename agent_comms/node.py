@@ -231,7 +231,7 @@ class Node:
             words = {k: child_words(self.config, template) for k, template in sorted(self.config.runners.items())}
             # 2: spawn too; 3: it also keeps a full-access session's parent up while the hub says results wait for
             # that session (node_sessions `results_waiting`), so a session may be started under a full-access child;
-            # 4: it restarts a turn in flight (node_sessions SESSION_PROTOCOL)
+            # 4: it restarts a turn in flight; 5: it steers into one (node_sessions SESSION_PROTOCOL)
             from .node_sessions import SESSION_PROTOCOL
             body["session_host"] = {"tree": SESSION_PROTOCOL, "runners": {k: w for k, w in words.items() if w}}
             dirs = {k: runner_dir(self.config.runners[k]) for k in body["session_host"]["runners"]}
@@ -241,6 +241,7 @@ class Node:
         if usage:       # only for a hub whose last answer asked (`report_usage`: it has account pools)
             body["usage"] = usage
         optional = [k for k in ("usage", "homes") if k in body]     # newest first: what an older hub refuses
+        sent = self.clock()     # its SEND time: an acknowledged hello renews the sessions' write authority from it
         while True:
             try:
                 out = self._call("POST", "/api/nodes/hello", json=body)
@@ -264,6 +265,8 @@ class Node:
         # pools; an older hub never does. Read from each answer, so a hub that stops asking gets none.
         self.report_usage = isinstance(out, dict) and out.get("report_usage") is True
         self.last_hello = self.clock()
+        if self.sessions is not None:
+            self.sessions.note_hello(sent)      # (node_sessions: a steer's write authority, from the send time)
         return out
 
     def _report(self, run_id: str, state: str, **fields) -> dict | None:

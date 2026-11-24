@@ -50,6 +50,20 @@ Rules the hub relies on:
   ordinary queued message it is: handed over by the ordinary path once the turn has ended, under the ordinary
   watermark. Reports say what the session's adapter can do (`modes`) and carry `restarted_by` on a turn's end, to a
   hub that names the feature `restart` in its listing.
+- Steering (`tree` 5; DESIGN_NOTES "Mid-turn steering, loose contract", parts E and G). A hub that has it lists a
+  steer S on its session's entry (`steer`: N, S's uuid, its text), only from an offer it revalidated in that
+  listing's own transaction. This loop passes it to the host (`steer_offer`) with whether the node's WRITE AUTHORITY
+  held for that offer, and passes an omission (any applied listing that does not list S) as a revocation for good
+  (`steer_revoke`). Write authority: the node's contact is fresh by the hub's own evidence, its last hub-acknowledged
+  hello (`note_hello`), or report whose answer names N as the session's turn in flight, SENT under
+  STEER_CONTACT_SECONDS before (listing GETs do not count). An offer is used only if the fetch that brought it was
+  sent while that held and it has not lapsed since, and the fetch's age on the monotonic clock is under
+  STEER_OFFER_AGE when its answer is read; it must still hold at every write (`_steer_authority`). Loss is one-way:
+  the deadline watchdog revokes a steer whose contact lapsed (`_steer_watch`) and cuts a frame half written past
+  its limit (session_host.steer_deadlines). The text is held to the hub's cap again (STEER_MAX_BYTES). While a steer
+  is held, the session's status is posted at least every STEER_STATUS_SECONDS. A turn's end carries the host's
+  `steer` outcome to a hub that names `steer`; to any other it goes at once without it, and a 422 sends it again
+  without it (`_for_hub`, the 422 path).
 - A child runs only under its parent AS THE PARENT IS HERE NOW. Roots are reconciled first; a child is opened, and
   handed a turn, only while its parent is open on this node and has at least the child's access (`_parent_problem`).
   The hub's stored words are not enough: this machine's runner may have been edited since. Otherwise the child is
@@ -116,7 +130,11 @@ JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
-SESSION_PROTOCOL = 4        # `tree` on every fetch and hello: 2 spawn, 3 the hold, 4 restart (hosted_tree)
+SESSION_PROTOCOL = 5        # `tree` on every fetch and hello: 2 spawn, 3 the hold, 4 restart, 5 steer (hosted_tree)
+STEER_CONTACT_SECONDS = 75.0    # write authority: the last hub-acknowledged hello or report naming N, sent within this
+STEER_OFFER_AGE = 20.0          # ... and an offer is used only from a fetch younger than this when its answer is read
+STEER_STATUS_SECONDS = 20.0     # while a steer is held, the session's status is posted at least this often
+STEER_MAX_BYTES = 12_288        # hosted_steer.STEER_MAX_BYTES (named here, so the node does not import the hub's module)
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 WORKTREES_FILE = "node-session-worktrees.json"   # session id -> {path, checkout}: a child session's own worktree
 SWEEP_SECONDS = 3600.0      # how often the worktrees of sessions that are gone are looked at again
@@ -157,6 +175,14 @@ class SessionRunner:
         self.host.admit = lambda s: self._admit(s, starting=True)    # every process start takes a slot here
         self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
         self.host.may_start_query = self._may_start_query   # the same, with no side effect (turn correlation's)
+        self.host.steer_authority = self._steer_authority     # ... and no steer byte without the node's write authority
+        # Write authority for steers (the module text): when the last hub-acknowledged hello was SENT (node.py says it,
+        # `note_hello`), and per session the send time of the last acknowledged report and the turn in flight its
+        # answer named; `fetch_contact`: those as they stood when the latest fetch was sent.
+        self.hello_ack = float("-inf")
+        self.report_ack: dict[str, tuple[float, Any]] = {}
+        self.fetch_contact: tuple[float, dict] = (float("-inf"), {})
+        self.steer_seen: dict[str, float] = {}      # session id -> the contact its held steer's authority rests on
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
@@ -327,6 +353,8 @@ class SessionRunner:
                   "answered": bool(e.answered)}     # the provider itself ended it (HostEvent.answered)
             if isinstance(e.restarted_by, str) and e.restarted_by.isdigit():
                 d["restarted_by"] = int(e.restarted_by)     # the provider said that restart's interrupt ended it
+            if isinstance(e.steer, dict):
+                d["steer"] = dict(e.steer)      # the host's word on the steer into this turn (never waits: `_takes`)
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
@@ -334,7 +362,7 @@ class SessionRunner:
         return d
 
     # Sent only to a hub whose listing names their feature (hosted.NODE_REPORT_FEATURES): field -> feature.
-    OPTIONAL_FIELDS = {"answered": "answered", "restarted_by": "restart"}
+    OPTIONAL_FIELDS = {"answered": "answered", "restarted_by": "restart", "steer": "steer"}
 
     def _for_hub(self, event: dict) -> dict:
         """The event as this hub takes it: without a field it has not named in its listing's `features`."""
@@ -426,10 +454,13 @@ class SessionRunner:
                 # The access the session really has here and a child's own worktree, for a hub that asked.
                 body |= {k: v for k, v in self.tree.get(sid, {}).items() if v is not None}
                 if "restart" in self.hub_features:
-                    body["modes"] = list(status[4])     # what its adapter can do with a turn in flight now
+                    # what its adapter can do with a turn in flight now (`steer` only to a hub that steers)
+                    body["modes"] = [m for m in status[4] if m != "steer" or "steer" in self.hub_features]
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
-                self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
+                answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                self.report_ack[sid] = (sent, answer.get("in_flight") if isinstance(answer, dict) else None)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
@@ -524,6 +555,7 @@ class SessionRunner:
         if ok and (wait or not self.fresh or self.clock() - self.last_sync >= self.sync_seconds):
             try:
                 fetch_sent = self.clock()
+                self.fetch_contact = (self.hello_ack, dict(self.report_ack))    # as it stood when the fetch was sent
                 data = self._sync(wait)
                 self.last_sync = self.clock()
             except Exception as e:
@@ -540,13 +572,14 @@ class SessionRunner:
                 return ok
             now = self.clock()
             if data is not None:
-                self._reconcile(data)
+                self._reconcile(data, fetch_sent)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
                 # above): what waits in an inbox may start again, in `tick` below. Only a listing from a fetch SENT
                 # after the latch was set: one sent before may have been built before the hub decided.
                 self._unlatch(fetch_sent, now)
             if self._silent(now):
                 self._emit(self.host.stop_turns(self._self_stop_detail()))
+            self._steer_watch(now)
             if self.fresh:
                 self._hand_over(now)
             self._park_idle(now)
@@ -567,7 +600,7 @@ class SessionRunner:
         ids = [m.id for m in s.inbox] + [m.id for m in (s.writing, s.in_flight) if m is not None]
         return {int(i) for i in ids if i.isdigit()}
 
-    def _reconcile(self, data: dict) -> None:
+    def _reconcile(self, data: dict, fetch_sent: float | None = None) -> None:
         if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
             log.warning("the hub's session list is not one; ignoring it")     # never read as "no sessions"
             return
@@ -677,7 +710,11 @@ class SessionRunner:
                                     "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
             self.queue[sid] = queue
+            self._steer_listed(sid, view, fetch_sent)
         for sid, s in self.host.sessions.items():
+            live = self.host.steer_live(sid)
+            if live is not None and sid not in listed:
+                self.host.steer_revoke(sid, live[1], "omitted")     # not listed at all: an omission too
             if sid not in listed and not s.ended:
                 # The hub ended it (closed while this node was away, or its record is gone): it must not go on.
                 self.dropped.add(sid)
@@ -703,8 +740,9 @@ class SessionRunner:
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
         named = data.get("features")
         features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
-        if "restart" in features and "restart" not in self.hub_features:
-            self.reported.clear()       # a hub that takes `modes` now: every session says it again
+        if ("restart" in features and "restart" not in self.hub_features) or (
+                "steer" in features and "steer" not in self.hub_features):
+            self.reported.clear()       # a hub that takes `modes` (or `steer` in them) now: every session says it again
         self.hub_features, self.features_known = features, True
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
@@ -980,12 +1018,92 @@ class SessionRunner:
                 self.status[sid] = (s.state, getattr(s.child, "pid", None), bool(s.resume), self._own_id(s),
                                     self.host.modes(sid))
                 self._tree_now(sid, s)      # a root's ceiling changes when its process confirms full access
+                if (self.host.steer_live(sid) is not None
+                        and now - self.report_ack.get(sid, (float("-inf"),))[0] >= STEER_STATUS_SECONDS):
+                    self.reported.pop(sid, None)    # a steer is held: its status goes again (part E), renewing contact
 
     @staticmethod
     def _own_id(s) -> str | None:
         """The provider's id for the session when it issued one of its own (Codex's thread id). Claude's is the
         session id, which the hub has: nothing is added to its reports."""
         return s.provider_id if s.provider_id != s.session_id else None
+
+    # ------------------------------------------------------------ write authority for steers (the module text)
+
+    def note_hello(self, sent: float) -> None:
+        """node.py: a hello the hub acknowledged, SENT at `sent` (this loop's clock)."""
+        self.hello_ack = max(self.hello_ack, sent)
+
+    def _steer_contact(self, sid: str, n: int, hello: float, reports: dict) -> float:
+        """The send time of the latest hub-acknowledged evidence that this node holds N: a hello, or a report on the
+        session whose answer named N as its turn in flight."""
+        sent, in_flight = reports.get(sid, (float("-inf"), None))
+        return max(hello, sent if in_flight == n else float("-inf"))
+
+    def _steer_check(self, sid: str, n: int, now: float) -> bool:
+        """The write authority for N holds NOW, and has held without a break since it was granted (`steer_seen`: the
+        contact it last rested on). A break is a later acknowledgement sent STEER_CONTACT_SECONDS or more after the
+        one before it: a late acknowledgement never erases a stale interval (R7-05). False is for good: the caller
+        revokes."""
+        prev = self.steer_seen.get(sid)
+        latest = self._steer_contact(sid, n, self.hello_ack, self.report_ack)
+        if (prev is None or latest - prev >= STEER_CONTACT_SECONDS or now - latest >= STEER_CONTACT_SECONDS
+                or self._silent(now)):
+            return False
+        self.steer_seen[sid] = latest
+        return True
+
+    def _steer_authority(self, s) -> bool:
+        """The host asks this before every write of a steer's bytes: the node's write authority holds NOW for the
+        session's turn in flight N (part E (iii)); lost, it is lost for good."""
+        slot = s.steer
+        if slot is None or not slot.into.isdigit():
+            return False
+        if self._steer_check(s.session_id, int(slot.into), self.clock()):
+            return True
+        self.host.steer_revoke(s.session_id, slot.uuid, "contact")
+        return False
+
+    def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None) -> None:
+        """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or
+        an omission (the held steer is revoked for good)."""
+        item = view.get("steer")
+        live = self.host.steer_live(sid)
+        ok = (isinstance(item, dict) and type(item.get("into")) is int and isinstance(item.get("uuid"), str)
+              and 0 < len(item["uuid"]) <= 64 and isinstance(item.get("text"), str) and item["text"].strip() != "")
+        if not ok:
+            if live is not None:
+                self.host.steer_revoke(sid, live[1], "omitted")
+            return
+        if live is not None and live[1] != item["uuid"]:
+            self.host.steer_revoke(sid, live[1], "omitted")
+        now, n = self.clock(), item["into"]
+        hello, reports = self.fetch_contact
+        # (i) the fetch was sent while contact held and (ii) that has not lapsed since: the contact known when it was
+        # sent is still within STEER_CONTACT_SECONDS now (and from then on `_steer_check` holds it to no break);
+        # (iv) the fetch is young enough now that its answer is read; (iii) is asked before every write.
+        at_fetch = self._steer_contact(sid, n, hello, reports)
+        contact = (fetch_sent is not None and fetch_sent - at_fetch < STEER_CONTACT_SECONDS
+                   and now - at_fetch < STEER_CONTACT_SECONDS and not self._silent(now))
+        if contact and (live is None or live[1] != item["uuid"]):
+            self.steer_seen[sid] = at_fetch     # the contact this offer rests on (a later one must not break it)
+        authorized = contact and now - fetch_sent < STEER_OFFER_AGE and self._steer_check(sid, n, now)
+        big = len(json.dumps(item["text"]).encode()) > STEER_MAX_BYTES
+        try:
+            self.host.steer_offer(sid, str(n), item["uuid"], item["text"], authorized=authorized and not big,
+                                  refused="too_big" if big else None)
+        except (LookupError, ValueError) as e:
+            log.warning("session %s: a steer offer could not be taken: %s", sid, e)
+
+    def _steer_watch(self, now: float) -> None:
+        """Loss is one-way: a held steer whose contact lapsed is revoked for good. Called by the loop and by the
+        deadline watchdog, on acknowledged SEND times."""
+        for sid in list(self.host.sessions):
+            live = self.host.steer_live(sid)
+            if live is None:
+                self.steer_seen.pop(sid, None)
+            elif live[0].isdigit() and not self._steer_check(sid, int(live[0]), now):
+                self.host.steer_revoke(sid, live[1], "contact")
 
     # ------------------------------------------------------------ the deadlines, off the hub-I/O path
 
@@ -1065,6 +1183,8 @@ class SessionRunner:
                     log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop held "
                                 "its lock that long (limit e)", now - due)
                 self.watched += stopped
+            self._steer_watch(now)
+            self.watched += self.host.steer_deadlines()     # a half-written steer frame past its limit is cut
             for sid, at in self.host.kill_due():
                 if now - at > allowed:
                     log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the session "
@@ -1102,6 +1222,11 @@ class SessionRunner:
         node can go on to stop its ordinary runs at once (node.run); `shutdown()` does the rest."""
         self.stopping.set()
         with self.lock:
+            # Every session holding a steer attempt is drained first: a native end already in its pipe counts.
+            try:
+                self.watched += self.host.drain()
+            except Exception:
+                log.exception("could not drain the sessions holding a steer")
             for s in self.host.sessions.values():
                 if s.child is not None:
                     try:
