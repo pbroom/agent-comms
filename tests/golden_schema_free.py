@@ -72,7 +72,7 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
 
     def recorded_tick():
         got = real_tick()
-        events.extend(dataclasses.asdict(e) for e in got)
+        events.append([dataclasses.asdict(e) for e in got])     # one list per pass: the tick boundaries kept
         return got
 
     host.tick = recorded_tick
@@ -140,6 +140,7 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
         "SELECT key, value FROM board_state WHERE key LIKE 'host.session.%' OR key LIKE 'host.msg.%' OR key LIKE "
         "'host.result.%' OR key LIKE 'host.outbox.%' ORDER BY key")}
     _sequences(env, out, allow)
+    _host_cases(tmp_path, out, allow)
     out["host_events"] = events
     out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:")]
     return normalized(out, tmp_path)
@@ -158,20 +159,56 @@ ECHO = re.compile(r', "user_message_uuid": "' + UUID + r'"|, "user_message_uuids
 LIFECYCLE = '{"type": "command_lifecycle", '
 
 
-def allowed(kind: str, line: str, removed: list) -> str | None:
-    """A raw line with the allowance taken out (`removed` keeps every fragment taken), or None: a whole row taken."""
+STATES = ("queued", "started", "completed", "cancelled")
+# The Claude envelopes that carry echo fields for a line, and which ones (as 2.1.330 writes them).
+ECHOING = {("system", "init"): ("user_message_uuids",), ("assistant", None): ("user_message_uuid", "user_message_uuids"),
+           ("system", "thinking_tokens"): ("user_message_uuid",),
+           ("result", None): ("user_message_uuid", "user_message_uuids")}
+SEEN: set = set()       # every line uuid the allowance took, in this run (each must be fresh)
+
+
+def allowed(kind: str, line: str, removed: list, expected: str | None = None) -> str | None:
+    """A raw line with the allowance taken out (`removed` keeps every fragment taken), or None: a whole row taken.
+    Only from a valid Claude envelope of a kind that carries it, and only for the right line: a user line
+    `{"type": "user", "message": {"role": "user", "content": <str>}, "uuid": <fresh uuid4>}` (its uuid, last); a
+    lifecycle row of exactly its four keys naming `expected` (the uuid of the line the frame was written for, in its
+    process and turn); an init, assistant, thinking or result frame whose echo fields are exactly [`expected`]. Any
+    other line, however similar, is kept as it is, so it differs from main's."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(ev, dict):
+        return line
     if kind == "stdin":
-        m = LINE_UUID.search(line) if line.startswith('{"type": "user"') else None
-        if m:
-            removed.append(("stdin", m.group(0)))
+        m = LINE_UUID.search(line)
+        u = ev.get("uuid")
+        if (m and list(ev) == ["type", "message", "uuid"] and ev["type"] == "user" and u not in SEEN
+                and ev["message"] == {"role": "user", "content": ev["message"].get("content")}
+                and isinstance(ev["message"].get("content"), str) and m.group(0) == f', "uuid": "{u}"}}'):
+            SEEN.add(u)
+            removed.append(("stdin", u))
             return line[:m.start()] + "}"
         return line
-    if line.startswith(LIFECYCLE):
-        removed.append(("lifecycle", line))
-        return None
-    for m in ECHO.finditer(line):
-        removed.append(("echo", m.group(0)))
-    return ECHO.sub("", line)
+    if expected is None:
+        return line
+    if ev.get("type") == "command_lifecycle":
+        if (list(ev) == ["type", "command_uuid", "state", "session_id"] and ev["command_uuid"] == expected
+                and ev["state"] in STATES and isinstance(ev["session_id"], str)):
+            removed.append(("lifecycle", expected))
+            return None
+        return line
+    fields = ECHOING.get((ev.get("type"), ev.get("subtype") if ev.get("type") == "system" else None))
+    if not fields or not set(fields) <= set(ev) or list(ev)[-len(fields):] != list(fields):
+        return line
+    want = {"user_message_uuid": expected, "user_message_uuids": [expected]}
+    if any(ev[f] != want[f] for f in fields):
+        return line
+    stripped = ECHO.sub("", line)
+    if json.loads(stripped) != {k: v for k, v in ev.items() if k not in fields}:
+        return line
+    removed.extend(("echo", expected) for _ in fields)
+    return stripped
 
 
 REMOVED: list = []      # what the last run with `allow` took out (for the test that the allowance is only that)
@@ -186,6 +223,9 @@ def _sequences(env, out: dict, allow: bool) -> None:
     from test_hosted_sessions import P2, P3, codex_handshake, codex_turn, show, start, tick
     from test_hosted_tree import as_started, began, proc_of
     from test_session_host import result
+    REMOVED.clear()
+    SEEN.clear()
+    EMITTED.clear()
 
     def line_id(proc):
         users = [json.loads(x) for x in proc.stdin.split(b"\n") if x and json.loads(x).get("type") == "user"]
@@ -248,9 +288,10 @@ def _sequences(env, out: dict, allow: bool) -> None:
         proc = proc_of(env, sid)[1]
         for f in frames:
             ev = f(sid) if callable(f) else f
-            if ev is not None:
+            if ev is not None:      # (a lifecycle row exists only for a line with a uuid: the pass is taken anyway)
                 proc.emit(ev)
-                tick(env)
+                EMITTED.setdefault(sid, []).append((json.dumps(ev), line_id(proc)))
+            tick(env)
         seq[name] = show(env, sid)
 
     def next_message(text, **body):
@@ -329,17 +370,128 @@ def _sequences(env, out: dict, allow: bool) -> None:
         "SELECT key, value FROM board_state WHERE key LIKE 'host.session.%' OR key LIKE 'host.msg.%' ORDER BY key")
         if any(i in k for i in ids)}
     out["seq_listing"] = env.laptop.get("/api/nodes/sessions", params={"tree": 4}).json()
-    REMOVED.clear()
-
-    def raw_lines(kind, data: bytes) -> list:
-        lines = data.decode().split("\n")
-        if allow:
-            lines = [x for x in (allowed(kind, line, REMOVED) for line in lines) if x is not None]
-        return lines
-
-    out["stdin"] = [raw_lines("stdin", proc.stdin) for proc in env.node.session_spawner.children]
+    out["stdin"] = [raw_lines("stdin", proc.stdin, allow) for proc in env.node.session_spawner.children]
     sessions = env.node.log_dir / "sessions"
-    out["transcripts"] = {p.name: raw_lines("transcript", p.read_bytes()) for p in sorted(sessions.glob("*.jsonl"))}
+    out["transcripts"] = {p.name: raw_lines("transcript", p.read_bytes(), allow, EMITTED.get(p.name[:-6], []))
+                          for p in sorted(sessions.glob("*.jsonl"))}
+
+
+EMITTED: dict = {}      # session id -> [(the frame as emitted, the uuid of the line it was written for)], in order
+
+
+def raw_lines(kind: str, data: bytes, allow: bool, emitted=()) -> list:
+    """Raw lines, the allowance taken out when `allow`. A transcript line is paired with the frame the run emitted
+    for it (the same bytes, in order), which says which line, of which process and turn, it may echo."""
+    lines = data.decode().split("\n")
+    if not allow:
+        return lines
+    out, queue = [], list(emitted)
+    for line in lines:
+        expected = None
+        # the next emitted frame with these very bytes (a frame a stopped process never had read is skipped)
+        j = next((i for i, (sent, _) in enumerate(queue) if sent == line), None)
+        if j is not None:
+            expected, queue = queue[j][1], queue[j + 1:]
+        kept = allowed(kind, line, REMOVED, expected)
+        if kept is not None:
+            out.append(kept)
+    return out
+
+
+def _host_cases(tmp_path: Path, out: dict, allow: bool) -> None:
+    """Host-level cases, pass by pass, through a SessionHost of fake processes and a fake clock (as
+    tests/test_session_host.py drives one): Codex's own turn with a replacement waiter and with a changed binding
+    (main's `_held`, kept as it is: a cancelled waiter's clock is inherited, a changed binding has no deadline), and
+    Claude's tick boundaries: a pipe that takes nothing, a partly written line, a write timer running out. Recorded:
+    every pass's events, and each process's raw stdin."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from agent_comms.dispatch import DispatchConfig
+    from conftest import PROJECT, FakeClock
+    import test_providers_codex as cx
+    from test_dispatch import FakeProcs, FakeSpawner
+    from test_session_host import SHIPPED, SID, FakeSessionChild, codex_host, codex_ready, init, make_host, result
+
+    def env_for(name):
+        work = tmp_path / f"host-{name}"
+        work.mkdir()
+        henv = SimpleNamespace(clock=FakeClock(), work=str(work), log_dir=tmp_path / f"host-{name}-logs", signals=[],
+                               groups=set())
+        henv.config = DispatchConfig.from_dict({"runners": {"claude-code": SHIPPED},
+                                                "worktrees": {PROJECT: str(work)}, "timeout_minutes": 30,
+                                                "kill_grace_seconds": 10})
+        henv.spawner = FakeSpawner(child=FakeSessionChild)
+        henv.procs = FakeProcs(henv.spawner)
+        return henv
+
+    cases: dict = {}
+
+    def run(name, host, henv, script):
+        passes = []
+        for action in script:
+            action()
+            passes.append([dataclasses.asdict(e) for e in host.tick()])
+        cases[name] = {"passes": passes,
+                       "stdin": [raw_lines("stdin", c.stdin, allow) for c in henv.spawner.children]}
+
+    def codex_busy(name):
+        henv = env_for(name)
+        host, sess = codex_host(henv)
+        host.send(SID, "first", message_id="a")
+        host.tick()
+        child = henv.spawner.children[-1]
+        codex_ready(host, child)
+        host.tick()
+        child.emit(cx.reply(3, cx.TURN_REPLY), cx.TURN_STARTED, cx.message("one"), cx.completed())
+        host.tick()
+        child.emit(cx.own_turn("turn/started"))
+        return henv, host, sess, child
+
+    henv, host, sess, child = codex_busy("codex-replacement")
+    run("codex_replacement_waiter", host, henv, [
+        lambda: host.send(SID, "waits", message_id="b"), lambda: henv.clock.advance(29 * 60),
+        lambda: host.cancel(SID, "b", "cancelled"), lambda: host.send(SID, "next", message_id="c"),
+        lambda: henv.clock.advance(2 * 60), lambda: henv.clock.advance(30 * 60)])
+    henv, host, sess, child = codex_busy("codex-binding")
+    run("codex_changed_binding", host, henv, [
+        lambda: setattr(sess, "bind", "a" * 64), lambda: host.send(SID, "waits", message_id="b"),
+        lambda: henv.clock.advance(31 * 60), lambda: henv.clock.advance(31 * 60),
+        lambda: child.emit(cx.own_turn("turn/completed", status="completed"))])
+
+    def claude(name, child=FakeSessionChild):
+        henv = env_for(name)
+        henv.spawner = FakeSpawner(child=child)
+        henv.procs = FakeProcs(henv.spawner)
+        host = make_host(henv)
+        host.open(SID, agent="claude", runtime="claude-code", project=PROJECT)
+        return henv, host
+
+    def taking(n):
+        class Child(FakeSessionChild):
+            def __init__(self, pid, exits_on_terminate=True):
+                super().__init__(pid, exits_on_terminate)
+                self.accept = n        # most bytes one write takes, from the start
+        return Child
+
+    henv, host = claude("claude-zero-byte", taking(0))
+    kids = henv.spawner.children
+    run("claude_zero_byte_write", host, henv, [
+        lambda: host.send(SID, "next", message_id="m"), lambda: kids[-1].emit(init()),
+        lambda: setattr(kids[-1], "accept", None), lambda: kids[-1].emit(result(text="its own")),
+        lambda: henv.clock.advance(5)])
+    henv, host = claude("claude-partial", taking(7))
+    kids = henv.spawner.children
+    run("claude_partial_line", host, henv, [
+        lambda: host.send(SID, "a longer line", message_id="m"), lambda: kids[-1].emit(init()),
+        lambda: setattr(kids[-1], "accept", None), lambda: kids[-1].emit(result(text="done"))])
+    henv, host = claude("claude-write-timer")
+    kids = henv.spawner.children
+    run("claude_write_timer", host, henv, [
+        lambda: host.send(SID, "first", message_id="m"), lambda: kids[-1].emit(init(), result()),
+        lambda: (setattr(kids[-1], "accept", 0), host.send(SID, "stuck", message_id="n")),
+        lambda: kids[-1].emit(init()), lambda: henv.clock.advance(30 * 60), lambda: None])
+    out["host_cases"] = cases
 
 def normalized(value, tmp: Path) -> dict:
     """The run's temporary directory and time stamps out (both differ by run), everything else as it is."""

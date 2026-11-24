@@ -21,7 +21,7 @@ from agent_comms.providers import claude
 from agent_comms.providers.claude import OWN, UNATTRIBUTED, ClaudeSession
 from agent_comms.session_host import INTERRUPTED
 
-from test_session_host import ROOT, SID, henv, open_session, real_host, result  # noqa: F401
+from test_session_host import ROOT, SID, FakeSessionChild, henv, make_host, open_session, real_host, result  # noqa: F401
 
 V = "2.1.330"                                       # the version the tests verify (VERIFIED itself ships empty)
 CAPS = ["msg_lifecycle_v1", "interrupt_receipt_v1"]
@@ -121,14 +121,20 @@ def idle_verified() -> ClaudeSession:
     return p
 
 
-def bracket(state: str, written=True):
-    """(adapter, M's uuid or None) with M written (unless not `written`) and the bracket in this state."""
+def bracket(state: str, written=True, delivered=True, activity=True):
+    """(adapter, M's uuid or None) with M written (unless not `written`; delivered, as the host confirms once every
+    byte is written, unless not `delivered`) and the bracket in this state (an unattributed one with model activity
+    seen in it unless not `activity`)."""
     p = idle_verified()
     m = write(p) if written else None
+    if written and delivered:
+        p.delivered()
     if state == "own":
         fed(p, vinit(m))
     elif state == "unattributed":
         fed(p, vinit())
+        if activity:
+            assert raw(p, {"type": "assistant", "session_id": SID, "message": {"content": []}}) == ([], [])
     assert p._bracket == {"none": None, "own": OWN, "unattributed": UNATTRIBUTED}[state]
     return p, m
 
@@ -217,6 +223,37 @@ def test_each_echo_field_alone_is_evidence_with_m_after_an_older_uuid(field):
 
 
 @pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("written", [True, False])
+def test_row_7a_a_no_query_notification_closes_an_unattributed_bracket_with_no_model_activity(written):
+    """An unmarked init and a SUCCESSFUL zero-turn notification with no model activity between them was a no-query
+    notification (a background Agent's quota denial can be one): it ends the bracket; the barrier lifts."""
+    p, _ = bracket("unattributed", written=written, activity=False)
+    assert raw(p, nonturn()) == ([], [])
+    assert p._bracket is None and not p.holds_turns() and p.verified
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("frame", [
+    {"type": "assistant", "session_id": SID, "message": {"content": [{"type": "text", "text": "x"}]}},
+    {"type": "stream_event", "session_id": SID, "event": {}},
+    {"type": "user", "session_id": SID, "message": {"content": [{"type": "tool_result"}]}},
+    {"type": "system", "subtype": "thinking_tokens", "session_id": SID, "estimated_tokens": 5}])
+def test_row_7a_after_any_model_activity_a_zero_turn_notification_stays_inert(frame):
+    p, _ = bracket("unattributed", activity=False)
+    raw(p, frame)
+    assert raw(p, nonturn()) == ([], []) and p._bracket == UNATTRIBUTED and p.holds_turns()
+
+
+@pytest.mark.usefixtures("verified")
+def test_row_7a_only_a_successful_one_and_not_a_replayed_line_or_a_status_frame():
+    p, _ = bracket("unattributed", written=False, activity=False)
+    raw(p, {"type": "user", "isReplay": True, "session_id": SID, "message": {"content": "go"}})
+    raw(p, {"type": "system", "subtype": "status", "session_id": SID, "status": "compacting"})
+    assert raw(p, nonturn(error=True)) == ([], []) and p._bracket == UNATTRIBUTED, "an error does not close it"
+    assert raw(p, nonturn()) == ([], []) and p._bracket is None, "replay and status rows are no model activity"
+
+
+@pytest.mark.usefixtures("verified")
 @pytest.mark.parametrize("state", ["none", "own", "unattributed"])
 def test_row_any_non_turn_success_is_inert_in_every_bracket(state):
     p, m = bracket(state)
@@ -253,9 +290,10 @@ def test_row_none_unmarked_init_opens_an_unattributed_bracket_and_the_barrier_ho
 def test_row_an_init_listing_only_settled_lines_changes_no_bracket(state):
     """C1-03: a late init[A] after A settled opens no barrier against B, and closes none."""
     p, m = bracket(state)
-    before = (p._bracket, p.holds_turns(), p._brackets)
-    assert fed(p, vinit(settled_uuid(p, m))) == [("turn_started", "other")]
-    assert (p._bracket, p.holds_turns(), p._brackets) == before and p.verified
+    before = (p._bracket, p.holds_turns(), p._caps)
+    assert fed(p, vinit(settled_uuid(p, m), caps=None, version=None)) == [("turn_started", "other")]
+    assert (p._bracket, p.holds_turns(), p._caps) == before and p.verified, (
+        "nothing of it is taken, not even missing capabilities or version (C1-03)")
 
 
 @pytest.mark.usefixtures("verified")
@@ -376,6 +414,17 @@ def test_rule_an_error_result_not_listing_m_while_m_is_in_flight_is_ms_by_order(
           "settled": owned(settled_uuid(p, m), subtype="error_during_execution", is_error=True)}[frame]
     assert fed(p, ev) == [("turn_ended", "order")]
     assert not p.verified and p.deviation and not p.holds_turns() and p._current is None
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("state", ["none", "unattributed"])
+@pytest.mark.parametrize("frame", ["plain", "zero_turn", "foreign"])
+def test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket(state, frame):
+    p, m = bracket(state, delivered=False)
+    before = (p._bracket, p.holds_turns(), p._current)
+    ev = {"plain": failed(), "zero_turn": nonturn(error=True), "foreign": foreign(error=True)}[frame]
+    assert raw(p, ev) == ([], [])
+    assert (p._bracket, p.holds_turns(), p._current) == before and p.verified
 
 
 @pytest.mark.usefixtures("verified")
@@ -658,6 +707,120 @@ def test_a_late_result_of_a_settled_line_does_not_release_a_cli_started_bracket(
     assert emit(henv, child, owned(a)) == [] and s.provider.holds_turns() and b'"b"' not in child.stdin
 
 
+class _ZeroPipe(FakeSessionChild):
+    """A process whose stdin takes nothing until the test says so (`accept`)."""
+
+    def __init__(self, pid, exits_on_terminate=True):
+        super().__init__(pid, exits_on_terminate)
+        self.accept = 0
+
+
+@pytest.mark.usefixtures("verified")
+@pytest.mark.parametrize("activity", [True, False])
+def test_c2_01_sols_sequence_an_error_never_lets_a_staged_m_into_the_clis_turn(henv, activity):
+    """Zero-byte write, then an unmarked init (with or without model activity), then a zero-turn notification
+    ERROR: the error is not M's (M is not delivered), it does not end the bracket, and M is not written."""
+    s, child = idle_host(henv)
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    child.accept = None
+    frames = [vinit()] + ([{"type": "assistant", "session_id": SID, "message": {"content": []}}] if activity else [])
+    assert emit(henv, child, *frames, nonturn(error=True)) == []
+    assert b'"next"' not in child.stdin and s.writing.id == "1" and s.provider.verified and s.provider.holds_turns()
+    for frame in (failed(), foreign(error=True)):
+        assert emit(henv, child, frame) == [] and b'"next"' not in child.stdin
+    assert emit(henv, child, foreign()) == [("delivered", "1")], "the CLI's turn really ended: now it goes"
+
+
+@pytest.mark.usefixtures("verified")
+def test_c2_01_rule_10_needs_a_delivered_m(henv):
+    """The same error once M is fully written: M's by order, as main settles it."""
+    s, child = idle_host(henv)
+    _, _, m = started(henv)
+    emit(henv, child, vinit())
+    child.emit(nonturn(error=True))
+    [end] = henv.host.tick()
+    assert (end.message_id, end.ok) == ("1", False) and not s.provider.verified
+
+
+def test_c2_02_the_write_timer_is_suspended_while_a_staged_turn_is_held(henv, monkeypatch):
+    """Timeout 60 s: staged at t=0 (the pipe takes nothing), the hold opens at t=45 (the CLI's own turn). At t=60 the
+    ordinary write timer would have failed it; it is suspended. The hold's own deadline is t=105: there the message,
+    never written, is kept for the next process (7b). Without the hold it would be the generic timeout."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    s, child = idle_host(henv)
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    assert henv.host.tick() == [] and s.writing.id == "1"
+    henv.clock.advance(45)
+    child.accept = None
+    assert emit(henv, child, vinit()) == [] and s.writing.id == "1"
+    henv.clock.advance(15)                              # t=60
+    assert henv.host.tick() == [] and child.terminated == 0, "the write timer is suspended"
+    henv.clock.advance(44)                              # t=104
+    assert henv.host.tick() == [] and child.terminated == 0
+    henv.clock.advance(1)                               # t=105: the hold's deadline
+    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"]
+    assert s.writing is None and b'"next"' not in child.stdin
+
+
+def test_c2_02_the_write_timer_starts_again_when_writing_resumes(henv, monkeypatch):
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    s, child = idle_host(henv)
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(45)
+    emit(henv, child, vinit())                          # held from t=45
+    henv.clock.advance(50)                              # t=95: the barrier lifts, the pipe still takes nothing
+    assert emit(henv, child, foreign()) == [] and s.writing.id == "1" and s.busy_since == henv.clock()
+    henv.clock.advance(59)
+    assert henv.host.tick() == [] and child.terminated == 0, "a fresh write timer"
+    henv.clock.advance(1)
+    [end] = henv.host.tick()
+    assert (end.message_id, end.delivered, end.detail) == ("1", False, "timed out after 1 minutes")
+
+
+@pytest.mark.usefixtures("verified")
+def test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles(henv):
+    """2.1.330's conditional path: a background Agent's quota denial becomes a no-query notification, an unmarked
+    init and a SUCCESSFUL zero-turn task-notification result while the host is idle. The bracket closes, so M is
+    written at once and settles by its own frames."""
+    s, child = idle_host(henv)
+    assert emit(henv, child, vinit(), nonturn()) == [] and not s.provider.holds_turns()
+    henv.host.send(SID, "next", message_id="1")
+    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
+    m = uuid_of(child)
+    child.emit(vinit(m), owned(m, text="mine"))
+    assert [(e.kind, e.message_id, e.text) for e in henv.host.tick()] == [
+        ("turn_started", "1", ""), ("turn_ended", "1", "mine")]
+
+
+@pytest.mark.usefixtures("verified")
+def test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline(henv, monkeypatch):
+    """The backstop: the bracket never closes (7a off in this test), the deadline passes, the process is stopped and
+    M, never written, goes to the next process, which writes it once and settles it."""
+    monkeypatch.setattr(claude, "model_activity", lambda ev: True)      # every frame counts as activity: no 7a
+    s, child = idle_host(henv)
+    emit(henv, child, {"type": "system", "subtype": "status", "session_id": SID})
+    assert emit(henv, child, vinit(), nonturn()) == [] and s.provider.holds_turns()
+    henv.host.send(SID, "next", message_id="1")
+    assert henv.host.tick() == []
+    henv.clock.advance(30 * 60)
+    assert henv.host.tick() == [] and child.terminated == 1 and b'"next"' not in child.stdin
+    evs = henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert ("delivered", "1") in [(e.kind, e.message_id) for e in evs] and fresh.turns() == ["next"]
+    m = uuid_of(fresh)
+    fresh.emit(vinit(m), owned(m, text="mine"))
+    assert [(e.kind, e.message_id, e.text) for e in henv.host.tick()] == [
+        ("turn_started", "1", ""), ("turn_ended", "1", "mine")]
+    assert sum(c.stdin.count(b'"next"') for c in henv.spawner.children) == 1, "written once, ever"
+
+
 # --- the barrier, its bound and its clock, the access check, interrupt readiness
 
 
@@ -674,15 +837,29 @@ def test_the_write_barrier_holds_while_an_unattributed_bracket_is_open(henv):
 
 
 @pytest.mark.usefixtures("verified")
-def test_the_barrier_is_bounded_by_the_turn_timeout_then_the_message_fails_and_the_process_stops(henv):
+def test_the_barrier_is_bounded_then_a_never_written_message_waits_for_the_next_process_once(henv):
+    """Rule 7b: at the deadline the message, not one byte of which was written, is kept and the process is stopped;
+    the next process takes it. Held again past a second deadline it fails as main's `_held` fails it."""
     s, child = idle_host(henv)
     emit(henv, child, vinit())
     henv.host.send(SID, "wait", message_id="1")
     assert henv.host.tick() == []
     henv.clock.advance(30 * 60)
+    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"]
+    assert b'"wait"' not in child.stdin
+    henv.spawner.child = _ZeroPipe                     # the next process's pipe takes nothing at first
+    henv.host.tick()                                    # the old group is gone: a new process, the message staged
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and s.writing.id == "1" and fresh.stdin == b""
+    fresh.emit(vinit())                                 # ... and that process begins a turn of its own first
+    henv.host.tick()
+    fresh.accept = None
+    assert henv.host.tick() == [] and fresh.stdin == b"", "behind the barrier again"
+    henv.clock.advance(30 * 60)
     [end] = henv.host.tick()
-    assert (end.kind, end.message_id, end.delivered, end.ok) == ("turn_ended", "1", False, False)
-    assert "busy with a turn of its own" in end.detail and child.terminated == 1
+    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and "busy with a turn of its own" in (
+        end.detail), "once per message: the second time it fails as main's `_held` fails it"
+    assert fresh.terminated == 1
 
 
 @pytest.mark.usefixtures("verified")
@@ -698,7 +875,7 @@ def test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte(henv):
     henv.clock.advance(60)
     assert henv.host.tick() == [] and b'"next"' not in child.stdin
     assert emit(henv, child, foreign()) == [("delivered", "1")] and child.turns()[-1] == "next"
-    # ... and the bound
+    # ... and the bound: kept for the next process (never written), which writes it
     child.emit(vinit(uuid_of(child)), owned(uuid_of(child)))
     henv.host.tick()
     child.accept = 0
@@ -707,9 +884,10 @@ def test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte(henv):
     child.accept = None
     emit(henv, child, vinit())
     henv.clock.advance(30 * 60)
-    [end] = henv.host.tick()
-    assert (end.message_id, end.delivered, end.ok) == ("2", False, False) and b'"later"' not in child.stdin
-    assert child.terminated == 1
+    assert henv.host.tick() == [] and b'"later"' not in child.stdin and child.terminated == 1
+    assert [m.id for m in s.inbox] == ["2"] and s.writing is None
+    henv.host.tick()
+    assert henv.spawner.children[-1].turns() == ["later"]
 
 
 @pytest.mark.usefixtures("verified")
@@ -731,8 +909,8 @@ def test_c1_02_a_changed_binding_does_not_let_a_message_wait_without_bound(henv)
     henv.host.send(SID, "wait", message_id="1")
     assert henv.host.tick() == [] and child.terminated == 0, "not stopped while the CLI runs its own turn"
     henv.clock.advance(30 * 60)
-    [end] = henv.host.tick()
-    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and child.terminated == 1
+    assert henv.host.tick() == [] and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], (
+        "bounded: the process is stopped and the message, never written, waits for the next one")
 
 
 @pytest.mark.usefixtures("verified")
@@ -750,23 +928,40 @@ def test_c1_02_a_cancelled_waiter_leaves_no_clock_for_the_next_message(henv, sam
     assert henv.host.tick() == []
     henv.clock.advance(2 * 60)
     assert henv.host.tick() == [], "its own clock: it does not fail at once"
-    assert [m.id for m in s.inbox] == ["2"]
+    assert [m.id for m in s.inbox] == ["2"] and child.terminated == 0, "nor is the process stopped for it"
 
 
 @pytest.mark.usefixtures("verified")
-def test_c1_02_the_same_waiter_behind_another_cli_turn_gets_a_fresh_clock(henv):
-    """The CLI's turn ends and another begins before the waiting message could be written: its wait starts again."""
+def test_c2_03_the_deadline_belongs_to_the_continuously_blocked_message(henv):
+    """C2-03: the CLI's turn ends and another begins in the same read, with no write opportunity between: the same
+    message's deadline is kept (it does not wait without bound)."""
     s, child = idle_host(henv)
     emit(henv, child, vinit())
     henv.host.send(SID, "wait", message_id="1")
     henv.host.tick()
     henv.clock.advance(29 * 60)
     assert emit(henv, child, foreign(), vinit()) == []
+    henv.clock.advance(60)
+    assert henv.host.tick() == [] and child.terminated == 1, "its deadline, not a fresh one"
+    assert [m.id for m in s.inbox] == ["1"]
+
+
+@pytest.mark.usefixtures("verified")
+def test_c2_03_after_a_write_opportunity_the_clock_starts_again(henv):
+    """A pass at which the barrier did not hold was a write opportunity (here the pipe still took nothing): the
+    next wait, behind the CLI's next turn, has its own clock."""
+    s, child = idle_host(henv)
+    child.accept = 0
+    henv.host.send(SID, "wait", message_id="1")
+    henv.host.tick()
+    emit(henv, child, vinit())                      # held from t=0
+    henv.clock.advance(29 * 60)
+    assert emit(henv, child, foreign()) == []       # the barrier lifted: a write was tried (nothing taken)
+    assert emit(henv, child, vinit()) == []         # held again from t=29
     henv.clock.advance(2 * 60)
-    assert henv.host.tick() == [] and [m.id for m in s.inbox] == ["1"]
+    assert henv.host.tick() == [] and child.terminated == 0, "a fresh clock"
     henv.clock.advance(28 * 60)
-    [end] = henv.host.tick()
-    assert (end.message_id, end.delivered) == ("1", False)
+    assert henv.host.tick() == [] and child.terminated == 1, "... which runs out 30 minutes after t=29"
 
 
 @pytest.mark.usefixtures("verified")
@@ -851,6 +1046,13 @@ def test_real_pipes_a_turn_the_cli_starts_itself_is_no_messages(tmp_path, monkey
         second = host.send(SID, "two")
         got = ends_of(host, [second])[second]
         assert got.text == ("turn 2: TWO" if verify else "background: FINISHED")
+        # C2-05: wait for the real pair (the CLI's turn and message 2's own) and settle nothing twice
+        later, deadline = [], time.monotonic() + 20
+        while time.monotonic() < deadline and len([x for x in transcript(tmp_path) if x.get("type") == "result"]) < 3:
+            later += host.tick()
+            time.sleep(0.02)
+        later += host.tick()
+        assert not [e for e in later if e.kind == "turn_ended"], "no second settlement"
         inits = [x for x in transcript(tmp_path) if x.get("subtype") == "init"]
         assert [bool(x.get("user_message_uuids")) for x in inits] == ([True, False, True] if verify
                                                                       else [False, False, False])

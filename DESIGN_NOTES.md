@@ -9128,7 +9128,8 @@ notes are closed in one commit on top of the reviewed one.
 ## Claude turn correlation (2026-11-24)
 
 Step 1 of the steering design on branch claude/steer-loose ("Mid-turn steering, loose contract: design (2026-11-24)",
-its part C), built on its own and revised after code review round 1 (Sol, on 2abac71: "Review round 1", below):
+its part C), built on its own and revised after code review rounds 1 (Sol, on 2abac71) and 2 (Sol, on b376771),
+below:
 node only (providers/claude.py, session_host.py), no hub change, no new record, no protocol change, no steering
 (`steers` stays False on Claude; `steer` is refused exactly as on main).
 
@@ -9156,41 +9157,77 @@ zero-turn task notification `result` did the same to a turn in flight.
   `other` (no message's). The host never settles a message by an `other` result, and for an `other` init only runs
   the access check (session_access.verify, on EVERY init whatever its bracket) and reports nothing.
 - **Frames by evidence** (`result_class`, in this order): OWNED (either echo field lists M's uuid); FAILED (rule 10,
-  below: an error not listing M while M is in flight); SETTLED (lists only uuids already settled); NON_TURN (no host
-  uuid, an `origin` whose `kind` is a word other than `human`, `num_turns` 0); FOREIGN (the same, `num_turns` >= 1);
-  PLAIN (anything else). An `init` is owned (lists M), settled-only, or unmarked.
-- **The write barrier**: a verified process in an unattributed bracket `holds_turns`, and the host's `_held` rule
-  (main's, for Codex) applies: the next message waits, for at most the turn timeout, then fails ("the agent was busy
-  with a turn of its own for N minutes; the message was not written") and the process is stopped; `park` and the
-  max_live eviction skip a holding session. The clock is the waiting message's behind that one turn of the CLI's
-  (`held_for`: the waiter's id and the adapter's `holding_key`), so a different waiter or another CLI turn starts it
-  again (C1-02). The barrier is rechecked before the FIRST byte of a staged turn on every write attempt
-  (`turn_at`, `barrier_before_first_byte`, Claude only): a pipe that took nothing before the CLI began its own turn
-  no longer lets M into that turn (C1-01); bytes before the turn still go. **A line already partly written is
-  completed**: it cannot be taken back, so its rest follows even behind the barrier (the CLI then decides where it
-  goes, as for any line written during a turn). On the binding path (a message waiting for a process restarted
-  with the binding as it is now) the same deadline applies (C1-02; this also bounds Codex's wait there, which was
-  unbounded).
+  below: an error not listing M while M is DELIVERED); HELD_ERROR (such an error while M is staged or partly
+  written: it settles nothing and keeps the bracket, C2-01); SETTLED (lists only uuids already settled); NON_TURN
+  (no host uuid, an `origin` whose `kind` is a word other than `human`, `num_turns` 0); FOREIGN (the same, `num_turns`
+  >= 1); PLAIN (anything else). An `init` is owned (lists M), settled-only (recognised FIRST, before its capabilities
+  or version are looked at, C1-03), or unmarked. "Delivered" is the host's word (`delivered()`, called once every
+  byte of the turn is in the pipe), never the staging of the turn.
+- **The write barrier**: a verified process in an unattributed bracket `holds_turns`. Every host behaviour of turn
+  correlation is scoped to a verified Claude incarnation (`_correlated`, review round 2): with VERIFIED empty, and
+  for Codex always, the host runs main's code paths, main's `_held` included. In a verified incarnation the
+  barrier's own rules (`_barrier`) apply: the next message waits, `park` and the max_live eviction skip the
+  session, and
+  - the deadline is the turn timeout and belongs to the continuously blocked MESSAGE (`held_for` is its id): it
+    starts again only for another message, or after a write opportunity (a pass at which the barrier did not hold);
+    a foreign result and the next unmarked init in one read do not reset it (C2-03);
+  - the barrier is rechecked before the FIRST byte of a staged turn on every write attempt (`turn_at`,
+    `barrier_before_first_byte`): a pipe that took nothing before the CLI began its own turn no longer lets M into
+    that turn (C1-01); bytes before the turn still go. **A line already partly written is completed**: it cannot be
+    taken back, so its rest follows even behind the barrier (the CLI then decides where it goes, as for any line
+    written during a turn);
+  - while a staged turn none of whose bytes is written is held, the ordinary write timer is suspended, and it starts
+    again when writing resumes; the hold has its own deadline (C2-02);
+  - the binding path (a message waiting for a process restarted with the binding as it is now) has the same deadline
+    (C1-02);
+  - **at the deadline a message of which NO byte was written is not failed** (rule 7b, below): the process is
+    stopped and the message stays first in the inbox (a staged one goes back there) for the next process. Once per
+    message (`recovered`): held past a second deadline it fails as main's `_held` fails it ("the agent was busy with
+    a turn of its own for N minutes; the message was not written"). That bounds the restarts at one per message.
 - **Interrupt readiness** (`takes_interrupt`) in a verified process needs M's owned bracket; the interrupt receipt
   counts only once M's own `init` came. Unverified: as main.
 - Codex attribution is unchanged.
 
-**Rule 10, a deliberate departure from part C** (the coordinator's ruling on review round 1): an error `result`
-(`is_error` true) that does not list M's uuid, while M is written and in flight, is M's result by order, exactly as
+**Rule 10, a deliberate departure from part C** (the coordinator's ruling on review round 1, narrowed in round 2):
+an error `result` (`is_error` true) that does not list M's uuid, while M is DELIVERED (the host confirmed every byte
+written, C2-01), is M's result by order, exactly as
 main settles it, and the incarnation loses verification from then on. It comes before the non-turn and foreign
 classes, in every bracket. With nothing in flight an error result settles nothing, as before. Why: Sol's case, a
 CLI-started turn that consumes M and then fails terminally (a usage limit, say) with a result that omits M's uuid
 and keeps the notification origin, would have been dropped (zero turns) or taken as foreign, leaving M to wait for
 its timeout where main settles it at once. Nobody can measure every such failure frame (a usage-limit failure
 cannot be produced on demand), so every one of them now falls back to main's behaviour instead of stranding M. An
-interrupt's aborted result lists its line (measured), so it is M's by evidence and unaffected.
+interrupt's aborted result lists its line (measured), so it is M's by evidence and unaffected. While M is only
+staged or partly written, such an error settles nothing and does not end the bracket (so it cannot release the
+barrier and let M into the CLI's running turn: Sol's round-2 sequence, replayed in
+`test_c2_01_sols_sequence_an_error_never_lets_a_staged_m_into_the_clis_turn`).
+
+**Rules 7a and 7b, deliberate additions to part C** (the coordinator's ruling on review round 2), for Sol's gate
+scenario: on 2.1.330 a background Agent's quota denial can become a no-query notification, an unmarked `init`
+followed by a SUCCESSFUL zero-turn task-notification `result` while the host is idle. Non-turn frames were inert, so
+that bracket never closed and the next M failed unwritten at the deadline, where main would write it.
+- **7a.** An unattributed bracket in which no model activity has been seen since its `init` is closed by a
+  successful zero-turn notification `result`: that pair was a no-query notification, not a turn. Model activity
+  (`model_activity`, from the probe runs' frames inside a turn): an `assistant` message, a `stream_event`, a `user`
+  frame that is not a replayed input line (`isReplay`: a tool result), `system` `thinking_tokens`. Status, task
+  and lifecycle rows are not activity. Once any activity was seen the zero-turn result stays inert, as before; an
+  ERROR zero-turn result never closes it (7b is the answer there). Why: a reliable marker for the measured shape,
+  without closing a real CLI turn on an auxiliary notification.
+- **7b.** The backstop, for whatever 7a does not recognise: at the barrier's deadline a message of which the host
+  wrote no byte is kept for the next process and this one is stopped (above). It was never written, so it cannot
+  arrive twice; a new process is a new incarnation, verified anew. Once per message, then main's failure.
+Replayed through delivery: `test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles`, and
+with 7a disabled, `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (M written once, by
+the next process, and settled by its own frames).
 
 The bracket table as built (M: the host's message in flight; verified incarnations only):
 
 | bracket | frame | effect | test |
 | --- | --- | --- | --- |
-| any, M in flight | error `result` not listing M (plain, zero-turn, foreign, settled-only) | rule 10: M's by order; unverified from now on | `test_rule_an_error_result_not_listing_m_while_m_is_in_flight_is_ms_by_order` |
-| any | non-turn success; non-turn error with nothing in flight | nothing (no event, no reply) | `test_row_any_non_turn_success_is_inert_in_every_bracket`, `test_row_any_non_turn_error_with_nothing_in_flight_is_inert` |
+| any, M delivered | error `result` not listing M (plain, zero-turn, foreign, settled-only) | rule 10: M's by order; unverified from now on | `test_rule_an_error_result_not_listing_m_while_m_is_in_flight_is_ms_by_order` |
+| none or unattributed, M staged or partly written | error `result` not listing M | nothing; the bracket stays (C2-01) | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket` |
+| unattributed, no model activity since its init | successful zero-turn notification | rule 7a: closes it (a no-query notification) | `test_row_7a_a_no_query_notification_closes_an_unattributed_bracket_with_no_model_activity` |
+| any (else) | non-turn success; non-turn error with nothing in flight | nothing (no event, no reply) | `test_row_any_non_turn_success_is_inert_in_every_bracket`, `test_row_7a_after_any_model_activity_a_zero_turn_notification_stays_inert`, `test_row_any_non_turn_error_with_nothing_in_flight_is_inert` |
 | any | `init` listing only settled uuids | access check only; no bracket change (C1-03) | `test_row_an_init_listing_only_settled_lines_changes_no_bracket` |
 | any | `result` listing only settled uuids | nothing (logged); no bracket change (C1-03) | `test_row_a_result_listing_only_settled_lines_changes_no_bracket` |
 | none | owned `init` for M | opens M's owned bracket; M's `turn_started` | `test_row_none_owned_init_for_m_opens_ms_owned_bracket` |
@@ -9220,33 +9257,43 @@ that failure and the next message proceeds), an owned bracket then a zero-turn e
 an error with nothing in flight (settles nothing). Part O: `unattributed init -> owned init[M] -> plain result`
 (`test_review_condition_*`) and the non-turn predicate against a zero-turn ERROR result as well as the empty
 successful notification. C1-01, C1-02, C1-03 each have their own host tests (`test_c1_01_*`, `test_c1_02_*`,
-`test_a_late_*`). The stand-in runs bg-late, notifications (rule 10 for the zero-turn error inside a turn), a
+`test_a_late_*`); C2-01, C2-02, C2-03 theirs (`test_c2_0*`), 7a and 7b theirs. The stand-in runs bg-late, notifications (rule 10 for the zero-turn error inside a turn), a
 re-init, a refused resume, a process that stops echoing and an interrupt through real pipes.
 
 **The stand-in** (tests/stand_in_claude.py) echoes a line's uuid on the `init` and `result` of the turn that took
 it (none for a line without one, as measured), with knobs: `STAND_IN_VERSION`, `STAND_IN_ECHO`, `noecho`,
 `bg D [S] [take]`, `notify-in`, `notify-error-in`, `notify-after`, `reinit`, `STAND_IN_REFUSE_RESUME`.
 
-**Parity.** With no verifiable version (VERIFIED empty, production): identical to main. With one: identical at the
-same frame and write boundaries apart from the uuid key and the echo fields (and the lifecycle rows Claude writes
-for a line with a uuid). Shown by the golden recording (tests/golden_schema_free.py, tests/fixtures/
-schema_free_main.json), re-pinned to main at d4b92e5 (recorded by the module against `git archive d4b92e5`, main's
-code and tests on the path; recorded twice, byte-identical). Its stream is source-faithful to 2.1.330: lifecycle rows
-(queued, started, completed, cancelled) and echo fields on `init`, `assistant`, `thinking_tokens` and `result`
-frames whenever the line had a uuid, none when it had not (measured, `nouuid` probe below). It records every bracket
-sequence (non-deviating first, so a verified process shows each rule), a timeout, a launch refusal, a resumed
-process and its second turn, a restart, an `auto` send, a Codex turn, every process's RAW stdin, every RAW
-transcript, the host's events in order and the board's log lines. Two cases:
+**Parity.** With no verifiable version (VERIFIED empty, production): identical to main, host-wide (every behaviour
+change of session_host.py is scoped to a verified Claude incarnation). With one: identical at the same frame and
+write boundaries apart from the uuid key and the echo fields (and the lifecycle rows Claude writes for a line with
+a uuid), for every process that is not verified. Shown by the golden recording (tests/golden_schema_free.py,
+tests/fixtures/schema_free_main.json), re-pinned to main at d4b92e5 (recorded by the module against `git archive
+d4b92e5`, main's code and tests on the path; recorded twice, byte-identical). Its stream is source-faithful to
+2.1.330: lifecycle rows (queued, started, completed, cancelled) and echo fields on `init`, `assistant`,
+`thinking_tokens` and `result` frames whenever the line had a uuid, none when it had not (measured, `nouuid` probe
+below). It records every bracket sequence (non-deviating first, so a verified process shows each rule), a timeout,
+a launch refusal, a resumed process and its second turn, a restart, an `auto` send, a Codex turn, every process's
+RAW stdin, every RAW transcript, the node host's events PASS BY PASS (tick boundaries kept), the board's log lines,
+and host-level cases pass by pass on a SessionHost of fake processes: Codex's own turn with a replacement waiter
+and with a changed binding (main's `_held` as it is), and Claude's tick boundaries (a pipe that takes nothing at
+first, a partly written line, a write timer running out). Two cases:
 - `verified=frozenset()`: this checkout's run is main's, every key, with NO allowance
   (`test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains`).
 - `verified={"0.0.0-golden-baseline"}` (an explicitly unverified baseline: a version is VERIFIED, the processes do not
-  report it): main's once `allowed` takes out of the raw bytes exactly the uuid key of the user lines written before
-  each process's first `init`, the echo fields, and the lifecycle rows; a third test asserts each Claude process's
-  first line, and only it, carries a fresh uuid, every echo and lifecycle row names one of those lines, and nothing
-  but those three kinds of fragment was taken out.
-Recorded with `VERIFIED = {2.1.330}` instead, the run differs from main's in its host events, its logs and two hub
-steps (`notification_inside`, `unattributed_first`; rule 10's steps settle as main by construction), so the
-comparison sees attribution.
+  report it): main's once `allowed` takes out of the raw bytes exactly the uuid key of user lines that are valid
+  Claude user envelopes with a fresh uuid, and, from valid Claude envelopes of the kinds that carry them only
+  (`init`, `assistant`, `thinking_tokens`, `result`; lifecycle rows of exactly their four keys and a known state),
+  echo fields and lifecycle rows that name exactly the line that frame was written for, in its process and turn
+  (each transcript line paired with the frame the run emitted, `EMITTED`). Anything else that looks similar stays,
+  and differs (`test_the_allowance_takes_only_valid_envelopes_for_the_right_line`). A third test asserts each Claude
+  process's first line, and only it, carries a fresh uuid, and that what was taken is only those fragments.
+What the comparison still normalises: time stamps (`created_at` and the other named fields), the temporary
+directory, session ids, frame and result tokens inside their markers, the listing's hash fields and receipt keys
+(each renamed by order of first appearance to a placeholder of the same width), and httpx's own "HTTP Request" log
+lines (only `agent_comms` loggers at INFO and above are kept). Recorded with `VERIFIED = {2.1.330}` instead, the
+run differs from main's in its host events, its logs and two hub steps (`notification_inside`,
+`unattributed_first`; rule 10's steps settle as main by construction), so the comparison sees attribution.
 
 **Transcript size.** The hosted transcript keeps every stdout line and has no file cap. With no uuid (VERIFIED empty)
 nothing changes. With one, Claude adds per turn three or four `command_lifecycle` rows (about 150 bytes each) and the
@@ -9305,27 +9352,26 @@ none`, every user line with its own uuid unless named), and the e2e's correlatio
 - C1-09 `_steer_only` removed.
 - Rule 10 (above), and VERIFIED left empty.
 
-**Mutation check** (scratchpad `correlation/mutate3.py`: each change applied alone to providers/claude.py or
-session_host.py, then tests/test_claude_correlation.py, test_providers_claude.py, test_session_restart.py and the
-three golden tests run; the file restored):
+**Mutation check** (round 2; scratchpad `correlation/mutate4.py`: each change applied alone to providers/claude.py or
+session_host.py, then tests/test_claude_correlation.py, test_providers_claude.py, test_session_restart.py,
+test_session_host.py and the golden tests run; the file restored):
 
-All 39 were caught (the count of failing tests in brackets; a test that names the row first where one does):
+All 53 were caught (one, the C1-02 waiter row, only after its test also asserted that the process was not stopped: 7b's backstop had made the old assertion pass; the count of failing tests in brackets):
 
 | row or rule | caught by |
 | --- | --- |
 | any \| non-turn (success): nothing | `test_row_any_non_turn_success_is_inert_in_every_bracket[own]` (1) |
-| none \| owned init for M: opens M's bracket | `test_each_echo_field_alone_is_evidence_with_m_after_an_older_uuid[user_message_uuid]` (50) |
+| none \| owned init for M: opens M's bracket | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket[foreign-none]` (63) |
 | unattributed \| owned init for M: the bracket becomes M's | `test_row_unattributed_owned_init_for_m_makes_the_bracket_ms` (1) |
-| none \| unmarked init: opens an unattributed bracket | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (27) |
-| any \| init listing only settled lines: no bracket change (C1-03) | `test_row_an_init_listing_only_settled_lines_changes_no_bracket[none]` (2) |
+| none \| unmarked init: opens an unattributed bracket | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (43) |
 | own \| re-init: access-checked only, whatever it carries (C1-04) | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (3) |
 | own \| re-init that no longer qualifies: downgrade when the bracket closes | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (3) |
 | own \| re-init replaces no capability | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (1) |
-| own \| owned result listing M: M's | `test_c1_01_a_line_already_partly_written_is_completed` (86) |
+| own \| owned result listing M: M's | `test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles` (107) |
 | own \| plain result: M's | `test_row_owned_plain_result_closes_it_as_ms` (2) |
 | own \| foreign result: nothing, the bracket stays | `test_row_owned_foreign_result_is_nothing_and_the_bracket_stays_ms` (1) |
 | any \| result listing only settled lines: no bracket change (C1-03) | `test_row_a_result_listing_only_settled_lines_changes_no_bracket[own]` (3) |
-| unattributed \| foreign result: closes it | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (6) |
+| unattributed \| foreign result: closes it | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (9) |
 | unattributed \| owned result listing M: M's | `test_row_unattributed_owned_result_listing_m_is_ms` (1) |
 | unattributed \| plain result: a deviation, by order | `test_row_unattributed_plain_result_is_a_deviation_by_order[False]` (4) |
 | none \| owned result listing M (init lost): M's | `test_row_none_owned_result_listing_m_is_ms_when_its_init_was_lost` (2) |
@@ -9333,25 +9379,59 @@ All 39 were caught (the count of failing tests in brackets; a test that names th
 | none \| plain result, nothing in flight: a deviation | `test_row_none_plain_result_with_nothing_in_flight_is_a_deviation` (1) |
 | none \| foreign result: the CLI's own | `test_row_none_foreign_result_is_the_clis_own` (1) |
 | before any init \| launch refusal: by order, as today | `test_row_before_any_init_a_launch_refusal_fails_the_message_as_today` (17) |
-| rule 10 \| an error not listing M, M in flight: M's by order | `test_rule_an_error_result_not_listing_m_while_m_is_in_flight_is_ms_by_order[foreign-none]` (15) |
-| rule 10 \| ... but an owned (aborted) result is M's by evidence first | `test_rule_an_interrupts_aborted_result_lists_its_line_and_is_ms_by_evidence` (3) |
-| rule 10 \| ... and the incarnation is by order from then on | `test_rule_an_error_result_not_listing_m_while_m_is_in_flight_is_ms_by_order[foreign-none]` (17) |
+| rule 10 \| an error not listing M, M in flight: M's by order | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket[foreign-none]` (22) |
+| rule 10 \| ... but an owned (aborted) result is M's by evidence first | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket[foreign-none]` (67) |
+| rule 10 \| ... and the incarnation is by order from then on | `test_c2_01_rule_10_needs_a_delivered_m` (18) |
 | gate: msg_lifecycle_v1 required | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (2) |
 | gate: pinned by the first init | `test_the_gate_is_a_verified_version_that_lists_msg_lifecycle_in_its_first_init` (2) |
-| gate: VERIFIED ships empty | `test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order` (17) |
+| gate: VERIFIED ships empty | `test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order` (18) |
 | verification lost for good | `test_lines_carry_a_fresh_uuid_until_the_first_init_shows_the_process_cannot_be_verified` (2) |
-| C1-05 \| no uuid while no version is VERIFIED | `test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order` (7) |
+| C1-05 \| no uuid while no version is VERIFIED | `test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order` (8) |
 | C1-05 \| no uuid once the first init shows it cannot be verified | `test_lines_carry_a_fresh_uuid_until_the_first_init_shows_the_process_cannot_be_verified` (2) |
-| the write barrier | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (12) |
+| the write barrier | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (22) |
 | interrupt readiness needs M's owned bracket | `test_interrupt_readiness_needs_ms_owned_bracket` (2) |
 | host: the access check on every init | `test_the_access_check_runs_on_every_init_whatever_its_bracket[none]` (3) |
 | host: an init that is no message's starts nothing | `test_review_condition_unattributed_init_then_owned_init_then_plain_result` (5) |
 | host: a result that is no message's settles nothing | `test_real_pipes_a_turn_the_cli_starts_itself_is_no_messages[True]` (3) |
-| C1-01 \| the barrier before a staged turn's first byte | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (1) |
+| C1-01 \| the barrier before a staged turn's first byte | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (7) |
 | C1-01 \| a line partly written is completed | `test_c1_01_a_line_already_partly_written_is_completed` (1) |
-| C1-02 \| the deadline on the unbound path | `test_c1_02_a_changed_binding_does_not_let_a_message_wait_without_bound` (1) |
-| C1-02 \| the clock restarts for another waiter or bracket | `test_c1_02_a_cancelled_waiter_leaves_no_clock_for_the_next_message[False]` (3) |
-| C1-02 \| ... for another of the provider's own turns | `test_c1_02_the_same_waiter_behind_another_cli_turn_gets_a_fresh_clock` (1) |
+| C1-02 \| the deadline on the unbound path (verified Claude) | `test_c1_02_a_changed_binding_does_not_let_a_message_wait_without_bound` (1) |
+| C1-02 \| the clock restarts for another waiting message | `test_c1_02_a_cancelled_waiter_leaves_no_clock_for_the_next_message` (2) |
+| C2-03 \| ... and after a write opportunity | `test_c2_02_the_write_timer_starts_again_when_writing_resumes` (2) |
+| C2-03 \| ... and not while the same message stays blocked | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (7) |
+| C2-02 \| the write timer is suspended while a staged turn is held | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (5) |
+| C2-02 \| ... and starts again when writing resumes | `test_c2_02_the_write_timer_starts_again_when_writing_resumes` (1) |
+| C2-01 \| the host confirms delivery | `test_c2_01_rule_10_needs_a_delivered_m` (6) |
+| 7b \| a never-written message is kept at the deadline | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (7) |
+| 7b \| ... once per message | `test_the_barrier_is_bounded_then_a_never_written_message_waits_for_the_next_process_once` (1) |
+| 7b \| ... and a staged one goes back to the inbox | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (2) |
+| host-wide parity \| only a verified Claude incarnation is correlated | `test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for_the_allowance` (3) |
+| C2-01 \| rule 10 only for a delivered M | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket[foreign-none]` (8) |
+| C2-01 \| an error while M is undelivered keeps the bracket | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket[foreign-unattributed]` (5) |
+| 7a \| a no-query notification closes an unattributed bracket | `test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles` (4) |
+| 7a \| ... only with no model activity in it | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (6) |
+| 7a \| ... only a successful one | `test_row_7a_only_a_successful_one_and_not_a_replayed_line_or_a_status_frame` (1) |
+| 7a \| ... a replayed input line is no model activity | `test_row_7a_only_a_successful_one_and_not_a_replayed_line_or_a_status_frame` (1) |
+| C1-03 \| a settled-only init is recognised before capabilities and verification | `test_row_an_init_listing_only_settled_lines_changes_no_bracket[none]` (3) |
+
+### Review round 2 (Sol, on b376771: CHANGES, 2 blockers, C1-03 and C1-06 still open) and what changed
+
+- C2-01 [blocker] rule 10 only for a DELIVERED M (the host's `delivered()`); an error while M is staged or partly
+  written settles nothing and keeps the bracket. Tests `test_c2_01_*` (Sol's sequence replayed).
+- C2-02 [blocker] the write timer is suspended while a staged turn is held, renewed when writing resumes; the hold
+  has its own deadline. Tests `test_c2_02_*` (staged at t=0, hold from t=45, timeout 60: nothing at t=60, the hold's
+  outcome at t=105).
+- C2-03 the deadline belongs to the continuously blocked message (`test_c2_03_*`; the round-1 test that asserted
+  the opposite is replaced).
+- C1-03 a settled-only init is recognised before capabilities or verification.
+- C1-06 the allowance takes only valid envelopes, for the right line, per process and turn.
+- Host-wide parity: every session_host.py change scoped to a verified Claude incarnation; the golden's case 1 now
+  has Codex and tick-boundary cases and keeps pass boundaries.
+- The gate scenario: rules 7a and 7b (above).
+- C2-04 the correlation e2e runs on a hub and a node of its own (X0, X5), between the scenarios before it and the
+  tree scenarios after it, so `node_verified` cannot reach another scenario's node. C2-05 the unverified real-pipe
+  test waits for the real pair and asserts no second settlement.
+- VERIFIED stays empty.
 
 ### Not done
 
@@ -9359,8 +9439,7 @@ All 39 were caught (the count of failing tests in brackets; a test that names th
 - No version in VERIFIED (above).
 - The adapter cannot read stderr in `feed`: the launch refusal row rests on the incarnation not being verified
   before its first `init` (so by order, as main), and on `session_exists` reading stderr as before.
-- Codex keeps main's write path: the barrier before the first byte is Claude's only (Codex's own-turn frames are
-  attributed as on main); only the binding path's deadline and the per-waiter clock reach it.
+- Codex keeps main's host behaviour entirely, `_held` included (review round 2's ruling).
 
 ### Choices where C's table is silent
 
@@ -9370,6 +9449,12 @@ All 39 were caught (the count of failing tests in brackets; a test that names th
   M's bracket, when the bracket closes.
 
 ### Follow-ups
+
+- **Main's two Codex `_held` weaknesses, recorded, not fixed** (the ruling keeps Codex on main's host behaviour):
+  a message waiting for a binding restart while Codex runs a turn of its own has no deadline (the binding path
+  returns before `_held`), and a cancelled waiter leaves `held_since` behind, so a later message waiting behind the
+  same turn can fail at once. The golden's host cases `codex_changed_binding` and `codex_replacement_waiter` pin
+  both as they are. The Claude barrier (`_barrier`) has neither.
 
 - The owner and the reviewer to decide whether M3, M6 and M7 (with rule 10) suffice to add "2.1.330" to VERIFIED;
   re-run the e2e's X0-X3 and the probes on any newer version first.

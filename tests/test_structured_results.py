@@ -725,7 +725,7 @@ def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_an
     import golden_schema_free as g
     rec = g.record(tmp_path / "raw", verified=BASELINE)
     ids = []
-    for lines in rec["stdin"]:
+    for lines in rec["stdin"] + [x for case in rec["host_cases"].values() for x in case["stdin"]]:
         users = [json.loads(x) for x in lines if x.startswith('{"type": "user"')]
         if users:
             assert ["uuid" in u for u in users] == [True] + [False] * (len(users) - 1), lines
@@ -744,11 +744,41 @@ def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_an
     g.record(tmp_path / "allowed", verified=BASELINE, allow=True)
     kinds = {k for k, _ in g.REMOVED}
     assert kinds == {"stdin", "echo", "lifecycle"} and sum(k == "stdin" for k, _ in g.REMOVED) == len(ids)
+    taken = {u for k, u in g.REMOVED if k == "stdin"}
+    assert {u for k, u in g.REMOVED if k != "stdin"} <= taken, "each echo or lifecycle row names a line taken"
     none = g.record(tmp_path / "empty", verified=frozenset())
     assert "user_message_uuid" not in json.dumps(none["transcripts"]) and "command_lifecycle" not in json.dumps(
         none["transcripts"]) and '\\"uuid\\"' not in json.dumps(none["stdin"])
     main = _main_fixture()
     assert "user_message_uuid" not in json.dumps(main) and "command_lifecycle" not in json.dumps(main)
+
+
+def test_the_allowance_takes_only_valid_envelopes_for_the_right_line():
+    """C1-06: anything that only looks like the allowance is kept (so it differs from main's)."""
+    import golden_schema_free as g
+    u, v = "1e64c1ac-3dc2-45ff-bad6-ee954a1892a1", "2f75d2bd-4ed3-46a0-8be7-ff065b2a93b2"
+    removed: list = []
+    g.SEEN.clear()
+    good = json.dumps({"type": "user", "message": {"role": "user", "content": "x"}, "uuid": u})
+    assert g.allowed("stdin", good, removed) == '{"type": "user", "message": {"role": "user", "content": "x"}}'
+    assert g.allowed("stdin", good, removed) == good, "a uuid already taken once is not fresh"
+    for bad in ({"type": "user", "message": {"role": "user", "content": "x"}, "uuid": v, "extra": 1},
+                {"type": "user", "message": {"role": "user", "content": ["x"]}, "uuid": v},
+                {"type": "assistant", "message": {"role": "user", "content": "x"}, "uuid": v}):
+        assert g.allowed("stdin", json.dumps(bad), removed) == json.dumps(bad)
+    life = json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "queued", "session_id": "s"})
+    assert g.allowed("transcript", life, removed, u) is None
+    for line, expected in ((life, v), (life, None),
+                           (json.dumps({"type": "command_lifecycle", "command_uuid": u, "state": "odd",
+                                        "session_id": "s"}), u)):
+        assert g.allowed("transcript", line, removed, expected) == line
+    res = {"type": "result", "subtype": "success", "result": "ok"}
+    echo = json.dumps(res | {"user_message_uuid": u, "user_message_uuids": [u]})
+    assert g.allowed("transcript", echo, removed, u) == json.dumps(res)
+    for line, expected in ((echo, v), (json.dumps(res | {"user_message_uuid": u, "user_message_uuids": [u, v]}), u),
+                           (json.dumps({"type": "rate_limit_event", "user_message_uuid": u}), u),
+                           (json.dumps(res | {"user_message_uuids": [u], "user_message_uuid": u, "x": 1}), u)):
+        assert g.allowed("transcript", line, removed, expected) == line
 
 
 def test_a_later_reply_that_repeats_the_block_derives_nothing_for_the_earlier_message(offenv):

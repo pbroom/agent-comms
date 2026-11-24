@@ -72,9 +72,11 @@ S3/S6. `--mode auto` on the idle session: a turn of its own, written within --ma
 With --claude-bin and --codex-bin those sessions are real (three small turns each).
 Then Claude turn correlation (`--only correlation` runs nothing else; DESIGN_NOTES "Claude turn correlation"), for a
 Claude session of its own agent (its runner may run `sleep`). VERIFIED ships empty, so a node writes no uuid at all;
-for these steps only the node is restarted with the CLI's own version (`claude --version`; the stand-in's
-"2.1.330-stand-in") put in VERIFIED in that node process alone (NODE_VERIFIED), so its lines carry a fresh uuid and
-its processes are attributed by evidence. The release gates are measured here on the real CLI:
+these steps run on a hub and a node of their own, after the scenarios above have stopped theirs and before any
+below start (X0), the node with the CLI's own version (`claude --version`; the stand-in's "2.1.330-stand-in") put
+in VERIFIED in that node process alone (NODE_VERIFIED), so its lines carry a fresh uuid and its processes are
+attributed by evidence; X5 stops them and checks nothing is left. The release gates are measured here on the real
+CLI:
 X1. `start --wait`: the line written (the wrapper's stdin log) carries a uuid, and the node's transcript shows the
     turn's `init` echoing it in `user_message_uuids` and its `result` in `user_message_uuid(s)`.
 X2. M3: the node is restarted, so the session's next process is started with `--resume` (exactly one new resume):
@@ -1153,6 +1155,13 @@ codex = true
         starts = [json.loads(x) for x in Path(str(self.stdin_log) + ".argv").read_text().splitlines()]
         return sum(1 for a in starts if sid in a and "--resume" in a)
 
+    def cli_version(self) -> str:
+        """The Claude CLI's own version (`claude --version`), or the stand-in's."""
+        if not self.real:
+            return "2.1.330-stand-in"
+        return subprocess.run([self.args.claude_bin, "--version"], capture_output=True, text=True,
+                              timeout=60).stdout.split()[0]
+
     def correlation_scenario(self) -> None:
         """X1-X4 (the module text)."""
         real = self.real
@@ -1161,14 +1170,9 @@ codex = true
         long = ("Run this exact shell command once, with your shell or Bash tool, and nothing else first: `sleep 12`. "
                 "When it has finished, reply with exactly the word: done") if real else "sleep 12 for the restart"
 
-        if real:
-            version = subprocess.run([self.args.claude_bin, "--version"], capture_output=True, text=True,
-                                     timeout=60).stdout.split()[0]
-        else:
-            version = "2.1.330-stand-in"
-        print(f"\n[X0] the node restarted with {version} in VERIFIED (in that node process only)")
-        self.node_verified = {version}
-        self.restart_node()
+        [version] = sorted(self.node_verified)
+        print(f"\n[X0] a hub and a node of their own; the node runs with {version} in VERIFIED (that node process "
+              "only)")
 
         print("\n[X1] a Claude session: the line carries a uuid; the turn's init and result echo it")
         out, _, _ = self.board("session", "start", str(self.project), words["alpha"], "--agent", CORR_AGENT, *model,
@@ -3322,7 +3326,7 @@ def main() -> int:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
-        if codex or claude or args.with_board or steer or structured or check or correlation:
+        if codex or claude or args.with_board or steer or structured or check:
             run.start_services()
             if codex:
                 run.codex_scenario()
@@ -3332,8 +3336,6 @@ def main() -> int:
                 run.scenario()
             if steer:
                 run.steer_scenario()
-            if correlation:
-                run.correlation_scenario()
             if structured:
                 run.structured_off_scenario()
             if check and not run.real:
@@ -3349,6 +3351,18 @@ def main() -> int:
             run.check(run.leftovers() == [], "no session process is left behind")
             if (codex or steer) and run.real_codex:
                 run.check_codex_config(config_before)
+        if correlation:
+            # Its own hub and node (the same temp directory and settings, nothing else running): the node with the
+            # CLI's version in VERIFIED, never one an earlier or a later scenario runs on.
+            run.node_verified = {run.cli_version()}
+            try:
+                run.start_services()
+                run.correlation_scenario()
+                print("\n[X5] stopping the node (SIGTERM) and the hub")
+                run.stop()
+                run.check(run.leftovers() == [], "no session process is left behind")
+            finally:
+                run.node_verified = None
         if tree or structured or check:
             run.enable_tree()
             run.start_services()
