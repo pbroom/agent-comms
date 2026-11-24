@@ -9124,3 +9124,200 @@ notes are closed in one commit on top of the reviewed one.
   make another's checks busy.
 - **The node's word on its runners**: the node could say which runners are Codex's and which approve the tool (the
   node-reported approval follow-up above), so the Claude hint and a Codex hint both rest on what really runs.
+
+## Claude turn correlation (2026-11-24)
+
+Step 1 of the steering design on branch claude/steer-loose ("Mid-turn steering, loose contract: design (2026-11-24)",
+its part C), built on its own: node only (providers/claude.py, session_host.py), no hub change, no new record, no
+protocol change, no steering (`steers` stays False on Claude; `steer` is refused exactly as on main).
+
+### Why
+
+The host wrote user lines with no id and took the next `init` and `result` for the turn in flight. Claude Code also
+starts turns of its own: a background Agent that finishes after the host's turn ended makes the CLI run a turn for
+its notification (measured on 2.1.330: bg-late in the steering design's part B). If a board message M was waiting,
+the host wrote it at once; Claude queued it; the CLI's own `init` and `result` were reported as M's (M "done" with the
+notification's reply), and M's real result was later dropped as "a turn ended that the host did not start". A
+zero-turn task notification `result` did the same to a turn in flight.
+
+### What was built
+
+- **Every host user line carries a fresh random `uuid`** (`_user_line`), as the last key, after the same `message`
+  bytes as before. It comes from `os.urandom` (uuid4's form), not `uuid.uuid4`, so the golden recording's
+  deterministic uuid4 is not consumed. Control lines (interrupt, get_settings) are unchanged.
+- **The gate, per process incarnation.** A process is attributed by evidence only if its FIRST `init` names a
+  `claude_code_version` in `claude.VERIFIED` and lists `msg_lifecycle_v1`. `VERIFIED` ships EMPTY (see "What was
+  measured"), so every real process today is attributed by order exactly as on main (`Event.turn` "order").
+  Verification is lost for good at the first deviation (`_lose`, `deviation` says why); a new process is asked again.
+- **`Event.turn`** (providers.OWNERS): `order` (main's rule), `own` (the evidence says it is the turn in flight's),
+  `other` (no message's). The host never settles a message by an `other` result, and for an `other` init only runs
+  the access check (session_access.verify, on EVERY init whatever its bracket) and reports nothing.
+- **Frames by evidence** (`result_class`, `_init_turn`): owned `init` (its `user_message_uuids` lists M's uuid),
+  unmarked `init` (it lists none); owned `result` (`user_message_uuid(s)` lists M), owned-other (lists only other
+  uuids the host wrote to this process), non-turn (no host uuid, an `origin` whose `kind` is a word other than
+  `human`, `num_turns` 0: success OR error), foreign (the same with `num_turns` >= 1), plain (anything else).
+- **The write barrier**: a verified process in an unattributed bracket `holds_turns`, so the host's existing `_held`
+  rule (main's, for Codex) applies unchanged: the next message waits, for at most the turn timeout from when it first
+  waits, then fails ("the agent was busy with a turn of its own for N minutes; the message was not written") and the
+  process is stopped. `park` and the max_live eviction skip a holding session, as for Codex. A message written just
+  before such a turn began stays in flight on its own timeout.
+- **Interrupt readiness** (`takes_interrupt`) in a verified process needs M's owned bracket; the interrupt receipt
+  counts only once M's own `init` came. Unverified: as main.
+- **The steer seam**: `_steer_only` (F-4's case, part D) returns False; a result listing only a steer would fall
+  into the owned-other row. No steering code.
+- Codex attribution is unchanged.
+
+The bracket table as built (M: the host's message in flight; verified incarnations only):
+
+| bracket | frame | effect | test |
+| --- | --- | --- | --- |
+| any | non-turn (success or error) | nothing (logged; no event) | `test_row_any_non_turn_is_inert_in_every_bracket` |
+| none | owned `init` for M | opens M's owned bracket; M's `turn_started` | `test_row_none_owned_init_for_m_opens_ms_owned_bracket` |
+| none | unmarked `init` | opens an unattributed bracket; the barrier holds | `test_row_none_unmarked_init_opens_an_unattributed_bracket_and_the_barrier_holds` |
+| none | `init` listing only uuids already settled | (not in C's table) as an unmarked one | `test_open_row_none_init_listing_only_settled_lines_is_unattributed` |
+| M's owned | owned `init` for M, unmarked, owned for another uuid | nothing (access check only); a non-M init is noted (`_competing`) | `test_row_owned_a_second_init_never_replaces_the_bracket` |
+| M's owned | owned `result` listing M | closes it: M's result | `test_row_owned_result_listing_m_closes_it_as_ms` |
+| M's owned | plain `result` | closes it: M's result (no deviation) | `test_row_owned_plain_result_closes_it_as_ms` |
+| M's owned | foreign `result` | nothing (logged); stays M's | `test_row_owned_foreign_result_is_nothing_and_the_bracket_stays_ms` |
+| M's owned | owned `result` listing only a steer S | seam only (`_steer_only` False): never the case | `test_row_owned_result_listing_only_other_host_uuids_is_nothing` |
+| M's owned | owned `result` listing only other host uuids | nothing (logged) | the same test |
+| unattributed | foreign `result` | closes it; the barrier lifts | `test_row_unattributed_foreign_result_closes_it_and_the_barrier_lifts` |
+| unattributed | owned `result` listing M | M's result; closes it | `test_row_unattributed_owned_result_listing_m_is_ms` |
+| unattributed | owned `init` for M | (not in C's table) the bracket becomes M's, the earlier init noted as competing | `test_review_condition_unattributed_init_then_owned_init_then_plain_result` |
+| unattributed | plain `result` | a deviation: by order (M's if in flight, else logged); unverified from now on | `test_row_unattributed_plain_result_is_a_deviation_by_order` |
+| unattributed | owned `result` listing only other host uuids | (not in C's table) closes it as no message's (logged) | `test_open_row_unattributed_result_listing_only_settled_lines_closes_it_as_no_messages` |
+| none | owned `result` listing M (its `init` lost) | M's result | `test_row_none_owned_result_listing_m_is_ms_when_its_init_was_lost` |
+| none | plain `result` while M in flight | M's by order; a deviation | `test_row_none_plain_result_with_m_in_flight_is_ms_by_order_and_a_deviation` |
+| none | plain `result`, nothing in flight | (not in C's table) by order (logged, as main); a deviation | `test_open_row_none_plain_result_with_nothing_in_flight_is_a_deviation` |
+| none | foreign `result` | the CLI's own (logged) | `test_row_none_foreign_result_is_the_clis_own` |
+| none | `result` listing only uuids already settled | (not in C's table) no message's (logged) | `test_open_row_none_result_listing_only_settled_lines_is_no_messages` |
+| before any `init` | launch refusal | fails the message that started the process, as today (by order: the incarnation is not verified before its first `init`) | `test_row_before_any_init_a_launch_refusal_fails_the_message_as_today` |
+
+The 11 ordinary sequences of C, each with the host and fake processes, each settling M once with none stranded:
+`test_seq_owned_init_then_owned_result`, `..._then_a_plain_failure_result`,
+`..._a_zero_turn_notification_then_owned_result` (success and error), `..._an_unmarked_init_compaction_then_owned_result`,
+`test_seq_an_unattributed_turn_before_ms_own_pair` (the bug, fixed; `test_seq_unverified_...` shows main's behaviour
+kept while VERIFIED is empty), `test_seq_unmarked_init_then_plain_result_with_m_in_flight_lost_echoes`,
+`test_seq_a_result_with_no_init` (owned, plain), `test_seq_a_launch_refusal_fails_the_message_that_started_the_process`,
+`test_seq_an_interrupt_owned_init_then_aborted_owned_result`, `test_seq_a_timeout_with_no_result_is_the_hosts_timeout_path`,
+`test_seq_a_zero_turn_notification_with_nothing_open`. Part O's conditions: the sequence `unattributed init -> owned
+init[M] -> plain result` (`test_review_condition_...`), and the non-turn predicate against a zero-turn ERROR result
+as well as the empty successful notification (`test_row_any_non_turn_...[*-True]`, both sequences above). The
+barrier, its bound, the access check in every bracket and interrupt readiness have their own tests; the stand-in
+runs bg-late, notifications, a re-init, a refused resume, a process that stops echoing and an interrupt through real
+pipes (tests/test_claude_correlation.py).
+
+**The stand-in** (tests/stand_in_claude.py) now echoes a line's uuid on the `init` and `result` of the turn that
+took it (none for a line without one: what main wrote), and has knobs: `STAND_IN_VERSION`, `STAND_IN_ECHO`
+(off / first N turns), `noecho`, `bg D [S] [take]` (a turn the CLI starts itself), `notify-in`, `notify-error-in`,
+`notify-after`, `reinit`, `STAND_IN_REFUSE_RESUME`.
+
+**With no steer sent, byte for byte as main but for the named changes** (the steering design's K, step 1's part):
+the golden recording (tests/golden_schema_free.py, tests/fixtures/schema_free_main.json) is re-pinned to main at
+d4b92e5 (recorded by the module run against `git archive d4b92e5`, main's own code and tests on the path) and
+extended through the hub and the node: every bracket sequence above with frames as 2.1.330 writes them (echo fields
+included whenever the line had a uuid to echo), a timeout, a launch refusal, a resumed process, a restart, an `auto`
+send, a Codex turn, and every process's stdin and transcript. The whitelist is exactly two paths: the `uuid` key on
+Claude user lines (`LINE_UUID`) and the echo fields on frames (`ECHO_FIELDS`); a second test asserts both are present
+in this checkout's run and only there, and absent from main's. Recorded with `VERIFIED = {2.1.330}` instead, the
+same run differs from main's in 16 of its 21 sequence steps, so the comparison is sensitive to attribution. The
+transcript keeps every stdout line, the settings answer still withheld (`transcript_line`, unchanged). On the real
+CLI the transcript also gains `command_lifecycle` lines (Claude writes them for lines with a uuid); the adapter
+reads nothing from them.
+
+**Mutation check.** One change per row and per rule (scratchpad `correlation/mutate.py`, `mutate2.py`: each applied
+alone to providers/claude.py or session_host.py, then tests/test_claude_correlation.py, test_providers_claude.py and
+the golden comparison run; the file restored). All 28 were caught; the first-named catching test of each:
+
+| row or rule | change | caught by |
+| --- | --- | --- |
+| any \| non-turn | non-turn in an owned bracket treated as a result | `test_row_any_non_turn_is_inert_in_every_bracket[*-own]` |
+| none \| owned init for M | reported by order | `test_row_none_owned_init_for_m_opens_ms_owned_bracket` (and 25 more) |
+| none \| unmarked init | no bracket opened | `test_row_none_unmarked_init_opens_an_unattributed_bracket_and_the_barrier_holds` |
+| none \| init listing only settled lines | taken as M's | `test_open_row_none_init_listing_only_settled_lines_is_unattributed` |
+| own \| any init | a competing init replaces the bracket | `test_row_owned_a_second_init_never_replaces_the_bracket[other,unmarked]` |
+| own \| owned result listing M | not attributed in an owned bracket | `test_row_owned_result_listing_m_closes_it_as_ms` (and 49 more) |
+| own \| plain result | not M's | `test_row_owned_plain_result_closes_it_as_ms` |
+| own \| foreign result | closes the bracket | `test_row_owned_foreign_result_is_nothing_and_the_bracket_stays_ms` |
+| own \| steer-only (seam) | the seam says True | `test_row_owned_result_listing_only_other_host_uuids_is_nothing` |
+| own \| only other host uuids | closes the bracket | the same test |
+| unattributed \| foreign result | the bracket stays open | `test_row_unattributed_foreign_result_closes_it_and_the_barrier_lifts` |
+| unattributed \| owned result listing M | not M's | `test_row_unattributed_owned_result_listing_m_is_ms` |
+| unattributed \| plain result | no deviation, no order | `test_row_unattributed_plain_result_is_a_deviation_by_order` |
+| unattributed \| only settled lines | the bracket stays open | `test_open_row_unattributed_result_listing_only_settled_lines_closes_it_as_no_messages` |
+| none \| owned result listing M | not M's | `test_row_none_owned_result_listing_m_is_ms_when_its_init_was_lost` |
+| none \| plain result, M in flight | not by order | `test_row_none_plain_result_with_m_in_flight_is_ms_by_order_and_a_deviation` |
+| none \| plain result, nothing in flight | no deviation | `test_open_row_none_plain_result_with_nothing_in_flight_is_a_deviation` |
+| none \| foreign result | by order | `test_row_none_foreign_result_is_the_clis_own` |
+| before any init \| launch refusal | ignored | `test_row_before_any_init_a_launch_refusal_fails_the_message_as_today` |
+| gate: msg_lifecycle_v1 | not required | `test_the_gate_is_a_verified_version_that_lists_msg_lifecycle_in_its_first_init` |
+| gate: VERIFIED empty | 2.1.330 added | `test_verified_ships_empty_...`, the golden comparison |
+| lost for good | re-verified at the next init | `test_verification_is_lost_for_good_...` |
+| the barrier | `holds_turns` always False | `test_the_write_barrier_holds_while_an_unattributed_bracket_is_open` |
+| interrupt readiness | any bracket | `test_interrupt_readiness_needs_ms_owned_bracket` |
+| access check on every init | skipped for an `other` init | `test_the_access_check_runs_on_every_init_whatever_its_bracket` |
+| host: `other` init | reported as M's start | `test_seq_an_unattributed_turn_before_ms_own_pair` |
+| host: `other` result | settles M | `test_seq_an_unattributed_turn_before_ms_own_pair` |
+| uuid on every line | dropped | `test_every_user_line_carries_a_fresh_random_uuid_and_the_same_content_bytes` |
+
+### What was measured (Claude Code 2.1.330, the installed version)
+
+Commands (all from this worktree; probes in this session's scratchpad `correlation/probe_gates.py`, run with
+`python3 -I`, each a private cwd, `--model haiku --permission-mode dontAsk --setting-sources= --strict-mcp-config
+--allowedTools 'Bash(sleep:*)' --no-session-persistence --input-format stream-json --output-format stream-json
+--verbose --permission-prompts none`, every user line with its own uuid):
+
+- **M3, a resumed process echoes: PASSED.** `uv run python -P scripts/session-host-e2e.py --claude-bin "$(command -v
+  claude)" --only correlation` (X1-X3, five haiku turns, PASS). X2 restarts the node; the session's next process is
+  started with `--resume`; its first turn's `init` lists the line's uuid in `user_message_uuids` and its `result`
+  in `user_message_uuid(s)`, and so does its second turn. Nothing else appeared in the resumed process's stream
+  (no replayed `init` or `result`).
+- **M6, compaction: PASSED as measured, with a forced threshold.** `probe_gates.py m6-compact`, with
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=1` in that process's environment only (the automatic compaction's own threshold,
+  lowered so it fires at ~34k tokens): three turns. Turn 2 compacted automatically inside its bracket after its
+  tool result (`system status compacting`, `status compact_result success`, `system compact_boundary` with
+  `trigger: auto`, then a `user` text frame), after a first attempt right after its `init` failed
+  (`compact_error: too_few_groups`); turn 3 compacted right after its `init`. In both no further `init` and no
+  `result` came from the compaction, and each turn's own `result` echoed its uuid: the owned bracket survived. What
+  was not measured: a compaction reached by filling a real context window.
+- **M7, failure frames: NOT PASSED (one case cannot be measured).** Measured, each echoing the turn's uuid on `init`
+  and `result` with no `origin`: a refused tool (`m7-refused`: `success`, a Write denial); an API error
+  (`m7-apierror`, `--model claude-nonexistent-model-9`: `subtype success`, `is_error true`, `terminal_reason
+  api_error`, `api_error_status 404`); a turn that fails on its own limit (`m7-maxturns`, `--max-turns 1`:
+  `error_max_turns`); an interrupt (`m7-interrupt`, and the e2e's X3 through the real host: `error_during_execution`,
+  `aborted_tools`). A launch refusal (`m7-launch`, `--resume` of an unknown session): one `result` before any
+  `init`, `error_during_execution`, `is_error`, `num_turns` 0, no echo, no `origin`, "No conversation found with
+  session ID" on stderr and in `errors`, exit 1: C's launch-refusal evidence. NOT measured: a turn that fails on a
+  usage limit (it cannot be produced without exhausting the account's plan), which the design's M7 names.
+
+**VERIFIED stays empty.** M7 is not passed in full: the usage-limit failure cannot be measured. The gate is not
+weakened to pass, so no version is verified, and every process is attributed by order as on main. With a usage
+limit measured (and M6 on a naturally full context, if the owner wants it), adding "2.1.330" to `claude.VERIFIED` is
+the one-line change that switches correlation on; the tests already run every row with it switched on.
+
+### Not done
+
+- Steering (the steering design's D to J, steps 2 and 3), `steers`, any hub, record or protocol change.
+- No version in VERIFIED (above).
+- The adapter cannot read stderr in `feed`: the launch refusal row rests on the incarnation not being verified
+  before its first `init` (so by order, as main), and on `session_exists` reading stderr as before.
+
+### Choices where C's table is silent
+
+- An owned `init` for M inside an UNATTRIBUTED bracket makes the bracket M's (an unattributed bracket is no owned
+  one, so "never replaced" does not apply), with the earlier `init` noted as competing for step 3 (part O's sequence).
+- A plain `result` with no bracket and nothing in flight is a deviation too (by order it is only logged, as main).
+- An `init` listing only uuids the host wrote earlier is treated as an unmarked one (a turn no message in flight
+  started); a `result` listing only such uuids is no message's in any bracket (logged), and closes an unattributed
+  bracket.
+- An `init` of a verified incarnation that no longer names a verified version with `msg_lifecycle_v1` is a
+  deviation.
+- The barrier's bound is main's `_held` clock: from when a message first waits, not from when the bracket opened;
+  with no message waiting, nothing bounds the CLI's own turn (as for Codex).
+
+### Follow-ups
+
+- Measure a usage-limit failure on 2.1.330 (M7's last case) when an account reaches its limit naturally; then, with
+  the owner's word, add the version to VERIFIED (and re-run the e2e's X1-X3 and the probes on any newer version first).
+- The adapter logs non-turn frames and competing inits at info level only; the hub sees nothing of them. If step 3
+  needs them, it is the place to report them.

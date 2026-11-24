@@ -27,7 +27,9 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   `<log dir>/node-session-providers.json` (mode 600) before the first turn is written to that session, and is
   handed it again (`adopt`) when the session is opened after a restart: a recorded id is resumed, whatever the
   caller knows. The id never comes from the hub. It is dropped when the provider refuses to resume it.
-- A message waits while the provider runs something of its own in the session (`holds_turns`).
+- A message waits while the provider runs something of its own in the session (`holds_turns`): Codex's own turn,
+  or a turn Claude Code started itself in a process the adapter verified (DESIGN_NOTES "Claude turn correlation").
+  A turn's frames that the adapter says are no message's (`Event.turn` "other") never settle the turn in flight.
 - A provider with a handshake (`waits_for_ready`) gets `handshake_seconds` for it, not the turn timeout.
 - Restart (DESIGN_NOTES "Restarting a running turn"): the caller asks for the turn in flight to be interrupted in-band
   for the message that replaces it (`interrupt_for`); that message itself is the caller's next ordinary message and
@@ -892,6 +894,11 @@ class SessionHost:
                 return
             if s.access == "full" and ev.mode == "bypassPermissions":
                 s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
+            if ev.turn == "other":
+                # Not the turn in flight (the adapter's evidence, providers.OWNERS: a turn the CLI started itself, or
+                # another `init` inside the turn's own bracket): its access was checked above, and that is all.
+                log.info("session %s: an init that is no message's turn (checked, nothing started)", s.session_id)
+                return
             if s.in_flight is not None:
                 s.begun = True      # the provider began the turn in flight (its `init`: Claude's capabilities)
                 out.append(HostEvent(s.session_id, "turn_started", s.in_flight.id))
@@ -908,6 +915,11 @@ class SessionHost:
             if not s.busy:
                 s.busy_since = None     # the check is over; the turn's own clock starts when it is written
         elif ev.kind == "turn_ended":
+            if ev.turn == "other":
+                # A turn the CLI started itself ended, or a result that is no message's (providers.OWNERS): the turn
+                # in flight, if any, is not settled by it (Claude turn correlation).
+                log.info("session %s: a turn that is no message's ended; the turn in flight goes on", s.session_id)
+                return
             if s.in_flight is None:
                 log.warning("session %s: a turn ended that the host did not start", s.session_id)
                 return

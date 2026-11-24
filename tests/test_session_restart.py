@@ -14,6 +14,7 @@ from agent_comms.providers.claude import ClaudeSession
 from agent_comms.session_host import INTERRUPTED
 
 import test_providers_codex as cx
+from test_providers_claude import main_bytes
 from conftest import PROJECT
 from test_session_host import (SID, codex_host, codex_ready, henv, init, open_session, real_codex_host,  # noqa: F401
                                real_host, result)
@@ -114,8 +115,9 @@ def test_claude_never_steers_and_restarts_once_its_process_said_it_acknowledges_
     p = ClaudeSession()
     p.argv(["claude", "-p", "{prompt}"], session_id=SID, resume=False, model=None)
     assert providers.modes(p) == () and p.steers is False and not hasattr(p, "steer"), "R6: no mid-turn steering"
-    # Byte for byte what a turn has always been.
-    assert p.turn("hello\nthere") == [b'{"type": "user", "message": {"role": "user", "content": "hello\\nthere"}}\n']
+    # Byte for byte what a turn has always been, and the uuid key turn correlation adds (its one named change).
+    [data] = p.turn("hello\nthere")
+    assert main_bytes(data) == b'{"type": "user", "message": {"role": "user", "content": "hello\\nthere"}}\n'
     p.feed(json.dumps(init()).encode())                      # a CLI that lists no capabilities
     assert providers.modes(p) == () and p.interrupt_turn() is None
     assert providers.modes(claude_in_turn()) == ("restart",)
@@ -222,7 +224,8 @@ def test_a_claude_restart_interrupts_the_turn_and_its_message_is_then_the_next_o
     assert s.restart_by is None and not s.busy
     henv.host.send(SID, "start over", message_id="2")       # the caller's next ordinary message
     assert kinds(henv.host.tick()) == [("delivered", "2")]
-    assert lines(child.stdin)[-1] == {"type": "user", "message": {"role": "user", "content": "start over"}}
+    assert {k: v for k, v in lines(child.stdin)[-1].items() if k != "uuid"} == {
+        "type": "user", "message": {"role": "user", "content": "start over"}}
 
 
 def test_a_codex_restart_is_turn_interrupt_with_the_turns_id(henv):

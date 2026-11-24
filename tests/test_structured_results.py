@@ -683,10 +683,13 @@ def test_wait_exits_0_3_and_4_with_their_words(offenv, monkeypatch, capsys):
 
 
 def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(tmp_path):
-    """tests/fixtures/schema_free_main.json is golden_schema_free.py's recording of main's code (a8b90cc): frames,
+    """tests/fixtures/schema_free_main.json is golden_schema_free.py's recording of main's code (d4b92e5): frames,
     result turns, a claim, spawn and send answers and their retries, status, show, a message poll, list, the node's
-    listing, the lineage view, CLI text and every hosted record. This checkout's run must be the same, byte for
-    byte (time stamps and the temporary directory aside)."""
+    listing, the lineage view, CLI text and every hosted record; and (Claude turn correlation) every bracket sequence
+    of the steering design's C through the node, a timeout, a launch refusal, a resumed process, a restart, an
+    `auto` send and a Codex turn, with every process's stdin and transcript. This checkout's run must be the same,
+    byte for byte (time stamps and the temporary directory aside), but for the named changes the recording takes
+    out (golden_schema_free.LINE_UUID, ECHO_FIELDS): the next test asserts they are there, and only there."""
     from pathlib import Path
 
     import golden_schema_free
@@ -695,6 +698,29 @@ def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(
     for key in sorted(main):
         assert ours[key] == main[key], key
     assert set(ours) == set(main)
+
+
+def test_the_golden_runs_named_changes_are_there_and_nothing_else_is_taken_out(tmp_path, monkeypatch):
+    """The whitelist is exactly the named paths. This checkout's raw stdin has the uuid key on every Claude user line,
+    as its last key, and on no other line; its transcripts have the echo fields on `init` and `result` frames only,
+    echoing those very uuids. Main's recording (the fixture) has neither."""
+    from pathlib import Path
+
+    import golden_schema_free as g
+    stdin, frames = [], []
+    line, echo = g._main_stdin_line, g._without_echo
+    monkeypatch.setattr(g, "_main_stdin_line", lambda x: stdin.append(x) or line(x))
+    monkeypatch.setattr(g, "_without_echo", lambda x: frames.append(x) or echo(x))
+    g.record(tmp_path)
+    users = [x for x in stdin if x.startswith('{"type": "user"')]
+    assert users and all(g.LINE_UUID.search(x) for x in users), "every Claude user line carries the uuid, last"
+    assert not any('"uuid"' in x for x in stdin if not x.startswith('{"type": "user"')), "and no other line"
+    ids = {json.loads(x)["uuid"] for x in users}
+    echoing = [json.loads(x) for x in frames if any(f in x for f in g.ECHO_FIELDS)]
+    assert echoing and all(e.get("type") == "result" or e.get("subtype") == "init" for e in echoing)
+    assert all(set(e.get("user_message_uuids", [])) <= ids for e in echoing)
+    fixture = (Path(__file__).parent / "fixtures" / "schema_free_main.json").read_text()
+    assert "user_message_uuid" not in fixture and "uuid" not in json.dumps(json.loads(fixture)["stdin"]), "main: none"
 
 
 def test_a_later_reply_that_repeats_the_block_derives_nothing_for_the_earlier_message(offenv):

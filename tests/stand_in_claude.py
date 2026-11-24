@@ -61,7 +61,25 @@ result `error_during_execution` (terminal_reason `aborted_tools`), and the queue
 An interrupt already behind a turn's line when that line is read (before the turn's `init`) is answered `success`
 and interrupts nothing: the turn runs whole (measured on 2.1.330 too).
 Every `init` also lists `capabilities` (`msg_lifecycle_v1` and `interrupt_receipt_v1`, as 2.1.330's does; with
-STAND_IN_CAPS set, that comma-separated list instead) and a `claude_code_version`.
+STAND_IN_CAPS set, that comma-separated list instead) and a `claude_code_version` ("2.1.330-stand-in", or
+STAND_IN_VERSION).
+Turn correlation (DESIGN_NOTES "Claude turn correlation"), as Claude Code 2.1.330 was measured to echo a line's
+`uuid`: the `init` of the turn that took it lists it in `user_message_uuids`, and the turn's `result` (an aborted one
+too) in `user_message_uuid` and `user_message_uuids`, with every line folded into the turn. A line with no uuid (what
+main wrote) gets no echo field at all. STAND_IN_ECHO=off: no echo ever; STAND_IN_ECHO=N: only for this process's first
+N turns (a process that stops echoing). A turn whose text has the word `noecho`: none for that turn. More words:
+- `bg D [S] [take]` (at the start): after the turn's result, D seconds later (stdin is read meanwhile: a line that
+  comes is queued), the CLI starts a turn of its own, as for a background Agent's notification: an `init` with no
+  echo, S seconds (default 0.5), then a `result` with no echo, `num_turns` 1 and `origin.kind` `task-notification`.
+  With `take`, the lines queued until its end are folded into it (its result lists them); without, they run as their
+  own turns after it.
+- `notify-in` / `notify-error-in`: before the turn's result, a zero-turn task notification `result` (`num_turns` 0,
+  `origin.kind` `task-notification`, no echo): a success, or an error. `notify-after`: one right after the result.
+- `reinit`: before the turn's result, a `compact_boundary` system line and a second `init` with no echo (as a
+  compaction or re-init could write).
+STAND_IN_REFUSE_RESUME set and started with `--resume`: the first stdin line is answered with a refusal, as for a
+`--resume` of a session Claude does not have: "No conversation found with session ID: <id>" on stderr, a `result`
+(`error_during_execution`, `is_error`, `num_turns` 0) before any `init`, exit 1.
 """
 import json
 import os
@@ -236,6 +254,30 @@ def emit(obj: dict) -> None:
     print(json.dumps(obj), flush=True)
 
 
+ECHO = os.environ.get("STAND_IN_ECHO", "on")
+
+
+def echo(turn: int, text: str, messages: list) -> dict:
+    """The echo fields of a frame for these lines (turn correlation, module text): nothing for a line with no uuid,
+    with STAND_IN_ECHO off or past its count, or for a `noecho` turn."""
+    if ECHO == "off" or (ECHO.isdigit() and turn > int(ECHO)) or re.search(r"\bnoecho\b", text):
+        return {}
+    ids = [m["uuid"] for m in messages if isinstance(m.get("uuid"), str)]
+    return {"user_message_uuids": ids} if ids else {}
+
+
+def result_echo(turn: int, text: str, messages: list) -> dict:
+    said = echo(turn, text, messages)
+    return {"user_message_uuid": said["user_message_uuids"][0], **said} if said else {}
+
+
+def notification(sid: str, error: bool = False) -> dict:
+    """A zero-turn task notification's `result` (no echo; it ends no turn)."""
+    return {"type": "result", "subtype": "error_during_execution" if error else "success", "is_error": error,
+            "num_turns": 0, "session_id": sid, "result": "", "stop_reason": None, "permission_denials": [],
+            "origin": {"kind": "task-notification", "producer": "session-task"}}
+
+
 class Stdin:
     """Every stdin line, read on a thread of its own (so a running turn still hears an interrupt or a steer).
     `queued`: user lines that came while a turn ran, in order, until a turn takes them."""
@@ -316,7 +358,37 @@ def main() -> None:
     sys.stderr.write("stand-in started\n")
     turn = 0
     stdin = Stdin(sid, args)
+    version = os.environ.get("STAND_IN_VERSION", "2.1.330-stand-in")
+    caps = os.environ.get("STAND_IN_CAPS", "msg_lifecycle_v1,interrupt_receipt_v1").split(",")
+    if os.environ.get("STAND_IN_REFUSE_RESUME") and "--resume" in args:
+        stdin.take()
+        sys.stderr.write(f"No conversation found with session ID: {sid}\n")
+        emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 0,
+              "session_id": sid, "permission_denials": [], "errors": [f"No conversation found with session ID: {sid}"]})
+        sys.exit(1)
+    background = None       # a turn of the CLI's own that is due: (when, seconds, take)
     while True:
+        if background is not None:
+            when, seconds, take = background
+            background = None
+            stdin.wait(max(0.0, when - time.monotonic()))     # a line that comes meanwhile is queued
+            # The CLI's own turn: no echo on its `init`; its result says it was a notification's.
+            emit({"type": "system", "subtype": "init", "session_id": sid, "permissionMode": grants(args)[0],
+                  "tools": grants(args)[1], "claude_code_version": version, "capabilities": caps})
+            stdin.wait(seconds)
+            folded, stdin.queued = (stdin.queued, []) if take else ([], stdin.queued)
+            for m in folded:
+                stdin.lifecycle(m, "started")
+            emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "session_id": sid,
+                  "result": "background: FINISHED" + "".join("; TOOK: " + m["message"]["content"].upper()
+                                                           for m in folded),
+                  "stop_reason": "end_turn", "permission_denials": [],
+                  "origin": {"kind": "task-notification", "producer": "session-task"},
+                  **({"user_message_uuid": folded[0]["uuid"], "user_message_uuids": [m["uuid"] for m in folded]}
+                     if folded and all(isinstance(m.get("uuid"), str) for m in folded) else {})})
+            for m in folded:
+                stdin.lifecycle(m, "completed")
+            continue
         if stdin.queued:
             message = stdin.queued.pop(0)       # a line that waited behind the last turn: its own turn now
         else:
@@ -356,9 +428,8 @@ def main() -> None:
             run_hooks(args, "SessionStart", sid)
         mode, tools, _ = grants(args)
         print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "permissionMode": mode,
-                          "tools": tools, "claude_code_version": "2.1.330-stand-in",
-                          "capabilities": os.environ.get("STAND_IN_CAPS", "msg_lifecycle_v1,interrupt_receipt_v1")
-                          .split(",")}), flush=True)
+                          "tools": tools, "claude_code_version": version, "capabilities": caps,
+                          **echo(turn, text, [message])}), flush=True)
         going, tool = True, False
         pause = re.match(r"(sleep|think) (\d+(?:\.\d+)?)\b", text)
         if pause:
@@ -372,7 +443,7 @@ def main() -> None:
             stdin.lifecycle(message, "cancelled")
             emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 1,
                   "session_id": sid, "result": None, "stop_reason": "tool_use", "terminal_reason": "aborted_tools",
-                  "permission_denials": []})
+                  "permission_denials": [], **result_echo(turn, text, [message])})
             continue
         steered = []
         if tool:
@@ -417,11 +488,24 @@ def main() -> None:
                     said.append(tool.upper() + " DENIED")
                     denials.append({"tool_name": tool, "tool_use_id": "toolu_02", "tool_input": {"name": name}})
             reply = f"turn {turn}: " + "; ".join(said)
+        if re.search(r"\bnotify-in\b", text) or re.search(r"\bnotify-error-in\b", text):
+            emit(notification(sid, error=bool(re.search(r"\bnotify-error-in\b", text))))
+        if re.search(r"\breinit\b", text):
+            emit({"type": "system", "subtype": "compact_boundary", "session_id": sid})
+            emit({"type": "system", "subtype": "init", "session_id": sid, "permissionMode": mode, "tools": tools,
+                  "claude_code_version": version, "capabilities": caps})
         print(json.dumps({"type": "result", "subtype": "error_during_execution" if failed else "success",
                           "is_error": failed, "num_turns": 1, "session_id": sid, "result": reply,
-                          "stop_reason": "end_turn", "permission_denials": denials}), flush=True)
+                          "stop_reason": "end_turn", "permission_denials": denials,
+                          **result_echo(turn, text, [message] + steered)}), flush=True)
         for m in steered + [message]:
             stdin.lifecycle(m, "completed")
+        if re.search(r"\bnotify-after\b", text):
+            emit(notification(sid))
+        later = re.match(r"bg (\d+(?:\.\d+)?)(?: (\d+(?:\.\d+)?))?( take)?\b", text)
+        if later:
+            background = (time.monotonic() + float(later.group(1)), float(later.group(2) or 0.5),
+                          bool(later.group(3)))
 
 
 if __name__ == "__main__":

@@ -49,11 +49,31 @@ DESIGN_NOTES "Account pools"):
   only, utilization a fraction 0..1 (0 right after a reset), and overage fields beside them.
 - A turn that fails on the limit: an `assistant` message whose `error` is `rate_limit`. That account counts as
   exhausted (until the last refusal's reset time, when one was seen).
+Turn correlation (DESIGN_NOTES "Claude turn correlation (2026-11-24)"; measured on Claude Code 2.1.330 for the steering
+design on branch claude/steer-loose, its part B):
+- Every user line the host writes carries a fresh random `uuid` beside the same `message` (`_user_line`). Claude
+  echoes it: the `init` of the turn that took the line lists it in `user_message_uuids`, the turn's `result` in
+  `user_message_uuid` and `user_message_uuids` (with every line folded into that turn), and `command_lifecycle` lines
+  name it (`queued`, `started`, `completed`, `cancelled`). An interrupted turn's aborted `result` echoes it too.
+- A turn the CLI starts itself (a background Agent finishing after the host's turn ended): its `init` lists no uuid
+  and has no `origin`; its `result` has no echo, `num_turns` 1 or more, and `origin.kind` `task-notification`. Main
+  took those frames for the next message's and later dropped that message's own result.
+- Only in a VERIFIED process incarnation are frames attributed by that evidence (`_init_turn`, `_result_turn`: the
+  bracket table): its first `init` names a `claude_code_version` in VERIFIED and lists `msg_lifecycle_v1`. VERIFIED
+  holds the versions that passed the release gates M3 (a resumed process echoes), M6 (compaction) and M7 (failure
+  frames); until one has, it is empty, and every process is attributed by order exactly as before (`Event.turn`
+  "order"). Verification is lost for good at the first deviation (a plain `result` where the table falls back to
+  order, an `init` that no longer qualifies). While a verified process runs a turn of its own (an unattributed
+  bracket) it `holds_turns`: the host writes no message for at most the turn timeout (session_host `_held`, as for
+  Codex).
 """
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import uuid
 
 from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
 
@@ -68,7 +88,16 @@ TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 MAX_DENIALS = 50
 MAX_TOOLS = 2000        # tool names taken from one `init`
 INTERRUPT_RECEIPT = "interrupt_receipt_v1"  # an `init` capability: a receipt for the in-band interrupt
+LIFECYCLE = "msg_lifecycle_v1"      # an `init` capability: user lines' uuids are echoed (module text)
 MAX_CAPS = 200
+# The Claude Code versions whose processes are attributed by evidence (module text). A version goes in only once the
+# release gates M3, M6 and M7 passed on it (DESIGN_NOTES "Claude turn correlation"): never to make a gate pass.
+VERIFIED: frozenset[str] = frozenset()
+MAX_ECHO = 64           # uuids read from one frame's echo fields
+# Brackets (`_bracket`): the turn the process is in, by evidence. OWN: the host's turn in flight (an `init` echoed
+# its uuid); UNATTRIBUTED: a turn no message of the host's is known to have started (an unmarked `init`).
+OWN, UNATTRIBUTED = "own", "unattributed"
+log = logging.getLogger("agent_comms.providers.claude")
 # The facts of a `result` the host passes on as `meta`: small scalars only. The reply text travels apart from them
 # (Event.text, capped), so nothing that logs or stores `meta` ever holds it.
 RESULT_META = ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd", "stop_reason", "terminal_reason",
@@ -204,9 +233,58 @@ def _usage_of(info) -> list[dict] | None:
     return kept or None
 
 
-def _user_line(text: str) -> bytes:
-    # json.dumps escapes every line break inside the text: one turn is exactly one line.
-    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}).encode() + b"\n"
+def new_uuid() -> str:
+    """A fresh random uuid for one user line. From os.urandom, not uuid.uuid4: a caller that makes uuid4
+    deterministic (tests/golden_schema_free.py) must see exactly the ids it saw before lines carried one."""
+    return str(uuid.UUID(bytes=os.urandom(16), version=4))
+
+
+def _user_line(text: str, line_id: str) -> bytes:
+    # json.dumps escapes every line break inside the text: one turn is exactly one line. The `message` is the same
+    # bytes as before lines carried a uuid; the uuid is one more key, last.
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}, "uuid": line_id}).encode() + b"\n"
+
+
+def echoed(ev: dict, *keys: str) -> set[str]:
+    """The uuids a frame echoes in these fields (a string, or a list of strings)."""
+    out: set[str] = set()
+    for k in keys:
+        v = ev.get(k)
+        for u in ([v] if isinstance(v, str) else v[:MAX_ECHO] if isinstance(v, list) else []):
+            if isinstance(u, str):
+                out.add(u)
+    return out
+
+
+def origin_not_human(ev: dict) -> bool:
+    """The frame names an `origin` whose `kind` is a word other than `human` (Claude's mark of a turn it started for
+    a notification). A frame with no `origin` (every turn of the host's, as measured) does not."""
+    origin = ev.get("origin")
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    return isinstance(kind, str) and kind != "human"
+
+
+# The classes of a `result` in a verified process (DESIGN_NOTES "Claude turn correlation", the frames by evidence).
+OWNED, OWNED_OTHER, NON_TURN, FOREIGN, PLAIN = "owned", "owned_other", "non_turn", "foreign", "plain"
+
+
+def result_class(ev: dict, written: set[str], current: str | None) -> str:
+    """OWNED: it lists the uuid of the host's turn in flight (`current`); OWNED_OTHER: it lists only other uuids the
+    host wrote to this process; NON_TURN: no host uuid, an `origin` that is not human, `num_turns` 0 (a zero-turn
+    task notification, success or error: it ends no turn); FOREIGN: the same with `num_turns` 1 or more (a turn the
+    CLI started itself); PLAIN: anything else (no evidence either way)."""
+    host = echoed(ev, "user_message_uuid", "user_message_uuids") & written
+    if current is not None and current in host:
+        return OWNED
+    if host:
+        return OWNED_OTHER
+    turns = ev.get("num_turns")
+    if origin_not_human(ev) and isinstance(turns, int) and not isinstance(turns, bool):
+        if turns == 0:
+            return NON_TURN
+        if turns >= 1:
+            return FOREIGN
+    return PLAIN
 
 
 class ClaudeSession:
@@ -235,6 +313,13 @@ class ClaudeSession:
     def _reset_turns(self) -> None:
         self._open = False              # a turn is running in this process (written or begun, its result not yet)
         self._begun = False             # ... and its own `init` came (`takes_interrupt`)
+        # Turn correlation (module text), per process incarnation.
+        self._current: str | None = None    # the uuid of the host's turn in flight (written, its result not yet)
+        self._written: set[str] = set()     # every uuid the host wrote to this process
+        self._verified: bool | None = None  # None until its first `init`; False for good after a deviation
+        self._bracket: str | None = None    # OWN, UNATTRIBUTED or None (no turn open, by evidence)
+        self._competing = False         # an `init` not the turn's own came inside OWN (the steering design's F-4)
+        self.deviation: str | None = None   # why verification was lost (for the log and the tests)
         self._caps: frozenset[str] = frozenset()   # what this process's `init` said it can (module text)
         self._interrupt_id: str | None = None    # the request id of the interrupt written for the turn in flight
         self._interrupt_ok = False      # ... which the process answered with success
@@ -325,18 +410,34 @@ class ClaudeSession:
 
     def turn(self, text: str, kind: str = "user") -> list[bytes]:
         # `kind` has no place in Claude's stream-json input (a user message is the one kind of turn it takes): the
-        # text is all it gets.
+        # text is all it gets, with a fresh uuid of its own (turn correlation, module text).
         self._open, self._begun = True, False
         self._interrupt_id, self._interrupt_ok = None, False
-        return [_user_line(text)]
+        self._current = new_uuid()
+        self._written.add(self._current)
+        return [_user_line(text, self._current)]
 
     def interrupt(self) -> list[bytes] | None:
         return None
 
+    @property
+    def verified(self) -> bool:
+        """This process incarnation is attributed by evidence (module text)."""
+        return self._verified is True and not self._dead
+
+    def holds_turns(self) -> bool:
+        """A verified process is running a turn of its own (an unattributed bracket): a line written now would be
+        taken into that turn or queued behind it, and that turn's frames are no message's. The host keeps the next
+        message until its end, for at most the turn timeout (session_host `_held`: the write barrier)."""
+        return self.verified and self._bracket == UNATTRIBUTED
+
     def takes_interrupt(self) -> bool:
         """Only once THIS turn's `init` came. The process says it can restart in its first `init`, but an interrupt
         written behind a later turn's line, before that turn's `init`, is answered `success` and the turn then runs
-        whole (measured on Claude Code 2.1.330: DESIGN_NOTES "Review follow-ups (2026-11-23)")."""
+        whole (measured on Claude Code 2.1.330: DESIGN_NOTES "Review follow-ups (2026-11-23)"). In a verified process:
+        only inside the turn's own bracket (an `init` that echoed its uuid), never during a turn the CLI started."""
+        if self.verified:
+            return self._open and self._bracket == OWN and self.restarts
         return self._open and self._begun and self.restarts
 
     def interrupt_turn(self) -> list[bytes] | None:
@@ -366,6 +467,99 @@ class ClaudeSession:
             return False
         return None
 
+    # ------------------------------------------------------------ turn correlation (module text)
+
+    def _lose(self, why: str) -> None:
+        """The first deviation: this incarnation is attributed by order from now on, for good."""
+        if self._verified is True:
+            log.warning("Claude session %s: this process is attributed by order from now on: %s",
+                        self.session_id, why)
+            self.deviation = why
+        self._verified = False
+        self._bracket, self._competing = None, False
+
+    def _init_turn(self, ev: dict) -> str:
+        """An `init`: whose turn it starts (Event.turn), and the bracket it leaves open."""
+        version = ev.get("claude_code_version")
+        qualifies = isinstance(version, str) and version in VERIFIED and LIFECYCLE in self._caps
+        if self._verified is None:
+            self._verified = qualifies      # pinned to this incarnation by its first `init`
+        elif self._verified and not qualifies:
+            self._lose("an init no longer names a verified version with msg_lifecycle_v1")
+        if not self._verified:
+            self._open = self._begun = True     # by order, as before turn correlation
+            return "order"
+        own = self._current is not None and self._current in echoed(ev, "user_message_uuids")
+        if self._bracket is None:
+            if own:
+                self._bracket, self._competing, self._begun = OWN, False, True
+                return "own"
+            # An unmarked `init` (or one echoing only lines settled already): a turn no message here started. The
+            # write barrier holds until its end (`holds_turns`).
+            self._bracket, self._competing = UNATTRIBUTED, False
+            log.info("Claude session %s: the CLI began a turn of its own", self.session_id)
+            return "other"
+        if self._bracket == OWN:
+            # An owned bracket is never replaced. Another `init` in it (a compaction's, a re-init, another turn's)
+            # is noted (the steering design's F-4) and logged; its access is checked all the same.
+            if not own:
+                self._competing = True
+                log.info("Claude session %s: an init that is not the turn's own came inside its bracket",
+                         self.session_id)
+            return "other"
+        # UNATTRIBUTED, and then the turn in flight's own `init`: the evidence makes the bracket the turn's (an
+        # unattributed bracket is no owned one); that another turn's `init` opened it first is noted.
+        if own:
+            self._bracket, self._competing, self._begun = OWN, True, True
+            log.info("Claude session %s: the turn in flight began inside a turn the CLI started", self.session_id)
+            return "own"
+        return "other"
+
+    def _steer_only(self, ev: dict) -> bool:
+        """SEAM for the steering design's F-4 (its part D, step 3): a `result` inside the turn's own bracket that lists
+        only a steer written into that bracket. No steer is ever written in this build (`steers` False), so it is
+        never the case, and such a result is what any other line's is: nothing (logged)."""
+        return False
+
+    def _result_turn(self, ev: dict) -> str | None:
+        """A `result`: whose turn it ends (Event.turn), or None for one that ends no turn (the bracket table)."""
+        if not self._verified:
+            # By order, as before turn correlation: also a `result` before any `init` of this process (a launch
+            # refusal: it fails the message that started the process, as it always has).
+            self._open, self._current = False, None
+            return "order"
+        cls = result_class(ev, self._written, self._current)
+        if cls == NON_TURN:
+            log.info("Claude session %s: a zero-turn notification ended no turn", self.session_id)
+            return None
+        if cls == OWNED:
+            # The turn's own result, in its bracket, in an unattributed one (Claude took the line into the CLI's
+            # turn), or with no bracket (its `init` was lost).
+            self._open, self._current, self._bracket, self._competing = False, None, None, False
+            return "own"
+        if self._bracket == OWN:
+            if cls == PLAIN:
+                # No echo at all: the bracket's own end. An absent echo never discards a result.
+                self._open, self._current, self._bracket, self._competing = False, None, None, False
+                return "own"
+            if self._steer_only(ev):
+                pass        # F-4's case would be decided here (the steering design's D); not built: the row below
+            log.info("Claude session %s: a %s result inside the turn's bracket ended nothing", self.session_id,
+                     "foreign" if cls == FOREIGN else "another line's")
+            return "other"
+        if cls == PLAIN:
+            # A deviation (the measured formats always say whose a result is): by order from now on, this result
+            # too (the turn in flight's if there is one, as before turn correlation).
+            self._lose("a result with no evidence of whose it is" + (" ended a turn the CLI started"
+                                                                    if self._bracket == UNATTRIBUTED else ""))
+            self._open, self._current = False, None
+            return "order"
+        # FOREIGN or OWNED_OTHER: no message's. It ends a turn the CLI started (the barrier lifts), or is only logged.
+        log.info("Claude session %s: a turn the CLI %s ended (%s)", self.session_id,
+                 "started itself" if self._bracket == UNATTRIBUTED else "ran", cls)
+        self._bracket, self._competing = None, False
+        return "other"
+
     def feed(self, line: bytes) -> tuple[list[Event], list[bytes]]:
         if self._dead:
             return [], []
@@ -383,21 +577,23 @@ class ClaudeSession:
         if init:
             events = [] if self._ready else [Event("ready", provider_id=sid)]
             self._ready = True
-            self._open = self._begun = True
             caps = ev.get("capabilities")
             self._caps = frozenset(c for c in (caps if isinstance(caps, list) else [])[:MAX_CAPS] if isinstance(c, str))
             mode, tools = ev.get("permissionMode"), ev.get("tools")
             # A name that is not a plain tool name still counts as a tool the session has: "unknown", never dropped.
             named = tuple(t if isinstance(t, str) and TOOL_NAME_RE.fullmatch(t) else "unknown"
                           for t in (tools if isinstance(tools, list) else [])[:MAX_TOOLS + 1])
+            # Every `init` is reported, whatever its bracket: the host checks each one's access (session_access.verify).
             return events + [Event("turn_started", mode=mode if isinstance(mode, str) and len(mode) <= 40 else None,
-                                   tools=named)], []
+                                   tools=named, turn=self._init_turn(ev))], []
         if kind == "result":
-            self._open = False
             ok = ev.get("subtype") == "success" and ev.get("is_error") is False
+            turn = self._result_turn(ev)
+            if turn is None:
+                return [], []       # a zero-turn notification: it ends no turn (logged)
             # Claude's own end of the turn, a success or an error: it took the turn (Event.answered).
             return [Event("turn_ended", ok=ok, meta=_meta(ev), denials=tool_names(ev.get("permission_denials")),
-                          text=cap_reply(ev.get("result")), answered=True)], []
+                          text=cap_reply(ev.get("result")), answered=True, turn=turn)], []
         if kind == "control_response":
             answer = ev.get("response")
             if (self._interrupt_id is not None and isinstance(answer, dict)

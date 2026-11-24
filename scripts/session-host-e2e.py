@@ -70,6 +70,19 @@ S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long tu
     end, as an ordinary turn, and answered (kiwi), and the same process took it (the in-band interrupt).
 S3/S6. `--mode auto` on the idle session: a turn of its own, written within --max-latency.
 With --claude-bin and --codex-bin those sessions are real (three small turns each).
+Then Claude turn correlation (`--only correlation` runs nothing else; DESIGN_NOTES "Claude turn correlation"), for a
+Claude session of its own agent (its runner may run `sleep`). Every user line the node writes carries a fresh uuid;
+the release gates for attributing a process by that evidence are measured here on the real CLI:
+X1. `start --wait`: the line written (the wrapper's stdin log) carries a uuid, and the node's transcript shows the
+    turn's `init` echoing it in `user_message_uuids` and its `result` in `user_message_uuid(s)`.
+X2. M3: the node is restarted, so the session's next process is started with `--resume`: its first turn, and a
+    second one, echo their lines' uuids the same way.
+X3. M7 (in part): a long turn (`sleep 12`) restarted with `--mode restart --wait`: its aborted `result`
+    (`aborted_tools`) still echoes the interrupted line's uuid; the restart's message is answered.
+X4. (stand-ins only) VERIFIED ships empty, so a process is still attributed by order exactly as on main: a turn
+    the CLI starts itself (`bg`) right after one turn is taken for the next message's, as before (a measured bug
+    that turn correlation fixes once a version is verified: tests/test_claude_correlation.py).
+With --claude-bin: five small haiku turns.
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
 the same temp directory with `[dispatch.sessions.spawn] enabled = true` on the hub, and on the node a worktree
@@ -250,6 +263,7 @@ WORK_AGENT = "claude-work"      # ... a seventh: another account's runner (an ac
                                 # the temp checkout only (A1-A3)
 POOL = "e2e-pool"               # P1-P4: an account pool of the work agent first, then the first agent
 STEER_AGENT = "claude-steer"    # the send-mode scenario's Claude agent: its runner may also run `sleep` (a long call)
+CORR_AGENT = "claude-corr"      # the turn-correlation scenario's Claude agent (X1-X4): the same runner as STEER_AGENT
 NO_BYPASS = "disableBypassPermissionsMode"  # the settings key (under permissions) a node adds to every launch but full
 GRANTS = {"permissions": {"allow": ["Bash(*)", "Write", "Edit", "Read"]}}     # ... and two hooks (enable_tree)
 BYPASS_BY_SETTINGS = {"permissions": {"defaultMode": "bypassPermissions"}}
@@ -472,6 +486,7 @@ class Run:
         self.poster_token = create_agent(agents, POSTER, "codex-cli")
         create_agent(agents, CODEX_AGENT, "codex-cli")
         create_agent(agents, STEER_AGENT, "claude-code")
+        create_agent(agents, CORR_AGENT, "claude-code")
         self.node_token = create_agent(agents, NODE, "node")
         (self.hub_home / "board.toml").write_text(f"""[server]
 host = "127.0.0.1"
@@ -484,7 +499,7 @@ enabled = false
 
 [dispatch.nodes.{NODE}]
 projects = {toml_list([str(self.project)])}
-agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT])}
+agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT, CORR_AGENT])}
 
 [dispatch.sessions]
 wake_min_interval_seconds = {WAKE_INTERVAL}
@@ -533,6 +548,7 @@ kill_grace_seconds = 5
 {AGENT} = {toml_list(runner)}
 {CODEX_AGENT} = {toml_list(self.codex_runner())}
 {STEER_AGENT} = {toml_list(steer_runner)}
+{CORR_AGENT} = {toml_list(steer_runner)}
 
 [dispatch.worktrees]
 {json.dumps(str(self.project))} = {json.dumps(str(self.project))}
@@ -1080,6 +1096,108 @@ codex = true
             time.sleep(0.2)
         self.check(self.show(sid)["state"] == "ended" and gone(pid), "closed, and its process is gone")
 
+    # ------------------------------------------------------------ Claude turn correlation (X1-X4)
+
+    def transcript(self, sid: str) -> list[dict]:
+        """The session's transcript on the node: every line its processes wrote (a settings answer withheld)."""
+        out = []
+        for line in (self.node_home / "data" / "node-logs" / "sessions" / f"{sid}.jsonl").read_text().splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                out.append(ev)
+        return out
+
+    def written_lines(self) -> list[dict]:
+        """Every user line written to a Claude session process so far (the wrapper's stdin log), parsed."""
+        lines = [json.loads(x) for x in self.stdin_log.read_text().splitlines() if x.strip()]
+        return [x for x in lines if x.get("type") == "user"]
+
+    def echoed(self, sid: str, text: str) -> tuple[str | None, list[dict], list[dict]]:
+        """(the uuid of the LAST line written with this text, the `init` frames echoing it, the `result` frames
+        echoing it), from the wrapper's stdin log and the session's transcript."""
+        mine = [x for x in self.written_lines() if x["message"]["content"] == text]
+        u = mine[-1].get("uuid") if mine else None
+        frames = self.transcript(sid)
+        inits = [f for f in frames if f.get("subtype") == "init" and u in (f.get("user_message_uuids") or [])]
+        results = [f for f in frames if f.get("type") == "result" and (
+            f.get("user_message_uuid") == u or u in (f.get("user_message_uuids") or []))]
+        return u, inits, results
+
+    def check_echo(self, sid: str, text: str, what: str) -> dict:
+        u, inits, results = self.echoed(sid, text)
+        version = next((f.get("claude_code_version") for f in inits), None)
+        print(f"  line uuid {u}; init echoes: {len(inits)}; result echoes: {len(results)}; version {version}")
+        self.check(isinstance(u, str) and len(u) == 36, f"{what}: the line written carries a uuid")
+        self.check(len(inits) == 1 and len(results) == 1,
+                   f"{what}: its init lists it in user_message_uuids and its result in user_message_uuid(s)")
+        return results[0]
+
+    def correlation_scenario(self) -> None:
+        """X1-X4 (the module text)."""
+        real = self.real
+        model = ["--model", "haiku"]
+        words = {k: (f"Reply with exactly the word: {k}" if real else k) for k in ("alpha", "beta", "gamma", "kiwi")}
+        long = ("Run this exact shell command once, with your shell or Bash tool, and nothing else first: `sleep 12`. "
+                "When it has finished, reply with exactly the word: done") if real else "sleep 12 for the restart"
+
+        print("\n[X1] a Claude session: the line carries a uuid; the turn's init and result echo it")
+        out, _, _ = self.board("session", "start", str(self.project), words["alpha"], "--agent", CORR_AGENT, *model,
+                               "--wait", "--json")
+        data = json.loads(out)
+        sid = data["session"]["session_id"]
+        self.check(data["message"]["state"] == "done" and "alpha" in (data["reply"] or "").lower(),
+                   "the first turn was answered")
+        self.check_echo(sid, words["alpha"], "the first turn")
+
+        print("\n[X2] M3: the node is restarted; the session's next process resumes it, and its turns echo")
+        before = self.show(sid)["pid"]
+        self.restart_node()
+        out, _, _ = self.board("session", "send", sid, words["beta"], "--wait")
+        starts = [json.loads(x) for x in Path(str(self.stdin_log) + ".argv").read_text().splitlines()]
+        resumed = [a for a in starts if sid in a and "--resume" in a]
+        self.check(bool(resumed) and self.show(sid)["pid"] != before,
+                   "the turn ran in a new process started with --resume")
+        self.check("beta" in out.lower(), "the resumed process's first turn was answered")
+        self.check_echo(sid, words["beta"], "M3, a resumed process's first turn")
+        out, _, _ = self.board("session", "send", sid, words["gamma"], "--wait")
+        self.check_echo(sid, words["gamma"], "M3, the resumed process's second turn")
+
+        print("\n[X3] M7: a long turn restarted in-band; its aborted result echoes the interrupted line")
+        self.board("session", "send", sid, long)
+        n = len(self.show(sid)["messages"])
+        m = self.message(sid, n, lambda m: m["state"] == "delivered", 60)
+        self.check(m is not None and m["state"] == "delivered", f"message {n}'s turn is in flight")
+        deadline = time.monotonic() + 60
+        while not self.echoed(sid, long)[1] and time.monotonic() < deadline:
+            time.sleep(0.2)
+        time.sleep(4 if real else 1)        # into the command
+        out, _, _ = self.board("session", "send", sid, words["kiwi"], "--mode", "restart", "--wait", "--json")
+        data = json.loads(out)
+        old = next(x for x in self.show(sid)["messages"] if x["n"] == n)
+        self.check(old["state"] == "failed" and old.get("restarted_by") == n + 1,
+                   "the long turn was interrupted by the restart, as the provider said")
+        aborted = self.check_echo(sid, long, "M7, an interrupted turn")
+        self.check(aborted.get("terminal_reason") == "aborted_tools" and aborted.get("is_error") is True,
+                   "... and that result is the abort (error_during_execution, aborted_tools)")
+        self.check("kiwi" in (data["reply"] or "").lower(), "the restart's message was answered")
+        self.check_echo(sid, words["kiwi"], "the restart's message")
+
+        if not real:
+            print("\n[X4] VERIFIED is empty: a turn the CLI starts itself is still attributed by order, as on main")
+            self.board("session", "send", sid, "bg 2 1 one", "--wait")
+            out, _, _ = self.board("session", "send", sid, "two", "--wait")
+            self.check(out.strip() == "background: FINISHED",
+                       "the CLI's own turn was taken for the next message's, exactly as main does (no version is "
+                       "verified yet)")
+        self.board("session", "close", sid)
+        deadline = time.monotonic() + 20
+        while self.show(sid)["state"] != "ended" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.check(self.show(sid)["state"] == "ended", "closed")
+
     # ------------------------------------------------------------ --with-board: a woken session reads the board
 
     def probe(self, post_id: int, sid: str) -> dict:
@@ -1346,7 +1464,7 @@ codex = true
             (directory / ".claude").mkdir(parents=True, exist_ok=True)
             (directory / ".claude" / "settings.json").write_text(json.dumps(fixture, indent=2) + "\n")
         hub = (self.hub_home / "board.toml").read_text()
-        hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT])}", "agents = " + toml_list(
+        hub = hub.replace(f"agents = {toml_list([AGENT, CODEX_AGENT, STEER_AGENT, CORR_AGENT])}", "agents = " + toml_list(
             [AGENT, CODEX_AGENT, FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, SPAWN_AGENT, WORK_AGENT,
              CHECK_CODEX, DENIED_CODEX]))
         hub = hub.replace(f"projects = {toml_list([str(self.project)])}",
@@ -3117,7 +3235,7 @@ def main() -> int:
     ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
                     help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
                          "one codex-cli 0.171.0 lists)")
-    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured", "check"),
+    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured", "check", "correlation"),
                     help="run only that scenario: one agent's, parent and child sessions, the send modes on a "
                          "running turn, results as data (D1-D8), or the in-turn check alone (D7-D8) "
                          "(default: all)")
@@ -3141,15 +3259,16 @@ def main() -> int:
         args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
         if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
             ap.error("--codex-bin must be an executable named codex")
-    if args.with_board and args.only in ("codex", "tree", "steer", "structured", "check"):
+    if args.with_board and args.only in ("codex", "tree", "steer", "structured", "check", "correlation"):
         ap.error("--with-board is a Claude scenario")
     codex, claude = args.only in (None, "codex") and not args.with_board, args.only in (None, "claude")
     tree = args.only in (None, "tree") and not args.with_board
     steer = args.only in (None, "steer") and not args.with_board
+    correlation = args.only in (None, "correlation") and not args.with_board
     structured = args.only in (None, "structured") and not args.with_board
     check = args.only == "check"        # the in-turn check's scenarios alone (D7-D8; structured runs them too)
     run = Run(args)
-    if claude or tree or steer or structured or check:
+    if claude or tree or steer or structured or check or correlation:
         print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
                            else "stand-in (tests/stand_in_claude.py), no model")
               + (", with the temp board's MCP tools" if args.with_board else ""))
@@ -3171,7 +3290,7 @@ def main() -> int:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
-        if codex or claude or args.with_board or steer or structured or check:
+        if codex or claude or args.with_board or steer or structured or check or correlation:
             run.start_services()
             if codex:
                 run.codex_scenario()
@@ -3181,6 +3300,8 @@ def main() -> int:
                 run.scenario()
             if steer:
                 run.steer_scenario()
+            if correlation:
+                run.correlation_scenario()
             if structured:
                 run.structured_off_scenario()
             if check and not run.real:
