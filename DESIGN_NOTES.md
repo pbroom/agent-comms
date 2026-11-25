@@ -13885,7 +13885,8 @@ hold, the finalizer, the checkpoint (`held`), S's own turn and `next_turn` with 
 stderr.txt, summary.txt), from `steer3/probe_m8.py`, run with `python3 -I`, the design's part B argv (private cwd,
 `--setting-sources=`, `--strict-mcp-config`, haiku, `--no-session-persistence`, stream-json, `--permission-prompts
 none`), every line `{"type": "user", "message": {...}, "uuid": <own uuid>}`. 30 runs: 3 of each scenario but `tool`
-(3) and `race` (6); `~/.codex/config.toml` 490d50b458847d7d before and after every batch.
+(3) and `race` (6); `~/.codex/config.toml` 490d50b458847d7d before and after every batch. (Corrected in review
+round 1: the table lists 27 runs, and 27 is what was run; round 1 adds 9 more and a resumed process, below.)
 
 | scenario | runs | N's result | after N's end |
 | --- | --- | --- | --- |
@@ -14136,3 +14137,285 @@ otherwise). In the e2e script: Q3's Claude refusal check (above) and the tree's 
 - `--only correlation` with the real Claude Code 2.1.330: PASS.
 - `~/.codex/config.toml` sha256 490d50b458847d7d before, between and after every real run (the M8 probes too).
 
+
+### Review round 1 (on 61b540b: CHANGES, five blockers, three shoulds, one nit) and what changed
+
+Rebased onto main d11ff99 (#116) first (backup branch `backup/claude-steering-61b540b`); one conflict, in this file
+(the follow-up after #115 and step 3's section, both kept, step 3's after it). The rulings, in short: **A** typed
+evidence and one adjudicator (the adapter classifies, the host decides, exact predicates, the attempt retired
+before any further frame; departure 4 handled as step 1's rule 10); **B** publication never depends on a later
+successful read (departure 1 kept with a rule, departure 2 overruled: rule 5); **C** the checkpoint's transport
+isolated, under a feature of its own, and the hub's report contract tightened; **D** coverage (the golden against
+main for the enabled version, the e2e through the normal entry points, every Partly/No row of part O closed, the
+model rebuilt); **E** gate M8's evidence (the manifest, the raw frames as fixtures, the missing cases measured, M8
+restated). Tests first for each blocker and should: every `test_r1_b*`, `test_r1_c*` and `test_r1_s*` test fails on 61b540b
+(run on an export of it) and passes now; the `test_r1_o_*` tests close part O's rows (D).
+
+#### A. Typed evidence, one adjudicator
+
+- **The adapter classifies only.** `ClaudeSession.feed` attaches to a frame's event its evidence for S
+  (`Event.steer`, one of `providers.EVIDENCE`: `n_with_s`, `n_without_s`, `s_only`, `s_open`, `s_end`,
+  `s_consumed`, `lost`), from `_steer_init` (called by `_init_turn` first), `_steer_result` (called by
+  `_result_turn` first) and `_lose` (a deviation while an attempt is live is typed `lost`). It holds no state that
+  decides an outcome: the attempt's facts (S's uuid, N's, the bytes of S that went, the phase `n` / `held` /
+  `s_turn`) are the host's, told through `steer_facts(sent=..., phase=...)` (callers: `SessionHost._steer_count_bytes`
+  after every write of S, and `_steer_adjudicate` when S's own turn opens). Byte evidence is per attempt
+  (`_attempt["bytes"]`): an attempt no byte of which went leaves no trace (`steer_done` forgets S's uuid).
+- **The exact predicates** (nothing wider than M8 measured): S's own turn opens only on an `init` whose
+  `user_message_uuids` is a list of exactly one element equal to S, with no `origin`, in a verified incarnation of a
+  version in STEER_MODES as `next_turn`, in VERIFIED, with `msg_lifecycle_v1`, after N's native end (phase `held`),
+  with no other bracket open; S's own turn ends only on a result inside that bracket whose `user_message_uuids` is
+  exactly [S] and `user_message_uuid` S (`_exact`); N's result with S is exactly [N, S]; S consumed is a terminal
+  result listing exactly [S] inside a bracket the CLI opened (UNATTRIBUTED) during the hold. Any other frame is no
+  evidence for S at all; one that is a deviation under step 1's table loses verification as on main and is typed
+  `lost`. Departure 4's rule: inside S's proved bracket with nothing else open, an error result with no echo at all
+  and no origin is step 1's rule 10: S's own turn failed with it, by order, and the incarnation is unverified from
+  then on (`s_end`, then `lost`). (Found this round by part O's row R6-04: a zero-turn notification's error inside
+  S's bracket took that rule; it is now no evidence, `test_r1_o_a_zero_turn_error_notification_in_the_hold_and_in_ss_own_bracket_is_inert[s_turn]`.)
+- **One adjudicator.** `SessionHost._steer_adjudicate` (its one caller: `_on_event`, for every event carrying
+  evidence other than N's own end, before anything else is done with it) decides every piece of evidence for S
+  after N's native end, inside `_steer_stop_lock` (the stop latch's lock); N's end itself is `_steer_end` (callers:
+  `_on_event`'s turn end, and `_fail`), under the same lock. Publication is `_publish_hold` (callers:
+  `_steer_adjudicate` for `s_end` and `s_consumed`, `_finalize_hold`, `_hold_fence`, `_reap`, `_publish_now`), and
+  its first act is the adapter's `steer_done()`: the attempt is retired before any further frame is processed (the
+  next ordinary turn, a second steer, a CLI turn in the same read are then step 1's: `test_r1_b1_*`).
+- **The latch and the contact clock, case by case** (`steer_stopping` sets the latch under the lock; the
+  attempt's own contact clock and the node's write authority apply for the whole life of the attempt, `_hold_pass`):
+
+| case | N | S |
+| --- | --- | --- |
+| latch set, then S's buffered `init` and result read | N's held native end, published by the stop of every turn at main's point | `unconfirmed` (`turn_cut`): nothing read after the latch counts (`test_r1_b3_evidence_after_the_stop_latch_never_counts`) |
+| latch set during S's proved own turn, then its result read | N's held native end, at main's point | `next_turn`, S failed: "its own turn was cut" (`test_r1_b3_evidence_after_the_latch_in_ss_own_turn_is_next_turn_cut`) |
+| latch set with N's own result buffered, unread | N fails as on main (the stop of every turn) | `unconfirmed` (`turn_cut`) (`test_r1_o_signal_with_buffered_evidence_publishes_n_once_before_ended[n_result]`) |
+| the attempt's contact runs out, or authority is lost, while N is held | N's held native end, after the bounded stop | `unconfirmed` (`turn_cut`) |
+| the same during S's proved own turn | N's held native end, after the bounded stop | `next_turn`, S failed: "its own turn was cut: the steer's contact with the hub ran out" (`test_r1_b3_the_steers_contact_running_out_in_the_hold_cuts_it[held|s_turn]`; e2e Z7) |
+| contact or authority lost before N's end | step 2's cut, unchanged (the shared write boundary and `_steer_pass`) | step 2's outcome |
+
+#### B. Publication never depends on a later successful read
+
+- `SessionHost._tick` checks every held session's deadline FIRST (`_hold_deadline`, before any fallible read); an
+  error there publishes at once (`_publish_now`). An unexpected error in a session's pass (`_host_error`, the two
+  exception handlers in `_tick`) follows "Shutdown simplified" rule 5: `_end` with `_at_once` set, then, whatever
+  happened, `_publish_now`: N's held end from the evidence in hand, then `ended`; nothing deferred, nothing read.
+  `_reap` publishes a fenced held end right after the child is let go, before the group's cleanup, so a cleanup
+  error cannot strand it. Departure 2 is gone; departure 1 is kept, with this rule.
+- **Precedence.** Step 2's inline-settlement rule (review round 6: a live attempt's turn end is settled inline where
+  main settles that process, its bounded drain first) decides WHEN N's end and S's outcome are decided, for Claude as
+  for Codex. Its one exception, for a held Claude N on a single-session stop (a timeout, a cancel, a close, the cut,
+  a deviation, contact or authority lost): the decided end is published once the process group is gone or 2 x
+  kill_grace after the stop, whichever is first (departure 1), the deadline checked at the start of every tick. A
+  stop of every turn, shutdown, the latch, an unexpected host error and an exit publish at main's point, at once.
+- **The real worst case for the checkout** (N delivered on the hub): from N's native end, up to one turn timeout
+  until S's own turn opens, then up to one turn timeout for S's own turn (its fresh clock), then the stop and up to
+  2 x kill_grace for the group; then the next tick (TICK_SECONDS, 0.2 s, while a session has work; a pass before it
+  may spend up to two hub calls, CALL_TIMEOUT 20 s each, and the checkpoint's own call, CHECKPOINT_SECONDS 5 s); then
+  the report (one call, retried while the hub cannot be reached). With 30-minute turns and a 10 s grace: about 60
+  minutes 20 seconds plus at most about 45 s of transport. With no hub contact the node's self-stop (90 s) is a
+  stop of every turn: published at once.
+- **Section 3's paths, one publication each**: S's own result (`test_next_turn_s_ran_as_its_own_turn_after_ns_end`);
+  consumed by a CLI turn (`test_s_consumed_by_a_turn_the_cli_started_itself_is_unconfirmed`); the bound
+  (`test_the_bound_a_held_end_times_out_a_turn_timeout_after_ns_native_end`, e2e Z8); a cancel
+  (`test_a_cancel_of_n_during_the_hold_reports_ns_native_result`); a close
+  (`test_the_queued_s_close_finalizer_n_end_then_ended`, `test_r1_o_a_close_with_ss_result_buffered_takes_it_in_the_drain`,
+  e2e Z3); an exit (`test_an_exit_during_the_hold_publishes_at_once`,
+  `test_r1_o_a_queued_successor_goes_through_the_reap_and_a_new_process`); the cut and contact
+  (`test_r1_b3_the_steers_contact_running_out_in_the_hold_cuts_it`, e2e Z7); a deviation
+  (`test_a_deviation_in_the_hold_finalizes_at_once`, `test_r1_b2_an_unverifying_init_in_the_hold_finalizes_it`); a
+  stop of every turn and shutdown (`test_a_stop_of_every_turn_publishes_a_held_end_at_mains_point[stop_turns|stop_all]`);
+  the latch (`test_r1_b3_*`, `test_r1_o_signal_with_buffered_evidence_publishes_n_once_before_ended`); a read error and
+  a cleanup error (`test_r1_b4_a_read_error_while_held_publishes_n_and_ended_at_once`,
+  `test_r1_b4_a_fenced_end_is_published_at_its_deadline_whatever_the_reads_do`); a lingering group
+  (`test_the_bounded_publication_a_lingering_group_delays_ns_end_at_most_two_graces`,
+  `test_r1_o_a_group_outliving_sigkill_with_a_queued_successor`); timeout, close and late reap together
+  (`test_r1_o_a_timeout_a_close_and_a_late_reap_overlap`); a node restart (e2e Z6) and node loss or a replacement
+  node (`test_g_a_committed_checkpoint_decides_ns_native_fields_on_every_settling_path[lost_node|replacement_node]`).
+  Each asserts exactly one end of N, and `ended` after it where there is one.
+
+#### C. The checkpoint's transport, isolated
+
+- A feature of its own: the hub's listing names `held` (`hosted.NODE_REPORT_FEATURES = ("answered", "restart",
+  "held", "steer")`); a step-2 hub, which names `steer` but not `held`, is never sent a checkpoint
+  (`test_r1_c_a_step_2_hub_that_names_steer_gets_no_checkpoint`).
+- The node: `NodeSessions._checkpoint` (its caller: `_emit`, for a `held` host event, never one of the session's
+  events) keeps it; `_flush` takes the checkpoints whose sessions have nothing pending before them out of the queue
+  INSIDE the report lock and `_post_checkpoints` posts them AFTER it is let go, one try each, CHECKPOINT_SECONDS (5 s)
+  at most, through the client's own call: its failure, refusal or stall clears no feature knowledge, renews no
+  contact, strips no other session's extension and holds no other report up longer than that. Sol's replay (A's
+  checkpoint refused with 409, then B's end) keeps B's steer extension:
+  `test_r1_b5_a_refused_checkpoint_never_strips_another_sessions_steer_outcome`;
+  `test_r1_c_the_checkpoint_has_its_own_short_call_outside_the_report_lock`.
+- The hub: `hosted_steer.checkpoint` (its one caller: `hosted.report`) accepts a checkpoint only for a Claude
+  session (runtime `claude-code`), only with `answered` true, from the session's assigned node only (the route), and
+  answers an ended session with an explicit conflict, not success (`test_r1_c_the_hub_refuses_impossible_checkpoints`,
+  `test_r1_o_a_checkpoint_from_another_authenticated_node_is_refused`); `settle` takes `next_turn` only for a Claude
+  steer (`test_r1_c_next_turn_is_taken_only_for_a_claude_steer`); optional metadata is sanitised on both sides
+  (non-finite numbers left out: `test_r1_c_nonfinite_metadata_is_left_out_on_both_sides`); a stale `held` is cleared
+  by the re-upgrade sweep (`hosted_steer._clear_held` from `_settled`: `test_r1_c_the_reupgrade_sweep_clears_a_stale_checkpoint`).
+
+#### The shoulds and the nit
+
+- Should 2 (byte evidence per attempt): `test_r1_s2_byte_evidence_is_per_attempt`.
+- Should 3 (the parent claim projection): a claimed `next_turn` keeps both blocks and S's failure
+  (`hosted_spawn.taken` adds S's `ok` and `detail`; `test_r1_s3_a_claimed_next_turn_keeps_both_blocks_and_ss_failure`,
+  e2e Z5); the CLI retry whose N was pruned keeps a known `next_turn` (`cli` `gone()`:
+  `test_r1_s3_a_retry_whose_n_is_pruned_keeps_a_known_next_turn`).
+- The nit (the model's reach depended on test order): the model test asserts its reach itself, in one test
+  (below).
+
+#### D. Coverage
+
+- **The golden** (tests/golden_schema_free.py; tests/fixtures/schema_free_main_330.json): the same recorded run
+  with every Claude process reporting 2.1.330 (VERIFIED and STEER_MODES as shipped), no steer sent, recorded
+  against main d11ff99 and compared ADDED KEYS ONLY (`added_only`): node report and hello bodies, hub records and
+  views, the listings, CLI text, every process's raw stdin and raw transcript, host events, log lines, and round 3's
+  parity runs (a cancel against the watchdog, a shutdown with turns in flight, a flush overlapping it). Every value
+  main has is byte-identical and no key is added anywhere; step 3's named changes (part K), taken out and recorded:
+  `held` before `steer` in a listing's features, and `steer` first in a Claude 2.1.330 session's `modes` (its record
+  and its reports): `test_with_the_enabled_version_and_no_steer_every_value_mains_has_is_byte_identical`,
+  `test_the_330_run_is_the_enabled_version_and_step3s_named_changes_are_only_what_k_names`,
+  `test_added_only_lets_through_added_keys_and_nothing_else`. The 40-seed test stays. The step-2 allowance also
+  takes `held` (step 3's feature) where it takes `steer`.
+- **The e2e** (scripts/session-host-e2e.py, `--only steering`, stand-ins; the module text): Z5 a parent steering
+  its Claude child with `board_session_send(mode=steer, wait=true)`, twice: `next_turn`, S's reply in its own block
+  after the hub's line, and the second S failing with its failure kept; Z6 a node restart during a hold; Z7 (with
+  `--only steering`) a partition past the attempt's contact clock during S's own turn; Z8 the bound (a 12 s turn
+  timeout, that node run only), within two turn timeouts plus 2 x kill_grace; Z9 a CLI-started turn taking S in
+  (`unconfirmed`/`consumed`, exit 6); Z10 S in a resumed process (stand-in once; the real CLI three times, below).
+  The stand-in gained two words for this (`fail-own` anywhere; `think N bg ...`) and reads `sleep`/`think`/`hold`/`bg`
+  inside a child's task frame (no existing test used those words inside a frame).
+- **Part O's table, every Partly/No row closed**:
+
+| row | test(s) |
+| --- | --- |
+| checkpoint validation, precedence, visibility and loss | `test_r1_o_a_checkpoint_from_another_authenticated_node_is_refused`, `test_r1_c_the_hub_refuses_impossible_checkpoints` (provider guard), `test_r1_b5_a_refused_checkpoint_never_strips_another_sessions_steer_outcome` and `test_r1_c_the_checkpoint_has_its_own_short_call_outside_the_report_lock` (failed and stalled POST), `test_r1_c_the_reupgrade_sweep_clears_a_stale_checkpoint` (rollback sweep) |
+| fresh clock for an S start found in the timeout drain | `test_r1_o_an_s_init_first_found_by_the_timeout_drain_and_the_hard_stop_contrast[timeout|stop_all]` |
+| `signal` and `stop_all` before and during the hold | `test_r1_o_signal_with_buffered_evidence_publishes_n_once_before_ended[n_result|s_init|s_result]` |
+| the watchdog's acknowledged send time, expiry in a fully written hold | `test_r1_b3_the_steers_contact_running_out_in_the_hold_cuts_it[held|s_turn]` |
+| R6-04, the zero-turn error in the hold and in S's bracket | `test_r1_o_a_zero_turn_error_notification_in_the_hold_and_in_ss_own_bracket_is_inert[held|s_turn]` |
+| close with S queued: buffered terminal evidence, a queued successor through reap and reopen | `test_r1_o_a_close_with_ss_result_buffered_takes_it_in_the_drain`, `test_r1_o_a_queued_successor_goes_through_the_reap_and_a_new_process` |
+| R8-05, lifecycle `completed(S)` then a terminal without S, both modes | `test_r1_o_lifecycle_completed_s_then_a_terminal_without_s_keeps_the_hold[next_turn|three]` |
+| R11-03 for the Claude adapter, each write phase | `test_r1_o_ns_result_without_s_at_each_write_phase[zero|partial|whole]` |
+| timeout, close and late reap overlap (No) | `test_r1_o_a_timeout_a_close_and_a_late_reap_overlap` |
+| a group that outlives SIGKILL: a queued successor, unwritability, no duplicate after the late reap | `test_r1_o_a_group_outliving_sigkill_with_a_queued_successor` |
+
+- **The model** (`test_model_claude_steer_walks_against_an_independent_reference`, 300 seeded walks): its generator chooses every
+  action from its own reference state (`_M2`), never from production's `s.held` or `s_turn`; it covers zero and
+  partial writes, successive turns and a second steer, the latch and contact races, multi-frame reads, mixed and
+  competing terminal frames; it checks S's reply, not only `ok`; and it asserts its own reach for every outcome,
+  `not_delivered` included, inside the one test (independent of test order).
+
+#### E. Gate M8
+
+- **The manifest, reconciled.** The earlier table's "30 runs" was a miscount: it listed 27 (3 each of `tool`,
+  `after_tool`, `text`, `cli_take`, `cli_late`, `interrupt`, `error`, and 6 races). Round 1 adds 9 (3 each of
+  `notify_first`, `s_error`, `s_interrupt`): 36 runs of 13 scenarios, every one checked in, sanitised
+  (tests/fixtures/m8_2.1.330/, MANIFEST; uuids normalised, session id and paths out, replies reduced to the probe
+  words, only the fields the classifier reads): `test_m8_the_manifest_is_36_runs_of_thirteen_scenarios`; and every
+  run in which S was written into N (30: all but `cli_take` and `cli_late`, where the probe wrote S after N had ended)
+  replayed through the host and the adapter as shipped:
+  `test_m8_real_frames_through_the_host_give_the_outcome_their_own_frames_prove[<run>]`.
+- **Measured this round** (three runs each, Claude Code 2.1.330, haiku, the probe's argv): `notify_first`: a
+  notification queued before S while N runs (S written 5 s after N's background Agent launched): in all three the
+  CLI's notification turn ran FIRST (an `init` with no echo, a result with origin `task-notification` and no
+  echo), taking nothing of S, and then `init` [S], `result` [S]: `next_turn` (the notification's bracket ends
+  without S and is no evidence). `s_error`: S's own turn ends `error_max_turns`, listing exactly [S]: `next_turn`,
+  S failed. `s_interrupt`: the in-band interrupt during S's own tool call: `error_during_execution`
+  (`aborted_tools`), listing exactly [S]: `next_turn`, S failed. S's echo lost could not be provoked (no run of 36
+  lost it). `resumed`: S in a resumed process, the way the node resumes a
+  hosted session (the e2e's Z10 with the real CLI, three runs: a first turn answered, the node restarted, the next
+  process started with `--resume`, a text-only N, a human steer 1.5 s into it): in all three N's result lists
+  exactly [N], then `init` [S] (no origin), `result` [S] (no origin, num_turns 1): `next_turn` with S's own reply.
+  Their frames are checked in as `resumed-1` to `resumed-3`: 39 runs of 14 scenarios
+  (`test_m8_the_manifest_is_39_runs_of_fourteen_scenarios`), 33 replayed through the host.
+- **M8, restated.** Under the exact predicates, in every measured case: N's result lists exactly
+  [N, S] (`tool`: `in_turn`) or exactly [N]; every N bracket was opened by `init` [N] and no result listing only S
+  ever came inside one, so N's ownership is never ambiguous; where S missed N (the 21 earlier runs and all 12 of
+  this round: a notification first, S's own error, S's own interrupt, a resumed process) S's own turn was opened by
+  an `init` listing exactly [S] with no origin and ended by a result listing exactly [S]; the only other result
+  listing exactly [S] was a CLI-started turn's terminal result (`cli_take`: `unconfirmed`, `consumed`). **Distinct
+  S ownership is proved for 2.1.330: it stays in STEER_MODES as `next_turn` (the four outcomes).** No predicate was
+  widened; the 33 runs replayed through the host give exactly the outcome their own frames prove.
+
+#### The departures' status
+
+1. The bounded publication on a single-session path: **kept**, with ruling B's rule (above).
+2. An unexpected host error: **overruled**; rule 5, at once (`_host_error`).
+3. A late [N, S] during the hold: **overruled**; it is no evidence for S (`test_r1_b2_a_late_n_s_result_in_the_hold_is_no_evidence`).
+4. A plain result inside S's own bracket: **ruled**: only an echo-less, origin-less error is rule 10 (above); any
+   other frame matching no predicate is no evidence for S.
+5. The golden: **built** (D).
+6. The e2e: **built** (D).
+7. (`not_owned` vs `not_written`, the class's `steers`): unchanged.
+
+#### Part K, restated for step 3
+
+With no steer sent, what an observer sees differently from main d11ff99 is exactly: `held` before `steer` in the
+hub's listing features, and `steer` first in a verified 2.1.330 Claude session's `modes` (its record and the node's
+reports for it). Everything else (frames, events, raw stdin and transcripts, hub records and views, CLI text, log
+lines, shutdown) is byte-identical: the golden above. With a steer: as before (S's line, the hold, the checkpoint as
+a report of its own, the extension with `next_turn`), and the INFO lines listed above (no steer or message text).
+
+#### Mutation check, review round 1
+
+Scratchpad `steer3/mutate_r1.py`, one change per row applied alone to an export of the branch (never the worktree),
+tests/test_claude_steering.py first and, only if that did not catch it, the correlation, Codex steering, restart,
+hub restart, golden and hosted-session tests; the file restored. 46 rows on the new adjudicator, the predicates
+(A), the publication (B) and the checkpoint (C). On 23a69db: 29 caught, 16 missed, 1 stale (my zero-turn fix had
+moved its line). The misses got tests (`test_r1_m_*` and a sixth case of `test_r1_b2_only_the_exact_init_opens_ss_own_turn`,
+b3207c1), and the 17 rows run again on b3207c1: 11 caught, 6 not, each equivalent here, given:
+
+| row | caught by, or why it cannot be |
+| --- | --- |
+| S's init: its version in STEER_MODES | `test_r1_b2_only_the_exact_init_opens_ss_own_turn[verified_not_in_steer_modes]` |
+| S's init: a verified incarnation | `test_r1_m_after_a_deviation_in_the_same_read_no_s_turn_opens` |
+| exact: a list, not a set; the scalar its first element; N's result with S exactly [N, S] | `test_r1_m_ns_result_with_s_is_exactly_n_then_s[reversed|scalar_not_first|extra]` |
+| S-only needs a byte of S; S-only: no origin | `test_r1_m_an_s_only_result_needs_a_byte_of_s`, `test_r1_m_an_s_only_result_with_a_notification_origin_is_not_ns` |
+| departure 4: an echo-less error ends S's turn; and loses verification | the model; `test_r1_m_departure_4_an_echoless_error_in_ss_bracket_ends_it_and_loses_verification` |
+| the adjudicator inside the latch's lock | `test_r1_m_the_adjudicator_decides_inside_the_latchs_lock` |
+| the deadline first in every tick | `test_r1_m_the_deadline_is_published_before_any_read_of_the_tick` |
+| a fenced hold takes no more evidence | equivalent: a fenced hold's process is stopping, and main's `_take_lines` drops a stopping process's events before any reaches the adjudicator |
+| S's end only inside S's proved turn; consumed only before S's turn | equivalent: the adapter types `s_end` only in phase `s_turn` and `s_consumed` only in phase `held`, and the phase is the host's, set with `held.s_turn` (defence in depth) |
+| a deadline error publishes at once | equivalent: the same fence check runs again in the session's pass, whose error is `_host_error`'s, which publishes |
+| a host error publishes at once (rule 5); a host error's end is at once | each is the other's backstop: `_end` with `_at_once` publishes, and `_publish_now` in the `finally` publishes whatever `_end` did; removing either alone leaves one publication, at once (`test_r1_b4_*` hold with either) |
+
+The 29 caught on the first run, by row: S's init exactly one element (`test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn`),
+no notification origin and the lifecycle capability (`test_r1_b2_only_the_exact_init_opens_ss_own_turn[notification|no_lifecycle]`),
+no other bracket open and S's end exactly [S] and a zero-byte attempt leaves no trace (the model), after N's native
+end and S-only no competing init and competing + [S] (`test_an_s_only_result_after_a_competing_init_is_nobodys_and_n_fails_at_its_bound`),
+never by order (`test_a_plain_result_after_a_steer_is_never_ns_by_order`), consumed needs the CLI's bracket
+(`test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn`), lost typed, lost marks the hold and the hold pass
+cuts on lost (`test_a_deviation_in_the_hold_finalizes_at_once`), S written only into N's proved turn
+(`test_s_is_never_written_before_ns_own_init`), the M8 gate (`test_only_a_verified_incarnation_of_an_m8_version_steers`),
+no evidence after the latch (`test_r1_b3_evidence_after_the_stop_latch_never_counts`), the fresh clock and a proved S
+turn cut (`test_the_fresh_clock_s_own_turn_gets_a_whole_turn_timeout`), the adapter's phase
+(`test_next_turn_s_ran_as_its_own_turn_after_ns_end`), retired before any further frame
+(`test_r1_b1_after_publication_the_next_ordinary_turn_is_its_own[next_turn]`), the hold pass cuts on contact
+(`test_r1_b3_the_steers_contact_running_out_in_the_hold_cuts_it[held]`), reap publishes before cleanup
+(`test_the_queued_s_close_finalizer_n_end_then_ended`), a stop of every turn at once
+(`test_a_stop_of_every_turn_publishes_a_held_end_at_mains_point[stop_turns]`), the checkpoint needs `held`
+(`test_r1_c_a_step_2_hub_that_names_steer_gets_no_checkpoint`), its own short call
+(`test_r1_c_the_checkpoint_has_its_own_short_call_outside_the_report_lock`), the feature list names `held`
+(`test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply`), a Claude attempt only and `answered`
+required (`test_r1_c_the_hub_refuses_impossible_checkpoints`).
+
+#### Runs
+
+After the last code commit (b3207c1):
+- `uv run pytest -q -p no:cacheprovider`: 4674 passed, 10 skipped (the old model's 200 parametrized seeds are now one
+  test of 300 walks).
+- The stand-in e2e in full: PASS (390 checks).
+- `--only steering` with stand-ins: PASS (106 checks: Q0-Q8, Z0-Z10, Z7 included).
+- `--only correlation` with stand-ins: PASS.
+- `--only steering` with the real CLIs (Claude Code 2.1.330, haiku; codex-cli 0.171.0): PASS (Q1-Q4; Z1 `in_turn`;
+  Z2 and Z10.1-3 `next_turn`, N's result [N], S's `init` [S] and result [S], no origin).
+- `--only correlation` with the real CLIs: PASS.
+- `~/.codex/config.toml` sha256: be07f3845d522521 before, between and after those real runs; it was 490d50b458847d7d
+  before and after the earlier real run that recorded Z10's fixtures (and the round's probes): it changed between
+  runs, never during one (the ChatGPT app rewrites it on its own updates).
+
+#### Not done
+
+- The CLI retry whose N was pruned is a unit test (`test_r1_s3_a_retry_whose_n_is_pruned_keeps_a_known_next_turn`),
+  not an e2e: pruning on the hub takes its retention time.
+- An S echo lost could not be provoked on 2.1.330 (36 runs); the rule for it (departure 4) is tested on frames only.
+- Checkout hardening (Q) and the node-local journal (L), as the design says.
