@@ -2764,6 +2764,10 @@ class _Model:
         self.g: float | None = None
         self.held = self.omitted = self.fenced = self.n_ended = self.cancelling = False
         self.native = self.answered = self.answer_read = self.frozen = False
+        # (Round 5:) the node began to stop (its stopping flag); the multi-session stop (shutdown, a stop of every
+        # turn) has come; the steered process's signals when stopping began.
+        self.stopped = self.shut = False
+        self.terms_at_stop = None
         self.gates = {"turn": True, "bind": True, "may": True}
 
     def ack(self, sent, received):
@@ -2793,12 +2797,12 @@ class _Model:
 
     def authority(self, t):
         return (self.g is not None and not self.omitted and not self.fenced and not self.n_ended
-                and all(self.gates.values()) and self.covered(self.g, t))
+                and not self.stopped and all(self.gates.values()) and self.covered(self.g, t))
 
 
 STEER_LINE = b'"method": "turn/steer"'
 EVENTS = ["pass", "local", "hello", "step", "gate", "accept", "answer", "end", "cancel_live", "cancel_queued", "stop",
-          "watchdog", "boundary_ack", "shutdown"]
+          "watchdog", "boundary_ack", "shutdown", "install_race", "stop_mid_pass", "mixed_exit"]
 
 
 def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
@@ -2925,9 +2929,17 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
         runner.fresh, runner.last_sync, runner.retry_at = False, float("-inf"), float("-inf")
         runner.pass_once(wait=0)
 
+    armed = []      # one-shot hooks at the write boundary (each returns whether it fired)
+
+    def boundary(w, sess):
+        for f in list(armed):
+            if f(w, sess):
+                armed.remove(f)
+    host.steer_write_hook = boundary
     plan = script if script is not None else [None] * steps
     for i, step in enumerate(plan):
-        ev = step[0] if step is not None else rnd.choices(EVENTS, weights=[10, 4, 4, 6, 3, 3, 3, 1, 1, 1, 1, 2, 3, 1])[0]
+        ev = step[0] if step is not None else rnd.choices(EVENTS,
+                                                          weights=[10, 4, 4, 6, 3, 3, 3, 1, 1, 1, 1, 2, 3, 1, 1, 1, 1])[0]
         arg = step[1] if step is not None else None
         if ev == "pass":
             if arg is None:
@@ -2983,6 +2995,7 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
             pass_("with", "timely", [])
         elif ev == "stop" and not model.n_ended:
             log_.append(f"{i} every turn is stopped")
+            model.shut = True       # (a multi-session stop: rule 2; its signals are main's)
             with runner.lock:
                 runner._emit(host.stop_turns("stopped"))
         elif ev == "watchdog":
@@ -2998,18 +3011,66 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
 
             def at_boundary(w, sess, when=when, late=late, i=i):
                 if w != when:
-                    return
-                host.steer_write_hook = None            # one shot
+                    return False
                 sent = env.clock() - late
                 runner.note_hello(sent)
                 model.ack(sent, env.clock())
                 log_.append(f"  ({i}) the boundary's hello published at {env.clock()}")
-            host.steer_write_hook = at_boundary
+                return True
+            armed.append(at_boundary)
+        elif ev == "install_race" and not model.stopped:
+            # (Round 5, R5-01:) shutdown's stop races a slot's installation: it begins just before the installation
+            # takes the latch's lock, while it holds it (the same thread: the latch's lock is re-entrant), or just
+            # after. Whichever, no byte of S may go from then on.
+            when = arg if arg is not None else rnd.choice(("before", "inside", "after"))
+            log_.append(f"{i} the node begins to stop {when} the next slot's installation")
+
+            def at_install(w, sess, when=when, i=i):
+                if w != when or model.stopped:
+                    return
+                host.steer_install_hook = None
+                log_.append(f"  ({i}) stopping began at the installation ({when})")
+                model.stopped, model.terms_at_stop = True, child.terminated
+                runner.stopping.set()
+            host.steer_install_hook = at_install
+        elif ev == "stop_mid_pass" and not model.stopped:
+            # (Round 5, R5-02:) shutdown begins while a pass holds the host's lock, at its next write boundary (a
+            # partial frame's rest, say): the failed gate does nothing else, so the steered process is not signalled
+            # before shutdown's own signals.
+            log_.append(f"{i} the node begins to stop at the next write boundary")
+
+            def at_stop(w, sess, i=i):
+                if w != "before" or model.stopped:
+                    return False
+                log_.append(f"  ({i}) stopping began at the write boundary")
+                model.stopped, model.terms_at_stop = True, child.terminated
+                runner.stopping.set()
+                return True
+            armed.append(at_stop)
+        elif ev == "mixed_exit" and not model.stopped and not model.n_ended and s.child is not None \
+                and s.stopping_since is None:
+            # (Round 5, R5-03:) a mixed pass in a shared checkout: the steered leader exits leaving members of its
+            # group, and an ordinary session in the same checkout has a message waiting for a process in that very
+            # pass. Main's barrier holds: it does not start beside the fenced group.
+            import uuid as uuid_mod
+            other = str(uuid_mod.uuid4())
+            log_.append(f"{i} the steered leader exits leaving its group; an ordinary session waits in its checkout")
+            host.open(other, agent=s.agent, runtime=s.runtime, project=s.project)
+            host.send(other, "an ordinary turn", message_id="z")
+            env.groups.add(child.pid)
+            child.code = 0
+            with runner.lock:
+                runner._emit(host.tick())
+            if host.sessions[other].child is not None:
+                raise AssertionError("an ordinary session started beside the steered session's fenced group\n  "
+                                     + "\n  ".join(log_))
+            host.close(other, "the model's ordinary session")
+            env.groups.discard(child.pid)
         elif ev == "shutdown":
             # (The shutdown simplification:) main's shutdown, a steer live or not: every SIGTERM at once, nothing
             # read first; S's outcome is what the host had read when it began (rule 2). It ends the sequence.
             log_.append(f"{i} the node shuts down (signal, then stop_all)")
-            model.frozen = True
+            model.frozen = model.shut = True
             runner.signal()
             with runner.lock:
                 runner._emit(host.stop_all())
@@ -3018,7 +3079,9 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
         _check(child, seen, model, log_)
     # (Round 4, R3-11:) every sequence ends: N ends natively if nothing ended it, local passes read it, and the host
     # must then have said N's end. Without this a sequence that never ended N checked no settlement at all.
-    host.steer_write_hook = None
+    host.steer_write_hook = host.steer_install_hook = None
+    armed.clear()
+    model.shut = True       # (what follows is the sequence's end, not a pass the stop interrupted)
     if not seen.ends:
         if not model.n_ended and not state.end_emitted:
             log_.append("end: N ends natively (its lines in the pipe)")
@@ -3074,6 +3137,9 @@ def _check(child, seen, model, log_):
     def fail(why):
         raise AssertionError(why + "\n  " + "\n  ".join(log_))
     stdin = bytes(child.stdin)
+    if (getattr(model, "stopped", False) and not model.shut
+            and getattr(child, "terminated", None) != model.terms_at_stop):
+        fail("the steered process was signalled after the node began to stop, ahead of the stop's own signals (R5-02)")
     if stdin.count(STEER_LINE) > 1 or len([f for f in seen.frames if f in stdin]) > 1:
         fail("S was written more than once")
     per = _frame_spans(seen)
@@ -3162,6 +3228,34 @@ def test_model_every_sequence_ends_with_the_hosts_end_of_n(tmp_path):
     seen, model, log_ = _run_model(tmp_path, 0, script=[("accept", 0), ("pass", ("with", "timely", []))])
     assert any(x.startswith("end: N ends natively") for x in log_)
     assert seen.ends and seen.ends[0].steer["outcome"] == "not_delivered"
+
+
+@pytest.mark.parametrize("when", ["before", "inside", "after"])
+def test_model_reach_r5_01_the_stop_races_a_slots_installation(tmp_path, when):
+    """Round 5 (R5-01): the model reaches shutdown's stop racing a fresh slot's installation, each side of the latch's
+    lock and under it: nothing of S is written (the checker's authority is gone from the stop on)."""
+    seen, model, log_ = _run_model(tmp_path, 0, script=[("install_race", when), ("pass", ("with", "timely", []))])
+    assert any("stopping began at the installation" in x for x in log_)
+    assert _frame_bytes(seen)[0] == [], "not one byte of S after the stop began"
+    assert seen.ends and seen.ends[0].steer["outcome"] == "not_delivered"
+
+
+def test_model_reach_r5_02_the_stop_begins_while_a_pass_holds_the_lock_with_a_partial_frame(tmp_path):
+    """Round 5 (R5-02): a partial frame, and the stop begins at the next write boundary of a pass: no cut, no signal
+    before the stop's own (the checker), the frame stays partial, and N's end says `unconfirmed` (`partial`)."""
+    seen, model, log_ = _run_model(tmp_path, 0, script=[("accept", 10), ("pass", ("with", "timely", [])),
+                                                        ("accept", None), ("stop_mid_pass", None), ("local", None),
+                                                        ("shutdown", None)])
+    assert any("stopping began at the write boundary" in x for x in log_)
+    assert seen.ends and seen.ends[0].steer == {"outcome": "unconfirmed", "why": "partial"}
+
+
+def test_model_reach_r5_03_a_mixed_pass_in_a_shared_checkout(tmp_path):
+    """Round 5 (R5-03): the model reaches the steered leader's exit with its group left behind while an ordinary
+    session in the same checkout waits to start in that very pass (the checker: it does not start)."""
+    seen, model, log_ = _run_model(tmp_path, 0, script=[("pass", ("with", "timely", [])), ("mixed_exit", None)])
+    assert any("the steered leader exits" in x for x in log_)
+    assert seen.ends and seen.ends[0].steer is not None
 
 
 def test_model_checker_follows_every_frame_not_only_the_first():
@@ -3996,6 +4090,7 @@ def _shutdown_run(tmp_path, steer: bool, case: str):
         tick(env)
     b, cb = codex_turn_in_flight(env, project=P2)
     c = start(env, "three", project=P3)["session_id"]
+    tick(env)       # (each opened in its own pass: the host's order, which main's signals follow, is the same in both runs)
     d = start(env, "four", project=P2)["session_id"]
     tick(env)
     answer(env, d, "four's reply")
@@ -4013,7 +4108,9 @@ def _shutdown_run(tmp_path, steer: bool, case: str):
     runner = env.node.sessions
     cb.exits_on_terminate = False
     names = {a: "A", b: "B", c: "C", d: "D"}
-    log, posted, t0 = {}, {}, []
+    # (Round 5:) ONE log in global order: every signal, kill and read of every session, and every report batch posted
+    # (its session and its events, a steer outcome stripped), so cross-session order and batching are compared too.
+    log, posted, t0 = [], None, []
     for sid, name in names.items():
         ch = runner.host.sessions[sid].child
         if ch is None:
@@ -4023,7 +4120,7 @@ def _shutdown_run(tmp_path, steer: bool, case: str):
 
             def rec(*args, real=real, what=what, name=name, **kw):
                 if t0:
-                    log.setdefault(name, []).append((what, env.clock() - t0[0]))
+                    log.append((what, name, env.clock() - t0[0]))
                 return real(*args, **kw)
             setattr(ch, what, rec)
     real_client = runner.client
@@ -4032,13 +4129,15 @@ def _shutdown_run(tmp_path, steer: bool, case: str):
         def request(self, method, path, **kw):
             if t0 and method == "POST" and path.startswith("/api/nodes/sessions/"):
                 name = names.get(path.rsplit("/", 1)[-1])
-                if name is not None:
-                    posted.setdefault(name, []).extend({k: v for k, v in e.items() if k != "steer"}
-                                                       for e in (kw.get("json") or {}).get("events", []))
+                body = kw.get("json") or {}
+                log.append(("post", name, env.clock() - t0[0], sorted(body),      # (its seq is a wall-clock stamp)
+                            [{k: v for k, v in e.items() if k != "steer"} for e in body.get("events", [])]))
             return real_client.request(method, path, **kw)
     runner.client = Recording()
     t0.append(env.clock())
+    starts = len(env.node.session_spawner.children)
     node_mod.shut_down(env.node)
+    log.append(("starts during it", len(env.node.session_spawner.children) - starts))
     rec = steer_rec(env, a) if steer else None
     return log, posted, rec, a
 
@@ -4053,9 +4152,9 @@ def test_sd_shutdown_with_a_live_steer_is_mains_for_every_session_event_for_even
     session's N end differing only by its steer outcome). S's outcome is what was read before the stop began."""
     plain = _shutdown_run(tmp_path / "plain", False, case)
     steered_ = _shutdown_run(tmp_path / "steered", True, case)
-    assert steered_[0] == plain[0], "every signal, kill and read at main's moment"
-    assert steered_[1] == plain[1], "the same events for every session"
-    assert "B" in plain[0] and any(w == "kill" for w, _ in plain[0]["B"]), "(the run has a SIGKILL to compare)"
+    assert steered_[0] == plain[0], "every signal, kill, read and report batch in main's global order and moment"
+    assert ("kill", "B") in [x[:2] for x in plain[0]], "(the run has a SIGKILL to compare)"
+    assert any(x[0] == "post" for x in plain[0]), "(and reports)"
     assert (steered_[2]["outcome"], steered_[2]["why"]) == want
 
 
@@ -4400,6 +4499,276 @@ def test_sd_r4_08_an_unexpected_error_ends_the_session_by_rule_2_without_a_drain
     assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
 
+# ------------------------------------------------------------ review round 5
+
+
+def test_r5_01_a_slot_installed_after_the_stop_latch_is_born_stopped_and_never_written(env):
+    """R5-01: shutdown's stop runs while no slot exists yet; inside it, after the latch (and before the stopping event
+    is published), a pass on another thread installs a fresh slot for a fresh offer into a proved turn and reaches
+    the boundary. The slot is born stopped: no byte of S is written, before or after the event is observable.
+    Barriers only: the pass signals its pipe write or its return."""
+    import threading
+    sid, child = codex_turn_in_flight(env, prove=True)
+    post_steer(env, sid)
+    runner = env.node.sessions
+    host = runner.host
+    assert host.sessions[sid].steer is None
+    progress, release, threads = threading.Event(), threading.Event(), []
+    real_write = child.write
+
+    def write(data):
+        if b'"turn/steer"' in data:
+            progress.set()                      # under way in the pipe
+            assert release.wait(30)
+        return real_write(data)
+    child.write = write
+
+    def a_pass():
+        try:
+            runner.fresh, runner.last_sync = False, float("-inf")
+            runner.pass_once(wait=0)
+        finally:
+            progress.set()                      # returned
+    real_stop = host.steer_stopping
+
+    def stop():
+        real_stop()
+        th = threading.Thread(target=a_pass)
+        threads.append(th)
+        th.start()
+        assert progress.wait(30)
+    host.steer_stopping = stop
+    runner.stopping.set()
+    release.set()
+    for th in threads:
+        th.join(30)
+    del host.steer_stopping
+    assert steers_of(child) == [], "a steer byte went after the node began to stop"
+    s = host.sessions[sid]
+    assert s.steer is None or s.steer.stopping, "a slot installed after the latch is born stopped"
+    runner.stopping.clear()
+
+
+def test_r5_01_a_slot_being_installed_when_the_stop_latch_is_set_is_marked_by_it(env):
+    """R5-01, the slot being installed: shutdown's stop is called while a pass is installing the slot (it holds the
+    latch's lock); the stop waits for the installation, then sets the latch and marks the new record. The pass then
+    reaches the boundary only after the stop returned: nothing is written. Barriers only."""
+    import threading
+    sid, child = codex_turn_in_flight(env, prove=True)
+    post_steer(env, sid)
+    runner = env.node.sessions
+    host = runner.host
+    lock = _SignalLock(host._steer_stop_lock)
+    host._steer_stop_lock = lock
+    stoppers = []
+
+    def install(when, sess):
+        if when == "inside":
+            th = threading.Thread(target=runner.stopping.set)
+            stoppers.append(th)
+            lock.quiet = threading.get_ident()
+            th.start()
+            assert lock.waiting.wait(30), "the stop never came to the latch's lock"
+
+    def boundary(when, sess):
+        if when == "before":
+            for th in stoppers:
+                th.join(30)                     # the stop has returned: its event is observable
+            assert runner.stopping.is_set()
+    host.steer_install_hook, host.steer_write_hook = install, boundary
+    tick(env)
+    host.steer_install_hook = host.steer_write_hook = None
+    for th in stoppers:
+        th.join(30)
+    assert stoppers and host.sessions[sid].steer.stopping, "the record installed meanwhile was marked"
+    assert steers_of(child) == [], "nothing written once the event is observable"
+    runner.stopping.clear()
+
+
+def test_r5_02_a_gate_failed_for_stopping_does_nothing_else(env):
+    """R5-02: a frame taken in part; shutdown begins (the stopping flag) at the next write boundary while the pass
+    holds the host's lock. The failed gate does nothing else: no cut, no drain, no read, no signal; the frame stays
+    partial, and the stop of every turn decides N afterwards (`unconfirmed`, `partial`)."""
+    sid, child = codex_turn_in_flight(env)
+    child.accept = 10
+    post_steer(env, sid)
+    tick(env)
+    runner = env.node.sessions
+    host = runner.host
+    s = host.sessions[sid]
+    assert 0 < s.steer.sent < s.steer.length
+    child.accept = None
+    reads, real_read = [], child.read_lines
+
+    def read():
+        reads.append(1)
+        return real_read()
+
+    def stop_now(when, sess):
+        if when == "before":
+            runner.stopping.set()
+            child.read_lines = read
+    host.steer_write_hook = stop_now
+    with runner.lock:
+        runner._emit(host.tick())
+    host.steer_write_hook = None
+    assert reads == [] and not child.terminated and s.stopping_since is None, "nothing else: no read, no signal"
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length, "the frame stays partial"
+    [end] = ended_of(host.stop_all())
+    assert end.steer == {"outcome": "unconfirmed", "why": "partial"}
+    runner.stopping.clear()
+
+
+def test_r5_03_a_steered_leaders_surviving_group_is_fenced_before_anything_starts(henv):
+    """R5-03: the steered session A's leader exits leaving members of its group; B, in the same checkout, has a
+    message waiting for a process in the same pass. As on main, A's group is fenced (stopping, the checkout blocked)
+    at its exit's discovery, before any start: B does not start in that pass. A's drain still runs, after the pass's
+    other work: N's own end, behind buffered output, wins."""
+    import uuid as uuid_mod
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    host.sessions.pop(SID)
+    a = str(uuid_mod.uuid4())
+    ca = _codex_steered_in(host, henv, a, "u1")
+    [req] = steers_of(ca)
+    host.open(SID, agent="codex", runtime="codex-cli", project=PROJECT)       # B, opened after A: main's order
+    starts = len(henv.spawner.children)
+    host.send(SID, "b's turn", message_id="b")
+    ca.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    _fragmented(ca, 2)
+    ca.code = 0
+    henv.groups.add(ca.pid)                     # a member of A's group lingers
+    events = host.tick()
+    assert host.sessions[a].stopping_since is not None, "A's group fenced"
+    assert len(henv.spawner.children) == starts and host.sessions[SID].child is None, "B did not start beside it"
+    [end] = ended_of(events)
+    assert end.session_id == a and end.ok and end.steer == {"outcome": "in_turn", "why": "answered"}
+
+
+def test_r5_04_one_drain_deadline_for_a_whole_hold_of_the_loops_lock(env):
+    """R5-04: in one hold of the loop's lock, a listing cancels steered turn X (a drain in the reconciliation) and
+    the tick reaps steered Y, which exited (a drain in the pass): both, each still writing without end, share ONE
+    2 s deadline, so the watchdog is never kept out longer than one budget by drains."""
+    import json as json_
+    from agent_comms.session_host import STEER_DRAIN_SECONDS
+    runner = env.node.sessions
+    x, cx_ = codex_turn_in_flight(env)
+    post_steer(env, x)
+    y, cy = codex_turn_in_flight(env, project=P2)
+    post_steer(env, y)
+    tick(env)
+    assert len(steers_of(cx_)) == 1 and len(steers_of(cy)) == 1
+    data = listing(env)
+    for e in data["sessions"]:
+        if e["session_id"] == x:
+            e["messages"][0]["cancel"] = True
+    cx_.exits_on_terminate = False              # (X stays stopping once cancelled)
+    cx_.bytes_read = 0
+
+    def x_read():
+        if runner.host.sessions[x].stopping_since is None:
+            env.clock.advance(0.5)              # a drain's read takes time; main's reads of a stopping X cost none
+        cx_.bytes_read += 4096
+        return []
+    cx_.read_lines = x_read
+    _endless_after_first(cy, env.clock)         # (the pass's own reads of Y cost nothing)
+    cy.code = 0
+
+    class Hub:
+        def request(self, method, path, **kw):
+            if method == "GET" and path == "/api/nodes/sessions":
+                return httpx.Response(200, json=json_.loads(json_.dumps(data)),
+                                      request=httpx.Request(method, "http://hub" + path))
+            if method == "POST":
+                return httpx.Response(503, request=httpx.Request(method, "http://hub" + path))
+            return env.laptop.request(method, path, **kw)
+    runner.client = Hub()
+    held, real_lock = [], runner.lock
+
+    class Timed:
+        def __enter__(self):
+            real_lock.acquire()
+            held.append(env.clock())
+
+        def __exit__(self, *exc):
+            held.append(env.clock())
+            real_lock.release()
+    runner.lock = Timed()
+    runner.fresh, runner.last_sync = False, float("-inf")
+    runner.pass_once(wait=0)
+    runner.lock = real_lock
+    assert len(held) == 2 and held[1] - held[0] <= STEER_DRAIN_SECONDS + 0.5, "one deadline for the hold"
+
+
+def test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then(henv):
+    """R5-04: an ordinary session's SIGKILL falls due while a steered session's deferred drain is reading: it is
+    sent between the drain's reads, when due, not after the drain."""
+    import uuid as uuid_mod
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    host.sessions.pop(SID)
+    a = str(uuid_mod.uuid4())
+    ca = _codex_steered_in(host, henv, a, "u1")
+    cb = _codex_steered_in(host, henv, SID, None)
+    cb.exits_on_terminate = False
+    host.close(SID, "closed")                   # B stopping; its SIGKILL falls due kill_grace later
+    t_stop = host.sessions[SID].stopping_since
+    killed, real_kill = [], cb.kill
+
+    def kill():
+        killed.append(henv.clock())
+        return real_kill()
+    cb.kill = kill
+    henv.clock.advance(host.kill_grace - 1)
+    _endless_after_first(ca, henv.clock)
+    ca.code = 0                                 # A exited, still writing: its reap's drain reads ~2 s
+    host.tick()
+    assert killed and killed[0] - (t_stop + host.kill_grace) <= 0.5, "killed when due, during the drain"
+
+
+def test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer(tmp_path):
+    """R5-05: a rolled-back hub refuses A's end because of its steer outcome (422); the plain retry is taken. B's
+    ordinary end later in the same flush is posted exactly as main posts it (`answered` kept): only `steer` is
+    forgotten, for that listing's features."""
+    from agent_comms.session_host import HostEvent
+
+    def run(env, with_steer):
+        runner = env.node.sessions
+        a, ca = codex_turn_in_flight(env)
+        b, cb = codex_turn_in_flight(env, project=P2)
+        runner._reconcile(listing(env))
+        assert {"answered", "steer"} <= runner.hub_features
+        bodies = []
+
+        class RolledBack:
+            def request(self, method, path, **kw):
+                if method == "POST" and path.startswith("/api/nodes/sessions/"):
+                    body = kw.get("json") or {}
+                    bodies.append((path.rsplit("/", 1)[-1], json.loads(json.dumps(body))))
+                    if any("steer" in e for e in body.get("events", [])):
+                        return httpx.Response(422, json={"detail": "extra field"},
+                                              request=httpx.Request(method, "http://hub" + path))
+                return env.laptop.request(method, path, **kw)
+        runner.client = RolledBack()
+        steer = {"outcome": "unconfirmed", "why": "turn_cut"} if with_steer else None
+        runner._emit([HostEvent(a, "turn_ended", "1", ok=True, text="a", answered=True, steer=steer),
+                      HostEvent(b, "turn_ended", "1", ok=True, text="b", answered=True)])
+        assert runner._flush()
+        return [{k: v for k, v in body.items() if k not in ("seq", "checkout")} for sid, body in bodies if sid == b], \
+            runner.hub_features
+    main_b, _ = run(session_env(tmp_path / "main", dispatch=TREE, config=tree_config), False)
+    steer_b, features = run(session_env(tmp_path / "steer", dispatch=TREE, config=tree_config), True)
+    # B's report as main's node sends it: its events with `answered`, and modes without `steer` (main's node never
+    # names it; this hub took everything else its listing said). (Its seq is a wall-clock stamp, its checkout this
+    # run's directory.)
+    assert [b["events"] for b in steer_b] == [b["events"] for b in main_b]
+    assert all(e.get("answered") for b in steer_b for e in b["events"]), "answered kept"
+    assert [b["modes"] for b in steer_b] == [["restart"]]
+    assert [{k: v for k, v in b.items() if k != "modes"} for b in steer_b] == \
+        [{k: v for k, v in b.items() if k != "modes"} for b in main_b]
+    assert "answered" in features and "steer" not in features
+
+
 def test_r3_gap_the_join_probe_fails_at_once_on_an_answer_naming_another_turn(tmp_path):
     run = _probe(tmp_path, ["answer_other", "item", "done"])
     with pytest.raises(SystemExit, match="named another turn"):
@@ -4557,7 +4926,8 @@ def test_r4_gap_an_attempt_made_after_the_node_began_to_stop_is_never_written(en
     del host.steer_offer
     runner.stopping.clear()
     s = host.sessions[sid]
-    assert s.steer is not None and s.steer.authorized and not getattr(s.steer, "stopping", False), "made unmarked"
+    # (Round 5, R5-01: a slot installed after the stop latch is born stopped; the node's authority refuses it too.)
+    assert s.steer is not None and s.steer.authorized and s.steer.stopping, "born stopped"
     assert steers_of(child) == [], "a steer byte went after the node began to stop"
 
 
