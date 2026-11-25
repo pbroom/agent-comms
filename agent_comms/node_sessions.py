@@ -128,12 +128,16 @@ def shutdown_bound(self_stop_seconds: float, kill_grace: float, watch_seconds: f
     return float(self_stop_seconds + kill_grace + 2 * (watch + LOCK_SLACK_SECONDS))
 JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a loop waiting at the hub is not waited for
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
-# One report's first attempt and its 422 retry without the steer outcome (S2-07) share one budget from the first send:
-# the retry gets only what is left of it (and is not made with less than REPORT_RETRY_MIN), so the pair takes no
-# longer than one call and fits inside REPORT_WAIT_SECONDS (R2-06).
+# A report that carries a steer outcome (only such a report has a retry, S2-07) is one exchange of at most
+# REPORT_PAIR_SECONDS by the wall clock, whatever the transport does (R3-06: a TOTAL deadline, `_call_by`, not
+# httpx's per-operation timeouts): its first attempt gets REPORT_FIRST_SECONDS, and the plain retry without the
+# outcome has its own reserved REPORT_RETRY_SECONDS, never skipped (after a 422, and in the final flush also after a
+# first attempt that failed in transport). So it fits in shutdown's wait for the report lock (REPORT_WAIT_SECONDS) and
+# the final flush never leaves N's end behind for want of time. Every other report is main's: one call, as ever.
 REPORT_PAIR_SECONDS = 20.0
-FETCH_ACKS_MAX = 256        # acknowledgements kept for the continuity of one fetch (`_fetch_ack`)
-REPORT_RETRY_MIN = 1.0
+REPORT_FIRST_SECONDS = 15.0
+REPORT_RETRY_SECONDS = REPORT_PAIR_SECONDS - REPORT_FIRST_SECONDS
+ACK_LOG_MAX = 512           # acknowledgements kept for the continuity of a fetch (`_publish_ack`, `_offer_contact`)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 SESSION_PROTOCOL = 5        # `tree` on every fetch and hello: 2 spawn, 3 the hold, 4 restart, 5 steer (hosted_tree)
@@ -182,21 +186,19 @@ class SessionRunner:
         self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
         self.host.may_start_query = self._may_start_query   # the same, with no side effect (turn correlation's)
         self.host.steer_authority = self._steer_authority     # ... and no steer byte without the node's write authority
-        # Write authority for steers (the module text): when the last hub-acknowledged hello was SENT (node.py says it,
-        # `note_hello`), and per session the send time of the last acknowledged report and the turn in flight its
-        # answer named; `fetch_contact`: those as they stood when the latest fetch was sent.
+        # The node's acknowledged EVIDENCE (the module text): when the last hub-acknowledged hello was SENT (node.py
+        # says it, `note_hello`), per session the send time of the last acknowledged report and the turn in flight its
+        # answer named, and every acknowledgement in order (`ack_log`: seq, sent, received, the session a report was
+        # for or None for a hello, the N it named). Authority itself lives only in each attempt's record
+        # (session_host.SteerSlot, review round 3, structure 1); `last_fetch` is the latest fetch, frozen when its
+        # answer came: (sent, received, the evidence when it was sent, the log's seq when sent and when received).
         self.hello_ack = float("-inf")
         self.report_ack: dict[str, tuple[float, Any]] = {}
-        self.fetch_contact: tuple[float, dict] = (float("-inf"), {})
-        self.steer_seen: dict[str, float] = {}      # session id -> the contact its held steer's authority rests on
-        self.steer_into: dict[str, int] = {}        # ... and the N that authority is for
-        self.steer_broken: set[str] = set()         # ... lost for good: a break seen when an ack came (R2-09)
-        # The acknowledgements received while the latest fetch was out (receipt time, send time, the session a report
-        # was for or None for a hello, the N its answer named): the contact's continuity across them (R2-07).
-        self.fetch_acks: list[tuple[float, float, str | None, Any]] = []
-        # The ack state above, between the loop, node.py's hellos and the watchdog: its own short lock, never the
-        # host's (R2-09: an acknowledgement is published without waiting for the host's work). Taken after the host's
-        # lock where both are held, never before it.
+        self.ack_log: list[tuple[int, float, float, str | None, Any]] = []
+        self.ack_seq = 0
+        self.last_fetch: tuple | None = None
+        # The evidence above, between the loop, node.py's hellos and the watchdog: its own short lock, never the
+        # host's (R2-09). Order: the host's lock (where held), then this, then an attempt's.
         self.ack_lock = threading.RLock()
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
@@ -353,6 +355,30 @@ class SessionRunner:
         self._renew_contact(sent)
         return r.json()
 
+    def _call_by(self, deadline: float, method: str, path: str, **kw) -> Any:
+        """`_call` held to a TOTAL deadline on this loop's clock (R3-06): the call runs in a worker thread with
+        per-operation timeouts no longer than what is left, and is given up at the deadline however the transport
+        behaves (a slow drip of bytes included); TimeoutError then. A call given up may still complete at the hub:
+        that is the same as any timed-out report (its `seq` keeps a late one from undoing a later one)."""
+        left = deadline - self.clock()
+        if left <= 0:
+            raise TimeoutError("no time left for this report")
+        box: dict = {}
+
+        def go():
+            try:
+                box["answer"] = self._call(method, path, timeout=httpx.Timeout(left, connect=min(5.0, left)), **kw)
+            except BaseException as e:      # (handed to the caller)
+                box["error"] = e
+        worker = threading.Thread(target=go, name="hosted-sessions-report", daemon=True)
+        worker.start()
+        worker.join(left)       # (this loop's clock is the monotonic clock: its seconds are real seconds)
+        if worker.is_alive():
+            raise TimeoutError(f"the report exchange ran past its {left:.1f} s deadline")
+        if "error" in box:
+            raise box["error"]
+        return box.get("answer")
+
     def _add(self, session_id: str, event: dict) -> None:
         if session_id not in self.dropped:
             self.pending.append((session_id, event))
@@ -445,11 +471,18 @@ class SessionRunner:
             if sid not in order:
                 order.append(sid)
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
+        steering = any("steer" in e for _, e in self.pending)
+        if final and steering:
+            # Shutdown's own flush: the sessions whose ends carry a steer outcome first (each session's own events
+            # stay in order), so their exchanges fit in the shutdown's budget. Only while one is pending.
+            carrying = {sid for sid, e in self.pending if "steer" in e}
+            order = [sid for sid in order if sid in carrying] + [sid for sid in order if sid not in carrying]
         sent_items: set[int] = set()
         for sid in order:
-            if self.stopping.is_set() and not final:
-                # Shutdown began during this flush: it waits for this lock (REPORT_WAIT_SECONDS), and what is left
-                # goes in its own final flush, so no other session's end is lost to that wait (R2-06).
+            if self.stopping.is_set() and not final and (steering or self.host.attempts()):
+                # Shutdown began during this flush while a steer attempt is live: it waits for this lock
+                # (REPORT_WAIT_SECONDS), and what is left goes in its own final flush, so no steer's end is lost to
+                # that wait (R2-06). With none live the flush goes on as on main (the parity rule, round 3).
                 self._drop_sent(sent_items)
                 return False
             # In order, up to the first event this hub may not take yet (`_takes`): nothing of the session overtakes
@@ -482,22 +515,25 @@ class SessionRunner:
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
                 sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
+                carries = any("steer" in x for x in body["events"])
+                path = f"/api/nodes/sessions/{sid}"
                 try:
-                    answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
-                except httpx.HTTPStatusError as e:
-                    if getattr(e.response, "status_code", None) != 422 or not any("steer" in x for x in body["events"]):
+                    if carries:
+                        answer = self._call_by(sent + REPORT_FIRST_SECONDS, "POST", path, json=body)
+                    else:
+                        answer = self._call("POST", path, json=body)        # main's call
+                except Exception as e:
+                    code = getattr(getattr(e, "response", None), "status_code", None)
+                    if not carries or not (code == 422 or (final and code is None)):
                         raise
-                    # A hub that named `steer` refuses it now (rolled back): N's end goes again at once, in this very
-                    # flush (the last one of a shutdown included), without the extension (S2-07).
-                    left = REPORT_PAIR_SECONDS - (self.clock() - sent)
-                    if left < REPORT_RETRY_MIN:
-                        raise TimeoutError("no time left in this report's budget for the retry") from None
-                    log.warning("the hub refused the report for session %s with a steer outcome (422): sending it "
-                                "again without the outcome", sid)
+                    # A hub that named `steer` refuses it now (rolled back), or, in shutdown's last flush, the first
+                    # attempt did not get through: N's end goes again at once, in this very flush, without the
+                    # extension (S2-07), in its own reserved slice (R3-06).
+                    log.warning("the report for session %s with a steer outcome did not go (%s): sending it again "
+                                "without the outcome", sid, code or type(e).__name__)
                     body["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
                     sent = self.clock()
-                    answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=body,
-                                        timeout=httpx.Timeout(left, connect=min(5.0, left)))
+                    answer = self._call_by(sent + REPORT_RETRY_SECONDS, "POST", path, json=body)
                 self._ack_report(sid, sent, answer)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
@@ -594,9 +630,12 @@ class SessionRunner:
             try:
                 with self.ack_lock:
                     fetch_sent = self.clock()
-                    self.fetch_contact = (self.hello_ack, dict(self.report_ack))    # as it stood when it was sent
-                    self.fetch_acks = []        # ... and what is acknowledged while it is out (R2-07)
+                    snapshot = (self.hello_ack, dict(self.report_ack)), self.ack_seq   # as it stood when it was sent
                 data = self._sync(wait)
+                with self.ack_lock:
+                    # Frozen when the answer came (R3-03): its receipt time (the offer's age is judged here) and the
+                    # acknowledgements received while it was out; what comes later counts only as current authority.
+                    self.last_fetch = (fetch_sent, self.clock(), snapshot[0], snapshot[1], self.ack_seq)
                 self.last_sync = self.clock()
             except Exception as e:
                 log.warning("could not fetch hosted sessions: %s", e)
@@ -743,8 +782,12 @@ class SessionRunner:
                     # The session that started this turn cancelled it (hosted_spawn.cancel): stopped where it is if
                     # the host has it, never handed over if not. Reported once; the hub then lists it no more.
                     # Held here or not (a restart's: its interrupt is no longer asked for), every event the cancel
-                    # returns is reported, in order: none is dropped (R2-04).
-                    self._emit(self.host.cancel(sid, str(n), CANCELLED))
+                    # returns is reported, in order: none is dropped (R2-04). One not held here that returned
+                    # nothing emits nothing, as on main (R3-07: an empty emit would post the watchdog's ends ahead of
+                    # the LOST detection below).
+                    cancelled = self.host.cancel(sid, str(n), CANCELLED)
+                    if n in held or cancelled:
+                        self._emit(cancelled)
                     if n not in held and (n > self.handed.get(sid, 0) and m.get("state") == "queued"
                                           and not any(x == sid and e.get("message") == n for x, e in self.pending)):
                         self._add(sid, {"kind": "turn_ended", "message": n, "ok": False, "delivered": False,
@@ -1070,9 +1113,7 @@ class SessionRunner:
                           self.parent_of):
                     d.pop(sid, None)
                 with self.ack_lock:
-                    for d in (self.report_ack, self.steer_seen, self.steer_into):
-                        d.pop(sid, None)
-                    self.steer_broken.discard(sid)
+                    self.report_ack.pop(sid, None)
                 # The session is gone here, so "the hub no longer lists it: report nothing" has done its work. It
                 # must be lifted BEFORE the worktree is looked at: that its worktree was removed is the one thing
                 # the hub still takes for a session it ended itself, and it would be swallowed with the rest.
@@ -1096,68 +1137,44 @@ class SessionRunner:
     # ------------------------------------------------------------ write authority for steers (the module text)
 
     def note_hello(self, sent: float) -> None:
-        """node.py: a hello the hub acknowledged, SENT at `sent` (this loop's clock). Authority that has run out by
-        now is latched as lost BEFORE this acknowledgement counts (S2-03): one sent before the deadline and read
-        after it never revives it. Under the ack lock only, never the host's (R2-09)."""
-        with self.ack_lock:
-            now = self.clock()
-            broke = self._ack_latch(now)
-            self.hello_ack = max(self.hello_ack, sent)
-            self._fetch_ack(now, sent, None, None)
-        self._revoke_broken(broke)
+        """node.py: a hello the hub acknowledged, SENT at `sent` (this loop's clock): evidence for every attempt. Under
+        the ack lock and each attempt's own, never the host's (R2-09)."""
+        self._publish_ack(sent, None, None)
 
     def _ack_report(self, sid: str, sent: float, answer: Any) -> None:
         """A report the hub acknowledged, SENT at `sent`: evidence for exactly this session and the integer turn its
-        answer names in flight (never a bool or another session's answer), counted only after authority that has
-        run out by now was latched as lost (S2-03). Kept only for a session open here (S2-13). Under the ack lock
-        only (R2-09)."""
-        with self.ack_lock:
-            now = self.clock()
-            broke = self._ack_latch(now)
-            if sid not in self.host.sessions:
+        answer names in flight (never a bool or another session's answer). Kept only for a session open here
+        (S2-13)."""
+        if sid not in self.host.sessions:
+            with self.ack_lock:
                 self.report_ack.pop(sid, None)
+            return
+        ok = isinstance(answer, dict) and answer.get("session_id") == sid
+        n = answer.get("in_flight") if ok else None
+        self._publish_ack(sent, sid, n if type(n) is int else None)
+
+    def _publish_ack(self, sent: float, about: str | None, n: Any) -> None:
+        """One acknowledgement: into the evidence and its log, then into every held attempt's record, each under its
+        own lock, where it counts for that attempt only if it names it (SteerSlot.ack: a break, if it came after the
+        contact ran out, is latched there for good, S2-03)."""
+        with self.ack_lock:
+            received = self.clock()
+            if about is None:
+                self.hello_ack = max(self.hello_ack, sent)
             else:
-                ok = isinstance(answer, dict) and answer.get("session_id") == sid
-                n = answer.get("in_flight") if ok else None
-                self.report_ack[sid] = (sent, n if type(n) is int else None)
-                self._fetch_ack(now, sent, sid, self.report_ack[sid][1])
-        self._revoke_broken(broke)
+                self.report_ack[about] = (sent, n)
+            self.ack_seq += 1
+            self.ack_log.append((self.ack_seq, sent, received, about, n))
+            if len(self.ack_log) > ACK_LOG_MAX:
+                del self.ack_log[:-ACK_LOG_MAX]
+            for slot in self.host.attempts():
+                slot.ack(sent, self.clock(), about, n)
 
-    def _fetch_ack(self, received: float, sent: float, about: str | None, named: Any) -> None:
-        """(The ack lock held.) One acknowledgement received while the latest fetch is out (R2-07). At most
-        FETCH_ACKS_MAX are kept (fetches stopped while hellos go on): with the oldest gone the walk can only see a
-        break that was not there, never miss one (safe side)."""
-        self.fetch_acks.append((received, sent, about, named))
-        if len(self.fetch_acks) > FETCH_ACKS_MAX:
-            del self.fetch_acks[:-FETCH_ACKS_MAX]
-
-    def _ack_latch(self, now: float) -> set[str]:
-        """(The ack lock held.) Before an acknowledgement is published: each held steer's contact, by what was
-        published so far, is checked NOW, its receipt time; a break is latched for good (S2-03). The sessions it
-        broke for."""
-        broke = set()
-        for sid, prev in list(self.steer_seen.items()):
-            if sid in self.steer_broken:
-                continue
-            latest = max(prev, self._steer_contact(sid, self.steer_into.get(sid), self.hello_ack, self.report_ack))
-            if latest - prev >= STEER_CONTACT_SECONDS or now - latest >= STEER_CONTACT_SECONDS:
-                self.steer_broken.add(sid)
-                broke.add(sid)
-            else:
-                self.steer_seen[sid] = latest
-        return broke
-
-    def _revoke_broken(self, broke: set[str]) -> None:
-        """The host is told at once only when its lock is free now (never waited for, R2-09); otherwise its next
-        write boundary or the loop's or watchdog's check finds the latch (`_steer_check`)."""
-        if broke and self.lock.acquire(blocking=False):
-            try:
-                for sid in broke:
-                    live = self.host.steer_live(sid)
-                    if live is not None:
-                        self.host.steer_revoke(sid, live[1], "contact")
-            finally:
-                self.lock.release()
+    @property
+    def steer_seen(self) -> dict[str, float]:
+        """(Read only, for the record's readers:) each held attempt's contact, as the send time it rests on."""
+        return {slot.session_id: slot.cover_until - STEER_CONTACT_SECONDS for slot in self.host.attempts()
+                if slot.cover_until is not None}
 
     def _steer_contact(self, sid: str, n: int, hello: float, reports: dict) -> float:
         """The send time of the latest hub-acknowledged evidence that this node holds N: a hello, or a report on the
@@ -1165,96 +1182,79 @@ class SessionRunner:
         sent, in_flight = reports.get(sid, (float("-inf"), None))
         return max(hello, sent if type(in_flight) is int and type(n) is int and in_flight == n else float("-inf"))
 
-    def _steer_check(self, sid: str, n: int, now: float) -> bool:
-        """The write authority for N holds NOW, and has held without a break since it was granted (`steer_seen`: the
-        contact it last rested on). A break is a later acknowledgement sent STEER_CONTACT_SECONDS or more after the
-        one before it: a late acknowledgement never erases a stale interval (R7-05). False is for good: the caller
-        revokes. A break latched when an acknowledgement came (`_ack_latch`) is for good too."""
-        with self.ack_lock:
-            prev = self.steer_seen.get(sid)
-            if prev is None:
-                return False
-            latest = self._steer_contact(sid, n, self.hello_ack, self.report_ack)
-            if (sid in self.steer_broken or latest - prev >= STEER_CONTACT_SECONDS
-                    or now - latest >= STEER_CONTACT_SECONDS or self._silent(now)):
-                self.steer_broken.add(sid)
-                return False
-            self.steer_seen[sid] = latest
-            return True
+    def _offer_contact(self, sid: str, n: int, fetch: tuple | None, now: float) -> tuple[bool, float]:
+        """(The ack lock held.) For an offer of S for N from `fetch`: whether it is FRESH (the fetch was sent while
+        contact held, contact held without a break until its answer came, by receipt times, and that answer came
+        within STEER_OFFER_AGE of the send: R2-07, R3-03), and the attempt's contact clock NOW (`cover_until`: the
+        walk continued through what was acknowledged since; minus infinity once broken)."""
+        lost = float("-inf")
+        if fetch is None:
+            return False, lost
+        sent_at, received_at, (hello, reports), seq_sent, seq_received = fetch
+        cover = self._steer_contact(sid, n, hello, reports) + STEER_CONTACT_SECONDS
+        if sent_at >= cover:
+            return False, lost
+        if self.ack_log and self.ack_log[0][0] > seq_sent + 1 and self.ack_seq > seq_sent:
+            return False, lost      # the log no longer reaches back to the fetch's send: never a gap it cannot see
+        fresh = None
+        for seq, sent, received, about, named in self.ack_log:
+            if seq <= seq_sent:
+                continue
+            if fresh is None and seq > seq_received:
+                fresh = received_at < cover and received_at - sent_at < STEER_OFFER_AGE
+            if about is not None and not (about == sid and type(named) is int and named == n):
+                continue        # a report on another session, or naming another turn: no evidence for N
+            if received >= cover:
+                return False, lost      # the contact ran out before this one came: a break
+            cover = max(cover, sent + STEER_CONTACT_SECONDS)
+        if fresh is None:
+            fresh = received_at < cover and received_at - sent_at < STEER_OFFER_AGE
+        return fresh and now < cover, (cover if now < cover else lost)
 
     def _steer_authority(self, s) -> bool:
-        """The host asks this before every write of a steer's bytes: the node's write authority holds NOW for the
-        session's turn in flight N (part E (iii)); lost, it is lost for good."""
-        slot = s.steer
-        if slot is None or not slot.into.isdigit():
-            return False
-        if self._steer_check(s.session_id, int(slot.into), self.clock()):
-            return True
-        self.host.steer_revoke(s.session_id, slot.uuid, "contact")
-        return False
+        """The host asks this at every write of a steer's bytes, under the attempt's lock: the node is not past its
+        self-stop. The contact itself is the attempt's own record (SteerSlot.contact_ok)."""
+        return not self._silent()
 
     def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
         """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or
         an omission (the held steer is revoked for good). `aware`: the listing names `steer` among its features;
         one that does not (an older hub, or a capability not known) only FENCES the held steer: nothing of it is
-        written, no offer of its is taken, nothing is revoked (S2-05)."""
-        live = self.host.steer_live(sid)
+        written, no offer of its is taken, nothing is revoked (S2-05). An offer that names the held attempt's uuid
+        for another N is rejected before anything is touched (R3-02)."""
+        held = self.host.steer_slot(sid)
         if not aware:
-            if live is not None:
+            if held is not None:
                 self.host.steer_fence(sid)
             return
         item = view.get("steer")
         ok = (isinstance(item, dict) and type(item.get("into")) is int and isinstance(item.get("uuid"), str)
               and 0 < len(item["uuid"]) <= 64 and isinstance(item.get("text"), str) and item["text"].strip() != "")
         if not ok:
-            if live is not None:
-                self.host.steer_revoke(sid, live[1], "omitted")
+            if held is not None:
+                self.host.steer_revoke(sid, held.uuid, "omitted", held.into)
             return
-        if live is not None and live[1] != item["uuid"]:
-            self.host.steer_revoke(sid, live[1], "omitted")
         n = item["into"]
-        with self.ack_lock:
-            now = self.clock()
-            hello, reports = self.fetch_contact
-            # (i) the fetch was sent while contact held; (ii) that has not lapsed since: from the contact known when
-            # it was sent, through every acknowledgement received while it was out, each received before the one
-            # before it ran out (receipt times, R2-07), to a contact still within STEER_CONTACT_SECONDS now (and from
-            # then on `_steer_check` holds it to no break); (iv) the fetch is young enough now that its answer is
-            # read; (iii) is asked before every write.
-            latest = self._steer_contact(sid, n, hello, reports)
-            contact = fetch_sent is not None and fetch_sent - latest < STEER_CONTACT_SECONDS
-            for received, sent, about, named in self.fetch_acks:
-                if about is not None and not (about == sid and type(named) is int and named == n):
-                    continue        # a report on another session, or naming another turn: no evidence for N
-                if received - latest >= STEER_CONTACT_SECONDS:
-                    contact = False     # the contact had run out before this one came: a break
-                    break
-                latest = max(latest, sent)
-            contact = contact and now - latest < STEER_CONTACT_SECONDS and not self._silent(now)
-            if contact and (live is None or live[1] != item["uuid"]):
-                # the contact this offer rests on (a later one must not break it), for this N
-                self.steer_seen[sid], self.steer_into[sid] = latest, n
-                self.steer_broken.discard(sid)
-        authorized = contact and now - fetch_sent < STEER_OFFER_AGE and self._steer_check(sid, n, now)
+        if held is not None and held.uuid == item["uuid"] and held.into != str(n):
+            log.warning("session %s: its steer offered for another turn: not taken", sid)
+            return
+        if held is not None and held.uuid != item["uuid"]:
+            self.host.steer_revoke(sid, held.uuid, "omitted", held.into)
+        fetch = self.last_fetch if self.last_fetch is not None and self.last_fetch[0] == fetch_sent else None
         big = len(json.dumps(item["text"]).encode()) > STEER_MAX_BYTES
-        try:
-            self.host.steer_offer(sid, str(n), item["uuid"], item["text"], authorized=authorized and not big,
-                                  refused="too_big" if big else None)
-        except (LookupError, ValueError) as e:
-            log.warning("session %s: a steer offer could not be taken: %s", sid, e)
+        with self.ack_lock:     # no acknowledgement slips between the walk and the record's creation
+            fresh, cover = self._offer_contact(sid, n, fetch, self.clock())
+            try:
+                self.host.steer_offer(sid, str(n), item["uuid"], item["text"], authorized=fresh and not big,
+                                      refused="too_big" if big else None, cover_until=cover)
+            except (LookupError, ValueError) as e:
+                log.warning("session %s: a steer offer could not be taken: %s", sid, e)
 
     def _steer_watch(self, now: float) -> None:
-        """Loss is one-way: a held steer whose contact lapsed is revoked for good. Called by the loop and by the
-        deadline watchdog, on acknowledged SEND times."""
-        for sid in list(self.host.sessions):
-            live = self.host.steer_live(sid)
-            if live is None:
-                with self.ack_lock:
-                    self.steer_seen.pop(sid, None)
-                    self.steer_into.pop(sid, None)
-                    self.steer_broken.discard(sid)
-            elif live[0].isdigit() and not self._steer_check(sid, int(live[0]), now):
-                self.host.steer_revoke(sid, live[1], "contact")
+        """Loss is one-way: a held attempt whose contact ran out is latched lost, in its own record. Called by the loop
+        and by the deadline watchdog."""
+        for slot in self.host.attempts():
+            slot.contact_ok(self.clock())
 
     # ------------------------------------------------------------ the deadlines, off the hub-I/O path
 
@@ -1374,17 +1374,29 @@ class SessionRunner:
         node can go on to stop its ordinary runs at once (node.run); `shutdown()` does the rest."""
         self.stopping.set()
         with self.lock:
-            # Every session holding a steer attempt is drained first: a native end already in its pipe counts.
-            try:
-                self.watched_steer += self.host.drain()
-            except Exception:
-                log.exception("could not drain the sessions holding a steer")
-            for s in self.host.sessions.values():
+            # Review round 3, structure 2 (the shutdown's part): every session holding NO live steer attempt gets its
+            # SIGTERM at once, as on main; then those that hold one are drained (`SessionHost.drain`: one deadline for
+            # the whole shutdown, each stopping as soon as N's own end is read), and get theirs. node.shut_down starts
+            # the grace after this returns.
+            live = {s.session_id for s in self.host.sessions.values() if self.host.live_attempt(s)}
+
+            def term(s):
                 if s.child is not None:
                     try:
                         s.child.terminate()
                     except Exception:
                         log.exception("could not signal session %s", s.session_id)
+            for s in self.host.sessions.values():
+                if s.session_id not in live:
+                    term(s)
+            if live:
+                try:
+                    self.watched_steer += self.host.drain()
+                except Exception:
+                    log.exception("could not drain the sessions holding a steer")
+                for s in self.host.sessions.values():
+                    if s.session_id in live:
+                        term(s)
 
     def _going(self, s) -> bool:
         return s.child is not None and (s.child.poll() is None or self.host.group_alive(s.child.pid))

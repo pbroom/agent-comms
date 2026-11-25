@@ -241,8 +241,11 @@ class Node:
         if usage:       # only for a hub whose last answer asked (`report_usage`: it has account pools)
             body["usage"] = usage
         optional = [k for k in ("usage", "homes") if k in body]     # newest first: what an older hub refuses
-        sent = self.clock()     # its SEND time: an acknowledged hello renews the sessions' write authority from it
         while True:
+            # Its SEND time: an acknowledged hello renews the sessions' write authority from it. Taken for each
+            # attempt, so a hello sent again (an older hub refused a field) is dated from the one that got through
+            # (R3-03).
+            sent = self.clock()
             try:
                 out = self._call("POST", "/api/nodes/hello", json=body)
                 break
@@ -525,9 +528,11 @@ def shut_down(node: Node) -> None:
     stopped = False
     try:
         node.signal_runs()
-        deadline = node.clock() + node.config.kill_grace_seconds
         if sessions is not None:
             quietly(sessions.signal)
+        # The grace starts when the last SIGTERM went (R3-04): a session holding a live steer attempt is drained, for
+        # at most one shutdown-wide deadline, before its SIGTERM. With none, nothing is drained and this is main's.
+        deadline = node.clock() + node.config.kill_grace_seconds
         while (node.runs_alive() or (sessions is not None and quietly(sessions.alive, False))) \
                 and node.clock() < deadline:
             node.sleep(0.2)
