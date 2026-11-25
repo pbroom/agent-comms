@@ -206,8 +206,10 @@ def test_a_plain_result_after_a_steer_is_never_ns_by_order(henv, monkeypatch):
     child.emit(plain(text="whose?"))
     assert not ends(henv.host.tick()) and not s.provider.verified
     child.emit(owned(n, S, text="mine"))
-    [end] = ends(henv.host.tick())
-    assert end.text == "mine" and end.steer == {"outcome": "in_turn", "why": "answered"}
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    # (review round 2, ruling F: typed evidence needs the verified incarnation; N's own result stands, S unconfirmed)
+    assert end.text == "mine" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
 
 # ---------------------------------------------------------------- the finalizer and the bounded publication
@@ -584,20 +586,16 @@ def test_the_three_outcome_mode_an_init_echoing_s_proves_nothing(henv, monkeypat
 
 
 def test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn(henv, monkeypatch):
-    """Review round 1, ruling A: only an `init` listing exactly [S] opens S's own turn. [S, X] matches no predicate:
-    it neither opens, ends nor releases anything for S, and an [S] result in no bracket after it releases nothing
-    either; the hold runs to its bound (the finalizer: `unconfirmed`)."""
+    """Only an `init` listing exactly [S] opens S's own turn. [S, X] names S in a shape M8 never measured: never
+    evidence, the loss of verification (review round 2, ruling F): the finalizer at once, S `unconfirmed`, and an [S]
+    result after it releases nothing."""
     s, child, n = steered(henv, monkeypatch)
     child.emit(owned(n))
     henv.host.tick()
-    child.emit(vinit(S, "0be7c0de-0000-4000-8000-000000000001"))
-    assert henv.host.tick() == [] and not s.held.s_turn
-    child.emit(owned(S, text="?"))
-    assert henv.host.tick() == [] and s.held is not None
-    henv.clock.advance(61)
-    out = henv.host.tick()
-    [end] = ends(out) or ends(henv.host.tick())
-    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+    child.emit(vinit(S, "0be7c0de-0000-4000-8000-000000000001"), owned(S, text="?"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"} and not s.provider.verified
 
 
 def test_o_a_checkpoint_whose_steer_was_never_listed_is_refused(env):
@@ -772,16 +770,16 @@ def test_r1_b2_only_the_exact_init_opens_ss_own_turn(henv, monkeypatch, init):
 
 
 def test_r1_b2_a_late_n_s_result_in_the_hold_is_no_evidence(henv, monkeypatch):
-    """Blocker 2 (departure 3 overruled): a late [N, S] during the hold releases nothing; S's own turn that follows
-    gives S's own reply, never the late frame's."""
+    """Blocker 2 (departure 3 overruled; round 2, ruling F): a late [N, S] during the hold names N after N's own
+    result: never evidence, the loss of verification; the finalizer at once, S `unconfirmed`, and the S frames
+    after it give nothing (never the late frame's text, never `next_turn`)."""
     s, child, n = steered(henv, monkeypatch)
     child.emit(owned(n, text="N"))
     henv.host.tick()
-    child.emit(owned(n, S, text="late"))
-    assert henv.host.tick() == [] and s.held is not None
-    child.emit(vinit(S), owned(S, text="S's own"))
-    [end] = ends(henv.host.tick())
-    assert end.text == "N" and end.steer["result"]["text"] == "S's own"
+    child.emit(owned(n, S, text="late"), vinit(S), owned(S, text="S's own"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
 
 def test_r1_b2_an_s_x_result_before_ns_end_is_not_ns_reply(henv, monkeypatch):
@@ -1103,7 +1101,11 @@ class _M2:
                 return
             if kind == "res_ns":
                 self.native = "N"
-                self.finish("in_turn", "answered")
+                if self.verified:
+                    self.finish("in_turn", "answered")
+                else:
+                    self.phase = "held"     # N's, with no evidence for S, in an unverified incarnation: lost
+                    self.cut()
             elif kind == "res_n":
                 self.native = "N"
                 if self.verified and not self.lost:
@@ -1115,33 +1117,46 @@ class _M2:
                 if self.verified and self.bracket == "own" and not self.comp:
                     self.native = "S-only"
                     self.finish("unconfirmed", "s_only")
-                elif self.verified and self.bracket == "own" and self.comp:
-                    self.verified, self.lost = False, True
-            elif kind in ("compete", "cli_open", "s_init", "s_init_bad"):
+                else:
+                    self.lose()             # names S, not in the measured shape (ruling F)
+            elif kind in ("compete", "cli_open"):
                 if self.verified:
                     self.comp = True
+            elif kind in ("s_init", "s_init_bad", "s_notify_end"):
+                self.lose()                 # an init or a terminal naming S inside N's bracket (ruling F)
             elif kind in ("plain", "error"):
-                if self.verified:
-                    self.verified, self.lost = False, True
+                self.lose()
         elif p == "held":
             if kind == "s_init" and self.bracket is None and self.verified:
                 self.phase, self.bracket, self.since = "s_turn", "s", self.now
-            elif kind == "s_init_bad" and self.bracket is None and self.verified:
-                self.bracket = "cli"        # a notification-origin [S]: a bracket that proves nothing
+            elif kind in ("s_init", "s_init_bad", "late_ns"):
+                self.lose()                 # names S or N in a shape M8 never measured here (ruling F)
+                self.cut()
             elif kind in ("cli_open", "compete") and self.bracket is None:
                 self.bracket = "cli"
             elif kind == "cli_end" and self.bracket == "cli":
                 self.bracket = None
-            elif kind == "cli_takes_s" and self.bracket == "cli":
-                self.finish("unconfirmed", "consumed")
+            elif kind in ("cli_takes_s", "s_notify_end"):     # (the same frame: [S], task-notification)
+                if self.bracket == "cli" and self.verified:
+                    self.finish("unconfirmed", "consumed")
+                else:
+                    self.lose()
+                    self.cut()
             elif kind in ("plain", "error"):
-                self.verified = False
+                self.lose()
                 self.cut()
         elif p == "s_turn":
             if kind == "s_res":
                 self.finish("next_turn", "own_turn", s_reply="S's reply", s_ok=True)
             elif kind == "s_err":
+                self.verified = False       # rule 10: S's own turn failed with it, and unverified from now on
                 self.finish("next_turn", "own_turn", s_reply="", s_ok=False)
+            elif kind in ("late_ns", "s_reinit", "s_notify_end", "cli_open", "compete", "s_init"):
+                self.lose()                 # any init in S's bracket, or a frame naming S or N not as measured
+                self.cut()
+
+    def lose(self):
+        self.verified, self.lost = False, True
 
     def clock(self, now, T=60.0):
         self.now = now
@@ -1163,18 +1178,20 @@ def _m2_frames(n, s_):
             "s_init": vinit(s_), "s_init_bad": vinit(s_) | {"origin": NOTIFY},
             "cli_takes_s": owned(s_, text="took S") | {"origin": NOTIFY}, "late_ns": owned(n, s_, text="late"),
             "s_res": owned(s_, text="S's reply"),
-            "s_err": result(subtype="error_max_turns", is_error=True, text="")}
+            "s_err": result(subtype="error_max_turns", is_error=True, text=""),
+            "s_reinit": vinit(), "s_notify_end": owned(s_, text="a notification's") | {"origin": NOTIFY}}
 
 
-_MENU = {"n": ["res_n", "res_n", "res_n", "res_ns", "res_s", "compete", "cli_open", "cli_end", "note", "plain",
-               "error"],
-         "held": ["s_init", "s_init", "s_init", "s_init_bad", "cli_open", "cli_open", "cli_end", "cli_takes_s",
-                  "cli_takes_s", "cli_takes_s", "late_ns", "note", "plain", "error"],
-         "s_turn": ["s_res", "s_res", "s_err", "note", "cli_end", "late_ns", "plain"]}
+_MENU = {"n": ["res_n"] * 5 + ["res_ns", "res_ns", "res_s", "compete", "cli_open", "cli_end", "note", "plain",
+                                 "error", "s_init"],
+         "held": ["s_init"] * 6 + ["s_init_bad", "cli_open", "cli_open", "cli_end", "cli_takes_s", "cli_takes_s",
+                                   "cli_takes_s", "late_ns", "note", "plain", "error", "s_notify_end"],
+         "s_turn": ["s_res"] * 6 + ["s_err", "s_err", "note", "cli_end", "late_ns", "plain", "s_reinit",
+                                    "s_notify_end", "cli_open"]}
 
 
 def test_model_claude_steer_walks_against_an_independent_reference(henv, monkeypatch):
-    """Ruling D: 300 seeded walks of one Claude session over up to two turns, each turn with no steer or a steer
+    """Ruling D: 900 seeded walks of one Claude session over up to two turns, each turn with no steer or a steer
     written whole, in part (then completed or cut at 5 s), or not at all (queued and retired with zero bytes);
     frames chosen from this test's OWN model phase (never production's), one to three per read; and host-made ends
     (the clock, an exit, a cancel, a close, a stop of every turn, the stop latch then shutdown, the attempt's contact
@@ -1188,14 +1205,14 @@ def test_model_claude_steer_walks_against_an_independent_reference(henv, monkeyp
     from agent_comms.session_host import STEER_CUT
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
     reach: dict = {}
-    for seed in range(300):
+    for seed in range(900):
         rnd = random.Random(seed)
         henv.spawner = FakeSpawner(child=FakeSessionChild)
         henv.procs = FakeProcs(henv.spawner)
         henv.host = make_host(henv, timeout_minutes=1)
         henv.host.steer_authority = lambda sess: True
         s, child = idle_host(henv)
-        ended_seen, log, verified = False, [seed], True
+        ended_seen, log, verified, retired = False, [seed], True, None
         for turn in range(1, 3):
             mid = str(turn)
             henv.host.send(SID, f"turn {turn}", message_id=mid)
@@ -1242,7 +1259,14 @@ def test_model_claude_steer_walks_against_an_independent_reference(henv, monkeyp
                 reach[("unconfirmed", "partial")] = reach.get(("unconfirmed", "partial"), 0) + 1
                 break
             if model is None:
-                # no steer: an ordinary turn, as main
+                # no steer: an ordinary turn, as main; after a decided steer, sometimes late frames of that retired
+                # S first (an error and a result naming it): they end, fail and supply text for nothing (ruling F)
+                if retired is not None and rnd.random() < 0.6:
+                    child.emit(result(subtype="error_during_execution", is_error=True, text="old S")
+                               | {"user_message_uuid": retired, "user_message_uuids": [retired]},
+                               owned(retired, text="old S"))
+                    assert not [e for e in henv.host.tick() if e.kind == "turn_ended"], log
+                    reach[("retired_frames", "")] = reach.get(("retired_frames", ""), 0) + 1
                 child.emit(owned(n, text="M"))
                 mine = [e for e in henv.host.tick() if e.kind == "turn_ended" and e.message_id == mid]
                 assert [(e.ok, e.text, e.steer) for e in mine] == [(True, "M", None)], log
@@ -1326,11 +1350,12 @@ def test_model_claude_steer_walks_against_an_independent_reference(henv, monkeyp
                 row = ("next_turn", "ok" if s_ok else "cut")
             reach[row] = reach.get(row, 0) + 1
             verified = model.verified
+            retired = s_ if model.bytes else None
             if stopped or ended_seen or model.host_cut or (want_outcome == "next_turn" and not s_ok):
                 break       # (the model's own reading: the process was stopped, or S's turn left it unverified)
     for row in [("in_turn", "answered"), ("next_turn", "ok"), ("next_turn", "cut"), ("unconfirmed", "consumed"),
                 ("unconfirmed", "s_only"), ("unconfirmed", "turn_cut"), ("unconfirmed", "partial"),
-                ("not_delivered", "")]:
+                ("not_delivered", ""), ("retired_frames", "")]:
         assert reach.get(row, 0) >= 3, (row, sorted(reach.items()))
     print("MODEL REACH", sorted(reach.items()))
 
@@ -1590,13 +1615,17 @@ def test_r1_m_after_a_deviation_in_the_same_read_no_s_turn_opens(henv, monkeypat
     ids=["reversed", "extra", "scalar_not_first"])
 def test_r1_m_ns_result_with_s_is_exactly_n_then_s(henv, monkeypatch, frame):
     """`in_turn` needs N's result to list exactly [N, S] (a list, in that order, its scalar N): [S, N], [N, S, X] and
-    [N, S] with scalar S are not N's result with S. Each is N's own result (it lists N): N's end is held."""
+    [N, S] with scalar S name N in a shape M8 never measured (ruling F): never N's result, the loss of
+    verification; with no other result of N's, N fails at its bound (part A's third exception), S `unconfirmed`."""
     s, child, n = steered(henv, monkeypatch)
     f = {k: ([n if u == "N" else u for u in v] if isinstance(v, list) else (n if v == "N" else v))
          for k, v in frame.items()}
     child.emit(result(text="N") | f)
     out = henv.host.tick()
-    assert not ends(out) and [e.kind for e in out] == ["held"], out
+    assert not ends(out) and not s.provider.verified, out
+    henv.clock.advance(61)
+    [end] = ends(henv.host.tick())
+    assert end.ok is False and end.detail == STEER_UNATTRIBUTED and end.steer["outcome"] == "unconfirmed"
 
 
 @pytest.mark.parametrize("frame", [
@@ -1605,18 +1634,18 @@ def test_r1_m_ns_result_with_s_is_exactly_n_then_s(henv, monkeypatch, frame):
     ids=["twice", "no_scalar", "other_scalar"])
 def test_r1_m_ss_end_is_a_result_listing_exactly_s(henv, monkeypatch, frame):
     """S's own turn ends only on a result listing exactly [S] with scalar S: [S, S], [S] with no scalar and [S]
-    with another scalar end nothing (no evidence for S); S's turn then runs to its bound (`next_turn` cut)."""
+    with another scalar name S in a shape M8 never measured (ruling F): never S's end, the loss of verification;
+    the finalizer at once: `next_turn` with S cut, never the frame's text."""
     s, child, n = steered(henv, monkeypatch)
     child.emit(owned(n, text="N"))
     henv.host.tick()
     child.emit(vinit(S))
     henv.host.tick()
     child.emit(result(text="?") | frame)
-    assert not ends(henv.host.tick()) and s.held is not None and s.held.s_turn
-    henv.clock.advance(61)
-    out = henv.host.tick()
-    [end] = ends(out) or ends(henv.host.tick())
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
     assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+    assert end.steer["result"]["text"] != "?" and not s.provider.verified
 
 
 def test_r1_m_an_s_only_result_needs_a_byte_of_s(henv, monkeypatch):
@@ -1735,6 +1764,113 @@ def test_r1_m_the_deadline_is_published_before_any_read_of_the_tick(henv, monkey
     henv.host._read = read
     out = henv.host.tick()
     assert len(ends(out)) == 1 and seen and seen[0] == 1, "published before the first read"
+
+
+
+# ---------------------------------------------------------------- review round 2, ruling F: one qualification
+
+
+def _s_turn_open(henv, monkeypatch):
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S))
+    henv.host.tick()
+    assert s.held is not None and s.held.s_turn
+    return s, child, n
+
+
+def test_r2_f_a_notification_in_ss_own_bracket_never_becomes_ss_reply(henv, monkeypatch):
+    """Sol's blocker 1: after `init` [S], a competing notification `init`, then a notification terminal echoing [S]:
+    never `next_turn` with the notification's text. The second init in S's bracket is a contradiction: verification
+    lost, the finalizer at once, S cut."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    child.emit(vinit() | {"origin": NOTIFY}, owned(S, text="a notification's") | {"origin": NOTIFY})
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+    assert end.steer["result"]["text"] != "a notification's" and not s.provider.verified
+
+
+def test_r2_f_a_notification_terminal_echoing_s_in_ss_bracket_is_a_contradiction(henv, monkeypatch):
+    """The notification terminal alone (no competing init): [S] with a notification origin is not S's end."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    child.emit(owned(S, text="a notification's") | {"origin": NOTIFY})
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.steer["result"]["ok"] is False and end.steer["result"]["text"] != "a notification's"
+
+
+def test_r2_f_a_notification_origin_n_s_result_is_not_in_turn(henv, monkeypatch):
+    """Sol's blocker 1: [N, S] with a notification origin is not N's result with S: never `in_turn`; it names N not
+    as measured: verification lost, N fails at its bound, S `unconfirmed`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, S, text="a notification's") | {"origin": NOTIFY})
+    out = henv.host.tick()
+    assert all(e.steer is None or e.steer["outcome"] != "in_turn" for e in ends(out)) and not s.provider.verified
+    henv.clock.advance(61)
+    [end] = ends(henv.host.tick())
+    assert end.ok is False and end.steer["outcome"] == "unconfirmed"
+
+
+@pytest.mark.parametrize("extra", [{"origin": {"kind": "human"}}, {"user_message_uuids": {}},
+                                   {"user_message_uuids": None}, {"user_message_uuid": 7}],
+                         ids=["human_origin", "malformed_dict", "null_list", "nonstring_scalar"])
+def test_r2_f_rule_10_needs_an_error_with_no_echo_field_and_no_origin(henv, monkeypatch, extra):
+    """Sol's blocker 1: rule 10 inside S's bracket is an error with NO echo field at all and NO origin key: an
+    explicit human origin, or a malformed echo field (not "empty"), is not S's failure: S's turn goes on to its
+    bound (`next_turn` cut), never failed by that frame at once."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    child.emit(plain(text="whose error", subtype="error_during_execution", is_error=True) | extra)
+    out = henv.host.tick()
+    assert not [e for e in ends(out) if e.steer and e.steer.get("result", {}).get("text") == "whose error"]
+
+
+def test_r2_f_a_retired_ss_error_never_fails_the_successor(henv, monkeypatch):
+    """Sol's blocker 2: after a successful S, message M is in flight; an error echoing S (retired) between
+    `init` [M] and M's result: it ends and fails nothing (checked before rule 10); M goes on to its own result."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    child.emit(owned(S, text="PINEAPPLE"))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn"
+    henv.host.send(SID, "M", message_id="2")
+    henv.host.tick()
+    m = uuid_of(child)
+    child.emit(vinit(m))
+    henv.host.tick()
+    child.emit(result(subtype="error_during_execution", is_error=True, text="S's old failure")
+               | {"user_message_uuid": S, "user_message_uuids": [S]})
+    assert not ends(henv.host.tick(), "2") and s.in_flight.id == "2", "M goes on"
+    child.emit(owned(m, text="M's own"))
+    [m_end] = ends(henv.host.tick(), "2")
+    assert m_end.ok and m_end.text == "M's own" and s.provider.verified
+
+
+def test_r2_f_a_retired_ss_result_never_supplies_the_successors_text(henv, monkeypatch):
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, S, text="N and S"))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "in_turn"
+    henv.host.send(SID, "M", message_id="2")
+    henv.host.tick()
+    m = uuid_of(child)
+    child.emit(vinit(m), owned(S, text="old"), vinit(S))
+    assert not ends(henv.host.tick(), "2")
+    child.emit(owned(m, text="M's own"))
+    [m_end] = ends(henv.host.tick(), "2")
+    assert m_end.text == "M's own"
+
+
+def test_r2_f_the_retired_set_is_bounded_per_incarnation():
+    """Retired S uuids are kept for the life of the process incarnation, at most RETIRED_MAX (oldest forgotten)."""
+    p = ClaudeSession()
+    p.argv(["claude", "-p", "{prompt}"], session_id=SID, resume=False, model=None)
+    for i in range(claude.RETIRED_MAX + 5):
+        p._attempt = {"s": f"5e7e7e7e-0000-4000-8000-{i:012d}", "n": "x", "bytes": 1, "phase": "n"}
+        p.steer_done()
+    assert len(p._retired) == claude.RETIRED_MAX and f"5e7e7e7e-0000-4000-8000-{0:012d}" not in p._retired
+    p.argv(["claude", "-p", "{prompt}"], session_id=SID, resume=True, model=None)
+    assert p._retired == set(), "a new incarnation starts with none"
 
 
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)

@@ -101,6 +101,7 @@ Steering (DESIGN_NOTES "Mid-turn steering, step 3: Claude steering, as built"; g
 """
 from __future__ import annotations
 
+import collections
 import dataclasses
 import json
 import logging
@@ -151,6 +152,7 @@ VERIFIED: frozenset[str] = frozenset({"2.1.330"})
 NEXT_TURN, THREE = "next_turn", "three"
 STEER_MODES: dict[str, str] = {"2.1.330": NEXT_TURN}
 MAX_ECHO = 64           # uuids read from one frame's echo fields
+RETIRED_MAX = 256       # retired steers remembered per process incarnation (ruling F)
 # Brackets (`_bracket`): the turn the process is in, by evidence. OWN: the host's turn in flight (an `init` echoed
 # its uuid); UNATTRIBUTED: a turn no message of the host's is known to have started (an unmarked `init`).
 OWN, UNATTRIBUTED = "own", "unattributed"
@@ -317,6 +319,30 @@ def echoed(ev: dict, *keys: str) -> set[str]:
     return out
 
 
+def _named(ev: dict) -> set[str]:
+    """Every string in a frame's echo fields, whatever their shape (a malformed field still names what it names)."""
+    out: set[str] = set()
+    for k in ("user_message_uuid", "user_message_uuids"):
+        v = ev.get(k)
+        for u in ([v] if isinstance(v, str) else v[:MAX_ECHO] if isinstance(v, list) else []):
+            if isinstance(u, str):
+                out.add(u)
+    return out
+
+
+def _echo_shape(ev: dict) -> tuple[list | None, str | None, bool]:
+    """(the list, the scalar, well-formed): `user_message_uuids` absent or a list of strings, `user_message_uuid`
+    absent or a string, and when both are there the scalar is the list's first element (M8's measured shape). A
+    malformed field is not "empty" (ruling F)."""
+    listed, scalar = ev.get("user_message_uuids"), ev.get("user_message_uuid")
+    ok = ((listed is None and "user_message_uuids" not in ev) or (
+        isinstance(listed, list) and all(isinstance(u, str) for u in listed))) and (
+        (scalar is None and "user_message_uuid" not in ev) or isinstance(scalar, str))
+    if ok and isinstance(listed, list) and isinstance(scalar, str):
+        ok = bool(listed) and listed[0] == scalar
+    return (listed if isinstance(listed, list) else None), (scalar if isinstance(scalar, str) else None), ok
+
+
 def origin_not_human(ev: dict) -> bool:
     """The frame names an `origin` whose `kind` is a word other than `human` (Claude's mark of a turn it started for
     a notification). A frame with no `origin` (every turn of the host's, as measured) does not."""
@@ -422,6 +448,11 @@ class ClaudeSession:
         self._interrupt_ok = False      # ... which the process answered with success
         # Steering (module text), per process incarnation.
         self._steer_mode: str | None = None     # STEER_MODES' word for this incarnation's version (its first `init`)
+        # Every S of this incarnation already decided a byte of which went (ruling F), oldest first: a frame naming
+        # one is checked before any ordinary fallback. At most RETIRED_MAX (one attempt per turn: the last
+        # RETIRED_MAX steers), forgotten with the incarnation.
+        self._retired_order: collections.deque = collections.deque(maxlen=RETIRED_MAX)
+        self._retired: set[str] = set()
         self._steer_reset()
 
     def _steer_reset(self) -> None:
@@ -430,6 +461,7 @@ class ClaudeSession:
         # turn proved). Classification only (module text): no outcome is decided here.
         self._attempt: dict | None = None
         self._evidence: str | None = None   # the evidence of the frame being read (`feed` puts it on its event)
+        self._s_named = False               # the open UNATTRIBUTED bracket was opened by an init naming S (THREE)
 
     def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
         """What the host decided for this session (session_access.prepare), before any `argv`. `access` "full":
@@ -636,8 +668,14 @@ class ClaudeSession:
         a, self._attempt = self._attempt, None
         if a is not None and a["bytes"] == 0:
             self._written.discard(a["s"])
+        elif a is not None:
+            if len(self._retired_order) == self._retired_order.maxlen:
+                self._retired.discard(self._retired_order[0])
+            self._retired_order.append(a["s"])
+            self._retired.add(a["s"])
         if self._bracket == STEER_BRACKET:
             self._bracket = None
+        self._s_named = False
 
     def steer_retire(self) -> None:
         """S's line, never written (not one byte), is given up (step 2's word for it)."""
@@ -647,91 +685,126 @@ class ClaudeSession:
     def steer_written(self) -> None:
         """Every byte of S's line is in the pipe (the host tells `steer_facts` the count as well)."""
 
-    @staticmethod
-    def _exact(ev: dict, *uuids: str) -> bool:
-        """`user_message_uuids` is exactly this list, and `user_message_uuid` its first element."""
-        listed = ev.get("user_message_uuids")
-        return (isinstance(listed, list) and listed == list(uuids) and ev.get("user_message_uuid") == uuids[0])
+    def _contradict(self, why: str) -> None:
+        """Ruling F: a frame that names S (or N) but contradicts the shape M8 measured is never evidence for an
+        outcome: it is the loss of verification for the attempt (`_lose`), typed `lost`."""
+        log.info("Claude session %s: a frame naming the steer does not have the measured shape: %s", self.session_id,
+                 why)
+        if self._verified is True:
+            self._lose(why)
+        self._evidence = "lost"
 
-    def _steer_init(self, ev: dict, caps: frozenset) -> str | None:
-        """An `init` while N's end is held: S's own turn opening (the exact predicate), a bracket the CLI opened, or
-        None for step 1's table. While S's own turn is open, a re-init is checked only."""
-        a = self._attempt
-        if a is None or a["phase"] == "n":
-            return None
-        if a["phase"] == "s_turn":
-            log.info("Claude session %s: another init inside the steer's own turn (checked, nothing started)",
+    def _steer_frame(self, ev: dict, kind: str, caps: frozenset = frozenset()) -> tuple[bool, str | None]:
+        """THE one qualification of a frame as steer evidence (review round 2, ruling F): every typed steer event
+        (`n_with_s`, `n_without_s`, `s_only`, `s_open`, `s_end`, `s_consumed`, and rule 10's echo-less error) is set
+        here and nowhere else (`_lose` types a loss `lost`). `kind`: "init" or "result". Returns (handled, whose
+        turn): handled False leaves the frame to step 1's table, unchanged.
+
+        It enforces exactly M8's measured shape: the exact echo list (a list of strings, in order; a result's
+        `user_message_uuid` its first element; an init has no scalar), the measured origin (none for the host's
+        lines; `task-notification` for a turn the CLI started), the bracket and phase, the verified incarnation and
+        its version. A frame naming S, or N once N's own result came, in any other shape contradicts it
+        (`_contradict`). A frame naming a RETIRED S of this process (an attempt already decided) is checked first,
+        before any ordinary fallback (rule 10, order): it is no message's, ends and fails nothing, and the turn in
+        flight goes on to its own result."""
+        named = _named(ev)
+        if named & self._retired:
+            log.info("Claude session %s: a frame of a steer already settled (nothing is taken from it)",
                      self.session_id)
-            return "other"
-        if self._verified is not True:
-            return "other"      # after a deviation nothing proves S's turn (G-2); no turn of a message starts here
-        listed = ev.get("user_message_uuids")
-        if not (isinstance(listed, list) and len(listed) == 1 and listed[0] == a["s"]):
-            return None         # not S's: step 1's table (an unmarked `init` opens the CLI's bracket)
-        if self._bracket is not None:
-            return "other"      # another bracket is open: no S turn opens inside it
-        version = ev.get("claude_code_version")
-        if (ev.get("origin") is None and self._steer_mode == NEXT_TURN and isinstance(version, str)
-                and STEER_MODES.get(version) == NEXT_TURN and version in VERIFIED and LIFECYCLE in caps):
-            self._evidence = "s_open"
-            log.info("Claude session %s: the steer's own turn began", self.session_id)
-            return "steer"
-        # It names S but proves no S-owned turn (the three-outcome mode, or not M8's measured shape): a turn no
-        # message here started; only its terminal result listing exactly [S] says S was consumed (H-2).
-        self._bracket, self._competing, self._activity = UNATTRIBUTED, False, False
-        log.info("Claude session %s: the CLI began a turn that names the steer (it proves nothing)", self.session_id)
-        return "other"
-
-    def _steer_result(self, ev: dict) -> tuple[bool, str | None]:
-        """A `result` while an attempt is live: (handled, whose turn) by the steering predicates, else (False, None)
-        for step 1's table. Never decides an outcome: it sets the frame's evidence (module text)."""
+            return True, "other"
         a = self._attempt
         if a is None:
             return False, None
-        if a["phase"] == "n":
-            n, s_ = a["n"], a["s"]
-            echo = echoed(ev, "user_message_uuid", "user_message_uuids")
-            if self._current == n and n in echo:
-                self._evidence = "n_with_s" if self._exact(ev, n, s_) else "n_without_s"
-                return False, None      # N's own result: step 1's table settles it (OWNED)
-            if (a["bytes"] > 0 and self._current == n and self._verified is True and self._bracket == OWN
-                    and not self._competing and self._exact(ev, s_) and ev.get("origin") is None):
-                self._evidence = "s_only"
-                self._close_own()
-                return True, "own"
+        s_, n, phase = a["s"], a["n"], a["phase"]
+        names_s, names_n = s_ in named, n in named
+        listed, scalar, shaped = _echo_shape(ev)
+        quiet = ev.get("origin") is None        # the measured origin of the host's lines: none
+        if kind == "init":
+            if phase == "n":
+                if names_s:
+                    self._contradict("an init naming the steer inside the turn's own bracket")
+                    return True, "other"
+                return False, None
+            if phase == "s_turn":
+                self._contradict("another init inside the steer's own turn")
+                return True, "other"
+            if names_n:
+                self._contradict("an init naming the turn whose end is held")
+                return True, "other"
+            if not names_s:
+                return False, None      # (step 1's table: an unmarked `init` opens the CLI's bracket)
+            if self._verified is not True:
+                self._evidence = "lost"
+                return True, "other"    # after a deviation nothing proves S's turn (G-2)
+            version = ev.get("claude_code_version")
+            exact = shaped and listed == [s_] and scalar is None and quiet
+            fits = (isinstance(version, str) and version in VERIFIED and LIFECYCLE in caps
+                    and STEER_MODES.get(version) == self._steer_mode)
+            if not exact or self._bracket is not None or not fits:
+                self._contradict("an init naming the steer: " + (
+                    "not exactly [S] with no origin" if not exact else "another bracket is open"
+                    if self._bracket is not None else "not a version and capability that steer"))
+                return True, "other"
+            if self._steer_mode == NEXT_TURN:
+                self._evidence = "s_open"
+                log.info("Claude session %s: the steer's own turn began", self.session_id)
+                return True, "steer"
+            # The three-outcome mode: it proves no S-owned turn; only that bracket's terminal result listing exactly
+            # [S] says S was consumed (H-2).
+            self._bracket, self._competing, self._activity, self._s_named = UNATTRIBUTED, False, False, True
+            log.info("Claude session %s: the CLI began a turn that names the steer (it proves nothing)",
+                     self.session_id)
+            return True, "other"
+        # a result
+        if phase == "n":
             if a["bytes"] == 0:
                 return False, None      # no byte of this attempt went: the process is as without a steer
-            if self._verified is True and self._bracket == OWN and self._competing and self._exact(ev, s_):
-                # The S-only result where a competing `init` was noted: N's ownership rests on S (part D): nobody's,
-                # and the incarnation is unverified from now on.
-                self._lose("a result listing only the steer, after a competing init in the turn's own bracket")
-                self._evidence = "lost"
+            if names_n and self._current == n:
+                if shaped and quiet and listed == [n, s_] and scalar == n:
+                    if self._verified is True:
+                        self._evidence = "n_with_s"
+                    return False, None      # N's own result: step 1's table settles it (OWNED)
+                if shaped and quiet and listed == [n] and scalar == n:
+                    if self._verified is True:
+                        self._evidence = "n_without_s"
+                    return False, None      # (unverified meanwhile: N's, with no evidence for S)
+                self._contradict("a result naming the turn in flight not in the measured shape")
+                return True, "other"
+            if names_s:
+                if (shaped and quiet and listed == [s_] and scalar == s_ and self._verified is True
+                        and self._bracket == OWN and not self._competing):
+                    self._evidence = "s_only"
+                    self._close_own()
+                    return True, "own"
+                self._contradict("a result naming the steer inside the turn's own bracket not in the measured shape")
                 return True, "other"
             # A byte went: never by order (G-3). What step 1 would settle by order is nobody's, and a deviation.
             cls = result_class(ev, self._written, self._current, self._delivered) if self._verified else PLAIN
             if cls == NON_TURN:
                 return True, None
-            if self._verified and cls in (SETTLED, FOREIGN):
+            if self._verified and cls in (SETTLED, FOREIGN, HELD_ERROR):
                 return False, None      # step 1's table: nothing for N
-            if self._verified and cls == HELD_ERROR:
-                return False, None
             if self._verified:
                 self._lose("a result could not be attributed after a steer")
             self._evidence = "lost"
             log.info("Claude session %s: a result that could not be attributed after a steer is nobody's",
                      self.session_id)
             return True, "other"
-        s_ = a["s"]
-        if a["phase"] == "s_turn":
-            if self._exact(ev, s_):
-                self._evidence = "s_end"
-                self._bracket = None
-                return True, "steer"
-            if (ev.get("is_error") is True and not echoed(ev, "user_message_uuid", "user_message_uuids")
-                    and not origin_not_human(ev)):
+        if names_n:
+            self._contradict("a result naming the turn whose end is held")
+            return True, "other"
+        if phase == "s_turn":
+            if names_s:
+                if shaped and quiet and listed == [s_] and scalar == s_ and self._verified is True:
+                    self._evidence = "s_end"
+                    self._bracket = None
+                    return True, "steer"
+                self._contradict("a result naming the steer in its own turn not in the measured shape")
+                return True, "other"
+            if (ev.get("is_error") is True and "user_message_uuid" not in ev and "user_message_uuids" not in ev
+                    and "origin" not in ev and self._verified is True):
                 # Step 1's rule 10 for a fully written turn: S's own turn failed with this error, by order, and the
-                # incarnation is unverified from now on. Only an error with no echo at all and no origin: a zero-turn
-                # notification's error, or an error naming another line, is no evidence for S.
+                # incarnation is unverified from now on. Only an error with no echo field at all and no origin key.
                 self._evidence = "s_end"
                 self._bracket = None
                 self._lose("an error result that does not list the steer's own turn's line")
@@ -740,10 +813,17 @@ class ClaudeSession:
                 return True, None
             return True, "other"        # no evidence for S: its turn goes on, to its bound
         # held: N's end is held, no S turn open
-        if self._bracket == UNATTRIBUTED and self._exact(ev, s_):
-            self._evidence = "s_consumed"
-            self._bracket, self._competing = None, False
-            log.info("Claude session %s: a turn the CLI started took the steer in", self.session_id)
+        if names_s:
+            origin = ev.get("origin")
+            measured = quiet if self._s_named else (isinstance(origin, dict)
+                                                     and origin.get("kind") == "task-notification")
+            if (self._bracket == UNATTRIBUTED and shaped and measured and listed == [s_] and scalar == s_
+                    and self._verified is True):
+                self._evidence = "s_consumed"
+                self._bracket, self._competing, self._s_named = None, False, False
+                log.info("Claude session %s: a turn the CLI started took the steer in", self.session_id)
+                return True, "other"
+            self._contradict("a result naming the steer while the turn's end is held not in the measured shape")
             return True, "other"
         return False, None
 
@@ -771,8 +851,8 @@ class ClaudeSession:
         """An `init`: whose turn it starts (Event.turn), and the bracket it leaves open."""
         version = ev.get("claude_code_version")
         qualifies = isinstance(version, str) and version in VERIFIED and LIFECYCLE in caps
-        steering = self._steer_init(ev, caps)
-        if steering is not None:
+        handled, steering = self._steer_frame(ev, "init", caps)
+        if handled:
             return steering
         mine = echoed(ev, "user_message_uuids")
         own = self._current is not None and self._current in mine
@@ -827,7 +907,7 @@ class ClaudeSession:
 
     def _result_turn(self, ev: dict) -> str | None:
         """A `result`: whose turn it ends (Event.turn), or None for one that ends no turn (the bracket table)."""
-        handled, turn = self._steer_result(ev)
+        handled, turn = self._steer_frame(ev, "result")
         if handled:
             return turn
         if not self._verified and self._attempt is not None and self._attempt["phase"] == "n" \
