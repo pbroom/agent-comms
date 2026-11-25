@@ -3658,20 +3658,29 @@ def test_r7_gap_an_ordinary_stop_after_a_steered_process_keeps_mains_dating(henv
     assert sent and s.stopping_since == t, "main's dating: the pass's time"
 
 
-def test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind(henv):
+@pytest.mark.parametrize("branch", ["after_interrupt", "plain"])
+def test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind(henv, branch):
     """(Round 7.) The turn's timeout drains a live attempt and reads N's own end there: no stop follows. The same
-    process's next, ordinary turn times out later: its stop is main's, dated with the pass's time."""
+    process's next, ordinary turn times out later: its stop is main's, dated with the pass's time. Both of the
+    timeout's branches: after its interrupt, and the plain one (bytes still in the buffer: no interrupt can go)."""
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
     host.tick()
     [req] = steers_of(child)
-    henv.clock.advance(31 * 60)
-    host.tick()                                 # the interrupt is written
-    henv.clock.advance(henv.config.kill_grace_seconds)
+    if branch == "after_interrupt":
+        henv.clock.advance(31 * 60)
+        host.tick()                             # the interrupt is written
+        henv.clock.advance(henv.config.kill_grace_seconds)
+    else:
+        child.accept = 0
+        s.outbuf += b"\n"                      # bytes the pipe does not take: the plain branch
+        henv.clock.advance(31 * 60)
     child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
     _fragmented(child, 2)                       # only the timeout's drain reaches N's end
     ends = ended_of(host.tick())
     assert ends and s.stopping_since is None and not s.steer_owned
+    child.accept = None
+    s.outbuf.clear()
     host.send(SID, "next", message_id="b")
     host.tick()
     st = last_start(child)
