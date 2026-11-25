@@ -1210,7 +1210,9 @@ class SessionHost:
         whose host behaviour differs from main's."""
         return s.child is not None and getattr(s.provider, "verified", False) is True
 
-    HELD = "the agent was busy with a turn of its own for {m:g} minutes; the message was not written"
+    # What was observed, not why (review round 8, C8-03): a held message and a pipe that takes nothing look alike.
+    HELD = ("not one byte of the message was accepted by the agent's process in two periods of {m:g} minutes; the "
+            "message was not written")
 
     def _barrier(self, s: Session, now: float, out: list[HostEvent]) -> bool:
         """The write barrier of a verified Claude incarnation (`holds_turns`: a turn the CLI started itself runs),
@@ -1267,18 +1269,18 @@ class SessionHost:
         if not msg.recovered:
             msg.recovered, msg.blocked_since = True, now
             if s.child is not None and s.stopping_since is None:
-                log.warning("session %s: message %s made no progress for %g minutes (the agent busy with turns of "
-                            "its own); its process is stopped and the message, never written, waits for the next one",
+                log.warning("session %s: message %s made no progress for %g minutes (not one byte of it accepted on "
+                            "stdin); its process is stopped and the message, never written, waits for the next one",
                             s.session_id, msg.id, self.timeout_minutes)
                 self._stop(s, now)
             else:
-                log.warning("session %s: message %s made no progress for %g minutes (the agent busy with turns of "
-                            "its own); the next process, needed anyway, is its one restart", s.session_id, msg.id,
-                            self.timeout_minutes)
+                log.warning("session %s: message %s made no progress for %g minutes (not one byte of it accepted on "
+                            "stdin); with its process gone or going down, the next one to start, needed anyway, is its "
+                            "one restart", s.session_id, msg.id, self.timeout_minutes)
             self._save_state()
             return True
-        log.warning("session %s: message %s made no progress for a second %g minutes; it fails, never written",
-                    s.session_id, msg.id, self.timeout_minutes)
+        log.warning("session %s: message %s made no progress for a second %g minutes (not one byte of it accepted "
+                    "on stdin); it fails, never written", s.session_id, msg.id, self.timeout_minutes)
         s.writing = s.inbox.popleft()
         self._fail(s, self.HELD.format(m=self.timeout_minutes), out)
         self._stop(s, now)

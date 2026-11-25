@@ -9214,9 +9214,10 @@ zero-turn task notification `result` did the same to a turn in flight.
     fresh budget"; starting it at the restart bounds the wait also when no process can start for it). With no
     process at that moment (stopped for its binding, say, and not reaped yet, or no slot) the one it needs anyway IS
     its restart: nothing is stopped, and the process that starts is not stopped for it. Once per message
-    (`_Message.recovered`): a second spent budget fails it as main's `_held` fails it ("the agent was busy with
-    a turn of its own for N minutes; the message was not written"), with nothing spawned for it. That bounds the
-    restarts at one per message and the wait at two budgets.
+    (`_Message.recovered`): a second spent budget fails it as main's `_held` fails it, with its own words since
+    review round 8 ("not one byte of the message was accepted by the agent's process in two periods of N minutes;
+    the message was not written": what was observed, as a held message and a pipe that takes nothing look alike),
+    with nothing spawned for it. That bounds the restarts at one per message and the wait at two budgets.
 - **Interrupt readiness** (`takes_interrupt`) in a verified process needs M's owned bracket; the interrupt receipt
   counts only once M's own `init` came. Unverified: as main.
 - Codex attribution is unchanged.
@@ -9656,9 +9657,7 @@ What changed (the invariant above, restated):
   timer, which runs out at the same pass); the 7b restart starts the second budget at once (`blocked_since = now`,
   was None); with no process (or one going down) it stops nothing; a spent second budget fails the message with
   nothing spawned for it. The budget is checked with no process before every start gate (`_write`) and while the
-  old process goes down (`_pass`). A log line for a no-process recovery: `session <id>: message <msg> made no
-  progress for <N> minutes (the agent busy with turns of its own); the next process, needed anyway, is its one
-  restart`.
+  old process goes down (`_pass`). A log line for a no-process recovery (worded as round 8 has it, below).
 - C7-01 tests: `test_c7_01_a_candidate_that_never_verifies_is_mains_write_timer_and_failure` (Sol's sequence with a
   2.1.329 `init`, and a candidate that never writes one: every pass's events, the stdin without the uuid key, the
   stops and the inbox equal to the same run with VERIFIED empty; failure at t=60 by main's timer, no restart, no
@@ -9688,6 +9687,39 @@ What changed (the invariant above, restated):
 - Edited replay, one: `test_r4_a_an_init_first_read_on_the_old_deadline_unstages_before_any_timeout` asserted
   `blocked_since is None` after the 7b restart; it now asserts the second budget started then (the ruling). Every
   other replay of rounds 4 to 6 passes unchanged.
+
+### Review round 8 (Sol, on df50e73 and 121c706: APPROVED, both gates yes) and what changed
+
+Sol: C7-01 and C7-02 resolved; C7-03 partly. Three follow-ups, which the coordinator asked for before the gate:
+- **C8-01**, the property test's bound after a first byte: it ran from when progress was SEEN (stage at t=0, first
+  byte at t=45: a failure at t=105 passed, while main's write timer runs out at t=60). It now records each
+  message's FINAL staging (a new message being written, or the same one on another process) and bounds the outcome
+  after progress, and an unbudgeted staged message's, by P(staging + T). Tightened, it found no failure (2000 seeds
+  while changing it; a write timer made 45 s late after a first byte fails it at once).
+- **C8-02**, the property test: an `ended` event (a host exception ends the session) now fails it instead of being
+  counted as failures; it tracks which process took each message's bytes (the line being written on the current
+  process at each pass's end, and every prefix long enough to name its message) and fails if a prefix on one is
+  followed by the line, or another prefix, on another. The generator gains a process that exits by itself (its
+  turn is lost, main's), a pipe that raises on write (the message fails, main's) and a cancelled message (failed,
+  never written, or its turn ended); all three fit without making an outcome ambiguous, as each gives exactly one
+  event per message. 200 seeds in the suite (each about 5 ms).
+- **C8-03**, the wording: the no-progress lines blamed "the agent busy with turns of its own" also for a verified,
+  idle process whose pipe takes nothing. They now say what was observed (not one byte accepted on stdin), and stay
+  distinct: "its process is stopped" (the 7b restart), "with its process gone or going down" (the restart with no
+  process), "for a second" (the failure). The asker's failure text (HELD) the same way; three tests that pinned
+  it changed accordingly. None of them can be written with VERIFIED empty (a message has no budget then, and only
+  `_spent` writes them, for a budgeted message): `test_c8_03_with_verified_empty_no_message_has_a_budget_*`; main's
+  fixture is unchanged. Main's `_held` (Codex) keeps its words.
+The final lines (logger `agent_comms.session_host`, WARNING):
+- `session <id>: message <msg> made no progress for <N> minutes (not one byte of it accepted on stdin); its process
+  is stopped and the message, never written, waits for the next one`
+- `session <id>: message <msg> made no progress for <N> minutes (not one byte of it accepted on stdin); with its
+  process gone or going down, the next one to start, needed anyway, is its one restart`
+- `session <id>: message <msg> made no progress for a second <N> minutes (not one byte of it accepted on stdin); it
+  fails, never written`; the asker sees `not one byte of the message was accepted by the agent's process in two
+  periods of <N> minutes; the message was not written`.
+Mutation re-check (scratchpad `correlation/mutate10.py`): the eight rows of the round-7 table whose change falls in
+`_spent`, where the wording changed, and a new one that swaps HELD for the write timer's detail: 9 of 9 caught.
 
 ### Not done
 

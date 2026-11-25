@@ -1173,7 +1173,7 @@ def test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_
     evs += henv.host.tick()
     evs += cycle(fresh, henv.clock())
     [end] = settled(evs, "1")
-    assert (end.delivered, end.ok) == (False, False) and "busy with a turn of its own" in end.detail
+    assert (end.delivered, end.ok) == (False, False) and "in two periods of" in end.detail
     assert henv.clock() - staged_at >= 60 and henv.clock() - staged_at < 70, "the second budget, from its staging"
     assert b'"next"' not in child.stdin and b'"next"' not in fresh.stdin
     valid_stdin(child, fresh)
@@ -1448,6 +1448,20 @@ def test_c7_01_an_unqualified_runner_never_restarts_for_a_blocked_message_whatev
     assert ours == main and ours["stops"] == [1] and ours["inbox"] == []
 
 
+@pytest.mark.parametrize("frames", [[vinit()], [vinit(), foreign(), vinit()], [vinit(version="2.1.329")], []])
+def test_c8_03_with_verified_empty_no_message_has_a_budget_and_no_no_progress_line_is_written(
+        henv, monkeypatch, caplog, frames):
+    """The three no-progress lines (and HELD) are written only by `_spent` for a message with a budget; with
+    VERIFIED empty no message ever has one, so none of them can appear, whatever the process writes and however long
+    its pipe takes nothing (main's fixture has none either)."""
+    import logging
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    run = candidate_run(henv, monkeypatch, (), [(5, frames), (55, []), (1, []), (125, [])])
+    s = henv.host.sessions[SID]
+    assert not run["staged_tracked"] and all(m.blocked_since is None for m in s.inbox)
+    assert "made no progress" not in caplog.text and "two periods of" not in json.dumps(run["passes"])
+
+
 def held_then_unbound(henv, monkeypatch):
     """Timeout 60 s, a verified idle session, the CLI's own turn open; M sent at t=0 is held (its budget from t=0);
     the binding changes, so once the turn closes the process is stopped for it. Returns (session, child, t0)."""
@@ -1514,7 +1528,7 @@ def test_c7_02_admission_denied_past_the_second_budget_fails_it_without_spawning
     henv.clock.advance(1)                               # t=120, and a slot just then
     henv.host.admit = None
     [end] = settled(henv.host.tick(), "1")
-    assert (end.delivered, end.ok) == (False, False) and "busy with a turn of its own" in end.detail
+    assert (end.delivered, end.ok) == (False, False) and "in two periods of" in end.detail
     henv.host.tick()
     assert len(henv.spawner.children) == 1 and not s.inbox, "nothing spawned for it"
 
@@ -1552,15 +1566,18 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
     live pipe taking nothing, everything, or a few bytes per write (partial writes); the NEXT process's pipe starting
     so; the CLI's own turn opening and closing; a downgrade; the in-flight message's own result; an init reporting
     2.1.329; a binding change; a process group that outlives its stop (a delayed reap) and its release; admission
-    denied and granted; and time steps from 1 s to past two budgets, so a deadline can pass between two reads. Then a
-    drain (slots, groups and pipes released, the clock running on). Every process starts as a candidate, and one
-    that is never sent an init never verifies. Asserted, for every message sent:
-    - exactly one outcome (delivered, or failed undelivered), recorded with its time; none is skipped;
+    denied and granted; a process that exits by itself; a pipe that raises on write; a cancelled message (review
+    round 8); and time steps from 1 s to past two budgets, so a deadline can pass between two reads. Then a drain
+    (slots, groups and pipes released, the clock running on). Every process starts as a candidate, and one that is
+    never sent an init never verifies. Asserted, for every message sent:
+    - exactly one outcome (delivered, or failed undelivered), recorded with its time; none is skipped; no `ended`
+      event (the session never ends: a host exception that ended it fails the test, it is not counted as failures);
     - written whole at most once over all processes, never after a message sent behind it; written iff delivered;
+      and its bytes, a prefix or the whole line, on ONE process only (a prefix on one and the line on another fails);
     - with a no-progress budget (first seen from b0): progress (a byte accepted) or its outcome by P(P(b0 + T) + T),
       P(x) the first pass at or after x: two budgets plus one pass, for a failure as for a delivery; after progress,
-      its outcome by P(progress + T) (main's write timer);
-    - never budgeted but staged at s0: its outcome by P(s0 + T) (main's write timer);
+      its outcome by P(s + T), s its FINAL staging (main's write timer runs from the staging, review round 8);
+    - never budgeted but staged: its outcome by P(s + T), s its final staging (main's write timer);
     - the 7b restart (`recovered`) only for a message seen budgeted under a process verified at the time (each line
       read, and each pass's end), C7-01.
     A failure names the seed and every step."""
@@ -1578,7 +1595,7 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
         return got
 
     monkeypatch.setattr(ClaudeSession, "feed", feeding)
-    for seed in range(80):
+    for seed in range(200):
         rnd = random.Random(seed)
         start = {"accept": None}
 
@@ -1595,7 +1612,7 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
         henv.host.admit = lambda sess: slot["ok"]
         s = henv.host.open(SID, agent="claude", runtime="claude-code", project="/work/repo")
         sent, outcome, extra, steps, pass_times = [], {}, [], [], []
-        budget0, progress, staged0, seen_verified = {}, {}, {}, set()
+        budget0, progress, staged, seen_verified, holders, at_writing = {}, {}, {}, set(), {}, [None]
 
         def holder():
             m = s.writing if s.writing is not None and s.turn_at is not None else (
@@ -1625,8 +1642,7 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
                 elif e.kind == "turn_ended" and outcome.get(e.message_id, ("?",))[0] != "delivered":
                     extra.append((e.message_id, "ended, never delivered", henv.clock()))
                 elif e.kind == "ended":
-                    for mid in e.undelivered:
-                        record(mid, "failed")
+                    extra.append(("the session", "ended", e.detail, henv.clock()))
             for m in list(s.inbox) + [s.writing]:
                 if m is None:
                     continue
@@ -1635,7 +1651,13 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
                 elif m.id in budget0 and m is s.writing and s.turn_at is None:
                     progress.setdefault(m.id, henv.clock())     # a byte of it accepted: its budget is over
             if s.writing is not None:
-                staged0.setdefault(s.writing.id, henv.clock())
+                if at_writing[0] != (id(s.writing), id(s.child)):
+                    staged[s.writing.id] = henv.clock()         # (re)staged in this pass: its write clock starts
+                c = s.child
+                tail = c.stdin[c.stdin.rfind(b"\n") + 1:] if c is not None else b""
+                if s.stopping_since is None and tail.startswith(b'{"type": "u'):
+                    holders.setdefault(s.writing.id, set()).add(c.pid)  # the line being written on it is this one
+            at_writing[0] = (id(s.writing), id(s.child)) if s.writing is not None else None
             see()
             for m in list(s.inbox) + [s.writing, s.in_flight]:
                 if m is not None and m.recovered and m.id not in seen_verified:
@@ -1647,7 +1669,8 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
         for k in range(70):
             p = proc()
             action = rnd.choice(["send", "send", "zero", "open", "partial", "next", "bracket", "close", "downgrade",
-                                 "own", "other", "bind", "linger", "release", "deny", "admit"])
+                                 "own", "other", "bind", "linger", "release", "deny", "admit", "exit", "broken",
+                                 "cancel"])
             arg = None
             if action == "send" and len(sent) < 6:
                 arg = f"m{len(sent)}"
@@ -1680,6 +1703,15 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
                 henv.groups.clear()
             elif action in ("deny", "admit"):
                 slot["ok"] = action == "admit"
+            elif action == "exit" and p is not None:
+                p.code = 1                                  # it exits by itself: the turn it had is lost (main's)
+            elif action == "broken" and p is not None:
+                p.broken = True                             # its next write raises: the message fails (main's)
+            elif action == "cancel" and sent:
+                arg = rnd.choice(sent)
+                for e in henv.host.cancel(SID, arg, "cancelled"):
+                    if e.kind == "turn_ended" and not e.delivered:
+                        record(e.message_id, "failed")
             dt = rnd.choice([1, 5, 5, 5, 10, 30, 65, 125])
             steps.append((action, arg, dt))
             henv.clock.advance(dt)
@@ -1705,7 +1737,15 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
                 # Whole lines, each one object; a process stopped in the middle of a line (a partial write and
                 # main's write timer) may end with that line's beginning, never with anything appended to it.
                 valid_stdin(SimpleNamespace(stdin=c.stdin[:c.stdin.rfind(b"\n") + 1]))
-                assert c.stdin.endswith(b"\n") or c.stdin == b"" or c.terminated or c.killed, "only a stopped one"
+                assert c.stdin.endswith(b"\n") or c.stdin == b"" or c.terminated or c.killed or (
+                    c.code is not None), "only a stopped or exited one"
+            for c in henv.spawner.children:
+                for x in c.stdin.split(b"\n"):
+                    found = re.search(rb'"content": "text (m\d)"', x)
+                    if found:       # a whole line, or a prefix long enough to name its message
+                        holders.setdefault(found.group(1).decode(), set()).add(c.pid)
+            assert all(len(pids) == 1 for pids in holders.values()), ("bytes of one message on two processes",
+                                                                         holders)
             order = [t.split(" ", 1)[1] for t in texts]
             assert len(order) == len(set(order)), ("written twice", order)
             assert order == [m for m in sent if m in order], ("out of order", order, sent)
@@ -1717,9 +1757,9 @@ def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv
                     bound = first_pass(first_pass(budget0[m] + T) + T)
                     assert min(at, progress.get(m, at)) <= bound, (m, kind, at, "budget from", budget0[m], bound)
                     if m in progress:
-                        assert at <= first_pass(progress[m] + T), (m, kind, at, "after progress", progress[m])
-                elif m in staged0:
-                    assert at <= first_pass(staged0[m] + T), (m, kind, at, "main's write timer from", staged0[m])
+                        assert at <= first_pass(staged[m] + T), (m, kind, at, "after progress, staged", staged[m])
+                elif m in staged:
+                    assert at <= first_pass(staged[m] + T), (m, kind, at, "main's write timer from", staged[m])
         except AssertionError as e:
             raise AssertionError(f"seed {seed}: {e}; steps {steps}") from None
 
@@ -1759,7 +1799,7 @@ def test_the_barrier_is_bounded_then_a_never_written_message_waits_for_the_next_
     assert henv.host.tick() == [] and fresh.stdin == b"", "behind the barrier again"
     henv.clock.advance(30 * 60)
     [end] = henv.host.tick()
-    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and "busy with a turn of its own" in (
+    assert (end.message_id, end.delivered, end.ok) == ("1", False, False) and "in two periods of" in (
         end.detail), "once per message: the second time it fails as main's `_held` fails it"
     assert fresh.terminated == 1
 
