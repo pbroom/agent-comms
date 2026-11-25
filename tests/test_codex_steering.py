@@ -2602,6 +2602,8 @@ for line in sys.stdin:
                 out({{"method": "item/completed", "params": {{"threadId": TID, "turnId": OTHER, "item": {{"type": "userMessage", "clientId": j}}}}}})
             elif step == "float_answer_other":
                 out({{"id": 4.0, "result": {{"turn": {{"id": OTHER, "status": "inProgress"}}}}}})
+            elif step == "answer_other":
+                out({{"id": 4, "result": {{"turn": {{"id": OTHER, "status": "inProgress"}}}}}})
             elif step == "done":
                 out({{"method": "turn/completed", "params": {{"threadId": TID, "turn": {{"id": T, "status": "completed"}}}}}})
 '''
@@ -3860,3 +3862,130 @@ def test_o_the_omission_after_a_partial_write_writes_not_one_byte_more(env):
     before = bytes(child.stdin)
     tick(env)
     assert bytes(child.stdin) == before and before.endswith(frame_head), "the prefix only, not one byte more"
+
+
+# --- the gaps round 3's mutation check found
+
+
+def test_r3_gap_a_valid_steer_in_an_answer_that_cannot_be_written_is_not_exposed(env):
+    """Another session's queued text cannot be written as UTF-8 (a damaged record): the listing's answer cannot be
+    sent, so the valid steer in it was never exposed (`listed_at` stays unset)."""
+    good, gchild = codex_turn_in_flight(env)
+    other, ochild = codex_turn_in_flight(env, project=P2)
+    env.human.post(f"/api/hosted-sessions/{other}/messages", json={"message": "queued behind"})
+    with hosted.db.write_tx(env.board.conn) as c:
+        m = hosted._get(c, hosted._msg_key(other, 2))
+        hosted._put(c, hosted._msg_key(other, 2), m | {"text": "queued \ud800 behind"}, "x", env.clock())
+    post_steer(env, good)
+    try:
+        env.laptop.get("/api/nodes/sessions", params={"tree": 5})
+    except Exception:
+        pass
+    assert steer_rec(env, good)["listed_at"] is None
+
+
+def test_r3_gap_an_answer_received_in_time_stays_fresh_with_acknowledgements_after_it(env):
+    """R3-03 with a hello acknowledged while the reconciliation waits (after the answer came): the offer's age is
+    still the one at receipt."""
+    import threading
+    import time as _time
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    runner = env.node.sessions
+    holders = []
+
+    class Busy:
+        armed = True
+
+        def request(self, method, path, **kw):
+            r = env.laptop.request(method, path, **kw)
+            if method == "GET" and path == "/api/nodes/sessions" and self.armed:
+                self.armed = False
+                got = threading.Event()
+
+                def hold():
+                    with runner.lock:
+                        got.set()
+                        _time.sleep(0.3)
+                        env.clock.advance(node_sessions.STEER_OFFER_AGE + 5)
+                        runner.note_hello(env.clock())       # acknowledged after the answer came
+                h = threading.Thread(target=hold)
+                holders.append(h)
+                h.start()
+                got.wait(5)
+            return r
+    runner.client = Busy()
+    runner.fresh, runner.last_sync = False, float("-inf")
+    tick(env)
+    for h in holders:
+        h.join(5)
+    assert len(steers_of(child)) == 1
+
+
+def test_r3_gap_the_plain_timeout_with_a_frame_queued_drains_first(henv):
+    """The timeout's plain branch (no interrupt can be queued behind a frame taken in part): a native end behind
+    buffered output is still N's own."""
+    host, s, child, _ = partial(henv)
+    child.accept = 0
+    henv.clock.advance(30 * 60)         # (the timeout is looked at before the frame's 5 s in a pass)
+    child.emit(cx.message("native"), cx.completed())
+    _fragmented(child, 2)
+    ends = ended_of(host.tick())
+    assert [e.text for e in ends] == ["native"]
+
+
+def test_r3_gap_shutdown_signals_the_sessions_holding_no_steer_before_it_drains(env):
+    runner = env.node.sessions
+    a, ca = codex_turn_in_flight(env)
+    post_steer(env, a)
+    b, cb = codex_turn_in_flight(env, project=P2)
+    tick(env)
+    _endless(ca, env.clock)
+    at = {}
+    real = cb.terminate
+
+    def term():
+        at.setdefault("b", env.clock())
+        return real()
+    cb.terminate = term
+    t = env.clock()
+    runner.signal()
+    assert at.get("b") == t, "the session holding no steer got its SIGTERM before the drain began"
+    runner.stopping.clear()
+
+
+def test_r3_gap_the_final_flush_posts_the_steer_carrying_report_first(env):
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    a, ca = codex_turn_in_flight(env)
+    b, cb = codex_turn_in_flight(env, project=P2)
+    order = []
+    real = runner.client
+
+    class Recording:
+        def request(self, method, path, **kw):
+            if method == "POST" and path.startswith("/api/nodes/sessions/"):
+                order.append(path.rsplit("/", 1)[-1])
+            return real.request(method, path, **kw)
+    runner.client = Recording()
+    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
+    runner._emit([HostEvent(a, "turn_ended", "1", ok=True, text="a", answered=True),
+                  HostEvent(b, "turn_ended", "1", ok=True, text="b", answered=True,
+                            steer={"outcome": "unconfirmed", "why": "turn_cut"})])
+    runner.stopping.set()
+    runner._flush(final=True)
+    runner.stopping.clear()
+    assert order[0] == b, "the report with the steer outcome first, in the shutdown's own flush"
+
+
+def test_r3_gap_a_childs_result_reads_no_steer_when_the_child_never_took_one(env, monkeypatch):
+    sid, kid, child = codex_child(env)
+    reads = _steer_reads(monkeypatch)
+    end_turn(env, child, "the task's answer")       # its result is made for the parent
+    assert [r for r in reads if kid in r[1]] == []
+
+
+def test_r3_gap_the_join_probe_fails_at_once_on_an_answer_naming_another_turn(tmp_path):
+    run = _probe(tmp_path, ["answer_other", "item", "done"])
+    with pytest.raises(SystemExit, match="named another turn"):
+        run._m5_join_probe()
