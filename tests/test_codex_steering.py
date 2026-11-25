@@ -4063,6 +4063,17 @@ def test_r8_04_a_failed_drain_is_logged_with_its_exception_type_only(henv, caplo
     assert "/home/someone" not in caplog.text and "Permission denied" not in caplog.text
 
 
+def test_r9_02_a_cut_is_only_made_for_the_current_processs_own_slot(henv):
+    """R9-02, the cut's own guard (the release makes the case unreachable; this holds it apart): a partial slot that
+    was not taken for the session's current process is never cut: nothing is signalled, the slot is dropped, and the
+    process runs on."""
+    host, s, child, _ = partial(henv)
+    s.steer.process = object()          # a slot left from another process
+    henv.clock.advance(STEER_PARTIAL_SECONDS + 1)
+    host.steer_deadlines()
+    assert child.terminated == 0 and s.stopping_since is None and s.steer is None
+
+
 def test_r9_02_a_host_reused_after_stop_all_with_a_partial_steer_runs_its_next_process_normally(henv):
     """R9-02: `stop_all` with S taken in part settles S (`unconfirmed`, `partial`) and lets the process go, and its
     slot with it; the same host is used again: the replacement handshakes and runs its turn, nothing is cut, and the
