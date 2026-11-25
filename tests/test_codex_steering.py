@@ -4806,6 +4806,64 @@ def test_r5_gap_a_fenced_pipe_stays_open_for_its_drain_when_the_group_goes_in_th
     assert closed, "the pipe is closed after its drain"
 
 
+def test_rebase_a_claude_budget_and_a_codex_drain_never_meet(henv, monkeypatch):
+    """(The rebase onto main's #112.) In one host, a verified Claude session holds M in the inbox while the CLI's own
+    turn runs (M's no-progress budget earned and counting), and a Codex session's live steer attempt ends with its
+    process exiting, N's native end behind buffered output (a deferred drain). In the pass: the Claude session's one
+    decision point comes in its own `_steps`, before the deferred drain, and the drain makes no decision; the drain
+    reads only the Codex process; the steer code takes no slot and writes nothing for the Claude session; the budget
+    code reads no gate and keeps no budget for the Codex session."""
+    import uuid as uuid_mod
+    import test_claude_correlation as cc
+    cc.short_host(henv, monkeypatch)
+    host = henv.host
+    s, child = cc.idle_host(henv)
+    cc.emit(henv, child, cc.vinit())                    # the CLI's own turn opens
+    host.send(SID, "next", message_id="1")
+    host.tick()
+    m = s.inbox[0]
+    assert m.earned and m.counted is not None, "M's budget is earned and counting"
+    henv.config.runners["codex-cli"] = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write",
+                                        "-c", cx.APPROVE, "{prompt}"]
+    henv.config.sessions.codex = True
+    host.steer_authority = lambda sess: True
+    other = str(uuid_mod.uuid4())
+    ca = _codex_steered_in(host, henv, other, "u1")
+    host.steer_offer(SID, "0", "u2", TEXT, authorized=True)     # a steer offered for the Claude session: no slot
+    assert s.steer is None and host.sessions[other].steer is not None
+    [req] = steers_of(ca)
+    ca.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    _fragmented(ca, 2)
+    ca.code = 0                                         # the Codex process exited: its reap's drain is deferred
+    order = []
+    real_decide, real_drain, real_gates = host._decide, host._drain_reads, host._read_gates
+
+    def decide(sess, now, out):
+        order.append(("decide", sess.session_id))
+        return real_decide(sess, now, out)
+
+    def drain(sess, *a, **kw):
+        order.append(("drain", sess.session_id))
+        return real_drain(sess, *a, **kw)
+
+    def gates(sess):
+        order.append(("gates", sess.session_id))
+        return real_gates(sess)
+    host._decide, host._drain_reads, host._read_gates = decide, drain, gates
+    counted_before = m.counted
+    events = host.tick()
+    assert ("drain", other) in order and {x for k, x in order if k == "drain"} == {other}, "only Codex is drained"
+    assert order.index(("decide", SID)) < order.index(("drain", other)), "Claude's decision precedes the drain"
+    assert [k for k, _ in order[order.index(("drain", other)):]] == ["drain"], "the drain makes no decision"
+    assert ("gates", SID) in order and ("gates", other) not in order, "no gate reading for the Codex session"
+    sx = host.sessions[other]
+    assert all(x.counted is None and not x.earned for x in list(sx.inbox) + [y for y in (sx.writing, sx.in_flight) if y])
+    assert b"turn/steer" not in bytes(child.stdin) and TEXT.encode() not in bytes(child.stdin)
+    assert m.counted is not None and m.counted >= counted_before, "M's budget only counted on in its own decision"
+    [end] = ended_of(events)
+    assert end.session_id == other and end.ok and end.steer == {"outcome": "in_turn", "why": "answered"}
+
+
 def test_r5_gap_a_failed_retry_answered_after_a_newer_listing_keeps_that_listings_features(env):
     """(Found by round 5's mutation check.) The plain retry after a steer-only 422 fails, but only after a newer
     listing was applied: the failure forgets nothing of that newer listing's features (as main forgets them only for
