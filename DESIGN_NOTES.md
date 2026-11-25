@@ -9179,8 +9179,10 @@ zero-turn task notification `result` did the same to a turn in flight.
       decision point, after the tick's reads.
     - **One decision point per session per tick** (`_decide`, called from `_steps`): `tick` first drains every
       session's process (its first drain: reads and reaps, in session order), then makes each session's pass in
-      session order; a session's pass reads and reaps it again (its second drain), takes back a staged line its
-      CLI's new turn holds (`_take_back`), and then decides, before any timeout or write. So the decision follows
+      session order; a session's pass reads and reaps it again (its second drain), applies main's write-timer
+      check to a staged line that has no budget (review round 16: a deadline is decided before anything that can
+      discard its input), takes back a staged line its CLI's new turn holds (`_take_back`), and then decides, before
+      any other timeout or write. So the decision follows
       every read and reap of that tick that comes before it: all first drains, the earlier sessions' passes, and its
       own second drain. There, and only there, the gates are read, once, and only for a message with a budget, or
       one that could earn one there because the process is verified right then (`_read_gates`: the turn gate and
@@ -9190,8 +9192,10 @@ zero-turn task notification `result` did the same to a turn in flight.
     - **Earned** at a decision point if and only if, in that decision's one reading, the session's current process
       is verified right then (`_correlated`: its first init read, its version in VERIFIED, not downgraded), live and
       not stopping, and the message is in a counted state; and not if it is a line staged with main's write timer due
-      (`_overdue`: earning cannot rescue an overdue line, review round 15; the order in a decision: main's
-      write-timer check for a line that entered it unearned, then the earning, then the budget). Once earned it stays
+      (`_overdue`: earning cannot rescue an overdue line, review round 15). The order in a pass (review round 16):
+      for a staged line with no budget, main's write-timer check (due: main's timeout, now); only then the
+      take-back; then the decision (the earning, the budget). An earned staged line keeps the take-back first: its
+      budget is its clock. Once earned it stays
       earned: the budget belongs to the message and survives an unstage, a restage, a downgrade and a replacement
       process. Only then does it have a budget at all (`counted`, from zero; no provisional accounting): an unearned
       message accumulates no counted time, and the budget machinery reads no gate and asks no callback for it (an
@@ -9226,8 +9230,8 @@ zero-turn task notification `result` did the same to a turn in flight.
       overshoot), after the earning; before it, main's write timer for a staged line. In WALL time it also includes
       the host's own waits (no process, the gates, no slot) and each new staging's ordinary write timer until the
       message is earned again under a verified process, as on main. Never a failure earlier than main's: the 7b
-      needs a whole budget counted after the earning, and the failure a second. With VERIFIED empty no message ever has evidence, so none has a budget, and its
-      path is main's;
+      needs a whole budget counted after the earning, and the failure a second. With VERIFIED empty no process is ever verified, so no message is earned or has a
+      budget, and its path is main's;
   - **the inbox owns the hold: a message is never held while staged** (review round 4). While the adapter reports an
     unattributed bracket, the next message stays in the inbox, unstaged. If a message is staged and not one byte of
     its user line was accepted when the bracket is seen open (`_hold_to_timeout`, after the pass's reads and before
@@ -10289,6 +10293,58 @@ Replays whose expectations changed:
 | C15 \| earning cannot rescue an overdue line | `test_c15_earning_cannot_rescue_an_overdue_line` (1) |
 | C15 \| ... overdue exactly when main's write timer is due | `test_c15_earning_cannot_rescue_an_overdue_line` (1) |
 | C14 \| earning needs the counted state | `test_c15_a_replacement_that_does_not_verify_earns_nothing` (7) |
+
+#### Review round 16 (Sol, on 70cd143: CHANGES, one blocker) and what changed
+
+Sol: round 15's blockers resolved; one blocker left, at `_steps`, `_take_back` and `_hold_to_timeout`. A line
+staged at t=0 with zero bytes accepted, before any init; at t=60 its first qualifying init opens a turn of the
+CLI's own and leaves it open. `_take_back` ran first and cleared the staging clock (unstaged: no `busy_since`)
+before `_overdue` could see it, so the decision earned M at t=60 and it was delivered at t=65, while with VERIFIED
+empty it times out at t=60. Ruling: a deadline is decided before anything that can discard its input; in a
+session's pass, after its reads and reap: (1) for a staged, unearned line, main's write-timer check, which times it
+out now if due; (2) then the take-back; (3) then the decision. An earned staged line keeps today's take-back. Done:
+`_steps` calls `_hold_to_timeout` (no gates: main's path) for a staged line with no budget before `_take_back`. It
+acts only if a deadline of main's is due; after the decision it runs again as on main, at the same time, and finds
+what it found before (or, for a line just earned, the budget governs).
+The other operations between the reads and that check, and why none can hide a due timer of an unearned line:
+- the reads (`_read`, `_on_event`): `ready` and `sealed` clear `busy_since` only when the session is not busy, and a
+  staged line keeps it busy; an accepted byte is progress, not a hidden deadline (main's timer keeps running, from
+  the same staging, for the rest of the line);
+- the reaps before it (`_reap`, the first drain's and the pass's): a process that is gone fails its staged line
+  there, before any check, exactly as on main (that failure, not the timeout, is main's outcome too);
+- restaging: only in `_write`, after the check; a new staging is main's new write timer, as on main;
+- the binding and turn-gate withdrawals (BINDING_CHANGED, TURN_WITHDRAWN): in `_write`, after `_hold_to_timeout`,
+  main's order;
+- `cancel`: called between ticks, not inside a pass, and it ends the message outright, as on main;
+- the budget's unstage (`_spent`, the 7b): only for an earned message;
+- the take-back: the one that could, now after the check.
+Tests (the open-bracket t=60 replay failed on 70cd143, the rest passed there):
+`test_c16_an_unearned_lines_due_write_timer_comes_before_the_take_back[60]` (main's timeout at t=60, every pass's
+events, the processes' stdin and stops and the inbox equal to the VERIFIED-empty run); `[55]` (one pass earlier: taken
+back, earned at that decision, the budget governs: no timeout; the 7b at t=115, M restaged on the replacement);
+`test_c16_an_earned_line_whose_clis_turn_opens_when_its_timer_is_due_keeps_the_take_back` (earned at t=0, the CLI's
+turn opening at t=60: taken back, the 7b at t=60, nothing failed). Sol's exact paired replay, pinned:
+`test_c16_sols_paired_replay_a_binding_change_then_two_results_and_a_downgrade[no_row, lifecycle_row]` (a binding
+change before the batch of 1's own result, a lifecycle row or none, and a plain result; the old process stopped for
+the binding, message 2 staged at t=1 on a replacement that writes no init and whose pipe takes nothing: main's
+timeout at t=61 in both; on 6f9b03e the row variant was taken back for the 7b at t=62, checked). The property test:
+the generator also emits more than one result in one drain (the in-flight message's own and a downgrade, with a
+lifecycle row between them or not, two plain results, the own result twice), after a binding change half the time;
+every event a tick or a cancel returns is settled by one function (a delivered cancellation's too: the cancel loop
+used to drop those); a second settlement of any kind is an invariant broken (no `setdefault` hiding it), and every
+delivered message's turn ends exactly once; and, checked before each tick, an unearned line still staged with its
+write timer due must settle in that tick (its model read the holder after the take-back, as the host did, so
+without this it passed 70cd143 at 4000 seeds; with it, 70cd143 fails at seed 56). 4000 seeds pass on this tree.
+
+**Mutation check** (round 16; scratchpad `correlation/mutate19.py`: the changed lines, and the property test's new
+settlement check): 3 of 3 caught. A first version guarded the new check with `_overdue` as well; its mutation (the
+guard dropped) survived, being equivalent (`_hold_to_timeout` acts only when due), so the guard was removed.
+
+| row or rule | caught by |
+| --- | --- |
+| C16 \| an unearned line's due write timer comes before the take-back | `test_c16_an_unearned_lines_due_write_timer_comes_before_the_take_back[60]`, the property test (2) |
+| C16 \| ... only for an unearned line (an earned one keeps the take-back) | `test_c16_an_earned_line_whose_clis_turn_opens_when_its_timer_is_due_keeps_the_take_back`, `test_c15_earning_cannot_rescue_an_overdue_line[55]` (11) |
+| C16 test \| a delivered cancellation settled twice is caught | the property test (1) |
 
 ### Not done
 

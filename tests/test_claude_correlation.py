@@ -2565,6 +2565,76 @@ def test_c15_earning_cannot_rescue_an_overdue_line(henv, monkeypatch, at):
         assert not ends and ours["stopped_at"] == 23, ("the 7b at t=115", ours["stopped_at"])
 
 
+# --- review round 16: the deadline is decided before anything can discard it
+
+
+@pytest.mark.parametrize("at", [60, 55])
+def test_c16_an_unearned_lines_due_write_timer_comes_before_the_take_back(henv, monkeypatch, at):
+    """A candidate's line staged at t=0, zero bytes accepted; its first qualifying init opens a turn of the CLI's own
+    and leaves it open. At t=60, the pass at which main's write timer is due: main's timeout, now, before the take-back
+    could clear that clock (it did: M was taken back, earned and delivered at t=65), every pass's events equal to the
+    run with VERIFIED empty. One pass earlier (t=55): not due, so taken back, earned there (held behind the CLI's
+    turn), and its budget governs: no timeout; the 7b restart at t=115, M restaged on the replacement."""
+    script = [(5, True, False, [])] * (at // 5 - 1) + [(5, True, False, [vinit()])] + [(5, True, False, [])] * 13
+    ours, s = candidate_latch_run(henv, monkeypatch, {V}, [], script)
+    ends = [(i * 5, e["delivered"], e["detail"]) for i, p in enumerate(ours["passes"]) for e in p
+            if e["kind"] == "turn_ended"]
+    if at == 60:
+        main, _ = candidate_latch_run(henv, monkeypatch, (), [], script)
+        assert ours == main
+        assert ends == [(60, False, henv.host._timeout_detail())]
+    else:
+        assert not ends and ours["stopped_at"] == 23 and ours["stops"] == [1, 0]
+        assert s.writing.id == "1" and s.writing.earned and s.writing.recovered   # restaged on the replacement
+
+
+def test_c16_an_earned_line_whose_clis_turn_opens_when_its_timer_is_due_keeps_the_take_back(henv, monkeypatch):
+    """An earned line (a verified process, staged at t=0, earned at that same time's decision) whose CLI opens a turn
+    of its own at t=60: its budget is its clock, not the write timer, so the take-back stands: unstaged, and its
+    budget, 60 s counted with the interval to t=60, is the 7b restart at t=60; nothing failed."""
+    short_host(henv, monkeypatch)
+    s, child = staged_zero(henv)
+    for _ in range(11):
+        henv.clock.advance(5)
+        assert henv.host.tick() == []
+    henv.clock.advance(5)                               # t=60
+    child.emit(vinit())
+    evs = henv.host.tick()
+    assert not settled(evs, "1") and child.terminated == 1 and s.inbox[0].recovered and s.writing is None
+
+
+@pytest.mark.parametrize("row", [False, True], ids=["no_row", "lifecycle_row"])
+def test_c16_sols_paired_replay_a_binding_change_then_two_results_and_a_downgrade(henv, monkeypatch, row):
+    """Sol's exact paired replay: a verified process, message 1 in flight, message 2 queued; a new binding is given,
+    then one drain reads 1's own result, (a lifecycle row,) and a downgrade (a plain result of nobody's). The old
+    process is stopped for the binding and message 2 is staged at t=1 on its replacement, which writes no init and
+    whose pipe takes nothing. Nothing earns it there (the replacement is never verified): main's write timer times it
+    out at t=61, with or without the row. (On 6f9b03e the row's evidence earned it, and the replacement was restarted
+    at t=62.)"""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    henv.host.send(SID, "one", message_id="1")
+    henv.host.tick()
+    u = uuid_of(child)
+    henv.host.send(SID, "two", message_id="2")
+    t0 = henv.clock()
+    henv.spawner.child = _ZeroPipe
+    henv.clock.advance(1)
+    s.bind = "e" * 64
+    child.emit(*([vinit(u), owned(u)] + ([LIFECYCLE] if row else []) + [plain()]))
+    henv.host.tick()                                    # the old process stopped (and gone) for the binding
+    henv.host.tick()                                    # its replacement: message 2 staged at t=1
+    assert s.writing.id == "2" and henv.spawner.children[-1] is s.child and henv.clock() - t0 == 1
+    end = None
+    for _ in range(70):
+        henv.clock.advance(1)
+        for e in settled(henv.host.tick(), "2"):
+            end = (henv.clock() - t0, e.delivered, e.detail)
+        if end or s.writing is None:
+            break
+    assert end == (61, False, henv.host._timeout_detail()), (end, henv.clock() - t0, s.inbox[0].recovered)
+
+
 def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     """Seeded random walks (review rounds 6 to 8, and the follow-up after the switch-on) on a host with 2.1.330
     VERIFIED, timeout T = 60 s, over: sends; the live pipe taking nothing, everything, or a few bytes per write; the
@@ -2599,7 +2669,11 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     nothing at the end of the reads written among the others, anywhere in a batch, between two results too
     (lifecycle rows, usage reports; between ticks also assistant text of a turn already attributed), and every
     message's outcome and its time, and the end of every delivered message's turn, must be the same. The generator
-    also replaces the process by one of another version, one that writes no init, or one that verifies. A failure names the seed and every step."""
+    also replaces the process by one of another version, one that writes no init, or one that verifies, and emits
+    more than one result in one drain (after a binding change or not, review round 16). Every event a tick or a
+    cancel returns is settled (a delivered cancellation's too): a message settles once, and every delivered
+    message's turn ends exactly once; a second settlement is an invariant broken. A failure names the seed and every
+    step."""
     import bisect
     import random
     from types import SimpleNamespace
@@ -2756,19 +2830,37 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             else:
                 outcome[mid] = (kind, henv.clock(), detail)
 
-        def tick():
-            pass_times.append(henv.clock())
-            for e in henv.host.tick():
+        def settle(events):
+            """Every event a tick or a cancel returns (review round 16: a cancel's too, a delivered one's included):
+            each message settles once; a second settlement of any kind is an invariant broken, never overwritten."""
+            for e in events:
                 if e.kind == "delivered":
                     record(e.message_id, "delivered")
                 elif e.kind == "turn_ended" and not e.delivered:
                     record(e.message_id, "failed", e.detail)
                 elif e.kind == "turn_ended" and outcome.get(e.message_id, ("?",))[0] != "delivered":
                     extra.append((e.message_id, "ended, never delivered", henv.clock()))
+                elif e.kind == "turn_ended" and e.message_id in terminal:
+                    extra.append((e.message_id, "its turn ended twice", terminal[e.message_id],
+                                  (e.ok, e.detail, henv.clock() - t0)))
                 elif e.kind == "turn_ended":
-                    terminal.setdefault(e.message_id, (e.ok, e.detail, henv.clock() - t0))
+                    terminal[e.message_id] = (e.ok, e.detail, henv.clock() - t0)
                 elif e.kind == "ended":
                     extra.append(("the session", "ended", e.detail, henv.clock()))
+
+        def tick():
+            pass_times.append(henv.clock())
+            w = s.writing
+            due = (w.id if w is not None and s.turn_at is not None and w.id not in earned_set and w.id in staged
+                   and s.child is not None and s.stopping_since is None and henv.clock() - staged[w.id] >= T
+                   else None)
+            settle(henv.host.tick())
+            if due is not None and due not in outcome:
+                # Review round 16: an unearned line still staged as the pass begins, its write timer due, settles on
+                # this pass (main's timeout, or whatever main does first), whatever the pass reads: nothing in it
+                # (a CLI turn opening: the take-back) can discard that deadline and earn it afresh.
+                extra.append((due, "an unearned line's due write timer passed over", staged[due], henv.clock(),
+                              dict(flags)))
             if pending and len(henv.spawner.children) > pending["after"] and s.child is henv.spawner.children[-1]:
                 fresh = henv.spawner.children[-1]               # the replacement, as its first frames say
                 if pending["kind"] == "other":
@@ -2816,7 +2908,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             action = rnd.choice(["send", "send", "zero", "open", "partial", "next", "bracket", "bracket", "close",
                                  "downgrade", "own", "other", "bind", "linger", "release", "exit", "broken",
                                  "cancel", "gate", "may", "slot", "groups", "latch", "latch", "flip", "flip", "flip",
-                                 "replace", "replace"])
+                                 "replace", "replace", "results", "results"])
             arg = None
             if action == "send" and len(sent) < 6:
                 arg = f"m{len(sent)}"
@@ -2853,9 +2945,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 p.broken = True                             # its next write raises: the message fails (main's)
             elif action == "cancel" and sent:
                 arg = rnd.choice(sent)
-                for e in henv.host.cancel(SID, arg, "cancelled"):
-                    if e.kind == "turn_ended" and not e.delivered:
-                        record(e.message_id, "failed")
+                settle(henv.host.cancel(SID, arg, "cancelled"))
             elif action in flags:
                 flags[action] = arg = not flags[action]
             elif action == "replace" and p is not None:
@@ -2863,6 +2953,17 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 arg = rnd.choice(["other", "no_init", "verified"])
                 p.code = 1
                 pending.update(kind=arg, after=len(henv.spawner.children))
+            elif action == "results" and p is not None:
+                # Review round 16 (Sol's paired replay): more than one result in one drain, after a binding change
+                # or not: the in-flight message's own, a downgrade, a second one; a lifecycle row between them.
+                u = uuid_of(p) if s.in_flight is not None else None
+                arg = rnd.choice(["own_plain", "own_row_plain", "plain_plain", "own_own"])
+                if rnd.random() < 0.5:
+                    s.bind = None if s.bind else "e" * 64
+                    arg += "+bind"
+                mine = [vinit(u), owned(u)] if u else [plain()]
+                p.emit(*{"own_plain": mine + [plain()], "own_row_plain": mine + [lifecycle, plain()],
+                         "plain_plain": [plain(), plain()], "own_own": mine + mine}[arg.split("+")[0]])
             elif action == "flip" and p is not None:
                 # Review round 13: the latch changes and, in the same tick's first drain, a qualifying init and a
                 # downgrade arrive together.
@@ -2898,6 +2999,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
         try:
             assert not extra, ("an invariant", extra)
             assert sorted(outcome) == sorted(sent), ("every message one outcome", sorted(outcome), sent)
+            assert sorted(terminal) == sorted(m for m, (kind, _, _) in outcome.items() if kind == "delivered"), (
+                "every delivered message's turn ends once", terminal, outcome)
             assert all(v <= T + max(STEPS) for v in peak.values()), ("a budget past T and a step", peak)
             assert all(len(pids) == 1 for pids in took.values()), ("bytes of one message on two processes", took)
             texts = [json.loads(x)["message"]["content"] for c in henv.spawner.children

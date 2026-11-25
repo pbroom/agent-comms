@@ -871,11 +871,19 @@ class SessionHost:
         if s.child is not None:
             self._read(s, now, out)
             self._reap(s, now, out)
+        if (s.child is not None and s.stopping_since is None and not s.ended and s.writing is not None
+                and s.turn_at is not None and s.writing.counted is None):
+            # A deadline is decided before anything that can discard its input (review round 16): for a staged line
+            # with no budget (not earned), main's write-timer check (main's clock, no gates: it acts only if due)
+            # comes before the take-back, which would clear that clock (and let the decision earn it afresh). An
+            # earned one keeps the take-back: its budget is its clock, not this one. (After the decision it runs
+            # again, as on main: at the same time, what was not due here is not due there.)
+            self._hold_to_timeout(s, now, out)
         if s.child is not None and s.stopping_since is None and not s.ended:
             self._take_back(s, now, out)
         # The session's ONE decision point in this tick (review round 14): after every read and reap that precede it
         # (`tick`'s first drain of every session, then the passes of the sessions before this one, then this one's
-        # second drain and take-back), before any timeout or write. Its one gate reading (`gates`, None if none was
+        # second drain, the check above and the take-back), before any other timeout or write. Its one gate reading (`gates`, None if none was
         # needed) serves the earning, the budget, the write timer's choice of clock and the pass's end mark.
         acted, gates = (False, None) if s.ended else self._decide(s, now, out)
         if s.child is not None and s.stopping_since is None and not s.ended:
@@ -1140,7 +1148,8 @@ class SessionHost:
         if s.writing is not None and s.turn_at is not None and self.holding(s):
             # A message is never held while staged (a verified Claude incarnation; `turn_at` is tracked for no other):
             # not one byte of it accepted and the CLI runs a turn of its own, so it goes back to the inbox. Seen here,
-            # after the pass's reads and before its budget, any timeout or any write is looked at (`_steps`).
+            # after the pass's reads and, for a line with no budget, main's write-timer check (review round 16), and
+            # before its budget, any other timeout or any write is looked at (`_steps`).
             self._unstage(s, now, out)
 
     def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent],
