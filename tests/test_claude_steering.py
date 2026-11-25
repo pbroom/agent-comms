@@ -1565,6 +1565,178 @@ def test_r1_o_a_group_outliving_sigkill_with_a_queued_successor(henv, monkeypatc
     assert len(henv.spawner.children) == 2 and ("delivered", "2") in [(e.kind, e.message_id) for e in out]
 
 
+
+# ---------------------------------------------------------------- the predicates, pinned (review round 1's mutation check)
+
+X = "0be7c0de-0000-4000-8000-000000000001"
+
+
+def test_r1_m_after_a_deviation_in_the_same_read_no_s_turn_opens(henv, monkeypatch):
+    """A plain result during the hold (a deviation: verification lost), then an `init` [S] and a result [S] in the
+    same read: an unverified incarnation proves no S turn; the finalizer, S `unconfirmed`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(plain(text="?"), vinit(S), owned(S, text="S"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+@pytest.mark.parametrize("frame", [
+    {"user_message_uuids": [S, "N"], "user_message_uuid": "N"},
+    {"user_message_uuids": ["N", S, X], "user_message_uuid": "N"},
+    {"user_message_uuids": ["N", S], "user_message_uuid": S}],
+    ids=["reversed", "extra", "scalar_not_first"])
+def test_r1_m_ns_result_with_s_is_exactly_n_then_s(henv, monkeypatch, frame):
+    """`in_turn` needs N's result to list exactly [N, S] (a list, in that order, its scalar N): [S, N], [N, S, X] and
+    [N, S] with scalar S are not N's result with S. Each is N's own result (it lists N): N's end is held."""
+    s, child, n = steered(henv, monkeypatch)
+    f = {k: ([n if u == "N" else u for u in v] if isinstance(v, list) else (n if v == "N" else v))
+         for k, v in frame.items()}
+    child.emit(result(text="N") | f)
+    out = henv.host.tick()
+    assert not ends(out) and [e.kind for e in out] == ["held"], out
+
+
+@pytest.mark.parametrize("frame", [
+    {"user_message_uuids": [S, S], "user_message_uuid": S}, {"user_message_uuids": [S]},
+    {"user_message_uuids": [S], "user_message_uuid": X}],
+    ids=["twice", "no_scalar", "other_scalar"])
+def test_r1_m_ss_end_is_a_result_listing_exactly_s(henv, monkeypatch, frame):
+    """S's own turn ends only on a result listing exactly [S] with scalar S: [S, S], [S] with no scalar and [S]
+    with another scalar end nothing (no evidence for S); S's turn then runs to its bound (`next_turn` cut)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S))
+    henv.host.tick()
+    child.emit(result(text="?") | frame)
+    assert not ends(henv.host.tick()) and s.held is not None and s.held.s_turn
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    [end] = ends(out) or ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+
+
+def test_r1_m_an_s_only_result_needs_a_byte_of_s(henv, monkeypatch):
+    """A result listing exactly [S] in N's bracket when no byte of S went (the pipe took nothing): not the S-only
+    case (it is no N result); N's own result then ends N, S `not_delivered`."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    henv.host.steer_authority = lambda sess: True
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a long turn", message_id="1")
+    henv.host.tick()
+    n = uuid_of(child)
+    child.emit(vinit(n))
+    henv.host.tick()
+    child.accept = 0
+    henv.host.steer_offer(SID, "1", S, TEXT, authorized=True)
+    henv.host.tick()
+    child.emit(owned(S, text="not N's"))
+    assert not ends(henv.host.tick())
+    child.accept = None
+    child.emit(owned(n, text="N"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer["outcome"] == "not_delivered"
+
+
+def test_r1_m_an_s_only_result_with_a_notification_origin_is_not_ns(henv, monkeypatch):
+    """The S-only case needs no origin: a result listing exactly [S] with a notification origin in N's bracket is
+    not N's result (N does not end with its text)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(S, text="a notification's") | {"origin": NOTIFY})
+    out = henv.host.tick()
+    assert all(e.text != "a notification's" for e in ends(out))
+
+
+def test_r1_m_departure_4_an_echoless_error_in_ss_bracket_ends_it_and_loses_verification(henv, monkeypatch):
+    """Departure 4's rule: inside S's proved bracket, an error result with no echo and no origin is step 1's rule
+    10: S's own turn failed with it (`next_turn`, S failed), and the incarnation is unverified from then on (the next
+    message's line carries no uuid)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S))
+    henv.host.tick()
+    child.emit(plain(text="broke", subtype="error_during_execution", is_error=True))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+    assert end.steer["result"]["text"] == "broke" and not s.provider.verified
+    henv.host.send(SID, "next", message_id="2")
+    henv.host.tick()
+    assert json.loads(child.stdin.split(b"\n")[-2]).get("uuid") is None, "attributed by order from now on"
+
+
+def test_r1_m_the_adjudicator_decides_inside_the_latchs_lock(henv, monkeypatch):
+    """Ruling A: every piece of evidence for S is decided inside the stop latch's lock (so `steer_stopping` on the
+    node's signal thread waits for it): while S's own turn opens, another thread cannot take that lock."""
+    import threading
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    seen = []
+    real = s.provider.steer_facts
+
+    def facts(**kw):
+        got = []
+        t = threading.Thread(target=lambda: got.append(henv.host._steer_stop_lock.acquire(blocking=False)))
+        t.start()
+        t.join()
+        if got and got[0]:
+            henv.host._steer_stop_lock.release()
+        seen.append(got[0])
+        return real(**kw)
+    s.provider.steer_facts = facts
+    child.emit(vinit(S))
+    henv.host.tick()
+    assert seen and seen[0] is False, "the lock was held while S's own turn opened"
+
+
+def test_r1_m_a_fenced_hold_takes_no_more_evidence(henv, monkeypatch):
+    """Once the finalizer decided S (a cancel during S's proved own turn: `next_turn`, S cut) and the stop is under
+    way, S's result read before the group is gone changes nothing: N's end is published once, S cut."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    out = henv.host.cancel(SID, "1", "cancelled")
+    child.emit(owned(S, text="too late"))
+    for _ in range(3):
+        henv.clock.advance(10)
+        out += henv.host.tick()
+    [end] = ends(out)
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+    assert end.steer["result"]["text"] != "too late"
+
+
+def test_r1_m_the_deadline_is_published_before_any_read_of_the_tick(henv, monkeypatch):
+    """Ruling B: the bounded publication's deadline is checked at the very start of a tick: when it is due, N's end
+    is already out before the tick's first read of any session."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    henv.host.close(SID, "closed")
+    henv.host.tick()
+    henv.clock.advance(21)
+    real = henv.host._read
+    seen = []
+
+    def read(sess, now, out):
+        seen.append(len(ends(out)))
+        return real(sess, now, out)
+    henv.host._read = read
+    out = henv.host.tick()
+    assert len(ends(out)) == 1 and seen and seen[0] == 1, "published before the first read"
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
