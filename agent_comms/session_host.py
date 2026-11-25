@@ -1505,6 +1505,7 @@ class SessionHost:
                 if self.live_attempt(s):
                     now = self._drain_before_stop(s, now, out)      # (R3-05)
                     if s.in_flight is None and s.writing is None:
+                        s.steer_owned = False       # (R7-02) N ended in the drain: no stop of this attempt follows
                         return
                 self._fail(s, self._timeout_detail(), out)
                 self._stop(s, now)
@@ -1534,6 +1535,7 @@ class SessionHost:
         if self.live_attempt(s):
             now = self._drain_before_stop(s, now, out)      # a native end behind buffered output is N's own (R3-05)
             if s.in_flight is None and s.writing is None:
+                s.steer_owned = False       # (R7-02) N ended in the drain: no stop of this attempt follows
                 return
         self._fail(s, self._timeout_detail(), out)
         self._stop(s, now)
