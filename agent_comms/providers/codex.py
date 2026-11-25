@@ -69,8 +69,9 @@ log = logging.getLogger("agent_comms.providers.codex")
 # Codex's refusals of a `turn/steer` before it admitted it (-32600, measured on 0.171.0): the steer never reached the
 # turn, so it is not delivered.
 STEER_NO_TURN = "no active turn to steer"
-# "expected active turn id `X` but found `Y`": evidence only when X is the very id that request named.
-STEER_OTHER_TURN = re.compile(r"expected active turn id `([^`]*)` but found `[^`]*`")
+# "expected active turn id `X` but found `Y`": evidence only when X is the very id that request named and Y is a
+# nonempty id other than X (a refusal that found the very turn it expected contradicts itself: no evidence, R2-01).
+STEER_OTHER_TURN = re.compile(r"expected active turn id `([^`]*)` but found `([^`]*)`")
 # ("expectedTurnId must not be empty" is Codex's third refusal; this adapter never sends an empty id, so as an answer
 # to one of its requests it is no evidence of anything.)
 THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -123,10 +124,10 @@ def _steer_answer(msg: dict, steer: dict) -> str:
     """What one answer to a `turn/steer` request is evidence of: "ok" (a success naming the very turn the request
     named), "refused" (Codex's -32600 refusal of that request), or "other" (anything else, which is no evidence:
     `unconfirmed`). Only an exclusive, well-formed answer (exactly one of `result` and `error`, nothing else but `id`
-    and a tolerated `jsonrpc`) read after every byte of the request was written; an integer code; a quoted expected
-    id equal to the request's."""
+    and a `jsonrpc` that is absent or exactly "2.0") read after every byte of the request was written; an integer
+    code; a quoted expected id equal to the request's and a found id that is nonempty and different (R2-01)."""
     if not steer.get("written") or set(msg) - {"id", "result", "error", "jsonrpc"} or ("result" in msg) == (
-            "error" in msg):
+            "error" in msg) or msg.get("jsonrpc", "2.0") != "2.0" or not _proof_id(steer.get("turn")):
         return "other"
     if "result" in msg:
         result = msg["result"]
@@ -140,7 +141,13 @@ def _steer_answer(msg: dict, steer: dict) -> str:
     if err["message"] == STEER_NO_TURN:
         return "refused"
     quoted = STEER_OTHER_TURN.fullmatch(err["message"])
-    return "refused" if quoted is not None and quoted.group(1) == steer["turn"] else "other"
+    return ("refused" if quoted is not None and quoted.group(1) == steer["turn"] and quoted.group(2)
+            and quoted.group(2) != quoted.group(1) else "other")
+
+
+def _proof_id(value) -> bool:
+    """A turn id that can be half of a steer's proof: a nonempty string (R2-01)."""
+    return isinstance(value, str) and value != ""
 
 
 def _fresh_id() -> str:
@@ -414,7 +421,7 @@ class CodexSession:
     def owns(self) -> bool:
         """The turn in flight is PROVED to be this message's: the answer to its turn/start named T, and a userMessage
         item with its clientId was reported in T (either order)."""
-        return (self._turn_open and not self._dead and self._answer_turn is not None
+        return (self._turn_open and not self._dead and _proof_id(self._answer_turn)
                 and self._answer_turn in self._owned_in)
 
     def steer(self, text: str) -> list[bytes] | None:
@@ -589,7 +596,8 @@ class CodexSession:
             turn = result.get("turn")
             if isinstance(turn, dict) and isinstance(turn.get("id"), str):
                 self._turn_id = turn["id"]
-                self._answer_turn = turn["id"]      # (the proof's T: only from the answer to this very request)
+                # (the proof's T: only from the answer to this very request, and only a nonempty id: R2-01)
+                self._answer_turn = turn["id"] if _proof_id(turn["id"]) else None
         return [], []       # turn/interrupt's answer, either way: the turn's own end says what happened
 
     def _asked(self, rid, method: str) -> tuple[list[Event], list[bytes]]:
@@ -615,7 +623,7 @@ class CodexSession:
         if method in ("item/started", "item/completed"):
             item = params.get("item")
             if (isinstance(item, dict) and item.get("type") == "userMessage" and self._client_id is not None
-                    and item.get("clientId") == self._client_id and isinstance(params.get("turnId"), str)):
+                    and item.get("clientId") == self._client_id and _proof_id(params.get("turnId"))):
                 self._owned_in.add(params["turnId"])    # the message's input is in that turn (the proof's other half)
         if method == "turn/started":
             turn = params.get("turn")
