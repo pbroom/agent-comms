@@ -92,7 +92,7 @@ import httpx
 
 from . import session_access, session_worktrees
 from .dispatch import DispatchConfig
-from .session_host import HostEvent, SessionHost
+from .session_host import HostEvent, SessionHost, received_under
 
 log = logging.getLogger("agent_comms.node_sessions")
 
@@ -171,6 +171,20 @@ def _bind_of(view: dict) -> str | None:
     bind = view.get("bind")
     return bind if isinstance(bind, str) and len(bind) == 64 and all(ch in "0123456789abcdef" for ch in bind) \
         else None
+
+
+class _Stopping(threading.Event):
+    """The node's stopping flag. Setting it first marks every held steer attempt stopping, under that record's lock
+    (SessionHost.steer_stopping, R4-01): a steer write either returned before, or does not happen. Otherwise the
+    plain event."""
+
+    def __init__(self, host):
+        super().__init__()
+        self._host = host
+
+    def set(self) -> None:
+        self._host.steer_stopping()
+        super().set()
 
 
 class SessionRunner:
@@ -253,7 +267,7 @@ class SessionRunner:
         self.seq_unsaved = False                      # the last attempt to put it on disk failed (said once)
         self.hub_seq = 0                              # the highest stamp the hub says it applied, for any session
         self.sent: dict[str, int] = {}                # session id -> stamp of this process's last status the hub took
-        self.stopping = threading.Event()
+        self.stopping = _Stopping(self.host)
         self.thread: threading.Thread | None = None
         self.watch_thread: threading.Thread | None = None
 
@@ -632,10 +646,11 @@ class SessionRunner:
                     fetch_sent = self.clock()
                     snapshot = (self.hello_ack, dict(self.report_ack)), self.ack_seq   # as it stood when it was sent
                 data = self._sync(wait)
-                with self.ack_lock:
-                    # Frozen when the answer came (R3-03): its receipt time (the offer's age is judged here) and the
-                    # acknowledgements received while it was out; what comes later counts only as current authority.
-                    self.last_fetch = (fetch_sent, self.clock(), snapshot[0], snapshot[1], self.ack_seq)
+                with received_under(self.ack_lock, self.clock) as received:
+                    # Frozen when the answer came (R3-03): its receipt time (the offer's age is judged here; read
+                    # under the lock that freezes the history, R4-02) and the acknowledgements received while it was
+                    # out; what comes later counts only as current authority.
+                    self.last_fetch = (fetch_sent, received, snapshot[0], snapshot[1], self.ack_seq)
                 self.last_sync = self.clock()
             except Exception as e:
                 log.warning("could not fetch hosted sessions: %s", e)
@@ -1168,7 +1183,7 @@ class SessionRunner:
             if len(self.ack_log) > ACK_LOG_MAX:
                 del self.ack_log[:-ACK_LOG_MAX]
             for slot in self.host.attempts():
-                slot.ack(sent, self.clock(), about, n)
+                slot.ack(sent, self.clock, about, n)     # its receipt read under the record's lock (R4-02)
 
     @property
     def steer_seen(self) -> dict[str, float]:
@@ -1213,8 +1228,9 @@ class SessionRunner:
 
     def _steer_authority(self, s) -> bool:
         """The host asks this at every write of a steer's bytes, under the attempt's lock: the node is not past its
-        self-stop. The contact itself is the attempt's own record (SteerSlot.contact_ok)."""
-        return not self._silent()
+        self-stop, nor stopping. The contact itself is the attempt's own record (SteerSlot.contact_ok); the record's
+        own `stopping` is set under its lock when the node begins to stop (`_Stopping`)."""
+        return not self._silent() and not self.stopping.is_set()
 
     def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
         """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or

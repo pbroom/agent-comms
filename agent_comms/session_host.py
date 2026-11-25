@@ -71,6 +71,7 @@ import threading
 import time
 import itertools
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -100,6 +101,15 @@ STEER_CUT = "the session's process was stopped: a steer to it could not be writt
 STEER_DRAIN_SECONDS = 2.0
 STEER_DRAIN_READS = 4096    # ... and at most this many reads (a clock that does not move)
 STEER_CONTACT_SECONDS = 75.0    # an attempt's contact: each acknowledgement counts from its receipt to 75 s after its send
+
+
+@contextmanager
+def received_under(lock, clock):
+    """Part E's receipt rule, in one place (R4-02): a receipt time is the clock read AFTER `lock` is taken, never one
+    sampled before waiting for it. Used for an acknowledgement in an attempt's record (`SteerSlot.ack`, the record's
+    lock) and for a fetch's answer (node_sessions, the lock that freezes the fetch's history)."""
+    with lock:
+        yield clock()
 
 
 def group_alive(pgid: int) -> bool:
@@ -174,18 +184,19 @@ class SteerSlot:
     # acknowledgement takes to count or to latch a break (`ack`, `contact_ok`).
     session_id: str = ""
     cover_until: float | None = None
+    stopping: bool = False          # the node is stopping: set under `lock` (`steer_stopping`), never written then
     lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
     @property
     def key(self) -> tuple[str, str, str]:
         return self.session_id, self.into, self.uuid
 
-    def ack(self, sent: float, received: float, about: str | None, n: Any) -> None:
-        """An acknowledgement, SENT at `sent` and received at `received` (read under this lock): a hello
-        (`about` None), or a report on `about` whose answer named `n` in flight. It counts for this attempt only
-        if it is evidence for exactly this session and N; received after the contact ran out, it latches the break
-        for good instead (S2-03, R2-07)."""
-        with self.lock:
+    def ack(self, sent: float, clock: Callable[[], float], about: str | None, n: Any) -> None:
+        """An acknowledgement, SENT at `sent`, received now: its receipt time is `clock` read under this record's
+        lock (`received_under`, R4-02). A hello (`about` None), or a report on `about` whose answer named `n` in
+        flight. It counts for this attempt only if it is evidence for exactly this session and N; received after the
+        contact ran out, it latches the break for good instead (S2-03, R2-07)."""
+        with received_under(self.lock, clock) as received:
             if self.cover_until is None or self.revoked is not None:
                 return
             if about is not None and not (about == self.session_id and type(n) is int and str(n) == self.into):
@@ -923,6 +934,13 @@ class SessionHost:
         with slot.lock:
             if slot.revoked is None:
                 slot.revoked = why[:40]
+
+    def steer_stopping(self) -> None:
+        """The node is stopping (R4-01): marked in every held attempt's record under its lock, so a write either
+        returned before this or does not happen."""
+        for slot in self.attempts():
+            with slot.lock:
+                slot.stopping = True
 
     def attempts(self) -> list:
         """Every held steer attempt (its record), for an acknowledgement to be counted in. Read without the host's
@@ -1760,7 +1778,7 @@ class SessionHost:
         """(The attempt's lock held.) Every rule; the two clocks LAST, on one reading taken after every callback has
         returned (R2-03, R3-01): the contact (whose expiry latches the break) and the 5 s of a frame taken in part."""
         if not (slot.revoked is None and slot.refused is None and (not fence or not slot.fenced)
-                and slot.outcome is None
+                and slot.outcome is None and not slot.stopping
                 and s.in_flight is not None and s.in_flight.id == slot.into and s.child is not None
                 and s.stopping_since is None and not s.ended and not s.unbound
                 and "steer" in providers.modes(s.provider)
@@ -1854,12 +1872,14 @@ class SessionHost:
             if slot.outcome is None or slot.sent > 0:
                 self._steer_hold(s, slot, now, out)
             return
-        if (slot.frame is not None and slot.sent == 0 and slot.outcome is None and slot.revoked is None
+        if (slot.authorized and slot.sent == 0 and slot.outcome is None and slot.revoked is None
                 and not self._steer_gate(s, slot, now, fence=False)):
-            # The frame waits out of the buffer (a fence took it back): a gate other than the fence that fails
-            # meanwhile is latched, as for a frame in the buffer (S2-04, R2-02). Never written from then on.
-            slot.revoked = slot.revoked or "gate"      # (the node's authority may have said "contact" just now)
-            self._steer_drop_frame(s, slot)
+            # Once authorized, a gate other than the fence that is seen closed is latched, as for a frame in the
+            # buffer (S2-04, R2-02), whether a frame was made yet or not (R4-01): never written from then on.
+            with slot.lock:
+                slot.revoked = slot.revoked or "gate"      # (the node's authority may have said "contact" just now)
+            if slot.frame is not None:
+                self._steer_drop_frame(s, slot)
             return
         if slot.sent > 0 or slot.outcome is not None or not self._steer_writable(s, slot, now):
             return
