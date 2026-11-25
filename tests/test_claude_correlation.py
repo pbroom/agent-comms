@@ -915,8 +915,10 @@ def short_host(henv, monkeypatch):
 
 def test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh(henv, monkeypatch):
     """Timeout 60 s: staged at t=0 with zero bytes; the CLI's turn opens at t=45, so M goes back to the inbox (no
-    trace in the adapter); a plain result at t=95 downgrades the incarnation; M is staged afresh, with its own write
-    clock from t=95, written once, and settles once by its own result. It never fails on the t=0 clock."""
+    trace in the adapter); a plain result at t=95 downgrades the incarnation. Review round 6 edited the end: M's
+    budget from t=0 ran out at t=60, and the first decision after it (t=95, before any staging) is the budget's: the
+    7b restart, not a staging into the downgraded process. The next process writes M once, and it settles once by
+    its own result. It never fails."""
     short_host(henv, monkeypatch)
     s, child = staged_zero(henv)
     staged_id = json.loads(bytes(s.outbuf[s.turn_at:]))["uuid"]
@@ -926,12 +928,15 @@ def test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh(henv, mo
     assert staged_id not in s.provider._written, "no uuid outstanding for it"
     child.accept = None
     henv.clock.advance(50)                              # t=95
-    assert emit(henv, child, plain()) == [("delivered", "1")] and not s.provider.verified
-    assert s.busy_since == henv.clock(), "a fresh write clock, from this staging"
-    child.emit(vinit(), plain(text="mine"))
+    assert emit(henv, child, plain()) == [] and not s.provider.verified
+    assert child.terminated == 1 and b'"next"' not in child.stdin and s.inbox[0].recovered, "7b, not a write"
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and fresh.turns() == ["next"]
+    fresh.emit(vinit(), plain(text="mine"))
     evs = henv.host.tick()
     assert [(e.kind, e.message_id, e.text) for e in settled(evs, "1")] == [("turn_ended", "1", "mine")]
-    valid_stdin(child, once=["next"])
+    valid_stdin(child, fresh, once=["next"])
 
 
 def test_r4_a_an_init_first_read_on_the_old_deadline_unstages_before_any_timeout(henv, monkeypatch):
@@ -1021,12 +1026,22 @@ def test_r4_d_a_replacement_process_whose_pipe_takes_nothing_gets_no_extra_inter
 
 
 @pytest.mark.usefixtures("verified")
-def test_r4_d_a_staged_m_with_no_bracket_keeps_mains_write_timer(henv):
-    """No turn of the CLI's own: a pipe that takes nothing is main's write timeout, from the staging."""
+def test_r4_d_a_staged_m_with_no_bracket_is_governed_by_its_budget(henv):
+    """Review round 6 edited this replay (it was `..._keeps_mains_write_timer`): staged in a process that can be
+    verified, M has a budget from that staging, and the budget governs it, not the write timer: a pipe that takes
+    nothing for a whole turn timeout is the 7b restart (never written, so it cannot arrive twice); the next process
+    gives it one fresh budget, and a second one spent fails it. Main fails it at the first timeout."""
     s, child = staged_zero(henv)
+    henv.spawner.child = _ZeroPipe                      # the next process's pipe takes nothing either
     henv.clock.advance(30 * 60)
-    [end] = henv.host.tick()
-    assert (end.message_id, end.detail) == ("1", "timed out after 30 minutes")
+    evs = henv.host.tick()                              # 7b; the old group goes at once: the next one, in this pass
+    assert not settled(evs, "1") and child.terminated == 1
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and s.writing.id == "1" and s.writing.blocked_since == henv.clock()
+    henv.clock.advance(30 * 60)
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False)
+    valid_stdin(child, fresh)
 
 
 @pytest.mark.usefixtures("verified")
@@ -1232,6 +1247,184 @@ def test_r3_event_turn_takes_no_part_in_equality():
     """Pre-merge review R-3: like the other added fields, `turn` is compare=False."""
     from agent_comms.providers import Event
     assert Event("turn_started", turn="own") == Event("turn_started", turn="other") == Event("turn_started")
+
+
+# --- review round 6: one budget invariant, in one place (C6-01, C6-02)
+
+
+def test_c6_01_a_downgrade_does_not_free_a_budgeted_message_from_its_budget(henv, monkeypatch):
+    """Sol's sequence: timeout 60 s; M's first budget is spent (7b at t=60), its second begins at t=60 in the next
+    process; that process begins a turn of its own (M back to the inbox), then at t=119 a plain result downgrades
+    it, M is staged again, zero bytes accepted: M fails at t=120 (its second budget), not at t=179 (a staging's
+    write timer). Zero bytes of M ever written; every stdin line whole."""
+    short_host(henv, monkeypatch)
+    t0 = henv.clock()
+    s, child = staged_zero(henv)
+    henv.clock.advance(45)
+    emit(henv, child, vinit())
+    henv.clock.advance(15)                              # t=60: the first budget is spent
+    assert henv.host.tick() == [] and child.terminated == 1 and s.inbox[0].recovered
+    henv.spawner.child = _ZeroPipe
+    henv.host.tick()                                    # the next process: M staged at t=60, its second budget
+    fresh = henv.spawner.children[-1]
+    assert s.writing.id == "1" and s.writing.blocked_since == t0 + 60
+    fresh.emit(vinit())
+    henv.host.tick()                                    # verified, a turn of its own: M back to the inbox
+    assert s.writing is None and [m.id for m in s.inbox] == ["1"]
+    henv.clock.advance(59)                              # t=119: a plain result downgrades the process
+    fresh.emit(plain())
+    assert henv.host.tick() == [] and not s.provider.verified and s.writing.id == "1" and s.turn_at is not None
+    henv.clock.advance(1)                               # t=120
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False) and henv.clock() - t0 == 120
+    assert b'"next"' not in child.stdin and b'"next"' not in fresh.stdin
+    valid_stdin(child, fresh)
+
+
+def test_c6_01_the_first_budget_too_survives_a_downgrade(henv, monkeypatch):
+    short_host(henv, monkeypatch)
+    t0 = henv.clock()
+    s, child = staged_zero(henv)
+    henv.clock.advance(10)
+    emit(henv, child, vinit())                          # back to the inbox
+    henv.clock.advance(40)
+    emit(henv, child, plain())                          # t=50: downgrade; M staged again, still zero bytes
+    assert not s.provider.verified and s.writing.id == "1" and s.turn_at is not None
+    henv.spawner.child = _ZeroPipe
+    henv.clock.advance(10)                              # t=60: its budget, not this staging's write timer
+    evs = henv.host.tick()
+    assert not settled(evs, "1") and child.terminated == 1 and henv.clock() - t0 == 60
+    assert s.writing.recovered and b'"next"' not in child.stdin, "7b: the next process has it, with a fresh budget"
+
+
+def test_c6_02_a_result_first_read_after_the_budget_is_the_budgets_7b_not_a_write(henv, monkeypatch):
+    """M waits in the inbox from t=0 behind the CLI's turn; the turn's result is first read at t=75, after M's 60 s
+    budget ran out: the release pass does not stage M into the original process; it is the 7b restart, and the next
+    process writes M once."""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(75)
+    child.emit(foreign())
+    evs = henv.host.tick()
+    assert not [e for e in evs if e.kind == "delivered"] and b'"next"' not in child.stdin and child.terminated == 1
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert fresh.turns() == ["next"]
+    valid_stdin(child, fresh, once=["next"])
+
+
+def test_c6_02_with_the_7b_spent_a_late_release_is_mains_failure(henv, monkeypatch):
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    henv.clock.advance(60)
+    henv.host.tick()                                    # 7b
+    henv.spawner.child = _ZeroPipe
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    fresh.emit(vinit())
+    henv.host.tick()                                    # the second budget, from its staging; back to the inbox
+    henv.clock.advance(75)
+    fresh.accept = None
+    fresh.emit(foreign())
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False) and b'"next"' not in fresh.stdin
+    valid_stdin(child, fresh)
+
+
+def test_c6_parity_with_verified_empty_no_message_ever_gets_a_budget(henv, monkeypatch):
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())
+    s, child, _ = started(henv, "zero", "0")
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    emit(henv, child, vinit(), plain())
+    assert s.writing.blocked_since is None and s.turn_at is None
+    child.emit(vinit(), foreign())
+    henv.clock.advance(30 * 60)
+    [end] = settled(henv.host.tick(), "1")
+    assert end.detail == "timed out after 30 minutes", "main's write timer"
+
+
+def test_c6_property_random_sequences_never_write_twice_or_out_of_order_and_resolve_within_two_budgets(
+        henv, monkeypatch):
+    """Random walks over {send, zero-byte pipe, open pipe, the CLI's turn opens, it closes, a downgrade, M's own
+    result, a binding change, a time step} on a verified host (timeout 60 s, passes every 5 s). For every message:
+    written at most once over all processes, never after a message sent behind it, and, from the first pass at which
+    it is the head with nothing in flight, resolved (written, or failed) within two budgets plus one pass."""
+    import random
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    T, STEP = 60.0, 5.0
+    for seed in range(60):
+        rnd = random.Random(seed)
+        from test_dispatch import FakeProcs, FakeSpawner
+        from test_session_host import FakeSessionChild
+        henv.spawner = FakeSpawner(child=FakeSessionChild)
+        henv.procs = FakeProcs(henv.spawner)
+        henv.host = make_host(henv, timeout_minutes=T / 60)
+        s = henv.host.open(SID, agent="claude", runtime="claude-code", project="/work/repo")
+        sent, head_since, written_at, failed = [], {}, {}, set()
+
+        def proc():
+            return henv.spawner.children[-1] if henv.spawner.children and s.child is not None else None
+
+        def tick():
+            for e in henv.host.tick():
+                if e.kind == "delivered":
+                    written_at.setdefault(e.message_id, henv.clock())
+                elif e.kind == "turn_ended" and not e.delivered:
+                    failed.add(e.message_id)
+            if s.inbox and not s.busy and s.child is not None:
+                head_since.setdefault(s.inbox[0].id, henv.clock())
+            if s.writing is not None and s.writing.id not in written_at:
+                head_since.setdefault(s.writing.id, henv.clock())
+
+        for k in range(70):
+            p = proc()
+            action = rnd.choice(["send", "send", "zero", "open", "bracket", "close", "downgrade", "own", "bind",
+                                 "step", "step", "step"])
+            if action == "send" and len(sent) < 6:
+                mid = f"m{len(sent)}"
+                sent.append(mid)
+                henv.host.send(SID, f"text {mid}", message_id=mid)
+            elif action == "zero" and p is not None:
+                p.accept = 0
+            elif action == "open" and p is not None:
+                p.accept = None
+            elif action == "bracket" and p is not None:
+                p.emit(vinit())
+            elif action == "close" and p is not None:
+                p.emit(foreign())
+            elif action == "downgrade" and p is not None:
+                p.emit(plain())
+            elif action == "own" and p is not None and s.in_flight is not None:
+                u = uuid_of(p)
+                p.emit(vinit(u) if u else vinit(), owned(u) if u else plain())
+            elif action == "bind":
+                s.bind = None if s.bind else "e" * 64
+            henv.clock.advance(STEP)
+            tick()
+        for _ in range(int(3 * T / STEP) + 2):        # drain: no new frames, the clock runs on
+            henv.clock.advance(STEP)
+            tick()
+        texts = [json.loads(x)["message"]["content"] for c in henv.spawner.children
+                 for x in c.stdin.split(b"\n")[:-1] if json.loads(x).get("type") == "user"]
+        for c in henv.spawner.children:
+            valid_stdin(c)
+        order = [t.split(" ", 1)[1] for t in texts]
+        assert len(order) == len(set(order)), (seed, "written twice", order)
+        assert order == [m for m in sent if m in order], (seed, "out of order", order, sent)
+        for m in sent:
+            if m in written_at or m in failed:
+                if m in written_at and m in head_since:
+                    assert written_at[m] - head_since[m] <= 2 * T + STEP, (seed, m, "resolved late")
+                continue
+            if m in head_since:
+                assert henv.clock() - head_since[m] <= 2 * T + STEP, (seed, m, "unresolved", s.state)
 
 
 # --- the barrier, its bound and its clock, the access check, interrupt readiness

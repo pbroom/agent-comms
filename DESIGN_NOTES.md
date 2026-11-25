@@ -9172,12 +9172,18 @@ zero-turn task notification `result` did the same to a turn in flight.
   barrier's own rules (`_barrier`) apply: the next message waits, `park` and the max_live eviction skip the
   session, and
   - **one no-progress budget per message** (review round 5, C5-01; it replaces C2-03's deadline): a message not
-    one byte of whose line was accepted carries ONE turn timeout from the first moment it is blocked or staged in
-    this process (`_Message.blocked_since`), kept across unstages, restagings, the end of the CLI's turns and a
-    downgrade; only an accepted byte ends it (progress). A successor's budget starts when it becomes the head and
-    is first blocked or staged. It is checked by the inbox's hold (`_barrier`) and, for a message staged again
-    after a wait with no byte accepted, before the write timer (`_hold_to_timeout`); a staging that BEGAN the budget
-    keeps main's write timer;
+    one byte of whose line was accepted carries ONE turn timeout from the first moment it is blocked or staged in a
+    process that can be verified (`_Message.blocked_since`), kept across unstages, restagings, the end of the CLI's
+    turns and a downgrade; only an accepted byte ends it (progress). A successor's budget starts when it becomes the
+    head and is first blocked or staged. **One invariant, in one place** (review round 6): a message with a budget is
+    governed by it until the first byte of its line is accepted, whatever the process's verification state is
+    then; every staging and timeout decision about it goes through the one check, `_spent`: the inbox hold
+    (`_barrier`), the head before it is staged (`_write`: also on the pass at which a bracket closes, C6-02, and
+    after a downgrade), and a staged message with not one byte accepted (`_hold_to_timeout`: its budget, never the
+    staging's write timer). Its byte span (`turn_at`, `turn_len`) is tracked whenever it has a budget, also in a
+    process no longer verifiable (C6-01); unstaging on a NEW bracket still needs a verifiable process, the budget
+    does not. A message with no budget, in a process that cannot be verified, is main's path, untouched: with
+    VERIFIED empty no message ever gets one;
   - **the inbox owns the hold: a message is never held while staged** (review round 4). While the adapter reports an
     unattributed bracket, the next message stays in the inbox, unstaged. If a message is staged and not one byte of
     its user line was accepted when the bracket is seen open (`_hold_to_timeout`, after the pass's reads and before
@@ -9392,28 +9398,28 @@ none`, every user line with its own uuid unless named), and the e2e's correlatio
 - C1-09 `_steer_only` removed.
 - Rule 10 (above), and VERIFIED left empty.
 
-**Mutation check** (round 5; scratchpad `correlation/mutate7.py`: each change applied alone to providers/claude.py,
+**Mutation check** (round 6; scratchpad `correlation/mutate8.py`: each change applied alone to providers/claude.py,
 providers/__init__.py or session_host.py, then tests/test_claude_correlation.py, test_providers_claude.py,
 test_session_restart.py, test_session_host.py and the golden tests run; the file restored):
 
-70 of 71 were caught; the one left is the EQUIVALENT mutant of rounds 3 and 4 (`turns >= 0` in C3-01). One more came up and was removed rather than kept: the failure path of a spent second budget for a STAGED message deleted the staged bytes itself, and replacing that with clearing the whole buffer changed nothing (the process is stopped at once), so that path now unstages exactly as 7b does, through `_unstage`, and fails the message from the inbox. The count of failing tests in brackets:
+71 of 73 were caught; the two left are EQUIVALENT mutants: `turns >= 0` in C3-01 (rounds 3 to 5), and, new, making the return after a staged budgeted message's `_spent` conditional (falling through to the staging's write timer when the budget is not spent): that timer starts at the staging, never before the message's budget (`blocked_since` is set at the latest at that same staging), so it can never expire first, and no interrupt is written while the message's bytes are in the buffer; the unconditional return states the invariant. The count of failing tests in brackets:
 
 | row or rule | caught by |
 | --- | --- |
 | any \| non-turn (success): nothing | `test_row_any_non_turn_success_is_inert_in_every_bracket[own]` (1) |
 | none \| owned init for M: opens M's bracket | `test_c2_01_an_error_while_m_is_staged_or_partly_written_settles_nothing_and_keeps_the_bracket[plain-none]` (68) |
 | unattributed \| owned init for M: the bracket becomes M's | `test_row_unattributed_owned_init_for_m_makes_the_bracket_ms` (1) |
-| none \| unmarked init: opens an unattributed bracket | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (60) |
+| none \| unmarked init: opens an unattributed bracket | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (63) |
 | own \| re-init: access-checked only, whatever it carries (C1-04) | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (3) |
 | own \| re-init that no longer qualifies: downgrade when the bracket closes | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (3) |
 | own \| re-init replaces no capability | `test_row_owned_a_second_init_is_access_checked_only[no_caps]` (1) |
-| own \| owned result listing M: M's | `test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles` (129) |
+| own \| owned result listing M: M's | `test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles` (133) |
 | own \| plain result: M's | `test_row_owned_plain_result_closes_it_as_ms` (2) |
 | own \| foreign result: nothing, the bracket stays | `test_row_owned_foreign_result_is_nothing_and_the_bracket_stays_ms` (1) |
 | any \| result listing only settled lines: no bracket change (C1-03) | `test_row_a_result_listing_only_settled_lines_changes_no_bracket[own]` (3) |
 | unattributed \| foreign result: closes it | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (18) |
 | unattributed \| owned result listing M: M's | `test_row_unattributed_owned_result_listing_m_is_ms` (1) |
-| unattributed \| plain result: a deviation, by order | `test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh` (5) |
+| unattributed \| plain result: a deviation, by order | `test_c6_01_a_downgrade_does_not_free_a_budgeted_message_from_its_budget` (7) |
 | none \| owned result listing M (init lost): M's | `test_row_none_owned_result_listing_m_is_ms_when_its_init_was_lost` (2) |
 | none \| plain result, M in flight: by order, a deviation | `test_row_none_plain_result_with_m_in_flight_is_ms_by_order_and_a_deviation` (4) |
 | none \| plain result, nothing in flight: a deviation | `test_row_none_plain_result_with_nothing_in_flight_is_a_deviation` (1) |
@@ -9428,7 +9434,7 @@ test_session_restart.py, test_session_host.py and the golden tests run; the file
 | verification lost for good | `test_lines_carry_a_fresh_uuid_until_the_first_init_shows_the_process_cannot_be_verified` (2) |
 | C1-05 \| no uuid while no version is VERIFIED | `test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order` (8) |
 | C1-05 \| no uuid once the first init shows it cannot be verified | `test_lines_carry_a_fresh_uuid_until_the_first_init_shows_the_process_cannot_be_verified` (2) |
-| the write barrier | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (37) |
+| the write barrier | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (40) |
 | interrupt readiness needs M's owned bracket | `test_interrupt_readiness_needs_ms_owned_bracket` (2) |
 | host: the access check on every init | `test_the_access_check_runs_on_every_init_whatever_its_bracket[none]` (3) |
 | host: an init that is no message's starts nothing | `test_review_condition_unattributed_init_then_owned_init_then_plain_result` (5) |
@@ -9446,31 +9452,33 @@ test_session_restart.py, test_session_host.py and the golden tests run; the file
 | C3-01 \| ... only with one or more turns | equivalent: none (0) |
 | C3-03 \| 7a needs subtype success | `test_c3_03_7a_needs_subtype_success_is_error_false_and_zero_turns` (1) |
 | C3-03 \| ... and is_error false | `test_c3_03_7a_needs_subtype_success_is_error_false_and_zero_turns` (1) |
-| parity \| turn_at only for an adapter that asks | `test_parity_with_verified_empty_the_host_tracks_no_turn_start_and_tells_no_delivery` (2) |
+| parity \| turn_at only for an adapter that asks, or a budgeted message | `test_c6_parity_with_verified_empty_no_message_ever_gets_a_budget` (5) |
 | parity \| delivered() only for an adapter that asks | `test_parity_with_verified_empty_the_host_tracks_no_turn_start_and_tells_no_delivery` (1) |
-| parity \| Claude asks only while it can be verified | `test_parity_with_verified_empty_the_host_tracks_no_turn_start_and_tells_no_delivery` (2) |
+| parity \| Claude asks only while it can be verified | `test_c6_parity_with_verified_empty_no_message_ever_gets_a_budget` (5) |
 | C2-01 \| the host confirms delivery | `test_c2_01_rule_10_needs_a_delivered_m` (6) |
-| R4 \| a staged M with no byte accepted goes back to the inbox when the CLI's turn is seen | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (18) |
-| R4 \| ... first in the inbox, ahead of a successor | `test_r4_f_fifo_an_unstaged_m_goes_first_ahead_of_its_successor` (1) |
+| R4 \| a staged M with no byte accepted goes back to the inbox when the CLI's turn is seen | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (19) |
+| R4 \| ... first in the inbox, ahead of a successor | `test_c6_property_random_sequences_never_write_twice_or_out_of_order_and_resolve_within_two_budgets` (2) |
 | R4 \| ... the adapter is told | `test_c2_01_sols_sequence_an_error_never_lets_a_staged_m_into_the_clis_turn[False]` (3) |
 | R4 \| ... and keeps no trace of M | `test_c2_01_sols_sequence_an_error_never_lets_a_staged_m_into_the_clis_turn[False]` (3) |
 | R4 \| ... nor its uuid outstanding | `test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh` (1) |
 | R4 \| once a byte of M is accepted the write owns it | `test_c1_01_a_line_already_partly_written_is_completed` (2) |
-| C5-01 \| the budget starts at the first staging | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (2) |
-| C5-01 \| ... or at the first block | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (7) |
-| C5-01 \| ... it is per message (a successor starts its own) | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (28) |
-| C5-01 \| ... an unstage gives no new interval | `test_c5_01_a_write_opportunity_with_no_byte_accepted_does_not_restart_the_budget` (3) |
-| C5-01 \| ... a staged M after a wait is held to it, not to the new write clock | `test_c5_01_the_budget_is_spent_while_m_is_staged_again_with_no_byte_accepted` (1) |
-| C5-01 \| ... a staging that began the budget keeps main's write timer | `test_r4_d_a_staged_m_with_no_bracket_keeps_mains_write_timer` (1) |
+| C5-01 \| the budget starts at the first staging | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (6) |
+| C5-01 \| ... or at the first block | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (9) |
+| C5-01 \| ... it is per message (a successor starts its own) | `test_7a_sols_gate_sequence_a_no_query_notification_then_m_is_written_and_settles` (127) |
+| C5-01 \| ... an unstage gives no new interval | `test_c5_01_a_write_opportunity_with_no_byte_accepted_does_not_restart_the_budget` (6) |
 | C5-01 \| an accepted byte ends the budget | `test_c5_01_an_accepted_byte_ends_the_budget` (1) |
-| C5-01 \| the budget is one turn timeout | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (12) |
-| 7b \| ... once per message | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (5) |
-| 7b \| ... and the next process gives ONE fresh budget | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (5) |
+| C5-01 \| the budget is one turn timeout | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (18) |
+| 7b \| the first spent budget keeps the message for the next process | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (18) |
+| 7b \| ... once per message | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (10) |
+| 7b \| ... and the next process gives ONE fresh budget | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (14) |
 | R-1 \| an unstage removes exactly the staged line's bytes | `test_r1_an_unstage_removes_exactly_the_staged_lines_bytes` (1) |
 | R-1 \| ... whose length is recorded at staging | `test_c1_01_the_barrier_is_rechecked_before_a_staged_turns_first_byte` (12) |
 | R-3 \| Event.turn takes no part in equality | `test_r3_event_turn_takes_no_part_in_equality` (1) |
-| 7b \| a staged M whose budget is spent is unstaged first (exactly its bytes) | `test_c5_01_the_budget_is_spent_while_m_is_staged_again_with_no_byte_accepted` (1) |
-| 7b \| the first spent budget keeps the message for the next process | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (12) |
+| 7b \| a staged M whose budget is spent is unstaged first (exactly its bytes) | `test_c5_01_the_budget_is_spent_while_m_is_staged_again_with_no_byte_accepted` (3) |
+| C6-02 \| the head's budget is checked before it is staged | `test_c6_02_a_result_first_read_after_the_budget_is_the_budgets_7b_not_a_write` (3) |
+| C6-01 \| a budgeted message's bytes are tracked whatever the verification | `test_c6_01_a_downgrade_does_not_free_a_budgeted_message_from_its_budget` (2) |
+| C6-01 \| a budgeted staged message is governed by its budget | `test_c5_01_the_budget_is_spent_while_m_is_staged_again_with_no_byte_accepted` (4) |
+| C6-01 \| ... and not by the staging's write timer | equivalent: none (0) |
 
 ### Review round 2 (Sol, on b376771: CHANGES, 2 blockers, C1-03 and C1-06 still open) and what changed
 
@@ -9575,6 +9583,35 @@ What changed:
   and the correlation tests read `turn` explicitly (`fed`). `test_r3_event_turn_takes_no_part_in_equality`.
 - **C5-02:** the golden's and its test's wording ("staged before each process's first `init`").
 The main fixture needed no re-recording (unchanged; the golden tests pass on it).
+
+### Review round 6 (Sol, on 2624199 and the switch commit) and what changed
+
+Sol: R-1, R-2, R-3 resolved; with VERIFIED empty no observable difference from main; the switch commit's fixture
+change is exactly 18 `init` lines; no duplicate write or FIFO regression; the first-line uuid for other versions is
+acceptable. Not sufficient for 2.1.330 because: C6-01 [blocker], a downgrade turned the byte-span tracking off when M
+was staged again, so its kept budget went unchecked (M used its first 60 s budget, began the second at t=60, the
+process downgraded at t=119 with zero bytes accepted, and M failed at t=179, not t=120; main: t=60); C6-02, a
+terminal result first read at t=75 let the original process write M though its 60 s inbox budget had run out
+(`_barrier` returned before the deadline once the bracket closed); C6-03, README's promise against the error
+fallback; C6-04, the switch notes' wording. The coordinator ruled one invariant, in one place (above).
+- C6-01: `test_c6_01_a_downgrade_does_not_free_a_budgeted_message_from_its_budget` (Sol's sequence: M fails at
+  t=120, zero bytes written, every stdin line whole) and `test_c6_01_the_first_budget_too_survives_a_downgrade`.
+- C6-02: `test_c6_02_a_result_first_read_after_the_budget_is_the_budgets_7b_not_a_write` and its second-budget
+  counterpart `test_c6_02_with_the_7b_spent_a_late_release_is_mains_failure`.
+- Parity: `test_c6_parity_with_verified_empty_no_message_ever_gets_a_budget` (and the existing parity tests).
+- A property test, `test_c6_property_random_sequences_*`: 60 seeded random walks of 70 steps over {send, a pipe
+  that takes nothing, an open pipe, the CLI's turn opening, closing, a downgrade, the message's own result, a
+  binding change, a time step} on a verified host (60 s timeout, a pass every 5 s), then a drain: every stdin line
+  whole, no message written twice, none written after one sent behind it, and every message resolved (written, or
+  failed) within two budgets plus one pass of the first pass at which it was the head with nothing in flight.
+- Edited replays, both because a budgeted message is now governed by its budget at every decision:
+  `test_r4_a_sols_timing_*` (the downgrading result at t=95 comes after M's budget from t=0 ran out: the 7b restart
+  there, then the next process writes M, instead of a staging into the downgraded process) and
+  `test_r4_d_a_staged_m_with_no_bracket_is_governed_by_its_budget` (was `..._keeps_mains_write_timer`: a staged M in
+  a process that can be verified, whose pipe takes nothing, is the 7b restart at the timeout, then main's failure at
+  the second; main fails it at the first). Every other round-4 and round-5 replay passes unchanged.
+- A log line for the second spent budget (the one that fails a message), for the owner's monitoring (the switch-on
+  section).
 
 ### Not done
 
