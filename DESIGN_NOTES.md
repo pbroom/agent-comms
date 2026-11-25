@@ -9834,3 +9834,838 @@ it, above).
   re-run the e2e's X0-X3 and the probes on any newer version first.
 - The adapter logs non-turn frames, settled-only frames and re-inits at info level only; step 3 may need them
   reported.
+
+## Checkout hardening for all turns and runs: design (2026-11-24)
+
+**Status: design approved by the owner on 2026-11-24, with the recommended answer (a) to each of the eight questions
+(M). No code yet. Reviewed SOUND by gpt-6.2-sol in round 13 (P), with conditions that are folded in below; the
+commit that folded them in was not read again by Sol.** The project the owner split off from mid-turn steering
+("Ship steering, harden apart": "the guard, the dispatch fixes and the node-token fix become their own project
+covering all turns"). Its starting point is part Q of "Mid-turn steering, loose contract" on branch
+`claude/steer-loose`, and the guard text at commit 4b00cfb there. Every weakness below was checked against
+`origin/main` at d4b92e5 (line numbers are that commit's); the facts about macOS were measured on the main laptop, not
+assumed (C).
+
+The short version. Two machines never share a directory, so work can collide only on ONE machine, in ONE directory.
+Today the hub decides when a directory is free, from timers and from what a node last said, and those can be wrong
+(sleep, a silent node, a restart, a read that failed, a stale claim). This design moves the last word to the node
+that owns the directory: a node starts nothing beside work it can still see, whatever the hub believed, and lets go
+of a directory only when it has checked that the processes are gone. The hub is not changed at all: its timers and
+checks stay, and now only decide what work is OFFERED to a node. No guard process, no exit tokens, no new hub
+records, no protocol change. Three small steps, each useful alone (I).
+
+### A. The contract
+
+**Scope.** Work that the one `board node` of an OS user starts on its own machine: hosted sessions' processes and
+the messages handed to them, and dispatched runs assigned to that node. Outside it, with today's rules unchanged
+(K): a run the dispatcher starts itself on the hub's machine; anything another OS account, another machine over a
+shared mount, or a node build from before step 1 does in the same directory.
+
+Words. A **directory** is a run directory as the node resolves it for a session or a run, compared by device and
+inode. The contract assumes that such a directory, and every name the node or a provider's command line reaches it by,
+is not renamed, replaced or pointed elsewhere from the moment the node first resolves it for a piece of work until
+that work is gone; that the node's own files in its state folder (`node.lock`, the ledger) are not removed or replaced
+behind its back; and that every node process of the user, and `board node check`, sees the same machine: the same
+state folder, on that machine's own disk (the account's home directory and the filesystems under it unchanged, and not
+a home shared with another machine), the same name for the current boot, the same process ids and the same process
+start times (no change of PID or time namespace) (K). The node's **registry** (`node_groups.Groups`) records, per
+directory, the process **groups** the node started and has not confirmed gone, each a dispatched **run**'s or a hosted
+**session**'s, each `live`, `stopping` (the node signalled it, or saw its leader gone with members left) or, from step
+3, `unknown` (found at start-up and not shown gone). A session is **about to start** in its directory while its host
+holds a message for it and it has no process. States, and whether a session is **idle** (no message held, no turn in
+flight), are what the node and its session host have observed, not what a CLI is doing unseen. An **automatic**
+message is one nobody typed: kinds `wake`, `child` and `task`; the human's own is `user`.
+
+1. **The node decides.** Every start of a process and every hand-over of a message to a session's host is decided
+   by the node, at that moment, under one lock. The hub's records decide what work is offered to a node. They never
+   make a directory free.
+2. **The directory rule**, in one directory:
+   - a) no process starts while a `stopping` or `unknown` group is there (today's rule, plus `unknown`); this holds
+     the human's own message to a session that has no process, as today;
+   - b) **a dispatched run gets the directory to itself**: it starts only when no other group of this node is
+     there, a run's or a session's, in any state, and no session is about to start. To get there the node stops
+     idle session processes in it (the sessions stay; a next message starts a process that resumes the
+     conversation). One exception: an idle session process that the node keeps up because a full-access child
+     depends on it (`_lends_full`) does not hold a run back;
+   - c) an automatic message is handed over only when no run's group and no `unknown` group is there;
+   - d) the human's own message is held by no run (the owner's rule: "The human's own never waits" for a checkout). It
+     keeps its place in its session's queue: behind an automatic message that waits, it waits too; - e) while a run's
+     group is in the directory, a session process there that becomes idle is stopped, with the same exception as b),
+     and unless the session's next message is the human's own and the node can hand it over in that same pass (it has
+     the message's text, and nothing else keeps it from handing over): then it is not stopped for the run's sake (the
+     host's own reasons to replace a process, a changed binding for one, are untouched). Otherwise the process is
+     stopped and that message starts a new one;
+   - f) hosted sessions share a directory with each other exactly as today.
+3. **Release on what was checked, never on a clock.** A group leaves the registry only when the node has found it
+   gone; or the machine has rebooted. Not after a time, not on an acknowledgement, not on the hub's word, and from
+   step 3 not because the node restarted.
+4. **What the hub's listing leaves out, the node stops.** Each of the node's two loops stops what its listing says
+   is over before it starts or hands over anything in that pass. The loops read different listings at different
+   moments; what holds between them is rule 2, not an order.
+5. **Trust is the OS account, as already decided** ("Trust model: the unit of trust is the OS account", child
+   sessions, round 2 S3; "Objections" 1). This design defends against faults: sleep, crashes, restarts, lost contact,
+   races, misconfiguration. It does not defend against a process of the same OS user that sets out to lie, which can
+   already read every token on the machine and rewrite the node's code. So nothing here needs a secret a provider
+   must not read (E).
+
+What the owner gets, by step of the build (I):
+- **From step 2**, while the node process lives: in one directory the node starts a dispatched run only when
+  nothing else it started is there, and hands no automatic message to a session beside a run, whatever the hub
+  believed. So a run is never started beside another run, beside a session the host knows to be busy, or beside
+  an idle session's process whose CLI could begin a turn by itself. One gap in "knows to be busy" is main's and is
+  named in K: a Claude result that the host takes for the wrong turn.
+- **From step 3**: the same across node restarts and crashes, for every process a step-3 build started.
+- Always excepted, and named in K: the human's own message beside a run, and what its session's process does until
+  it is idle and stopped; the parent in rule 2 b's exception; a tool that left its process group or works outside
+  the directories its launch registered; the scope's "outside" list.
+
+### B. What was verified on main
+
+| # | weakness | where | real | what follows from it |
+| --- | --- | --- | --- | --- |
+| 1 | the hub releases an ended session's checkout on the node's acknowledgement (its own `ended`, or a later listing it applied) while the process is in its kill grace | hosted.py 935 to 945 (`may_still_run`), session_host.py 1171 to 1177 (`_end` emits `ended` right after `_stop`) | yes | on the node that ran it, while that node process lives, no process STARTS there meanwhile, with two exceptions: the registry holds a `stopping` group until main's probe calls it gone (a group that outlives SIGKILL included: node_groups; node.py 321; session_host.py 1318, 1018), and that probe also calls a group gone when it may not signal it (session_host.py 72 to 82); and when a directory cannot be `stat`ed at the registration or at a later look, but can at the other, one side has the path text and the other the device and inode, and the two do not meet (node_groups.py 22 to 46, 73 to 76). A warm session can still be written a turn there. The hole is across a node restart (N3) and for a launcher that does not share the registry |
+| 2 | an expired lease comes back with a later hello | hosted.py 1021 to 1031: `_lost` is computed fresh from the node's last hello as a session host, the session's last report, and orphaning. It is recorded only where something settles it (a hello that does so must first find the child orphaned): the human's reads and sends (hosted.py 661, 792, 800, 831), an agent's send and status (hosted_spawn.py 1700, 1766), a hello for orphaned children (nodes.py 188 to 190, hosted_tree.py 288 to 300) | yes | while a session counts as lost it no longer holds its checkout against dispatch (hosted_wake.py 871 to 878), so the directory can be offered; a hello before anything settled the turn makes it count again, beside whatever was started there meanwhile |
+| 3 | the launch check reads running turns fail-open | dispatch.py 2287 to 2293 | yes | pinned on purpose by tests/test_hosted_wake.py 710. Why: added with the wake pass (#87) as an isolation rule, "a failing wake pass fails neither the node's fetch nor the dispatcher"; `turn_sessions` joined that list in #94 when the launch transaction began to read it |
+| 4 | a reservation outlives its claim | dispatch.py 1033, 1056 (a claim is read as gone once it is 120 s old); from the reservation (2551) to `_launch` (3118 to 3166), which writes the run record without looking at the claim again | yes | a dispatcher that stalls between the two launches on a claim a hosted task has since passed |
+| 5 | two project keys, one directory | hosted.py 1264 and dispatch.py 2295 compare normalized project strings; dispatch.py 1374 (`checkout_for`) maps a project to a directory per machine, and nothing refuses two keys for one directory | yes | the hub sees two checkouts where the node has one |
+| 6 | the node's clock stands still in sleep | node_sessions.py 150, node.py 77 (`clock=time.monotonic`) | yes, measured on macOS (C) | after a sleep the node believes it just spoke to the hub. The harm was N1: a turn the hub failed during the sleep ran to its end |
+| 7 | a provider can read the node's token | cli.py 718, config.py 258 to 266 and 355 to 363 (by default `~/.config/agent-comms/<node>.token`, mode 600 or stricter, same user; `AGENT_COMMS_TOKEN` and `AGENT_COMMS_TOKEN_DIR` override) | yes, and already the documented trust model | E |
+| 8 | a tool that leaves its process group escapes | session_host.py 72 (`group_alive` is `killpg(pgid, 0)`); a session's waits are for the group; a node's shutdown of runs waits for the leader only (node.py 476 to 480) | yes | F |
+| 9 | recovery cannot always identify a survivor | dispatch.py 1720 to 1735 (`stop_verified` never signals a pid it cannot verify), session_host.py 527 to 553; node_sessions.py 613 to 626 then opens the session again, and its next message starts a process | yes | the next message goes to a new process of the same session while the old one may still run |
+
+Found on the way, all on main:
+
+| # | finding | where |
+| --- | --- | --- |
+| N1 | **the node does not stop a turn the hub settled.** For a session the hub still lists, `_reconcile` walks only the messages the hub lists; a turn the node still holds that the hub no longer lists (failed as `node_lost`, say) runs to its end and its result is dropped (only a settled result turn can still be confirmed by a late `turn_started` or answered end, hosted.py 1373 to 1379). Runs are stopped when unlisted; turns are not | node_sessions.py 569 to 707; node.py 301 to 304 for runs |
+| N2 | the node starts newly assigned runs before it stops the runs the hub no longer lists, so a replacement can start beside the run it replaces (the registry refuses only beside a `stopping` group) | node.py 285 to 304 |
+| N3 | a group that outlives SIGKILL is forgotten across a restart: session shutdown calls `groups.gone` and writes a state file with no entries; session recovery, after its bounded wait, overwrites the state file; a node's shutdown of runs does `groups.gone` for every run whatever is left of its group | session_host.py 1440 to 1472, 544 to 551; node.py 482 to 492 |
+| N4 | `Node.recover` queues an "ended, its process was stopped" report for every run in its state file, including one `stop_verified` did not signal, and clears the state file before those reports are sent | node.py 127 to 147, 165 to 181 |
+| N5 | nothing stops two `board node` processes on one machine | node.py 535 to 569 |
+| N6 | **a run's lost reports.** `_report` swallows a failed call (node.py 267 to 272). If the `running` report and then the `ended` report are both lost, the run is gone from `running` while the hub still lists it `assigned`, and the next pass tries to start it again. The stock spawner's exclusive log file (dispatch.py 1576 to 1584) then usually fails that start, and the failure takes the place of the lost outcome. Not fixed here (L) | node.py 283 to 295, 403 to 407, 448 to 454 |
+| N7 | a run registers the project's checkout, but a `codex exec` runner that names a directory of its own (`-C`/`--cd`, absolute or relative) works there | node.py 318, 372 to 385; agent_accounts.py 118 to 144 (`codex_workspaces`, which reads every spelling, relative ones too); dispatch.py 1459 to 1463 |
+
+Part Q's other entries: "the silent-node watchdog lives in the node, so a frozen node fences nothing" is true and is
+answered by rule 1 (no node work can start on a frozen node's machine either; on thaw D-1 and D-2 apply); "local waiting
+versus hub release" is what rule 1 settles; "recovery and same-session ordering" is weakness 9.
+
+### C. What was measured (main laptop, macOS 27.0.1, the project's Python 3.12.14)
+
+- **The clock.** `time.get_clock_info("monotonic")` says `mach_absolute_time()`. At the time of the measurement
+  `time.monotonic()` and `CLOCK_UPTIME_RAW` read 1 475 075 s while wall time since boot was 1 811 385 s: 93 hours of
+  sleep the node's clock never saw. `CLOCK_MONOTONIC_RAW` read 1 811 394 s: it counts sleep.
+- **A lock that outlives the launcher.** A file locked with `flock` whose descriptor is passed to a child
+  (`pass_fds`) stays locked after the launcher closes its own copy, until every process holding the descriptor has
+  exited or closed it. A Python child passes it on; **Node 24 and Bun mark inherited descriptors close-on-exec**,
+  so the children of a Node or Bun program do not hold it (`claude` is a native binary here, `codex` a Node script
+  that starts the native program). `lsof -t <file>` lists every process that has the file open (0.37 s), which is
+  not the same as holding the lock. So a lock cannot follow a provider's tools, and is used here only for the
+  moment before the provider exists (D-3).
+- **An environment tag is not an identity.** `ps -E` shows a process's environment for user-installed binaries and
+  hides it for Apple's own (`/bin/sleep`, `/usr/bin/git`). Not built on.
+- **A boot has a name**: `sysctl -n kern.bootsessionuuid` (Linux: `/proc/sys/kernel/random/boot_id`).
+
+To measure before step 3: what the launch step adds to a start (expected: one Python start-up, tens of milliseconds,
+against the 1 s bound in D-3), with both CLIs started through it; and that the start time the launch step reads for
+itself is the value a later look at the process table gives for it.
+
+### D. The mechanism
+
+**D-1. The node stops what the hub's listing leaves out; one node per user** (rule 4; N1, N2, N5). Step 1. - In
+`_reconcile`, for each listed session whose `messages` is a list: a message the host still holds that the listing does
+not name is over for the hub. (A turn that ended on the node is no longer held, so a result on its way is never
+mistaken for this.) One in the inbox is dropped, unwritten, and nothing is reported for it. One being written or in
+flight is ended the way a cancelled turn is (`SessionHost.cancel`: the turn fails, the process is stopped, the
+conversation resumes in the next process), and nothing is reported for it either: the hub left it out, so the hub is
+owed no result, and a report into a record the hub may not be able to read could be refused again and again and hold
+up every other report of this node. Normally the omission means the hub settled the turn. A listing has always left
+settled messages out (hosted.py 1188), so no protocol change is needed. There is one other way a held turn can be
+missing: the hub cannot read its record (`hosted._messages` skips such a row, hosted.py 136 to 147). That turn is
+stopped too, and the hub's damaged record stays as it is. A restart whose message the listing no longer names is
+withdrawn in both places the host may hold it: the interrupt it asked for is forgotten when none of it was written yet
+(one partly written stays as it is, as on main), and the message itself, if it is already in the inbox, is dropped;
+both before the host is ticked (`SessionHost.cancel`, called until neither is left). Stopping a turn whose record is
+damaged, and what stopping can cost a result turn (K), are put to the owner (question 8).
+- In `Node.tick`, runs the hub no longer lists, and runs it asks to stop, are signalled first; assigned runs are
+  looked at after.
+- `board node` holds an exclusive `flock` on `node.lock` for its life, in `.local/state/agent-comms/` (mode 700)
+  under the account's home directory as the password database gives it, so neither `HOME` nor `AGENT_COMMS_HOME`
+  moves it; tests pass their own path in code. Not passed to children. A second `board node` of the same user says
+  so and exits. The registry is one process's memory; this keeps it the only one.
+
+**D-2. The directory rule** (rules 1 and 2; makes weaknesses 1 to 6 harmless for work a node starts; N7). Step 2.
+Why a run needs the whole directory, not only "no turn in flight": both CLIs can begin a turn in an idle session by
+themselves (Codex goes on with a goal or runs a queued prompt, providers/codex.py 572; Claude starts a turn for a
+task notification, measured in the steering design, part B), the host learns of it only after it began, and on
+main a Claude result can be taken for another turn's (the reason for the steering work's turn-correlation step).
+So the registry does not try to know which turn is running. It asks only whether a process is there.
+- **Which directories a launch occupies.** Its run directory and, for a run, every directory its rendered command line
+  names with `-C`/`--cd`, read by `agent_accounts.codex_workspaces` and resolved against the run directory, as
+  `launch_blocker` already does when `uses_codex(argv)` says the command line is Codex's (dispatch.py 174, 1459 to
+  1463; a relative path included). Such a path is accepted only when it is plain: made absolute against the run
+  directory, it has no `..` in it and no symbolic link on the way, so that Codex, which tidies the text of the path,
+  and the node, which follows it on disk, mean the same directory. A run whose command line names any other kind of
+  path is not started, and ends with that reason. Other runners' command lines are not read for directories (K). A
+  launch is registered under each and refused if any refuses. A directory that cannot be `stat`ed refuses the start
+  (no fall-back to the path string). Once the OS has created a process, its group stays in the registry until it is
+  gone, whatever fails after that: today a spawner that raises while setting up the child's pipes leaves a live
+  process with no handle and `Groups.start` drops its entry (dispatch.py 1597, 1664; node_groups.py 38 to 51). The two
+  spawners hand the child back, or stop it and say which group to hold, on every path after the fork. - **An automatic
+  message.** Every message whose kind is not exactly `user` counts as automatic here (a missing kind too, which main
+  reads as the human's). Before `_hand_over` hands one over it asks the registry, and does not hand it over while a
+  run's group or an `unknown` group is in the session's directory: the message stays queued at the hub and listed to
+  the node, nothing is saved as handed on the node, and it is asked again each pass. (The hub's own books may already
+  count it as shown; K.)
+- **A run's start.** The run loop asks through the session runner, under the runner's own lock (the one its watchdog
+  takes; the session loop holds it for local work only, never across a hub call, and `_hand_over` runs under it).
+  Under that lock, in order: the start is refused if any session of those directories is about to start (it holds a
+  message and has no process, whether it never had one or its process has gone since: read from the host under that
+  lock, not from a mark; such a session keeps the device and inode its directory had when the message was handed over,
+  and if the two directories cannot be compared the run is held), or if a group is there that parking cannot clear (a
+  run's, a `stopping` or `unknown` one, a busy session's); otherwise every session whose process is there and that
+  `SessionHost.park` accepts (no message, no turn, not known to run a turn of its own, not already going down) is
+  parked, unless `_lends_full` keeps it; then `Groups.start` for the run, which refuses while any group other than
+  those idle kept parents is in a directory. A node that hosts no sessions asks the registry directly. A refused run
+  stays assigned and is tried again each pass (as today beside a stopping group, node.py 321 to 325). The run loop's
+  own looks at its groups go through the same lock whenever they change what the registry says: finding a run's leader
+  gone with members left and marking the group `stopping`, a stop, finding a group gone. So a session cannot be
+  started in a directory between the moment the run loop saw a group in trouble and the moment the registry says so.
+  What the run loop then reports to the hub is sent after the lock is released. Because the exception is worked out
+  under the same lock as the start, a stale answer cannot let a run in; a parent that stops lending later is an idle
+  process beside a run and is parked by the next point. - **While a run's group is in a directory**, a session process
+  there is parked as soon as `park` accepts it and `_lends_full` does not keep it (rule 2 e), in the pass in which its
+  turn ended and before anything else is handed over. One thing comes first: if the session's next message is the
+  human's own and `_hand_over` can hand it over in that pass by its existing rules (the listing gave its text, which
+  it does only for the first queued message, and the last fetch succeeded), it is handed over and the process is not
+  parked (the host may still replace the process for a reason of its own, such as a changed binding, and then the
+  message starts the new one). In every other case the process is parked: an automatic message next (held, above), a
+  human's message the node has only the heading of, a failed fetch, or nothing queued. The check is made after each of
+  the two host ticks a pass can have. It can only be there for a message of the human's, or as a kept parent.
+- **What parking costs in time.** The parked group is seen gone by the session loop's next pass, which can be a whole
+  long-poll away (20 s, plus a slow network) when nothing else is going on; a process that ignores SIGTERM adds the
+  kill grace; and the run is tried again at the run loop's next pass (`poll_seconds`). A turn Codex began by itself
+  and the host has seen keeps `park` from stopping the process: the run waits until that turn ends, or until the
+  dispatcher's own timeout ends the assignment (the host's limit on a held session runs only while a message waits for
+  it). Claude's adapter does not tell the host about a turn of its own, so such a turn, seen or not, is cut off with
+  the process.
+- **Gone, from this step**: the node has reaped the group's leader and `killpg(group id, 0)` answers that no such
+  group exists (ESRCH), which only the kernel can say and says for the whole group at once. Any other answer means
+  "still there": main's probe also reads "may not signal it" (EPERM) as gone, and that reading stops, in the probe
+  both loops use: `Node` builds the stricter one and passes it to its `SessionHost`, as it already can (node.py 84 to
+  97), so `session_host.py` is not edited for it. A group whose last members have exited and wait to be reaped is
+  still there until they are. - **A child session's own worktree** is removed (`_drop_worktree`, and the hourly sweep)
+  only at a moment when the node has nothing registered anywhere and no session about to start (no group of any kind,
+  no `unknown`), and under the registry's lock, so that nothing starts meanwhile. A directory can be reached under
+  more names than the node can check (a bind mount of a subdirectory), so the node does not try to prove that a
+  worktree is unused while anything runs; it waits until nothing does. The price is that worktrees are cleaned up
+  later (K). Today the removal asks whether the worktree is the session's, clean, without ignored files, and its HEAD
+  reachable (session_worktrees.py 113 to 133), not whether a process is in it.
+
+The hub's own rule (one run per checkout, both ways round) stays. Where it held, the one thing step 2 adds on a
+healthy system is the stop of idle session processes before a run and the wait for them. When the hub was wrong,
+the node's rule is the one that holds: the run or the automatic message waits at the node. A steered turn, when
+steering lands, needs nothing built here: its session's process is up, so no run starts beside it.
+
+**D-3. A launch record written by the process itself** (rule 3 across restarts; weaknesses 1 and 9; N3, N4). Step 3.
+Not a guard: the provider stays the node's own child and no extra process stays. - **The ledger**: `launches/<the
+boot's name>/` beside `node.lock`; the folders of other boots are removed at start-up, unread. If the boot's name
+cannot be read, nothing is removed and every directory is `unknown` until it can; that hold, like the one for an
+unreadable record, is lifted only once the name is read and every entry of this boot has been classified. Per launch,
+named by a random launch id: `<id>.json` and `<id>.lock`. An entry is a json file; a lock file with no json, or a
+temporary file, is a remnant and is ignored (the json is removed first when a launch is gone). If the folder cannot be
+listed, every directory is `unknown` until a listing succeeds and every entry has been classified, with or without the
+hub. The ledger decides occupancy only. Which runs are reported to the hub as ended after a restart is still read from
+the install's own run state file, as today, so an entry left by a node of another install never causes a report there.
+- **At a start**, inside `Groups.start`, in this order. (1) The node writes `<id>.json` (run or session, its id, the
+  registered directories with their device and inode; a temporary file, renamed), and the node's ordinary reporting
+  state is untouched before the spawn (the lock file, the log and a browser's output folder may exist by then). When
+  the node later saves its ordinary state row for the started process, as today, the row names the launch id, so that
+  the state file's pid check, which is for older builds' processes, never takes up a row of a launch that had a ledger
+  entry, also when the node died between removing the entry and rewriting the state file. This is the moment the
+  launch exists for a later node process: before it, nothing was spawned. (2) It creates and `flock`s `<id>.lock`,
+  opens a status pipe, and spawns, with the lock's descriptor and the pipe's write end passed on, a **launch step** in
+  place of the provider: `python -I -S launch_step.py ... -- <provider argv>` (standard library only), the new process
+  group's leader. (3) The launch step marks both descriptors close-on-exec, rewrites the json with its own pid (which
+  is the group id) and its own start time as the kernel reports it (again a temporary file, renamed), writes one mark
+  on the status pipe, and `exec`s the provider, which is therefore the same process with the same pid, pipes,
+  environment and directory as today and no extra descriptor. If the write of the record fails it says why on the
+  pipe, without the mark, and exits; if the `exec` fails it says why after the mark and exits. (4) The node reads the
+  pipe until it ends, for at most 1 s, and judges only an ended pipe. Ended with no mark: the `exec` was never
+  attempted, nothing of the provider ran: a failed start (with the reason if one was given, else the launch step
+  died). Ended with the mark and a reason: the `exec` failed: a failed start. Ended with the mark alone: started. Not
+  ended within the bound, whatever was read: the node kills the group and the start fails as timed out. Two of these
+  readings can be wrong, and both are named in K: "started" when the launch step died between the mark and the `exec`,
+  or after a failed `exec` before it could say so (a start is reported for a provider that never ran, and its exit
+  follows at once by the ordinary path); and "timed out" when the `exec` happened just before the kill (a provider ran
+  for a moment). Only "ended with no mark" says that nothing ran. A run is reported `running` only for a start that
+  was made. On every path after the spawn returned, a failed one too, the group stays in the registry (`stopping`)
+  until it is gone; it is never dropped unproved. So **the group id and the leader's start time are on disk before the
+  provider's first instruction runs**, and the lock is held exactly while the launch step is alive and has not yet
+  become the provider.
+- **Gone** is as in step 2 (the leader reaped or absent, and the kernel's "no such group"). Only then are the launch's
+  two files removed and the registry lets go. Session shutdown, run shutdown and recovery stop forgetting: what is
+  still there when they give up waiting stays in the ledger, and the next node process reads it. - **At start-up**,
+  holding `node.lock`, before anything else, for each entry of this boot (and in `board node check`): first try to
+  take the entry's lock and keep it while deciding; only then read the json, so that a launch step that records itself
+  and becomes the provider meanwhile is never judged from an older reading.
+  1. a json that cannot be read. The node cannot know which directory it stands for, so every directory is
+     `unknown` until the file is gone (the human removes it, or the machine restarts). Records are replaced by
+     rename, so this takes a damaged disk.
+  2. no `<id>.lock`: the node died before it spawned. Removed. 3. no pid in the json, read after the attempt on the
+     lock. The lock was taken: the launch step died before recording itself, nothing of the provider ran: removed. It
+     was not taken: the launch step is alive and about to write: `unknown` until the next look. 4. a pid P and a start
+     time: - a) the process table shows pid P with that start time, leading its own group: it is the launch's leader,
+     as main's recovery decides it today (`stop_verified`), and it is stopped by main's rule. The start time is the
+     kernel's own number, the one the launch step recorded for itself (not the local-time text of `ps`, which main
+     compares and which changes with the time zone); the node also takes it from the record for its own books instead
+     of asking `ps` after each spawn as main does (node.py 400, session_host.py 1287). If the recorded and the current
+     reading cannot be compared, the entry is `unknown`. It is read again immediately before each signal; SIGTERM to
+     its group; after the grace, SIGKILL to the group if the leader is still there.
+     - b) pid P now belongs to a process with another start time: the number was given out again, which the
+       system does only once the old group has ended (POSIX; the macOS and Linux allocators skip a number still
+       in use as a group's). Gone, removed.
+     - c) no process P, and the kernel says no such group: gone, removed.
+     - d) no process P, and the group is still there (now, or after a): `unknown`. Nothing is signalled: with its
+       leader gone the group cannot be told from another program's. (Main kills such a group after it stopped the
+       leader, session_host.py 544 to 546; that stops.) Processes of a build from before this step have no entry; for
+       them, and only for them, the state file's pid check works as today (H), also on a node that hosts no sessions.
+- **`unknown`** closes its directory to every start, every run and every automatic hand-over (rule 2 a to c), is
+  looked at again every 5 s by the same rules, and clears by itself when the entry is gone. The node says so in its
+  log once when it appears. `board node check` (read-only) says for each entry whether its processes are gone, by the
+  same rules. There is no command to release one: it clears when those processes end, by themselves or by the human's
+  hand, or at a restart of the machine. - **Weakness 9**: a session's next process is a start in the session's
+  directory, so it waits until the old launch is gone. The next message is never written beside an old provider of the
+  same session in that directory. (If the node's settings were changed to run the project somewhere else, the session
+  opens there; that is a changed mapping, K.) - **N4**: a run whose launch recovery could not show gone is still
+  reported ended to the hub (for the hub it is over), but with words that say its processes could not be confirmed
+  stopped and WITHOUT the checkout's state, which a later run's takeover reads as "clean and free" (workstreams.py 346
+  to 365); without it, a takeover that the hub would decide from this run's report waits for other evidence or for the
+  human (K). Its directory stays `unknown` here. The same goes for a run whose group is still there when an orderly
+  shutdown gives up waiting (node.py 482 to 492 attaches the checkout's state today). The price is in K.
+
+**What becomes of each listed weakness.**
+
+| # | answer |
+| --- | --- |
+| 1 | the hub's release rule is unchanged (the owner's round-6 decision stands). What it releases is an offer; the node starts nothing beside the old process (D-2), also after a restart (D-3) |
+| 2 | the revival is unchanged and now harmless: if the hub offered the directory meanwhile, the run waits at the node while the session's process is busy, and the turn, live again at the hub, finishes. If the hub settled the turn, D-1 stops it |
+| 3, 4, 5 | unchanged at the hub. Of two pieces of work wrongly offered for one directory, the one the node admits second waits there, within rule 2's exceptions (the human's own message; a kept parent): the registry compares by device and inode, under one lock, at the moment of the start. Fixing them at the hub is optional tidiness, not designed here (L) |
+| 6 | the clock is left as it is (question 5): time asleep is not time a turn ran unseen. What mattered was N1, and D-1 closes it |
+| 7 | E |
+| 8 | F |
+| 9 | D-3 |
+
+### E. The node's token (weakness 7)
+
+**Judgement: real, known, and not urgent on its own.** It is the boundary this project already wrote down twice:
+"Tokens are not a security boundary against a local agent" (Objections, 1) and "the unit of trust is the OS
+account ... those sessions hold that machine's keys: the agents' token files there, the node's credential ... and
+on the hub the database and the human token" (child sessions, round 2 S3). By that text, the only sessions kept
+from it are those without a shell (a read-only Claude child: no Bash, the token folder denied). The node's token is
+one of seven token files in `~/.config/agent-comms/` on the main laptop, all mode 600 and all readable by the same
+user; the human token is among them. Guarding one of them changes little.
+
+What each idea would really give:
+- **The login keychain does not put it out of a provider's reach.** A keychain item's access list names programs,
+  not processes. An item the node reads without a prompt is readable the same way by anything that can run the same
+  program (`/usr/bin/security`, or the same Python), which a provider with a shell can. It stops reading by accident
+  (a `cat`, a grep, a file-read tool, a transcript that quotes the folder) and nothing deliberate. It also makes the
+  node depend on an unlocked login keychain. To be measured before building, if chosen.
+- **Proof tokens** (the hub holds a hash, a secret is revealed on exit) need the secret registered first, by
+  something the hub already trusts, which is the node's token again: the earlier reviewer's point about a trusted
+  first registration. Under rule 5 nothing in this design needs them, and none are built.
+- **A second holder can be detected.** Each node process draws a random instance secret, kept in memory only, and
+  sends it with every call; the hub notes it per node, and calls from two instances that are both live raise one
+  Needs-you item. It needs a change on the node and on the hub, and a rule for an ordinary restart (the old
+  instance is gone, the new one must not be flagged). It covers the node's token only.
+- **A second OS account** (the node and its providers under one user, the human's token and the hub's database
+  under another) is the boundary for the human's credentials; the providers would still share the node's own token
+  with the node. That is the remedy both earlier passages name, and a project of its own (CLI logins,
+  checkout ownership, the keychain the CLIs use, the browser).
+
+Recommended (M, question 1): leave the token where it is, say plainly that the checkout rules are a defence against
+faults and not against a hostile process of the same user, and take the OS-account split as its own project if the
+owner wants the boundary. One thing costs nothing: `human.token` is present on the main laptop, and the hub moved to
+the 2nd Mac on 2026-10-27. If no hub runs on the main laptop any more and nothing there uses it, the owner can
+remove it.
+
+### F. A tool that leaves its process group (weakness 8)
+
+macOS gives an unprivileged parent no way to keep a descendant: no subreaper, no control groups. A tool that starts
+its own session (`setsid`, Node's `detached: true`) is in no group the node knows, holds no lock (C: the CLIs do not
+pass descriptors on) and carries no visible tag (C). Rule 2 therefore covers what stayed in its group and says so.
+What an escaped tool can do is what it can do today: keep running in the directory after its turn is over and
+beside whatever comes next. Options are in M, question 3; the recommendation is to name the limit and build nothing.
+
+### G. What changes
+
+Healthy node, hub reachable:
+- A turn the hub settled while the node still held it is stopped at the next listing. Before: it ran to its end
+  and its result was dropped.
+- When a dispatched run is assigned for a directory in which a hosted session's process sits idle, that process is
+  stopped first and the run starts when it is gone: later than today by up to a long-poll (20 s) and a run-loop
+  pass, more on a slow network or with a process that ignores SIGTERM. The session resumes with its next message,
+  in a new process. Before: the process stayed up beside the run and could begin a turn of its own there.
+- Where the hub was wrong (B, 1 to 5): a run assigned for a directory where this node still has a busy session or
+  a run waits at the node; an automatic message waits at the node while a run is there, and a human's message
+  queued behind it waits with it. Before: both ran.
+- From step 3: each provider and each run on the node is started through the launch step (one short Python start,
+  no process left behind, no extra descriptor in the provider), and has two small files while it lives.
+
+Unhealthy node: - **Sleep**: on wake the node goes on. A turn the hub settled meanwhile is stopped at the first
+listing built after the settlement; one the hub did not settle carries on, and a run offered meanwhile waits for it.
+Before: both ran side by side. - **Hub out of reach**: as today, plus this: a session process beside a run is parked
+when the fetch that would have brought its next message failed (D-2), and from step 3 the node's own looks at
+`unknown` entries go on without the hub.
+- **Node crash or kill**: the provider runs on until the node is back, as today. From step 3 the new node process
+  knows it from its launch record: a leader it can identify is stopped as today, and whatever it cannot show gone
+  keeps its directory closed. Before: what the node could not verify was left alone and forgotten, and the
+  session's next process started beside it.
+- **Shutdown or recovery with a survivor of SIGKILL**: from step 3, remembered by the next node process. Before:
+  forgotten.
+- **A second `board node`** of the same user exits.
+
+### H. Versions, rollback and the deploy rule
+
+Every step changes the node only. No hub change, no protocol field, no stored record on the board, no session
+protocol number (nothing collides with steering's protocol 5). The node goes on working with exactly the hubs
+today's node works with (d4b92e5 and later): D-1 reads only what the listing already holds. Hub and node can be
+upgraded in either order.
+
+| step (I) | on the node's disk | rollback |
+| --- | --- | --- |
+| 1 | `node.lock` | install the older build; N1 and N2 are back. A build from before step 1 does not take the lock: never run one beside a newer node (stop first, as every upgrade does) |
+| 2 | nothing | install the older build |
+| 3 | `launches/`, on the machine's own disk like `node.lock` | the rule below |
+
+**The deploy rule for step 3**, in the README's deploy notes. The guarantee across restarts is for processes a
+step-3 build started (A). A process an older build left behind and forgot (N3) is in no ledger, and nothing run
+after the fact can list such processes with certainty.
+- **Installing step 3**: to be sure, restart the machine once between the old build and the new. Without that, the new
+  build's first start has for the old build's leftovers exactly what every restart has today (the state file's pid
+  check), and the contract's second line begins with the processes the new build starts. - **Going back from step 3**:
+  stop the node and keep everything that could start work for this user off until the older build is in place (the
+  LaunchAgent that restarts the node, a `board node` started by hand, another install); run `board node check` as the
+  same user, on the same machine and in the same view of it as the node (the assumption in A), so that it reads the
+  lock, the ledger and the process table the node used; it must say of every entry of this boot that its processes are
+  gone before the older build is started, because the older build does not read the ledger. (The files may stay; the
+  older build ignores them and a later newer build removes them.) If one is not gone: end those processes, or restart
+  the machine.
+
+### I. The build, smallest useful first
+
+Each step is one small PR, reviewed and merged on its own, and safe with the later ones not built.
+
+1. **The node stops what the hub's listing leaves out; stop before start; one node per user** (D-1).
+   `node_sessions.py`, `node.py`. By itself it ends the turns that outlive their settlement. It gives no part of the
+   contract's guarantee yet: the two loops are not ordered against each other.
+2. **The directory rule** (D-2). `node_groups.py`, `node_sessions.py`, `node.py`, and the two spawners in
+   `dispatch.py` (so that a process the OS created is never left without a handle). The first line of the guarantee
+   in A holds from here, for as long as the node process lives.
+3. **The launch step and the ledger** (D-3). New `launch_step.py` and `launch_ledger.py`; `pass_fds` in
+   `dispatch.spawn_piped` and `spawn_process`; `session_host.py` (`_spawn`, `recover`, `stop_all`); `node.py`;
+   `cli.py` (`board node check`). The second line. **After the steering
+   step in flight has merged**, because it touches `session_host.py`; before it, the measurement in C.
+
+Steps 1 and 2 touch neither `session_host.py` nor `agent_comms/providers/` (they use `SessionHost.cancel` and `park`
+as they are, and the stricter probe is passed in), so they can be built beside the steering work.
+
+### J. Tests
+
+Unit tests with the fakes the node's tests already use (a fake clock, spawner and hub), and real processes for
+step 3.
+- Step 1: a held turn the listing omits is stopped with its process, one in the inbox is dropped unwritten, and for
+  neither is anything sent to the hub; a held turn with a `delivered` report still waiting is stopped all the same; a
+  restart the listing no longer names is withdrawn, also when its message sits in the inbox of a process that is being
+  replaced and its interrupt was asked for again meanwhile (the intent is cleared and the message dropped before the
+  host is ticked); a listing whose `messages` is not a list changes nothing; with a record the hub cannot read and no
+  earlier report waiting for it, the node's other sessions go on being fetched and reported. A run the hub no longer
+  lists is signalled before an assigned run is looked at. A second `board node` exits, also with another
+  `AGENT_COMMS_HOME` and another `HOME`.
+- Step 2, the registry's table, cell by cell: a run beside a run (waits); beside a session with a turn (waits, nothing
+  stopped); beside an idle Claude process and beside an idle Codex process (parked, the run starts when the group is
+  gone, never before); beside a Codex process whose own turn the host has seen (waits, nothing stopped) and one it has
+  not seen (stopped with the process); beside a session about to start (waits); beside an idle parent that lends full
+  access (starts; the parent, the child's handshake and the child's inbox are untouched), and beside that parent with
+  a turn (waits); a parent that stops lending after the run started is parked. An automatic message beside a live run
+  and beside a stopping run (waits, `handed` unsaved, handed over once the run is gone); the human's message beside a
+  run (handed over), behind a waiting automatic one (waits with it), and to a session without a process beside a
+  stopping group (waits, as today). A session that goes idle beside a run is parked. Two names for one directory
+  counted as one; a child in its own worktree untouched; a run whose command line names another directory, absolute
+  and relative, registered under both; a directory that cannot be `stat`ed refuses; a spawner that fails after the
+  process exists leaves its group held until gone; a message with no kind is treated as automatic. About to start: a
+  session that holds a message and has no process holds a run back, also after its process went away with the message
+  still in its inbox and while the contact latch keeps a new process from starting; not once the message is dropped
+  (D-1, a cancel, the session's end). Gone: a group the kernel says is absent is gone; one it may not signal, and one
+  with only exited, unreaped members, is not. A child's worktree is removed only when the registry is empty and no
+  session is about to start, and nothing starts while it is removed. A run is not parked for when another group
+  already holds it back. Two human messages queued for a session beside a run: if the node has the second one's text
+  when the first ends, it is handed over without a stop in between; if it has only its heading (both were in one
+  listing), or the last fetch failed, the process is parked and the message starts a new one; with an automatic one
+  next, it is held and the process parked. Each is checked after the first and after the second host tick of a pass.
+  Only a hand-over that was completed skips the parking: one that failed while saving the handed number does not, and
+  a Codex session that goes idle without a `turn_ended` event is parked like any other. A session about to start whose
+  directory can no longer be `stat`ed holds a run in the directory it had. A session whose binding changed is still
+  replaced by the host with that message waiting. A run's leader exits leaving members: no session starts in that
+  directory between the run loop seeing it and the registry saying `stopping`. After a shutdown has begun the node
+  starts nothing. Two threads: a run start and the hand-over of an automatic message racing never both succeed; a run
+  start while the session loop waits at the hub parks and later starts; a session leader that exits leaving members
+  while the session loop waits at the hub still holds the run back. The walk-through of weakness 2: lost at the hub, a
+  run offered, the node returns, the run waits, the turn ends, the process is parked, the run starts.
+- Step 3, with real processes: the launch step writes the pid and start time before the provider runs (a provider that
+  reads the json at its first instruction sees them) and leaves the provider no extra descriptor; a failed write and a
+  failed `exec` each arrive on the status pipe, the start fails with that reason and a run is not reported `running`;
+  a launch step killed before its mark (the pipe ends empty) is a failed start, and the provider never ran; the mark
+  alone on an ended pipe is a start; a pipe that has not ended at the bound is a timeout whether or not the mark was
+  read, the group is killed and held until gone. Recovery, case by case: a json with no lock file (removed); an entry
+  looked at while the launch step is still alive (not removed; decided on a later look), and one whose launch step
+  records itself and becomes the provider during the look (the json is read after the lock, so it is found with its
+  pid); a free lock with no pid (removed); an unreadable json (every directory closed until it is removed); a leader
+  identified and stopped, its start time re-read before each signal; a leader that goes on SIGTERM leaving a member
+  (`unknown`, nothing more signalled); no leader and a group still there (`unknown`, nothing signalled); a pid now
+  held by another process, with another start time (gone, never signalled); another boot's folder removed unread; a
+  lock file without a json and a leftover temporary file ignored; a folder that cannot be listed closes every
+  directory until it can; a state-file row that names a launch id is never given to the pid check; a boot name that
+  cannot be read closes every directory and removes nothing; all of it also on a node that hosts no sessions and with
+  the hub out of reach. Session shutdown, run shutdown and recovery with a survivor leave the entry, and the next
+  process reads it. A session's next process waits for an `unknown` entry and starts once those processes are ended.
+  An entry of another install holds its directory and causes no report to this hub. A run whose launch is `unknown`,
+  at recovery or at an orderly shutdown, is reported ended without a checkout state. A leader's identity survives a
+  change of time zone.
+- R10-06's cases that still apply are in step 3's list: recovery after the launcher is gone; an entry made before
+  anything else was recorded; nothing removed while a process of the launch is alive.
+
+### K. Known limits
+
+- **Outside the scope** (A): a run the dispatcher starts itself on the hub's machine, also when a `board node` on
+  that machine uses the same directories (question 6); another OS account or another machine (a network mount) in
+  the same directory; a node build from before step 1 run beside a newer one.
+- **A directory, or a name it is reached by, that is renamed, replaced or pointed elsewhere** between the node's
+  first look at it for a piece of work and that work's end (a symlink in a configured path or in a runner's
+  `-C`/`--cd` moved; a checkout swapped under its name) is outside the contract: the node and the CLIs resolve a
+  name each time they use it.
+- **The node's own files.** If `node.lock` is replaced while the node runs, a second node can start; if the ledger's
+  folder for this boot is lost between two node processes, what it recorded is forgotten. Both are outside the
+  contract (A). So is a node process, or a `board node check`, that does not see what the last one saw: the account's
+  home directory moved or another filesystem mounted over the state folder (it then finds an empty ledger and a free
+  lock), or another PID or time namespace (a container restarted beside its old processes: the numbers in its ledger
+  then name nothing it can see, or cannot be compared), or another name for the current boot (a container that shows
+  its own: the ledger of the boot then looks like an old one's and is removed). A boot name that cannot be read at all
+  is the one case the node can see, and it holds everything (D-3).
+- **Idle is what the host has seen.** On main a Claude result that belongs to a turn the CLI began by itself can be
+  taken for the turn the node handed over, so the host can believe a session idle while that turn still works. Such a
+  session can then be stopped, cutting the turn short, and a lending parent in that state does not hold a run back.
+  The steering work's turn-correlation step is what makes the host's account of a Claude turn reliable; until it has
+  merged this is a limit of step 2. A full-access child whose parent was stopped for a run waits, with any message it
+  holds, until its parent has a process again; while it holds a message and has no process of its own it is about to
+  start, and holds runs back in its own directory, at worst until the dispatcher's timeout ends their assignment. -
+  **A directory that cannot be `stat`ed** holds the starts and the automatic hand-overs the node would make there, an
+  automatic message to a session whose process is already up included, for as long as that lasts. - **A Codex runner
+  whose `-C`/`--cd` path has a `..` or a symbolic link in it** no longer runs on a node from step 2, also where that
+  link never moves: its runs end with that reason until the settings name the plain path.
+- **The human's own message** is written beside a run, by the owner's rule (question 4), and the session process
+  it starts stays beside the run until it is idle and stopped. While it is up, its CLI can begin a turn of its own
+  beside the run.
+- **A human's message queued behind an automatic one waits with it.** Where the node holds back an automatic
+  message that the hub, being wrong, let through, that is a wait for the human's message that main does not have
+  (main would have run both beside the run).
+- **An idle parent that lends full access to a child** stays up beside a run (rule 2 b's exception: `_lends_full`
+  as it is, which also spares a parent whose child's subtree is merely open), and its CLI can begin a turn of its
+  own there.
+- **A turn a CLI began by itself is cut off** when a run needs the directory and the host does not know of the turn
+  (always so for Claude; for Codex until the host has read its start). One the host knows of holds the run back for as
+  long as it lasts. - **A tool that leaves its process group** is not seen (F). Nor is work a provider does outside
+  the directories its launch registered (an extra writable root, a tool that changes directory, a directory named on
+  the command line of a runner that is not Codex's, which the node tells by the command's name being `codex`
+  (dispatch.py 174 to 175); a worktree Codex makes and manages for itself). A node whose settings are changed to run a
+  project in another directory opens its sessions there from then on. A tool left running in a live provider's group
+  after its turn ended holds runs back with its group, and works on beside the session's later turns as today.
+- **Hosted sessions share a directory with each other** as today; this design is about runs against sessions.
+- **Two views of the same files with different device and inode numbers** (the same disk mounted twice) are two
+  directories to the node.
+- **A group the node may not signal, or whose exited members nobody reaps,** counts as still there (D-2), and
+  holds its directory until that changes or the machine restarts.
+- **What recovery cannot show gone stays `unknown`** until those processes end or the machine restarts (D-3):
+  members left without their leader. An entry that cannot be read closes every directory. Nothing releases either
+  by command; removing an entry's files by hand, with the node stopped, is the one way to overrule rule 3, and it
+  is the human's.
+- **Between reading a leader's start time and signalling its group**, the leader can exit and its number pass to
+  another process that leads a group. Main's recovery has exactly this gap today, and step 3 keeps it. No
+  interface on macOS closes it.
+- **Stopping a turn the listing leaves out can repeat a result.** If the turn carried child sessions' results and
+  the provider's word that it had started was still unread when the node stopped it, the hub never learns they
+  arrived and delivers those results once more, in a later message.
+- **A turn stopped for a damaged record can leave the hub holding its checkout.** If the hub's record of the turn
+  lost only what the listing needs (its number) and the session still names it as in flight, the hub would have
+  taken the turn's result by its key; D-1 stops the turn and sends nothing, so the session goes on counting as busy
+  at the hub and its checkout stays held against dispatch until the record is repaired.
+- **An automatic message the node holds back may already count as shown at the hub.** A wake's grace can run out
+  meanwhile, the dispatcher can then start a run for the same request, and the wake still runs afterwards: the same
+  request worked on twice, one after the other, never side by side.
+- **A child's worktree is removed later than today**: only when the node has nothing registered and nothing about
+  to start (D-2), so on a node that is never idle it stays until it is.
+- **Local work under the session runner's lock delays a run's start.** As on main, the session loop holds that
+  lock for a child's worktree being made or removed (several Git commands, each with its own timeout, 60 s for a
+  removal) and for its other local work. From step 2 a run's start, and the reaping in that pass, wait for it.
+- **A run can be started after the hub gave up on it.** The run loop fetches an assignment, then may wait for the
+  lock; if the dispatcher's timeout ends the assignment meanwhile, the node learns it only from the answer to its
+  `running` report, after the spawn, and stops the run then; if that answer is lost or refused, at the next listing or
+  at the run's own time limit. Main has this window; the wait for the lock widens it. - **After a human's turn beside
+  a run, the session's process is stopped** (rule 2 e) unless another message of the human's is there for the node to
+  hand over in that pass. A later message of the human's then waits for that stop to finish, and for a process that
+  will not die, as rule 2 a has it. Messages of the human's that arrive one by one, each in time for the node to have
+  its text, keep the process up beside the run for as long as they last, unless the host replaces it for a reason of
+  its own. - **A report that waits for a record the hub cannot read** (an object damaged in a way that makes the hub's
+  `_apply` raise; plain invalid JSON is ignored, and a record missing only its number still takes a result by its key)
+  is refused by the hub each time, and the node, which sends reports before it fetches, then gets no listing: its
+  hosted sessions stall until the record is repaired. That is main's behaviour and is unchanged; D-1 only avoids
+  adding a report of its own to it. - **Process starts hold the session runner's lock**: for each start in a pass, the
+  ledger's writes, the spawn, and the wait for the launch step's status (tens of milliseconds as a rule, up to 1 s for
+  the status alone). The watchdog's deadlines can be late by the sum. The bound the node tells the hub
+  (`shutdown_bound`) does not count it; under rule 1 that bound only decides offers.
+- **The launch step's report of a start can be wrong two ways** (D-3): a start reported for a provider that never
+  ran (the launch step died between its mark and the `exec`, or after a failed `exec` before it could say so), and
+  a timeout reported for a provider that did run for a moment before it was killed.
+- **A node that dies between a run's start and saving its own row for it** leaves, from step 3, a ledger entry
+  that holds the directory and no row from which to tell the hub the run ended. The hub's own timeout ends the
+  assignment, or the next node process is offered it again once the hold has cleared; the run's log file, which
+  already exists, can then make that second start fail, as it can on main.
+- **What the node keeps on disk for a held group** (a browser's output) is cleaned up only once the group is gone;
+  if the row that named it was cleared meanwhile, it stays until someone removes it.
+- **A run reported ended without its checkout's state** (its launch was `unknown`, or its group outlived a shutdown)
+  gives the hub nothing to let a later run take over that work from, and the hub takes no later report for an ended
+  run. The takeover stays blocked until a later run reports or the human resolves it, also after the node's own
+  `unknown` has cleared. Where the hub knows the same directory under another project key, it can pass over that run
+  and allow a takeover on an older report; the run it then offers waits at the node like any other (rule 1).
+- **When the node itself reaps a leader whose group is already empty**, the number is free at once, and a group
+  that took it before the node's next probe would be signalled as the old one's leftover. Main has this gap today
+  and it is kept.
+- **A node that is killed and does not come back** leaves its provider running, unsupervised, until its turn ends
+  by itself; no node work can start beside it on that machine meanwhile.
+- **After a sleep**, a turn the hub settled during it runs from the wake until the first listing built after the
+  settlement is applied (a reply sent before the sleep can still arrive first). The node's own self-stop is as today,
+  with today's gaps: it counts awake time only; in the run loop a reply can renew the contact before the stop is
+  looked at; in the session loop a message already handed to a host can still start after a failed fetch, before the
+  latch is set; and it does not stop a turn a CLI began by itself (question 5).
+- **The hub counts a silent node's turn lost after 180 s, but records that only where something settles it** (B,
+  2). Until then the session only stops holding its checkout against dispatch, and a hello can make the unsettled
+  turn count again; that is now harmless on the node.
+- **A run offered to a node that must wait there** shows at the hub as assigned and not started; the dispatcher's own
+  timeout ends it as "stopped before start", as today for a run that waits beside a stopping group. Why it waits is in
+  the node's log, not on the hub (the round-6 decision for lingering groups, kept). - **A message saved as handed and
+  not yet given to the host when the node dies** is reported lost rather than written twice; one whose save failed
+  before the file was replaced is handed over once by the next node process, if the hub still has it queued. The file
+  of handed numbers also forgets a session that a listing left out altogether, which a damaged session record on the
+  hub can cause for a while. That is main's deliberate choice and is unchanged, and it rests, as on main, on the
+  node's file of handed numbers being intact.
+- **A node pointed at another hub with the same `AGENT_COMMS_HOME`** reports the runs its state file names to
+  that hub, as today.
+- **The first start of a step-3 build** knows nothing of processes an older build left and forgot, unless the
+  machine was restarted in between (H).
+- **The dispatcher's own crash windows** (a trigger dropped before its run is on record; a dispatcher that freezes
+  between the record and the assignment while its replacement launches again) and **a node's lost run reports**
+  (N6) are unchanged. On a node, two runs can no longer be in one directory at once (D-2).
+- **A hostile process of the same user** is outside every rule here (rule 5, E). The ledger is plain files of that
+  user.
+
+### L. Considered and not built
+
+- **The guard** (a wrapper that is the provider's parent, holds the leader unreaped and reports the group empty;
+  4b00cfb, part E). What it would add: when the node dies, the provider is asked to stop then (SIGTERM, SIGKILL
+  after the grace) rather than when the node returns, and a group whose leader is gone stays identifiable while
+  the guard lives. What it costs: a second process per provider, and a host that tracks the guard and the provider
+  apart through natural exit, shutdown and recovery (R10-01), in the file steering is changing. It does not remove
+  the need for D-3's recovery, because the guard can be killed too. Left as an option (question 2).
+- **Exit tokens and a trusted registration** (4b00cfb, K-3 to K-5; R10-02, R10-03). They defend a release against a
+  forged report. Under rule 5 a forged report is outside the boundary, and under rule 1 no release is granted on a
+  report at all: the node checks its own processes.
+- **A hold record at the hub, released by proof** (4b00cfb, K-1). The hub cannot see a node's processes, so any
+  hub-side release is a report or a timer. Rule 1 puts the decision where the facts are.
+- **Hub-side fixes for weaknesses 2 to 5** (make a loss final in the launch transaction; fail the launch check
+  closed; exchange the claim for the run record; refuse aliases). Round 1 of the review showed that each needs more
+  than it first seemed (revoking an offer the node may already hold; rows the readers skip silently; two crash
+  windows around the record) and none is needed for the contract once the node decides. They stay possible as
+  follow-ups for the hub's own accuracy and for runs the dispatcher starts itself; findings H1-09, H1-10 and H1-13
+  are their starting point.
+- **Durable run attempts on the node** (N6): intent, execution and outcome recorded so that a lost report can
+  neither replace an outcome nor start a run again. It is about reports, not about a directory, and needs its own
+  crash boundaries (H2-09). A follow-up.
+- **A clock that counts sleep for the self-stop.** It would end every turn and run on wake after a long sleep. It
+  needs a stop that survives the contact being renewed first and that reaches runs and provider-begun turns
+  (H1-07), and it ends turns nothing else wanted ended. With D-1 the turn that must stop is stopped. Question 5.
+- **Sharing the ledger between a node and a dispatcher on one machine.** Two processes that each look and then
+  write can both admit work (H1-03). The sound form is one launcher per directory: on a machine that runs a node,
+  the dispatcher gives its runs for that node's directories to the node. Not designed here (question 6).
+- **Per-message turn claims** (rounds 1 and 2 of this design): the registry tracking which message's turn is in
+  flight, so that an idle session's process could stay up beside a run. A claim cannot cover a turn a CLI begins by
+  itself, depends on the host attributing every result to the right turn (which main's Claude adapter does not yet
+  do), and needs its own rules for every way a message leaves the host (H1-04, H3-02, H3-03). Asking only whether
+  a process is there needs none of that.
+- **Checking the started process's working directory, or re-keying on a changed directory** (round 2): it checks
+  after the fact and adds states of its own (H3-01, H3-02). The contract assumes a stable directory instead (A, K).
+- **An inventory of the old build's processes at the upgrade, and a `board node release` command** (round 2): the
+  inventory cannot be complete (H3-06); a release is an override the contract would have to carve out, and ending
+  the processes or restarting the machine does the same (H3-13).
+- **Keeping the launch's lock descriptor open in the provider, and killing a leaderless group's older members**
+  (round 2): the first gave little once the record is written before `exec`; the second signals processes on an
+  inference (H3-12, H3-13).
+- **Identifying a launch's processes by who has its lock file open** (`lsof`), by an environment tag, or by a
+  start-time stamp of the node: each can name a process that is not ours (H2-05, C, H1-12).
+### M. Open questions for the owner
+
+**Answered 2026-11-24.** The owner approved the design "as recommended": answer (a) to every question below. So:
+the token is left as it is and the boundary stated (1); no guard (2); the escaped tool stays a named limit (3); the
+human's own message is not held by a run (4); the clock is left (5); a dispatched run gets its directory to itself
+(7); a turn the listing leaves out is stopped (8). Question 6 is a question of fact, and the approval does not
+answer it: the design goes on as if no machine runs both the dispatcher and a `board node` on the same directories.
+If the 2nd Mac does, it has today's protection until the follow-up design in 6 (b). Removing `human.token` from the
+main laptop (1) is the owner's to do, if nothing there uses it. The table is kept as it was put.
+
+| # | question | recommended | alternatives, and what they cost |
+| --- | --- | --- | --- |
+| 1 | **The node's token** is readable by any provider with a shell (E). What to do about it? | (a) leave it and state the boundary (the checkout rules defend against faults, not a hostile same-user process); remove `human.token` from the main laptop if nothing there uses it. Reason: it is one of seven readable token files there, and the boundary is already the OS account | (b) also detect a second holder: a change on node and hub, with a rule so that an ordinary restart is not flagged; a Needs-you item when two live processes use the token; covers that token only. (c) move it to the login keychain: stops accidental reads only, makes the node depend on an unlocked keychain, needs measuring. (d) a second OS account for the node and its providers: it puts the human's token and the hub's database out of their reach, while the providers still share the node's own token with the node; a project of its own |
+| 2 | **Build the guard process?** | (a) no: the launch step and the ledger (D-3). Reason: smaller, no process left behind, and it stays out of the provider's process model while steering changes it. Its price: what recovery cannot show gone holds its directory; a run in that state is reported without its checkout's state, which, where the hub would decide a takeover from that report, blocks it until other evidence comes or the human resolves it; and the launch step's report of a start can be wrong in the two ways K names | (b) yes, after step 3: when the node dies its providers are asked to stop then, and a leaderless group stays identifiable for as long as the guard itself lives; costs a process per provider and the R10-01 work in `session_host.py` |
+| 3 | **A tool that leaves its process group** (F) | (a) name the limit, build nothing. Reason: nothing an unprivileged process can do on macOS closes it | (b) the node lists the process table every few seconds, remembers each provider's descendants and treats one that outlives its group as an occupant: catches slow escapes, misses one that detaches within an interval. (c) run each launch in a container or virtual machine of its own, torn down and checked before the directory is used again: closes it, a project of its own. A second OS account does not close it |
+| 4 | **The human's own message beside a dispatched run**: today it is written at once | (a) keep "the human's own never waits" for a checkout; it still keeps its place in the queue, so behind an automatic message the node holds back it waits, and after a turn beside a run its session's process is stopped unless your next message is already there for the node to hand over, so a later message waits for a new process; the host's own reasons to replace a process still apply (K). Reason: it is the owner's explicit rule and the human can see the run | (b) hold it like an automatic message while a run is in the directory: the human's turn no longer overlaps a run (a kept lending parent still can), and a message of yours can wait for a run to finish |
+| 5 | **After a sleep**, should the node end every turn and run on wake once the real time without the hub is over 90 s? | (a) no: leave the clock. The node stops what the hub settled (D-1), the rest carries on, and a run offered meanwhile waits. Reason: time asleep is not time a turn ran unseen, and a lid closed for five minutes should not cost a turn | (b) yes: a sleep-counting clock, plus a stop that is owed until carried out (it must survive the first reply after the wake, and reach runs and turns a CLI began itself). Costs every turn and run in flight whenever the time without the hub, asleep or awake, passes 90 s across a sleep, and one more step in the build |
+| 6 | **Does any machine run both the dispatcher and a `board node` on the same directories?** (the 2nd Mac, for instance) | (a) if not: nothing to do; it stays a limit in K | (b) if so: a follow-up design in which the dispatcher gives those runs to the node, so that one launcher owns each directory. Until then such a machine has today's protection |
+| 7 | **A dispatched run gets its directory to itself**: an idle hosted session's process there is stopped first (rule 2 b, D-2) | (a) as designed. Reason: both CLIs can begin a turn by themselves and nothing else keeps such a turn from starting beside a run; and it is the simplest rule to get right. Costs: an idle session's process is stopped whenever a run takes its directory (its next message pays one process start and a resume); the run starts later (G); the run's start also waits behind the session runner's local work, Git on worktrees included (K); a turn a CLI had begun by itself is cut off unless the host knows of it, in which case the run waits for it; until the turn-correlation step has merged, a Claude session the host wrongly believes idle can be stopped in mid-turn, or, if it is a lending parent, have a run start beside it; and a full-access child whose parent was stopped waits for the parent's next process (K) | (b) let idle session processes stay beside a run: nothing is stopped and no run waits for one; a turn a CLI begins by itself can run beside a run, as today. The run's start would then read, under the same lock, what the host already knows of each session's inbox and turn in flight (L) |
+| 8 | **A turn the hub's listing leaves out is stopped, and nothing is reported for it** (D-1). Normally the hub settled it. If instead its record on the hub is damaged, the turn is lost on the node and the hub's record stays as it was. Either way, a result turn stopped before the host read its start can have its results delivered once more, and with one kind of damage the hub goes on holding the session's checkout (K) | (a) stop it all the same. Reason: the node cannot tell the two apart without a change to the hub, a damaged record is not a turn anyone can follow, and sending nothing adds no report that such a record would refuse (a report already waiting for it still stalls the node, as on main, K) | (b) add an explicit list of settled messages to the hub's listing and stop only those: a hub change and a protocol field, and the hub must then keep settled messages listed for as long as a node may hold them (today it prunes them), for a case that needs a corrupted row |
+
+### N. Where part Q's open findings went
+
+| finding | now |
+| --- | --- |
+| R10-01 the host must track the guard and the provider apart | no longer applies: no guard (L); the launch step becomes the provider, one process as today |
+| R10-02 the tokenless replacement and boot checks are unsound | met differently: a replacement signals only a group whose leader it finds, in one listing, with the pid and start time the leader itself recorded before the provider ran; members left without a leader are never signalled on a guess; the boot is named by `kern.bootsessionuuid`; what it cannot identify is `unknown` and holds; no hub release rests on any of it (rule 1) |
+| R10-03 exit proof must be process-scoped | met: one record per launch, its group id and start time written by the leader itself before the provider runs; gone is decided per launch (D-3) |
+| R10-04 a reservation that outlives its claim | harmless for work a node starts (D-2); the hub-side exchange is a follow-up (L) |
+| R10-05 checkout aliases, shared mounts, an older dispatcher | aliases: the registry compares device and inode (D-2); shared mounts and the dispatcher's own runs are limits (K) |
+| R10-06 its tests | J, step 3 |
+
+### O. Conditions for code review
+
+Not design questions, but each must be shown in the PR that builds it. - Step 2: the group of every process the OS
+created is registered and held until gone, on every error path of the spawners and of the node's own code after the
+fork; only a message whose kind is exactly `user` passes the gate as the human's; a directory whose identity cannot be
+read holds an automatic hand-over as well as a start; the lending exception applies only to a session with a live
+group, no message, and no turn of its own that the host has seen; no hub call is made while the admission lock is
+held; a run is parked for only when parking is all that stands in its way; a failed spawn leaves a handle the node can
+reap and a path that goes on stopping the group, through a shutdown too; no shutdown path drops a group that is still
+there; the admission-race test keeps the winner running while the loser is tried; the registry keeps what it needs to
+see a group gone after `SessionHost.stop_all` has cleared the session's own handle, a SIGTERM that arrives during a
+spawn included; a Codex `-C`/`--cd` path that is not plain refuses the run before anything is spawned; whatever the
+node keeps for a run or a session on disk (a browser's output, a session's settings and MCP files) is neither deleted
+nor replaced while its group is still held (appending to its log and updating the node's own state go on); parking
+beside a run happens before the same pass hands anything over, except a human's message eligible in that pass, and
+that exception only skips the parking; every change the run loop makes to the registry is made under the admission
+lock, with no hub call inside it; the shutdown gate closes before either loop signals a child, and a SIGTERM that
+arrives inside the spawn itself, before the spawner has a handle, loses no group; a session about to start keeps its
+directory's identity, and a comparison that cannot be made holds the run; only a completed hand-over skips the
+parking. - Step 3: a leader's identity is the kernel's raw start time, the same value read by the launch step for
+itself and by recovery, unaffected by the time zone; a start time that cannot be read leaves the entry unresolved,
+never gone; a marked start is judged only once the status pipe has ended; launches with a ledger entry never go
+through the state file's pid check, whether the node hosts sessions or not; a global hold is lifted, and a rollback
+approved, only after the boot's name was read and every entry classified, and the holds on single directories are in
+place before the global one goes; that classification needs no hub call and no session hosting, and is done again
+after a first hello that failed; a launch counts as never spawned only when its lock file is known to be absent, not
+when the look failed; `board node check` uses the same classification and never signals or removes anything; while the
+boot's name or an entry cannot be read, the state file's pid check is not run for any item that cannot be shown to be
+older than the ledger; the launch step leaves the provider the signal dispositions a direct spawn gives it (Python
+ignores SIGPIPE in itself and must put the default back before the `exec`); `board node check` and recovery share one
+classification; the launch step holds nothing open across the `exec` but what the provider had before.
+- Every step: the pinned tests of main that describe behaviour this design keeps (the node's fetch and the
+  dispatcher survive a failing wake pass; the hub's release rule) stay as they are.
+
+### P. Review rounds
+
+**Round 1** (gpt-6.2-sol, on dc6f70f: NOT SOUND, H1-01 to H1-15). The design then had hub changes (a final loss, a
+fail-closed read, a claim exchange, alias refusal), a sleep-counting clock, a shared ledger for other launchers and
+an alive stamp. Most findings were against those; they were removed and the node's part kept.
+
+**Round 2** (on 4f23cf6: NOT SOUND, H2-01 to H2-16). It judged H1-04, H1-07, H1-09, H1-10 and H1-13 settled and
+reopened the rest in sharper form. The answer added per-message claims bound to directories, a check of the started
+process's directory, an upgrade inventory, a release command and a kill of a leaderless group's older members.
+
+**Round 3** (on d924949: NOT SOUND, H3-01 to H3-15). It judged H2-02 (within step 3), H2-03, H2-04, H2-09, H2-14 and
+H2-15 settled. Nearly all of its findings were against what round 2 had added. This round takes those additions out
+again (L) and makes the rule coarser and simpler: a run needs the directory to itself, and the registry asks only
+whether a process is there. The table is where every finding stands.
+
+**Round 4** (on fe2faab: NOT SOUND, H4-01 to H4-12). It judged H3-04, H3-05, H3-06, H3-07 (for separate installs),
+H3-10, H3-11, H3-12, H3-13 and H3-14 settled. Its findings were narrow, and each is answered by a narrower claim, a
+named limit, or the kernel's own answer in place of a listing.
+
+**Round 5** (on d91e286: NOT SOUND, H5-01 to H5-10). It judged every round-4 finding settled except the launch
+step's start-up reading (H4-05), the aggregate watchdog delay (H4-10) and some baseline wording (H4-11), and raised
+two blockers, both in step 3: the order of lock and read at recovery (H5-01, which the text had lost in an edit)
+and the empty end of the status pipe (H5-02). The rest were prices and limits to name.
+
+**Round 6** (on f441d4f: NOT SOUND, H6-01 to H6-09). It judged H5-01, H5-04, H5-06, H5-07 and H5-09 settled. Three
+blockers, each a sentence: a spawner that fails after the process exists must not lose its group, already in step 2
+(H6-01); the same PID namespace across node processes is an assumption (H6-02); a marked start is judged only when
+the status pipe has ended, and the deadline has one outcome (H6-03). The rest were prices to name (H6-04, H6-05)
+and conditions to pin (H6-06).
+
+**Round 7** (on 2c07b3b: NOT SOUND, H7-01 to H7-09). It judged H6-01, H6-02, H6-03, H6-04 and H6-06 settled. One
+blocker, an assumption to state: every node process and `board node check` must find the same lock and ledger
+(H7-01). The rest were assumptions, prices and conditions to add (H7-02 to H7-08).
+
+**Round 8** (on bf150f3: NOT SOUND, H8-01 to H8-08). It judged H7-02, H7-03, H7-05, H7-07 and H7-08 settled. Two
+blockers: the boot's name must be the same for every node process and unreadable must hold, not clear (H8-01); and
+no check of names can prove a worktree unused, so cleanup waits until the node has nothing registered at all
+(H8-02, the reviewer's own simpler option). The rest were the rollback procedure's wording and prices (H8-03 to
+H8-06) and conditions (H8-07).
+
+**Round 9** (on 7feb190: NOT SOUND, H9-01 to H9-06). It judged every round-8 finding settled. One blocker: a Codex
+`-C` path with `..` or a symbolic link in it means one directory to the node and another to Codex (H9-01). Such a
+path now refuses the run. The rest were two hub-side costs to qualify (H9-02) and tests to pin (H9-03).
+
+**Round 10** (on c2b7ed8: NOT SOUND, H10-01 to H10-07). It judged H9-01 settled. One blocker, a disagreement inside
+the text: D-2 lets the human's next message keep a session's process up beside a run, while rule 2 e, K and
+question 4 said the process is stopped (H10-01); all four now say the same. The rest: a restart withdrawn in both
+places the host holds it (H10-02), the takeover cost qualified where it was still stated flatly (H10-03), two
+conditions (H10-04), and B1's opening claim (H10-05).
+
+**Round 11** (on a540c42: NOT SOUND, H11-01 to H11-06). It judged H10-02, H10-03, H10-04 and H10-06 settled. One
+blocker: the exception for the human's next message promised a hand-over the node cannot always make (it has the
+text of the first queued message only, and none after a failed fetch); the exception is now limited to a message
+the node can hand over in that pass (H11-01). The rest: which ledger failures hold everything (H11-02), a
+condition on deleting a run's output (H11-03), and wording in B, D and K (H11-04).
+
+**Round 12** (on 4c34087: NOT SOUND, H12-01 to H12-08). It judged every round-11 finding settled. One blocker: the
+run loop could see a run's leader gone and a session start in that directory before the registry said `stopping`;
+the run loop's changes to the registry now go through the admission lock (H12-01). The rest: when the state row
+gets its launch id (H12-02), that the human's-message exception only skips the parking (H12-03), conditions
+(H12-04) and two availability costs to name (H12-05).
+
+**Round 13** (on f648c7a: **SOUND**, with H13-01 to H13-05 as conditions). It judged every round-12 finding
+settled but K's wording on H12-03, confirmed B, the stages and the version boundary, and listed five should-fix
+items, none of which makes the contract false: a session about to start keeps its directory's identity (H13-01);
+what happens to a run whose node died before saving its row (H13-02); only a completed hand-over skips the
+parking (H13-03); shutdown, recovery and kept-files boundaries (H13-04); wording in G, H, K and M (H13-05). They are
+folded into the text in the commit after the verdict (A, D-2, D-3, G, H, J, K, M, O), which the reviewer has not
+read again. Two trims the reviewer offers stay open for the owner: clean up other boots' folders later than
+start-up; and drop `board node check` if a restart of the machine is accepted as the only way back from step 3.
+
+| finding | now |
+| --- | --- |
+| H1-01, H2-02, H3-03, H4-07 a turn can run that no claim covers; a Claude result can make a working session look idle | met by not tracking turns: a run starts only with no session process in the directory, idle ones are stopped first (rule 2 b, D-2). Idle is what the host has seen; main's Claude gap is named with both of its outcomes and tied to the turn-correlation step (A, K, question 7) |
+| H2-08, H3-04 parking and the lending parent | met: the exception is worked out under the same lock as the run's start, only for an idle parent, with `_lends_full` as it is; a parent that stops lending is parked by rule 2 e (D-2, K) |
+| H1-04, H3-02, H4-01 claim lifecycle; a session whose process went while it held a message | met: no claims and no mark. "About to start" is read from the host under the admission lock: a session that holds a message and has no process, however it lost it (A, D-2, J) |
+| H1-05, H2-01, H3-01, H4-06, H9-01 the directory that is checked | met by stating the assumption, from the node's first look at a directory for a piece of work until that work is gone, for every name it is reached by (A, K); the rendered `-C`/`--cd` is registered, and accepted only as a plain path that the node and Codex read alike (D-2); the after-the-fact checks are removed (L) |
+| H1-02, H2-04 a live group with no recorded id; a stale read | settled in round 3 (the launch step records itself before `exec`; recovery takes the entry's lock first) |
+| H1-12, H2-05, H3-12 recovery signalling the wrong group | met: recovery signals only what main's recovery signals (a leader verified by pid and start time), re-reading the start time before each signal; no `lsof`, no stamp, no kill of leaderless members; the gap that remains is main's and is stated without a bound (D-3, K); C corrected |
+| H1-03, H2-03 two launchers | settled within scope in round 3; the lock's path now comes from the account, not from `HOME` (D-1) |
+| H1-06, H2-09 lost run reports | settled in round 3 by deferring (L, K) |
+| H1-07 the sleep clock | settled in round 2 (K, question 5) |
+| H1-08, H2-07, H3-10, H8-05, H10-01, H11-01, H12-03 the human's message and a run | met by saying it: the human's message is held by no run but keeps its place in the queue, and behind an automatic message the node holds back it waits, which is new where the hub was wrong; after the human's turn the process is stopped unless the human's next message is one the node can hand over in that pass, said the same way in rule 2 e, D-2, J, K and question 4 |
+| H1-09, H1-10, H1-13 | settled in round 2 (no hub change) |
+| H1-11, H2-06, H2-12, H3-06 the stages and the first upgrade | met: three steps, each stating what it gives (A, I); the guarantee across restarts is for processes a step-3 build started; no inventory: a restart of the machine at the upgrade, or today's protection for that one start (H, K) |
+| H3-07, H4-09, H5-07, H6-02, H6-04, H7-01, H7-02 recovery reports; going back; the node's own files; what one node process and the next must share | met: the ledger decides occupancy only; what is reported after a restart is still read from the install's own state file, and re-pointing one install at another hub is main's limit, named (D-3, K); going back needs every entry's processes gone, not its files (H); a run whose launch is `unknown` is reported without a checkout state (D-3); at a shutdown too, and what that costs a takeover is named (K, question 2); the node's own files, one state folder, one name for the boot, and unchanged PID and time namespaces are assumptions; incomparable identities and an unreadable boot name hold; everything that could start work stays off through a rollback, and the check runs in the node's own view (A, D-3, H, K; H8-01, H8-03) |
+| H2-10, H3-05, H4-03, H5-03, H5-04, H7-03, H10-02 omission | met: a held turn the listing leaves out is stopped and nothing is reported for it, so a damaged record cannot hold up the node's reports; the lost turn, a result that can be delivered again, and main's own stall on a refused report are named and put to the owner (D-1, K, question 8) |
+| H2-11, H3-08, H4-02, H4-08, H12-01 observation, reap, worktrees | met: states are what the node has observed (A); any group holds a run back; "gone" is the kernel's "no such group", from step 2, and no listing decides anything (D-2, K); a worktree is removed only when the registry is empty and nothing is about to start, under its lock, from step 2 (D-2, K; H5-06, H7-04, H8-02) |
+| H3-09, H4-04, H4-05, H5-01, H5-02, H6-01, H6-03, H11-02, H12-02 wrapper start is not provider start; a process created and then lost; records that cannot be read; recovery reading before locking | met: the launch exists from its first json, written before anything is spawned, in a folder per boot; the launch step writes a mark on the status pipe just before `exec`, so no mark means nothing ran and the one instant in which a start is wrongly reported is named; recovery takes the entry's lock before it reads the json; the pipe is judged only when it has ended, a pipe still open at the bound is a timeout whatever was read, and the two readings that can be wrong are named; a group the OS created is held until gone on every path, from step 2, spawners included; an unreadable record or folder closes every directory, remnants are ignored, and a launch's state-file row names its launch id (D-2, D-3, K, O) |
+| H2-13, H3-11, H4-10, H5-05, H6-05, H7-05, H7-06, H8-04, H9-02, H10-03, H10-06, H12-05 costs and scope | corrected (also: the 1 s bound on reading the launch step's status, whose sum over several starts can delay the watchdog and is named in K; a node that hosts no sessions asks the registry directly; question 4's alternative): the delay of parking, the wait for a Codex turn the host knows of, the cut-off of a Claude turn, the second account (D-2, G, K, questions 1 and 7) |
+| H1-14, H2-14, H3-14, H4-11, H5-08, H6-06, H6-07, H7-07, H8-06, H8-07, H9-03, H9-04, H10-04, H10-05, H11-03, H11-04, H12-04, H12-06 baseline claims; conditions for code review | corrected in B, D, G, K and M; the conditions are part O (an explicit `user` kind, the kernel's raw start time); the live-reap gap main has is named (K) |
+| H1-15, H2-15, H3-13, H5-09 trims | taken: no waiting-run marker, no release command, no descriptor left in the provider, no parking when something else already holds the run, one log line for an `unknown` entry, no disk syncs for the launch record, and no second start-time probe after a spawn (H6-08, H7-08) |
