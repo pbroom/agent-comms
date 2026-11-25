@@ -1098,36 +1098,41 @@ class SessionHost:
 
     def _tick(self, now: float, out: list[HostEvent]) -> None:
         with self.one_drain_budget():
-            # Every exit first: a leader that went by itself leaving members of its group is registered as stopping
-            # (`_reap`) before this pass starts any process, so nothing it starts goes beside such a group.
-            for s, at in self._pass_order(now):
-                if s.child is not None and s.stopping_since is None:
+            for group, at in self._pass_groups(now):
+                # Every exit first: a leader that went by itself leaving members of its group is registered as
+                # stopping (`_reap`) before this pass starts any process, so nothing it starts goes beside such a group.
+                for s in group:
+                    if s.child is not None and s.stopping_since is None:
+                        try:
+                            self._read(s, at(), out)
+                            self._reap(s, at(), out)
+                        except Exception as e:
+                            log.exception("session %s failed", s.session_id)
+                            if not s.ended:
+                                self._end(s, f"host error: {type(e).__name__}", at(), out)    # (rule 2: no drain)
+                for s in group:
                     try:
-                        self._read(s, at(), out)
-                        self._reap(s, at(), out)
+                        self._pass(s, at(), out)
                     except Exception as e:
                         log.exception("session %s failed", s.session_id)
                         if not s.ended:
-                            self._end(s, f"host error: {type(e).__name__}", at(), out)    # (rule 2: no drain)
-            for s, at in self._pass_order(now):
-                try:
-                    self._pass(s, at(), out)
-                except Exception as e:
-                    log.exception("session %s failed", s.session_id)
-                    if not s.ended:
-                        self._end(s, f"host error: {type(e).__name__}", at(), out)
+                            self._end(s, f"host error: {type(e).__name__}", at(), out)
 
-    def _pass_order(self, now: float):
-        """The sessions in the order a pass handles them, each with the time to date its work by. With no live steer
-        attempt this is main's: every session in order, at the pass's `now`. With one, every session holding none
-        comes first, in main's order and at `now`, so no drain can delay its stop, signal or timeout (R4-06); then
-        the sessions holding one, each dated when its turn comes (never backdated past another's drain)."""
+    def _pass_groups(self, now: float) -> list:
+        """The sessions a pass handles, in groups, each group with the time to date its work by; each group gets
+        both of the pass's loops (every exit, then every session's pass) before the next. With no live steer attempt
+        this is main's pass: one group, every session in order, at the pass's `now`. With one, the sessions holding
+        none come first, in main's order and at `now`, so no drain (in a reap, a timeout, a broken pipe or the cut)
+        can delay their stop, signal, timeout or start (R4-06); then the sessions holding one, each dated when its
+        work is done (never backdated past another's drain). (A live attempt's exit is then registered after the
+        ordinary sessions' starts in that pass: none of them can be one in N's checkout, which is busy on the hub
+        until N's end is reported.)"""
         sessions = list(self.sessions.values())
         live = {id(s) for s in sessions if self.live_attempt(s)}
         if not live:
-            return [(s, lambda: now) for s in sessions]
-        return ([(s, lambda: now) for s in sessions if id(s) not in live]
-                + [(s, self.clock) for s in sessions if id(s) in live])
+            return [(sessions, lambda: now)]
+        return [([s for s in sessions if id(s) not in live], lambda: now),
+                ([s for s in sessions if id(s) in live], self.clock)]
 
     def _pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
         gates = self._steps(s, now, out)

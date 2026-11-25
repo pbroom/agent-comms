@@ -4149,6 +4149,37 @@ def test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it(hen
     assert all(e.steer == {"outcome": "unconfirmed", "why": "turn_cut"} for e in ended_of(events) if e.session_id != plain)
 
 
+def test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass(henv):
+    """Rule 3 / R4-06 across the pass's two loops: a steered session whose process exited while still writing is
+    reaped (and drained) in the same pass in which an ordinary session's turn timeout falls due: the ordinary one is
+    stopped at the pass's own time, as on main, before any drain."""
+    import uuid as uuid_mod
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    host.sessions.pop(SID)
+    steered_id = str(uuid_mod.uuid4())
+    ch = _codex_steered_in(host, henv, steered_id, "u1")
+    plain = _codex_steered_in(host, henv, SID, None)          # opened last: main's order handles it last
+    henv.clock.advance(31 * 60)
+    host.tick()                                 # both turns' interrupts are written
+    henv.clock.advance(henv.config.kill_grace_seconds - 1)
+    host.tick()
+    henv.clock.advance(1)
+    plain.exits_on_terminate = False
+    at, real = {}, plain.terminate
+
+    def term():
+        at.setdefault("plain", henv.clock())
+        return real()
+    plain.terminate = term
+    _endless_after_first(ch, henv.clock)
+    ch.code = 0                                 # the steered process exited, still writing: its reap drains
+    t = henv.clock()
+    events = host.tick()
+    assert at.get("plain") == t and host.sessions[SID].stopping_since == t, "the ordinary timeout is main's"
+    assert {e.session_id for e in ended_of(events)} == {SID, steered_id}
+
+
 def test_sd_the_cancels_of_one_listing_share_one_drain_deadline(env):
     """Rule 3: a listing that cancels two steered turns, each process still writing without end, is one pass: its
     two cancels share ONE drain deadline (2 s in all, not 2 s each)."""
