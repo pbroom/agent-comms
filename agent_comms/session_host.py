@@ -166,6 +166,9 @@ class Session:
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
     held_since: float | None = None     # since when the next message waits for a turn of the provider's own
+    # The host's gates (turn gate open, `may_start`) as read ONCE in this pass, for turn correlation's budget and the
+    # write timer alike (`_gates`; None: not read yet in this pass). Only ever read for a message with a budget.
+    gates: tuple[bool, bool] | None = None
     # Turn correlation (a verified Claude incarnation only): where the staged turn starts in `outbuf` while none of
     # it is accepted, and how many bytes it is (only for an adapter that asks, `barrier_before_first_byte`).
     turn_at: int | None = None
@@ -851,6 +854,7 @@ class SessionHost:
         return out
 
     def _pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        s.gates = None      # read afresh, once, in this pass (`_gates`)
         self._steps(s, now, out)
         self._mark(s, now)
 
@@ -1127,14 +1131,15 @@ class SessionHost:
             self._unstage(s, now, out)
 
     def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent]) -> None:
-        if (s.writing is not None and s.turn_at is not None and s.writing.counted is not None
+        if (s.writing is not None and s.turn_at is not None and s.writing.counted is not None and s.writing.earned
                 and self._counting(s, s.writing)):
-            # ONE clock at every pass for a message staged with not one byte accepted (review round 11): its budget
-            # while its counted state holds (`_budget`, earlier in this pass; not this staging's write timer, C5-01,
-            # C6-01), and otherwise main's write timer from the staging, below, exactly as on main: while the host
-            # withholds it (`may_start` false: a latch the watchdog does not see), with no budget, or once an
-            # unearned budget is dropped (C7-01, at that very pass). The write timer never restarts while the line
-            # stays staged, so it never gets more than that timer plus its counted budgets.
+            # ONE clock at every pass for a message staged with not one byte accepted (review rounds 11 and 12): an
+            # EARNED message's budget while its counted state holds (`_budget`, earlier in this pass; not this
+            # staging's write timer, C5-01, C6-01); otherwise main's write timer from the staging, below, exactly as
+            # on main: while the host withholds it (`may_start` false: a latch the watchdog does not see), with no
+            # budget, or with one not earned (a candidate's, an other version's: main's path, entirely, C7-01). The
+            # write timer never restarts while the line stays staged, so it never gets more than that timer plus its
+            # counted budgets; and the gates are the pass's one reading (`_gates`), the budget's too.
             return
         if s.busy_since is None:
             return
@@ -1277,9 +1282,17 @@ class SessionHost:
         """The host-side conditions under which the host itself withholds a session's next (or staged) message, for
         both counted states (`_counting`): a handshake or a settings check pending, the turn gate closed (main
         withdraws a staged line then, TURN_WITHDRAWN, later in this pass), `may_start` false."""
-        return bool(s.checking or (s.provider.waits_for_ready and not s.ready)
-                    or (self.turn_gate is not None and not self.turn_gate(s))
-                    or (self.may_start is not None and not self.may_start()))
+        turn_gate, may_start = self._gates(s)
+        return bool(s.checking or (s.provider.waits_for_ready and not s.ready) or not turn_gate or not may_start)
+
+    def _gates(self, s: Session) -> tuple[bool, bool]:
+        """The turn gate and `may_start`, read once per pass (review round 12): the budget, its end mark and the
+        write timer's choice of clock all see the same reading, so a gate that closes in the middle of a pass cannot
+        let the budget count before the write timer is asked."""
+        if s.gates is None:
+            s.gates = (self.turn_gate is None or bool(self.turn_gate(s)),
+                       self.may_start is None or bool(self.may_start()))
+        return s.gates
 
     def _budget(self, s: Session, now: float, out: list[HostEvent]) -> bool:
         """THE one place that adds counted time, once every pass, after its reads and before any timeout or write
@@ -1326,9 +1339,11 @@ class SessionHost:
         its line is accepted (`_write`), whatever the process's verification state is meanwhile; with VERIFIED
         empty no message ever has one, and its path is main's. It counts only COUNTED time (`_counting`), kept
         across unstages, restagings, the end of the CLI's turns and a downgrade. When it reaches the timeout:
-        - a first budget that was not EARNED (`earned`: never in a counted state under a process verified at the
-          time; a candidate that never verified, or reported another version) is dropped: False, and the message is
-          on main's path from here (a staged one: main's write timer, which runs out at this very pass; C7-01);
+        - a budget not EARNED (`earned`: never in a counted state under a process verified at the time; a
+          candidate that never verified, or reported another version) is never acted on: False. Its message is on
+          main's path, entirely (main's write timer is its one clock, `_hold_to_timeout`; review round 12): the
+          budget only keeps its byte span, so the line can be taken back should the process verify, and its count
+          (C7-01's drop at the deadline is a consequence of that and is gone);
         - an earned first budget is the 7b restart: True; the message stays (or goes back, unstaged) first in the
           inbox, its second budget starts from nothing, and its process is stopped;
         - a second budget: True; it fails as main's `_held` fails it, never written.
@@ -1336,9 +1351,8 @@ class SessionHost:
         pass), and the first one never fails it; its wall time is unbounded only by host-side waits, as on main."""
         if msg.counted is None or msg.counted < self.timeout_minutes * 60:
             return False
-        if not msg.recovered and not msg.earned:
-            msg.counted = msg.counted_at = None     # never counted under a verified process: main's path (C7-01)
-            return False
+        if not msg.earned:
+            return False        # main's path, entirely: its write timer decides (C7-01, review round 12)
         if s.writing is msg:
             self._unstage(s, now, out)      # exactly its own bytes leave the buffer: it is first in the inbox again
         if not msg.recovered:

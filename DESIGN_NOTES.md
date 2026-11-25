@@ -9188,10 +9188,13 @@ zero-turn task notification `result` did the same to a turn in flight.
     host withholds is main's: the turn gate closing withdraws it (TURN_WITHDRAWN) and a new binding does
     (BINDING_CHANGED), later in that pass, as on main; with `may_start` false it stays staged (main keeps writing
     it), charged nothing, and main's write timer from its staging governs it. **One clock** (review round 11): at
-    every pass a message staged with not one byte accepted is governed by exactly one clock: its budget while its
-    counted state holds (`_hold_to_timeout` then leaves it to `_budget`), otherwise main's write timer from the
-    staging, exactly as on main (main's failure, detail and time), whether or not it has a budget, for verified,
-    other-version and no-init processes alike. The order in a pass (review round 10): the reads; a staged message
+    every pass a message staged with not one byte accepted is governed by exactly one clock: an EARNED message's
+    budget while its counted state holds (`_hold_to_timeout` then leaves it to `_budget`), otherwise main's write
+    timer from the staging, exactly as on main (main's failure, detail and time), for verified, other-version and
+    no-init processes alike. **An unearned message is on main's path, entirely** (review round 12): its write timer is
+    its one clock at every pass, whatever its counted state; its budget keeps the byte span (so the line can be taken
+    back should the process verify) and keeps counting, but neither acts nor suppresses anything until `earned`.
+    The host's gates are read once per pass (`_gates`), for the budget and the write timer's choice alike. The order in a pass (review round 10): the reads; a staged message
     the CLI's new turn takes back (`_take_back`, the unstage); then the budget; then timeouts and writes, where
     main's withdrawals happen. **One place adds it**
     (`_budget`, every pass, after the reads and the take-back, before any timeout or write decision): the interval
@@ -9214,9 +9217,9 @@ zero-turn task notification `result` did the same to a turn in flight.
     observed: each line read, the hold, a staging, each budget step; a wait the host imposes earns nothing; a later
     downgrade does not take it away), or it is the second
     budget of a message that earned its first. Otherwise (a candidate that never verifies, or reports another
-    version) the budget is dropped at its deadline and the message is on main's path: main's write timer, which runs
-    out at that very pass (the staging started both), main's failure, at main's time, with no restart and no
-    requeue. A verification read in the pass at which the budget is found spent counts (the pass's reads come
+    version) the message is on main's path, entirely: main's write timer is its one clock, main's failure, at main's
+    time, with no restart and no requeue; its budget never acts (review round 12; before it, the budget was dropped
+    at its deadline, which the write timer reached at the same pass). A verification read in the pass at which the budget is found spent counts (the pass's reads come
     first, as for C6-02). A message with no budget, in a process that cannot be verified, is main's path, untouched:
     with VERIFIED empty no message ever gets one;
   - **the inbox owns the hold: a message is never held while staged** (review round 4). While the adapter reports an
@@ -10047,19 +10050,73 @@ expiry, the escaped version).
 - **[should] `shown_version`**: the input is sliced to 64 characters before it is escaped (bounded work whatever
   the init's size), and the rendered text is capped at 64 too, its length said when cut.
 
-**Mutation check** (round 11; scratchpad `correlation/mutate13.py`: the rows on the staged state's clock, `_counting`'s staged branch and the logged version, rewritten where round 11 changed their lines, and rows for the new lines): 8 of 9 caught. The one left is EQUIVALENT: taking the budget's branch out of `_hold_to_timeout` altogether, so that main's write timer also runs while the counted state holds; in that state every interval since the staging is counted, so the budget holds at least the write timer's span and is compared earlier in the same pass: the write timer can never run out first (round 6's argument, now only for the counted state; outside it the write timer is the clock, row C11).
+**Mutation check** (round 11; scratchpad `correlation/mutate13.py`: the rows on the staged state's clock, `_counting`'s staged branch and the logged version, rewritten where round 11 changed their lines, and rows for the new lines): 8 of 9 caught. The one left was taken for EQUIVALENT, wrongly (review round 12: taking the budget's branch out of `_hold_to_timeout` altogether is distinguishable: a verified stage latched at t=40 and reopened with a writable pipe at t=65, no pass between, is written under the branch and times out without it, as the interval across the latch is not counted; now `test_c12_a_verified_stage_latched_then_reopened_follows_its_budget`, and caught in round 12's table).
 
 | row or rule | caught by |
 | --- | --- |
-| C9 \| ... nor while may_start does | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate[may_start]` (6) |
+| C9 \| ... nor while may_start does | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate` (6) |
 | C10 \| a staged message the host withholds counts nothing | `test_c10_may_start_false_on_a_staged_message_charges_nothing_and_mains_write_timer_ends_it` (5) |
 | C10 \| ... nor one whose binding changed | `test_c10_a_binding_change_on_a_staged_message_is_mains_withdrawal_not_the_budget` (2) |
-| C10 \| the reported version escaped in the log | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (2) |
-| C10 \| ... used in the log line | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (7) |
+| C10 \| the reported version escaped in the log | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded` (2) |
+| C10 \| ... used in the log line | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded` (7) |
 | C11 \| one clock: the budget only while its counted state holds, else the write timer | `test_c10_may_start_false_on_a_staged_message_charges_nothing_and_mains_write_timer_ends_it` (6) |
 | C11 \| the version sliced before it is escaped | `test_c11_the_version_is_sliced_before_it_is_escaped` (1) |
-| C11 \| ... and the rendered text capped | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01]` (2) |
+| C11 \| ... and the rendered text capped | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded` (2) |
 | C6-01 \| a budgeted staged message in its counted state is governed by its budget, not the write timer | equivalent: none (0) |
+
+#### Review round 12 (Sol, on 44d0424: CHANGES, one blocker, one should) and what changed
+
+Sol: the latch held closed now matches main for all three runner kinds; `shown_version` resolved.
+- **[blocker] a reopened latch let an unearned budget take over.** M staged at t=0 (zero bytes, before any init),
+  the latch closed at t=5, and at t=60 the latch reopened with a pipe that took the line: a 2.1.329 and a no-init
+  runner delivered M, where VERIFIED empty times it out at t=60: once counting resumed, the provisional budget
+  suppressed main's write timer. Ruling: an unearned message is on main's path, entirely (the rule above). Done:
+  `_hold_to_timeout` leaves a staged message to its budget only when that budget is earned and in its counted state;
+  `_spent` never acts on an unearned budget. C7-01's separate branch (an unearned first budget dropped at its
+  deadline, `counted = None`) is now dead and removed: an unearned message's write timer, which the staging started,
+  ends it at main's pass whatever its budget holds.
+- **Becoming earned mid-staging** (a candidate that verifies, or the latch reopening under a verified process): the
+  budget is the clock from the pass at which the message is first in a counted state under the verified process (it
+  is earned there, in `_budget` before the clock is chosen, or by the line that verifies it), and main's write timer
+  before. The hand-over cannot end it earlier than main would: an unearned budget counts only since its staging (it
+  starts there, and the only way back to the inbox, the take-back, needs the CLI's own turn), so whatever it holds is
+  at most the wall time since that staging; the 7b needs the timeout of it, so it comes no earlier than main's
+  failure (staging plus the timeout), and the failure only after a second whole budget. Nor can it give more than
+  main's write timer plus two budgets of counted time: before the hand-over the write timer governs (at most its
+  span); after it, round 11's rule (at most the write timer's span outside counted passes, then only counted time,
+  which the two budgets bound).
+- **A verified process with an unearned staged message** is reachable only one way: the process verifies while the
+  host withholds the message (the latch), so it has had no counted state under it yet. Then main's write timer
+  governs (`test_c12_a_candidate_that_verifies_while_latched_is_unearned_until_a_counted_pass`: equal to VERIFIED
+  empty, the timeout at t=60), and the first counted pass earns it (`..._earns_at_the_first_counted_pass`: the 7b at
+  t=100, nothing ended before main's t=60). Staged under a verified process with its gates open, a message is always
+  earned at the staging. If the verifying init opens a turn of the CLI's own that still runs as the pass ends, the
+  line is taken back (the byte span is kept for that) and waits in the inbox behind the latch, a host-side wait, as
+  on main for a message in the inbox.
+- **Mid-pass gate reads**: the turn gate and `may_start` are read once per pass (`_gates`, `Session.gates`, reset as
+  each pass begins), so the budget, its end mark and the write timer's choice of clock share one reading
+  (`test_c12_the_gates_are_read_once_per_pass`: `may_start` open at the first reading and closed after, in one pass).
+- Tests first (the two reopen replays and the gate test failed on 44d0424):
+  `test_c12_a_reopened_latch_leaves_an_unearned_line_on_mains_write_timer[other, no_init]` (latch at t=5, reopen
+  with a writable pipe at t=60: main's timeout at t=60, every pass's events equal to the VERIFIED-empty run); the
+  two latched-verification tests above; `test_c12_a_verified_stage_latched_then_reopened_follows_its_budget` (the
+  should: an earned stage latched at t=40 and reopened at t=65 is written). The property test: an unearned budget
+  never acts and keeps its count (no drop); a delivery on a pass at which the line is overdue fails it unless an
+  earned budget in its counted state was that pass's clock; an unearned staged message's timeout must come at main's
+  time exactly (the first pass at or after its staging plus T, by the test's own computation); the "always a clock"
+  property now needs the message earned to be outside the write timer. It catches 44d0424's code at seed 4; 4000
+  seeds pass.
+
+**Mutation check** (round 12; scratchpad `correlation/mutate14.py`: the rows on the staged message's clock, the unearned budget and the once-per-pass gate reading): 6 of 6 caught, none left as equivalent (round 11's one is caught).
+
+| row or rule | caught by |
+| --- | --- |
+| C11 \| one clock: the budget only while its counted state holds, else the write timer | `test_c10_may_start_false_on_a_staged_message_charges_nothing_and_mains_write_timer_ends_it` (4) |
+| C11/C12 \| the budget's branch in _hold_to_timeout (round 11 took it for equivalent) | `test_c12_a_candidate_that_verifies_while_latched_earns_at_the_first_counted_pass` (3) |
+| C12 \| an unearned budget never suppresses the write timer | `test_c12_a_reopened_latch_leaves_an_unearned_line_on_mains_write_timer` (7) |
+| C12 \| an unearned budget never acts | `test_c7_01_a_candidate_that_never_verifies_is_mains_write_timer_and_failure` (5) |
+| C12 \| the gates are read afresh each pass | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate` (13) |
+| C12 \| ... and once within it | `test_c12_the_gates_are_read_once_per_pass` (1) |
 
 ### Not done
 
