@@ -50,6 +50,8 @@ STEER_LINE = ("If you are still working on that turn, take this into account the
 REFUSED = {
     "off": "steering is switched off on this hub ([dispatch.sessions] steer = false)",
     "unreadable": "steering is off on this hub: its [dispatch.sessions] settings could not be read",
+    "misplaced": ("steering is off on this hub: its settings set steer directly under [dispatch]; the switch is "
+                  "[dispatch.sessions] steer"),
     "rejected": ("steering is off on this hub: its settings were rejected at the last reload (fix board.toml or "
                  "board.local.toml; until they load, no new steer is taken)"),
     "ended": "the session has ended",
@@ -118,6 +120,8 @@ def off_reason(board: Board) -> str | None:
     - "unreadable": the settings in force do not validate: `[dispatch]` or `[dispatch.sessions]` present but not a
       table (`dispatch = false`, `sessions = []`), a value of the wrong type, an unknown key. Main's other readers
       of that table fall back to their defaults, which are off. Said once in the hub's log per change of the error.
+    - "misplaced": a `steer` key directly under `[dispatch]` (any value): the switch in the wrong place (follow-up
+      after #115). Said in the hub's log like "unreadable".
     - "off": `steer = false`.
     Absent (no `[dispatch]`, or no `[dispatch.sessions]`), steering is on: the design's default."""
     import contextlib
@@ -129,9 +133,16 @@ def off_reason(board: Board) -> str | None:
         rejected, d = getattr(board, "settings_error", None), getattr(board.s, "dispatch", None)
     if rejected is not None:
         return "rejected"
+    why = "unreadable"
     try:
         if d is not None and not isinstance(d, dict):
             raise ValueError("[dispatch] must be a table")
+        if isinstance(d, dict) and "steer" in d:
+            # (Follow-up after #115) `steer` directly under [dispatch], whatever its value: the switch, plainly meant,
+            # in the wrong place. Startup does not validate [dispatch], so without this a cold start would read no
+            # [dispatch.sessions] and steer on. (A reload rejects the key itself: "rejected" above.)
+            why = "misplaced"
+            raise ValueError("steer is set directly under [dispatch]; the switch is [dispatch.sessions] steer")
         on = SessionsConfig.from_dict((d or {}).get("sessions", {})).steer
     except (ValueError, AttributeError) as e:
         what = str(e)
@@ -139,7 +150,7 @@ def off_reason(board: Board) -> str | None:
             _unreadable_last = what
             log.warning("the hub's [dispatch.sessions] settings could not be read (%s): steering is off until they "
                         "can be", what)
-        return "unreadable"
+        return why
     _unreadable_last = None     # (read again: a recurrence is said again)
     return None if on else "off"
 

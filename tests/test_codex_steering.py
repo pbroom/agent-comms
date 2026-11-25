@@ -6705,3 +6705,62 @@ def test_r11_1_a_decision_during_a_recovering_reload_sees_the_new_table_never_th
     object.__setattr__(gated, "_armed", False)
     assert alive, "the decision waits for the reload to finish"
     assert out["applied"] is True and out["why"] == "off", "it read the new table"
+
+
+# ------------------------------------------------------------ follow-up after #115: the switch in the wrong place
+
+
+MISPLACED_WORDS = ("steering is off on this hub: its settings set steer directly under [dispatch]; the switch is "
+                   "[dispatch.sessions] steer")
+
+
+@pytest.mark.parametrize("value", ["false", "true", '"off"'])
+def test_followup_a_steer_key_directly_under_dispatch_at_a_cold_start_turns_steering_off(tmp_path, caplog, monkeypatch,
+                                                                                        value):
+    """Follow-up after #115 (review round 12): `steer` placed directly under `[dispatch]` instead of
+    `[dispatch.sessions]`, whatever its value, in the file a hub starts from. Startup does not validate `[dispatch]`
+    (unchanged), so the switch itself reads it: "misplaced", steering off, and the hub's one warning names the
+    right place."""
+    import logging
+    from agent_comms.config import Settings
+    from agent_comms.core import Board
+    monkeypatch.setattr(hosted_steer, "_unreadable_last", None)
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    path = tmp_path / "board.toml"
+    path.write_text(f'[server]\ndb_path = "{tmp_path / "b.db"}"\nagents_path = "{tmp_path / "a.toml"}"\n'
+                    f'[dispatch]\nsteer = {value}\n')
+    board = Board(Settings.load(path))
+    assert board.settings_error is None, "the hub starts as on main"
+    for _ in range(3):
+        assert hosted_steer.off_reason(board) == "misplaced"
+    said = [r.getMessage() for r in caplog.records if "settings could not be read" in r.getMessage()]
+    assert len(said) == 1 and "[dispatch.sessions] steer" in said[0], said
+
+
+def test_followup_a_misplaced_steer_key_refuses_new_steers_with_words_that_name_the_right_place(env):
+    """The refusal a sender gets on such a hub (settings as a cold start has them: never validated), and that an
+    accepted steer is still offered and settled."""
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    env.board.s.dispatch = json.loads(json.dumps(env.board.s.dispatch)) | {"steer": False}
+    refusal(env, sid, MISPLACED_WORDS)
+    tick(env)
+    [req] = steers_of(child)
+    answer_steer(child, req, {"turnId": cx.TURN})
+    end_turn(env, child)
+    assert steer_rec(env, sid)["outcome"] == "in_turn"
+
+
+def test_followup_a_misplaced_steer_key_at_a_reload_is_rejected_as_any_unknown_key(env):
+    """The reload path already refuses it: `Board.reload_settings` rejects `[dispatch] steer` as an unknown key and
+    keeps the last good settings, so new steers are refused as "rejected" until a reload succeeds."""
+    sid, child = codex_turn_in_flight(env)
+    _settings_file(env, "steer = true\n")
+    assert env.board.reload_settings(force=True) is True
+    _settings_file(env, "steer = true\n", extra="[dispatch]\nsteer = false\n")
+    assert env.board.reload_settings(force=True) is False
+    assert "steer" in env.board.settings_error and "dispatch" in env.board.settings_error
+    refusal(env, sid, REJECTED_WORDS)
+    _settings_file(env, "steer = false\n")
+    assert env.board.reload_settings(force=True) is True
+    refusal(env, sid, OFF_WORDS)
