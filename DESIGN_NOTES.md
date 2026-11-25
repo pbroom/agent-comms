@@ -9127,8 +9127,9 @@ notes are closed in one commit on top of the reviewed one.
 
 ## Checkout hardening for all turns and runs: design (2026-11-24)
 
-**Status: design only, no code. Reviewed SOUND by gpt-6.2-sol in round 13 (P), with conditions that are folded in
-below. Waiting for the owner's approval and answers (M).** The project the owner split off from mid-turn steering
+**Status: design approved by the owner on 2026-11-24, with the recommended answer (a) to each of the eight questions
+(M). No code yet. Reviewed SOUND by gpt-6.2-sol in round 13 (P), with conditions that are folded in below; the
+commit that folded them in was not read again by Sol.** The project the owner split off from mid-turn steering
 ("Ship steering, harden apart": "the guard, the dispatch fixes and the node-token fix become their own project
 covering all turns"). Its starting point is part Q of "Mid-turn steering, loose contract" on branch
 `claude/steer-loose`, and the guard text at commit 4b00cfb there. Every weakness below was checked against
@@ -9547,10 +9548,10 @@ Each step is one small PR, reviewed and merged on its own, and safe with the lat
 
 1. **The node stops what the hub's listing leaves out; stop before start; one node per user** (D-1).
    `node_sessions.py`, `node.py`. By itself it ends the turns that outlive their settlement. It gives no part of the
-   contract's guarantee yet: the two loops are not ordered against each other. 2. **The directory rule** (D-2).
-   `node_groups.py`, `node_sessions.py`, `node.py`, and the two spawners in `dispatch.py` (so that a process the OS
-   created is never left without a handle). The first line of the guarantee in A holds from here, for as long as the
-   node process lives.
+   contract's guarantee yet: the two loops are not ordered against each other.
+2. **The directory rule** (D-2). `node_groups.py`, `node_sessions.py`, `node.py`, and the two spawners in
+   `dispatch.py` (so that a process the OS created is never left without a handle). The first line of the guarantee
+   in A holds from here, for as long as the node process lives.
 3. **The launch step and the ledger** (D-3). New `launch_step.py` and `launch_ledger.py`; `pass_fds` in
    `dispatch.spawn_piped` and `spawn_process`; `session_host.py` (`_spawn`, `recover`, `stop_all`); `node.py`;
    `cli.py` (`board node check`). The second line. **After the steering
@@ -9801,6 +9802,14 @@ step 3.
 - **Identifying a launch's processes by who has its lock file open** (`lsof`), by an environment tag, or by a
   start-time stamp of the node: each can name a process that is not ours (H2-05, C, H1-12).
 ### M. Open questions for the owner
+
+**Answered 2026-11-24.** The owner approved the design "as recommended": answer (a) to every question below. So:
+the token is left as it is and the boundary stated (1); no guard (2); the escaped tool stays a named limit (3); the
+human's own message is not held by a run (4); the clock is left (5); a dispatched run gets its directory to itself
+(7); a turn the listing leaves out is stopped (8). Question 6 is a question of fact, and the approval does not
+answer it: the design goes on as if no machine runs both the dispatcher and a `board node` on the same directories.
+If the 2nd Mac does, it has today's protection until the follow-up design in 6 (b). Removing `human.token` from the
+main laptop (1) is the owner's to do, if nothing there uses it. The table is kept as it was put.
 
 | # | question | recommended | alternatives, and what they cost |
 | --- | --- | --- | --- |
