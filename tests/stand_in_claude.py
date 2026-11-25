@@ -10,7 +10,8 @@ What a turn does is in its text:
   a test needs, released by creating the file.
 - `wait-init PATH REST`: the turn's `init` waits until the file PATH exists (stdin is read meanwhile: a control
   request is answered, before the `init`); then the turn is REST.
-- `fail ...`: the result is an error.
+- `fail ...`: the result is an error; so is a turn whose text has the word `fail-own` anywhere (a steer, which the
+  hub's frame puts after its own words, that fails as its own turn).
 - `crash ...`: the process exits (code 3) at once, before anything of the turn is written.
 - `deny ...`: the result lists a refused Write (the turn itself succeeds, as Claude's does).
 - `big ...`: the reply is 40 KB.
@@ -72,7 +73,10 @@ N turns (a process that stops echoing). A turn whose text has the word `noecho`:
   comes is queued), the CLI starts a turn of its own, as for a background Agent's notification: an `init` with no
   echo, S seconds (default 0.5), then a `result` with no echo, `num_turns` 1 and `origin.kind` `task-notification`.
   With `take`, the lines queued until its end are folded into it (its result lists them); without, they run as their
-  own turns after it.
+  own turns after it. `think N bg ...`: the turn takes N seconds with no tool first (a line queued meanwhile is
+  not folded into it), then as `bg ...`.
+A child's task comes framed by the hub (`<<<task T>>>` ... `<<<end task T>>>`): `sleep`, `think`, `hold` and `bg` are
+read at the start of the task inside that frame.
 - `notify-in` / `notify-error-in`: before the turn's result, a zero-turn task notification `result` (`num_turns` 0,
   `origin.kind` `task-notification`, no echo): a success, or an error. `notify-after`: one right after the result.
 - `reinit`: before the turn's result, a `compact_boundary` system line and a second `init` with no echo (as a
@@ -431,11 +435,15 @@ def main() -> None:
                           "tools": tools, "claude_code_version": version, "capabilities": caps,
                           **echo(turn, text, [message])}), flush=True)
         going, tool = True, False
-        pause = re.match(r"(sleep|think) (\d+(?:\.\d+)?)\b", text)
+        # A child's task comes in the hub's frame (<<<task T>>> ... <<<end task T>>>): `sleep`, `think`, `hold` and
+        # `bg` are read at the start of the task itself (the reply still names the whole text).
+        framed = re.search(r"<<<task [0-9a-f]+>>>\n(.*?)\n<<<end task [0-9a-f]+>>>", text, re.S)
+        cmd = framed.group(1) if framed else text
+        pause = re.match(r"(sleep|think) (\d+(?:\.\d+)?)\b", cmd)
         if pause:
             tool = pause.group(1) == "sleep"
             going = stdin.wait(float(pause.group(2)))
-        held = re.match(r"hold (/\S+)", text)
+        held = re.match(r"hold (/\S+)", cmd)
         if held:
             tool = True
             going = stdin.wait(120, until=lambda: os.path.exists(held.group(1)))
@@ -460,7 +468,7 @@ def main() -> None:
                 "status": "rejected" if pct >= 100 else "allowed_warning" if pct >= 75 else "allowed",
                 "resetsAt": int(time.time()) + 3600, "rateLimitType": "five_hour", "utilization": pct / 100,
                 "unifiedWindows": {"five_hour": {"utilization": pct / 100, "resetsAt": int(time.time()) + 3600}}}})
-        failed = text.startswith("fail")
+        failed = text.startswith("fail") or bool(re.search(r"\bfail-own\b", text))
         reply = "x" * 40_000 if text.startswith("big") else data_reply(text) or f"turn {turn}: {text.upper()}"
         reply += "".join("; STEERED: " + m["message"]["content"].upper() for m in steered)
         denials = ([{"tool_name": "Write", "tool_use_id": "toolu_01", "tool_input": {"file_path": "/tmp/x"}}]
@@ -502,7 +510,7 @@ def main() -> None:
             stdin.lifecycle(m, "completed")
         if re.search(r"\bnotify-after\b", text):
             emit(notification(sid))
-        later = re.match(r"bg (\d+(?:\.\d+)?)(?: (\d+(?:\.\d+)?))?( take)?\b", text)
+        later = re.match(r"(?:think \d+(?:\.\d+)? )?bg (\d+(?:\.\d+)?)(?: (\d+(?:\.\d+)?))?( take)?\b", cmd)
         if later:
             background = (time.monotonic() + float(later.group(1)), float(later.group(2) or 0.5),
                           bool(later.group(3)))

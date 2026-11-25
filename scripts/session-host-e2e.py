@@ -127,6 +127,24 @@ Z2. A human steer into a text-only turn: N's result lists only N; N stays in fli
     S's own reply after it, exit 0 (the raw frames printed: M8's evidence through the node).
 Z3. (stand-in only) A close while S's own turn runs: N's native end first, `next_turn` with S failed ("its own turn
     was cut"), then the session ends.
+Z10. (stand-in, and the real CLI: gate M8 in a RESUMED process, ruling E) A session answers a first turn; the node
+    restarts, so its next process is started with `--resume`, as the node resumes any hosted session; a human steer
+    into that process's text-only turn: N's result lists exactly [N] and S's own turn exactly [S] (`next_turn`), or
+    N's lists exactly [N, S] (`in_turn`); the raw frames printed. With the real CLI three runs; with E2E_KEEP_FRAMES
+    naming a directory, each run's frames and lines are kept there (for the fixtures).
+Then, stand-in only (review round 1, ruling D), before Z4:
+Z5. A parent steers its Claude child with `board_session_send(mode=steer, wait=true)`, twice (two children): the
+    wait takes N's result with `next_turn`, S's own reply in a block of its own after the hub's line; the second S
+    fails as its own turn, and its failure detail is kept (in the facts and in the text).
+Z6. The node restarts while N is held and S's own turn runs: N's native end, `next_turn` with S cut; the session
+    goes on in a new process and S is never written again.
+Z8. The bound: with a turn timeout of 12 s (that node run only), S's own turn outlasts it: N's native end comes
+    with `next_turn`, S cut ("timed out"), within the bound (two turn timeouts plus 2 x kill_grace of N's end).
+Z9. A turn the CLI starts itself (a background notification) takes S in: `unconfirmed` (`consumed`), exit 6, N's
+    reply as it was.
+Z7. (only with `--only steering`: it takes 82 s) A partition while S's own turn runs: the hub is stopped past the
+    attempt's 75 s contact clock; the node cuts S's turn; once the hub is back, N's native end with `next_turn`, S
+    cut (its contact ran out).
 Z4. Stop; nothing is left; no steer text in the node's log.
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
@@ -1437,6 +1455,9 @@ codex = true
         self.check(self.held_of(sid, 1) is None, "the checkpoint is cleared with N's settlement")
         self._close(sid)
 
+        for i in range(1, 4 if real else 2):
+            self._z10_resumed(model, i)
+
         if not real:
             print("\n[Z3] a close while S's own turn runs: N's native end, next_turn with S cut, then the end")
             sid = self._claude_root("think 2 z3", model)
@@ -1455,6 +1476,222 @@ codex = true
             self.check(m["state"] == "done" and st.get("outcome") == "next_turn"
                        and str((st.get("result") or {}).get("detail")).startswith("its own turn was cut"),
                        "N's native end, then next_turn with S failed: its own turn was cut")
+            self._z5_parent(model)
+            self._z6_restart(model)
+            self._z8_bound(model)
+            self._z9_cli_turn(model)
+            if self.args.only == "steering":
+                self._z7_partition(model)
+
+    def _z10_resumed(self, model: list[str], i: int) -> None:
+        real = self.real
+        print(f"\n[Z10.{i}] M8 in a resumed process: the node restarts; a steer into the resumed process's turn")
+        first = "Reply with exactly the word: ready" if real else "ready"
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", STEER_AGENT, *model,
+                               "--wait", "--json")
+        sid = json.loads(out)["session"]["session_id"]
+        resumes = self.resumes(sid)
+        self.restart_node()
+        n_text = ("Write a story of about 500 words about a lighthouse keeper, then a last line: DONE followed by any "
+                  f"codeword you were given. Use no tools. (z10 {i})") if real else f"think 4 z10 {i}"
+        s_text = f"{self.Z_STEER} z10 {i}" if real else f"sleep 2 steer into a resumed process z10 {i}"
+        self.board("session", "send", sid, n_text)
+        m = self.message(sid, 2, lambda m: m["state"] == "delivered", 90)
+        self.check(m is not None and self.resumes(sid) == resumes + 1,
+                   "message 2's turn is in flight in ONE new process, started with --resume")
+        time.sleep(1.5 if real else 0.3)
+        out, _, _ = self.board("session", "send", sid, s_text, "--mode", "steer", "--request-id", f"z10-{i}", "--json")
+        sent = json.loads(out)
+        self.check(sent["message"] is None and sent["steer"]["into"] == 2, "the steer is accepted into message 2")
+        rc, data, err = self._z_wait(sid, f"z10-{i}", s_text)
+        steer = data.get("steer") or {}
+        n_line, s_line = self._z_line(n_text) or {}, self._z_line(s_text) or {}
+        n_u, s_u = n_line.get("uuid"), s_line.get("uuid")
+        frames = self.transcript(sid)
+        n_res = next((f for f in frames if f.get("type") == "result" and n_u in (f.get("user_message_uuids") or [])),
+                     {})
+        s_init = next((f for f in frames if f.get("subtype") == "init" and (f.get("user_message_uuids") or []) == [s_u]),
+                      {})
+        s_res = next((f for f in frames if f.get("type") == "result" and (f.get("user_message_uuids") or []) == [s_u]),
+                     {})
+        print("  M8 raw evidence through the node (resumed process):")
+        print(f"    N's result: uuids {self._z_names(n_res.get('user_message_uuids'), n_u, s_u)} origin "
+              f"{n_res.get('origin')} num_turns {n_res.get('num_turns')}")
+        print(f"    S's init:   uuids {self._z_names(s_init.get('user_message_uuids'), n_u, s_u)} origin "
+              f"{s_init.get('origin')}")
+        print(f"    S's result: uuids {self._z_names(s_res.get('user_message_uuids'), n_u, s_u)} origin "
+              f"{s_res.get('origin')} num_turns {s_res.get('num_turns')}")
+        own = steer.get("result") or {}
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); S's reply "
+              f"{(own.get('reply') or '')[-60:]!r}")
+        if steer.get("outcome") == "in_turn":
+            self.check(rc == 0 and (n_res.get("user_message_uuids") or []) == [n_u, s_u],
+                       "in_turn: N's result lists exactly [N, S]; exit 0")
+        else:
+            self.check(rc == 0 and steer.get("outcome") == "next_turn" and own.get("ok") is True and s_init and s_res
+                       and (n_res.get("user_message_uuids") or []) == [n_u] and s_init.get("origin") is None,
+                       "next_turn: N's result lists exactly [N]; an init listing exactly [S] (no origin) opened S's "
+                       "own turn and a result listing exactly [S] ended it; exit 0")
+        self.check(self.held_of(sid, 2) is None, "no checkpoint left")
+        keep = os.environ.get("E2E_KEEP_FRAMES")
+        if keep:
+            start = next((k for k, f in enumerate(frames) if f.get("type") == "command_lifecycle"
+                          and f.get("command_uuid") == n_u), 0)
+            Path(keep).mkdir(parents=True, exist_ok=True)
+            (Path(keep) / f"resumed-{i}.json").write_text(json.dumps(
+                {"N": n_u, "S": s_u, "frames": frames[start:], "outcome": steer}, indent=1))
+        self._close(sid)
+
+    @staticmethod
+    def _z_names(uuids, n_u, s_u):
+        return None if uuids is None else ["N" if u == n_u else "S" if u == s_u else "other" for u in uuids]
+
+    def _z_framed(self, text: str) -> list[dict]:
+        """Every user line written to a Claude process whose text contains `text` (a parent's steer is framed)."""
+        return [x for x in self.written_lines() if text in str(x["message"]["content"])]
+
+    def _z_held(self, sid: str, seconds: float = 20) -> dict | None:
+        deadline, held = time.monotonic() + seconds, None
+        while held is None and time.monotonic() < deadline:
+            held = self.held_of(sid, 1)
+            time.sleep(0.2)
+        return held
+
+    def _z_cut(self, sid: str, words: str, what: str) -> None:
+        """N's native end with `next_turn`, S failed as cut (`words` in its detail): N done, its reply N's."""
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 120)
+        st = self.steer_of(sid, 1)
+        own = st.get("result") or {}
+        print(f"  N {m and m['state']}; steer {st.get('outcome')} ({st.get('why')}); S's result ok {own.get('ok')} "
+              f"{own.get('detail')!r}")
+        self.check(m is not None and m["state"] == "done" and st.get("outcome") == "next_turn"
+                   and own.get("ok") is False and str(own.get("detail")).startswith("its own turn was cut")
+                   and words in str(own.get("detail")), what)
+
+    def _z5_parent(self, model: list[str]) -> None:
+        print("\n[Z5] a parent steers its Claude child with board_session_send(mode=steer, wait=true): next_turn")
+        out, _, _ = self.board("session", "start", str(self.project), "ready", "--agent", SPAWN_AGENT, "--model",
+                               "haiku", "--wait", "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.board("session", "grant", str(self.project), "--agent", SPAWN_AGENT, "--access", "workspace",
+                   "--hours", "1")
+        busy = self.tmp / "z5-parent"
+        # The parent is in a turn of its own meanwhile (as a parent that waits is): the child's result waits for it.
+        self.board("session", "send", rid, f"hold {busy} z5 parent")
+        self._running(rid, 2, False)
+        kids = []
+        for name, steer, ok in (("z5", "plum please z5", True), ("z5b", "fail-own z5b", False)):
+            [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+                "task": f"think 3 {name}", "child_agent": STEER_AGENT, "access": "read-only"}]], rid)
+            if made["error"]:
+                raise SystemExit(f"FAIL: the Claude child was refused: {made['text'][:600]}")
+            kid = json.loads(made["text"])["child"]["id"]
+            kids.append(kid)
+            self.message(kid, 1, lambda m: m["state"] == "delivered", 90)
+            time.sleep(0.5)
+            got: list = []
+            th = threading.Thread(target=lambda: got.append(self.mcp_calls(SPAWN_AGENT, [["board_session_send", {
+                "child": kid, "message": steer, "mode": "steer", "wait": True}]], rid)))
+            th.start()
+            th.join(120)
+            [sent] = got[0] if got else [{"error": True, "text": "no answer"}]
+            answer = json.loads(sent["text"]) if not sent["error"] else {}
+            facts = (answer.get("result") or {}).get("result") or {}
+            text = (answer.get("result") or {}).get("text") or ""
+            st = facts.get("steer") or {}
+            print(f"  {name}: status {answer.get('steer_status')}; result steer {st}"
+                  + (f"; ERROR {sent['text'][:600]}" if sent["error"] else ""))
+            lines = self._z_framed(steer)
+            self.check(len(lines) == 1 and "A message sent while your turn was running" in json.dumps(lines[0]),
+                       f"{name}: the parent's text went once, in the follow-up frame that says what it is")
+            self.check((answer.get("steer_status") or {}).get("outcome") == "next_turn"
+                       and st.get("outcome") == "next_turn" and st.get("ok") is ok,
+                       f"{name}: wait=true took N's result with the steer's outcome next_turn, S's own turn "
+                       + ("succeeded" if ok else "failed"))
+            head, _, tail = text.partition("\nYour steer (sent while this turn ran) ran as a turn of its own after "
+                                           "it; its reply follows.\n<<<child-output ")
+            self.check(f"THINK 3 {name.upper()}" in head and "<<<end child-output " in head and tail
+                       and ("PLUM PLEASE Z5" in tail if ok else "FAIL-OWN Z5B" in tail),
+                       f"{name}: N's reply in its block; the hub's line; S's own reply in a block of its own after it")
+            if not ok:
+                self.check("detail" in st and "The steer's own turn failed: " in head,
+                           f"{name}: S's failure detail is kept, in the facts and in the text")
+        busy.touch()
+        self.board("session", "close", rid)
+        self.check(all(self.wait_ended(x, 40)["state"] == "ended" for x in [rid, *kids]), "closed, with its children")
+
+    def _z6_restart(self, model: list[str]) -> None:
+        print("\n[Z6] the node restarts while N is held and S's own turn runs")
+        sid = self._claude_root("think 2 z6", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        text = "sleep 60 steer before the restart z6"
+        self._z_steer(sid, "z6", text)
+        self.check(self._z_held(sid) is not None, "N is held (its checkpoint on the hub)")
+        time.sleep(1.0)
+        self.restart_node()
+        self._z_cut(sid, "", "N's native end; next_turn with S cut at the node's stop")
+        out, _, _ = self.board("session", "send", sid, "after the restart", "--wait")
+        self.check("AFTER THE RESTART" in out and len(self._z_framed(text)) == 1,
+                   "the session goes on in a new process, and S was never written again")
+        self._close(sid)
+
+    def _z8_bound(self, model: list[str]) -> None:
+        print("\n[Z8] the bound: S's own turn outlasts a 12 s turn timeout (this node run only)")
+        conf = self.node_home / "board.toml"
+        before = conf.read_text()
+        conf.write_text(before.replace("[dispatch]\n", "[dispatch]\ntimeout_minutes = 0.2\n", 1))
+        try:
+            self.restart_node()
+            sid = self._claude_root("think 2 z8", model)
+            self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+            time.sleep(0.3)
+            self._z_steer(sid, "z8", "sleep 90 steer past the bound z8")
+            self.check(self._z_held(sid) is not None, "N is held")
+            t0 = time.monotonic()
+            self._z_cut(sid, "timed out", "N's native end; next_turn with S cut by the turn timeout")
+            took = time.monotonic() - t0
+            print(f"  N settled {took:.1f} s after its checkpoint was seen")
+            self.check(took <= 2 * 12 + 2 * 5 + 5, "within the bound: two turn timeouts plus 2 x kill_grace")
+            self._close(sid)
+        finally:
+            conf.write_text(before)
+            self.restart_node()
+
+    def _z9_cli_turn(self, model: list[str]) -> None:
+        print("\n[Z9] a turn the CLI starts itself takes S in: unconfirmed (consumed)")
+        sid = self._claude_root("think 2 bg 0.3 1 take z9", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        text = "steer taken by the cli z9"
+        self._z_steer(sid, "z9", text)
+        rc, data, err = self._z_wait(sid, "z9", text)
+        steer = data.get("steer") or {}
+        frames = self.transcript(sid)
+        took = [f for f in frames if f.get("type") == "result" and (f.get("origin") or {}).get("kind")
+                == "task-notification" and "STEER TAKEN BY THE CLI Z9" in str(f.get("result"))]
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); N's reply {data.get('reply')!r}")
+        self.check(took and rc == 6 and (steer.get("outcome"), steer.get("why")) == ("unconfirmed", "consumed")
+                   and "THINK 2 BG" in str(data.get("reply")),
+                   "the CLI's own turn took S: unconfirmed (consumed), exit 6; N's reply as it was")
+        self._close(sid)
+
+    def _z7_partition(self, model: list[str]) -> None:
+        print("\n[Z7] (--only steering) a partition while S's own turn runs: the hub is stopped for 82 s")
+        sid = self._claude_root("think 2 z7", model)
+        self.message(sid, 1, lambda m: m["state"] == "delivered", 90)
+        time.sleep(0.3)
+        self._z_steer(sid, "z7", "sleep 150 steer across a partition z7")
+        self.check(self._z_held(sid) is not None, "N is held")
+        time.sleep(1.0)
+        hub = next(p for n, p in self.procs if n == "hub")
+        hub.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(82)
+        finally:
+            hub.send_signal(signal.SIGCONT)
+        self._z_cut(sid, "contact", "N's native end; next_turn with S cut: the attempt's contact ran out")
+        self._close(sid)
 
     def hub_rows(self, key: str) -> list:
         """One board_state value of the hub's database, read by another process (read only)."""

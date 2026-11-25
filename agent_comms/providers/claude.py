@@ -727,9 +727,11 @@ class ClaudeSession:
                 self._evidence = "s_end"
                 self._bracket = None
                 return True, "steer"
-            if ev.get("is_error") is True and s_ not in echoed(ev, "user_message_uuid", "user_message_uuids"):
+            if (ev.get("is_error") is True and not echoed(ev, "user_message_uuid", "user_message_uuids")
+                    and not origin_not_human(ev)):
                 # Step 1's rule 10 for a fully written turn: S's own turn failed with this error, by order, and the
-                # incarnation is unverified from now on.
+                # incarnation is unverified from now on. Only an error with no echo at all and no origin: a zero-turn
+                # notification's error, or an error naming another line, is no evidence for S.
                 self._evidence = "s_end"
                 self._bracket = None
                 self._lose("an error result that does not list the steer's own turn's line")
@@ -745,7 +747,6 @@ class ClaudeSession:
             return True, "other"
         return False, None
 
-    # ------------------------------------------------------------ turn correlation (module text)
     # ------------------------------------------------------------ turn correlation (module text)
 
     def _lose(self, why: str) -> None:

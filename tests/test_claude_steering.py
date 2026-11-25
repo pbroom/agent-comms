@@ -1332,6 +1332,236 @@ def test_model_claude_steer_walks_against_an_independent_reference(henv, monkeyp
     print("MODEL REACH", sorted(reach.items()))
 
 
+
+# ---------------------------------------------------------------- part O's rows the review rated Partly or No (ruling D)
+
+
+def test_r1_o_a_checkpoint_from_another_authenticated_node_is_refused(env):
+    """Part O, the checkpoint: an authenticated node that is not the session's own cannot checkpoint its N."""
+    from test_hosted_sessions import client
+    sid, child, n, s_uuid = claude_steered(env)
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    r = client(env, "desktop").post(f"/api/nodes/sessions/{sid}", json={"held": held})
+    assert r.status_code in (403, 404, 409), r.text
+    assert "held" not in hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+
+
+@pytest.mark.parametrize("stop", ["timeout", "stop_all"])
+def test_r1_o_an_s_init_first_found_by_the_timeout_drain_and_the_hard_stop_contrast(henv, monkeypatch, stop):
+    """Part O, the fresh S clock: S's `init` is in the pipe, unread, when the hold's bound comes. The timeout's drain
+    finds it and honours it (S's own turn, its own clock; then its result: `next_turn`). A stop of every turn reads
+    nothing (the latch, Shutdown simplified): the same buffered `init` proves nothing (`unconfirmed`)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.clock.advance(61)
+    child.emit(vinit(S))
+    if stop == "timeout":
+        out = henv.host.tick()
+        assert not ends(out) and s.held is not None and s.held.s_turn, "the drain found S's own turn: its clock"
+        child.emit(owned(S, text="PINEAPPLE"))
+        [end] = ends(henv.host.tick())
+        assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is True
+        assert end.steer["result"]["text"] == "PINEAPPLE"
+    else:
+        henv.host.steer_stopping()
+        [end] = ends(henv.host.stop_all())
+        assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+@pytest.mark.parametrize("buffered", ["n_result", "s_init", "s_result"])
+def test_r1_o_signal_with_buffered_evidence_publishes_n_once_before_ended(henv, monkeypatch, buffered):
+    """Part O, `signal()` and `stop_all`: the node's stop latch set while evidence is buffered (N's own result before
+    the hold; S's `init` or result in the hold): that evidence never counts; N's end is published once, at main's
+    point, and before the session's `ended`."""
+    s, child, n = steered(henv, monkeypatch)
+    if buffered != "n_result":
+        child.emit(owned(n, text="N"))
+        henv.host.tick()
+        if buffered == "s_result":
+            child.emit(vinit(S))
+            henv.host.tick()
+    child.emit({"n_result": owned(n, text="N"), "s_init": vinit(S), "s_result": owned(S, text="S")}[buffered])
+    henv.host.steer_stopping()
+    out = henv.host.stop_all() + henv.host.close(SID, "the node is stopping") + henv.host.tick()
+    kinds = [(e.kind, e.message_id) for e in out]
+    [end] = ends(out)
+    assert kinds.count(("turn_ended", "1")) == 1
+    if ("ended", None) in kinds:
+        assert kinds.index(("turn_ended", "1")) < kinds.index(("ended", None))
+    if buffered == "s_result":
+        assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False, "S's proved turn, cut"
+    else:
+        assert end.steer["outcome"] in ("unconfirmed", "not_delivered") and end.steer.get("result") is None
+    assert henv.host.tick() == [] or not ends(henv.host.tick())
+
+
+@pytest.mark.parametrize("where", ["held", "s_turn"])
+def test_r1_o_a_zero_turn_error_notification_in_the_hold_and_in_ss_own_bracket_is_inert(henv, monkeypatch, where):
+    """Part O, R6-04: a zero-turn notification's ERROR result (and a success one) in the hold, or inside S's own
+    bracket, is no evidence for S: the hold stays; S's own result still ends it as `next_turn`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    if where == "s_turn":
+        child.emit(vinit(S))
+        henv.host.tick()
+    child.emit(nonturn(error=True), nonturn())
+    assert henv.host.tick() == [] and s.held is not None and s.held.s_turn is (where == "s_turn")
+    if where == "held":
+        child.emit(vinit(S))
+        henv.host.tick()
+    child.emit(owned(S, text="PINEAPPLE"))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is True
+
+
+def test_r1_o_a_close_with_ss_result_buffered_takes_it_in_the_drain(henv, monkeypatch):
+    """Part O, a close with S queued: S's own result is buffered (unread) when the close comes. The close's drain
+    reads it before the stop: N's native end with `next_turn` and S's own result, then `ended`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S))
+    henv.host.tick()
+    child.emit(owned(S, text="PINEAPPLE"))
+    out = henv.host.close(SID, "closed") + henv.host.tick() + henv.host.tick()
+    kinds = [(e.kind, e.message_id) for e in out]
+    [end] = ends(out)
+    assert end.text == "N" and end.steer["outcome"] == "next_turn" and end.steer["result"]["text"] == "PINEAPPLE"
+    assert kinds.index(("turn_ended", "1")) < kinds.index(("ended", None))
+
+
+def test_r1_o_a_queued_successor_goes_through_the_reap_and_a_new_process(henv, monkeypatch):
+    """Part O, a queued successor: message 2, sent during the hold, waits (nothing is written into the held process);
+    the process exits; N's end is published at once (S `unconfirmed`); message 2 then starts in a new process and
+    its own result is its own."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.send(SID, "the successor", message_id="2")
+    before = child.stdin
+    assert not [e for e in henv.host.tick() if e.message_id == "2"] and child.stdin == before, "it waits"
+    child.code = 1
+    out = henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+    out += henv.host.tick()
+    assert len(henv.spawner.children) == 2 and child.stdin == before, "a new process; nothing into the old one"
+    new = henv.spawner.children[-1]
+    m = uuid_of(new)
+    new.emit(vinit(m), owned(m, text="M's own"))
+    [m_end] = ends(henv.host.tick(), "2")
+    assert m_end.ok and m_end.text == "M's own" and m_end.steer is None
+    assert not ends(henv.host.tick()), "N's end once"
+
+
+@pytest.mark.parametrize("mode", ["next_turn", "three"])
+def test_r1_o_lifecycle_completed_s_then_a_terminal_without_s_keeps_the_hold(henv, monkeypatch, mode):
+    """Part O, R8-05: in either mode, a CLI-started bracket during the hold, a lifecycle row saying S `completed`, and
+    that bracket's terminal result NOT listing S: no evidence for S (a lifecycle row is none); the hold runs to its
+    bound (`unconfirmed`, the finalizer)."""
+    if mode == "three":
+        monkeypatch.setattr(claude, "STEER_MODES", {V: claude.THREE})
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(), {"type": "command_lifecycle", "command_uuid": S, "state": "completed", "session_id": SID,
+                         "uuid": "1f000000-0000-4000-8000-000000000001"}, foreign())
+    assert not ends(henv.host.tick()) and s.held is not None and not s.held.s_turn
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    [end] = ends(out) or ends(henv.host.tick())
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+@pytest.mark.parametrize("phase", ["zero", "partial", "whole"])
+def test_r1_o_ns_result_without_s_at_each_write_phase(henv, monkeypatch, phase):
+    """Part O, R11-03 for Claude: N's own result lists exactly [N] (authoritatively without S). No byte of S went:
+    `not_delivered`, at once. Part of S went: the frame cannot be completed into a turn that ended: the cut,
+    `unconfirmed`. All of S went: N's end is held (S may still run as its own turn)."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    henv.host.steer_authority = lambda sess: True
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a long turn", message_id="1")
+    henv.host.tick()
+    n = uuid_of(child)
+    child.emit(vinit(n))
+    henv.host.tick()
+    child.accept = {"zero": 0, "partial": 7, "whole": None}[phase]
+    henv.host.steer_offer(SID, "1", S, TEXT, authorized=True)
+    henv.host.tick()
+    child.emit(owned(n, text="N"))
+    out = henv.host.tick()
+    if phase == "whole":
+        assert not ends(out) and [e.kind for e in out] == ["held"] and s.held is not None
+        return
+    out += henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and s.held is None
+    want = ({"outcome": "not_delivered", "why": "not_written"} if phase == "zero" else
+            {"outcome": "unconfirmed", "why": "turn_cut"})
+    assert end.steer["outcome"] == want["outcome"], end.steer
+
+
+def test_r1_o_a_timeout_a_close_and_a_late_reap_overlap(henv, monkeypatch):
+    """Part O, timeout, close and late reap: the hold's bound stops the process (its group lingers); a close comes;
+    a message waits; the group outlives the graces. N's end is published once, at the bound; `ended` after it;
+    nothing is handed over or written into the old process; the late reap publishes nothing more."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    assert not ends(out) and s.stopping_since is not None
+    henv.host.send(SID, "waits", message_id="2")
+    out += henv.host.close(SID, "closed")
+    before = child.stdin
+    for _ in range(3):
+        henv.clock.advance(10)
+        out += henv.host.tick()
+    kinds = [(e.kind, e.message_id) for e in out]
+    assert kinds.count(("turn_ended", "1")) == 1 and ("delivered", "2") not in kinds and child.stdin == before
+    [end] = ends(out)
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+    henv.groups.discard(child.pid)
+    child.code = -9
+    out2 = henv.host.tick() + henv.host.tick()
+    kinds += [(e.kind, e.message_id) for e in out2]
+    assert kinds.count(("turn_ended", "1")) == 1, "the late reap publishes nothing more"
+    assert ("ended", None) in kinds and kinds.index(("turn_ended", "1")) < kinds.index(("ended", None))
+    assert len(henv.spawner.children) == 1, "nothing started for a closed session"
+
+
+def test_r1_o_a_group_outliving_sigkill_with_a_queued_successor(henv, monkeypatch):
+    """Part O, a group that outlives SIGKILL with a successor queued: N's end at the bound (two graces), once; the
+    successor is never written into the old process nor started beside its group; after the late reap it starts in
+    a new process; no second end of N."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.send(SID, "the successor", message_id="2")
+    henv.groups.add(child.pid)
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    before = child.stdin
+    for _ in range(3):
+        henv.clock.advance(10)
+        out += henv.host.tick()
+    [end] = ends(out)
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"} and s.child is child, "still lingering"
+    assert child.stdin == before and len(henv.spawner.children) == 1, "unwritable; nothing beside its group"
+    henv.groups.discard(child.pid)
+    child.code = -9
+    out = henv.host.tick() + henv.host.tick()
+    assert not ends(out), "no second end of N"
+    assert len(henv.spawner.children) == 2 and ("delivered", "2") in [(e.kind, e.message_id) for e in out]
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
