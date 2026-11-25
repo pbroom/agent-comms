@@ -283,6 +283,7 @@ NAMED: list = []        # what the last run with `named` took out: (kind, where)
 CLIENT_ID = re.compile(r', "clientUserMessageId": "(' + r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
                        + r')"\}\}$')
 CLIENT_IDS: set = set()
+STARTS: dict = {}       # (round 6, R6-05) a stripped id -> (its turn/start's threadId, that request's id)
 
 
 def _codex_line(line: str) -> str:
@@ -303,6 +304,7 @@ def _codex_line(line: str) -> str:
     if json.loads(stripped) != {**ev, "params": {k: v for k, v in params.items() if k != "clientUserMessageId"}}:
         return line
     CLIENT_IDS.add(m.group(1))
+    STARTS[m.group(1)] = (params.get("threadId"), ev.get("id"))
     NAMED.append(("client_id", m.group(1)))
     return stripped
 
@@ -328,9 +330,27 @@ def cx_turn() -> str:
 ITEM = re.compile(r'"clientId": "([0-9a-f-]{36})"')
 
 
-def _item_echo(line: str) -> str:
+def _turns_answered(lines: list) -> dict:
+    """In one transcript: each request id -> the turn ids its answers named (`result.turn.id`)."""
+    out: dict = {}
+    for x in lines:
+        try:
+            ev = json.loads(x)
+        except ValueError:
+            continue
+        result = ev.get("result") if isinstance(ev, dict) else None
+        turn = result.get("turn") if isinstance(result, dict) else None
+        if isinstance(turn, dict) and isinstance(turn.get("id"), str) and "id" in ev:
+            out.setdefault(ev["id"], set()).add(turn["id"])
+    return out
+
+
+def _item_echo(line: str, answered: dict | None = None) -> str:
     """Codex's echo of a stripped `clientUserMessageId` in a userMessage item (K: "echoed as the userMessage item's
-    clientId"), back to the null main's run has, only for an id `_codex_line` took and only in such an item."""
+    clientId"), back to the null main's run has, only for an id `_codex_line` took and only in such an item.
+    (Round 6, R6-05:) only in the item's own `clientId` field, and only for the start it answers in this transcript:
+    the item's thread is that start's, and its turn is the one this transcript's answer to that start named
+    (`answered`), so two starts' ids swapped are not taken."""
     m = ITEM.search(line)
     if not m or m.group(1) not in CLIENT_IDS:
         return line
@@ -338,11 +358,20 @@ def _item_echo(line: str) -> str:
         ev = json.loads(line)
     except ValueError:
         return line
-    item = ((ev.get("params") or {}).get("item") or {}) if isinstance(ev, dict) else {}
-    if ev.get("method") not in ("item/started", "item/completed") or item.get("type") != "userMessage":
+    params = ev.get("params") if isinstance(ev, dict) else None
+    item = params.get("item") if isinstance(params, dict) else None
+    if not isinstance(item, dict) or ev.get("method") not in ("item/started", "item/completed") or item.get("type") != "userMessage":
+        return line
+    if item.get("clientId") != m.group(1):
+        return line
+    thread, rid = STARTS.get(m.group(1), (None, None))
+    if params.get("threadId") != thread or params.get("turnId") not in (answered or {}).get(rid, ()):
+        return line
+    nulled = line[:m.start()] + '"clientId": null' + line[m.end():]
+    if json.loads(nulled) != {**ev, "params": {**params, "item": {**item, "clientId": None}}}:
         return line
     NAMED.append(("client_id_echo", m.group(1)))
-    return line[:m.start()] + '"clientId": null' + line[m.end():]
+    return nulled
 
 
 def _modes_named(body, where: str) -> None:
@@ -366,9 +395,11 @@ def _codex_sessions(out: dict) -> set:
 def step2_named(out: dict) -> None:
     """Take K's named changes out of the raw run, in place (module text), each recorded in NAMED."""
     CLIENT_IDS.clear()
+    STARTS.clear()
     codex = _codex_sessions(out)
     out["stdin"] = [[_codex_line(x) for x in lines] for lines in out.get("stdin", [])]
-    out["transcripts"] = {k: [_item_echo(x) for x in lines] for k, lines in (out.get("transcripts") or {}).items()}
+    out["transcripts"] = {k: [_item_echo(x, _turns_answered(lines)) for x in lines]
+                          for k, lines in (out.get("transcripts") or {}).items()}
     for url, body in out.get("node_bodies") or []:
         if url == "/api/nodes/hello" and isinstance((body or {}).get("session_host"), dict) \
                 and body["session_host"].get("tree") == 5:
