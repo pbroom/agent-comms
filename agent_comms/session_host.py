@@ -132,15 +132,15 @@ class _Message:
     text: str
     kind: str = "user"      # providers.TURN_KINDS: whose turn it is, passed on to the provider with the text
     # Turn correlation's no-progress budget (`_decide`, `_spent`), for a message not one byte of whose line was
-    # accepted yet. `earned`: at a decision point, the session's process was verified right then and the message was
-    # in a counted state (only then does it have a budget at all; nothing is remembered from reading lines: review
-    # rounds 14 and 15). `counted`: seconds of COUNTED time since it was earned (None: no budget); `counted_at`: the
+    # accepted yet. `counted`: seconds of COUNTED time since it was EARNED (None: not earned, no budget). It is
+    # earned at a decision point at which the session's process was verified right then and the message was in a
+    # counted state (only then does it have a budget at all; nothing is remembered from reading lines: review
+    # rounds 14 and 15); `counted` set is the one record of that. `counted_at`: the
     # time of the last pass that ENDED with it in a counted state (None: the last one did not). `recovered`: its one
     # 7b restart is spent. On the message itself, so they go when it goes (and survive an unstage, a restage, a
     # downgrade and a replacement process).
     counted: float | None = field(default=None, compare=False)
     counted_at: float | None = field(default=None, compare=False)
-    earned: bool = field(default=False, compare=False)
     recovered: bool = field(default=False, compare=False)
 
 
@@ -1337,7 +1337,7 @@ class SessionHost:
         counting = self._counting(s, msg, gates)
         if msg.counted is None:
             if counting:
-                msg.earned, msg.counted = True, 0.0     # counting starts, from zero, here (`_mark` sets its end)
+                msg.counted = 0.0       # earned: counting starts, from zero, here (`_mark` sets its end)
             return False, gates
         if not counting:
             return False, gates
@@ -1368,7 +1368,10 @@ class SessionHost:
           inbox, its second budget starts from nothing, and its process is stopped;
         - a second budget: True; it fails as main's `_held` fails it, never written.
         So an unwritten budgeted message accumulates at most two timeouts of counted time (each plus at most one
-        pass), and the first one never fails it; its wall time is unbounded only by host-side waits, as on main."""
+        pass); the budget never fails it at its first expiry (that is the 7b), and a host-side wait never makes the
+        BUDGET act (it is not a counted state). Main's write timer still applies to a staged line the host withholds
+        with `may_start` false (latched, not silent: it stays staged), and can fail it then, as on main. Its wall
+        time is unbounded only by host-side waits, as on main."""
         if msg.counted is None or msg.counted < self.timeout_minutes * 60:
             return False
         if s.writing is msg:

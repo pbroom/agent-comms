@@ -71,7 +71,7 @@ design on branch claude/steer-loose, its part B):
   or an `init` that no longer qualifies, inside the turn's own bracket only once that bracket closes). While a verified process runs a turn of its own (an unattributed
   bracket) it `holds_turns`: the host keeps the next message in the inbox (session_host `_barrier`), within the
   message's no-progress budget in counted time: one restart at the first spent budget, the failure at the second
-  (session_host `_budget`, `_spent`). Each process's first `init` is said in the node's log (INFO), with the version
+  (session_host `_decide`, `_spent`). Each process's first `init` is said in the node's log (INFO), with the version
   it reports and whether turn correlation is on for it, while some version is VERIFIED.
 """
 from __future__ import annotations
@@ -508,7 +508,7 @@ class ClaudeSession:
     def holds_turns(self) -> bool:
         """A verified process is running a turn of its own (an unattributed bracket): a line written now would be
         taken into that turn or queued behind it, and that turn's frames are no message's. The host keeps the next
-        message until its end (session_host `_barrier`), within that message's no-progress budget (`_budget`)."""
+        message until its end (session_host `_barrier`), within that message's no-progress budget (`_decide`)."""
         return self.verified and self._bracket == UNATTRIBUTED
 
     def takes_interrupt(self) -> bool:

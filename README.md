@@ -577,7 +577,8 @@ turn Claude starts by itself (a background agent finishing after your turn ended
 message's, and your message waits while such a turn runs (if, for a whole turn timeout, such turns, or a pipe
 that takes nothing, keep all of it from being written, its process is restarted once and the message goes to the
 next one; a second such timeout fails it; time in which the node itself holds the message back, as for a slot or a
-parent's turn, does not count). One
+parent's turn, does not count toward these, though a message already being written keeps the ordinary turn timeout,
+as before). One
 exception: once your message is fully written, an error result that does not name it settles it by order, as
 before, even if that error came from a turn Claude started by itself before it took up your message (an error
 names no message reliably); the process is matched by order from then on. Other Claude Code versions are matched by
