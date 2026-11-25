@@ -6284,3 +6284,227 @@ def test_r4_09_a_known_in_turn_with_n_pruned_says_the_outcome_and_that_ns_status
     assert run_cli("send", sid, TEXT, "--mode", "steer", "--request-id", "q1", "--wait") == 7
     err = capsys.readouterr().err
     assert "outcome is known" in err and cli.STEER_WORDS["in_turn"] in err and "exit status are not available" in err
+
+
+# ------------------------------------------------------------ the pre-merge review (after review round 10)
+
+
+def test_pm_1_a_break_published_between_the_boundarys_check_and_its_write_comes_after_the_write(env):
+    """Pre-merge review, item 1: the write boundary's check and its pipe write are ONE critical section under the
+    attempt's lock. The gate's last step (the contact clock) passes at 74.9 s; at exactly that point, the clock now
+    past the 75 s, a hello is acknowledged from another thread: a break, to be latched. It waits for the attempt's
+    lock (the lock itself says so), so the steer's bytes go with nothing latched, and the break is latched only after
+    the write returned. With the check outside the lock the break would be latched before the write."""
+    import threading
+    sid, child, s, runner, t0 = _near_deadline(env)
+    slot = s.steer
+    lock = _SignalLock(slot.lock)
+    slot.lock = lock
+    real_ok = slot.contact_ok
+    threads, armed = [], []
+    runner.host.steer_write_hook = lambda when, sess: armed.append(when) if when == "before" else None
+
+    def contact_ok(now):
+        ok = real_ok(now)
+        if ok and armed and not threads:        # the boundary's own check (after its "before"), its last step
+            env.clock.advance(0.2)          # the 75 s run out now, after the check read the clock
+            th = threading.Thread(target=runner.note_hello, args=(t0 + 1,))
+            threads.append(th)
+            th.start()
+            assert lock.waiting.wait(30), "the acknowledgement came to the attempt's lock"
+            if not lock.real._is_owned():
+                th.join(30)     # (the boundary does not hold the lock here: the break goes through at once)
+        return ok
+    slot.contact_ok = contact_ok
+    at_write, real_write = [], child.write
+
+    def write(data):
+        if b'"turn/steer"' in data:
+            at_write.append(slot.revoked)
+        return real_write(data)
+    child.write = write
+    with runner.lock:
+        runner._emit(runner.host.tick())
+    for th in threads:
+        th.join(30)
+    assert threads, "the window between the check and the write was reached"
+    assert at_write == [None], "the steer's bytes went with no break latched"
+    assert slot.revoked == "contact", "the break is latched, after the write returned"
+
+
+def _child_at_its_limits(env, **spawn):
+    """A Codex child of an agent's session with its turn in flight; then the hub's spawn settings changed by
+    `spawn`. Returns (parent, child, the budget's charged count)."""
+    from test_hosted_spawn import with_spawn
+    sid, kid, child = codex_child(env)
+    if spawn:
+        with_spawn(env, **spawn)
+    return sid, kid, budget(env)["seq"]
+
+
+def test_pm_2_a_parents_steer_above_its_ceiling_now_is_refused_and_charges_and_stores_nothing(env):
+    """Pre-merge review, item 2: the parent's grant is narrowed (read-only) after the child was started with
+    workspace access: the steer is refused with ABOVE_NOW's words, through the parent's real send path; nothing is
+    stored and nothing is charged."""
+    from test_hosted_spawn import revoke
+    sid = root(env)
+    answer(env, sid)
+    g = grant(env, agents=("claude", "codex"))
+    kid = spawn(env, bound(env, sid), task="long task", agent="codex")["child"]["id"]
+    tick(env)
+    child = codex_of(env)
+    codex_handshake(env, child)
+    st = last_start(child)
+    child.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED, user_item(st["params"]["clientUserMessageId"]))
+    tick(env)
+    revoke(env, g)
+    grant(env, agents=("claude", "codex"), access="read-only")
+    used = budget(env)["seq"]
+    with pytest.raises(Conflict, match="above what you may give a child now"):
+        hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
+    assert steer_rec(env, kid) is None and budget(env)["seq"] == used
+    tick(env)
+    assert steers_of(child) == []
+
+
+def test_pm_2_a_parents_steer_at_its_turn_limit_is_refused_and_charges_and_stores_nothing(env):
+    """Pre-merge review, item 2: the tree has used its child turns without the human (`max_turns_without_human`):
+    the parent's steer is refused (LimitReached), through its real send path; nothing is stored or charged."""
+    sid, kid, used = _child_at_its_limits(env, max_turns_without_human=1)
+    with pytest.raises(hs.LimitReached):
+        hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
+    assert steer_rec(env, kid) is None and budget(env)["seq"] == used
+
+
+def _malformed(env, how):
+    env.board.s.dispatch = json.loads(json.dumps(env.board.s.dispatch))
+    t = env.board.s.dispatch["sessions"]
+    if how == "string":
+        t["steer"] = "false"
+    elif how == "type":
+        t["steer"] = 0
+    else:
+        t["max_lvie"] = 3       # a typo in a sibling key
+
+
+@pytest.mark.parametrize("how", ["string", "type", "sibling_typo"])
+def test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off(env, caplog, how):
+    """Pre-merge review, item 3: `[dispatch.sessions]` does not validate (`steer = "false"`, `steer = 0`, or a typo
+    in another key): steering fails CLOSED. New steers are refused with words that say the setting could not be
+    read; the hub says so once in its log however often it is read; a steer accepted before is still offered,
+    written and settled, as with `steer = false`; the listing's features are what they are with `steer = false`.
+    Main's other settings of that table (spawn) go to their defaults, as on main."""
+    import logging
+    from agent_comms import hosted_tree
+    from agent_comms.dispatch import SpawnConfig
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)                    # accepted while the setting was read
+    hosted_steer._unreadable_said.clear()
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    off = json.loads(json.dumps(env.board.s.dispatch))
+    off["sessions"]["steer"] = False
+    env.board.s.dispatch = off
+    features_off = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json().get("features")
+    env.board.s.dispatch["sessions"]["steer"] = True
+    _malformed(env, how)
+    assert hosted_tree.spawn_config(env.board) == SpawnConfig(), "main's other settings: their defaults"
+    for _ in range(2):
+        refusal(env, sid, hosted_steer.REFUSED["unreadable"])
+    said = [r for r in caplog.records if "settings could not be read" in r.getMessage()]
+    assert len(said) == 1 and r"steering is off" in said[0].getMessage()
+    assert env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json().get("features") == features_off
+    tick(env)
+    [req] = steers_of(child)
+    answer_steer(child, req, {"turnId": cx.TURN})
+    end_turn(env, child)
+    assert steer_rec(env, sid)["outcome"] == "in_turn", "the accepted steer is offered and settled as ever"
+
+
+def test_pm_3_with_no_sessions_table_steering_is_on_as_designed():
+    from types import SimpleNamespace
+    for dispatch in (None, {}, {"sessions": {}}):
+        assert hosted_steer.off_reason(SimpleNamespace(s=SimpleNamespace(dispatch=dispatch))) is None
+    assert hosted_steer.off_reason(SimpleNamespace(s=SimpleNamespace(dispatch={"sessions": {"steer": False}}))) == "off"
+
+
+def test_pm_4_a_human_steer_starts_the_trees_count_of_turns_without_the_human_over(env):
+    """Pre-merge review, item 4: a human steer is a human send (H): the count of child turns without the human, of
+    the root's agent in its project, starts over; a refused one changes nothing."""
+    sid, child = codex_turn_in_flight(env)
+    with hosted.db.write_tx(env.board.conn) as c:
+        b = hs._budget(c, "codex", PROJECT)
+        hs._charge(b)
+        hs._charge(b)
+        hs._save_budget(c, b, env.clock())
+    turns = lambda: hs._usage(env.board.conn, "codex", PROJECT, env.clock())["turns"]     # noqa: E731
+    assert turns() == 2
+    refusal(env, sid, hosted_steer.REFUSED["big"], text="x" * (hosted_steer.STEER_MAX_BYTES - 1))
+    assert turns() == 2, "a refused steer is no send"
+    post_steer(env, sid)
+    assert turns() == 0
+
+
+def test_pm_4_an_offer_older_than_20_s_is_unusable_also_when_a_hello_is_acknowledged_before_it_is_applied(env):
+    """Pre-merge review, item 4: the offer-age rule's other branch. The listing's answer is read 20 s after it was
+    sent, and a hello is acknowledged after that answer and before the listing is applied (a hello every 10 s makes
+    this ordinary): the walk meets that acknowledgement first, and the offer is still too old to use."""
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    runner = env.node.sessions
+
+    class Slow:
+        def __init__(self, hub, clock):
+            self.hub, self.clock = hub, clock
+
+        def request(self, method, path, **kw):
+            out = self.hub.request(method, path, **kw)
+            if method == "GET":
+                self.clock.advance(node_sessions.STEER_OFFER_AGE)
+            return out
+    real = runner._reconcile
+
+    def late(data, *a, **kw):
+        runner.note_hello(env.clock() - 1)      # acknowledged after the fetch's answer, before it is applied
+        return real(data, *a, **kw)
+    runner.client = Slow(env.laptop, env.clock)
+    runner._reconcile = late
+    env.node.hello()
+    tick(env)
+    s = runner.host.sessions[sid]
+    assert s.steer is not None and not s.steer.authorized and steers_of(child) == []
+
+
+def test_pm_4_a_frame_queued_before_the_stop_is_refused_at_the_boundary_by_the_gates_own_latch_check(henv):
+    """Pre-merge review, item 4: the frame was queued in an earlier pass (the pipe full: not a byte taken); the node
+    begins to stop, and the records are marked and the latch set while its own stopping flag (the authority
+    callback) still says yes; the pipe opens and a pass writes: the boundary's gate refuses on the latch and the
+    record's mark: not a byte of S."""
+    host, s, child, _ = host_n(henv)
+    child.accept = 0
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert s.steer.mark is not None and s.steer.sent == 0, "queued, not a byte taken"
+    host.steer_stopping()
+    assert host.steer_authority(s), "the node's own flag is not set yet"
+    child.accept = None
+    host.tick()
+    assert steers_of(child) == [] and s.steer.sent == 0
+
+
+@pytest.mark.parametrize("dt, holds", [(-0.001, True), (0.0, False), (0.001, False)])
+def test_pm_4_the_75_s_renewal_boundary(dt, holds):
+    """Pre-merge review, item 4: an acknowledgement sent at 150 renews the contact to exactly 150 + 75 s: just under
+    it holds; at it and just over, it has run out (and the break is latched)."""
+    from agent_comms.session_host import STEER_CONTACT_SECONDS
+    slot = _record(100.0)
+    slot.ack(150.0, lambda: 150.5, None, None)
+    assert slot.cover_until == 150.0 + STEER_CONTACT_SECONDS == 225.0
+    assert slot.contact_ok(225.0 + dt) is holds
+    assert (slot.revoked is None) is holds
+
+
+def test_pm_4_the_75_s_is_defined_once():
+    from agent_comms import session_host
+    assert node_sessions.STEER_CONTACT_SECONDS is session_host.STEER_CONTACT_SECONDS == 75.0
+    assert "STEER_CONTACT_SECONDS = " not in open(node_sessions.__file__).read()
+    assert not hasattr(hosted_steer, "any_unsettled")
