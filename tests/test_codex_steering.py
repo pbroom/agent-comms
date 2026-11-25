@@ -4178,6 +4178,74 @@ def test_r4_01_a_write_never_comes_after_the_node_began_to_stop(env):
     assert steers_of(child) == [], "a steer byte went after the node began to stop"
 
 
+def test_r4_gap_a_write_checked_after_the_records_were_marked_is_refused_though_the_flag_is_not_set_yet(env):
+    """The window inside the flag's `set()`: every record is marked, the flag itself not set yet, and a pass on
+    another thread reaches the boundary. The record's own `stopping` refuses it (the flag alone would still say go),
+    so no write can be under way once the flag is set. Barriers only: the pass signals its pipe write or its return."""
+    import threading
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    host = runner.host
+    st = last_start(child)
+    child.emit(user_item(st["params"]["clientUserMessageId"]))     # proved: the next pass would write
+    progress, release, marked, threads = threading.Event(), threading.Event(), [], []
+    real_write = child.write
+
+    def write(data):
+        if b'"turn/steer"' in data:
+            progress.set()                      # under way in the pipe
+            assert release.wait(30)
+        return real_write(data)
+    child.write = write
+
+    def a_pass():
+        try:
+            with runner.lock:
+                runner._emit(host.tick())
+        finally:
+            progress.set()                      # returned
+    real_mark = host.steer_stopping
+
+    def mark():
+        real_mark()
+        marked.append(s.steer.stopping)
+        th = threading.Thread(target=a_pass)
+        threads.append(th)
+        th.start()
+        assert progress.wait(30)
+    host.steer_stopping = mark
+    runner.stopping.set()
+    release.set()
+    for th in threads:
+        th.join(30)
+    del host.steer_stopping
+    runner.stopping.clear()
+    assert marked == [True], "setting the flag marks every record first"
+    assert steers_of(child) == [], "a steer write was under way when the flag was set"
+
+
+def test_r4_gap_an_attempt_made_after_the_node_began_to_stop_is_never_written(env):
+    """The flag is set inside a pass that is already past its own check, just before it applies a fresh offer into a
+    proved turn: the attempt is made after the records were marked, so it has no mark; the node's authority, asked
+    at the boundary, refuses it."""
+    sid, child = codex_turn_in_flight(env, prove=True)
+    post_steer(env, sid)
+    runner = env.node.sessions
+    host = runner.host
+    real_offer = host.steer_offer
+
+    def offer(*a, **kw):
+        runner.stopping.set()
+        return real_offer(*a, **kw)
+    host.steer_offer = offer
+    tick(env)
+    del host.steer_offer
+    runner.stopping.clear()
+    s = host.sessions[sid]
+    assert s.steer is not None and s.steer.authorized and not getattr(s.steer, "stopping", False), "made unmarked"
+    assert steers_of(child) == [], "a steer byte went after the node began to stop"
+
+
 def test_r4_02_an_acknowledgements_receipt_is_read_after_the_records_lock_is_taken(env):
     """A hello is published at 74.99 s while the record's lock is held (a write under way); it gets the lock at
     75.01 s, after the contact ran out at 75 s: its receipt is 75.01, a break, not a renewal."""
