@@ -2802,7 +2802,8 @@ class _Model:
 
 STEER_LINE = b'"method": "turn/steer"'
 EVENTS = ["pass", "local", "hello", "step", "gate", "accept", "answer", "end", "cancel_live", "cancel_queued", "stop",
-          "watchdog", "boundary_ack", "shutdown", "install_race", "stop_mid_pass", "mixed_exit"]
+          "watchdog", "boundary_ack", "shutdown", "install_race", "stop_mid_pass", "mixed_exit", "stop_at_cut",
+          "stop_in_drain", "loop2_exit"]
 
 
 def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
@@ -2939,7 +2940,8 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
     plan = script if script is not None else [None] * steps
     for i, step in enumerate(plan):
         ev = step[0] if step is not None else rnd.choices(EVENTS,
-                                                          weights=[10, 4, 4, 6, 3, 3, 3, 1, 1, 1, 1, 2, 3, 1, 1, 1, 1])[0]
+                                                          weights=[10, 4, 4, 6, 3, 3, 3, 1, 1, 1, 1, 2, 3, 1, 1, 1, 1,
+                                                                   1, 1, 1])[0]
         arg = step[1] if step is not None else None
         if ev == "pass":
             if arg is None:
@@ -3030,7 +3032,7 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
                     return
                 host.steer_install_hook = None
                 log_.append(f"  ({i}) stopping began at the installation ({when})")
-                model.stopped, model.terms_at_stop = True, child.terminated
+                model.stopped, model.frozen, model.terms_at_stop = True, True, child.terminated
                 runner.stopping.set()
             host.steer_install_hook = at_install
         elif ev == "stop_mid_pass" and not model.stopped:
@@ -3043,7 +3045,7 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
                 if w != "before" or model.stopped:
                     return False
                 log_.append(f"  ({i}) stopping began at the write boundary")
-                model.stopped, model.terms_at_stop = True, child.terminated
+                model.stopped, model.frozen, model.terms_at_stop = True, True, child.terminated
                 runner.stopping.set()
                 return True
             armed.append(at_stop)
@@ -3066,6 +3068,60 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
                                      + "\n  ".join(log_))
             host.close(other, "the model's ordinary session")
             env.groups.discard(child.pid)
+        elif ev == "stop_at_cut" and not model.stopped:
+            # (Round 6, R6-01:) shutdown publishes between a cut's precheck and its ownership (the watchdog's, or a
+            # pass's): the cut does nothing (the checker: no signal ahead of the stop's own).
+            log_.append(f"{i} the node begins to stop at the next cut")
+
+            def at_cut(sess, i=i):
+                host.steer_cut_hook = None
+                log_.append(f"  ({i}) stopping began at a cut")
+                model.stopped, model.frozen, model.terms_at_stop = True, True, child.terminated
+                runner.stopping.set()
+            host.steer_cut_hook = at_cut
+        elif ev == "stop_in_drain" and not model.stopped:
+            # (Round 6, R6-01:) shutdown publishes while a drain reads (a cut's, a cancel's, an exit's): the drain
+            # reads no more, nothing after counts for S (frozen), and the stop it belongs to goes on as its own.
+            log_.append(f"{i} the node begins to stop during the next drain")
+
+            def at_drain(sess, i=i):
+                host.steer_drain_hook = None
+                log_.append(f"  ({i}) stopping began during a drain")
+                model.stopped = model.frozen = model.shut = True
+                runner.stopping.set()
+            host.steer_drain_hook = at_drain
+        elif ev == "loop2_exit" and not model.stopped and not model.n_ended and s.child is not None \
+                and s.stopping_since is None:
+            # (Round 6, R6-03:) a successor already queued in the host's FIFO, and the steered process exits during
+            # the pass's second loop: nothing starts for the session before its old process is settled (N decided,
+            # its pipe and transcript closed), and the new process's transcript is never closed by the old one's.
+            log_.append(f"{i} a successor is queued; the steered process exits in the pass's second loop")
+            host.send(sid, "a successor", message_id="z9")
+            calls, real_read = [], child.read_lines
+
+            def read():
+                calls.append(1)
+                if len(calls) == 2:
+                    child.code = 0
+                return real_read()
+            child.read_lines = read
+            spawns, real_spawner = [], host.spawner
+
+            def spawner(*a, **kw):
+                spawns.append((s.in_flight.id if s.in_flight is not None else None, s.child is None,
+                               s.transcript_fd))
+                return real_spawner(*a, **kw)
+            host.spawner = spawner
+            with runner.lock:
+                runner._emit(host.tick())
+            host.spawner, child.read_lines = real_spawner, real_read
+            if any(x != (None, True, None) for x in spawns):
+                raise AssertionError(f"a process started before the old one was settled: {spawns}\n  "
+                                     + "\n  ".join(log_))
+            if s.child is not None and s.child is not child and s.transcript_fd is None:
+                raise AssertionError("the new process's transcript was closed\n  " + "\n  ".join(log_))
+            _check(child, seen, model, log_)
+            break       # (the successor is the host's own: no listing knows it)
         elif ev == "shutdown":
             # (The shutdown simplification:) main's shutdown, a steer live or not: every SIGTERM at once, nothing
             # read first; S's outcome is what the host had read when it began (rule 2). It ends the sequence.
@@ -3079,7 +3135,7 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
         _check(child, seen, model, log_)
     # (Round 4, R3-11:) every sequence ends: N ends natively if nothing ended it, local passes read it, and the host
     # must then have said N's end. Without this a sequence that never ended N checked no settlement at all.
-    host.steer_write_hook = host.steer_install_hook = None
+    host.steer_write_hook = host.steer_install_hook = host.steer_cut_hook = host.steer_drain_hook = None
     armed.clear()
     model.shut = True       # (what follows is the sequence's end, not a pass the stop interrupted)
     if not seen.ends:
@@ -3256,6 +3312,59 @@ def test_model_reach_r5_03_a_mixed_pass_in_a_shared_checkout(tmp_path):
     seen, model, log_ = _run_model(tmp_path, 0, script=[("pass", ("with", "timely", [])), ("mixed_exit", None)])
     assert any("the steered leader exits" in x for x in log_)
     assert seen.ends and seen.ends[0].steer is not None
+
+
+def test_model_reach_r6_01_the_stop_between_the_watchdogs_precheck_and_its_cut(tmp_path):
+    """Round 6 (R6-01): the model reaches shutdown publishing between the watchdog's precheck and its cut of a frame
+    taken in part past its limit: the cut does nothing (the checker: no signal ahead of the stop's own); N's end, at
+    the shutdown, says `unconfirmed` (`partial`)."""
+    seen, model, log_ = _run_model(tmp_path, 0, script=[("accept", 10), ("pass", ("with", "timely", [])),
+                                                        ("stop_at_cut", None), ("step", 5.1), ("watchdog", None),
+                                                        ("shutdown", None)])
+    assert any("stopping began at a cut" in x for x in log_)
+    assert seen.ends and seen.ends[0].steer == {"outcome": "unconfirmed", "why": "partial"}
+
+
+def test_model_reach_r6_01_the_stop_during_a_drain_read(tmp_path):
+    """Round 6 (R6-01): the model reaches shutdown publishing during a drain (a cancel of N through the listing, S
+    written whole): the drain reads no more, nothing after counts, and N's end says `unconfirmed`."""
+    seen, model, log_ = _run_model(tmp_path, 0, script=[("pass", ("with", "timely", [])), ("stop_in_drain", None),
+                                                        ("cancel_live", None)])
+    assert any("stopping began during a drain" in x for x in log_)
+    assert seen.ends and seen.ends[0].steer["outcome"] == "unconfirmed"
+
+
+def test_model_reach_r6_03_a_second_loop_exit_with_a_queued_successor(tmp_path):
+    """Round 6 (R6-03): the model reaches the steered process exiting in the pass's second loop with a successor
+    already queued (the checker: nothing starts before the old process is settled)."""
+    seen, model, log_ = _run_model(tmp_path, 0, script=[("pass", ("with", "timely", [])), ("loop2_exit", None)])
+    assert any("a successor is queued" in x for x in log_)
+    assert seen.ends and seen.ends[0].steer is not None
+
+
+def test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start():
+    """R6-05: the golden's allowance for Codex's echo nulls a stripped id only in the userMessage item's own
+    `clientId`, and only for the start it answers in that transcript (that start's thread, the turn this transcript's
+    answer to that start named). Two known start ids swapped, another thread, or the id in another field: kept."""
+    import golden_schema_free as g
+    g.CLIENT_IDS.clear()
+    g.STARTS.clear()
+    g.NAMED.clear()
+    u1, u2 = "1e64c1ac-3dc2-45ff-bad6-ee954a1892a1", "2e64c1ac-3dc2-45ff-bad6-ee954a1892a2"
+    for rid, u in ((3, u1), (4, u2)):
+        start = json.dumps({"id": rid, "method": "turn/start", "params": {"threadId": "T1", "input": [],
+                                                                          "clientUserMessageId": u}})
+        assert g._codex_line(start) != start
+    answered = g._turns_answered([json.dumps({"id": 3, "result": {"turn": {"id": "A"}}}),
+                                  json.dumps({"id": 4, "result": {"turn": {"id": "B"}}})])
+
+    def echo(cid, turn, thread="T1", **extra):
+        return json.dumps({"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": {
+            "type": "userMessage", "id": "i", "clientId": cid, **extra}}})
+    assert g._item_echo(echo(u1, "A"), answered) == echo(None, "A"), "its own start's echo"
+    assert g._item_echo(echo(u2, "B"), answered) == echo(None, "B")
+    for kept in (echo(u2, "A"), echo(u1, "B"), echo(u1, "A", thread="T2"), echo(None, "A", note={"clientId": u1})):
+        assert g._item_echo(kept, answered) == kept, "swapped, another thread, or not the item's own field"
 
 
 def test_model_checker_follows_every_frame_not_only_the_first():
@@ -4134,10 +4243,14 @@ def _shutdown_run(tmp_path, steer: bool, case: str):
                             [{k: v for k, v in e.items() if k != "steer"} for e in body.get("events", [])]))
             return real_client.request(method, path, **kw)
     runner.client = Recording()
+    real_spawner = runner.host.spawner
+
+    def spawner(*args, **kw):       # (round 6: every start in the global order, not a count at the end)
+        log.append(("start", env.clock() - t0[0]))
+        return real_spawner(*args, **kw)
+    runner.host.spawner = spawner
     t0.append(env.clock())
-    starts = len(env.node.session_spawner.children)
     node_mod.shut_down(env.node)
-    log.append(("starts during it", len(env.node.session_spawner.children) - starts))
     rec = steer_rec(env, a) if steer else None
     return log, posted, rec, a
 
@@ -4222,79 +4335,49 @@ def _endless_after_first(child, clock, step=0.5, free=2):
     return reads
 
 
-def test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it(henv):
-    """R4-06, Sol's 8 s case: four steered sessions, each still writing without end, and one ordinary session reach
-    their turn timeout in the same pass. The ordinary one is stopped first, at the pass's own time (never delayed
-    nor backdated by a drain); the four share ONE 2 s drain deadline (not 2 s each), and each is stopped when its
-    turn comes, dated then."""
+def test_sd_one_drain_budget_per_pass_bounds_how_late_an_ordinary_session_acts(henv):
+    """Review round 6 (the deferral withdrawn): four steered sessions, each still writing without end, and two
+    ordinary sessions, one before them in main's order and one after, reach their turn timeout in one pass. The
+    steered ones are settled inline, sharing ONE 2 s drain deadline (not 2 s each). The ordinary one before them is
+    stopped at the pass's time; the one after them may act up to that one budget later than on main, never earlier;
+    both are dated with the pass's time (main's) and come in main's order. Each steered stop is dated when sent."""
     import uuid as uuid_mod
     from agent_comms.session_host import STEER_DRAIN_SECONDS
     host, s0 = codex_host(henv)
     host.steer_authority = lambda sess: True
-    ids = [SID] + [str(uuid_mod.uuid4()) for _ in range(4)]
     host.sessions.pop(SID)
-    kids = {}
-    for i, sid in enumerate(ids[1:]):
+    first, last = SID, str(uuid_mod.uuid4())
+    steered_ids = [str(uuid_mod.uuid4()) for _ in range(4)]
+    kids = {first: _codex_steered_in(host, henv, first, None)}          # ordinary, first in main's order
+    for i, sid in enumerate(steered_ids):
         kids[sid] = _codex_steered_in(host, henv, sid, f"u{i}")
-    plain = ids[0]
-    kids[plain] = _codex_steered_in(host, henv, plain, None)       # opened last: main's order handles it last
+    kids[last] = _codex_steered_in(host, henv, last, None)              # ordinary, last in main's order
     henv.clock.advance(31 * 60)
     host.tick()                                 # every turn's interrupt is written
     henv.clock.advance(henv.config.kill_grace_seconds)
-    signalled = {}
+    signalled, order = {}, []
     for sid, ch in kids.items():
         ch.exits_on_terminate = False       # (each stays stopping, so its stop's time can be read)
         real = ch.terminate
 
         def term(real=real, sid=sid):
             signalled.setdefault(sid, henv.clock())
+            order.append(sid)
             return real()
         ch.terminate = term
-        if sid != plain:
+        if sid in steered_ids:
             _endless_after_first(ch, henv.clock)
     t = henv.clock()
     events = host.tick()
-    assert signalled[plain] == t and host.sessions[plain].stopping_since == t, "the ordinary stop is main's"
     assert henv.clock() - t <= STEER_DRAIN_SECONDS + 0.5, "one drain deadline for the whole pass"
-    for sid in ids[1:]:
-        assert host.sessions[sid].stopping_since == signalled[sid], "each stop dated when it was sent"
-    assert len(ended_of(events)) == 5
-    assert all(e.steer == {"outcome": "unconfirmed", "why": "turn_cut"} for e in ended_of(events) if e.session_id != plain)
-
-
-@pytest.mark.parametrize("group", [False, True])
-def test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass(henv, group):
-    """Rule 3 / R4-06 across the pass's two loops: a steered session whose process exited while still writing is
-    reaped (and drained) in the same pass in which an ordinary session's turn timeout falls due: the ordinary one is
-    stopped at the pass's own time, as on main, before any drain. (Round 5: with its group left behind too, the
-    mutation check's gap: fenced at its discovery, drained after the pass's other work.)"""
-    import uuid as uuid_mod
-    host, s0 = codex_host(henv)
-    host.steer_authority = lambda sess: True
-    host.sessions.pop(SID)
-    steered_id = str(uuid_mod.uuid4())
-    ch = _codex_steered_in(host, henv, steered_id, "u1")
-    plain = _codex_steered_in(host, henv, SID, None)          # opened last: main's order handles it last
-    henv.clock.advance(31 * 60)
-    host.tick()                                 # both turns' interrupts are written
-    henv.clock.advance(henv.config.kill_grace_seconds - 1)
-    host.tick()
-    henv.clock.advance(1)
-    plain.exits_on_terminate = False
-    at, real = {}, plain.terminate
-
-    def term():
-        at.setdefault("plain", henv.clock())
-        return real()
-    plain.terminate = term
-    _endless_after_first(ch, henv.clock)
-    ch.code = 0                                 # the steered process exited, still writing: its reap drains
-    if group:
-        henv.groups.add(ch.pid)                 # ... leaving members of its group behind
-    t = henv.clock()
-    events = host.tick()
-    assert at.get("plain") == t and host.sessions[SID].stopping_since == t, "the ordinary timeout is main's"
-    assert {e.session_id for e in ended_of(events)} == {SID, steered_id}
+    assert signalled[first] == t, "an ordinary session before any drain acts as on main"
+    assert t <= signalled[last] <= t + STEER_DRAIN_SECONDS + 0.5, "one after them: at most one budget late"
+    assert host.sessions[first].stopping_since == t and host.sessions[last].stopping_since == t, "main's dating"
+    assert [x for x in order if x in (first, last)] == [first, last], "the ordinary sessions in main's order"
+    assert order == list(kids), "every signal in main's order"
+    for sid in steered_ids:
+        assert host.sessions[sid].stopping_since == signalled[sid], "each steered stop dated when it was sent"
+    assert len(ended_of(events)) == 6
 
 
 def test_sd_gap_the_watchdogs_cuts_in_one_call_share_one_drain_deadline(henv):
@@ -4704,84 +4787,6 @@ def test_r5_04_one_drain_deadline_for_a_whole_hold_of_the_loops_lock(env):
     assert len(held) == 2 and held[1] - held[0] <= STEER_DRAIN_SECONDS + 0.5, "one deadline for the hold"
 
 
-def test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then(henv):
-    """R5-04: an ordinary session's SIGKILL falls due while a steered session's deferred drain is reading: it is
-    sent between the drain's reads, when due, not after the drain."""
-    import uuid as uuid_mod
-    host, s0 = codex_host(henv)
-    host.steer_authority = lambda sess: True
-    host.sessions.pop(SID)
-    a = str(uuid_mod.uuid4())
-    ca = _codex_steered_in(host, henv, a, "u1")
-    cb = _codex_steered_in(host, henv, SID, None)
-    cb.exits_on_terminate = False
-    host.close(SID, "closed")                   # B stopping; its SIGKILL falls due kill_grace later
-    t_stop = host.sessions[SID].stopping_since
-    killed, real_kill = [], cb.kill
-
-    def kill():
-        killed.append(henv.clock())
-        return real_kill()
-    cb.kill = kill
-    henv.clock.advance(host.kill_grace - 1)
-    _endless_after_first(ca, henv.clock)
-    ca.code = 0                                 # A exited, still writing: its reap's drain reads ~2 s
-    host.tick()
-    assert killed and killed[0] - (t_stop + host.kill_grace) <= 0.5, "killed when due, during the drain"
-
-
-def test_r5_gap_the_watchdogs_cut_does_nothing_once_the_node_is_stopping(henv):
-    """(Found by round 5's mutation check.) The watchdog already past its own stopping check calls `steer_deadlines`
-    after the stop latch was set, with a frame taken in part past its limit: nothing is cut, read or signalled."""
-    host, s, child, _ = partial(henv)
-    henv.clock.advance(STEER_PARTIAL_SECONDS)
-    host.steer_stopping()
-    reads, real = [], child.read_lines
-
-    def read():
-        reads.append(1)
-        return real()
-    child.read_lines = read
-    assert host.steer_deadlines() == []
-    assert reads == [] and not child.terminated and s.stopping_since is None
-    assert s.steer is not None and 0 < s.steer.sent < s.steer.length, "the frame stays partial"
-
-
-def test_r5_gap_a_cut_in_a_pass_never_delays_an_ordinary_timeout(henv):
-    """(Found by round 5's mutation check.) A steered frame taken in part runs past its limit in the same pass in
-    which an ordinary session's turn timeout falls due, later in main's order: the cut stops the steered process at
-    its point, its drain waits for the end of the pass, and the ordinary stop is at the pass's own time."""
-    import uuid as uuid_mod
-    host, s0 = codex_host(henv)
-    host.steer_authority = lambda sess: True
-    host.sessions.pop(SID)
-    a = str(uuid_mod.uuid4())
-    ca = _codex_steered_in(host, henv, a, None)
-    plain = _codex_steered_in(host, henv, SID, None)          # opened last: main's order handles it last
-    henv.clock.advance(31 * 60)
-    host.tick()                                 # the plain turn's interrupt is written (and A's)
-    sa = host.sessions[a]
-    sa.busy_since, sa.interrupted_at = henv.clock(), None      # (A's own turn is not timing out: only its cut)
-    ca.accept = 10
-    host.steer_offer(a, "a", "u1", TEXT, authorized=True)
-    henv.clock.advance(henv.config.kill_grace_seconds - STEER_PARTIAL_SECONDS)
-    host.tick()
-    assert 0 < host.sessions[a].steer.sent < host.sessions[a].steer.length
-    henv.clock.advance(STEER_PARTIAL_SECONDS)
-    plain.exits_on_terminate = False
-    at, real = {}, plain.terminate
-
-    def term():
-        at.setdefault("plain", henv.clock())
-        return real()
-    plain.terminate = term
-    _endless_after_first(ca, henv.clock)
-    t = henv.clock()
-    host.tick()
-    assert at.get("plain") == t and host.sessions[SID].stopping_since == t, "the ordinary timeout is main's"
-    assert host.sessions[a].stopping_since is not None, "the cut stopped A"
-
-
 def test_r5_gap_a_fenced_pipe_stays_open_for_its_drain_when_the_group_goes_in_the_same_pass(henv):
     """(Found by round 5's mutation check.) The steered leader exits leaving its group (fenced at discovery); the group
     is gone by the pass's second loop. The pipe is kept open for the pending drain, which still reads N's own end."""
@@ -4807,12 +4812,12 @@ def test_r5_gap_a_fenced_pipe_stays_open_for_its_drain_when_the_group_goes_in_th
 
 
 def test_rebase_a_claude_budget_and_a_codex_drain_never_meet(henv, monkeypatch):
-    """(The rebase onto main's #112.) In one host, a verified Claude session holds M in the inbox while the CLI's own
-    turn runs (M's no-progress budget earned and counting), and a Codex session's live steer attempt ends with its
-    process exiting, N's native end behind buffered output (a deferred drain). In the pass: the Claude session's one
-    decision point comes in its own `_steps`, before the deferred drain, and the drain makes no decision; the drain
-    reads only the Codex process; the steer code takes no slot and writes nothing for the Claude session; the budget
-    code reads no gate and keeps no budget for the Codex session."""
+    """(The rebase onto main's #112; round 6: the drain inline.) In one host, a verified Claude session holds M in
+    the inbox while the CLI's own turn runs (M's no-progress budget earned and counting), and a Codex session's live
+    steer attempt ends with its process exiting, N's native end behind buffered output (its drain, in the reap). In
+    the pass: the Claude session has its one decision point, in its own `_steps`, and no decision is made inside the
+    drain; the drain reads only the Codex process; the steer code takes no slot and writes nothing for the Claude
+    session; the budget code reads no gate and keeps no budget for the Codex session."""
     import uuid as uuid_mod
     import test_claude_correlation as cc
     cc.short_host(henv, monkeypatch)
@@ -4838,13 +4843,20 @@ def test_rebase_a_claude_budget_and_a_codex_drain_never_meet(henv, monkeypatch):
     order = []
     real_decide, real_drain, real_gates = host._decide, host._drain_reads, host._read_gates
 
+    in_drain = []
+
     def decide(sess, now, out):
+        assert not in_drain, "a decision inside a drain"
         order.append(("decide", sess.session_id))
         return real_decide(sess, now, out)
 
     def drain(sess, *a, **kw):
         order.append(("drain", sess.session_id))
-        return real_drain(sess, *a, **kw)
+        in_drain.append(1)
+        try:
+            return real_drain(sess, *a, **kw)
+        finally:
+            in_drain.pop()
 
     def gates(sess):
         order.append(("gates", sess.session_id))
@@ -4853,8 +4865,7 @@ def test_rebase_a_claude_budget_and_a_codex_drain_never_meet(henv, monkeypatch):
     counted_before = m.counted
     events = host.tick()
     assert ("drain", other) in order and {x for k, x in order if k == "drain"} == {other}, "only Codex is drained"
-    assert order.index(("decide", SID)) < order.index(("drain", other)), "Claude's decision precedes the drain"
-    assert [k for k, _ in order[order.index(("drain", other)):]] == ["drain"], "the drain makes no decision"
+    assert order.count(("decide", SID)) == 1, "Claude's one decision point, in its own `_steps`, as on main"
     assert ("gates", SID) in order and ("gates", other) not in order, "no gate reading for the Codex session"
     sx = host.sessions[other]
     assert all(x.counted is None for x in list(sx.inbox) + [y for y in (sx.writing, sx.in_flight) if y])
@@ -4929,6 +4940,129 @@ def test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer(tmp_path)
     assert [{k: v for k, v in b.items() if k != "modes"} for b in steer_b] == \
         [{k: v for k, v in b.items() if k != "modes"} for b in main_b]
     assert "answered" in features and "steer" not in features
+
+
+def test_r6_01_a_cut_that_meets_the_stop_latch_does_nothing(henv):
+    """R6-01: the watchdog's `steer_deadlines` passed its precheck for a frame taken in part past its limit; the
+    node's stop latch is set just as its gate is asked (shutdown published between the two). The cut, which takes
+    ownership under the latch's lock, does nothing: no read, no signal; the frame stays partial."""
+    host, s, child, _ = partial(henv)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    real_gate, reads, real_read = host._steer_gate, [], child.read_lines
+
+    def gate(sess, slot, now, fence=True):
+        host.steer_stopping()                   # shutdown publishes here
+        return real_gate(sess, slot, now, fence)
+
+    def read():
+        reads.append(1)
+        return real_read()
+    host._steer_gate, child.read_lines = gate, read
+    assert host.steer_deadlines() == []
+    assert reads == [] and not child.terminated and s.stopping_since is None, "the cut did nothing"
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length, "the frame stays partial"
+
+
+def test_r6_01_a_drain_reading_when_the_stop_latch_is_set_reads_no_more_and_nothing_after_counts(henv):
+    """R6-01: a close drains a steered session whose answer and native end are still behind a partial line; during
+    the drain's first read the node's stop latch is set. The drain reads no more, and N's end says what was read
+    before the cutoff: `unconfirmed` (`turn_cut`), never `in_turn`."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    [req] = steers_of(child)
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    real_read, reads = child.read_lines, []
+    child.bytes_read = 0
+
+    def read():
+        reads.append(1)
+        if len(reads) == 1:
+            host.steer_stopping()               # shutdown publishes during this read
+            child.bytes_read += 4096
+            return []                           # (bytes into a line not complete yet)
+        return real_read()
+    child.read_lines = read
+    [end] = ended_of(host.close(SID, "closed"))
+    assert reads == [1], "no read after the cutoff"
+    assert not end.ok and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def _timed_out_and_exited(henv, steer, behind=1):
+    """N reaches its turn timeout and is interrupted; its process then exits with N's native completion behind the
+    first `behind` reads. Returns the end of N the host reports."""
+    host, s, child, _ = host_n(henv)
+    if steer:
+        host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+        host.tick()
+        assert len(steers_of(child)) == 1
+    henv.clock.advance(31 * 60)
+    host.tick()
+    assert s.interrupted_at is not None, "the timeout's interrupt was written"
+    child.emit(cx.message("native"), cx.completed())
+    _fragmented(child, behind)
+    child.code = 0
+    [end] = ended_of(host.tick())
+    return end
+
+
+def _a_henv(tmp_path):
+    """(test_session_host's `henv` fixture, for a second host in one test.)"""
+    from types import SimpleNamespace
+    from agent_comms.dispatch import DispatchConfig
+    from conftest import FakeClock
+    from test_dispatch import FakeProcs, FakeSpawner
+    from test_session_host import SHIPPED, FakeSessionChild, make_host
+    work = tmp_path / "checkout"
+    work.mkdir(parents=True)
+    h = SimpleNamespace(clock=FakeClock(), work=str(work), log_dir=tmp_path / "node-logs", signals=[], groups=set())
+    h.config = DispatchConfig.from_dict({"runners": {"claude-code": SHIPPED}, "worktrees": {PROJECT: str(work)},
+                                         "timeout_minutes": 30, "kill_grace_seconds": 10})
+    h.spawner = FakeSpawner(child=FakeSessionChild)
+    h.procs = FakeProcs(h.spawner)
+    h.host = make_host(h)
+    return h
+
+
+def test_r6_02_a_timed_out_turn_whose_completion_is_behind_the_first_read_reports_the_timeout(tmp_path):
+    """R6-02: the completion is behind both of the pass's own reads of the exited process, so only the steer's
+    drain reaches it. It is read with the process's timeout state as it was (the drain runs before the reap lets go
+    of anything): the interrupted turn is reported as main reports it when its read finds that completion, a timeout,
+    ok=False, with its detail (the reference: no steer, the completion behind one read only)."""
+    plain = _timed_out_and_exited(_a_henv(tmp_path / "plain"), False, behind=1)
+    end = _timed_out_and_exited(_a_henv(tmp_path / "steered"), True, behind=2)
+    assert (end.ok, end.detail, end.text) == (plain.ok, plain.detail, plain.text)
+    assert not end.ok and end.detail.startswith("timed out")
+
+
+def test_r6_03_a_successor_never_starts_before_the_old_process_is_settled(henv):
+    """R6-03: N+1 is already queued in the host's FIFO; the steered process exits during the pass's second loop
+    (after its first-loop read). The old process is settled inline, N decided and its pipe and transcript closed,
+    before the successor's process starts; the new process's transcript is never closed by the old one's cleanup."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert len(steers_of(child)) == 1
+    host.send(SID, "next", message_id="b")
+    calls, real_read = [], child.read_lines
+
+    def read():
+        calls.append(1)
+        if len(calls) == 2:                     # the second loop's read: the process has exited by now
+            child.code = 0
+        return real_read()
+    child.read_lines = read
+    seen, real_spawner = [], host.spawner
+
+    def spawner(*a, **kw):
+        seen.append((s.in_flight.id if s.in_flight is not None else None, s.child is None, s.transcript_fd))
+        return real_spawner(*a, **kw)
+    host.spawner = spawner
+    events = host.tick()
+    assert ("turn_ended", "a") in [(e.kind, e.message_id) for e in events]
+    assert seen and seen[0] == (None, True, None), "spawned only once N was decided and the old process let go of"
+    if s.child is not None:
+        assert s.child is not child and s.transcript_fd is not None, "the new process's transcript stays open"
 
 
 def test_r3_gap_the_join_probe_fails_at_once_on_an_answer_naming_another_turn(tmp_path):
