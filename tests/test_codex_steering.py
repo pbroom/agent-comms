@@ -4822,7 +4822,7 @@ def test_rebase_a_claude_budget_and_a_codex_drain_never_meet(henv, monkeypatch):
     host.send(SID, "next", message_id="1")
     host.tick()
     m = s.inbox[0]
-    assert m.earned and m.counted is not None, "M's budget is earned and counting"
+    assert m.counted is not None, "M's budget is earned and counting (`counted` set is main's one record of it)"
     henv.config.runners["codex-cli"] = ["codex", "exec", "--cd", "{project}", "--sandbox", "workspace-write",
                                         "-c", cx.APPROVE, "{prompt}"]
     henv.config.sessions.codex = True
@@ -4857,7 +4857,7 @@ def test_rebase_a_claude_budget_and_a_codex_drain_never_meet(henv, monkeypatch):
     assert [k for k, _ in order[order.index(("drain", other)):]] == ["drain"], "the drain makes no decision"
     assert ("gates", SID) in order and ("gates", other) not in order, "no gate reading for the Codex session"
     sx = host.sessions[other]
-    assert all(x.counted is None and not x.earned for x in list(sx.inbox) + [y for y in (sx.writing, sx.in_flight) if y])
+    assert all(x.counted is None for x in list(sx.inbox) + [y for y in (sx.writing, sx.in_flight) if y])
     assert b"turn/steer" not in bytes(child.stdin) and TEXT.encode() not in bytes(child.stdin)
     assert m.counted is not None and m.counted >= counted_before, "M's budget only counted on in its own decision"
     [end] = ended_of(events)
