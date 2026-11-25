@@ -1261,7 +1261,8 @@ codex = true
         print(f"  M5 raw evidence (fresh start): turn/start request {rid} clientUserMessageId {client_id}")
         print(f"    answer: {json.dumps(answer)[:400]}")
         print(f"    item:   {json.dumps(item)[:500]}")
-        self.check(t is not None and item and (item.get("params") or {}).get("turnId") == t,
+        self.check(t is not None and item and (item.get("params") or {}).get("turnId") == t
+                   and (item.get("params") or {}).get("threadId") == self.show(sid).get("provider_id"),
                    "M5 (fresh start): the answer to N's turn/start names T, and a userMessage item with N's clientId "
                    "came in T")
         out, _, _ = self.board("session", "send", sid, self.STEER_TEXT, "--mode", "steer", "--request-id", "q1",
@@ -1375,10 +1376,26 @@ codex = true
                   and ((m.get("params") or {}).get("item") or {}).get("type") == "commandExecution")
             send({"id": 4, "method": "turn/start", "params": {"threadId": tid, "clientUserMessageId": j, "input": [
                 {"type": "text", "text": "Also include the word KIWI."}]}})
-            joined = until(lambda m: m.get("id") == 4)
-            item = until(lambda m: m.get("method") in ("item/started", "item/completed")
-                         and ((m.get("params") or {}).get("item") or {}).get("clientId") == j)
-            until(lambda m: m.get("method") == "turn/completed" and (m.get("params") or {}).get("threadId") == tid)
+            # Both observations, in either order (S2-14): the answer to J's request, and a userMessage item of THIS
+            # thread with J's clientId; then the thread's turn/completed (or the item, if it comes after that).
+            seen: dict = {}
+
+            def j_item(m) -> bool:
+                p = m.get("params") or {}
+                it = p.get("item") or {}
+                return (m.get("method") in ("item/started", "item/completed") and p.get("threadId") == tid
+                        and it.get("type") == "userMessage" and it.get("clientId") == j)
+
+            def both(m) -> bool:
+                if m.get("id") == 4 and ("result" in m or "error" in m):
+                    seen.setdefault("answer", m)
+                if j_item(m):
+                    seen.setdefault("item", m)
+                if m.get("method") == "turn/completed" and (m.get("params") or {}).get("threadId") == tid:
+                    seen["done"] = True
+                return "answer" in seen and "item" in seen and "done" in seen
+            until(both)
+            joined, item = seen["answer"], seen["item"]
         finally:
             try:
                 proc.stdin.close()
@@ -1390,7 +1407,8 @@ codex = true
         print(f"    answer to J: {json.dumps(joined)[:300]}")
         print(f"    J's item:    {json.dumps(item)[:400]}")
         self.check(((joined.get("result") or {}).get("turn") or {}).get("id") == t
-                   and (item.get("params") or {}).get("turnId") == t,
+                   and (item.get("params") or {}).get("turnId") == t and (item.get("params") or {}).get("threadId") == tid
+                   and ((item.get("params") or {}).get("item") or {}).get("type") == "userMessage",
                    "M5 (join): the answer to J's turn/start names the active turn T, and J's userMessage item, with "
                    "J's clientId, came in T")
 
