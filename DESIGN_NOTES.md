@@ -13367,3 +13367,170 @@ Scratchpad `mutate9.py`, one or more rows per change of A. Each was applied alon
 | R7-04 the stop says it is waiting | `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress` (a test added after the first run) |
 | R7-02 a timeout drain that ends N clears the flag (after the interrupt) | `test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind` |
 | R7-02 a timeout drain that ends N clears the flag (plain) | `test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind[plain]` (a test added after the second run) |
+
+### Review round 8 (on 2af03c4: CHANGES, one blocker, three shoulds) and what changed
+
+The reviewer judged R7-01 resolved and R7-02 and R7-04 partly resolved. The backup branch
+`backup/codex-steering-2af03c4` sits at 2af03c4. Each test named below fails on 2af03c4's code by its assertion; this
+was checked on an export of 2af03c4 with this round's tests.
+
+- **R8-01** [blocker] Stop ownership belongs to the operation that sends the SIGTERM. `Session.steer_owned` is gone.
+  - `_stop(s, now, at_signal=False)` takes the dating from its caller. With `at_signal`, the stop is dated by a clock
+    read immediately before its SIGTERM. Without it, the stop is dated `now`, exactly as on main.
+  - Nothing about the dating is stored, or inferred from a slot, from a past drain or from any field.
+  - `_stop_from(s, now, steering)` is how a single-session path passes its decision. When `steering` is false it
+    makes main's own call, `_stop(s, now)`, unchanged in shape. Main's `test_c17_...` wraps `_stop(s, now)` with two
+    arguments, and it passes unchanged.
+  - **Every caller and what it passes:**
+    - Dated at the SIGTERM only when this same call drained a live attempt (`live_attempt(s)` read just before its
+      drain):
+      - `close`, through `_end(..., at_signal=live)`;
+      - `_reap` (the leader exited and left its group);
+      - `_hold_to_timeout`, both branches (after the interrupt, and plain);
+      - `cancel` of the live turn (`drained`);
+      - `_write` on a broken pipe.
+    - Always dated at the SIGTERM: `_steer_cut` (the contact cut), with or without a drain.
+    - Main's time, always:
+      - `stop_turns` (the watchdog's bulk stop) and `stop_all` (shutdown);
+      - `park` (with `self.clock()`, as main);
+      - `_held`, and `_spent` twice (the self-stops);
+      - `_on_event` (the refusal to start), and the end on a fatal or unsealed event, through `_end`;
+      - the handshake timeout in `_hold_to_timeout`, and the unverified seal there, through `_end`;
+      - `_write`'s binding restarts (twice), its changed binding, and its withdrawn turn;
+      - `_tick`'s host error, and `_spawn`'s failure, through `_end`;
+      - an ordinary timeout, a cancel or close with no live attempt, and any later stop of a session that once had a
+        steer.
+  - The three reported cases, each compared against the same run with no steer where it applies:
+    - (a) `test_r8_01a_a_cancel_that_drains_ns_end_leaves_no_dating_behind`. A live cancel drains N's own end and
+      returns without stopping. The same process's next ordinary timeout, with a 5 s registry wait, is dated at the
+      pass time; on 2af03c4 it was dated 5 s later, at the SIGTERM.
+    - (b) `test_r8_01b_a_process_stop_all_let_go_of_leaves_no_dating_behind`. The same, after `stop_all` let the
+      process go, on the same host.
+    - (c) `test_r8_01c_a_bulk_stop_with_a_partial_steer_is_mains`. The watchdog's bulk `stop_turns` with S taken in
+      part, and a 2 s registry wait. Its recorded time, its SIGTERM time and its SIGKILL deadline equal the no-steer
+      run's. On 2af03c4 the recorded time was 2 s later, so the kill came 2 s after main's.
+  - The property: `test_r8_01_property_every_stop_is_dated_as_on_main_unless_a_steering_caller_issued_it`.
+    - 300 random host sequences: offers, partial and whole writes, answers, N's end, 5 s, 75 s and 31 min steps, the
+      cut, cancel, close, `stop_turns`, `stop_all`, a broken pipe, a leader that leaves its group, a slow registry, a
+      slow `poll`, and a next message after a steer.
+    - `_record_stops` wraps `_stop` and `_drain_before_stop` from outside. For every stop that begins, it records
+      the time the caller passed, the call chain, each drain in that chain, the recorded time and the SIGTERM's
+      time.
+    - `_check_stop_dating` asserts, for every stop: its recorded time is the time its caller passed (main's), with
+      no live or advancing drain in its chain, unless it was issued by a single-session steering caller after its
+      own live drain in that call, or by the cut. In that case it is the SIGTERM's time, and never under
+      `stop_turns` or `stop_all`.
+    - The sequences reach both kinds. Dated at the SIGTERM: close 25, timeout 15, cancel 32, cut 22, broken pipe 1,
+      reap 40. Main's time: `stop_turns` 54, `stop_all` 63, close 35, timeout 22, cancel 16, reap 30, broken pipe 4.
+      The test asserts that each steering caller is reached at the SIGTERM, and that the bulk callers and the
+      ordinary timeout, cancel and close are reached with main's time.
+    - The same check runs inside `_check`, on every sequence of the existing model.
+- **R8-02** [should] For a stop dated at its SIGTERM, the clock is read immediately before `terminate()`, after the
+  registry, `poll()` and the group-liveness probe.
+  - Test: `test_r8_02_a_stop_dated_at_its_signal_reads_the_clock_after_the_probes[poll|group_probe]`. Either a slow
+    `poll`, or a leader gone with its group alive and a slow group probe, takes 3 s before the cut's SIGTERM. The
+    recorded time is the SIGTERM's, and no kill is due. On 2af03c4 it was 3 s early.
+- **R8-03** [should] `_stop_pending` is read inside the latch's lock at each batch's admission, with the latch
+  itself. The check outside the lock is gone.
+  - Test: `test_r8_03_a_stop_announced_as_a_batch_is_admitted_stops_the_drain_inside_the_lock`. A wrapped lock sets
+    `_stop_pending` as the drain takes it for its second batch, after any check outside. No second batch is read.
+    On 2af03c4 a second batch was read.
+  - **The bound, restated.** Once `steer_stopping` is called, `_stop_pending` is set before it takes the latch's
+    lock. From then on no batch is admitted. The latch is set as soon as the lock is free. The setter may wait
+    behind at most one of these short sections already inside the lock:
+    - a batch already admitted: its one non-blocking `read_lines`;
+    - `_steer_end`'s settlement of an outcome;
+    - a cut's admission: its check, and its clearing of the buffer;
+    - a slot's installation: a few assignments.
+  - The lock gives the setter no priority over a section that has not yet begun. A batch's admission reads the latch
+    and `_stop_pending` once inside the lock, so no batch begins after the stop announced itself. The cut, the
+    settlement and the installation read the latch once inside it. A cut that begins after the latch is set does
+    nothing; a settlement then counts nothing for S; a slot installed then is born stopped.
+  - The setter then marks each held record under that record's lock, waiting for a write already inside one.
+- **R8-04** [should] The rejected-offer diagnostics are said once and outside the evidence lock.
+  - `steer_offer` now returns its rejection ("not the held attempt") instead of logging it.
+  - The node captures that reason and any `ValueError` or `LookupError` inside `ack_lock`, and logs them after
+    releasing it. `_say_once` logs each key once.
+    - The key is (session, held attempt's uuid or the offered uuid, reason). For the "could not be taken" warning,
+      the reason is the exception's type and text.
+    - Keys are kept for open sessions only, pruned with `report_ack`.
+  - The 422 warning is said once per report, keyed by (session, the steer-carrying message ids of that report).
+  - The failed-drain line now carries the exception's type only. It has no exception text and no traceback, so it
+    has no path under `AGENT_COMMS_HOME` and no line the process wrote.
+  - Tests:
+    - `test_r8_04_a_rejected_offer_is_said_once_per_attempt_and_reason_outside_the_ack_lock[another_turn|not_held|overlong]`.
+      Three listings repeat the same rejected offer, giving one line. A logging handler probes `ack_lock` from
+      another thread as each line is emitted, and it is free. The overlong case is a numeric `into` of 301 digits
+      with a fresh uuid. On 2af03c4 there were three lines for another turn, and the other two were logged with the
+      lock held.
+    - `test_r8_04_a_refused_report_retried_again_is_said_once`. The same report is refused three times, with its
+      plain retry failing each time, giving one warning.
+    - `test_r8_04_a_failed_drain_is_logged_with_its_exception_type_only`. A `PermissionError` naming a path gives a
+      line ending "(PermissionError)", with no path, no text and no traceback.
+
+**Every log line this branch adds**, with its frequency now. None prints steer text, message text, tokens or
+environment values.
+- node_sessions, WARNING: "the hub refused the report for session %s with a steer outcome (422): sending it again
+  without the outcome". Prints the session id. Once per report, however often it is retried.
+- node_sessions, WARNING: "session %s: its steer offered for another turn: not taken". Prints the session id. Once
+  per held attempt.
+- node_sessions, WARNING: "session %s: a steer offer could not be taken: %s". Prints the session id and the host's
+  fixed error text ("a steer's ids must be short strings", "no such session on this host"). Once per offered uuid and
+  error, outside `ack_lock`.
+- node_sessions, INFO: "session %s: a steer offer that is %s: not taken" ("not the held attempt"). Prints the session
+  id. Once per held attempt, outside `ack_lock`. This was the host's line in round 7.
+- providers/codex, INFO: "a late answer to a turn/steer retired with its turn (request %s): it changes nothing".
+  Prints the JSON-RPC request id. Once per late answer.
+- session_host, ERROR: "session %s: could not read what its process wrote before stopping it (%s)". Prints the
+  session id and the exception's type name only. Once per failed drain.
+- session_host, WARNING: "session %s: a steer to its process could not be written whole: the process is stopped".
+  Prints the session id. Once per cut.
+- session_host, INFO: "session %s: the steer into message %s: %s (%s)". Prints the session id, N's message id, and
+  the fixed outcome and its why. Once per attempt.
+- On the hub (the reviewer's addition to the list):
+  - hosted, WARNING: "the session listing for node %s could not be written as JSON: no steer in it counts as listed".
+    Prints the node's name. Once per failed listing render.
+  - hosted_wake, ERROR with traceback, through `_complain`: "hosted sessions: could not check the steers to offer;
+    none is offered". At most once a minute per message. The traceback is the hub's own exception in the offer
+    check, in the hub's log, not the node's.
+
+**Runs** at 61cdc56. The last code commit is 8774768; 61cdc56 adds tests only.
+- `uv run pytest -q -p no:cacheprovider`: 4459 passed, 10 skipped.
+- The stand-in e2e in full: PASS (163 s).
+- `--only steering` with stand-ins: PASS (111 s).
+- `--only correlation` with stand-ins: PASS (12 s).
+- `--only steering` with the real Codex: PASS (64 s).
+- `--only steer` with the real Codex: PASS (32 s).
+- `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (14 s).
+- `~/.codex/config.toml` sha256 unchanged through all of them:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+### Mutation check, review round 8
+
+Scratchpad `mutate10.py`, one row per changed line of this round. Each row was applied alone to an export of 61cdc56,
+then the steering test set was run with -x, and the file was restored. All 20 were caught on the first run. Rows the
+property test catches name the model's random sequences first when those run earlier in the file, because the same
+check runs inside `_check`.
+
+| mutation | caught by |
+| --- | --- |
+| R8-01 a stop asked to date at its SIGTERM is | `test_r7_02_a_cut_with_no_drain_is_dated_when_its_sigterm_is_sent` |
+| R8-01 an ordinary stop keeps main's time (`_stop_from` with steering false) | `test_model_random_sequences_...[0]` (`_check_stop_dating`) |
+| R8-01 a steering caller's stop is dated at its SIGTERM | `test_model_random_sequences_...[0]` |
+| R8-01 the cut's stop is dated at its SIGTERM | `test_model_random_sequences_...[0]` |
+| R8-01 close passes whether it drained a live attempt | `test_r8_01_property_...` |
+| R8-01 `_end` passes its caller's argument | `test_r8_01_property_...` |
+| R8-01 a cancel passes whether it drained a live attempt | `test_model_random_sequences_...[0]` |
+| R8-01 a cancel's drained stop is dated at its SIGTERM | `test_model_random_sequences_...[0]` |
+| R8-01 the reap's group-left stop after a live drain | `test_model_random_sequences_...[0]` |
+| R8-01 the timeout (after the interrupt) after a live drain | `test_r7_gap_a_drained_stop_is_dated_after_the_registrys_wait` |
+| R8-01 the timeout (plain) after a live drain | `test_r8_01_property_...` |
+| R8-01 the broken pipe after a live drain | `test_r8_01_property_...` |
+| R8-02 the date read after `poll` and the group probe | `test_r8_02_..._after_the_probes[poll]` |
+| R8-03 the pending stop read inside the lock at admission | `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress` (and `test_r8_03_...`, later in the file) |
+| R8-04 the drain failure logged with its type only | `test_r8_04_a_failed_drain_is_logged_with_its_exception_type_only` |
+| R8-04 the host returns its rejection | `test_r8_04_..._outside_the_ack_lock[not_held]` |
+| R8-04 each diagnostic said once | `test_r8_04_..._outside_the_ack_lock[another_turn]` |
+| R8-04 said outside the evidence lock | `test_r8_04_..._outside_the_ack_lock[another_turn]` |
+| R8-04 the 422 warning once per report | `test_r8_04_a_refused_report_retried_again_is_said_once` |
+| R8-04 the another-turn warning once per attempt | `test_r8_04_..._outside_the_ack_lock[another_turn]` |
