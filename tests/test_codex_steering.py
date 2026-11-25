@@ -6631,7 +6631,7 @@ def test_r11_3_the_unreadable_warning_keeps_one_entry_and_says_one_line_per_chan
     again."""
     import logging
     from types import SimpleNamespace
-    monkeypatch.setattr(hosted_steer, "_unreadable_last", None)
+    monkeypatch.setattr(hosted_steer, "_unreadable_last", None, raising=False)
     caplog.set_level(logging.INFO, logger="agent_comms")
     board = lambda d: SimpleNamespace(s=SimpleNamespace(dispatch=d))     # noqa: E731
 
