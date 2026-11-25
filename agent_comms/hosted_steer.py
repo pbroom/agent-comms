@@ -290,7 +290,7 @@ def offer(board: Board, c, node: str, tree: int, now: float, shown: dict) -> Non
                 continue
             if s.get("withdrawn_at") is not None:
                 continue
-            why = _offer_problem(board, c, r, m, s, tree, now)
+            why = _offer_problem(board, c, r, m, s, tree, now) or _malformed(s)
             if why is not None:
                 s |= {"withdrawn_at": now, "withdrawn": why, "updated_at": now}
                 _put(c, key, s, "hub", now)
@@ -302,6 +302,17 @@ def offer(board: Board, c, node: str, tree: int, now: float, shown: dict) -> Non
         shown.clear()
         c.execute("ROLLBACK TO SAVEPOINT steer_offer")
         c.execute("RELEASE SAVEPOINT steer_offer")
+
+
+def _malformed(s: dict) -> str | None:
+    """A stored steer that cannot be rendered as an offer (R3-09: a record from a prerelease build, or one damaged):
+    withdrawn like any failed check, so the rest of the listing goes as ever and it settles by the rule at N's end
+    (`not_delivered` when it was never listed)."""
+    uuid_, text = s.get("uuid"), s.get("text")
+    if not (isinstance(uuid_, str) and 0 < len(uuid_) <= 64 and isinstance(text, str) and text.strip()
+            and utf8(text) and utf8(uuid_) and encoded_size(text) <= STEER_MAX_BYTES):
+        return "malformed"
+    return None
 
 
 def renderable(c, r: dict, tree: int) -> bool:

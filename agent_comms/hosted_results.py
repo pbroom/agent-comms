@@ -262,7 +262,8 @@ def turn(c, child: dict, m: dict, *, ok: bool, delivered: bool, detail: str, tex
         # The verdict of a request the PARENT made: for it alone (a turn the human asked for carries none, R2-05).
         fields["output"] = {k: o.get(k) for k in ("state", "code", "reasons", "schema_sha")}
     from . import hosted_steer
-    s = hosted_steer.get(c, child["session_id"], m["n"]) if m.get("kind") == "task" else None
+    s = (hosted_steer.get(c, child["session_id"], m["n"]) if m.get("kind") == "task" and hosted_steer.has_steers(child)
+         else None)
     if s is not None and s.get("kind") == "task" and s.get("outcome") is not None:
         # The parent's own steer into this turn, settled with it (hosted_steer.settle, in this transaction): its
         # outcome as a field, never added to the reply (H, "One result for N").

@@ -1811,10 +1811,11 @@ def send(board: Board, p: Principal, ident: Ident, child: Any, message: Any = No
 
 STEER_UNSETTLED = ("not settled within the wait: the turn's result, with the steer's outcome, comes later (as a turn of "
                    "yours if you are a hosted session; board_session_status shows the steer's outcome either way)")
-STEER_WENT = ("the child finished, and its result (result {n}) went to you as a turn: the steer's outcome is with it "
-              "and in `steer` here")
-STEER_QUEUED = ("the child finished, and its result (result {n}) is queued to come to you as a turn (not delivered "
-                "yet): the steer's outcome is in `steer` here, and will be with it")
+STEER_WENT = "the child finished, and its result (result {n}) went to you as a turn{carrier}; the steer's status is in "\
+             "`steer_status` here"
+STEER_QUEUED = "the child finished, and its result (result {n}) is queued to come to you as a turn (not delivered " \
+               "yet){carrier}; the steer's status is in `steer_status` here"
+STEER_CARRIER = ", with the steer's outcome"      # said only when that result record carries it (R3-10)
 
 
 def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: dict | None) -> dict:
@@ -1845,7 +1846,8 @@ def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: di
             if went:
                 # a carrier still queued is queued, not delivered (R2-10)
                 note = STEER_WENT if went[-1].get("state") == "delivered" else STEER_QUEUED
-                return out | {"note": note.format(n=went[-1]["n"])}
+                carrier = STEER_CARRIER if isinstance(went[-1].get("steer"), dict) else ""
+                return out | {"note": note.format(n=went[-1]["n"], carrier=carrier)}
         if status is None or status.get("outcome") is None:
             return out | {"note": STEER_UNSETTLED}
         return out | {"note": "the steer is settled; the turn's result was not taken within the wait (it comes as a "

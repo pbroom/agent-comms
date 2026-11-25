@@ -1291,13 +1291,17 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
     path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{st['into']}?wait=25&steer=1"
 
     def gone() -> None:
-        # Message N (and the steer with it) is no longer kept on the hub (R2-10): the outcome is not known.
-        note = f"message {st['into']} is no longer kept on the hub, and neither is the steer's outcome"
+        # Message N (and the steer with it) is no longer kept on the hub (R2-10). An outcome the send's own answer
+        # already said is kept, with its exit (R3-10); otherwise the outcome is not known: exit 7.
+        known = st.get("outcome")
+        note = (f"message {st['into']} is no longer kept on the hub; the steer's outcome, from the send's answer: "
+                f"{STEER_WORDS.get(known, known)}" if known in STEER_EXIT else
+                f"message {st['into']} is no longer kept on the hub, and neither is the steer's outcome")
         if a.json:
             print(json.dumps({"session": s, "steer": st, "reply": None, "note": note}, indent=2))
         else:
             print(f"note: {note}", file=sys.stderr)
-        raise SystemExit(STEER_UNSETTLED_EXIT)
+        raise SystemExit(STEER_EXIT.get(known, STEER_UNSETTLED_EXIT))
     while True:
         got = _kept(settings, token, path)
         if got is None:

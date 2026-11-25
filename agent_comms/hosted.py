@@ -831,7 +831,7 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
         msgs = _messages(c, r["session_id"])[-SHOW_MESSAGES:]
         out["messages"] = _labelled(c, r, msgs, "whole")
         from . import hosted_steer
-        for v in out["messages"]:
+        for v in out["messages"] if hosted_steer.has_steers(r) else ():     # (none read for a session never steered)
             s = hosted_steer.view(hosted_steer.get(c, r["session_id"], v.get("n")))
             if s is not None:       # a steer into this turn (hosted_steer.py): its terminal status
                 v["steer"] = s
@@ -869,7 +869,8 @@ def message(board: Board, p: Principal, session_id: Any, n: Any, steer: bool = F
         out = {"message": _labelled(c, r, [m], "whole")[0], "session": _human_view(board, r)}
         if steer:
             from . import hosted_steer
-            out["steer"] = hosted_steer.view(hosted_steer.get(c, r["session_id"], n))
+            out["steer"] = (hosted_steer.view(hosted_steer.get(c, r["session_id"], n)) if hosted_steer.has_steers(r)
+                            else None)
         data = _result_data(r, m)
         return out if data is None else out | {"result_data": data}
     return in_snapshot(board, read)
