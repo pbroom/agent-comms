@@ -751,12 +751,15 @@ def test_r1_b1_an_approval_request_in_ss_own_turn_is_not_ns(henv, monkeypatch):
 @pytest.mark.parametrize("init", [
     {"user_message_uuids": [S, S]}, {"user_message_uuids": S}, {"user_message_uuids": [S], "origin": NOTIFY},
     {"user_message_uuids": [S], "claude_code_version": "2.1.329"},
-    {"user_message_uuids": [S], "capabilities": ["interrupt_receipt_v1"]}],
-    ids=["twice", "scalar", "notification", "other_version", "no_lifecycle"])
+    {"user_message_uuids": [S], "capabilities": ["interrupt_receipt_v1"]},
+    {"user_message_uuids": [S], "claude_code_version": "2.1.331"}],
+    ids=["twice", "scalar", "notification", "other_version", "no_lifecycle", "verified_not_in_steer_modes"])
 def test_r1_b2_only_the_exact_init_opens_ss_own_turn(henv, monkeypatch, init):
     """Blocker 2: S's own turn opens only on an `init` listing exactly [S], no origin, of a version in STEER_MODES
-    with the lifecycle capability; none of these does, and none makes a later [S] result `next_turn`."""
+    with the lifecycle capability; none of these does, and none makes a later [S] result `next_turn`. (2.1.331 is
+    VERIFIED here but not in STEER_MODES: verification alone does not open S's turn.)"""
     s, child, n = steered(henv, monkeypatch)
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V, "2.1.331"}))
     child.emit(owned(n))
     henv.host.tick()
     frame = {k: v for k, v in vinit().items() if k != "user_message_uuids"} | init
@@ -1576,13 +1579,15 @@ def _m8_runs():
     return [x for x in names if not x.startswith(("cli_take", "cli_late"))]
 
 
-def test_m8_the_manifest_is_36_runs_of_thirteen_scenarios():
-    """The run accounting (ruling E): 36 runs, 3 of each of 13 scenarios (the race at 3, 5 and 7 s is three)."""
+def test_m8_the_manifest_is_39_runs_of_fourteen_scenarios():
+    """The run accounting (ruling E): 36 probe runs, 3 of each of 10 scenarios and 2 of each race (at 3, 5 and 7 s),
+    and 3 runs of S into a RESUMED process through the node (`resumed`, the e2e's Z10 with the real CLI)."""
     names = (M8_DIR / "MANIFEST").read_text().split()
     scenarios = sorted({x.rsplit("-", 1)[0] for x in names})
-    assert len(names) == 36 and len(scenarios) == 13, (len(names), scenarios)
+    assert len(names) == 39 and len(scenarios) == 14, (len(names), scenarios)
+    assert sum(x.startswith("resumed-") for x in names) == 3
     assert all(sum(1 for x in names if x.rsplit("-", 1)[0] == sc) in (2, 3) for sc in scenarios)
-    assert len(_m8_runs()) == 30
+    assert len(_m8_runs()) == 33
 
 
 @pytest.mark.parametrize("run", _m8_runs())
