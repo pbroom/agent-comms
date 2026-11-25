@@ -166,8 +166,9 @@ class Session:
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
     held_since: float | None = None     # since when the next message waits for a turn of the provider's own
-    # The host's gates (turn gate open, `may_start`) as read ONCE in this pass, for turn correlation's budget and the
-    # write timer alike (`_gates`; None: not read yet in this pass). Only ever read for a message with a budget.
+    # The host's gates (turn gate open, `may_start`) as sampled ONCE in this tick, for turn correlation's budget, its
+    # earning, its end mark and the write timer's choice of clock alike (`_gates`; None: not sampled yet in this
+    # tick, and between ticks). Only ever sampled for a message with a budget.
     gates: tuple[bool, bool] | None = None
     # Turn correlation (a verified Claude incarnation only): where the staged turn starts in `outbuf` while none of
     # it is accepted, and how many bytes it is (only for an adapter that asks, `barrier_before_first_byte`).
@@ -454,6 +455,11 @@ class SessionHost:
         # the node is past its self-stop deadline, until a listing fetched since has been applied). False: nothing
         # starts and no turn is taken from the inbox; the messages wait there, and nothing is failed.
         self.may_start: Callable[[], bool] | None = None
+        # The same question with no side effect (node_sessions: `may_start` itself sets the node's latch at the
+        # self-stop deadline): read by turn correlation's budget accounting only, which must change nothing main
+        # would not (review round 13). Not set: `may_start` is read instead (a test's, with no side effect).
+        self.may_start_query: Callable[[], bool] | None = None
+        self._ticking = False       # inside `tick` (the gate sample's lifetime, `_gates`)
         self._recovered = False
         self._next_message = 0
         # Runner key -> window -> the latest plan usage a session of that runner's provider reported for it (`usage`
@@ -833,6 +839,16 @@ class SessionHost:
             self.recover()
         out: list[HostEvent] = []
         now = self.clock()
+        for s in self.sessions.values():
+            s.gates = None      # the gate sample is this tick's: taken at its first use, before any read (`_gates`)
+        self._ticking = True
+        try:
+            self._tick(now, out)
+        finally:
+            self._ticking = False   # ... and never read outside it (`_gates`)
+        return out
+
+    def _tick(self, now: float, out: list[HostEvent]) -> None:
         # Every exit first: a leader that went by itself leaving members of its group is registered as stopping
         # (`_reap`) before this pass starts any process, so nothing it starts goes beside such a group.
         for s in list(self.sessions.values()):
@@ -851,10 +867,8 @@ class SessionHost:
                 log.exception("session %s failed", s.session_id)
                 if not s.ended:
                     self._end(s, f"host error: {type(e).__name__}", now, out)
-        return out
 
     def _pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
-        s.gates = None      # read afresh, once, in this pass (`_gates`)
         self._steps(s, now, out)
         self._mark(s, now)
 
@@ -1286,12 +1300,17 @@ class SessionHost:
         return bool(s.checking or (s.provider.waits_for_ready and not s.ready) or not turn_gate or not may_start)
 
     def _gates(self, s: Session) -> tuple[bool, bool]:
-        """The turn gate and `may_start`, read once per pass (review round 12): the budget, its end mark and the
-        write timer's choice of clock all see the same reading, so a gate that closes in the middle of a pass cannot
-        let the budget count before the write timer is asked."""
+        """The turn gate and `may_start`, sampled once per tick (review rounds 12 and 13): cleared as the tick
+        begins, before any of its reads, so the earning in its first drain, the budget, its end mark and the write
+        timer's choice of clock all see one sample, and none sees another tick's. With no side effect: `may_start`
+        through `may_start_query` (the node's `may_start` sets its latch), and the turn gate is a pure question
+        (node_sessions `_turn_allowed` reads the parent's state). Outside a tick (only `stop_all`'s last read of each
+        process, at shutdown) nothing is cached: a fresh reading, with no side effect either."""
+        may = self.may_start_query if self.may_start_query is not None else self.may_start
+        if not self._ticking:
+            return (self.turn_gate is None or bool(self.turn_gate(s)), may is None or bool(may()))
         if s.gates is None:
-            s.gates = (self.turn_gate is None or bool(self.turn_gate(s)),
-                       self.may_start is None or bool(self.may_start()))
+            s.gates = (self.turn_gate is None or bool(self.turn_gate(s)), may is None or bool(may()))
         return s.gates
 
     def _budget(self, s: Session, now: float, out: list[HostEvent]) -> bool:

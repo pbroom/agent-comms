@@ -9194,7 +9194,9 @@ zero-turn task notification `result` did the same to a turn in flight.
     no-init processes alike. **An unearned message is on main's path, entirely** (review round 12): its write timer is
     its one clock at every pass, whatever its counted state; its budget keeps the byte span (so the line can be taken
     back should the process verify) and keeps counting, but neither acts nor suppresses anything until `earned`.
-    The host's gates are read once per pass (`_gates`), for the budget and the write timer's choice alike. The order in a pass (review round 10): the reads; a staged message
+    The host's gates are sampled once per TICK (`_gates`; review round 13), before any of its reads, for the
+    earning in its first drain, the budget, its end mark and the write timer's choice alike, and with no side
+    effect (`may_start_query`). The order in a pass (review round 10): the reads; a staged message
     the CLI's new turn takes back (`_take_back`, the unstage); then the budget; then timeouts and writes, where
     main's withdrawals happen. **One place adds it**
     (`_budget`, every pass, after the reads and the take-back, before any timeout or write decision): the interval
@@ -10117,6 +10119,51 @@ Sol: the latch held closed now matches main for all three runner kinds; `shown_v
 | C12 \| an unearned budget never acts | `test_c7_01_a_candidate_that_never_verifies_is_mains_write_timer_and_failure` (5) |
 | C12 \| the gates are read afresh each pass | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate` (13) |
 | C12 \| ... and once within it | `test_c12_the_gates_are_read_once_per_pass` (1) |
+
+#### Review round 13 (Sol, on 21b00ab: CHANGES, one blocker, one should, one nit) and what changed
+
+Sol: round 12's replays hold; the hand-over and C7-01 hold.
+- **[blocker] the gate sample outlived its pass.** `tick()` drains every process's stdout before any `_pass`, and
+  `_pass` reset the sample: the earning in that first drain read the previous tick's gates. Both ways reproduced:
+  the latch closing while a qualifying init and a downgrade arrive in that drain earned M falsely (it was delivered
+  at t=60); the latch reopening with the same batch missed the earning (an eligible M timed out at t=60). Ruling:
+  the sample is tick-local, every use in the tick reads it, nothing outside a tick does. Done: `tick()` clears every
+  session's sample before its first read (`_tick` holds the old body); `_gates` takes and keeps the sample only
+  inside a tick (`_ticking`), and outside one reads the gates afresh, keeping nothing
+  (`test_c13_outside_a_tick_the_gates_are_read_afresh`). Paths outside a tick: only `stop_all` reads a process's lines (its last `_read`, at
+  shutdown, which can earn): it gets a fresh reading, cached nowhere. `cancel`, `close`, `park`, `stop_turns` and
+  `kill_due` read no gate. Tests, through `tick()` (both failed on 21b00ab):
+  `test_c13_the_latch_closing_with_a_verifying_init_and_a_downgrade_in_the_first_drain_earns_nothing` (main's timeout
+  at t=60, every pass's events equal to VERIFIED empty) and `..._reopening_..._earns_it` (no timeout; the 7b at t=80).
+- **[should] accounting had a side effect.** It called the node's stateful `_may_start` for a zero-byte staged line
+  where main would not, and at the self-stop deadline that sets the node's latch (earlier than main would, for a
+  2.1.329 and a no-init runner; the message events were the same). Ruling: no side effects. Done: the host's
+  accounting reads `may_start_query`, which node_sessions sets to `_may_start_query` (the same answer, never
+  latching: the latch unset and the deadline not reached); the stateful `may_start` stays exactly where main asks
+  it. The turn gate (`_turn_allowed`) has no side effect: it reads the parent's session and the child's access
+  only. Tests: `test_c13_the_budget_never_calls_the_stateful_may_start_more_than_main[other, no_init, verified]`
+  (the stateful calls, how many and when, equal the VERIFIED-empty run; the query is read instead) and
+  `test_c13_the_nodes_may_start_query_never_sets_the_latch` (wired, and past the deadline it says no and latches
+  nothing).
+- **[nit]** `test_c12_..._earns_at_the_first_counted_pass` said t=100: the sample at t=5 is already latched, so
+  nothing is counted before the latch and the 7b comes at t=105; it now asserts that pass.
+- **The property test**: the exact-time check covers every unearned staged message's outcome (never after its write
+  timer's pass; a timeout exactly at it); the message whose budget is observed is chosen by the test's own reading,
+  no longer by production `_holder` (the same two places: the line staged with not one byte accepted, or the first
+  in the inbox with nothing written or in flight); a new check that the host's `earned` equals the test's own (each
+  line read, with the tick's flags) for every message that still has a budget; and a combined step: the latch
+  changes and a qualifying init and a downgrade arrive in the same tick. It catches 21b00ab's code at seed 139 of the
+  suite's 200 (a budget earned under a stale sample); 4000 seeds pass.
+
+**Mutation check** (round 13; scratchpad `correlation/mutate16.py`: the rows on the gate sample's lifetime and the side-effect-free query): 5 of 5 caught. (A first version also cleared the sample as the tick ended; with the clearing at its start and no read outside a tick, that was redundant, the mutation check showed the two clearings covering each other, and it is gone.)
+
+| row or rule | caught by |
+| --- | --- |
+| C13 \| the gate sample is cleared as a tick begins | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate` (16) |
+| C13 \| ... and never read outside a tick | `test_c13_outside_a_tick_the_gates_are_read_afresh` (1) |
+| C13 \| the accounting reads the side-effect-free query | `test_c13_the_budget_never_calls_the_stateful_may_start_more_than_main` (2) |
+| C13 \| the node wires the query | `test_c13_the_nodes_may_start_query_never_sets_the_latch` (1) |
+| C13 \| the query never sets the latch | `test_c13_the_nodes_may_start_query_never_sets_the_latch` (1) |
 
 ### Not done
 
