@@ -97,6 +97,20 @@ MAX_TOOLS = 2000        # tool names taken from one `init`
 INTERRUPT_RECEIPT = "interrupt_receipt_v1"  # an `init` capability: a receipt for the in-band interrupt
 LIFECYCLE = "msg_lifecycle_v1"      # an `init` capability: user lines' uuids are echoed (module text)
 MAX_CAPS = 200
+VERSION_SHOWN = 64      # at most this many characters of a reported version go in a log line (`shown_version`)
+
+
+def shown_version(version) -> str:
+    """A process's reported `claude_code_version` as it may go in a log line: untrusted text, so every character
+    outside printable ASCII (a newline, any control character, anything else) is escaped, and it is capped at
+    VERSION_SHOWN characters (and says how long it was). Not a string: "no version"."""
+    if not isinstance(version, str):
+        return "no version"
+    text = re.sub(r"[^\x20-\x7e]", lambda m: "\\u%04x" % ord(m.group()) if ord(m.group()) < 0x10000
+                  else "\\U%08x" % ord(m.group()), version)
+    return text if len(text) <= VERSION_SHOWN else f"{text[:VERSION_SHOWN]}... ({len(version)} characters)"
+
+
 # The Claude Code versions whose processes are attributed by evidence (module text). A version goes in only once the
 # release gates M3, M6 and M7 passed on it (DESIGN_NOTES "Claude turn correlation"): never to make a gate pass.
 VERIFIED: frozenset[str] = frozenset({"2.1.330"})
@@ -577,7 +591,7 @@ class ClaudeSession:
             # empty, so main's logs are untouched).
             self._told = True
             log.info("Claude session %s: this process reports Claude Code %s; turn correlation is %s", self.session_id,
-                     version if isinstance(version, str) else "no version",
+                     shown_version(version),
                      "on for it" if qualifies and self._verified is None else "off for it (attributed by order)")
         if self._verified is None:
             self._verified = qualifies      # pinned to this incarnation by its first `init`

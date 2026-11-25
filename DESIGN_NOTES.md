@@ -9177,14 +9177,21 @@ zero-turn task notification `result` did the same to a turn in flight.
     or staged in a process that can be verified (`_Message.counted`, seconds; None: no budget), kept across
     unstages, restagings, the end of the CLI's turns and a downgrade; only an accepted byte ends it (progress). A
     successor's budget starts when it becomes the head and is first held or staged. **Counted time** is time in
-    which the agent's process is what holds the message back, exactly two states (`_counting`): (b) staged with not
-    one byte of its line accepted, in a live process; (a) first in the inbox, a live process, nothing on the host
-    side withholding it (no handshake or settings check pending, `may_start`, the turn gate), and the CLI's own turn
-    open (`holding`); a new binding while that turn runs is (a), for the host would restart for it at once and waits
-    only for the agent's turn. Nothing else counts: no process, one going down (the restart for a binding
+    which the agent's process is what holds the message back, exactly two states (`_counting`), both in a live
+    process with nothing on the host side withholding the message (`_withheld`, ONE list for both: no handshake or
+    settings check pending, `may_start`, the turn gate; review round 10): (b) staged with not one byte of its line
+    accepted, in a process started with the binding the session has now; (a) first in the inbox with the CLI's own
+    turn open (`holding`); a new binding while that turn runs is (a), for the host would restart for it at once and
+    waits only for the agent's turn. Nothing else counts: no process, one going down (the restart for a binding
     included), the turn gate closed, `may_start` false, a stopping group in the checkout, no slot; there the message
-    waits exactly as on main, without limit, and the budget neither stops nor fails anything. **One place adds it**
-    (`_budget`, every pass, after the reads and before any timeout or write decision): the interval since the
+    waits exactly as on main, without limit, and the budget neither stops nor fails anything. A staged message the
+    host withholds is main's: the turn gate closing withdraws it (TURN_WITHDRAWN) and a new binding does
+    (BINDING_CHANGED), later in that pass, as on main; with `may_start` false it stays staged, charged nothing (no
+    write timer either: its budget governs it). The order in a pass (review round 10): the reads; a staged message
+    the CLI's new turn takes back (`_take_back`, the unstage); then the budget; then timeouts and writes, where
+    main's withdrawals happen. **One place adds it**
+    (`_budget`, every pass, after the reads and the take-back, before any timeout or write decision): the interval
+    since the
     previous pass counts iff the message was in a counted state at BOTH ends, the end of the previous pass
     (`_Message.counted_at`, set by `_mark` as every pass ends) and now. Conservative: it never counts time in which
     the host may have withheld it or the CLI's turn may have ended (a pass that first reads the turn's result sees
@@ -9814,7 +9821,9 @@ it, above).
     agent's process in two periods of <N> minutes; the message was not written`.
   - What the two can mean, since the follow-up (counted time): <N> minutes in which the agent's process held the
     message back, either by a turn of its own (a background agent's, say) while nothing on the node withheld the
-    message, or by a pipe that took none of the staged line, added up over the message's life and across a
+    message, or by a pipe that took none of the staged line while nothing on the node withheld it (review round
+    10: a gate closing on a staged line is main's withdrawal, never the budget), added up over the message's life
+    and across a
     downgrade, not necessarily in one stretch. What they cannot mean: a wait the node itself imposes (a parent's
     turn or its parked process, the self-stop deadline, a stopping process group in the checkout, no slot, no
     process, a process going down) counts nothing and never leads to either line; nor a runner of another version
@@ -9928,6 +9937,68 @@ The pre-merge reviewer (both PRs OK to merge) found two shoulds and some nits; t
 | C9 \| the INFO line only while some version is VERIFIED | `test_c9_with_verified_empty_no_process_says_whether_turn_correlation_is_on` (2) |
 | C9 \| ... once per process | `test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on[2.1.330-caps0-reports` (4) |
 | C9 \| ... on only for a qualifying first init | `test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on[2.1.330-caps2-reports` (5) |
+
+#### Review round 10 (Sol, on 0cac651: CHANGES, one blocker, two shoulds) and what changed
+
+Sol: the follow-up's accounting holds for the inbox (the gate, `may_start`, a stopping group, no slot: M waits and
+is written once); the earlier replays follow the new rule; the `unbound` choice is sound (the coordinator keeps it).
+- **[blocker] the staged state was charged while the host withheld the message.** Sol's replay: 40 s held, a
+  zero-byte staging at t=45, the parent's gate closing at t=65: the budget charged the last 20 s and stopped and
+  requeued M before the gate was asked. Ruling: host-side withholding wins in the staged state too; the pass's order
+  is the reads, the take-back of a staged message the CLI's new turn holds, the binding and write gates as main
+  applies them, and only then the budget, which counts (b) only if nothing on the host side withholds the message,
+  at both ends. Done: `_take_back` (the unstage, split out of `_hold_to_timeout`) runs before `_budget`; `_counting`
+  takes its host-side conditions from one list (`_withheld`) for (a) and (b), and (b) also needs the process's
+  binding to be the session's (main withdraws a staged line on a new binding). Main's withdrawals stay where main has
+  them (`_write`), so with VERIFIED empty nothing moved. Tests (all but the last two failed on 0cac651):
+  `test_c10_the_turn_gate_closing_on_a_staged_message_is_mains_withdrawal_not_the_budget` (TURN_WITHDRAWN at t=65,
+  55 s counted, nothing requeued); `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate`
+  (turn gate and `may_start`: unstaged, 300 s, nothing; written once when it opens); `test_c10_may_start_false_on_a_
+  staged_message_charges_nothing` (main keeps the staged line: 300 s, nothing; written once);
+  `test_c10_a_binding_change_on_a_staged_message_is_mains_withdrawal_not_the_budget` (BINDING_CHANGED at t=65); and,
+  with a new turn of the CLI's own and a new binding, `test_c10_a_binding_change_and_a_new_turn_hold_m_behind_the_
+  turn_which_counts` (that wait counts, the follow-up's choice: the 7b at t=65, the next process writes M once) and
+  `..._early_restart_for_the_binding_once_it_ends` (at t=50: held, restarted for its binding when the turn ends,
+  written once, not recovered). One consequence: with `may_start` false a budgeted staged message has no clock at
+  all (main's write timer would fail it at its staging plus the timeout); in production the self-stop watchdog
+  stops the node's turns at that deadline.
+- **[should] the property test's oracle.** Both ends of every interval are now this test's own reading (the flags it
+  set and the session's plain fields, the host gates for the staged state included; never `_counting`); its total
+  must equal the host's, and the budget's action (the 7b, the failure, or the drop) must come on the FIRST pass at
+  which that total reaches T: a five-second-late expiry (the comparison made at T + 5) fails it at once. The bound
+  after a first byte is the write timer from the final staging, once the budget is over (a gate can hold the
+  budget, and so the write timer, still). 200 seeds in the suite; 4000 once.
+- **[should] the reported version in the log** was untrusted text: a newline in it forged a second line. Now
+  `shown_version`: everything outside printable ASCII escaped (`\uXXXX`), at most 64 characters, the length said
+  when cut; the one place the version is logged uses it. `test_c10_the_reported_version_goes_in_the_log_*` (a
+  newline and a forged line, 10,000 characters, an escape sequence and non-ASCII).
+- **Accepted limits of the both-ends rule** (Sol's observations): a host gate closed at every sampled pass suppresses
+  counting even if it was open in between (host-side, as on main); an interval with counted ends can include a
+  closure no pass saw; a result and a new init of the CLI's own read in one pass can hide the gap between two turns.
+  Production passes are about 0.2 s apart (plus work and hub calls) against a 30-minute timeout, so each such miss
+  is small; under repeated flapping the rule gives no wall-clock bound, only the counted one.
+
+**Mutation check** (round 10; scratchpad `correlation/mutate12.py`: the rows on `_counting`, the staged state, the pass's order and the logged version, rewritten where round 10 changed their lines, and rows for the new lines; each applied alone, the same tests run): 15 of 17 caught. The two rows above taken for equivalent in the follow-up's table (the staged message's return, and C6-01's) are now CAUGHT: with a host gate holding a staged message's budget still, the write timer would fail it (`test_c10_may_start_false_on_a_staged_message_charges_nothing`). The two left are EQUIVALENT: `_earn`'s counted-state condition (as before), and the handshake or settings check in `_withheld` (a Claude process has no handshake, and while its settings are being checked nothing is staged and it cannot be verified, so it cannot hold a message: kept so the one list is complete).
+
+| row or rule | caught by |
+| --- | --- |
+| C6-01 \| a budgeted staged message is governed by its budget, not the write timer | `test_c10_may_start_false_on_a_staged_message_charges_nothing` (1) |
+| C9 \| counted only with a live process, not one going down | `test_c9_after_a_7b_the_old_process_going_down_counts_nothing` (1) |
+| C9 \| earned only in a counted state | equivalent: none (0) |
+| C9 \| the staged message's return (equivalent: its budget runs out first) | `test_c10_may_start_false_on_a_staged_message_charges_nothing` (1) |
+| C9 \| the INFO line only while some version is VERIFIED | `test_c9_with_verified_empty_no_process_says_whether_turn_correlation_is_on` (2) |
+| C9 \| ... once per process | `test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on[2.1.330-caps0-reports` (4) |
+| C9 \| ... on only for a qualifying first init | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (8) |
+| C9 \| ... not while the turn gate withholds it | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate[turn_gate]` (5) |
+| C9 \| ... nor while may_start does | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate[may_start]` (4) |
+| C9 \| ... nor once the CLI's turn is over | `test_c10_a_binding_change_and_a_new_turn_early_restart_for_the_binding_once_it_ends` (17) |
+| C9 \| ... nor while a handshake or settings check is pending | equivalent: none (0) |
+| C10 \| a staged message the host withholds counts nothing | `test_c10_may_start_false_on_a_staged_message_charges_nothing` (3) |
+| C10 \| ... nor one whose binding changed | `test_c10_a_binding_change_on_a_staged_message_is_mains_withdrawal_not_the_budget` (2) |
+| C10 \| the take-back comes before the budget | `test_c10_a_binding_change_and_a_new_turn_early_restart_for_the_binding_once_it_ends` (2) |
+| C10 \| the reported version escaped in the log | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (2) |
+| C10 \| ... and capped | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (2) |
+| C10 \| ... used in the log line | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (5) |
 
 ### Not done
 

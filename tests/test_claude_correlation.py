@@ -19,7 +19,7 @@ import pytest
 from agent_comms import providers
 from agent_comms.providers import claude
 from agent_comms.providers.claude import OWN, UNATTRIBUTED, ClaudeSession
-from agent_comms.session_host import INTERRUPTED
+from agent_comms.session_host import BINDING_CHANGED, INTERRUPTED, TURN_WITHDRAWN
 
 from test_session_host import ROOT, SID, FakeSessionChild, henv, make_host, open_session, real_host, result  # noqa: F401
 
@@ -1802,6 +1802,30 @@ def test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on(m
     assert len([r for r in caplog.records if "turn correlation is" in r.getMessage()]) == 2
 
 
+@pytest.mark.parametrize("version", ["2.1.330\nClaude session forged: this process reports Claude Code 2.1.330; "
+                                     "turn correlation is on for it", "9" * 10_000, "2.1.330\x1b[2J\u202e\U0001f600"])
+def test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded(monkeypatch, caplog, version):
+    """The version is the process's own text: in the log line no newline or control character (nor anything outside
+    printable ASCII) appears, and at most 64 of its characters, with its length said when cut (review round 10)."""
+    import logging
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    p = adapter()
+    write(p)
+    raw(p, vinit(version=version))
+    [line] = [r.getMessage() for r in caplog.records if "turn correlation is" in r.getMessage()]
+    assert all(" " <= ch <= "~" for ch in line), repr(line)
+    assert line.startswith(f"Claude session {SID}: this process reports Claude Code ") and line.endswith(
+        "; turn correlation is off for it (attributed by order)")
+    shown = line[len(f"Claude session {SID}: this process reports Claude Code "):-len(
+        "; turn correlation is off for it (attributed by order)")]
+    assert shown == claude.shown_version(version) and len(shown) <= 64 + len("... (10000 characters)")
+    if len(version) > 64:
+        assert shown.endswith(f"... ({len(version)} characters)")
+    assert "\n" not in line and "\x1b" not in line
+    if "\n" in version:
+        assert "\\u000a" in shown
+
 def test_c9_with_verified_empty_no_process_says_whether_turn_correlation_is_on(monkeypatch, caplog):
     """With VERIFIED empty the line is never written (main's logs, pinned by the golden's case 1, are untouched)."""
     import logging
@@ -1813,6 +1837,148 @@ def test_c9_with_verified_empty_no_process_says_whether_turn_correlation_is_on(m
     raw(p, vinit(version="2.1.331"))
     assert not [r for r in caplog.records if "turn correlation" in r.getMessage()]
 
+# --- review round 10: host-side withholding wins over the budget in the staged state too
+
+
+def held_then_staged(henv, monkeypatch, gate):
+    """Sol's replay, timeout 60 s, a pass every 5 s: M held by the CLI's own turn from t=0 (40 s counted: the pass
+    at t=45 first sees the turn ended), staged at t=45 into a pipe that takes nothing, 15 s more counted to t=60.
+    `gate`: "turn_gate" or "may_start", installed open (or None: neither). Returns (session, child, flag)."""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    flag = {"open": True}
+    if gate == "turn_gate":
+        henv.host.turn_gate = lambda sess: flag["open"]
+    elif gate == "may_start":
+        henv.host.may_start = lambda: flag["open"]
+    emit(henv, child, vinit())
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    assert henv.host.tick() == []
+    for _ in range(8):                                  # to t=40, held
+        henv.clock.advance(5)
+        assert henv.host.tick() == []
+    henv.clock.advance(5)                               # t=45: the turn ends; M staged, zero bytes
+    child.emit(foreign())
+    assert henv.host.tick() == [] and s.writing.id == "1" and s.turn_at is not None and s.writing.counted == 40
+    for _ in range(3):                                  # to t=60
+        henv.clock.advance(5)
+        assert henv.host.tick() == []
+    assert s.writing.counted == 55 and child.terminated == 0
+    return s, child, flag
+
+
+def test_c10_the_turn_gate_closing_on_a_staged_message_is_mains_withdrawal_not_the_budget(henv, monkeypatch):
+    """Sol's replay: the parent's gate closes at t=65 with M staged, zero bytes, and no new turn of the CLI's own.
+    Main's withdrawal (TURN_WITHDRAWN, the process stopped) is what happens, as on main; the budget charges nothing
+    after the gate closed (55 s, not 60) and neither restarts the process nor requeues M (it did, before)."""
+    s, child, flag = held_then_staged(henv, monkeypatch, "turn_gate")
+    henv.clock.advance(5)
+    flag["open"] = False
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False) and end.detail == TURN_WITHDRAWN
+    assert child.terminated == 1 and not s.inbox and len(henv.spawner.children) == 1
+
+
+@pytest.mark.parametrize("gate", ["turn_gate", "may_start"])
+def test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate(henv, monkeypatch, gate):
+    """The same, but the CLI begins a new turn of its own at t=65 as the gate (or `may_start`) closes: M is taken
+    back (unstaged) and waits in the inbox behind the closed gate for 300 s, nothing counted, stopped or failed; once
+    the gate opens and the turn is over, the same process writes M, once."""
+    s, child, flag = held_then_staged(henv, monkeypatch, gate)
+    henv.clock.advance(5)
+    flag["open"] = False
+    child.emit(vinit())
+    assert henv.host.tick() == [] and s.writing is None and [m.id for m in s.inbox] == ["1"]
+    for _ in range(60):
+        henv.clock.advance(5)
+        assert henv.host.tick() == []
+    assert s.inbox[0].counted == 55 and not s.inbox[0].recovered and child.terminated == 0
+    child.emit(foreign())
+    child.accept = None
+    flag["open"] = True
+    henv.clock.advance(5)
+    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
+    assert child.turns()[-1] == "next" and child.terminated == 0
+    valid_stdin(child, once=["next"])
+
+
+def test_c10_may_start_false_on_a_staged_message_charges_nothing(henv, monkeypatch):
+    """The node past its self-stop deadline (`may_start` false) at t=65 with M staged, zero bytes, no new turn: main
+    withdraws nothing here (it keeps the staged line), and the budget charges nothing while the host withholds new
+    work: 300 s, nothing stopped or failed, 55 s counted; once it may start again and the pipe takes the line, the
+    same process writes M, once. (A budgeted staged message has no write timer: its budget governs it, C6-01.)"""
+    s, child, flag = held_then_staged(henv, monkeypatch, "may_start")
+    henv.clock.advance(5)
+    flag["open"] = False
+    for _ in range(61):
+        assert henv.host.tick() == []
+        henv.clock.advance(5)
+    assert s.writing.id == "1" and s.writing.counted == 55 and child.terminated == 0
+    flag["open"] = True
+    child.accept = None
+    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
+    valid_stdin(child, once=["next"])
+
+
+def test_c10_a_binding_change_on_a_staged_message_is_mains_withdrawal_not_the_budget(henv, monkeypatch):
+    """A new binding at t=65 with M staged, zero bytes, no new turn: main's withdrawal (BINDING_CHANGED, the process
+    stopped), not the budget's restart (55 s counted, not 60)."""
+    s, child, flag = held_then_staged(henv, monkeypatch, None)
+    henv.clock.advance(5)
+    s.bind = "e" * 64
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False) and end.detail == BINDING_CHANGED
+    assert child.terminated == 1 and not s.inbox
+
+
+def test_c10_a_binding_change_and_a_new_turn_hold_m_behind_the_turn_which_counts(henv, monkeypatch):
+    """A new binding at t=65 as the CLI begins a new turn of its own: M is taken back and waits for that turn, the
+    only thing between it and the restart for its binding, so that wait counts (the follow-up's choice for a binding
+    behind the CLI's turn): with 55 s counted at t=60 and the interval to t=65 counted at both ends, the budget is
+    spent at t=65, the 7b restart, and the next process, started with the new binding, writes M once."""
+    s, child, flag = held_then_staged(henv, monkeypatch, None)
+    henv.clock.advance(5)
+    s.bind = "e" * 64
+    child.emit(vinit())
+    assert henv.host.tick() == [] and child.terminated == 1 and s.inbox[0].recovered
+    henv.host.tick()
+    evs = henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and fresh.turns() == ["next"] and not settled(evs, "1")
+    valid_stdin(child, fresh, once=["next"])
+
+
+def test_c10_a_binding_change_and_a_new_turn_early_restart_for_the_binding_once_it_ends(henv, monkeypatch):
+    """The same at t=50 (45 s counted): M is taken back and held behind the CLI's turn; the turn ends at t=55 (the
+    pass that first sees it counts nothing before it); the process is restarted for the binding, and the next one
+    writes M once. Not recovered."""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    emit(henv, child, vinit())
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    for _ in range(8):
+        henv.clock.advance(5)
+        henv.host.tick()
+    henv.clock.advance(5)
+    child.emit(foreign())
+    henv.host.tick()                                    # t=45: staged, zero bytes
+    henv.clock.advance(5)                               # t=50: a new binding and a new turn
+    s.bind = "e" * 64
+    child.emit(vinit())
+    assert henv.host.tick() == [] and s.writing is None and s.inbox[0].counted == 45
+    henv.clock.advance(5)                               # t=55: the turn ends; restarted for the binding
+    child.emit(foreign())
+    henv.host.tick()
+    assert child.terminated == 1 and not s.inbox[0].recovered and s.inbox[0].counted == 45
+    evs = henv.host.tick() + henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert fresh is not child and fresh.turns() == ["next"] and not settled(evs, "1")
+    valid_stdin(child, fresh, once=["next"])
+
+
 def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     """Seeded random walks (review rounds 6 to 8, and the follow-up after the switch-on) on a host with 2.1.330
     VERIFIED, timeout T = 60 s, over: sends; the live pipe taking nothing, everything, or a few bytes per write; the
@@ -1821,13 +1987,13 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     itself; a pipe that raises on write; a cancelled message; and the host-side gates: the turn gate, `may_start`,
     admission, a stopping group in the checkout, each closed and opened; with time steps from 1 s to past two
     timeouts. Then a drain (every gate open, groups and pipes released). Every process starts as a candidate.
-    Asserted, at every pass's budget step (a wrapper of `_budget` records what the host decided and on what):
-    - counted time is added only in a counted state, and only for an interval whose earlier end was the end of the
-      previous pass in a counted state: then it is exactly that interval; never while a host gate this test closed
-      withholds the message, with no process, or one going down;
-    - the budget acts (the 7b restart, the failure, or the drop of an unearned one) only once it holds T of counted
-      time; the 7b only for a message seen in a counted state under a verified process (line by line, and at each
-      pass's end); a first or second budget never holds more than T plus one step of counted time;
+    Asserted, at every pass's budget step (a wrapper of `_budget` records what the host decided), against this
+    test's OWN reading of both ends of every interval (from the flags it set and the session's plain fields, never
+    the host's `_counting`; a host gate closed withholds a staged message too, review round 10):
+    - the host's count equals this test's: an interval is added iff it was counted at both ends, and then whole;
+    - the budget acts (the 7b restart, the failure, or the drop of an unearned one) on the FIRST pass at which this
+      test's total reaches T, never before and never a pass late; the 7b only for a message seen in a counted state
+      under a verified process (line by line, and at each pass's end); no budget exceeds T plus one step;
     - at every pass's end, `counted_at` is that pass's time exactly when the message is in a counted state as this
       test sees it (staged with no byte accepted in a live process; or first in the inbox, a live process, every
       gate open, the CLI's turn open);
@@ -1843,7 +2009,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     from test_dispatch import FakeProcs, FakeSpawner
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
     T, STEPS = 60.0, [1, 5, 5, 5, 10, 30, 65, 125]
-    feed, budget, watch = ClaudeSession.feed, SessionHost._budget, {"see": lambda: None, "obs": lambda rec: None}
+    feed, budget = ClaudeSession.feed, SessionHost._budget
+    watch = {"see": lambda: None, "pre": lambda m, now: None, "obs": lambda rec: None}
 
     def feeding(self, line):
         got = feed(self, line)
@@ -1852,11 +2019,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
 
     def budgeting(self, s, now, out):
         m = self._holder(s)
-        rec = None
-        if m is not None and m.counted is not None:
-            rec = {"t": now, "id": m.id, "counting": self._counting(s, m), "before": m.counted, "at": m.counted_at,
-                   "staged": m is s.writing, "live": s.child is not None and s.stopping_since is None,
-                   "unbound": s.unbound, "holding": self.holding(s), "recovered": m.recovered, "msg": m}
+        rec = watch["pre"](m, now) if m is not None and m.counted is not None else None    # this test's reading
         acted = budget(self, s, now, out)
         if rec is not None:
             rec.update(acted=acted, after=rec["msg"].counted, recovered_after=rec["msg"].recovered)
@@ -1899,7 +2062,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
         s = henv.host.open(SID, agent="claude", runtime="claude-code", project="/work/repo")
         sent, outcome, extra, steps, pass_times = [], {}, [], [], []
         staged, seen_verified, last_holder, peak = {}, set(), [None], {}
-        progressed = set()
+        progressed, end_state, totals = {}, {}, {}
 
         def holder():
             m = s.writing if s.writing is not None and s.turn_at is not None else (
@@ -1907,41 +2070,48 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             return m if m is not None and m.counted is not None else None
 
         def counted_state(m):
-            """This test's own reading: is `m` held back by the agent now?"""
-            if s.child is None or s.stopping_since is not None:
+            """This test's own reading, from the flags it set and the session's plain fields (never the host's
+            `_counting`): is `m` held back by the agent now, with nothing on the host side withholding it?"""
+            if s.child is None or s.stopping_since is not None or not flags["gate"] or not flags["may"] or s.checking:
                 return False
             if m is s.writing:
-                return s.turn_at is not None
-            return flags["gate"] and flags["may"] and not s.checking and s.provider.holds_turns()
+                return s.turn_at is not None and not s.unbound
+            return s.writing is None and s.in_flight is None and s.inbox and s.inbox[0] is m and (
+                s.provider.holds_turns())
 
         def see():
             m = holder()
             if m is not None and counted_state(m) and s.provider.verified:
                 seen_verified.add(m.id)
 
+        def pre(m, now):
+            return {"t": now, "id": m.id, "mine": counted_state(m), "before": m.counted, "recovered": m.recovered,
+                    "msg": m}
+
         def observe(rec):
-            t, m = rec["t"], rec["id"]
-            if rec["counting"]:
-                if not rec["live"]:
-                    extra.append((m, "counted with no live process", t))
-                if not rec["staged"] and not (flags["gate"] and flags["may"] and rec["holding"]):
-                    extra.append((m, "counted while the host withholds it", t, dict(flags)))
-            added = (t - rec["at"]) if rec["counting"] and rec["at"] is not None else 0.0
-            if rec["at"] is not None and (len(pass_times) < 2 or rec["at"] != pass_times[-2]):
-                extra.append((m, "an interval whose earlier end was not the previous pass", rec["at"], t))
-            total = rec["before"] + added
-            if not rec["acted"]:
-                if rec["after"] is None:                # dropped: an unearned first budget at T
-                    if rec["recovered"] or total < T or not rec["counting"]:
-                        extra.append((m, "a budget dropped wrongly", total, t))
-                elif rec["after"] != total:
-                    extra.append((m, "counted time other than the interval", rec["before"], rec["after"], t))
-            elif total < T or not rec["counting"]:
-                extra.append((m, "the budget acted before T of counted time, or outside a counted state", total, t))
+            """Both ends of the interval read by this test (the end of the previous pass, `end_state`; now, `pre`),
+            its own total per message and budget, and the budget's action due on the FIRST pass that reaches T."""
+            t, m, key = rec["t"], rec["id"], (rec["id"], rec["recovered"])
+            earlier = pass_times[-2] if len(pass_times) >= 2 else None
+            counts = rec["mine"] and earlier is not None and end_state.get(m) == earlier
+            if abs(rec["before"] - totals.setdefault(key, 0.0)) > 1e-6:
+                extra.append((m, "the host's count is not this test's", rec["before"], totals[key], t))
+            total = totals[key] + ((t - earlier) if counts else 0.0)
+            totals[key] = total
+            due = rec["mine"] and total >= T
+            dropped = rec["after"] is None and not rec["acted"]
+            if due and not (rec["acted"] or dropped):
+                extra.append((m, "not acted on at the first pass that reaches T", total, t, dict(flags)))
+            if (rec["acted"] or dropped) and not due:
+                extra.append((m, "acted on though not due", total, rec["mine"], t, dict(flags)))
+            if dropped and rec["recovered"]:
+                extra.append((m, "a second budget dropped", t))
+            if not rec["acted"] and not dropped and rec["after"] != total:
+                extra.append((m, "the host added other than the interval", rec["after"], total, t))
             if rec["recovered_after"] and not rec["recovered"] and m not in seen_verified:
                 extra.append((m, "a 7b restart it never earned", t))
-            peak[(m, rec["recovered"])] = max(peak.get((m, rec["recovered"]), 0.0), total)
-        watch["see"], watch["obs"] = see, observe
+            peak[key] = max(peak.get(key, 0.0), total)
+        watch["see"], watch["pre"], watch["obs"] = see, pre, observe
 
         def record(mid, kind):
             if mid in outcome:
@@ -1964,11 +2134,13 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 if last_holder[0] != (id(s.writing), id(s.child)):
                     staged[s.writing.id] = henv.clock()         # (re)staged in this pass: its write clock starts
                 if s.turn_at is None:
-                    progressed.add(s.writing.id)
+                    progressed.setdefault(s.writing.id, henv.clock())
             last_holder[0] = (id(s.writing), id(s.child)) if s.writing is not None else None
             m = holder()
+            end_state.clear()
             if m is not None:
                 want = henv.clock() if counted_state(m) else None
+                end_state[m.id] = want                  # one end of the next interval, as this test reads it
                 if m.counted_at != want:
                     extra.append((m.id, "the pass's end mark", m.counted_at, want, dict(flags)))
             see()
@@ -2061,8 +2233,13 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             budgeted = {key[0] for key in peak}
             for m in sent:
                 kind, at = outcome[m]
-                if m in staged and (m in progressed or m not in budgeted):
+                if m in staged and m not in budgeted:
                     assert at <= first_pass(staged[m] + T), (m, kind, at, "main's write timer from", staged[m])
+                elif m in staged and m in progressed:
+                    # Its write timer runs from its staging, but only once its budget is over (a budgeted staged
+                    # message is governed by its budget, which a host gate can hold still: review round 10).
+                    bound = first_pass(max(staged[m] + T, progressed[m] + 1e-6))
+                    assert at <= bound, (m, kind, at, "the write timer from", staged[m], "progress", progressed[m])
         except AssertionError as e:
             raise AssertionError(f"seed {seed}: {e}; steps {steps}") from None
 

@@ -858,7 +858,9 @@ class SessionHost:
         if s.child is not None:
             self._read(s, now, out)
             self._reap(s, now, out)
-        acted = not s.ended and self._budget(s, now, out)   # after the reads, before any timeout or write decision
+        if s.child is not None and s.stopping_since is None and not s.ended:
+            self._take_back(s, now, out)
+        acted = not s.ended and self._budget(s, now, out)   # after the reads and the take-back, before any timeout
         if s.child is not None and s.stopping_since is None and not s.ended:
             self._hold_to_timeout(s, now, out)
         if s.child is not None and s.stopping_since is not None:
@@ -1117,12 +1119,14 @@ class SessionHost:
     def _timeout_detail(self) -> str:
         return f"timed out after {self.timeout_minutes:g} minutes"
 
-    def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent]) -> None:
+    def _take_back(self, s: Session, now: float, out: list[HostEvent]) -> None:
         if s.writing is not None and s.turn_at is not None and self.holding(s):
             # A message is never held while staged (a verified Claude incarnation; `turn_at` is tracked for no other):
             # not one byte of it accepted and the CLI runs a turn of its own, so it goes back to the inbox. Seen here,
-            # after the pass's reads and before any timeout is looked at or anything is written (`_pass`).
+            # after the pass's reads and before its budget, any timeout or any write is looked at (`_steps`).
             self._unstage(s, now, out)
+
+    def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent]) -> None:
         if s.writing is not None and s.turn_at is not None and s.writing.counted is not None:
             # A budgeted message staged with not one byte accepted is governed by its budget (`_budget`, earlier in
             # this pass), whatever the process's verification is now, not by this staging's write timer (C5-01,
@@ -1248,27 +1252,38 @@ class SessionHost:
         return s.inbox[0] if s.inbox and s.in_flight is None else None
 
     def _counting(self, s: Session, msg: _Message) -> bool:
-        """Is `msg` in a COUNTED state now, one in which the agent's process is what holds it back? Exactly two:
-        (b) it is staged with not one byte of its line accepted, in a live process; (a) it is first in the inbox,
-        a live process exists, nothing on the host side withholds it (no handshake or settings check pending,
-        `may_start`, the turn gate) and the CLI's own turn is open (`holding`). Nothing else counts: no process, one
-        going down (the restart for a new binding included), the turn gate closed, `may_start` false, a stopping
-        group, no slot. A new binding while the CLI's turn runs is (a): the host would restart the process for it at
-        once, and waits only because the agent runs a turn of its own (and main's Claude path waits for no such turn
-        at all). (The gates are asked last, and only for a message with a budget: never with VERIFIED empty.)"""
+        """Is `msg` in a COUNTED state now, one in which the agent's process is what holds it back? Exactly two, in a
+        live process and with nothing on the host side withholding it (`_withheld`, ONE list for both): (b) it is
+        staged with not one byte of its line accepted, and its process was started with the binding the session has
+        now (on a new binding main withdraws the staged line, BINDING_CHANGED, later in this pass); (a) it is first in
+        the inbox and the CLI's own turn is open (`holding`). Nothing else counts: no process, one going down (the
+        restart for a new binding included), the turn gate closed, `may_start` false, a handshake or settings check
+        pending, a stopping group, no slot. A new binding while the CLI's turn runs is (a): the host would restart
+        the process for it at once, and waits only because the agent runs a turn of its own (and main's Claude path
+        waits for no such turn at all). (The host's gates are asked last, and only for a message with a budget:
+        never with VERIFIED empty.)"""
         if s.child is None or s.stopping_since is not None or s.ended:
             return False
         if s.writing is not None:
-            return s.writing is msg and s.turn_at is not None
-        if s.in_flight is not None or not s.inbox or s.inbox[0] is not msg:
+            if s.writing is not msg or s.turn_at is None or s.unbound:
+                return False
+        elif s.in_flight is not None or not s.inbox or s.inbox[0] is not msg or not self.holding(s):
             return False
-        if s.checking or (s.provider.waits_for_ready and not s.ready) or not self.holding(s):
-            return False
-        return ((self.turn_gate is None or self.turn_gate(s)) and (self.may_start is None or self.may_start()))
+        return not self._withheld(s)
+
+    def _withheld(self, s: Session) -> bool:
+        """The host-side conditions under which the host itself withholds a session's next (or staged) message, for
+        both counted states (`_counting`): a handshake or a settings check pending, the turn gate closed (main
+        withdraws a staged line then, TURN_WITHDRAWN, later in this pass), `may_start` false."""
+        return bool(s.checking or (s.provider.waits_for_ready and not s.ready)
+                    or (self.turn_gate is not None and not self.turn_gate(s))
+                    or (self.may_start is not None and not self.may_start()))
 
     def _budget(self, s: Session, now: float, out: list[HostEvent]) -> bool:
         """THE one place that adds counted time, once every pass, after its reads and before any timeout or write
-        decision. The interval since the last pass counts only if the message was in a counted state at BOTH its
+        decision (and after a staged message the CLI's new turn takes back, `_take_back`, so the hold, not the
+        staging, is what is judged). The interval since the last pass counts only if the message was in a counted
+        state at BOTH its
         ends: at the end of the last pass (`counted_at`, set by `_mark`) and now, after this pass's reads
         (`_counting`). Conservative: time in which the host may have withheld it, or the CLI's turn may have ended
         (the pass that first reads its result sees it ended), is never counted; it loses at most one pass interval
