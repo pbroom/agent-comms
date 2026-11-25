@@ -130,6 +130,7 @@ def shutdown_bound(self_stop_seconds: float, kill_grace: float, watch_seconds: f
 JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a loop waiting at the hub is not waited for
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
 ACK_LOG_MAX = 512           # acknowledgements kept for the continuity of a fetch (`_publish_ack`, `_offer_contact`)
+BAD_OFFER_LOG_SECONDS = 300.0   # a session's offers that cannot be taken are said at most once in this long (R9-01)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 SESSION_PROTOCOL = 5        # `tree` on every fetch and hello: 2 spawn, 3 the hold, 4 restart, 5 steer (hosted_tree)
@@ -206,9 +207,18 @@ class SessionRunner:
         # The evidence above, between the loop, node.py's hellos and the watchdog: its own short lock, never the
         # host's (R2-09). Order: the host's lock (where held), then this, then an attempt's.
         self.ack_lock = threading.RLock()
-        # (R8-04) The steer diagnostics already said, each once per held attempt (or report) and reason: (session,
-        # what, why). Kept for open sessions only.
-        self._said: set = set()
+        # (R8-04, R9-01) The steer diagnostics, each bounded by construction:
+        # - a held attempt's reasons (another turn, not the held attempt): session -> (its uuid, the reasons said),
+        #   at most one entry per open session, of at most two reasons; gone with the slot (a new attempt is said
+        #   afresh);
+        # - a refused report's 422: the steer-carrying events it was said for, gone when they leave the queue (at
+        #   most one entry per such event pending);
+        # - an offer that cannot be taken (malformed ids, an unknown session): session -> when it was last said,
+        #   once per BAD_OFFER_LOG_SECONDS whatever the uuid offered; at most one entry per listed session, pruned
+        #   to open ones.
+        self._said_held: dict[str, tuple[str, set]] = {}
+        self._said_422: list[tuple] = []
+        self._said_bad: dict[str, float] = {}
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
@@ -509,9 +519,7 @@ class SessionRunner:
                     except Exception as e:
                         if getattr(getattr(e, "response", None), "status_code", None) != 422:
                             raise
-                        self._say_once((sid, "422", tuple(x.get("message") for x in body["events"] if "steer" in x)),
-                                       logging.WARNING, "the hub refused the report for session %s with a steer "
-                                       "outcome (422): sending it again without the outcome", sid)
+                        self._say_422(sid, tuple(e for e, x in zip(events, body["events"]) if "steer" in x))
                         plain = {k: v for k, v in body.items() if k != "events"}
                         plain["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
                         sent = self.clock()
@@ -558,6 +566,22 @@ class SessionRunner:
         """Drop exactly the events this pass sent (appends during the flush only ever come after them), keeping the
         order: also when a later session's report stops the pass, so an earlier session's events are not sent again."""
         self.pending = [item for i, item in enumerate(self.pending) if i not in sent_items]
+        self._prune_422()
+
+    def _say_422(self, sid: str, steer_events: tuple) -> None:
+        """(R8-04, R9-01) The 422-and-retry warning, once per report: per set of steer-carrying events (the queue's
+        own objects), for as long as they wait in the queue."""
+        self._prune_422()
+        if any(len(k) == len(steer_events) and all(a is b for a, b in zip(k, steer_events)) for k in self._said_422):
+            return
+        self._said_422.append(steer_events)
+        log.warning("the hub refused the report for session %s with a steer outcome (422): sending it again without "
+                    "the outcome", sid)
+
+    def _prune_422(self) -> None:
+        if self._said_422:
+            queued = [e for _, e in self.pending]
+            self._said_422 = [k for k in self._said_422 if all(any(e is q for q in queued) for e in k)]
 
     def _sync(self, wait: float) -> dict:
         params: dict[str, Any] = {"wait": wait, "tree": SESSION_PROTOCOL,   # children, spawn, the hold, restart
@@ -837,7 +861,16 @@ class SessionRunner:
         self.features_gen += 1
         for sid in [x for x in self.report_ack if x not in self.host.sessions]:
             del self.report_ack[sid]        # acknowledgements are kept for open sessions only (S2-13)
-        self._said = {k for k in self._said if k[0] in self.host.sessions}
+        self._prune_said()
+
+    def _prune_said(self) -> None:
+        """(R9-01) A held attempt's reasons go with its slot; every diagnostic of a closed session goes."""
+        for sid in list(self._said_held):
+            held = self.host.steer_slot(sid) if sid in self.host.sessions else None
+            if held is None or held.uuid != self._said_held[sid][0]:
+                del self._said_held[sid]
+        self._said_bad = {k: v for k, v in self._said_bad.items() if k in self.host.sessions}
+        self._prune_422()
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 
@@ -1227,7 +1260,7 @@ class SessionRunner:
             return
         n = item["into"]
         if held is not None and held.uuid == item["uuid"] and held.into != str(n):
-            self._say_once((sid, held.uuid, "another turn"), logging.WARNING,
+            self._say_held(sid, held, "another turn", logging.WARNING,
                            "session %s: its steer offered for another turn: not taken", sid)
             return
         if held is not None and held.uuid != item["uuid"]:
@@ -1245,17 +1278,27 @@ class SessionRunner:
         # (R8-04) Said outside the evidence lock (slow stderr never holds up an acknowledgement's publication), and
         # once per held attempt (or offered steer) and reason, however many listings repeat it.
         if why is not None:
-            self._say_once((sid, held.uuid if held is not None else item["uuid"], why), logging.INFO,
-                           "session %s: a steer offer that is %s: not taken", sid, why)
+            now_held = self.host.steer_slot(sid)        # the attempt the host holds (the one it compared with)
+            if now_held is not None:
+                self._say_held(sid, now_held, why, logging.INFO, "session %s: a steer offer that is %s: not taken",
+                               sid, why)
         if err is not None:
-            self._say_once((sid, item["uuid"], f"{type(err).__name__}: {err}"), logging.WARNING,
-                           "session %s: a steer offer could not be taken: %s", sid, err)
+            # (R9-01) Keyed by the session, not by the uuid offered (a hub's bug could offer a fresh one each pass):
+            # at most one line per BAD_OFFER_LOG_SECONDS for the session.
+            now = self.clock()
+            if now - self._said_bad.get(sid, float("-inf")) >= BAD_OFFER_LOG_SECONDS:
+                self._said_bad[sid] = now
+                log.warning("session %s: a steer offer could not be taken: %s", sid, err)
 
-    def _say_once(self, key: tuple, level: int, msg: str, *args) -> None:
-        """A steer diagnostic, logged the first time its key is seen (R8-04)."""
-        if key in self._said:
+    def _say_held(self, sid: str, held: Any, why: str, level: int, msg: str, *args) -> None:
+        """(R8-04, R9-01) A reason about the held attempt, said once per attempt: kept with that attempt only."""
+        uuid, said = self._said_held.get(sid, (None, set()))
+        if uuid != held.uuid:
+            uuid, said = held.uuid, set()
+            self._said_held[sid] = (uuid, said)
+        if why in said:
             return
-        self._said.add(key)
+        said.add(why)
         log.log(level, msg, *args)
 
     def _steer_watch(self, now: float) -> None:

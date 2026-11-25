@@ -194,6 +194,9 @@ class SteerSlot:
     cover_until: float | None = None
     stopping: bool = False          # the node is stopping: set under `lock` (`steer_stopping`), never written then
     lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
+    # (R9-02) The process this attempt was taken for. The slot goes when that process is let go of
+    # (`_release_steer`); a cut is only ever made for the current process's own slot.
+    process: Any = field(default=None, repr=False, compare=False)
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -951,7 +954,7 @@ class SessionHost:
         with self._steer_stop_lock:
             # (R5-01) serialized with the stop latch: installed before it (and then marked by it), or born stopped.
             slot = SteerSlot(uuid, into, text, authorized=bool(authorized) and refused is None, refused=refused,
-                             session_id=s.session_id, cover_until=cover_until)
+                             session_id=s.session_id, cover_until=cover_until, process=s.child)
             slot.stopping = self.steer_stopped
             s.steer = slot
             s.steered.add(uuid)
@@ -1413,8 +1416,7 @@ class SessionHost:
             s.transcript_fd = None
         if not stopped:
             self._went_by_itself(s, code, was_ready, was_checking, out)
-        if s.steer is not None and s.steer.outcome is not None:
-            s.steer = None
+        self._release_steer(s)
         self._forget_restart(s)     # nothing is left to interrupt
         s.held_since = None
         self._save_state()
@@ -1769,6 +1771,12 @@ class SessionHost:
                     s.stopping_since = self.clock()
                 s.child.terminate()
 
+    def _release_steer(self, s: Session) -> None:
+        """(Review round 9, R9-02) Releasing a process releases its steer slot: the attempt was taken for that
+        process, and N's end (settled before this on every path that lets a process go) decided it. Only the uuid
+        stays, in `steered`, so the same steer is never taken again; a replacement process starts with no slot."""
+        s.steer = None      # (one process at a time: any slot held now was taken for the one let go of)
+
     def _stop_from(self, s: Session, now: float, steering: bool) -> None:
         """A single-session path's stop (R8-01): dated at its SIGTERM when `steering` (this call drained a live
         attempt, or is the cut); otherwise main's own call, `_stop(s, now)`, unchanged in shape."""
@@ -2029,6 +2037,11 @@ class SessionHost:
         is read (N's own end may be there), N is reported honestly (its native result if it had one, else failed with
         STEER_CUT) and the process is stopped."""
         slot = s.steer
+        if slot is None or slot.process is not s.child:
+            # (R9-02) Not this process's attempt (its own went when it was let go of): nothing to cut here.
+            if slot is not None:
+                s.steer = None
+            return
         hook = self.steer_cut_hook
         if hook is not None:
             hook(s)
@@ -2338,6 +2351,7 @@ class SessionHost:
             self.groups.gone(s.group_token)
             s.group_token = None
             s.outbuf.clear()
+            self._release_steer(s)
         for s in self.sessions.values():
             s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
         self._save_state()
