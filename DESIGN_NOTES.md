@@ -9186,8 +9186,12 @@ zero-turn task notification `result` did the same to a turn in flight.
     included), the turn gate closed, `may_start` false, a stopping group in the checkout, no slot; there the message
     waits exactly as on main, without limit, and the budget neither stops nor fails anything. A staged message the
     host withholds is main's: the turn gate closing withdraws it (TURN_WITHDRAWN) and a new binding does
-    (BINDING_CHANGED), later in that pass, as on main; with `may_start` false it stays staged, charged nothing (no
-    write timer either: its budget governs it). The order in a pass (review round 10): the reads; a staged message
+    (BINDING_CHANGED), later in that pass, as on main; with `may_start` false it stays staged (main keeps writing
+    it), charged nothing, and main's write timer from its staging governs it. **One clock** (review round 11): at
+    every pass a message staged with not one byte accepted is governed by exactly one clock: its budget while its
+    counted state holds (`_hold_to_timeout` then leaves it to `_budget`), otherwise main's write timer from the
+    staging, exactly as on main (main's failure, detail and time), whether or not it has a budget, for verified,
+    other-version and no-init processes alike. The order in a pass (review round 10): the reads; a staged message
     the CLI's new turn takes back (`_take_back`, the unstage); then the budget; then timeouts and writes, where
     main's withdrawals happen. **One place adds it**
     (`_budget`, every pass, after the reads and the take-back, before any timeout or write decision): the interval
@@ -9827,7 +9831,8 @@ it, above).
     downgrade, not necessarily in one stretch. What they cannot mean: a wait the node itself imposes (a parent's
     turn or its parked process, the self-stop deadline, a stopping process group in the checkout, no slot, no
     process, a process going down) counts nothing and never leads to either line; nor a runner of another version
-    (it gets main's write timer, `timed out after <N> minutes`). The restart line with "with its process gone or
+    (it gets main's write timer, `timed out after <N> minutes`); nor a line staged while the node is latched
+    (`may_start` false: main's write timer again). The restart line with "with its process gone or
     going down" of round 8 is no longer written.
   - `made no progress` matches both; `for a second` only the failure. Neither is ever written with VERIFIED empty.
   - and, at INFO, `session <id>: message <msg>, not one byte of it written, waits again: the agent began a turn of
@@ -9959,9 +9964,8 @@ is written once); the earlier replays follow the new rule; the `unbound` choice 
   with a new turn of the CLI's own and a new binding, `test_c10_a_binding_change_and_a_new_turn_hold_m_behind_the_
   turn_which_counts` (that wait counts, the follow-up's choice: the 7b at t=65, the next process writes M once) and
   `..._early_restart_for_the_binding_once_it_ends` (at t=50: held, restarted for its binding when the turn ends,
-  written once, not recovered). One consequence: with `may_start` false a budgeted staged message has no clock at
-  all (main's write timer would fail it at its staging plus the timeout); in production the self-stop watchdog
-  stops the node's turns at that deadline.
+  written once, not recovered). (Round 10 left a budgeted staged message with no clock at all while `may_start`
+  was false, trusting the self-stop watchdog; round 11 showed that wrong, below.)
 - **[should] the property test's oracle.** Both ends of every interval are now this test's own reading (the flags it
   set and the session's plain fields, the host gates for the staged state included; never `_counting`); its total
   must equal the host's, and the budget's action (the 7b, the failure, or the drop) must come on the FIRST pass at
@@ -9999,6 +10003,63 @@ is written once); the earlier replays follow the new rule; the `unbound` choice 
 | C10 \| the reported version escaped in the log | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (2) |
 | C10 \| ... and capped | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (2) |
 | C10 \| ... used in the log line | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (5) |
+
+#### Review round 11 (Sol, on 647ca38: CHANGES, one blocker, one should) and what changed
+
+Sol: round 10's findings resolved (both t=65 variants, `may_start` spending nothing, BINDING_CHANGED, the first-pass
+expiry, the escaped version).
+- **[blocker] a staged line with no clock under the latch.** A hub call straddling the self-stop deadline sets the
+  latch and then renews contact: `_may_start()` stays false until a fresh listing clears it, while `_silent()` is
+  already false and the watchdog does nothing. Round 10 then suspended both clocks of a budgeted staged message:
+  M stayed staged past its ordinary deadline (t=105), and was still delivered while latched once the pipe reopened.
+  A parity regression too: with VERIFIED empty M failed at t=60; under the shipped allowlist a 2.1.329 and a no-init
+  candidate stayed staged. Ruling: a staged message is never without a clock: while `may_start` is false and a line
+  is staged with zero bytes accepted, main's write timer applies exactly as on main, budget or not, and the budget
+  does not count. Done: the one-clock rule above, in `_hold_to_timeout` (the budget's branch returns only while the
+  counted state holds). Whether main writes a staged line while `may_start` is false is unchanged (it does).
+- **When the counted state stops and resumes** (`may_start` false, then true again): the budget keeps what it had
+  counted, counts nothing while it is false, and counts again from the first pass at which the state holds at both
+  ends (the closing and the reopening passes' intervals are lost, as for any other entry or exit). The write timer
+  runs from the staging in wall time and never restarts while the line stays staged; it is consulted at every pass
+  outside the counted state, so the first such pass at or after the staging plus the timeout ends the message. A
+  staging therefore lives at most the write timer's span outside counted passes, and after that only counted time
+  can pass, which the two budgets bound (a restage, after an unstage or the 7b, starts the write timer again, as on
+  main, but each restage spends counted time or comes after the CLI's own turn, itself counted): no path gives a
+  staged line more than main's write timer plus its two budgets of counted time, each plus one pass.
+- **Searched for any other state in which a staged budgeted message has neither clock**: none. A staged message
+  always has a live process that is not going down (the 7b unstages before it stops; the write timer, the gate's and
+  the binding's withdrawals and a cancellation fail it before a stop; a binding or parent-gate stop happens only
+  with nothing staged; a process that goes by itself fails it), and `busy_since` (the write timer's start) is set
+  at the staging and cleared only by `_unstage` or by the message leaving staging. Outside the counted state the
+  write timer now applies; inside it, the budget. A staged line with a byte accepted keeps main's write timer; a turn
+  in flight, main's turn timer. Only an inbox message waits without a clock, and only while the host withholds it
+  (the gate, `may_start`, no process, no slot, a stopping group), as on main.
+- Tests first (all but the resume one failed on 647ca38): `test_c11_latched_but_not_silent_a_staged_message_keeps_
+  mains_write_timer[verified, other, no_init]` (Sol's replay, the latch closed from t=5: M fails at t=60 by main's
+  write timer with main's detail, every pass's events, the stdin and the stops equal to the same run with VERIFIED
+  empty); `test_c11_the_latch_closing_and_opening_again_before_the_write_timer_the_budget_resumes` (written once,
+  the budget's count kept and resumed); `test_c11_the_latch_and_the_budget_never_give_more_than_*` (the latch
+  flapping on a blocked pipe: ended by the write timer); round 10's `may_start` test changed to expect main's write
+  timer at t=105 (`..._charges_nothing_and_mains_write_timer_ends_it`). The property test's generator has the latch
+  (`may_start` false while not silent, the pipe then taking the line again or still none), and the property "a
+  staged zero-byte message always has a clock that can end it" (no pass ends with it staged outside a counted state
+  T or more after its final staging); it catches the round-10 code at seed 41 of the suite's 200; 4000 seeds pass.
+- **[should] `shown_version`**: the input is sliced to 64 characters before it is escaped (bounded work whatever
+  the init's size), and the rendered text is capped at 64 too, its length said when cut.
+
+**Mutation check** (round 11; scratchpad `correlation/mutate13.py`: the rows on the staged state's clock, `_counting`'s staged branch and the logged version, rewritten where round 11 changed their lines, and rows for the new lines): 8 of 9 caught. The one left is EQUIVALENT: taking the budget's branch out of `_hold_to_timeout` altogether, so that main's write timer also runs while the counted state holds; in that state every interval since the staging is counted, so the budget holds at least the write timer's span and is compared earlier in the same pass: the write timer can never run out first (round 6's argument, now only for the counted state; outside it the write timer is the clock, row C11).
+
+| row or rule | caught by |
+| --- | --- |
+| C9 \| ... nor while may_start does | `test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate[may_start]` (6) |
+| C10 \| a staged message the host withholds counts nothing | `test_c10_may_start_false_on_a_staged_message_charges_nothing_and_mains_write_timer_ends_it` (5) |
+| C10 \| ... nor one whose binding changed | `test_c10_a_binding_change_on_a_staged_message_is_mains_withdrawal_not_the_budget` (2) |
+| C10 \| the reported version escaped in the log | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (2) |
+| C10 \| ... used in the log line | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[2.1.330\nClaude` (7) |
+| C11 \| one clock: the budget only while its counted state holds, else the write timer | `test_c10_may_start_false_on_a_staged_message_charges_nothing_and_mains_write_timer_ends_it` (6) |
+| C11 \| the version sliced before it is escaped | `test_c11_the_version_is_sliced_before_it_is_escaped` (1) |
+| C11 \| ... and the rendered text capped | `test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded[\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01]` (2) |
+| C6-01 \| a budgeted staged message in its counted state is governed by its budget, not the write timer | equivalent: none (0) |
 
 ### Not done
 

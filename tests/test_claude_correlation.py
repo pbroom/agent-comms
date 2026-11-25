@@ -1803,7 +1803,8 @@ def test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on(m
 
 
 @pytest.mark.parametrize("version", ["2.1.330\nClaude session forged: this process reports Claude Code 2.1.330; "
-                                     "turn correlation is on for it", "9" * 10_000, "2.1.330\x1b[2J\u202e\U0001f600"])
+                                     "turn correlation is on for it", "9" * 10_000, "2.1.330\x1b[2J\u202e\U0001f600",
+                                     "\x01" * 64, "\x00" * 1_000_000])
 def test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded(monkeypatch, caplog, version):
     """The version is the process's own text: in the log line no newline or control character (nor anything outside
     printable ASCII) appears, and at most 64 of its characters, with its length said when cut (review round 10)."""
@@ -1819,12 +1820,29 @@ def test_c10_the_reported_version_goes_in_the_log_escaped_and_bounded(monkeypatc
         "; turn correlation is off for it (attributed by order)")
     shown = line[len(f"Claude session {SID}: this process reports Claude Code "):-len(
         "; turn correlation is off for it (attributed by order)")]
-    assert shown == claude.shown_version(version) and len(shown) <= 64 + len("... (10000 characters)")
+    assert shown == claude.shown_version(version) and len(shown) <= 64 + len(f"... ({len(version)} characters)")
     if len(version) > 64:
         assert shown.endswith(f"... ({len(version)} characters)")
     assert "\n" not in line and "\x1b" not in line
     if "\n" in version:
         assert "\\u000a" in shown
+
+def test_c11_the_version_is_sliced_before_it_is_escaped(monkeypatch):
+    """Bounded work whatever the init's size (review round 11): the escaper sees at most 64 characters of the
+    version, and the rendered text is capped at 64 too (64 control characters render as 384, cut to 64)."""
+    seen = []
+    sub = claude.re.sub
+
+    def spy(pattern, repl, text, *a, **kw):
+        seen.append(len(text))
+        return sub(pattern, repl, text, *a, **kw)
+
+    monkeypatch.setattr(claude.re, "sub", spy)
+    shown = claude.shown_version("\x01" * 1_000_000)
+    assert seen == [64] and shown == "\\u0001" * 10 + "\\u00" + "... (1000000 characters)"
+    assert claude.shown_version("\x01" * 64).startswith("\\u0001" * 10) and claude.shown_version(
+        "\x01" * 64).endswith("... (64 characters)")
+    assert claude.shown_version("2.1.330") == "2.1.330" and claude.shown_version(None) == "no version"
 
 def test_c9_with_verified_empty_no_process_says_whether_turn_correlation_is_on(monkeypatch, caplog):
     """With VERIFIED empty the line is never written (main's logs, pinned by the golden's case 1, are untouched)."""
@@ -1903,22 +1921,22 @@ def test_c10_a_new_turn_and_a_closed_gate_unstage_m_and_it_waits_behind_the_gate
     valid_stdin(child, once=["next"])
 
 
-def test_c10_may_start_false_on_a_staged_message_charges_nothing(henv, monkeypatch):
-    """The node past its self-stop deadline (`may_start` false) at t=65 with M staged, zero bytes, no new turn: main
-    withdraws nothing here (it keeps the staged line), and the budget charges nothing while the host withholds new
-    work: 300 s, nothing stopped or failed, 55 s counted; once it may start again and the pipe takes the line, the
-    same process writes M, once. (A budgeted staged message has no write timer: its budget governs it, C6-01.)"""
+def test_c10_may_start_false_on_a_staged_message_charges_nothing_and_mains_write_timer_ends_it(henv, monkeypatch):
+    """The node latched (`may_start` false) at t=65 with M staged since t=45, zero bytes, no new turn: main withdraws
+    nothing here (it keeps the staged line), the budget charges nothing while the host withholds new work (55 s),
+    and main's write timer from the staging governs instead (review round 11: a staged message always has a
+    clock): M fails at t=105, main's detail, the process stopped; nothing is requeued."""
     s, child, flag = held_then_staged(henv, monkeypatch, "may_start")
     henv.clock.advance(5)
     flag["open"] = False
-    for _ in range(61):
+    for _ in range(7):                                  # t=65 to t=95
         assert henv.host.tick() == []
         henv.clock.advance(5)
-    assert s.writing.id == "1" and s.writing.counted == 55 and child.terminated == 0
-    flag["open"] = True
-    child.accept = None
-    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
-    valid_stdin(child, once=["next"])
+    assert henv.host.tick() == [] and s.writing.counted == 55      # t=100
+    henv.clock.advance(5)                               # t=105: the staging (t=45) plus the timeout
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False) and end.detail == henv.host._timeout_detail()
+    assert child.terminated == 1 and not s.inbox
 
 
 def test_c10_a_binding_change_on_a_staged_message_is_mains_withdrawal_not_the_budget(henv, monkeypatch):
@@ -1979,6 +1997,122 @@ def test_c10_a_binding_change_and_a_new_turn_early_restart_for_the_binding_once_
     valid_stdin(child, fresh, once=["next"])
 
 
+# --- review round 11: a staged message is never without a clock
+
+
+def latched_run(henv, monkeypatch, verified, kind, reopen_at=None):
+    """The latched-but-not-silent node (`may_start` false from t=5: a hub call straddled the self-stop deadline, so
+    the latch is set but the watchdog sees contact): M staged at t=0 into a pipe that takes nothing. `kind`:
+    "verified" (a process that verified, then one ordinary turn, M staged after it: a budget, earned), "other" (M
+    staged before the first `init`, which reports 2.1.329), "no_init" (M staged, no `init` ever). A pass every 5 s
+    to t=120; at `reopen_at` the latch clears and the pipe takes the line. What is seen outside: every pass's
+    events, the stdin without the uuid key, the stops, the inbox."""
+    import dataclasses
+    from test_dispatch import FakeProcs, FakeSpawner
+    monkeypatch.setattr(claude, "VERIFIED", frozenset(verified))
+    henv.spawner = FakeSpawner(child=FakeSessionChild)
+    henv.procs = FakeProcs(henv.spawner)
+    henv.host = make_host(henv, timeout_minutes=1)
+    flag = {"open": True}
+    henv.host.may_start = lambda: flag["open"]
+    s = open_session(henv)
+    if kind == "verified":
+        henv.host.send(SID, "zero", message_id="0")
+        henv.host.tick()
+        child = henv.spawner.children[-1]
+        u = uuid_of(child)
+        child.emit(*((vinit(u), owned(u)) if u else (vinit(), plain())))
+        henv.host.tick()
+        child.accept = 0
+    else:
+        henv.spawner.child = _ZeroPipe
+    henv.host.send(SID, "next", message_id="1")
+    passes = [[dataclasses.asdict(e) for e in henv.host.tick()]]
+    child = henv.spawner.children[-1]
+    assert s.writing.id == "1" and child.stdin.count(b'"next"') == 0
+    budgeted = s.writing.counted is not None
+    for k in range(1, 25):
+        henv.clock.advance(5)
+        if k == 1:
+            flag["open"] = False
+            if kind == "other":
+                child.emit(vinit(version="2.1.329"))
+        if reopen_at is not None and k * 5 == reopen_at:
+            flag["open"] = True
+            child.accept = None
+        passes.append([dataclasses.asdict(e) for e in henv.host.tick()])
+    return {"passes": passes, "stdin": [UUID_KEY.sub(b"}\n", c.stdin) for c in henv.spawner.children],
+            "stops": [c.terminated for c in henv.spawner.children], "inbox": [m.id for m in s.inbox]}, budgeted
+
+
+@pytest.mark.parametrize("kind", ["verified", "other", "no_init"])
+def test_c11_latched_but_not_silent_a_staged_message_keeps_mains_write_timer(henv, monkeypatch, kind):
+    """Sol's replay, with the latch closed from t=5 and the watchdog doing nothing (the node is not silent): M,
+    staged at t=0 with zero bytes, fails at t=60 by main's write timer, with main's detail, and its process is
+    stopped, for a verified 2.1.330 process with a budgeted message, a 2.1.329 one and one that never writes an
+    init alike: every pass's events, the stdin (the uuid key aside) and the stops are those of the same run with
+    VERIFIED empty (main's, by the golden's case 1). The budget counts nothing meanwhile."""
+    ours, budgeted = latched_run(henv, monkeypatch, {V}, kind)
+    main, main_budgeted = latched_run(henv, monkeypatch, (), kind)
+    assert budgeted and not main_budgeted
+    assert ours == main
+    [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended" and e["message_id"] == "1"]
+    assert end["delivered"] is False and end["detail"] == henv.host._timeout_detail()
+    assert ours["passes"][12] == [end], "at t=60"
+
+
+def test_c11_the_latch_closing_and_opening_again_before_the_write_timer_the_budget_resumes(henv, monkeypatch):
+    """The latch closed from t=5 to t=40: main's write timer from the staging (t=0) governs meanwhile and has not run
+    out; at t=40 the latch clears, the budget governs again (it resumes: it counted the 5 s to t=5 and counts from
+    the pass at t=40 on, not the closed interval), and the line is written once when the pipe takes it, at t=50."""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    flag = {"open": True}
+    henv.host.may_start = lambda: flag["open"]
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    m = s.writing
+    assert m.counted == 0
+    henv.clock.advance(5)
+    henv.host.tick()
+    assert m.counted == 5
+    flag["open"] = False
+    for _ in range(7):                                  # to t=40, latched
+        henv.clock.advance(5)
+        assert henv.host.tick() == []
+    assert m.counted == 5 and s.writing is m and child.terminated == 0
+    flag["open"] = True
+    henv.clock.advance(5)                               # t=45: the budget again (the interval to t=45 counts nothing)
+    assert henv.host.tick() == [] and m.counted == 5
+    henv.clock.advance(5)                               # t=50
+    child.accept = None
+    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
+    assert child.terminated == 0 and child.turns()[-1] == "next"
+    valid_stdin(child, once=["next"])
+
+
+def test_c11_the_latch_and_the_budget_never_give_more_than_the_write_timer_and_two_budgets(henv, monkeypatch):
+    """The latch closed at every other pair of passes while the pipe takes nothing: the write timer runs from the
+    staging in the closed passes, the budget in the open ones; at the first closed pass at or after the staging plus
+    the timeout, main's write timer ends it (a budget not yet spent cannot keep it)."""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    flag = {"open": True}
+    henv.host.may_start = lambda: flag["open"]
+    child.accept = 0
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    t0, end = henv.clock(), None
+    while end is None and henv.clock() - t0 < 600:
+        henv.clock.advance(5)
+        flag["open"] = (henv.clock() - t0) % 20 < 10
+        for e in settled(henv.host.tick(), "1"):
+            end = (henv.clock() - t0, e.detail)
+    assert end is not None and end[0] <= 60 + 3 * 60 + 10, end
+    assert end[1] in (henv.host._timeout_detail(), henv.host.HELD.format(m=1)), end
+
+
 def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     """Seeded random walks (review rounds 6 to 8, and the follow-up after the switch-on) on a host with 2.1.330
     VERIFIED, timeout T = 60 s, over: sends; the live pipe taking nothing, everything, or a few bytes per write; the
@@ -1994,6 +2128,9 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     - the budget acts (the 7b restart, the failure, or the drop of an unearned one) on the FIRST pass at which this
       test's total reaches T, never before and never a pass late; the 7b only for a message seen in a counted state
       under a verified process (line by line, and at each pass's end); no budget exceeds T plus one step;
+    - a staged zero-byte message always has a clock that can end it (review round 11; the generator has the latch,
+      `may_start` false with the pipe taking the line again): at no pass's end is it still staged, outside a counted
+      state, T or more after its final staging;
     - at every pass's end, `counted_at` is that pass's time exactly when the message is in a counted state as this
       test sees it (staged with no byte accepted in a live process; or first in the inbox, a live process, every
       gate open, the CLI's turn open);
@@ -2136,6 +2273,13 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 if s.turn_at is None:
                     progressed.setdefault(s.writing.id, henv.clock())
             last_holder[0] = (id(s.writing), id(s.child)) if s.writing is not None else None
+            w = s.writing
+            if (w is not None and s.turn_at is not None and s.child is not None and s.stopping_since is None
+                    and not counted_state(w) and henv.clock() - staged.get(w.id, henv.clock()) >= T):
+                # Review round 11: a staged zero-byte message always has a clock that can end it: its budget while
+                # its counted state holds, main's write timer from the staging otherwise.
+                extra.append((w.id, "staged, zero bytes, with no clock that ends it", staged[w.id], henv.clock(),
+                              dict(flags)))
             m = holder()
             end_state.clear()
             if m is not None:
@@ -2152,7 +2296,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             p = proc()
             action = rnd.choice(["send", "send", "zero", "open", "partial", "next", "bracket", "bracket", "close",
                                  "downgrade", "own", "other", "bind", "linger", "release", "exit", "broken",
-                                 "cancel", "gate", "may", "slot", "groups"])
+                                 "cancel", "gate", "may", "slot", "groups", "latch", "latch"])
             arg = None
             if action == "send" and len(sent) < 6:
                 arg = f"m{len(sent)}"
@@ -2194,6 +2338,13 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                         record(e.message_id, "failed")
             elif action in flags:
                 flags[action] = arg = not flags[action]
+            elif action == "latch":
+                # Latched but not silent (review round 11): `may_start` false while the watchdog sees contact; the
+                # pipe then takes the staged line again (main still writes a staged line then), or still takes none.
+                flags["may"] = False
+                arg = rnd.choice(["reopen", "blocked"])
+                if p is not None:
+                    p.accept = None if arg == "reopen" else 0
             dt = rnd.choice(STEPS)
             steps.append((action, arg, dt))
             henv.clock.advance(dt)

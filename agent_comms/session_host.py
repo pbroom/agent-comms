@@ -1127,13 +1127,15 @@ class SessionHost:
             self._unstage(s, now, out)
 
     def _hold_to_timeout(self, s: Session, now: float, out: list[HostEvent]) -> None:
-        if s.writing is not None and s.turn_at is not None and s.writing.counted is not None:
-            # A budgeted message staged with not one byte accepted is governed by its budget (`_budget`, earlier in
-            # this pass), whatever the process's verification is now, not by this staging's write timer (C5-01,
-            # C6-01) ...
+        if (s.writing is not None and s.turn_at is not None and s.writing.counted is not None
+                and self._counting(s, s.writing)):
+            # ONE clock at every pass for a message staged with not one byte accepted (review round 11): its budget
+            # while its counted state holds (`_budget`, earlier in this pass; not this staging's write timer, C5-01,
+            # C6-01), and otherwise main's write timer from the staging, below, exactly as on main: while the host
+            # withholds it (`may_start` false: a latch the watchdog does not see), with no budget, or once an
+            # unearned budget is dropped (C7-01, at that very pass). The write timer never restarts while the line
+            # stays staged, so it never gets more than that timer plus its counted budgets.
             return
-            # ... unless the budget was never earned and is dropped (C7-01): then main's write timer, below, as on
-            # main (it runs out at that very pass: the staging started both, and a staged message's time all counts).
         if s.busy_since is None:
             return
         if s.interrupted_at is not None:

@@ -106,9 +106,13 @@ def shown_version(version) -> str:
     VERSION_SHOWN characters (and says how long it was). Not a string: "no version"."""
     if not isinstance(version, str):
         return "no version"
+    # Bounded work whatever the init's size: only the first VERSION_SHOWN characters are escaped, then the result
+    # itself is capped (an escape takes up to ten characters).
     text = re.sub(r"[^\x20-\x7e]", lambda m: "\\u%04x" % ord(m.group()) if ord(m.group()) < 0x10000
-                  else "\\U%08x" % ord(m.group()), version)
-    return text if len(text) <= VERSION_SHOWN else f"{text[:VERSION_SHOWN]}... ({len(version)} characters)"
+                  else "\\U%08x" % ord(m.group()), version[:VERSION_SHOWN])
+    if len(text) <= VERSION_SHOWN and len(version) <= VERSION_SHOWN:
+        return text
+    return f"{text[:VERSION_SHOWN]}... ({len(version)} characters)"
 
 
 # The Claude Code versions whose processes are attributed by evidence (module text). A version goes in only once the
