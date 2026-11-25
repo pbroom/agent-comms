@@ -9215,7 +9215,10 @@ zero-turn task notification `result` did the same to a turn in flight.
       false, a stopping group in the checkout, no slot; there the message waits exactly as on main, and the budget
       neither stops nor fails anything. A staged message the host withholds is main's: the turn gate closing
       withdraws it (TURN_WITHDRAWN) and a new binding does (BINDING_CHANGED), as on main; with `may_start` false it
-      stays staged (main keeps writing it), and main's write timer governs it.
+      stays staged (main keeps writing it), and main's write timer governs it, so it can fail it there, earned or
+      not, first budget spent or not, at main's time (the reviewer's probe after #112: earned at t=5, latched over
+      [55, 70), "timed out" at t=60, as on main). A host-side wait never makes the BUDGET act; it does not suspend
+      main's write timer.
     - **One clock** (review rounds 11 and 12): at every pass a message staged with not one byte accepted is
       governed by exactly one clock: an earned message's budget while its counted state holds in the decision's
       reading, otherwise main's write timer from the staging, exactly as on main.
@@ -9235,8 +9238,9 @@ zero-turn task notification `result` did the same to a turn in flight.
       budget, and its path is main's;
   - **the inbox owns the hold: a message is never held while staged** (review round 4). While the adapter reports an
     unattributed bracket, the next message stays in the inbox, unstaged. If a message is staged and not one byte of
-    its user line was accepted when the bracket is seen open (`_hold_to_timeout`, after the pass's reads and before
-    any timeout is looked at or anything is written), it is UNSTAGED (`_unstage`): only its own bytes leave the
+    its user line was accepted when the bracket is seen open (`_take_back`, after the pass's reads and, for a line
+    with no budget, main's write-timer check (review round 16), before the decision, any other timeout and any
+    write), it is UNSTAGED (`_unstage`): only its own bytes leave the
     buffer (from `turn_at` on; the rest of a partly written control frame before it stays exactly as it was, and
     still goes), it goes back FIRST in the inbox, ahead of any successor, its write clock goes with it (its no-progress budget does not), and the
     adapter keeps no trace of it (`unstaged`: no `_current`, no uuid outstanding, so rule 10 cannot fire for it). A
@@ -9868,11 +9872,13 @@ The pre-merge reviewer (both PRs OK to merge) found two shoulds and some nits; t
   restarted, at two M failed "not one byte ... accepted by the agent's process", though nothing was ever offered.
   On main M waits for the gate. The same held for `may_start`, a stopping group, admission and the binding path.
   Ruling: the budget counts only time in which the agent's process holds the message back (the invariant above,
-  restated): accumulated seconds on the message (`counted`), one adder (`_budget`, with the both-ends rule), one
-  comparison (`_spent`); C7-02's "admission denied past the second budget fails the message" is withdrawn. What
-  changed in the code: `_Message.blocked_since` is now `counted` and `counted_at`; `_budget` and `_mark` added;
-  `_spent` is called only from `_budget`; the checks with no process (`_write`) and while a process goes down
-  (`_pass`), the head check before staging and `_barrier`'s check are gone; `_earn` earns only in a counted state.
+  restated): accumulated seconds on the message (`counted`), one adder (`_budget`, with the both-ends rule; since
+  review round 14 the decision point `_decide`), one comparison (`_spent`); C7-02's "admission denied past the
+  second budget fails the message" is withdrawn. What changed in the code: `_Message.blocked_since` is now
+  `counted` and `counted_at`; `_budget` (now `_decide`) and `_mark` added; `_spent` is called only from `_budget`
+  (now `_decide`); the checks with no process (`_write`) and while a process goes down (`_pass`), the head check
+  before staging and `_barrier`'s check are gone; `_earn` earns only in a counted state (`_earn` is gone since
+  review round 14: earning is decided in `_decide`).
   The log line for a restart with no process ("with its process gone or going down ...") is gone with them: a
   budget is acted on only where it is reached, with a live process.
 - **One choice beyond the ruling's letter**: a new binding while the CLI runs a turn of its own COUNTS (state a).
@@ -9899,7 +9905,7 @@ The pre-merge reviewer (both PRs OK to merge) found two shoulds and some nits; t
   and open by turns while the CLI's turns and a blocked pipe use the open intervals: the outcome within two timeouts
   of counted time, measured from the passes' own record, the wall time longer); the INFO line's tests; and
   `test_c9_property_random_sequences_in_counted_time`, replacing round 7's: bounds in counted time (a wrapper of
-  `_budget` records each decision: counted time is added only in a counted state, only for an interval whose
+  `_budget`, now of `_decide`, records each decision: counted time is added only in a counted state, only for an interval whose
   earlier end was the previous pass's end in a counted state, and then exactly that interval; never while a gate
   the test closed withholds the message; the budget acts only at T; no budget holds more than T plus one step; the
   end-of-pass mark matches the test's own reading of the state), the host-side gates in the generator (turn gate,
@@ -9966,7 +9972,8 @@ is written once); the earlier replays follow the new rule; the `unbound` choice 
   requeued M before the gate was asked. Ruling: host-side withholding wins in the staged state too; the pass's order
   is the reads, the take-back of a staged message the CLI's new turn holds, the binding and write gates as main
   applies them, and only then the budget, which counts (b) only if nothing on the host side withholds the message,
-  at both ends. Done: `_take_back` (the unstage, split out of `_hold_to_timeout`) runs before `_budget`; `_counting`
+  at both ends. Done: `_take_back` (the unstage, split out of `_hold_to_timeout`) runs before `_budget` (now
+  `_decide`); `_counting`
   takes its host-side conditions from one list (`_withheld`) for (a) and (b), and (b) also needs the process's
   binding to be the session's (main withdraws a staged line on a new binding). Main's withdrawals stay where main has
   them (`_write`), so with VERIFIED empty nothing moved. Tests (all but the last two failed on 0cac651):
@@ -10088,7 +10095,8 @@ Sol: the latch held closed now matches main for all three runner kinds; `shown_v
   ends it at main's pass whatever its budget holds.
 - **Becoming earned mid-staging** (a candidate that verifies, or the latch reopening under a verified process): the
   budget is the clock from the pass at which the message is first in a counted state under the verified process (it
-  is earned there, in `_budget` before the clock is chosen, or by the line that verifies it), and main's write timer
+  is earned there, in `_budget` (now `_decide`) before the clock is chosen, or by the line that verifies it:
+  since review round 15 only at the decision), and main's write timer
   before. The hand-over cannot end it earlier than main would: an unearned budget counts only since its staging (it
   starts there, and the only way back to the inbox, the take-back, needs the CLI's own turn), so whatever it holds is
   at most the wall time since that staging; the 7b needs the timeout of it, so it comes no earlier than main's
@@ -10365,6 +10373,70 @@ and a `may_start_query` call there).
 | row or rule | caught by |
 | --- | --- |
 | C17 \| a stopping process earns nothing: no gate read for an unbudgeted message | `test_c17_after_the_early_timeout_the_queued_successor_reads_no_gate` |
+
+#### The cleanup after #112 (the pre-merge review of #112: OK to merge; one should, three nits)
+
+- **[should] The property test rarely reached the budget.** Measured over the suite's 200 seeds (their walks
+  without the inert frames), the walks that reached each state, before and after:
+
+  | state reached in a walk | before | after |
+  | --- | --- | --- |
+  | a budget earned | 3 | 68 |
+  | a first budget spent (the 7b restart) | 2 | 55 |
+  | a second budget spent (the HELD failure) | 0 | 50 |
+  | a budgeted message at a decision while the host withholds it | 3 | 67 |
+  | a staged earned line's clock switching (budget, main's write timer) | 0 | 19 |
+
+  Every odd seed now walks a budget profile: pipes blocked from the start; most new processes verifying at once,
+  their own first turn left open (the take-back) or over (an earned staged line); more sends, CLI turns, in-flight
+  results, the latch and passes that only let time go by; steps of 5 to 30 s, rarely 65; and before the drain 200 s
+  with every gate open and the pipes still blocked, so that budgets run out. The even seeds walk as before. The
+  test asserts minima for each state (30, 25, 20, 30, 6 walks over 200 seeds, scaled for `C9_SEEDS`) and prints the
+  counts when one is missed. A new oracle: an earned staged line never times out on a pass at which its budget is
+  the clock. Mutations run against the property test alone (scratchpad `correlation/mutate21.py`): main's write
+  timer also acting on an earned staged line in its counted state (two clocks) was MISSED before and is caught now;
+  the second budget never failing (`_spent` restarting again) was MISSED before and is caught now; host-side waits
+  counting (`_withheld` always false) was caught before and still is. 4000 seeds pass. Its docstring no longer
+  describes a `_budget` wrapper or "the drop of an unearned one".
+- **[nit] Stale names**: providers/claude.py's module text and `holds_turns` named `_budget` (now `_decide`); this
+  section's design text placed the take-back in `_hold_to_timeout` (now `_take_back`, after main's write-timer
+  check for an unearned line); the follow-up and rounds 10 and 12 named `_budget` and `_earn` without saying what
+  they became; three tests that the notes name had been dropped by later rounds' edits, though their rules stand,
+  and are restored. The other names the round records use and the code no longer has are listed below.
+- **[nit] Wording**: `_spent`'s docstring, this section and the README now say that the budget never fails a
+  message at its first expiry and that a host-side wait never makes the BUDGET act; main's write timer still applies
+  to a staged line while `may_start` is false (latched, not silent), as on main.
+- **[nit] `_Message.earned`** was set and never read: removed. A message is earned exactly when `counted` is set;
+  the tests that compared the host's `earned` with the model's compare `counted is not None`. No behaviour changed:
+  the golden, the callback-trace tests and every directed replay pass unchanged.
+
+#### Names in the round records that the code no longer has
+
+The round records above name the code and the tests as they were at that round. Where a later round renamed or
+removed one, this is what it is now (the cleanup after #112 checked every backticked name in this section against
+the tree):
+- `_budget` (follow-up, rounds 10 to 13): `_decide`, the one decision point (round 14).
+- `_earn` (round 7 to round 13), `_evidence` and `_Message.evidence` (round 14): gone; earning is decided in
+  `_decide` from the state at the decision point (round 15).
+- `_Message.earned` (round 7 on): gone (the cleanup after #112); a message is earned exactly when `counted` is set.
+- `_Message.blocked_since` (round 5): `counted` and `counted_at` (the follow-up). `held_staged`, `_staged_hold`
+  (round 3), `Session.recovered`, `Session.held_for` (round 5): gone, as those records say.
+- `_gates`, `Session.gates` (round 12), `_ticking` (round 13): gone (round 14); the one reading is `_read_gates`, at `_decide`.
+- `_steer_only` (round 1): removed there.
+- Tests: `test_c7_property_random_sequences_every_message_has_one_outcome_in_time` became
+  `test_c9_property_random_sequences_in_counted_time` (the follow-up); `test_verified_ships_empty_and_lines_are_
+  mains_bytes_and_attributed_by_order` became `test_verified_is_2_1_330_only` (the switch-on);
+  `test_c2_03_after_a_write_opportunity_the_clock_starts_again` became `test_c5_01_a_write_opportunity_with_no_
+  byte_accepted_does_not_restart_the_budget` (round 5); `test_c7_01_a_verification_and_a_downgrade_read_in_one_
+  pass_still_earn_it` became `..._earn_nothing` (round 15); `test_c7_02_admission_denied_past_the_second_budget_
+  fails_it_without_spawning` became `test_c7_02_admission_denied_for_two_timeouts_m_waits_and_is_written_when_a_
+  slot_comes` (the follow-up); `test_c10_may_start_false_on_a_staged_message_charges_nothing` became
+  `..._and_mains_write_timer_ends_it` (round 11); `test_c13_the_latch_reopening_..._earns_it` became
+  `..._earns_nothing` (round 15); `test_c13_outside_a_tick_the_gates_are_read_afresh` went with the sample (round
+  14). Three tests that later rounds' edits dropped though their rules stand are restored:
+  `test_c7_01_an_unqualified_runner_never_restarts_for_a_blocked_message_whatever_the_frames`,
+  `test_c9_a_pass_that_first_sees_the_turn_ended_counts_nothing_before_it` and
+  `test_c13_the_nodes_may_start_query_never_sets_the_latch`.
 
 ### Not done
 
