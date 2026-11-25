@@ -552,7 +552,8 @@ def _prune(c, now: float) -> None:
                       _range(f"{hosted_results.RESULT_PREFIX}{r['session_id']}."))
             c.execute("DELETE FROM board_state WHERE key = ?", (hosted_results.OUTBOX_PREFIX + r["session_id"],))
             from . import hosted_steer
-            hosted_steer.prune_session(c, r["session_id"])    # its steers, with the session
+            if hosted_steer.has_steers(r):
+                hosted_steer.prune_session(c, r["session_id"])    # its steers, with the session
     from . import hosted_steer
     hosted_steer.prune_orphans(c)       # steer rows of sessions that are gone
 
@@ -1515,7 +1516,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
         c.execute("""DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ? AND json_valid(value)
                      AND json_extract(value, '$.state') IN ('done', 'failed')""",
                   (*_range(f"{MSG_PREFIX}{sid}."), now - KEEP_SETTLED_SECONDS))
-        hosted_steer.prune_settled(c, sid)      # a settled steer goes with its message
+        if hosted_steer.has_steers(r):
+            hosted_steer.prune_settled(c, sid)      # a settled steer goes with its message
     m["updated_at"] = now
     _put(c, _msg_key(sid, n), m, by, now)
 

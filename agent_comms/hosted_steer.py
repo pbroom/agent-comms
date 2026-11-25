@@ -372,7 +372,9 @@ def extension(ev: Any) -> dict | None:
 def settle(c, r: dict, n: Any, ext: dict | None, now: float) -> dict | None:
     """N (message `n` of session `r`) is being settled, in this transaction: its steer, if it has one, is settled by
     the one precedence rule. `ext`: the owning host's extension on N's own end (`extension`), or None on every other
-    path. Returns the steer as settled (or None)."""
+    path. Returns the steer as settled (or None). None at once, with no read, for a session that never took one."""
+    if not has_steers(r):
+        return None
     s = get(c, r["session_id"], n)
     if s is None or s.get("outcome") is not None:
         return s
@@ -419,6 +421,8 @@ def sweep(board: Board, r: dict) -> dict:
 def settle_unsettled(c, r: dict, now: float) -> None:
     """Every steer of the session whose N is settled or gone: settled by the rule (hosted._end, after it failed the
     session's messages)."""
+    if not has_steers(r):
+        return
     for s in steers(c, r["session_id"]):
         if s.get("outcome") is None:
             m = _get(c, hosted._msg_key(r["session_id"], s["into"]))
