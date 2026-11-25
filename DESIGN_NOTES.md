@@ -10888,7 +10888,9 @@ ExitTimeOut (60 s, scripts/install-launchagents.py), holds a shutdown with a liv
 kill grace (10 s by default), the loop's join (1 s), the wait for a report under way (at most 25 s) and the first
 steer report (at most 20 s): 58 s. Every report that carries no outcome is main's one call. While a steer attempt
 is live, a flush that is not shutdown's own stops between sessions once shutdown has begun; with none live it goes on
-as on main. (R3-09:) a stored steer that cannot be rendered as an offer (`_malformed`: its uuid or text not a short
+as on main. (WITHDRAWN, provisionally, by "Shutdown simplified" at the end of step 2's notes: the total deadline,
+`_call_by`, the reserved retry, the steer-first final flush, the stop between sessions and the 58 s budget are gone;
+a report carrying an outcome gets main's call and, after a 422 only, one plain synchronous retry.) (R3-09:) a stored steer that cannot be rendered as an offer (`_malformed`: its uuid or text not a short
 string, not UTF-8, empty or over the cap; a prerelease record, say) is withdrawn like any failed check, so the rest of
 the listing goes as ever, and it settles by the rule at N's end (`not_delivered` when never listed).
 
@@ -11039,7 +11041,9 @@ result turns and claims, and CLI text. The named changes:
   The golden's `zz_parity` (recorded on d4b92e5, normalized on its own so every earlier key keeps its placeholders)
   pins three runs against main: a cancel of a queued task right after the watchdog stopped the child's turn
   (R3-07's case), a shutdown with three ordinary sessions, and a flush under way when shutdown begins. No ordinary
-  difference remains. (A hello sent again after a 422 is now dated from the attempt that got through: that date is
+  difference remains. (Stronger, provisionally, under "Shutdown simplified", rule 7: with a steer attempt live too,
+  shutdown and every multi-session stop are main's, event for event and in timing, for every ordinary session and for
+  the steered one except the steer outcome its N end carries.) (A hello sent again after a 422 is now dated from the attempt that got through: that date is
   the node's own steer evidence, never on the wire.)
 
 **The proof.** The golden recording (tests/golden_schema_free.py, fixtures/schema_free_main.json) is re-pinned to main
@@ -11172,7 +11176,9 @@ Design-level questions are closed; these go to code review (F-6, the round-5 rev
   full write still needs its outcome tracked; omission alone never abandons N or erases S's dedupe state;
 - (R11-04) shutdown before the hold exists: `signal()` drains every live steer attempt first, including one still
   waiting for N's result, and a native result larger than one `read_lines()` budget (dispatch.py line 1613) is drained
-  across reads, since one `_read` does not necessarily empty the pipe;
+  across reads, since one `_read` does not necessarily empty the pipe; (WITHDRAWN, provisionally, with part O's
+  "shutdown drains a live attempt across read budgets" row, by "Shutdown simplified": shutdown reads nothing first,
+  and S's outcome is what was already read)
 - (round 12) the stop deadline while the process is already marked stopping, with an overlapping timeout, close
   and late reap: one native N end, no later outcome revision, and no same-session hand-over while the stopping barrier
   remains; a sent signal alone never establishes that S was cut;
@@ -11564,8 +11570,9 @@ review round 3: departure 2 is fully built on the one authority record (a listin
 rejected before it touches anything, R3-02; a fresh re-offer is judged at receipt, R3-03); departure 11 keeps a known
 outcome's exit on a retention miss (R3-10); departure 15 is fully built for steers by the one drain on every failing
 path, the shutdown-wide deadline and the grace from the actual SIGTERM (R3-04, R3-05), and an unheld cancel that
-returned nothing emits nothing, so main's order is kept for a session holding no steer (R3-07). As of review round
-4, see "One-way authority, after round 4" in the round 4 subsection for what departure 2's one-way rule now covers
+returned nothing emits nothing, so main's order is kept for a session holding no steer (R3-07). (Departure 15's
+shutdown part, the shutdown-wide drain and the grace from the actual SIGTERM, is withdrawn provisionally by "Shutdown
+simplified": shutdown is main's; its single-session part stays.) As of review round 4, see "One-way authority, after round 4" in the round 4 subsection for what departure 2's one-way rule now covers
 and what is left.
 - F, "N ended with the process: unconfirmed if any byte was written": read literally for every end the HOST makes
   (exit, a timeout it gives up on, cancel, close, self-stop, shutdown, the cut): `unconfirmed` (`turn_cut`), also
@@ -12622,3 +12629,206 @@ caught on the first run; the 4 missed (all R4-01 (b)) got the two gap tests abov
 | R4-01b the node's authority knows stopping (its check removed) | `test_r4_gap_an_attempt_made_after_the_node_began_to_stop_is_never_written` (a test added after this run) |
 | R4-02 the receipt after the lock (the helper reads the clock before the lock) | `test_r4_02_an_acknowledgements_receipt_is_read_after_the_records_lock_is_taken` |
 | R4-09 in_turn says the outcome is known (the branch removed) | `test_r4_09_a_known_in_turn_with_n_pruned_says_the_outcome_and_that_ns_status_is_unavailable` |
+
+### Shutdown simplified (provisional: owner decision pending)
+
+**Status.** Built on the coordinator's recommended option while the owner's answer to the shutdown scope question
+(does a steered turn at node shutdown need more than main's shutdown?) is open. If the owner chooses the other
+option, these commits are dropped as a unit: b6baf3d (code), eb67e0e (tests), 8eebd46 (the two-loop order), 7551759
+(the gap tests) and the notes commit that adds this subsection. The branch before them is kept as
+`backup/codex-steering-4d1088a`. It replaces round 3's structure 2 for multi-session stops and shutdown, and settles
+R4-03 to R4-08.
+
+**The rule.**
+1. Node shutdown and every multi-session stop are main's, a steer attempt live or not: `SessionRunner.signal`
+   (every SIGTERM at once, nothing read first), `drain`/`shutdown` (main's final flush, in main's order with main's
+   per-call timeouts), `node.shut_down` (the kill deadline set before the sessions are signalled, R4-07), `stop_all`,
+   `stop_turns` and the watchdog's self-stop (its ends in main's `watched` queue, so the hub hears LOST first, as on
+   main). Nothing is drained before a signal, no signal is reordered, no grace or kill deadline moves, no report is
+   prioritized or reordered, and there is no total report deadline and no reserved retry slice.
+2. S's outcome at such a stop is what the host had already read when the stop began. N's native end with its
+   evidence, if already read, decided it as usual. Otherwise it is `unconfirmed` (`turn_cut`, or `partial`) once a
+   byte of S was written, and `not_delivered` with none. No read is made to find out more.
+3. The bounded drain (`SessionHost._drain_before_stop`) stays only on the single-session paths that end a live
+   attempt's turn: the reap (both branches), the turn timeout (both branches), a broken pipe, `close`, a cancel of the
+   live turn, and the contact cut. A pass that can touch several sessions shares ONE drain deadline,
+   STEER_DRAIN_SECONDS (2 s) in all, from its first drain (`SessionHost.one_drain_budget`): `tick`, `steer_deadlines`
+   (the watchdog's cuts) and the node's reconciliation of one listing (its closes and cancels). An attempt that cannot
+   be drained in what is left is stopped without a drain (rule 2). In `tick` the sessions holding no live attempt get
+   both of the pass's loops first, in main's order and at the pass's time; the sessions holding one come after, each
+   dated when its work is done (`_pass_groups`; `_drain_before_stop` returns the time to date the stop by, so no
+   SIGTERM is backdated). The watchdog makes its cuts only after main's SIGKILLs.
+4. A 422 on a report carrying a steer outcome gets one immediate plain retry in the same flush: synchronous, with
+   main's per-call timeout, each attempt with its own payload built from the unchanged body (R4-03). A failed call
+   made under a listing's features forgets only those (`SessionRunner.features_gen`, counted at every listing): a
+   refusal answered after a newer listing was applied leaves that listing's features, so a later valid outcome is not
+   stripped. No threads. The final flush is any flush: a transport failure there is not retried.
+5. An unexpected host exception that ends a session (`_end` from `tick`) follows rule 2. No drain is made there
+   (R4-08).
+6. R4-01 (b) stays: the stopping flag marks every held record before it is set, so no byte of S is written after the
+   node began to stop.
+7. Parity, now stronger (part K): with no steer live, everything is main's, as before. With a steer live, shutdown and
+   multi-session stops are also main's, event for event and in timing, for every ordinary session, and for the
+   steered session too except the steer outcome carried on N's end.
+
+**What it withdraws.**
+- Design R11-04 (part O's bullet) and part O's "shutdown drains a live attempt across read budgets" row.
+- Part E's round 3 paragraph on report exchanges: the total deadline (`_call_by`, REPORT_PAIR/FIRST/RETRY_SECONDS),
+  the reserved retry, the steer-first final flush, the stop of a flush between sessions once shutdown began
+  (R2-06), and the 58 s budget against launchd's ExitTimeOut.
+- Departure 15's shutdown part: the drain before the signal, the shutdown-wide drain deadline (R3-04) and the grace
+  from the actual SIGTERM.
+- Round 3's structure 2 for `stop_turns`, `stop_all` and `signal`, and S2-06's drain on those stops.
+- Each withdrawal above is marked where it is written.
+
+**What it costs.**
+- A steer in flight at a node shutdown or restart reads `unconfirmed` even if it landed, when N's native end and
+  evidence had not been read yet.
+- At a self-stop, the hub hears LOST first (main's order). S then settles by the hub's own rule (`unconfirmed`,
+  `no_word`); the host's word on N's end comes after and is not applied.
+- A report that does not get out before the node exits is lost as on main. The node restarts, N is LOST, and S
+  settles by the hub's fallback.
+- A listing that closes or cancels several live attempts drains them within one 2 s in all. Within that one
+  reconciliation, a close or cancel of an ordinary session listed after them can therefore come up to 2 s later than
+  on main. Every other stop, signal, timeout and kill of an ordinary session is main's in time. (Deferring those
+  drains to the end of the reconciliation would remove even this, at the cost of moving the steered session's events
+  within the listing's events. Not built.)
+- In a pass with a live attempt, its exit is registered after the ordinary sessions' passes. None of them can start
+  a turn in N's checkout meanwhile, because the hub keeps that checkout busy until N's end is reported.
+
+**What remains of structure 2, and every caller.**
+- `SessionHost._drain_before_stop`, called by `_reap` (a group left behind; the exit), `_hold_to_timeout` (after the
+  interrupt; the plain branch), `_write` (a broken pipe), `close`, `cancel` (the live turn only) and `_steer_cut`.
+- `SessionHost.live_attempt`, used by those callers and by `_pass_groups`.
+- `SessionHost.one_drain_budget`, entered by `tick`, `steer_deadlines` and `SessionRunner.pass_once` around
+  `_reconcile`.
+- STEER_DRAIN_SECONDS and STEER_DRAIN_READS.
+- `SessionRunner.watched_steer`, which now carries only the watchdog's cuts (S2-06's order before LOST, a
+  single-session stop).
+
+**Removed.**
+- `SessionHost.drain`.
+- The drains in `stop_turns` and `stop_all`.
+- `SessionRunner._call_by` and its worker threads.
+- REPORT_PAIR_SECONDS, REPORT_FIRST_SECONDS and REPORT_RETRY_SECONDS.
+- `_post_pending`'s `final` path, meaning the steer-first ordering, the stop between sessions and the
+  transport-failure retry.
+- The self-stop's split into `watched_steer`.
+- The drain in `signal`.
+- `node.shut_down`'s grace after the signal.
+
+**Findings R4-03 to R4-08.**
+- R4-03: fixed (rule 4). Tests: `test_sd_r4_03_the_retry_never_changes_the_first_requests_payload`,
+  `test_sd_r4_03_a_refusal_answered_after_a_newer_listing_keeps_that_listings_features` and
+  `test_sd_r4_03_the_final_flush_is_any_flush`. The abandoned workers are gone with `_call_by`.
+- R4-04: gone with the removal. The flush overlapping shutdown is main's:
+  `test_r2_06_a_flush_under_way_when_shutdown_begins_is_mains_with_a_steer_live`.
+- R4-05: gone with the removal. There is no shutdown reporting budget and no special order; an unsent end is lost as
+  on main (the cost above).
+- R4-06: fixed (rule 3). Tests: `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` (Sol's 8 s
+  case), `test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass` and
+  `test_sd_the_cancels_of_one_listing_share_one_drain_deadline`.
+- R4-07: fixed (node.py is main's). Test: `test_sd_r4_07_the_kill_deadline_is_mains_with_and_without_a_steer`.
+- R4-08: rule 2, stated here. Test: `test_sd_r4_08_an_unexpected_error_ends_the_session_by_rule_2_without_a_drain`.
+  It passes on 4d1088a too, since nothing about this path changed.
+
+**Tests.**
+
+New:
+- `test_sd_shutdown_with_a_live_steer_is_mains_for_every_session_event_for_event_and_in_time[written|unwritten|in_turn]`.
+  A node shutdown with a live steer attempt and three ordinary sessions is compared with the same run without the
+  steer, which the golden's `zz_parity` pins to main. It checks every SIGTERM, SIGKILL and pipe read of every session
+  at the same moment, and the same events posted for each, the steered N end differing only by its steer outcome.
+  S's outcome is `unconfirmed` (`turn_cut`) when bytes were written, `not_delivered` (`not_owned`) when none were,
+  and `in_turn` when N's native end and evidence were read before the stop. The in_turn case passes on 4d1088a, as
+  nothing differs there.
+- `test_sd_a_stop_of_every_turn_reads_nothing_more_and_s_is_what_was_read[stop_turns|stop_all|self_stop]`: no read
+  beyond main's.
+- The R4 tests listed above, and the two gap tests the mutation check found:
+  `test_sd_gap_a_reap_whose_group_is_left_behind_drains_first` and
+  `test_sd_gap_the_watchdogs_cuts_in_one_call_share_one_drain_deadline`.
+- Each new test except the two noted fails on 4d1088a by its assertion. This was checked on an export of 4d1088a
+  with these tests.
+
+Deleted (they asserted the removed behaviour):
+- `test_host_drain_reads_a_native_end_before_a_shutdowns_signal`
+- `test_s2_06_shutdown_drains_a_native_end_larger_than_one_read`
+- `test_r2_06_a_reports_retry_fits_in_what_is_left_of_one_calls_budget` and
+  `test_r2_06_no_retry_is_made_with_under_a_second_of_the_budget_left` (with their `_Timed` client)
+- `test_r3_04_shutdown_drains_every_session_within_one_deadline`
+- `test_r3_04_the_grace_starts_at_the_actual_sigterm` (replaced by the R4-07 test)
+- `test_r3_06_a_report_exchange_has_a_total_deadline_whatever_the_transport_does`
+
+Rewritten:
+- `test_e2e_in_process_shutdown_drains_a_steer_attempt_first` became
+  `test_e2e_in_process_shutdown_decides_s_by_what_was_read_before_it[False|True]`.
+- `test_r2_06_a_flush_under_way_when_shutdown_begins_posts_no_other_session` became
+  `..._is_mains_with_a_steer_live`.
+- `test_o_shutdown_reads_the_pipe_before_its_sigterm` became `test_o_shutdown_reads_nothing_before_its_sigterm`.
+- `test_o_the_watchdog_with_a_fully_written_steer_a_valid_receipt_and_no_native_end`: the end now goes to main's
+  queue, and the hub's outcome is `unconfirmed`/`no_word`.
+- `test_r3_04_a_sessions_drain_stops_once_ns_end_is_read`: it now drains through `close`.
+- `test_r3_06_the_final_flush_sends_ns_end_plainly_after_a_slow_refusal`: only its text changed. The final flush is
+  any flush.
+- `test_r3_gap_shutdown_signals_the_sessions_holding_no_steer_before_it_drains` became
+  `test_r3_gap_shutdown_signals_every_session_at_once_a_steer_live_or_not`.
+- `test_r3_gap_the_final_flush_posts_the_steer_carrying_report_first` became
+  `test_r3_gap_the_final_flush_posts_in_mains_order`.
+- The `stop_turns` and `stop_all` parameters were dropped from
+  `test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first` and
+  `test_r2_05_a_drain_goes_on_while_reads_make_progress_without_a_line`. The `stop_all` parameter was dropped from
+  `test_r2_05_a_drain_error_neither_skips_the_stop_nor_loses_what_was_read`. Their close and cancel cases stand.
+
+The model:
+- It gains a `shutdown` event: `signal`, then `stop_all` under the loop's lock, which ends the sequence.
+- What is read once a shutdown began no longer counts as evidence (rule 2).
+- It still requires exactly one outcome for S in every sequence, and the one the evidence allows.
+- Over the 200 seeded sequences, 101 end in a shutdown (34 of them with a frame made) and 52 contain a stop of every
+  turn. Their outcomes: `not_delivered` 64, `unconfirmed` 63, `in_turn` 6, and none in 67 (the node never held S).
+
+**Runs** at 7551759; the code is unchanged since 8eebd46, and 7551759 adds tests only:
+- `uv run pytest -q -p no:cacheprovider`: 4347 passed, 10 skipped.
+- The stand-in e2e in full: PASS (166 s, 345 checks).
+- `--only steering` with stand-ins: PASS (113 s, 57 checks).
+- `--only correlation` with stand-ins: PASS (11 s, 24 checks).
+- `--only steering` with the real Codex (codex-cli 0.171.0, gpt-6-luna): PASS (62 s, 27 checks).
+- `--only steer` with the real Codex: PASS (36 s, 28 checks).
+- `~/.codex/config.toml` sha256 before, between and after the real runs:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+**Mutation check** (scratchpad `mutate6.py`, each mutation applied alone to an export of 8eebd46, the same test set
+with -x as before, the file restored). Earlier rows whose code was removed with structure 2's shutdown part are
+withdrawn with it: J drain, S2 one deadline for the shutdown, S2 signal: the others first, S2 the grace after the
+signal (replaced by the R4-07 row), S2 a total deadline, S2 the final flush's reserved retry, S2 steer reports first
+in the final flush, S2 stop between sessions only while live, S2 stop between sessions at all. Earlier rows whose
+lines changed but whose behaviour stays were rewritten and run again; one row per change of this simplification was
+added. Every other earlier row stands as recorded (its line is unchanged). 24 run: 19 caught on the first run; 2 of
+the 5 missed got a gap test each (named above, added after the run) and were caught when run again on 7551759; 3 are
+equivalent.
+
+| mutation | caught by |
+| --- | --- |
+| S2 the reap drains (the exit) | `test_r3_05_a_native_end_behind_buffered_output_wins_over_the_reap` |
+| S2 the reap drains (its group left behind) | `test_sd_gap_a_reap_whose_group_is_left_behind_drains_first` (a test added after this run) |
+| S2 the drain stops at N's end | `test_r3_04_a_sessions_drain_stops_once_ns_end_is_read` |
+| S2 the deadline before each read | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| S2 only a live attempt is drained | EQUIVALENT: the mutated check also drains a session whose N is decided or whose process is stopping; the first returns at once (N not in flight), and the second does not occur with N in flight (every stop fails N first) |
+| S2 the timeout drains | `test_r3_gap_the_plain_timeout_with_a_frame_queued_drains_first` |
+| S2 a broken pipe drains | `test_r3_05_a_native_end_behind_buffered_output_wins_over_a_broken_pipe` |
+| S2 the cut drains | `test_d_the_watchdogs_cut_reads_what_the_process_wrote_first` |
+| S2 a live cancel drains | `test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first[cancel]` |
+| SD ordinary sessions first in a pass | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| SD a live session dated when handled | EQUIVALENT: every stop of a live attempt's turn follows `_drain_before_stop`, which returns the clock, so no stop is dated by the group's time; what else it dates (the timeout's judgement) moves by at most the pass's 2 s |
+| SD one deadline per pass | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| SD tick is one pass | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| SD a listing is one pass | `test_sd_the_cancels_of_one_listing_share_one_drain_deadline` |
+| SD the cuts of one call are one pass | `test_sd_gap_the_watchdogs_cuts_in_one_call_share_one_drain_deadline` (a test added after this run) |
+| SD a stop after a drain dated after it | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| SD the cut after main's SIGKILLs (the cut removed) | `test_e_the_node_watchdog_cuts_a_half_written_frame_past_its_limit` |
+| SD only a 422 is retried | `test_sd_r4_03_the_final_flush_is_any_flush` |
+| SD the first attempt's own payload | EQUIVALENT: the retry's payload is built new, so the body passed first is never changed either way |
+| SD the retry's own payload | `test_sd_r4_03_the_retry_never_changes_the_first_requests_payload` |
+| SD a refusal forgets only its listing's features | `test_sd_r4_03_a_refusal_answered_after_a_newer_listing_keeps_that_listings_features` |
+| SD every listing counted | `test_sd_r4_03_a_refusal_answered_after_a_newer_listing_keeps_that_listings_features` |
+| SD the kill deadline before the signal (R4-07) | `test_sd_r4_07_the_kill_deadline_is_mains_with_and_without_a_steer` |
+| SD the self-stop's ends in main's queue | `test_o_the_watchdog_with_a_fully_written_steer_a_valid_receipt_and_no_native_end` |
