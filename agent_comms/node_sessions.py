@@ -134,6 +134,7 @@ ABOVE_PARENT = ("its access ({have}) is above what its parent session has on thi
                 "never has more access than its parent")
 LOST = "the node restarted while this turn was in flight; it was not replayed"
 CANCELLED = "cancelled by the session that started it"      # hosted_results.CANCELLED: the hub's outcome reads it
+UNLISTED = "the hub no longer lists this turn"     # checkout hardening D-1: never reported to the hub
 FRESH_START = (". Before that the agent refused to resume this session's conversation: the next message starts a NEW "
                "one, without the earlier turns")
 
@@ -675,6 +676,8 @@ class SessionRunner:
                     self._add(sid, {"kind": "turn_ended", "message": n, "ok": False,
                                     "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
+            if isinstance(view.get("messages"), list):
+                self._drop_unlisted(sid, s, view["messages"])
             self.queue[sid] = queue
         for sid, s in self.host.sessions.items():
             if sid not in listed and not s.ended:
@@ -705,6 +708,32 @@ class SessionRunner:
         if "restart" in features and "restart" not in self.hub_features:
             self.reported.clear()       # a hub that takes `modes` now: every session says it again
         self.hub_features, self.features_known = features, True
+
+    def _drop_unlisted(self, sid: str, s, messages: list) -> None:
+        """What the listing leaves out is over for the hub (checkout hardening, D-1; rule 4 of its contract): a message
+        the host still holds that the hub's listing of this session does not name, and for which no turn's end is
+        waiting here to be sent. The hub has settled it (a listing never names a settled message), or cannot read its
+        record; either way it is owed no result. One still in the inbox is dropped, never written; one being written
+        or in flight is ended as a cancelled turn is (`SessionHost.cancel`: the turn fails, the process is stopped,
+        the conversation resumes in the next process). A restart whose message is left out is withdrawn in both
+        places the host may hold it: its interrupt, and the message in the inbox. Nothing is reported for any of
+        them: a report into a record the hub cannot read would be refused again and again and hold up the others.
+        A turn that ended here is no longer held, so a result on its way is never taken for this."""
+        if s.ended:
+            return
+        named = {m["n"] for m in messages if isinstance(m, dict) and type(m.get("n")) is int}
+        ending = {e.get("message") for x, e in self.pending if x == sid and e.get("kind") == "turn_ended"}
+
+        def holds(n: int) -> bool:
+            return n in self._held(s) or s.restart_by == str(n)
+
+        restart = {int(s.restart_by)} if isinstance(s.restart_by, str) and s.restart_by.isdigit() else set()
+        for n in sorted((self._held(s) | restart) - named - ending):
+            log.info("session %s: the hub no longer lists message %s: stopping it here, reporting nothing", sid, n)
+            for _ in range(3):      # a restart's interrupt first, then the message itself (`SessionHost.cancel`)
+                if not holds(n):
+                    break
+                self.host.cancel(sid, str(n), UNLISTED)     # what it returns is the hub's no more: not reported
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 

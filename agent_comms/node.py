@@ -42,6 +42,41 @@ HELLO_SECONDS = 10.0
 SELF_STOP_SECONDS = 90.0     # leaves room for a hung hub call (CALL_TIMEOUT) and the kill grace before 180 s
 CALL_TIMEOUT = httpx.Timeout(20, connect=5)
 STATE_FILE = "node-runs.json"   # run id -> {pid, proc_start}: what a restarted node must clean up
+LOCK_FILE = "node.lock"         # held by the one `board node` of this OS user for its whole life (`hold_lock`)
+
+
+class NodeRunning(RuntimeError):
+    """Another `board node` of this OS user holds the lock."""
+
+
+def lock_path() -> Path:
+    """Where the node's lock lives: `.local/state/agent-comms/node.lock` under the account's home directory as the
+    password database gives it, so that neither `HOME` nor `AGENT_COMMS_HOME` moves it (checkout hardening, D-1):
+    every `board node` of the user finds the same file, whatever its environment."""
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "state" / "agent-comms" / LOCK_FILE
+
+
+def hold_lock(path: Path | None = None) -> int:
+    """Take the node's exclusive lock (`flock`) and return its descriptor, which the caller keeps open for as long as
+    the node lives: the node's registry of process groups (node_groups) is one process's memory, and this keeps that
+    process the only one. Its folder is made private (mode 700). The descriptor is close-on-exec and not inheritable,
+    so no child holds the lock after the node is gone. NodeRunning when another process holds it."""
+    import fcntl
+    path = Path(path) if path is not None else lock_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        os.set_inheritable(fd, False)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise NodeRunning(f"another `board node` of this user is already running (it holds {path})") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 @dataclass
@@ -280,28 +315,30 @@ class Node:
             self._flush_unreported()
             if self.clock() - self.last_hello >= HELLO_SECONDS:
                 self.hello()
-            runs = self._call("GET", "/api/nodes/assignments").get("runs", [])
-            listed = set()
+            runs = [r for r in self._call("GET", "/api/nodes/assignments").get("runs", [])
+                    if isinstance(r.get("run_id"), str)]
+            listed = {r["run_id"] for r in runs}
+            # Stop before start (checkout hardening, D-1): what the hub no longer lists, and what it asks to stop, is
+            # signalled before any assigned run is looked at, so that a run's replacement is never started first.
+            for rid, local in list(self.running.items()):
+                if rid not in listed:
+                    # The hub has ended this run (stopped it, or counted this node lost): it must not go on.
+                    self._stop(local, "terminate")
             for r in runs:
-                rid = r.get("run_id")
-                if not isinstance(rid, str):
-                    continue
-                listed.add(rid)
+                local = self.running.get(r["run_id"])
+                if local is not None and r.get("stop") in ("terminate", "kill"):
+                    self._stop(local, r["stop"])
+            for r in runs:
+                rid = r["run_id"]
                 local = self.running.get(rid)
                 if r.get("state") == "assigned" and local is None:
                     if r.get("stop"):
                         self._report(rid, "ended", error="stopped before start")
                     else:
                         self._start(r)
-                elif local is not None and r.get("stop") in ("terminate", "kill"):
-                    self._stop(local, r["stop"])
                 elif r.get("state") == "running" and local is None:
                     # Started by an earlier node process here and not in our state file: nothing left to stop.
                     self._report(rid, "ended", error="node restarted while the run was going")
-            for rid, local in list(self.running.items()):
-                if rid not in listed:
-                    # The hub has ended this run (stopped it, or counted this node lost): it must not go on.
-                    self._stop(local, "terminate")
         finally:
             if self.clock() - self.last_contact >= SELF_STOP_SECONDS:
                 for local in self.running.values():
@@ -532,7 +569,20 @@ def shut_down(node: Node) -> None:
                 sessions.shutdown()     # its processes are gone: the bookkeeping, then its reports
 
 
-def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
+def run(hub: str, token: str, *, poll_seconds: float | None = None, lock: Path | None = None) -> None:
+    """`board node`. First of all it takes the node's lock (`hold_lock`; tests pass their own `lock`): a second
+    `board node` of the same user says so and exits before it touches anything."""
+    try:
+        lock_fd = hold_lock(lock)
+    except NodeRunning as e:
+        raise SystemExit(f"board node: {e}; this one exits") from None
+    try:
+        _run(hub, token, poll_seconds=poll_seconds)
+    finally:
+        os.close(lock_fd)
+
+
+def _run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
     from .config import Settings, home
     settings = Settings.load()
     config = DispatchConfig.from_dict(settings.dispatch, settings=settings)
