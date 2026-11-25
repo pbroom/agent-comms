@@ -2076,6 +2076,86 @@ def test_r2_the_bounded_publication_counts_from_the_sigterm(henv, monkeypatch):
     assert stamped and stamped[0] > t0 and s.held is not None and s.held.fenced_at == stamped[0]
 
 
+
+# ---------------------------------------------------------------- review round 2, ruling G
+
+
+@pytest.mark.parametrize("where", ["held", "s_turn"])
+def test_r2_g_an_omission_never_masks_the_contact_running_out(henv, monkeypatch, where):
+    """Sol's blocker 3: an authoritative omission revokes the steer's writing first; its contact clock then runs out
+    during the hold: the hold is cut all the same (the watchdog's boundary, `steer_deadlines`)."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    if where == "s_turn":
+        child.emit(vinit(S))
+        henv.host.tick()
+    henv.host.steer_revoke(SID, S, "omitted")
+    assert s.steer.revoked == "omitted"
+    henv.clock.advance(21)
+    out = henv.host.steer_deadlines()
+    assert child.terminated and s.steer.expired and s.steer.revoked == "omitted", "cut; the first reason stays"
+    out += henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N"
+    if where == "s_turn":
+        assert end.steer["outcome"] == "next_turn" and "contact" in end.steer["result"]["detail"]
+    else:
+        assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r2_g_after_the_latch_the_hold_pass_initiates_no_stop(henv, monkeypatch):
+    """Sol's blocker 3: once the global stop latch is set, neither the loop's hold pass nor the watchdog's boundary
+    starts a single-session stop (even with the contact run out): the stop of every turn publishes N's held end
+    from what was processed, once."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.steer_stopping()
+    henv.clock.advance(21)
+    out = henv.host.steer_deadlines() + henv.host.tick()
+    assert not child.terminated and not ends(out) and s.stopping_since is None
+    [end] = ends(henv.host.stop_all())
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r2_g_the_real_watchdog_cuts_a_full_hold_while_the_loop_is_blocked(env):
+    """Ruling G through the node: N held, the hub then unreachable (the loop makes no pass: blocked on hub I/O);
+    the node's deadline watchdog (`SessionRunner.enforce_deadlines`, its own thread's call) cuts the hold once the
+    attempt's contact ran out: the process gets its SIGTERM with no pass of the loop."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    s = env.node.sessions.host.sessions[sid]
+    assert s.held is not None and s.steer.cover_until is not None
+    env.clock.advance(node_sessions.STEER_CONTACT_SECONDS + 1 if hasattr(node_sessions, "STEER_CONTACT_SECONDS")
+                      else 76)
+    env.node.sessions.enforce_deadlines()
+    assert child.terminated and s.held is not None and s.held.fenced_at is not None
+
+
+def test_r2_g_runner_signal_during_a_hold_then_shutdown_publishes_n_once(env):
+    """Ruling G through `SessionRunner.signal`: the node's signal during a hold (contact run out meanwhile): no
+    single-session stop is initiated after it; shutdown publishes N's held end once, at main's point."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    runner = env.node.sessions
+    s = runner.host.sessions[sid]
+    assert s.held is not None
+    runner.signal()
+    env.clock.advance(80)
+    runner.enforce_deadlines()
+    assert s.held is not None and s.held.fenced_at is None, "nothing single-session after the latch"
+    runner.kill()
+    runner.shutdown()
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    assert m["state"] == "done" and (rec["outcome"], rec["why"]) == ("unconfirmed", "turn_cut"), (m, rec)
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"

@@ -216,15 +216,23 @@ class SteerSlot:
     # Claude steering (review round 1, ruling A): what the one adjudicator (`_steer_adjudicate`) has taken as
     # evidence for this attempt, before N's end: a deviation while it was live (`lost`: no S turn can be proved).
     lost: bool = False
+    # (Review round 2, ruling G) The contact clock's expiry, latched on its own: write revocation (`revoked`, whose
+    # first reason stays) and contact expiry are tracked apart, so an authoritative omission never masks the contact
+    # running out later (a fully written attempt's hold is still cut then).
+    expired: bool = False
+
+    def _expire(self, now: float) -> None:
+        """(Under `lock`.) Past the contact clock: expired for good, and never written from then on."""
+        if self.cover_until is not None and not self.expired and now >= self.cover_until:
+            self.expired = True
+            if self.revoked is None:
+                self.revoked = "contact"
 
     def contact_ran_out(self, now: float) -> bool:
-        """The attempt's own contact clock (not an authoritative omission) has run out: latched, for good."""
+        """The attempt's own contact clock has run out (whatever else revoked its writing): latched, for good."""
         with self.lock:
-            if self.cover_until is None:
-                return False
-            if self.revoked is None and now >= self.cover_until:
-                self.revoked = "contact"
-            return self.revoked == "contact"
+            self._expire(now)
+            return self.expired
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -236,22 +244,21 @@ class SteerSlot:
         flight. It counts for this attempt only if it is evidence for exactly this session and N; received after the
         contact ran out, it latches the break for good instead (S2-03, R2-07)."""
         with received_under(self.lock, clock) as received:
-            if self.cover_until is None or self.revoked is not None:
+            if self.cover_until is None or self.expired:
                 return
             if about is not None and not (about == self.session_id and type(n) is int and str(n) == self.into):
                 return
             if received >= self.cover_until:
-                self.revoked = "contact"
+                self._expire(received)
                 return
+            # (ruling G) an acknowledgement keeps the contact of an attempt whose writing an omission revoked: the
+            # contact clock is its own, never masked by the revocation
             self.cover_until = max(self.cover_until, sent + STEER_CONTACT_SECONDS)
 
     def contact_ok(self, now: float) -> bool:
         """The contact holds at `now` (read under this lock); run out, the break is latched for good."""
         with self.lock:
-            if self.cover_until is None:
-                return self.revoked is None
-            if self.revoked is None and now >= self.cover_until:
-                self.revoked = "contact"
+            self._expire(now)
             return self.revoked is None
 
 
@@ -1072,7 +1079,7 @@ class SessionHost:
     def steer_deadlines(self) -> list[HostEvent]:
         """A partial steer frame whose authority is gone or whose time is up is cut now (`_steer_pass`), also between
         passes: the node's deadline watchdog calls this."""
-        out: list[HostEvent] = []
+        out = self._outbox
         now = self.clock()
         with self.one_drain_budget():      # one drain deadline for every cut in this call
             for s in list(self.sessions.values()):
@@ -1081,7 +1088,11 @@ class SessionHost:
                         and s.stopping_since is None and not self._steer_stopped(slot)
                         and not self._steer_gate(s, slot, now)):
                     self._steer_cut(s, self.clock(), out)
-        return out
+                elif s.held is not None:
+                    # (Review round 2, ruling G) the same boundary cuts a fully written hold whose contact ran out
+                    # or whose authority is gone, also while the loop is blocked on hub I/O
+                    self._hold_cut(s, self.clock(), out)
+        return self._take_outbox()
 
     def live_attempt(self, s: Session) -> bool:
         """The session holds a live steer attempt: N's outcome open, its process up and not stopping."""
@@ -2389,9 +2400,19 @@ class SessionHost:
     def _hold_pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
         """After the pass's reads, for a held end: the finalizer at once when the adjudicated evidence says nothing
         can prove S quiet (`lost`), or when the attempt's own contact clock ran out or the node's write authority is
-        gone (the cut, as for any live attempt: ruling A)."""
+        gone (the cut, as for any live attempt: ruling A). The watchdog's boundary makes the same cut
+        (`steer_deadlines`, ruling G)."""
+        self._hold_cut(s, now, out)
+
+    def _hold_cut(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """THE cut of a held end (review round 2, ruling G; callers: `_hold_pass` in the loop's pass, and
+        `steer_deadlines`, the deadline watchdog's boundary). After the global stop latch it initiates nothing: the
+        latch is checked under its lock, which is held across the decision and the SIGTERM, so a stop of every turn
+        (Shutdown simplified) publishes the held end from the evidence already processed."""
         held, slot = s.held, s.steer
         if held is None or held.fenced_at is not None or s.child is None or s.stopping_since is not None:
+            return
+        if self.steer_stopped or (slot is not None and slot.stopping):
             return
         why = None
         if held.lost:
@@ -2402,7 +2423,9 @@ class SessionHost:
         if why is None:
             return
         now = self._drain_before_stop(s, now, out)
-        if s.held is held:
+        with self._steer_stop_lock:
+            if self.steer_stopped or (slot is not None and slot.stopping) or s.held is not held:
+                return      # the latch came during the drain: the stop of every turn is the one that acts
             self._fail(s, why, out)
             self._stop(s, now, at_signal=True)
 
