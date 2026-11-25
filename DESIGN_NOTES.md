@@ -11008,11 +11008,22 @@ A steer is invisible to older builds: not a message, so never listed as text or 
 | node restarted or rolled back during a hold | the replacement node reports N lost (LOST); with a committed `held`, the hub settles N with its native result (G's rule), S `unconfirmed` |
 | hub downgraded with a steer unsettled | not supported (the deploy rule); if it happens, the old hub strips the field: N's own result is intact, S's outcome and reply are lost; on re-upgrade the sweep settles S, leaving N as the old hub settled it |
 
-**The deploy rule** (README deploy notes): "Before installing an older hub over one with mid-turn steering, set
-`[dispatch.sessions] steer = false` on the hub, wait until `board session list` shows no session with a steer
-unsettled (each settles when its turn ends), then downgrade. A steer left unsettled through a
-downgrade is settled `unconfirmed`, or `not_delivered` if it never reached a node, when the newer hub returns." Hubs
-before nodes.
+**The deploy rule** (README deploy notes; numbered and given its configuration step in review round 11). Hubs
+before nodes. Before installing an older hub over one with mid-turn steering, in this order:
+1. On the running hub, set a valid `steer = false` under `[dispatch.sessions]`. Check that it loaded:
+   `board_configuration_status` must not show `stale`, and the settings page shows no reload error. A rejected
+   edit keeps the last good settings and refuses every new steer until a reload succeeds. Then check that new steers
+   are refused: `uv run board session send <an ended session's id> "check" --mode steer` must answer with the
+   switch's words ("steering is switched off on this hub ([dispatch.sessions] steer = false)"). The switch is read
+   before anything about the session, so nothing is sent.
+2. Wait until `uv run board session list` shows no session with a steer unsettled.
+3. Roll back the nodes.
+4. At the hub's cut-over: stop this hub, remove the `steer` key, then start the older hub. An older hub's parser
+   rejects `steer` as an unknown key, even `steer = false`, and would leave that whole table at its defaults.
+   Removed earlier, while this hub still serves, the missing key means steering on (the default).
+The older hub reads the same board.local.toml, so I found no cleaner way without building something new. A steer
+left unsettled through a downgrade is settled `unconfirmed`, or `not_delivered` if it never reached a node, when the
+newer hub returns.
 
 ### K. With no steer sent: the named changes, and the proof
 
@@ -13724,3 +13735,97 @@ row (the in-transaction turn limit) got the request-id case and was caught when 
 | PM-4 the offer age where a hello came after the answer | `test_pm_4_an_offer_older_than_20_s_is_unusable_also_when_...` |
 | PM-4 the gate's own stop-latch check | `test_pm_4_a_frame_queued_before_the_stop_is_refused_at_the_boundary_...` |
 | PM-4 the renewal by exactly 75 s (76) | `test_pm_4_the_75_s_renewal_boundary[-0.001-True]` |
+
+### Review round 11 (on 95bfb2a: CHANGES, one blocker, three shoulds, all on the fail-closed switch) and what changed
+
+The backup branch `backup/codex-steering-95bfb2a` sits at 95bfb2a. The independent pre-merge reviewer had
+re-confirmed 95bfb2a "OK to merge" with its nine findings resolved, but had not tested the reload path. The
+production change this round is `hosted_steer.off_reason`, its refusal text and its log state only. core.py is
+unchanged: it is main's (7456971), and `Board.reload_settings` already records a rejected reload in
+`settings_error` and clears it on the next successful one. agent_accounts reads it the same way.
+
+- **R11-1** [blocker] A rejected reload left the live switch on. The pre-merge test injected an invalid table
+  straight into `board.s.dispatch`. A real reload never installs one: it rejects the file and keeps the last good
+  settings, steering on in them.
+  - Now `off_reason` returns "rejected" while the hub's latest reload was rejected. It reads `settings_error` and
+    the `[dispatch]` table as one snapshot, under the reload's own lock, as `agent_accounts._snapshot` does.
+  - New steers are refused with "steering is off on this hub: its settings were rejected at the last reload (fix
+    board.toml or board.local.toml; until they load, no new steer is taken)". There is no parsing of the rejected
+    file.
+  - The next successful reload clears it. Steers accepted earlier are still offered and settled.
+  - Every other setting keeps main's last-good behaviour: nothing in `reload_settings` changed.
+  - The hub's log line for the rejection is main's own; the steering code adds none here.
+  - Tests, all through `Board.reload_settings` on a board.toml on disk:
+    - `test_r11_1_a_rejected_reload_refuses_new_steers_until_a_reload_succeeds` (the reviewer's replay). Steering
+      on, then `steer = false` with a sibling typo: rejected, steers refused with the new words, nothing stored.
+      The fix `steer = false` loads: refused as off. Then `steer = true`: taken. On 95bfb2a the steer was taken.
+    - `test_r11_1_a_reload_rejected_for_another_table_refuses_new_steers_until_it_is_fixed`, with
+      `[web] session_days = 0`.
+    - `test_r11_1_a_steer_accepted_before_a_rejected_reload_is_still_offered_and_settled`.
+    - `test_r11_1_a_rejected_reload_is_otherwise_mains`. The reload returns False and keeps the very same
+      `[dispatch]` object, the limits and the generation. It records main's error text and logs exactly main's one
+      warning, with nothing else logged. Spawning keeps its last good settings, and `configuration_status` says
+      `stale`.
+    - `test_r11_1_a_decision_during_a_recovering_reload_sees_the_new_table_never_the_old_one_without_the_error`.
+      A decision made while the fixing reload is held between clearing the error and publishing the table waits
+      for the reload's lock, and reads "off".
+- **R11-2** [should] A `[dispatch]` or `[dispatch.sessions]` present but not a table is "unreadable"; absent is
+  on.
+  - Before, `dispatch = false` or `dispatch = []` became `{}` through `or {}`, and steering was on.
+  - Main at startup: `Settings.load` does not validate `[dispatch]` ("startup does not check them",
+    `check_reloadable`). The Board and the app start with each of `dispatch = false`, `dispatch = []`,
+    `sessions = false`, `sessions = []` and `sessions = ""`. Main's other readers fall back to their defaults
+    (`spawn_config`: spawning off), and the dispatcher logs that it ignores `[dispatch]` settings that do not
+    validate. Unchanged.
+  - Test: `test_r11_2_at_startup_a_present_value_that_is_not_a_table_is_unreadable_and_an_absent_one_is_on[...]`,
+    on a Board built from a board.toml on disk. It covers the five present values, and no table, an empty
+    `[dispatch]`, an empty `[dispatch.sessions]` and `steer = false`.
+- **R11-3** [should] The warning keeps one entry: `_unreadable_last`, the error last said. A line is said when the
+  error changes, and a good read forgets it, so a recurrence is said again.
+  - Test: `test_r11_3_the_unreadable_warning_keeps_one_entry_and_says_one_line_per_change`. 100 distinct unknown
+    keys, each read twice, keep one entry and say 100 lines, one per change. The same error read 50 times says one
+    line.
+- **R11-4** [should] The rollback needs a configuration step. An older hub's parser rejects even `steer = false`.
+  - The README and part J ("The deploy rule") now give it as four numbered steps:
+    1. set a valid `steer = false` on the running hub, check that it loaded, and check that new steers are refused;
+    2. wait until no session shows a steer unsettled;
+    3. roll back the nodes;
+    4. at the cut-over, stop this hub, remove the key, then start the older hub. Not before: while this hub still
+       serves, a missing key means steering on.
+  - The check command is `uv run board session send <an ended session's id> "check" --mode steer`. The switch is
+    read first, so it answers with the switch's words and sends nothing; while steering is on it says the session
+    has ended.
+  - Test: `test_r11_4_the_rollback_check_on_an_ended_session_names_the_switch_and_sends_nothing`.
+  - The older hub reads the same board.local.toml as this one, so I found no cleaner way to make the downgrade safe
+    without building something new.
+- The extra blank line after the function is gone.
+
+**Runs** at 430fc42. The last code commit is 65030f3; the commits after it change tests and the README only.
+- `uv run pytest -q -p no:cacheprovider`: 4493 passed, 10 skipped.
+- The stand-in e2e in full: PASS (165 s).
+- `--only steering` with stand-ins: PASS (113 s).
+- `--only correlation` with stand-ins: PASS (11 s).
+- `--only steering` with the real Codex: PASS (63 s).
+- `--only steer` with the real Codex: PASS (34 s).
+- `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (14 s).
+- `~/.codex/config.toml`: unchanged through every run of this round, at
+  490d50b458847d7d9576f405ad288c9f2fb4f354a616be23c66249f534338c70 before, between and after them.
+  - That is not the round's baseline (bfac656f...). The file was rewritten at 12:49:21 today. The ChatGPT app's
+    Codex framework 158.0.8127.89 helpers started at 12:49:35.
+  - The only run of ours then was the full pytest suite, whose tests keep the user's Codex home out of reach.
+
+### Mutation check, review round 11
+
+Scratchpad `mutate13.py`, one row per changed rule, applied alone to an export of 9f678d4. Each row ran the steering
+test set with -x; the file was then restored. All 8 were caught on the first run.
+
+| mutation | caught by |
+| --- | --- |
+| R11-1 a rejected reload refuses new steers | `test_r11_1_a_rejected_reload_refuses_new_steers_until_a_reload_succeeds` |
+| R11-1 the reload status and the table read as one (no lock) | `test_r11_1_a_decision_during_a_recovering_reload_sees_the_new_table_...` |
+| R11-1 the rejected refusal's own words | `test_r11_1_a_rejected_reload_refuses_new_steers_until_a_reload_succeeds` |
+| R11-2 `[dispatch]` present but not a table is unreadable | `test_r11_2_at_startup_..._unreadable_and_an_absent_one_is_on[dispatch = false]` |
+| R11-2 absent `[dispatch]` is on | `test_pm_3_with_no_sessions_table_steering_is_on_as_designed` |
+| R11-3 one line per change of the error | `test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off[string]` |
+| R11-3 one remembered error (the last) | `test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off[string]` |
+| R11-3 a good read forgets the error | `test_r11_3_the_unreadable_warning_keeps_one_entry_and_says_one_line_per_change` |
