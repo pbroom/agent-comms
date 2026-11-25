@@ -786,7 +786,14 @@ def test_step2s_named_changes_are_each_there_and_are_only_what_k_names(tmp_path)
     assert codex and all(r["modes"] == ["steer", "restart"] for r in codex)
     g.record(tmp_path / "named", verified=frozenset(), named=True)
     kinds = {k for k, _ in g.NAMED}
-    assert kinds == {"client_id", "features", "host_event", "modes"}
+    assert kinds == {"client_id", "client_id_echo", "features", "host_event", "modes", "hello_tree", "report_modes"}
+    hellos = [b for u, b in raw["node_bodies"] if u == "/api/nodes/hello"]
+    assert hellos and all(b["session_host"]["tree"] == 5 for b in hellos), "the node's raw hello says tree 5"
+    reports = [b for u, b in raw["node_bodies"] if u != "/api/nodes/hello" and b.get("modes")]
+    assert any(b["modes"] == ["steer", "restart"] for b in reports), "a Codex report's raw modes name steer"
+    assert all("steer" not in e for u, b in raw["node_bodies"] for e in b.get("events", [])), "no extension sent"
+    echoes = [x for lines in raw["transcripts"].values() for x in lines if '"item-golden"' in x]
+    assert echoes and all(json.loads(x)["params"]["item"]["clientId"] in ids for x in echoes), "Codex's item echo"
     assert sum(k == "client_id" for k, _ in g.NAMED) == len(starts) and sum(
         k == "host_event" for k, _ in g.NAMED) == len(events)
     main = json.dumps(_main_fixture())

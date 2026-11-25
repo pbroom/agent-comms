@@ -78,6 +78,20 @@ def _run(tmp_path: Path, logs: list, allow: bool, named: bool = False) -> dict:
     env = session_env(tmp_path, dispatch=TREE, config=tree_config)
     out: dict = {}
     events: list = []
+    # The node's raw report and hello bodies, as it sends them (review round 1: the golden's limits). A report's
+    # `seq` is the wall clock in ns (node_sessions._stamp): taken out here, the same on main's code and this one.
+    bodies: list = []
+    node_client = env.node.sessions.client
+    real_request = node_client.request
+
+    def recording(method, url, *args, **kw):
+        if method == "POST" and (url == "/api/nodes/hello" or str(url).startswith("/api/nodes/sessions/")):
+            body = json.loads(json.dumps(kw.get("json")))
+            if isinstance(body, dict) and "seq" in body:
+                body["seq"] = 0
+            bodies.append([str(url), body])
+        return real_request(method, url, *args, **kw)
+    node_client.request = recording
     host = env.node.sessions.host
     real_tick = host.tick
 
@@ -153,6 +167,7 @@ def _run(tmp_path: Path, logs: list, allow: bool, named: bool = False) -> dict:
     _sequences(env, out, allow)
     _host_cases(tmp_path, out, allow)
     out["host_events"] = events
+    out["node_bodies"] = bodies
     out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:") and not (allow and told(x, REMOVED))]
     # The listing at protocol 5 (step 2's): with no steer, what a protocol-4 fetch gets (main's code answers it so).
     out["listing_p5"] = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json()
@@ -214,10 +229,55 @@ def _events_named(passes: list, where: str) -> None:
                 NAMED.append(("host_event", where))
 
 
+def cx_thread() -> str:
+    import test_providers_codex as cx
+    return cx.THREAD
+
+
+def cx_turn() -> str:
+    import test_providers_codex as cx
+    return cx.TURN
+
+
+ITEM = re.compile(r'"clientId": "([0-9a-f-]{36})"')
+
+
+def _item_echo(line: str) -> str:
+    """Codex's echo of a stripped `clientUserMessageId` in a userMessage item (K: "echoed as the userMessage item's
+    clientId"), back to the null main's run has, only for an id `_codex_line` took and only in such an item."""
+    m = ITEM.search(line)
+    if not m or m.group(1) not in CLIENT_IDS:
+        return line
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return line
+    item = ((ev.get("params") or {}).get("item") or {}) if isinstance(ev, dict) else {}
+    if ev.get("method") not in ("item/started", "item/completed") or item.get("type") != "userMessage":
+        return line
+    NAMED.append(("client_id_echo", m.group(1)))
+    return line[:m.start()] + '"clientId": null' + line[m.end():]
+
+
+def _modes_named(body, where: str) -> None:
+    """A report body's `modes` with `steer` first (a Codex session to a hub that steers: K)."""
+    if isinstance(body, dict) and isinstance(body.get("modes"), list) and body["modes"][:1] == ["steer"]:
+        body["modes"] = body["modes"][1:]
+        NAMED.append(("report_modes", where))
+
+
 def step2_named(out: dict) -> None:
     """Take K's named changes out of the raw run, in place (module text), each recorded in NAMED."""
     CLIENT_IDS.clear()
     out["stdin"] = [[_codex_line(x) for x in lines] for lines in out.get("stdin", [])]
+    out["transcripts"] = {k: [_item_echo(x) for x in lines] for k, lines in (out.get("transcripts") or {}).items()}
+    for url, body in out.get("node_bodies") or []:
+        if url == "/api/nodes/hello" and isinstance((body or {}).get("session_host"), dict) \
+                and body["session_host"].get("tree") == 5:
+            body["session_host"]["tree"] = 4        # K: `tree` 5 on fetch and hello
+            NAMED.append(("hello_tree", url))
+        else:
+            _modes_named(body, url)
     for name, case in (out.get("host_cases") or {}).items():
         case["stdin"] = [[_codex_line(x) for x in lines] for lines in case["stdin"]]
         _events_named(case["passes"], name)
@@ -468,6 +528,12 @@ def _sequences(env, out: dict, allow: bool) -> None:
     tick(env)
     child = env.node.session_spawner.children[-1]
     codex_handshake(env, child)
+    # Codex's echo of the turn's message id (its userMessage item's `clientId`), as 0.171.0 writes it: the id the
+    # turn/start carried, or null for one that carried none (main's).
+    start_line = [json.loads(x) for x in child.stdin.split(b"\n") if x and b'"turn/start"' in x][-1]
+    child.emit({"method": "item/completed", "params": {"threadId": cx_thread(), "turnId": cx_turn(), "item": {
+        "type": "userMessage", "id": "item-golden", "clientId": start_line["params"].get("clientUserMessageId"),
+        "content": [{"type": "text", "text": "seq codex"}]}}})
     codex_turn(env, child, "codex answer")
     seq["codex"] = show(env, cid)
     out["seq"] = seq

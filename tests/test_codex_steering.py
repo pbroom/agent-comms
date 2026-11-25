@@ -175,16 +175,25 @@ def test_f_a_join_is_proved_once_its_item_comes_in_the_turn_the_answer_named():
     ({"result": {"turnId": "01a1fe39-0000-7000-8000-000000000000"}}, "other"),
     ({"result": {}}, "other"),
     ({"error": {"code": -32600, "message": "no active turn to steer"}}, "refused"),
-    ({"error": {"code": -32600, "message": "expected active turn id `a` but found `b`"}}, "refused"),
-    ({"error": {"code": -32600, "message": "expectedTurnId must not be empty"}}, "refused"),
+    ({"error": {"code": -32600, "message": f"expected active turn id `{cx.TURN}` but found `b`"}}, "refused"),
+    ({"error": {"code": -32600, "message": "expected active turn id `a` but found `b`"}}, "other"),
+    ({"error": {"code": -32600, "message": "expectedTurnId must not be empty"}}, "other"),
+    ({"error": {"code": -32600.0, "message": "no active turn to steer"}}, "other"),
+    ({"error": {"code": True, "message": "no active turn to steer"}}, "other"),
+    ({"result": {"turnId": cx.TURN}, "error": {"code": -32600, "message": "no active turn to steer"}}, "other"),
+    ({"result": {"turnId": cx.TURN, "extra": 1}}, "other"),
+    ({"result": {"turnId": cx.TURN}, "method": "x"}, None),     # (a request, not an answer)
     ({"error": {"code": -32600, "message": "no active turn to steer, and more"}}, "other"),
     ({"error": {"code": -32603, "message": "no active turn to steer"}}, "other"),
     ({"error": {"code": -32603, "message": "internal error"}}, "other"),
     (None, None),
 ])
 def test_f_what_the_steer_request_was_answered_before_ns_end(answer, want):
+    """S2-01: only an exclusive, well-formed answer to the fully written request is evidence; an integer code; a
+    quoted expected id that is the request's own."""
     p, _ = proved()
     [req] = cx.sent(p.steer(TEXT))
+    p.steer_written()
     if answer is not None:
         p.feed(cx.line({"id": req["id"], **answer}))
     [ended], _ = p.feed(cx.line(cx.completed()))
@@ -194,11 +203,33 @@ def test_f_what_the_steer_request_was_answered_before_ns_end(answer, want):
 def test_f_an_answer_after_ns_end_changes_nothing_and_is_logged(caplog):
     p, _ = proved()
     [req] = cx.sent(p.steer(TEXT))
+    p.steer_written()
     p.feed(cx.line(cx.completed()))
     assert p.steer_result() is None
     with caplog.at_level("INFO", logger="agent_comms.providers.codex"):
         assert p.feed(cx.reply(req["id"], {"turnId": cx.TURN})) == ([], [])
     assert p.steer_result() is None and "late answer" in caplog.text
+
+
+def test_s2_01_an_answer_read_before_the_frame_was_fully_written_is_no_evidence():
+    p, _ = proved()
+    [req] = cx.sent(p.steer(TEXT))
+    p.feed(cx.reply(req["id"], {"turnId": cx.TURN}))       # before the host said every byte is in the pipe
+    p.steer_written()
+    p.feed(cx.line(cx.completed()))
+    assert p.steer_result() == "other"
+
+
+def test_s2_01_a_double_answer_with_a_success_and_a_refusal_is_unconfirmed_through_the_host(henv):
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    [req] = steers_of(child)
+    child.emit(cx.line({"id": req["id"], "result": {"turnId": cx.TURN},
+                        "error": {"code": -32600, "message": "no active turn to steer"}}))
+    child.emit(cx.message("done"), cx.completed())
+    [end] = ended_of(host.tick())
+    assert end.steer == {"outcome": "unconfirmed", "why": "other_answer"}
 
 
 def test_f_a_retired_frame_is_never_answered_into_anything():
@@ -375,18 +406,62 @@ def test_d_a_partial_frame_is_completed_while_authority_lasts(henv):
 
 
 def test_d_no_next_turn_is_staged_behind_a_half_written_frame(henv):
+    """The half frame blocks the next turn while it may still be completed."""
     host, s, child, _ = partial(henv)
-    child.emit(cx.message("done"), cx.completed())      # N ends while the frame is still half written
-    [end] = ended_of(host.tick())
-    assert end.steer == {"outcome": "unconfirmed", "why": "partial"}
+    child.accept = 0
     host.send(SID, "next", message_id="b")
     host.tick()
     assert s.writing is None and list(s.inbox)[0].id == "b", "nothing is staged behind the steer frame"
     child.accept = None
     host.tick()
-    assert s.steer is None and steers_of(child), "completed, and the slot is gone"
+    assert s.steer.mark is None and steers_of(child), "completed while N runs"
     host.tick()
-    assert last_start(child)["params"]["input"][0]["text"] == "next", "then the next turn, as its own line"
+    assert list(s.inbox)[0].id == "b", "the next turn waits for N's end as ever"
+
+
+def test_s2_02_after_ns_end_the_rest_of_a_half_frame_never_goes_the_process_is_cut(henv):
+    """Review round 1, S2-02 (this replaces round 0's test, which expected the suffix after N had ended: wrong).
+    N's native result is kept; the rest of the frame is not written; the process is stopped."""
+    host, s, child, _ = partial(henv)
+    written_before = len(child.stdin)
+    child.emit(cx.message("done"), cx.completed())      # N ends while the frame is still half written
+    child.accept = None
+    events = host.tick()
+    [end] = ended_of(events)
+    assert end.ok and end.text == "done" and end.steer == {"outcome": "unconfirmed", "why": "partial"}
+    assert len(child.stdin) == written_before, "not one more byte of the frame"
+    assert s.stopping_since is not None and s.steer is None
+
+
+@pytest.mark.parametrize("gate", ["turn_gate", "unbound", "may_start"])
+def test_s2_02_the_rest_of_a_half_frame_goes_only_while_every_gate_holds(henv, gate):
+    host, s, child, _ = partial(henv)
+    child.accept = None
+    written_before = len(child.stdin)
+    if gate == "turn_gate":
+        host.turn_gate = lambda sess: False
+    elif gate == "unbound":
+        s.bind = "c" * 64
+    else:
+        host.may_start = lambda: False
+    events = host.tick()
+    [end] = ended_of(events)
+    assert end.detail == STEER_CUT and len(child.stdin) == written_before and s.stopping_since is not None
+
+
+def test_s2_02_the_5_s_limit_is_read_on_a_fresh_clock_at_the_write(henv):
+    """A clock advance inside one pass (the read takes long): at the write boundary the limit has passed."""
+    host, s, child, _ = partial(henv)
+    child.accept = None
+    real = child.read_lines
+
+    def slow():
+        henv.clock.advance(STEER_PARTIAL_SECONDS)
+        return real()
+    child.read_lines = slow
+    before = len(child.stdin)
+    [end] = ended_of(host.tick())
+    assert end.detail == STEER_CUT and len(child.stdin) == before
 
 
 @pytest.mark.parametrize("how", ["time", "authority", "omission"])
@@ -1269,10 +1344,14 @@ OLDER = "d4b92e5"       # main's code before steering (the golden's pin), run fo
 
 
 def test_k_an_older_hub_takes_ns_stripped_end_behind_its_real_report_route_and_the_sweep_settles_s(env, tmp_path):
-    """J, K: a hub downgraded with a steer unsettled. The node sends N's end as it does to a hub that does not name
-    `steer` (`_for_hub`: no extension); main's own code (exported from git) takes it behind its real report route,
-    and its records are what main makes of any end: the message, the session, the parent's result and the parent's
-    turn text, with no steer anywhere. Back on this hub, the sweep settles S by the rule and leaves N as it was."""
+    """J, K, S2-07: a hub downgraded with a steer unsettled, while the node still believes it names `steer`. Main's
+    own code (exported from git) runs as a real HTTP server on this hub's database; the node's final shutdown flush
+    sends N's end WITH the extension, main's strict route refuses it (422), and the node's own retry, in that same
+    flush, sends it without (nothing here strips it by hand). Its records are what main makes of any end: the
+    message, the session, the parent's result and the parent's turn text, with no steer anywhere. Back on this hub,
+    the sweep settles S by the rule and leaves N as it was."""
+    import socket
+    import time as _time
     import subprocess
     import sys
     from pathlib import Path
@@ -1286,36 +1365,68 @@ def test_k_an_older_hub_takes_ns_stripped_end_behind_its_real_report_route_and_t
     tick(env)
     assert steer_rec(env, kid)["listed_at"] is not None and len(steers_of(child)) == 1
     runner = env.node.sessions
-    runner.hub_features, runner.features_known = {"answered", "restart"}, True     # what the older hub names
-    event = runner._for_hub(runner._event(HostEvent(kid, "turn_ended", "1", ok=True, text="the child's answer",
-                                                    answered=True, steer={"outcome": "in_turn", "why": "answered"})))
-    assert "steer" not in event and event["text"] == "the child's answer"
     old = tmp_path / "main"
     old.mkdir()
     archive = subprocess.run(["git", "-C", str(root_dir), "archive", OLDER, "agent_comms"], capture_output=True,
                              check=True).stdout
     subprocess.run(["tar", "-x", "-C", str(old)], input=archive, check=True)
     assert not (old / "agent_comms" / "hosted_steer.py").exists(), "main's code, without this change"
-    code = ("import json, sys\n"
+    boot = ("import json, sys\n"
             "from pathlib import Path\n"
-            "from fastapi.testclient import TestClient\n"
+            "import uvicorn\n"
             "from agent_comms.api import create_app\n"
             "from agent_comms.config import Settings\n"
             "from agent_comms.core import Board\n"
-            "from agent_comms import hosted, hosted_results\n"
             "s = Settings(db_path=Path(sys.argv[1]), agents_path=Path(sys.argv[2]))\n"
             "s.dispatch = json.loads(sys.argv[3])\n"
-            "b = Board(s)\n"
-            "c = TestClient(create_app(b), base_url='http://127.0.0.1:8787',\n"
-            "               headers={'Authorization': 'Bearer ' + sys.argv[4]})\n"
-            "r = c.post('/api/nodes/sessions/' + sys.argv[5], json={'events': [json.loads(sys.argv[6])]})\n"
-            "assert r.status_code == 200, r.text\n"
-            "x = [x for x in hosted_results._results(b.conn, sys.argv[7]) if x.get('message') == 1]\n"
+            "uvicorn.run(create_app(Board(s)), host='127.0.0.1', port=int(sys.argv[4]), log_level='warning')\n")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    envs = {"PYTHONPATH": str(old), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    hub = subprocess.Popen([sys.executable, "-c", boot, str(env.settings.db_path), str(env.settings.agents_path),
+                            json.dumps(env.board.s.dispatch), str(port)], cwd=str(old), env=envs,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        client = httpx.Client(base_url=f"http://127.0.0.1:{port}",
+                              headers={"Authorization": "Bearer " + env.tokens["laptop"]}, timeout=10)
+        deadline = _time.monotonic() + 60
+        while _time.monotonic() < deadline:
+            try:
+                client.get("/api/whoami")
+                break
+            except httpx.HTTPError:
+                _time.sleep(0.2)
+        posts = []
+        real_request = client.request
+
+        def spy(method, path, **kw):
+            r = real_request(method, path, **kw)
+            if method == "POST":
+                posts.append((r.status_code, [("steer" in e) for e in (kw.get("json") or {}).get("events", [])]))
+            return r
+        client.request = spy
+        runner.client = client
+        runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True    # as last named
+        runner.status.pop(kid, None)
+        runner._emit([HostEvent(kid, "turn_ended", "1", ok=True, text="the child's answer", answered=True,
+                                steer={"outcome": "in_turn", "why": "answered"})])
+        runner.stopping.set()
+        assert runner._flush(final=True), "the final flush got N's end through"
+        assert posts[:2] == [(422, [True]), (200, [False])], posts
+    finally:
+        hub.terminate()
+        hub.wait(30)
+    code = ("import json, sys\n"
+            "from pathlib import Path\n"
+            "from agent_comms.config import Settings\n"
+            "from agent_comms.core import Board\n"
+            "from agent_comms import hosted_results\n"
+            "b = Board(Settings(db_path=Path(sys.argv[1]), agents_path=Path(sys.argv[2])))\n"
+            "x = [x for x in hosted_results._results(b.conn, sys.argv[3]) if x.get('message') == 1]\n"
             "print(json.dumps({'text': hosted_results.render(x, token='0123456789abcdef')}))\n")
-    r = subprocess.run([sys.executable, "-c", code, str(env.settings.db_path), str(env.settings.agents_path),
-                        json.dumps(env.board.s.dispatch), env.tokens["laptop"], kid, json.dumps(event), sid],
-                       cwd=str(old), capture_output=True, text=True,
-                       env={"PYTHONPATH": str(old), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}, timeout=120)
+    r = subprocess.run([sys.executable, "-c", code, str(env.settings.db_path), str(env.settings.agents_path), sid],
+                       cwd=str(old), capture_output=True, text=True, env=envs, timeout=120)
     assert r.returncode == 0, r.stderr[-2000:]
     turn_text = json.loads(r.stdout.strip().splitlines()[-1])["text"]
     m = hosted._get(env.board.conn, hosted._msg_key(kid, 1))
@@ -1426,7 +1537,7 @@ def test_e_the_node_watchdog_cuts_a_half_written_frame_past_its_limit(env):
     assert s.steer is not None and 0 < s.steer.sent < s.steer.length
     env.clock.advance(STEER_PARTIAL_SECONDS)
     env.node.sessions.enforce_deadlines()
-    assert s.stopping_since is not None and any(e.detail == STEER_CUT for e in env.node.sessions.watched)
+    assert s.stopping_since is not None and any(e.detail == STEER_CUT for e in env.node.sessions.watched_steer)
 
 
 def test_d_the_watchdogs_cut_reads_what_the_process_wrote_first(henv):
@@ -1443,3 +1554,472 @@ def test_the_cells_table_is_the_one_in_design_notes():
     from pathlib import Path
     notes = (Path(__file__).resolve().parents[1] / "DESIGN_NOTES.md").read_text()
     assert f"Steer cells: {len(STEER_CELLS)}" in notes
+
+
+# ------------------------------------------------------------ review round 1 (S2-01 .. S2-14, and part O's gaps)
+
+
+def held_slot(env, prove=False):
+    """A Codex turn in flight on the node, a human steer offered and held there (not written unless proved)."""
+    sid, child = codex_turn_in_flight(env, prove=prove)
+    post_steer(env, sid)
+    tick(env)
+    s = env.node.sessions.host.sessions[sid]
+    assert s.steer is not None and s.steer.authorized
+    return sid, child, s
+
+
+def test_s2_03_an_ack_sent_before_the_deadline_and_read_after_it_never_revives_authority(env):
+    """A report SENT at 74 s and acknowledged at 76 s: the authority, resting on contact sent at 0 s, ran out at 75 s
+    and is latched as lost before that acknowledgement counts."""
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    t0 = runner.steer_seen[sid]
+    runner.hello_ack, runner.report_ack[sid] = t0, (t0, 1)
+    env.clock.advance(node_sessions.STEER_CONTACT_SECONDS + 1)       # 76 s after the contact
+    runner._ack_report(sid, t0 + 74, {"session_id": sid, "in_flight": 1})
+    assert s.steer.revoked == "contact", "latched before the late acknowledgement was published"
+    runner.note_hello(t0 + 74)
+    assert s.steer.revoked == "contact"
+
+
+def test_s2_03_an_ack_names_exactly_this_session_and_an_integer_n(env):
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    for answer in ({"session_id": sid, "in_flight": True}, {"session_id": "another", "in_flight": 1},
+                   {"session_id": sid, "in_flight": 1.0}, {"in_flight": 1}, None):
+        runner._ack_report(sid, 1.0, answer)
+        assert runner.report_ack[sid][1] is None, answer
+        assert runner._steer_contact(sid, 1, float("-inf"), runner.report_ack) == float("-inf")
+    assert runner._steer_contact(sid, True, float("-inf"), {sid: (1.0, 1)}) == float("-inf"), "N is an integer too"
+
+
+def test_s2_03_a_real_report_is_acknowledged_for_its_own_session_and_n(env):
+    """Part O, a real report identity check: the hub's own answer to the node's report names the session and N."""
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    runner.report_ack.clear()
+    runner.reported.clear()
+    runner._flush()
+    sent, n = runner.report_ack[sid]
+    assert n == 1 and type(n) is int and sent <= env.clock()
+
+
+def test_s2_04_a_zero_byte_frame_whose_gate_fails_is_revoked_and_a_recovered_gate_never_writes_it(henv):
+    host, s, child, _ = host_n(henv)
+    child.accept = 0
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert s.steer.mark is not None and s.steer.sent == 0
+    host.turn_gate = lambda sess: False
+    host.tick()
+    assert s.steer.revoked == "gate" and s.steer.mark is None and b"turn/steer" not in bytes(s.outbuf)
+    host.turn_gate, child.accept = None, None       # the gate recovers
+    host.tick()
+    host.tick()
+    assert steers_of(child) == [] and s.provider.steer(TEXT) is None, "never written, no second request"
+    child.emit(cx.message("done"), cx.completed())
+    assert ended_of(host.tick())[0].steer == {"outcome": "not_delivered", "why": "not_written"}
+
+
+class _Featureless:
+    """The node's client, with the listing's `features` taken out (an older hub, or a capability not known)."""
+
+    def __init__(self, hub, drop_steer_only=False):
+        self.hub, self.only = hub, drop_steer_only
+
+    def request(self, method, path, **kw):
+        r = self.hub.request(method, path, **kw)
+        if method == "GET" and path == "/api/nodes/sessions" and r.status_code == 200:
+            data = r.json()
+            data["features"] = [f for f in data.get("features", []) if f != "steer"] if self.only else None
+            return httpx.Response(200, json=data, request=r.request)
+        return r
+
+
+@pytest.mark.parametrize("only", [False, True])
+def test_s2_05_a_listing_that_does_not_name_steer_fences_and_revokes_nothing(env, only):
+    sid, child, s = held_slot(env)
+    env.node.sessions.client = _Featureless(env.laptop, drop_steer_only=only)
+    st = last_start(child)
+    child.emit(user_item(st["params"]["clientUserMessageId"]))     # proved now
+    tick(env)
+    assert s.steer.fenced and s.steer.revoked is None and steers_of(child) == [], "fenced: nothing written"
+    env.node.sessions.client = env.laptop
+    tick(env)
+    assert not s.steer.fenced and len(steers_of(child)) == 1, "an authoritative listing still lists it: written"
+
+
+def test_s2_05_a_featureless_listing_carrying_an_offer_is_taken_by_nobody(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+
+    class Offering(_Featureless):
+        pass
+    env.node.sessions.client = Offering(env.laptop)
+    tick(env)
+    assert env.node.sessions.host.sessions[sid].steer is None and steers_of(child) == []
+
+
+def test_s2_05_a_fenced_zero_byte_frame_goes_later_as_the_same_request(henv):
+    host, s, child, _ = host_n(henv)
+    child.accept = 0
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    first = bytes(s.steer.frame)
+    host.steer_fence(SID)
+    host.tick()
+    assert s.steer.mark is None and s.steer.revoked is None and s.steer.frame == first
+    child.accept = None
+    host.tick()
+    assert steers_of(child) == [], "nothing while fenced"
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)        # an authoritative listing lists it again
+    host.tick()
+    [req] = steers_of(child)
+    assert json.dumps(req).encode() + b"\n" == first or req["id"] == json.loads(first)["id"], "the same request"
+
+
+def test_s2_05_and_r11_03_a_full_write_re_offered_through_reconciliation_is_never_written_again(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    tick(env)
+    assert len(steers_of(child)) == 1
+    for _ in range(3):
+        tick(env)
+    assert len(steers_of(child)) == 1, "the hub offers it again (N runs): the host never writes it twice"
+
+
+def test_s2_05_an_authoritative_omission_still_revokes_for_good(env):
+    sid, child, s = held_slot(env)
+    with hosted.db.write_tx(env.board.conn) as c:
+        hosted_steer.cancel(c, sid, 1, env.clock(), "x")
+    tick(env)
+    assert s.steer.revoked == "omitted"
+
+
+def test_s2_06_a_native_end_the_watchdog_drained_reaches_the_hub_before_any_lost(env):
+    """Part O's watchdog-to-hub ordering and the cut with the receipt and the native end both in stdout."""
+    sid, child = codex_turn_in_flight(env)
+    child.accept = 10
+    post_steer(env, sid)
+    tick(env)
+    [req] = [json.loads(x) for x in bytes(env.node.sessions.host.sessions[sid].steer.frame).splitlines()]
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    env.clock.advance(STEER_PARTIAL_SECONDS)
+    env.node.sessions.enforce_deadlines()       # the watchdog drains and cuts, between passes
+    tick(env)
+    m = msg(env, sid, 1)
+    assert m["state"] == "done" and show(env, sid)["reply"] == "native", "N's own end, not a synthetic LOST"
+    assert (steer_rec(env, sid)["outcome"], steer_rec(env, sid)["why"]) == ("unconfirmed", "partial")
+
+
+@pytest.mark.parametrize("how", ["close", "cancel", "stop_turns", "stop_all"])
+def test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first(henv, how):
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    [req] = steers_of(child)
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    events = (host.close(SID, "closed") if how == "close" else host.cancel(SID, "a", "cancelled") if how == "cancel"
+              else host.stop_turns("no contact") if how == "stop_turns" else host.stop_all())
+    [end] = ended_of(events)
+    assert end.ok and end.text == "native" and end.steer == {"outcome": "in_turn", "why": "answered"}
+
+
+def test_s2_06_shutdown_drains_a_native_end_larger_than_one_read(henv):
+    """Part O: a native end that takes many reads (one line per read here) is drained whole."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    [req] = steers_of(child)
+
+    def one_at_a_time():
+        return [child.stdout.popleft()] if child.stdout else []
+    child.read_lines = one_at_a_time
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), *[cx.message(f"note {i}", phase="commentary")
+                                                           for i in range(40)], cx.message("native"), cx.completed())
+    [end] = ended_of(host.stop_all())
+    assert end.ok and end.text == "native" and end.steer["outcome"] == "in_turn"
+
+
+def test_o_a_codex_partial_cut_a_close_and_a_late_reap_end_n_once(henv):
+    host, s, child, _ = partial(henv)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    events = host.steer_deadlines()
+    events += host.close(SID, "closed")
+    child.code = 0
+    events += host.tick()
+    events += host.tick()
+    ends = [e for e in events if e.kind == "turn_ended"]
+    assert len(ends) == 1 and ends[0].steer == {"outcome": "unconfirmed", "why": "partial"}
+    assert [e.kind for e in events].count("ended") == 1
+
+
+def test_s2_07_a_refused_shutdown_report_goes_again_without_the_steer_outcome_in_that_flush(env):
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    sid, child = codex_turn_in_flight(env)
+    posts = []
+
+    class RefusesSteer:
+        def __init__(self, hub):
+            self.hub = hub
+
+        def request(self, method, path, **kw):
+            if method == "POST" and any("steer" in e for e in (kw.get("json") or {}).get("events", [])):
+                posts.append("refused")
+                return httpx.Response(422, json={"detail": "extra field"},
+                                      request=httpx.Request(method, "http://hub" + path))
+            posts.append("taken")
+            return self.hub.request(method, path, **kw)
+    runner.client = RefusesSteer(env.laptop)
+    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
+    runner._emit([HostEvent(sid, "turn_ended", "1", ok=True, text="the end", answered=True,
+                            steer={"outcome": "unconfirmed", "why": "turn_cut"})])
+    assert runner._flush(final=True)
+    assert posts[:2] == ["refused", "taken"] and msg(env, sid, 1)["state"] == "done"
+    assert show(env, sid)["reply"] == "the end" and runner.pending == []
+
+
+def two_steered_roots(env):
+    a, ca = codex_turn_in_flight(env)
+    b, cb = codex_turn_in_flight(env, project=P2)
+    post_steer(env, a)
+    post_steer(env, b)
+    return a, b
+
+
+def test_s2_08_offer_writes_are_all_or_nothing(env, monkeypatch):
+    a, b = two_steered_roots(env)
+    real = hosted_steer._offer_problem
+    calls = []
+
+    def second_fails(*args):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("a fault on the second steer")
+        return real(*args)
+    monkeypatch.setattr(hosted_steer, "_offer_problem", second_fails)
+    got = listing(env)
+    assert all("steer" not in x for x in got["sessions"])
+    assert steer_rec(env, a)["listed_at"] is None and steer_rec(env, b)["listed_at"] is None
+
+
+def test_s2_08_listed_at_only_for_an_entry_rendered_into_the_answer(env, monkeypatch):
+    """An entry the renderer leaves out (here: the request's protocol below 5 at render time) is never stamped."""
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    monkeypatch.setattr(hosted_steer, "renderable", lambda c, r, tree: False)
+    got = entry(env, sid)
+    assert "steer" not in got and steer_rec(env, sid)["listed_at"] is None
+
+
+def test_s2_08_an_interactive_child_the_renderer_excludes_is_never_stamped(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    with hosted.db.write_tx(env.board.conn) as c:
+        r = hosted._session(c, sid)
+        hosted._put(c, hosted.SESSION_PREFIX + sid, r | {"parent": "0" * 8 + "-0000-4000-8000-" + "0" * 12,
+                                                         "parent_kind": "interactive"}, "hub", env.clock())
+    env.board.s.dispatch = json.loads(json.dumps(env.board.s.dispatch))
+    env.board.s.dispatch["sessions"]["spawn"]["enabled"] = False      # such a child is not listed then
+    got = listing(env)
+    assert all(x["session_id"] != sid for x in got["sessions"])
+    assert steer_rec(env, sid)["listed_at"] is None
+
+
+@pytest.mark.parametrize("what", ["modes", "recorded"])
+def test_s2_08_modes_and_the_recorded_protocol_are_rechecked_at_every_offer(env, what):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    if what == "modes":
+        with hosted.db.write_tx(env.board.conn) as c:
+            r = hosted._session(c, sid)
+            hosted._put(c, hosted.SESSION_PREFIX + sid, r | {"modes": ["restart"]}, "hub", env.clock())
+    else:
+        hub_node(env, 4)
+    assert "steer" not in entry(env, sid)
+    assert steer_rec(env, sid)["withdrawn"] == ("modes" if what == "modes" else "protocol")
+
+
+def test_s2_09_discovering_steer_resends_only_a_session_whose_report_gains_it(env):
+    claude = root(env)
+    call, proc = proc_of(env, claude)
+    proc.emit(began(claude, *as_started(call["argv"])) | {"capabilities": ["interrupt_receipt_v1"]})
+    tick(env)
+    cdx, child = codex_turn_in_flight(env, project=P2)
+    runner = env.node.sessions
+    runner.hub_features = {"answered", "restart"}        # the hub, before it named steer
+    runner.reported = dict(runner.status)
+    posted = []
+    real = runner._call
+
+    def spy(method, path, **kw):
+        if method == "POST":
+            posted.append(path.rsplit("/", 1)[-1])
+        return real(method, path, **kw)
+    runner._call = spy
+    claude_seq = hosted._session(env.board.conn, claude).get("status_seq")
+    tick(env)                                             # a listing that names steer
+    assert cdx in posted and claude not in posted, "only Codex's report gains `steer`"
+    assert hosted._session(env.board.conn, claude).get("status_seq") == claude_seq
+
+
+def test_s2_10_the_drain_list_marks_an_unsettled_steer_on_a_child_row(env):
+    sid, kid, child = codex_child(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
+    text = cli._fmt_hosted_tree(env.human.get("/api/hosted-sessions").json()["sessions"])
+    kid_line = next(line for line in text.splitlines() if kid in line)
+    assert kid_line.startswith(" ") and "steer unsettled (into message 1)" in kid_line
+
+
+def test_s2_11_a_steer_whose_n_is_terminal_settles_on_a_read_with_its_node_offline(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    entry(env, sid)
+    with hosted.db.write_tx(env.board.conn) as c:     # an older hub settled N; the node is gone since
+        m = hosted._get(c, hosted._msg_key(sid, 1))
+        hosted._put(c, hosted._msg_key(sid, 1), m | {"state": "done", "ok": True}, "x", env.clock())
+        r = hosted._session(c, sid)
+        hosted._put(c, hosted.SESSION_PREFIX + sid, r | {"in_flight": None}, "x", env.clock())
+    view = show(env, sid)
+    assert view["messages"][0]["steer"]["outcome"] == "unconfirmed" and "steer_unsettled" not in view
+
+
+def test_s2_11_the_cli_wait_never_exits_0_without_a_terminal_steer_status(steer_cli, capsys, monkeypatch):
+    env = steer_cli
+    sid, child = codex_turn_in_flight(env)
+    monkeypatch.setattr(cli, "STEER_SETTLE_POLLS", 1)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    real = hosted.message_wait
+
+    async def n_done_steer_open(board, p, session_id, n, wait=0, gone=None, steer=False):
+        out = await real(board, p, session_id, n, wait, gone, steer=steer)
+        out["message"] = out["message"] | {"state": "done"}
+        out["steer"] = (out.get("steer") or {}) | {"outcome": None, "state": "accepted"}
+        return out
+    monkeypatch.setattr(hosted, "message_wait", n_done_steer_open)
+    assert run_cli("send", sid, TEXT, "--mode", "steer", "--wait") == cli.STEER_UNSETTLED_EXIT
+    assert "steer: not settled" in capsys.readouterr().err
+
+
+def test_s2_12_a_receipt_only_retry_with_wait_does_not_wait(steer_cli, capsys, monkeypatch):
+    env = steer_cli
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid, request_id="e1")
+    with hosted.db.write_tx(env.board.conn) as c:
+        c.execute("DELETE FROM board_state WHERE key = ?", (hosted_steer._key(sid, 1),))
+
+    async def never(*a, **kw):
+        raise AssertionError("nothing is waited for")
+    monkeypatch.setattr(hosted, "message_wait", never)
+    assert run_cli("send", sid, TEXT, "--mode", "steer", "--request-id", "e1", "--wait") == cli.STEER_UNSETTLED_EXIT
+
+
+def test_s2_12_an_expired_mcp_retry_does_not_wait(env, monkeypatch):
+    sid, kid, child = codex_child(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer", request_id="x1")
+    with hosted.db.write_tx(env.board.conn) as c:
+        c.execute("DELETE FROM board_state WHERE key = ?", (hosted_steer._key(kid, 1),))
+
+    async def never(*a, **kw):
+        raise AssertionError("nothing is waited for")
+    monkeypatch.setattr(hosted_results, "claim_wait", never)
+    out = mcp_call(env, sid, monkeypatch, "board_session_send",
+                   {"child": kid, "message": "other", "mode": "steer", "request_id": "x1", "wait": True})
+    assert out["created"] is False and out["steer"]["state"] == "expired" and out["note"] == hs.STEER_EXPIRED
+    assert out["steer_status"] is None
+
+
+def test_s2_12_status_shows_every_retained_steer_by_n(env):
+    sid, kid, child = codex_child(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
+    tick(env)
+    end_turn(env, child)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message="again")
+    tick(env)
+    st = last_start(child)
+    child.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED, user_item(st["params"]["clientUserMessageId"]))
+    tick(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message="second steer", mode="steer")
+    view = hs.status(env.board, env.p["claude"], bound(env, sid), kid)["children"][0]
+    assert set(view["steers"]) == {"1", "2"} and view["steer"]["into"] == 2
+
+
+def test_s2_12_the_wait_reads_status_and_disposition_in_one_snapshot(env, monkeypatch):
+    """Part O, a wait with a concurrent settlement: another connection settles the steer between the two reads; the
+    answer pairs what one snapshot holds (still accepted, still unsettled), never an accepted steer with a later
+    disposition."""
+    import sqlite3
+    sid, kid, child = codex_child(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
+    real = hosted_results.claimed
+
+    def settle_meanwhile(conn, parent, child_id, n):
+        other = sqlite3.connect(env.settings.db_path, timeout=10)
+        s = json.loads(other.execute("SELECT value FROM board_state WHERE key = ?",
+                                     (hosted_steer._key(kid, 1),)).fetchone()[0])
+        s |= {"outcome": "in_turn", "why": "answered"}
+        other.execute("UPDATE board_state SET value = ? WHERE key = ?", (json.dumps(s), hosted_steer._key(kid, 1)))
+        # ... and N's result is delivered to the parent as a turn, by that same other writer
+        x = {"parent": sid, "n": 99, "child": kid, "message": 1, "state": "delivered", "outcome": "completed"}
+        other.execute("INSERT INTO board_state(key, value, updated_by, updated_at) VALUES (?, ?, 'x', 0)",
+                      (hosted_results._key(sid, 99), json.dumps(x)))
+        other.commit()
+        other.close()
+        return real(conn, parent, child_id, n)
+    monkeypatch.setattr(hosted_results, "claimed", settle_meanwhile)
+    out = hs.steer_waited(env.board, sid, kid, 1, None)
+    assert out["steer_status"]["state"] == "accepted" and out["note"] == hs.STEER_UNSETTLED, \
+        "one snapshot: never an accepted steer beside a result already delivered"
+
+
+def test_s2_12_plain_show_prints_the_steers_outcome(env):
+    sid, child, req = steered(env)
+    answer_steer(child, req, {"turnId": cx.TURN})
+    end_turn(env, child)
+    assert "steer: taken into the turn (answered)" in cli._fmt_hosted_detail(show(env, sid))
+
+
+def test_s2_13_ack_entries_are_kept_for_open_sessions_only(env):
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    runner.report_ack["0" * 8 + "-dead-4000-8000-" + "0" * 12] = (1.0, 1)
+    tick(env)
+    assert set(runner.report_ack) <= set(runner.host.sessions)
+    env.human.post(f"/api/hosted-sessions/{sid}/close")
+    for _ in range(4):
+        tick(env)
+    assert sid not in runner.report_ack and sid not in runner.steer_seen
+
+
+@pytest.mark.parametrize("delta, ok", [(-1, True), (0, True), (1, False)])
+def test_o_the_cap_at_the_exact_boundary_with_escaped_text(env, delta, ok):
+    """12,288 bytes as json.dumps writes the text (quotes, escapes and \\u sequences counted): one under, at, over."""
+    sid, child = codex_turn_in_flight(env)
+    unit = 'é\n"'                       # 6 + 2 + 2 bytes encoded
+    body = unit * 1000
+    rest = hosted_steer.STEER_MAX_BYTES - hosted_steer.encoded_size(body) + delta
+    text = body + "a" * rest
+    assert hosted_steer.encoded_size(text) == hosted_steer.STEER_MAX_BYTES + delta
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": text, "mode": "steer"})
+    assert (r.status_code == 200) == ok, r.text
+    assert len(json.dumps(text).encode()) - hosted_steer.STEER_MAX_BYTES == delta
+    assert (len(json.dumps(text).encode()) > node_sessions.STEER_MAX_BYTES) == (not ok), "the node's check agrees"
+
+
+@pytest.mark.parametrize("delta, ok", [(-1, True), (0, True), (1, False)])
+def test_o_the_cap_at_the_exact_boundary_after_a_parents_frame(env, monkeypatch, delta, ok):
+    sid, kid, child = codex_child(env)
+    monkeypatch.setattr(hs.secrets, "token_hex", lambda n=8: "0123456789abcdef")
+    who = hs._who(hs.resolve(env.board, env.p["claude"], bound(env, sid), None))
+    framed = hosted_steer.encoded_size(hs.render_task(who, "x", steer=True))
+    text = "x" + "é" * ((hosted_steer.STEER_MAX_BYTES - framed + delta) // 6) + "a" * (
+        (hosted_steer.STEER_MAX_BYTES - framed + delta) % 6)
+    assert hosted_steer.encoded_size(hs.render_task(who, text, steer=True)) == hosted_steer.STEER_MAX_BYTES + delta
+    if ok:
+        out = hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=text, mode="steer")
+        assert out["steer"]["state"] == "accepted"
+    else:
+        with pytest.raises(Conflict, match=re.escape(hosted_steer.REFUSED["big"])):
+            hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=text, mode="steer")
