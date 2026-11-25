@@ -142,7 +142,7 @@ class Event:
     tools: tuple[str, ...] = field(default=(), compare=False)
     answered: bool = field(default=False, compare=False)     # turn_ended: the provider took the turn (above)
     usage: list[dict[str, Any]] | None = field(default=None, compare=False)     # `usage` only (above)
-    turn: str = "order"     # turn_started / turn_ended: whose turn (OWNERS, above)
+    turn: str = field(default="order", compare=False)     # turn_started / turn_ended: whose turn (OWNERS, above)
 
     def __post_init__(self):
         if self.kind not in KINDS:

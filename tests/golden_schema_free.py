@@ -10,8 +10,9 @@ line had a uuid, none when it had not: measured on 2.1.330), every process's raw
 host's events in order and the board's log lines. It promises two cases (`record(verified=...)`):
 - no version VERIFIED (production): byte for byte main's, everything, with no allowance at all;
 - a version VERIFIED that these processes do not report (an explicitly unverified baseline): main's but for the
-  allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines written before each
-  process's first `init`, and the echo fields and lifecycle rows the process wrote for them.
+  allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines STAGED before each
+  process's first `init` (a line staged then may be written after that init, as the zero-byte case's is, still
+  carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them.
 
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
 """
@@ -416,7 +417,8 @@ def _host_cases(tmp_path: Path, out: dict, allow: bool) -> None:
     """Host-level cases, pass by pass, through a SessionHost of fake processes and a fake clock (as
     tests/test_session_host.py drives one): Codex's own turn with a replacement waiter and with a changed binding
     (main's `_held`, kept as it is: a cancelled waiter's clock is inherited, a changed binding has no deadline), and
-    Claude's tick boundaries: a pipe that takes nothing, a partly written line, a write timer running out. Recorded:
+    Claude's tick boundaries: a pipe that takes nothing, a partly written line, a write timer running out, a first
+    line staged into a pipe that never takes it (with an init that does not qualify, or none). Recorded:
     every pass's events, and each process's raw stdin."""
     import dataclasses
     from types import SimpleNamespace
@@ -505,6 +507,21 @@ def _host_cases(tmp_path: Path, out: dict, allow: bool) -> None:
         lambda: host.send(SID, "first", message_id="m"), lambda: kids[-1].emit(init(), result()),
         lambda: (setattr(kids[-1], "accept", 0), host.send(SID, "stuck", message_id="n")),
         lambda: kids[-1].emit(init()), lambda: henv.clock.advance(30 * 60), lambda: None])
+    # A process whose pipe takes nothing from its first line on (staged before any init: while some version is
+    # VERIFIED, only a candidate): its init does not qualify (it reports none), then frames that would hold a verified
+    # process; or it never writes an init at all. Main's write timer fails the message and stops the process; nothing
+    # is restarted or requeued (review round 7, C7-01).
+    henv, host = claude("claude-blocked-unqualified", taking(0))
+    kids = henv.spawner.children
+    run("claude_blocked_first_line_unqualified", host, henv, [
+        lambda: host.send(SID, "next", message_id="m"), lambda: kids[-1].emit(init()),
+        lambda: (henv.clock.advance(5 * 60), kids[-1].emit(result(text="its own"), init())),
+        lambda: henv.clock.advance(25 * 60), lambda: None])
+    henv, host = claude("claude-blocked-no-init", taking(0))
+    kids = henv.spawner.children
+    run("claude_blocked_first_line_no_init", host, henv, [
+        lambda: host.send(SID, "next", message_id="m"), lambda: henv.clock.advance(10 * 60),
+        lambda: henv.clock.advance(20 * 60), lambda: None])
     out["host_cases"] = cases
 
 def normalized(value, tmp: Path) -> dict:

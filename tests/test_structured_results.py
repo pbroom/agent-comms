@@ -718,8 +718,9 @@ def test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for
 
 
 def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_and_lifecycle_rows(tmp_path):
-    """In the baseline run: each Claude process's first user line (written before its first init) carries a fresh
-    uuid and no later line does (the first init shows the process cannot be verified); every echo field and lifecycle
+    """In the baseline run: each Claude process's first user line (staged before its first init; the zero-byte
+    case's is written after that init, with the uuid it was staged with) carries a fresh uuid and no later line does
+    (the first init shows the process cannot be verified); every echo field and lifecycle
     row names one of those very lines; what the allowance took out is exactly those fragments and rows. With no
     version VERIFIED nothing carries a uuid, and main's recording has none either."""
     import golden_schema_free as g

@@ -147,6 +147,63 @@
   "revoked_by": null
  },
  "host_cases": {
+  "claude_blocked_first_line_no_init": {
+   "passes": [
+    [],
+    [],
+    [
+     {
+      "answered": false,
+      "delivered": false,
+      "denials": [],
+      "detail": "timed out after 30 minutes",
+      "kind": "turn_ended",
+      "message_id": "m",
+      "meta": {},
+      "ok": false,
+      "restarted_by": null,
+      "session_id": "00000000-0000-0000-0000-000000000005",
+      "text": "",
+      "undelivered": []
+     }
+    ],
+    []
+   ],
+   "stdin": [
+    [
+     ""
+    ]
+   ]
+  },
+  "claude_blocked_first_line_unqualified": {
+   "passes": [
+    [],
+    [],
+    [],
+    [
+     {
+      "answered": false,
+      "delivered": false,
+      "denials": [],
+      "detail": "timed out after 30 minutes",
+      "kind": "turn_ended",
+      "message_id": "m",
+      "meta": {},
+      "ok": false,
+      "restarted_by": null,
+      "session_id": "00000000-0000-0000-0000-000000000005",
+      "text": "",
+      "undelivered": []
+     }
+    ],
+    []
+   ],
+   "stdin": [
+    [
+     ""
+    ]
+   ]
+  },
   "claude_partial_line": {
    "passes": [
     [],
@@ -2181,6 +2238,21 @@
    "agent_comms.session_host",
    "INFO",
    "started session 00000000-0000-0000-0000-000000000005 for claude (pid 1000)"
+  ],
+  [
+   "agent_comms.session_host",
+   "INFO",
+   "started session 00000000-0000-0000-0000-000000000005 for claude (pid 1000)"
+  ],
+  [
+   "agent_comms.session_host",
+   "INFO",
+   "started session 00000000-0000-0000-0000-000000000005 for claude (pid 1000)"
+  ],
+  [
+   "agent_comms.session_host",
+   "WARNING",
+   "session 00000000-0000-0000-0000-000000000005: a turn ended that the host did not start"
   ],
   [
    "agent_comms.session_host",
