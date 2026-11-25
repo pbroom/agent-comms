@@ -746,6 +746,7 @@ def test_model_reach():
                 ("unconfirmed", "consumed"), ("unconfirmed", "s_only"), ("unconfirmed", "turn_cut")]:
         assert row in rows, (row, sorted(rows))
     counts = {row: sum(1 for o, w, _ in _REACH if (o, w) == row) for row in rows}
+    print("MODEL REACH", sorted(counts.items()))
     assert all(c >= 3 for c in counts.values()), counts
     assert any("compete" in k and o == "unconfirmed" for o, _, k in _REACH), "an ambiguity after a competing init"
 
@@ -829,3 +830,18 @@ def test_g_the_checkpoint_goes_only_to_a_hub_that_names_steer(env):
     runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x")])
     assert runner.checkpoints["5e551011-0000-4000-8000-000000000000"]["text"] == "x"
     assert runner.pending == [], "the checkpoint is no event of the session's"
+
+
+def test_o_a_checkpoint_for_a_queued_message_or_a_settled_n_is_refused_with_its_reason(env):
+    """Part O (a test the mutation check asked for): the checkpoint is only for N delivered and in flight: a message
+    still queued behind it is refused as not the turn in flight, and N once settled is refused as settled."""
+    from test_hosted_sessions import send
+    sid, child, n, s_uuid = claude_steered(env)
+    send(env, sid, "queued behind N")
+    held = {"message": 2, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held})
+    assert r.status_code == 409 and "not the turn in flight" in r.text
+    child.emit(cresult(sid, n, s_uuid, text="done"))
+    tick(env)
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"message": 1}})
+    assert r.status_code == 409 and "it is settled" in r.text

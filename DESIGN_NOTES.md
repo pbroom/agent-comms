@@ -13870,3 +13870,269 @@ on 6998a54. Branch `claude/codex-steering-followup`, from origin/main 2b84f42.
   the hub machine, before the key is removed at the cut-over. The README and part J now say why: a long-lived
   process still running this code would read no key, steering on, and could accept a parent's steer that no node
   ever writes.
+
+## Mid-turn steering, step 3: Claude steering, as built (2026-11-25)
+
+Step 3 of the design above (part L, build order item 3): Claude steering, on branch `claude/claude-steering` from
+main 2b84f42 (#115, step 2). It reuses step 2's structures: the same `SteerSlot` record and lock, the same write
+boundary (`_steer_write`), the same offer, acknowledgement, contact clock, fence, cap, stop latch and evidence cutoff,
+the same hub store, refusals, outcomes, CLI/MCP surface and exit codes. New for Claude only what the design names: the
+hold, the finalizer, the checkpoint (`held`), S's own turn and `next_turn` with S's reply.
+
+### Gate M8, measured on Claude Code 2.1.330 (the CLI installed here)
+
+**Result (i): PROVED, the four-outcome mode with `next_turn`.** Raw evidence: scratchpad `steer3/runs/<scenario>-<n>-<time>/` (argv.json, stream.jsonl with every stdout frame and its time, stdin.jsonl with every line written,
+stderr.txt, summary.txt), from `steer3/probe_m8.py`, run with `python3 -I`, the design's part B argv (private cwd,
+`--setting-sources=`, `--strict-mcp-config`, haiku, `--no-session-persistence`, stream-json, `--permission-prompts
+none`), every line `{"type": "user", "message": {...}, "uuid": <own uuid>}`. 30 runs: 3 of each scenario but `tool`
+(3) and `race` (6); `~/.codex/config.toml` 490d50b458847d7d before and after every batch.
+
+| scenario | runs | N's result | after N's end |
+| --- | --- | --- | --- |
+| (a) `tool`: S written during N's `sleep 8` | 3 | `user_message_uuid` N, `user_message_uuids` [N, S], origin none, num_turns 2, "DONE PINEAPPLE" | nothing |
+| (b) `after_tool`: S just after N's last tool result (N then writes ~250 words) | 3 | [N] only | at once `init` [S] (origin none), `result` [S] (origin none, num_turns 1) |
+| (c) `text`: text-only N, S 1.5 s after N's `init` | 3 | [N] only | `init` [S], `result` [S] |
+| (d) `cli_take`: S during a CLI-started turn's tool call | 3 | (N ended before) | the CLI turn's TERMINAL result lists [S], `user_message_uuid` S, origin `task-notification`, num_turns 2 |
+| (d) `cli_late`: S after the CLI turn's last tool result | 3 | (N ended before) | the CLI turn's result (no echo, `task-notification`), then `init` [S], `result` [S] (origin none) |
+| (d) `race_3/5/7`: S past N's last boundary, N's background Agent finishing near N's end (the competing notification) | 6 | [N] only | `init` [S] FIRST in all 6 (also where the notification came 0.4 s before N's result), `result` [S]; then the CLI's own notification turn (unmarked `init`, foreign result) |
+| (e) `interrupt`: S during N's tool call, then the in-band interrupt | 3 | `error_during_execution`, `aborted_tools`, [N] only, lifecycle N `cancelled` | `init` [S], `result` [S] |
+| (e) `error`: `--max-turns 1`, S during N's tool call | 3 | `error_max_turns`, [N] only (S not read at the boundary: the limit ended N there) | `init` [S], `result` [S] |
+
+So, in the design's terms: a `result` listing only S never occurred inside N's owned bracket (every N bracket was
+opened by `init` [N]: ownership never rests on S); the only S-only result was a CLI-started turn's terminal result
+(an unattributed bracket consuming S: `unconfirmed`, as the hold table says); and an `init` echoing exactly [S] after
+N's native end opened a distinct, S-owned turn in all 21 runs where S missed N, whatever ended N (success, error,
+interrupt) and whatever competed (a notification turn queued or arriving at the same time). Nothing contradicts an
+assumption of the approved design. Recorded as VERIFIED is, per version: `providers/claude.py` `STEER_MODES =
+{"2.1.330": "next_turn"}`; a version not there never steers (its adapter says so: `steers` False).
+
+### What was built
+
+- **The adapter** (providers/claude.py). `steers` is the incarnation's: verified (step 1) AND its first `init`'s
+  version in STEER_MODES (gate M8's record), pinned like the verification itself and lost with it; on the class it
+  stays False (step 1's tests read it there). `owns()`: N's own `init` opened its owned bracket. S's line is
+  `steer_named(text, uuid)`: a user line with S's hub-issued uuid (no `steer()` method: a Claude line always names
+  its steer). `steer_sent` / `steer_written`: once a byte of S went, N is never attributed by order in this
+  incarnation (G-3): N gets a result listing N's uuid, or the S-only result inside N's owned bracket with no
+  competing `init` (then N's, S `unconfirmed`, `s_only`); a plain result, an unlisted error or an S-only result whose
+  ownership rests on S is nobody's, the incarnation is unverified, and N fails at its bound with part A's third
+  exception's words (STEER_UNATTRIBUTED). `steer_result()` at N's native end: "ok" (`in_turn`), "s_only", "hold" (S
+  written whole, not in N's result). `steer_hold_state()` while held: "waiting"; "s_turn" once an `init` echoing
+  EXACTLY [S] opens S's own bracket (NEXT_TURN only; `Event.turn` "steer", a new OWNERS value); "s_ended";
+  "consumed" once another bracket's TERMINAL result lists S; "lost" once a deviation (a plain result outside S's
+  bracket) means nothing later can prove S quiet, also at once when N's end is held in an incarnation already
+  unverified. In the three-outcome mode (a version recorded THREE) an `init` echoing [S] opens an unproved bracket
+  and only its terminal result listing S ends the hold.
+- **The host** (session_host.py). Step 2's `_steer_pass` calls `steer_named` where the adapter has it and tells the
+  adapter of the first byte (`steer_sent`); everything else of the write (slot, lock, `_steer_write`, the gates, the
+  5 s, the cut, the stop latch) is step 2's, unchanged. At N's native end `_steer_end` returns HOLD for "hold": N's
+  end is kept, unaltered (`Session.held`, `_Held`), N stays `in_flight` (so the host writes nothing else and the
+  node hands nothing over), `busy_since` restarts from N's native end (the bound: one turn timeout), and one
+  `HostEvent` kind "held" (N's native end, capped as an end's) is the checkpoint. `turn_started` "steer": S's own
+  turn proved, a fresh clock (`busy_since` = its `init`). `turn_ended` "steer": the hold ends: N's native end with
+  `{"outcome": "next_turn", "why": "own_turn", "result": S's ok, detail, denials, meta, text, answered}`.
+  `_hold_pass` (after the pass's reads): "consumed" ends it `unconfirmed`/`consumed`; "lost" is the finalizer at
+  once. **The finalizer** is `_fail` on a held N (`_finalize_hold`): every host-made end (its timeout, an exit, a
+  cancel, a close, the cut, a broken pipe, a stop of every turn, shutdown) decides S as what was read (`next_turn`
+  with S failed, "its own turn was cut: <why>", if S's own turn was proved; else `unconfirmed`/`turn_cut`) and N's
+  native end stands. **The bounded publication**: on a single-session path the caller stops the process (step 2's
+  drain first, where it applies) and N's end is published once the group is gone (the reap) or 2 x kill_grace
+  after the stop (`_hold_fence`), whichever comes first; a close's `ended` waits behind it (`_Held.after`). A stop
+  of every turn, shutdown and the node's stop latch publish at main's point at once (`_every_turn`): "Shutdown
+  simplified" for Claude steers exactly as for Codex ones, nothing read first.
+- **The node** (node_sessions.py). A "held" host event is never one of the session's events: it is the checkpoint,
+  kept (`checkpoints`) only when the hub's last listing named `steer` and what it takes is known, and posted alone
+  (`{"events": [], "held": ..., "seq"}`) in the first flush once nothing of the session is pending before it, one
+  try; a refusal or a failure is logged and it is dropped, never resent. N's end with `next_turn` carries S's
+  result in the extension, as step 2's extension carries the outcome.
+- **The hub** (hosted_steer.py, hosted.py, api.py, hosted_results.py, cli.py). `checkpoint`: write-once, from the
+  session's assigned node only (the route's check), for N delivered and in flight, with a listed, unsettled steer
+  into it; a conflict otherwise (also once N is settled). Kept as `held` on N's record, in no view, verdict or
+  claim. G's one rule: `_apply` takes N's native fields from a committed `held` on every settling end (the node's
+  own, a replacement node's LOST), `_end` (close, cascade, orphan) and `_settle` (a lost node) settle a held N by
+  its native end first; `held` goes in the same transaction. The extension takes `next_turn` with its `result`
+  (checked like an event's fields; a malformed one is ignored), only if S was listed; S's result is kept in the
+  steer record (`result`: ok, detail, denials, meta, reply), apart from N's: the session's `reply`, `turns` and
+  `last_result` stay N's. Views: `view` shows S's result and reply to its sender. A parent's result record (H):
+  `reply` (N's raw reply), the steer's ok, detail and reply as fields, the combined text in `text`; the renderer
+  shows N's reply in its markers, the hub's line, then S's reply in markers of its own. CLI: `send --mode steer
+  --wait` prints S's reply after N's for `next_turn` and exits 0 only if N and S's own turn completed, else 1.
+
+**How a held S and S's own bracket meet step 1's rules** (`_steps`' order, the one decision point, counted time, the
+unearned path and the take-back are untouched):
+- A steer line is a host line but never a message: it never enters the inbox, is never staged (`writing`) and
+  never has `turn_at`; so `_take_back`, `_decide`, `_spent`, `_mark` and the write timer never see it. Its own
+  clock is the hold's: the turn timeout from N's native end, then one from S's own `init`.
+- During the hold N stays `in_flight`, so the session is busy: no message is handed over (node `_hand_over`), the
+  inbox stays empty, `_holder` finds no message and no budget runs. The owned-turn barrier (`_barrier`) is not
+  reached either (nothing to write). A turn the CLI starts itself during the hold opens an unattributed bracket as
+  step 1 says (the adapter's barrier holds through it); only its terminal result listing S matters to S.
+- S's own bracket is the adapter's STEER_BRACKET, not OWN: no `turn_started` of a message comes of it, and it is
+  never "holds_turns" for the barrier, which is moot while N is in flight. After the hold N's end is published and
+  the session is idle as on main: the next message's budget, barrier and write follow step 1 from nothing.
+
+### Departures and open points (decisions for the coordinator)
+
+1. **The bounded publication on a single-session path**: N's end waits for the group to be gone or 2 x kill_grace
+   (part D's step 4). During that wait N stays in flight on the host, so the hub keeps N delivered (and the
+   checkout busy) up to 2 x kill_grace longer than main's failure would. That is the design's choice; noted because
+   it is a timing difference for a steered session only.
+2. **An unexpected host error** (`_end` from `tick`'s exception handler) takes the single-session finalizer
+   (bounded publication), not rule 5's "follows rule 2" at once: `_end` cannot tell that call from a close. It reads
+   nothing more (no drain is made there), so rule 2's evidence cutoff holds; only the publication waits for the
+   group. If you want it published at once, that is one flag.
+3. **A late result listing N and S during the hold** (after N's own result) is a terminal result listing S:
+   `unconfirmed`/`consumed`. The design is silent; the model test reads it so too.
+4. **A plain result inside S's own bracket** ends S's turn as S's own result (an absent echo never discards a
+   result, as in N's owned bracket, step 1); an error result with no echo there ends nothing (S's turn then ends at
+   its bound, `next_turn` failed). The design is silent.
+5. **`not_owned` vs `not_written`**: a steer offered after N's own `init` but whose N ended before any pass saw the
+   slot is `not_delivered`/`not_owned` (step 2's rule: `proved` is set by a pass). Both say not delivered.
+6. **The golden is not extended.** The parity proof for step 3 is a test of its own (part K below): 40 seeded
+   sequences of a verified Claude session with no steer, compared with the same tree with STEER_MODES empty
+   (step 2's Claude on main 2b84f42), event for event, stdin byte for byte, log line for log line and callback for
+   callback; the golden (main d4b92e5, unchanged) still passes. Re-recording the golden from main for a new Claude
+   case would compare against code that has no step-1 verification at all; I did not find a key it could pin that
+   the parity test does not. Your call whether a golden key is still wanted.
+7. **e2e** (below): built with the stand-in and the real CLI for `in_turn`, `next_turn` (M8 through the node) and,
+   stand-in only, a close during S's own turn. Not built: a parent steering a Claude child with `wait=true`, a node
+   restart and a partition during a hold, the bound and a CLI-started turn taking S (the stand-in can do some;
+   unit and in-process tests cover each).
+8. **`steers` on the class is False** (a descriptor): step 1's test reads `ClaudeSession.steers is False` and
+   tests/test_claude_correlation.py is unmodified.
+
+### Part K for step 3: what an observer sees differently
+
+With no steer sent: nothing but `modes`. A verified 2.1.330 Claude process now says `steer` (to a hub that names
+it), so the hub accepts a steer into its turns instead of refusing "this session's agent CLI cannot steer"; frames,
+events, stdin bytes, log lines and callbacks are otherwise those of the build where Claude never steers
+(`test_k_with_no_steer_sent_a_claude_session_is_the_build_that_never_steers`, 40 seeds). With a steer: S's stdin
+line (its own uuid); for a held N, N's end comes later (at most two turn timeouts plus 2 x kill_grace after N's
+native end, I), a checkpoint report (`held`) of its own, an extension with `next_turn` and S's result, and these
+INFO lines in the node's log (no steer or message text in any): "the end of message N is held while the steer into
+it is unresolved", "the steer's own turn began", "a result that could not be attributed after a steer is nobody's",
+and step 2's "the steer into message N: <outcome> (<why>)"; a checkpoint the hub refuses is one WARNING.
+
+### Part O's conditions for step 3, and their tests (tests/test_claude_steering.py)
+
+- The checkpoint: write-once, for the exact assigned node, a delivered N in flight and a listed, unresolved steer;
+  refused once N is settled; out of views; cleared with N's settlement; a dropped checkpoint leaves the hold in the
+  loss exception: `test_o_the_checkpoint_is_write_once_and_only_for_its_delivered_n`,
+  `test_o_a_checkpoint_for_a_turn_with_no_listed_steer_is_refused`,
+  `test_o_a_checkpoint_whose_steer_was_never_listed_is_refused`,
+  `test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply` (out of every view, cleared),
+  `test_g_a_committed_checkpoint_decides_ns_native_fields_on_every_settling_path[lost_node|close|replacement_node]`,
+  `test_g_without_a_checkpoint_ns_end_is_as_on_main`, `test_g_the_checkpoint_goes_only_to_a_hub_that_names_steer`,
+  `test_the_checkpoint_carries_ns_native_end_once`; e2e Z2.
+- The hold: `test_next_turn_s_ran_as_its_own_turn_after_ns_end`, `test_next_turn_after_an_error_end_of_n`,
+  `test_s_consumed_by_a_turn_the_cli_started_itself_is_unconfirmed`,
+  `test_an_unattributed_bracket_ending_without_s_keeps_the_hold`, `test_a_zero_turn_notification_in_the_hold_is_inert`,
+  `test_the_three_outcome_mode_an_init_echoing_s_proves_nothing`,
+  `test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn`, `test_a_deviation_in_the_hold_finalizes_at_once`;
+  (R8-05, kept) an unattributed bracket that mentions S before its terminal result never releases a hold:
+  `test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn` and the model.
+- The fresh S clock (a timeout drain that finds a proved S start honours it):
+  `test_the_fresh_clock_s_own_turn_gets_a_whole_turn_timeout`, and the bound itself
+  `test_the_bound_a_held_end_times_out_a_turn_timeout_after_ns_native_end`.
+- The queued-S close finalizer (drain, bounded stop, N's end, then `ended`):
+  `test_the_queued_s_close_finalizer_n_end_then_ended`; e2e Z3 (a close while S's own turn runs).
+- The bounded lingering-group publication (R11-01): `test_the_bounded_publication_a_lingering_group_delays_ns_end_at_most_two_graces`.
+- `signal()`/`stop_all` before and during a hold, N's end once, before `ended`: under "Shutdown simplified" a stop
+  of every turn and shutdown publish the held end at main's point:
+  `test_a_stop_of_every_turn_publishes_a_held_end_at_mains_point[stop_turns|stop_all]`; before the hold, step 2's
+  `test_sd_*` hold for a Claude slot as for a Codex one (the same code).
+- Round 12's stop deadline with an overlapping timeout, close and late reap: one native N end, no revision: the
+  model (exits, cancels, closes, stops and the clock in one sequence; exactly one end of N, `ended` after it).
+- No order fallback after a steer (G-3), the S-only case (D, F-4) and part A's third exception:
+  `test_an_s_only_result_in_ns_own_bracket_is_ns_and_s_is_unconfirmed`,
+  `test_an_s_only_result_after_a_competing_init_is_nobodys_and_n_fails_at_its_bound`,
+  `test_a_plain_result_after_a_steer_is_never_ns_by_order`.
+- A cancel and an exit during the hold: `test_a_cancel_of_n_during_the_hold_reports_ns_native_result`,
+  `test_an_exit_during_the_hold_publishes_at_once`.
+- Who steers (M8's per-version record): `test_only_a_verified_incarnation_of_an_m8_version_steers`,
+  `test_s_is_never_written_before_ns_own_init`, `test_not_delivered_n_ended_before_s_was_written`,
+  `test_in_turn_n_s_result_lists_its_own_uuid_and_s`; e2e Z1.
+- H: `test_h_the_extension_carries_next_turn_with_ss_result_and_a_malformed_one_is_ignored`,
+  `test_h_the_parents_result_record_and_the_renderer_for_next_turn`,
+  `test_h_a_parents_next_turn_result_record_keeps_ns_reply_apart_and_combines_the_text`; the CLI's exits: e2e Z1, Z2.
+- K (with no steer sent): `test_k_with_no_steer_sent_a_claude_session_is_the_build_that_never_steers[0-39]`;
+  tests/test_claude_correlation.py unmodified; the golden unchanged and passing.
+- The model: `test_model_claude_steer_sequences_against_an_independent_reference[0-199]` (this test's own reading of
+  part D's tables, never the adapter's or the host's) and `test_model_reach` (every Claude outcome row reached,
+  each at least 3 times, and an ambiguity after a competing `init`).
+
+### Mutation check
+
+Scratchpad `steer3/mutate_s3.py`, one change per row applied alone to an export of the branch (`steer3/mutexport`, never the worktree), tests/test_claude_steering.py run first and, only if that did not catch it, the correlation, Codex steering, restart, hub restart and golden tests; the file restored. 32 rows: 31 caught on the first run; the one missed (the checkpoint's in-flight check: a queued message was still refused, for another reason) got a test that pins the reason, and is caught by it.
+
+| mutation | caught by |
+| --- | --- |
+| A M8 gate: any verified version steers | `test_only_a_verified_incarnation_of_an_m8_version_steers` |
+| A owns needs N's owned bracket | `test_s_is_never_written_before_ns_own_init` |
+| A in_turn needs S in N's result | `test_next_turn_s_ran_as_its_own_turn_after_ns_end` |
+| A S-only needs no competing init | `test_an_s_only_result_after_a_competing_init_is_nobodys_and_n_fails_at_its_bound` |
+| A no order fallback once S went | `test_next_turn_s_ran_as_its_own_turn_after_ns_end` |
+| A S's turn needs an init echoing exactly [S] | `test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn` |
+| A the three-outcome mode proves no S turn | `test_the_three_outcome_mode_an_init_echoing_s_proves_nothing` |
+| A a terminal result listing S consumed it | `test_s_consumed_by_a_turn_the_cli_started_itself_is_unconfirmed` |
+| A a deviation in the hold is lost | `test_a_deviation_in_the_hold_finalizes_at_once` |
+| A an unverified hold is lost at once | `test_model_claude_steer_sequences_against_an_independent_reference[73]` |
+| H the bound from N's native end | `test_the_bound_a_held_end_times_out_a_turn_timeout_after_ns_native_end` |
+| H a fresh clock for S's own turn | `test_the_fresh_clock_s_own_turn_gets_a_whole_turn_timeout` |
+| H the bounded publication waits for the group | `test_the_bounded_publication_a_lingering_group_delays_ns_end_at_most_two_graces` |
+| H the bounded publication has a bound | `test_the_bounded_publication_a_lingering_group_delays_ns_end_at_most_two_graces` |
+| H ended after N's held end | `test_the_queued_s_close_finalizer_n_end_then_ended` |
+| H a proved S turn cut is next_turn failed | `test_the_fresh_clock_s_own_turn_gets_a_whole_turn_timeout` |
+| H a stop of every turn publishes at once | `test_a_stop_of_every_turn_publishes_a_held_end_at_mains_point[stop_turns]` |
+| H the checkpoint event | `test_next_turn_s_ran_as_its_own_turn_after_ns_end` |
+| H part A's third exception's words | `test_an_s_only_result_after_a_competing_init_is_nobodys_and_n_fails_at_its_bound` |
+| H consumed ends the hold | `test_s_consumed_by_a_turn_the_cli_started_itself_is_unconfirmed` |
+| H S's own end ends the hold | `test_next_turn_s_ran_as_its_own_turn_after_ns_end` |
+| G precedence: a checkpoint decides N's native fields (node's end) | `test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply` |
+| G precedence on a close | `test_g_a_committed_checkpoint_decides_ns_native_fields_on_every_settling_path[close]` |
+| G precedence on a lost node | `test_g_a_committed_checkpoint_decides_ns_native_fields_on_every_settling_path[lost_node]` |
+| O the checkpoint is write-once | `test_o_the_checkpoint_is_write_once_and_only_for_its_delivered_n` |
+| O the checkpoint needs a listed steer | `test_o_a_checkpoint_whose_steer_was_never_listed_is_refused` |
+| O the checkpoint needs a delivered N in flight | `test_o_a_checkpoint_for_a_queued_message_or_a_settled_n_is_refused_with_its_reason` (a test added after the run; caught when run again) |
+| G next_turn's extension needs its result | `test_h_the_extension_carries_next_turn_with_ss_result_and_a_malformed_one_is_ignored` |
+| G S's result kept in the steer record | `test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply` |
+| N the checkpoint only to a hub that names steer | `test_g_the_checkpoint_goes_only_to_a_hub_that_names_steer` |
+| N the checkpoint is posted | `test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply` |
+| R the combined text | `test_h_a_parents_next_turn_result_record_keeps_ns_reply_apart_and_combines_the_text` |
+
+### The e2e (scripts/session-host-e2e.py, `--only steering`)
+
+After step 2's Q0-Q8, on a hub and a node of their own whose VERIFIED and STEER_MODES name the CLI under test (that
+node process only; `E2E_STEER_MODES`): Z1 `in_turn` into a tool turn, Z2 `next_turn` into a text-only turn (the
+checkpoint seen on the hub while S's own turn runs, with the stand-in; N's and S's raw frames printed: M8 through the
+node), Z3 (stand-in) a close during S's own turn, Z4 no steer text in the node's log. Changed for step 3: Q3's
+Claude refusal, with a real CLI of a version that steers, is now the idle refusal (a 2.1.330 process steers); the
+tree's settings add the `claude-steer` runner and agent for Z. With the real CLI (2.1.330, haiku), Z2's frames:
+N's result `user_message_uuids` [N] (origin none, num_turns 1); S's `init` [S] (origin none); S's result [S]
+(origin none, num_turns 1); exit 0, `next_turn`, S's own reply after N's.
+
+### Existing tests changed
+
+None in tests/. tests/test_claude_correlation.py, tests/test_codex_steering.py and the golden are unmodified; no
+shared helper's signature changed (the host calls the adapter's `steer_named` where it exists, Codex's `steer`
+otherwise). In the e2e script: Q3's Claude refusal check (above) and the tree's runners and agents (`claude-steer`).
+
+### Not done
+
+- A golden key for step 3 (departure 6): the parity test stands in for it.
+- e2e: a parent steering a Claude child with `wait=true`; a node restart, a partition and the bound during a hold;
+  a CLI-started turn taking S (each covered by unit and in-process tests, not through real processes).
+- The checkpoint rides the next flush after the hold begins (one pass later than N's native end), as part G's
+  "normally one host pass and one POST" allows; it is not pushed out of band.
+- Checkout hardening (Q) and the node-local journal (L), as the design says.
+
+### Runs
+
+- `uv run pytest -q -p no:cacheprovider`: 4772 passed, 10 skipped.
+- The stand-in e2e in full: PASS (363 checks).
+- `--only steering` with stand-ins: PASS (Q0-Q8, Z0-Z4).
+- `--only correlation` with stand-ins: PASS.
+- `--only steering` with the real CLIs (Claude Code 2.1.330, haiku; codex-cli 0.171.0): PASS (Q1-Q4, Z1, Z2, Z4).
+- `--only correlation` with the real Claude Code 2.1.330: PASS.
+- `~/.codex/config.toml` sha256 490d50b458847d7d before, between and after every real run (the M8 probes too).
+

@@ -626,7 +626,7 @@ every command takes `--json`. One session per agent and project at a time (child
 | mode | what the message does | Claude Code | Codex |
 | --- | --- | --- | --- |
 | `queue` (default) | its own turn: at once if the session is idle, after the turns ahead of it otherwise | yes | yes |
-| `steer` | puts your message into the turn in flight (one you sent, with nothing queued behind it, not one asked for its result as data; one steer per turn). It is no message of its own: the answer names the turn it went into, and that turn's result carries the steer's outcome: `in_turn` (taken into it), `not_delivered` (it never reached the agent: send it again, for example as a queued message) or `unconfirmed` (delivery could not be confirmed, and the agent may have read it) | not yet: refused (its adapter does not steer) | yes (`turn/steer` into a turn proved to be your message's) |
+| `steer` | puts your message into the turn in flight (one you sent, with nothing queued behind it, not one asked for its result as data; one steer per turn). It is no message of its own: the answer names the turn it went into, and that turn's result carries the steer's outcome: `in_turn` (taken into it), `next_turn` (Claude: it ran as a turn of its own right after it; the result carries its reply after the turn's), `not_delivered` (it never reached the agent: send it again, for example as a queued message) or `unconfirmed` (delivery could not be confirmed, and the agent may have read it) | yes, on Claude Code 2.1.330 with turn correlation on (other versions: refused, its adapter does not steer) | yes (`turn/steer` into a turn proved to be your message's) |
 | `restart` | interrupts the turn in flight and runs your message next; refused while other messages are queued for the session; the interrupted turn ends `failed`, "interrupted by a restart: message N replaced it" (one that finished by itself first, or whose CLI refused the interrupt, keeps its own outcome) | yes | yes |
 | `auto` | starts at once when the session is idle, else queues behind the turn in flight; it never restarts; the answer's `why` says which | yes | yes |
 
@@ -644,7 +644,10 @@ being cancelled or was asked for its result as data, something is queued behind 
 settled yet, the turn already took one, or the text is over 12,288 bytes as written to the agent. A restart is refused
 while a steer is unsettled. `--wait` prints the turn's reply and the steer's outcome; with `--output-schema` it is
 refused before anything is sent. `board session list` marks a session with a steer unsettled. Nothing is promised
-about what the model did with it: `in_turn` is evidence that Codex admitted it into that turn.
+about what the model did with it: `in_turn` is evidence that the agent admitted it into that turn. On Claude a steer
+can also miss the turn and run as Claude's next turn (`next_turn`): the turn's result then waits for that one (at most
+another turn timeout), the session's reply stays the turn's own, and `--wait` prints the steer's own reply after it
+(DESIGN_NOTES "Mid-turn steering, step 3: Claude steering, as built").
 
 **Before installing an older hub over one with mid-turn steering**, in this order:
 

@@ -102,7 +102,8 @@ Q2. M5 on a join: with the real CLI, a probe of its own app-server (the node's f
     a long turn A, then a turn/start J while A runs: the answer names A's turn and J's clientId item comes in it
     (printed raw). With the stand-in, through the node: a turn/start the thread joins (`join-own`), proved and
     steered (`in_turn`).
-Q3. The refusals: a Claude turn (its adapter does not steer); the cap (12,288 bytes); a second steer while one is
+Q3. The refusals: a Claude turn (its adapter does not steer; with a real CLI of a version that steers, step 3, it is
+    refused for having no turn in flight); the cap (12,288 bytes); a second steer while one is
     unsettled; a restart while it is unsettled; `--output-schema` with a steer (refused before sending);
     `board session list` marks it; after N's end no turn is in flight.
 Q4. A parent (the spawning agent's stand-in session, with a spawn grant) steers its Codex child through its own
@@ -318,6 +319,8 @@ MARKER = "E2E-BODY-MARKER-4c1e9a"
 BODY_WORDS = ("zebra", "quartz", "lantern")
 
 # The turn-correlation steps' node (X1-X4): the node, with VERIFIED set to argv[1] in this process only.
+from agent_comms.providers.claude import STEER_MODES   # noqa: E402  (Q3: which Claude versions steer, as shipped)
+
 NODE_VERIFIED = """
 import os, sys
 from agent_comms.providers import claude
@@ -1657,9 +1660,15 @@ codex = true
                                "--wait", "--json")
         cl = json.loads(out)["session"]["session_id"]
         rc, _, err = self.board_rc("session", "send", cl, self.STEER_TEXT, "--mode", "steer")
-        self.check(rc != 0 and "cannot steer into a running turn (its node says so)" in err
-                   and len(self.show(cl)["messages"]) == 1,
-                   "Claude: refused with the reason (its adapter does not steer), nothing is made")
+        if self.real and self.cli_version() in STEER_MODES:
+            # Step 3: a verified process of a version that passed gate M8 steers (Z1-Z3); with nothing in flight
+            # the steer is refused as idle, and nothing is made.
+            self.check(rc != 0 and "no turn is in flight" in err and len(self.show(cl)["messages"]) == 1,
+                       "Claude (a version that steers): refused with nothing in flight, nothing is made")
+        else:
+            self.check(rc != 0 and "cannot steer into a running turn (its node says so)" in err
+                       and len(self.show(cl)["messages"]) == 1,
+                       "Claude: refused with the reason (its adapter does not steer), nothing is made")
         self._close(cl)
         sid, _, _ = self._codex_root(self.LONG if real else f"hold {hold} q3", model)
         self._running(sid, 1, real)
