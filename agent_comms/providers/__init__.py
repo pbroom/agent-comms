@@ -46,11 +46,13 @@ KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "
 # correlation"): `order`, the host's turn in flight by order (what every adapter did before, and what Claude's still
 # does in any process it has not verified); `own`, the turn in flight by the process's own evidence (its frames echo
 # the id of the host's line); `other`, NOT the turn in flight (a turn the CLI started itself, or a frame that belongs
-# to no message): the host never settles a message by it, and only checks an `init`'s access.
-OWNERS = ("order", "own", "other")
+# to no message): the host never settles a message by it, and only checks an `init`'s access; `steer`, the own turn
+# of a steer written into the turn in flight, after that turn's end (Claude steering, DESIGN_NOTES "Mid-turn steering,
+# step 3"): the host never settles a message by it either, and reads it only for the steer it holds.
+OWNERS = ("order", "own", "other", "steer")
 # What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"; steering:
 # "Mid-turn steering, loose contract"). Codex's adapter steers (`turn/steer` into a turn proved to be the message's);
-# Claude's `steers` stays False until its own step (the design's step 3).
+# Claude's steers only in a verified process of a version that passed gate M8 (step 3: providers/claude.py STEER_MODES).
 MODES = ("steer", "restart")
 TURN_KINDS = ("user", "wake", "child", "task")   # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
@@ -190,7 +192,8 @@ class ProviderSession(Protocol):
     # False, is never asked, and the hub is told it cannot (`modes`). `steers`: putting a message into the turn in
     # flight (session_host's steer slot): an adapter that steers has `steer(text)` (the bytes, or None while it cannot
     # yet), `steer_retire()` and `steer_result()`, and may have `owns()` (the turn in flight is proved its message's).
-    # True on Codex's; False on Claude's.
+    # Codex's always; Claude's in a verified process of a version that passed gate M8, which also has `steer_named`
+    # (the line carries the steer's own uuid), `steer_sent` and `steer_hold_state` (the hold, step 3).
     steers: bool
     restarts: bool
 
