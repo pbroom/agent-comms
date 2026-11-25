@@ -1298,6 +1298,8 @@ def _own_steer(conn, r: dict, caller_id: str | None) -> dict:
     """The latest steer this caller sent into one of its turns of this child (hosted_steer.view): its terminal
     status, while N's message is kept. Nothing for a child that took no steer of the caller's."""
     from . import hosted_steer
+    if not hosted_steer.has_steers(r):
+        return {}       # never took a steer: no read (part K)
     mine = [s for s in hosted_steer.steers(conn, r["session_id"])
             if s.get("kind") == "task" and isinstance(s.get("by"), dict) and s["by"].get("session") == caller_id
             and caller_id is not None]
@@ -1654,7 +1656,9 @@ def _resent(board: Board, p: Principal, ident: Ident, child: Any, project: Any, 
     from . import hosted_steer
     try:
         caller = resolve(board, p, ident, project)
-        kid = _own_child(board.conn, caller, child)
+        # The sweep first (R2-10): a steer whose N is settled where it was not (its node offline) is settled now,
+        # so a retry never answers `accepted` for a terminal N.
+        kid = hosted_steer.sweep(board, _own_child(board.conn, caller, child))
         was, steer = hosted_steer.sent_before(board.conn, kid, rid, {"session": caller.id, "agent": p.name},
                                               board.now())
         if was:
@@ -1809,6 +1813,8 @@ STEER_UNSETTLED = ("not settled within the wait: the turn's result, with the ste
                    "yours if you are a hosted session; board_session_status shows the steer's outcome either way)")
 STEER_WENT = ("the child finished, and its result (result {n}) went to you as a turn: the steer's outcome is with it "
               "and in `steer` here")
+STEER_QUEUED = ("the child finished, and its result (result {n}) is queued to come to you as a turn (not delivered "
+                "yet): the steer's outcome is in `steer` here, and will be with it")
 
 
 def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: dict | None) -> dict:
@@ -1816,6 +1822,12 @@ def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: di
     from the record, read FIRST; then, without the result, where it went (a turn of the caller's, another call), or
     only if the steer is still unsettled, that it is."""
     from . import hosted_steer
+
+    try:
+        # The sweep first (R2-10): N settled where its steer was not is settled by the one rule before it is read.
+        hosted_steer.sweep(board, hosted._session(board.conn, child))
+    except BoardError:
+        pass
 
     def read(conn) -> dict:
         # The status and where the result went, in ONE snapshot (S2-12): a settlement between two reads can never
@@ -1831,7 +1843,9 @@ def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: di
             went = [x for x in hosted_results._results(conn, parent) if x.get("child") == child
                     and x.get("message") == n and x.get("state") in ("queued", "delivered")]
             if went:
-                return out | {"note": STEER_WENT.format(n=went[-1]["n"])}
+                # a carrier still queued is queued, not delivered (R2-10)
+                note = STEER_WENT if went[-1].get("state") == "delivered" else STEER_QUEUED
+                return out | {"note": note.format(n=went[-1]["n"])}
         if status is None or status.get("outcome") is None:
             return out | {"note": STEER_UNSETTLED}
         return out | {"note": "the steer is settled; the turn's result was not taken within the wait (it comes as a "

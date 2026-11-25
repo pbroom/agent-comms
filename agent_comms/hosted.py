@@ -243,7 +243,7 @@ def _human_view(board: Board, r: dict) -> dict:
     if home is not None:        # the account folder its node says this agent's runner uses (agent_accounts.py)
         out["account_home"] = home
     from . import hosted_steer
-    steering = hosted_steer.unsettled(board.conn, r["session_id"])
+    steering = hosted_steer.unsettled(board.conn, r["session_id"]) if hosted_steer.has_steers(r) else None
     if steering is not None:    # a steer not settled yet (hosted_steer.py): the drain's check, `board session list`
         out["steer_unsettled"] = {"into": steering["into"]}
     if isinstance(r.get("pool"), dict):     # the pool its agent was chosen from, and why (account_pools.py)
@@ -737,7 +737,7 @@ def restart_target(c, r: dict, by_parent: bool) -> tuple[dict | None, str | None
     if int(r.get("queued") or 0) > 0:
         return None, REFUSED["queued"].format(k=int(r["queued"]))
     from . import hosted_steer
-    steering = hosted_steer.unsettled(c, r["session_id"])
+    steering = hosted_steer.unsettled(c, r["session_id"]) if hosted_steer.has_steers(r) else None
     if steering is not None:
         return None, REFUSED["steered"].format(n=steering["into"])
     return m, None
@@ -1071,13 +1071,7 @@ def _settle(board: Board, r: dict) -> dict:
     (node_sessions.py), so the failed turn is not still running somewhere."""
     now = board.now()
     from . import hosted_steer, hosted_tree
-    if hosted_steer.stale(board.conn, r["session_id"]):
-        # A steer whose N is already settled (an older hub settled N, or a path that left it): settled here by the
-        # one rule, whatever its node does (S2-11: an offline node never polls, so the listing's sweep never runs).
-        with db.write_tx(board.conn) as c:
-            stored = _session(c, r["session_id"])
-            hosted_steer.settle_unsettled(c, stored, board.now())
-        r = _session(board.conn, r["session_id"])
+    r = hosted_steer.sweep(board, r)
     if not hosted_tree.orphaned(board.conn, r) and not _lost(board.conn, r, now):
         return r
     with db.write_tx(board.conn) as c:
@@ -1233,7 +1227,7 @@ def _listed(board: Board, p: Principal, tree: bool = False, shown: dict | None =
     # and the messages whose turn their starter cancelled. Nothing of it for an earlier node, or with spawn off.
     spawns = spawn and int(tree) >= hosted_tree.SPAWN_PROTOCOL
     restarts = int(tree) >= hosted_tree.RESTART_PROTOCOL   # a node that restarts: a message's mode and turn
-    out, mark = [], []
+    out, mark, stamps = [], [], []
     every = _sessions(board.conn)
     for r in sorted(every, key=lambda r: r["session_id"]):
         if (r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree)
@@ -1271,7 +1265,7 @@ def _listed(board: Board, p: Principal, tree: bool = False, shown: dict | None =
         steer = (shown or {}).get(r["session_id"])
         if steer is not None:
             if hosted_steer.renderable(board.conn, r, tree):
-                hosted_steer.stamp(board.conn, r["session_id"], steer["into"], board.now())     # first exposure
+                stamps.append((r["session_id"], steer["into"]))
             else:
                 steer = None
         out.append({k: r.get(k) for k in ("session_id", "agent", "runtime", "project", "model", "stop")}
@@ -1295,7 +1289,19 @@ def _listed(board: Board, p: Principal, tree: bool = False, shown: dict | None =
     # What this hub takes in a node's reports beyond what every hub took: a node sends such a field only to a hub
     # that names it here, so a newer node's reports reach an older hub exactly as before (its strict model refuses an
     # unknown field, and the report would be lost).
-    return {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
+    answer = {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
+    if stamps:
+        from . import hosted_steer
+        # A steer's first exposure (`listed_at`), in this transaction, only once the answer it is in can be written
+        # as the HTTP layer writes it (R2-08): one that could not be sent was never exposed.
+        if hosted_steer.serialised(answer):
+            for sid, n in stamps:
+                hosted_steer.stamp(board.conn, sid, n, board.now())
+        else:
+            import logging
+            logging.getLogger("agent_comms.hosted").warning(
+                "the session listing for node %s could not be written as JSON: no steer in it counts as listed", p.name)
+    return answer
 
 
 def checkout_runs(board: Board) -> tuple[list[dict], list[dict]]:

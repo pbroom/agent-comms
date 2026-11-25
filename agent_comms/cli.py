@@ -1255,6 +1255,16 @@ STEER_WORDS = {"in_turn": "taken into the turn", "not_delivered": "not delivered
                "unconfirmed": "not confirmed: delivery could not be confirmed, and the agent may have read it"}
 
 
+def _kept(settings: Settings, token: str, path: str) -> dict | None:
+    """One read of the steer's turn N; None when the hub no longer keeps it (404). Any other failure is raised."""
+    try:
+        return _api(settings, token, "GET", path, timeout=60)
+    except SystemExit as e:
+        if isinstance(e.code, str) and e.code.startswith("error (not_found)"):
+            return None
+        raise
+
+
 def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> None:
     """`board session send --mode steer`: the steer's answer, and with --wait the result of the turn it went into
     (message N) and the steer's outcome: exit 0 when that turn completed, 1 when not, 5 when the steer was not
@@ -1279,8 +1289,19 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
     if not a.json:
         print(info, file=sys.stderr)
     path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{st['into']}?wait=25&steer=1"
+
+    def gone() -> None:
+        # Message N (and the steer with it) is no longer kept on the hub (R2-10): the outcome is not known.
+        note = f"message {st['into']} is no longer kept on the hub, and neither is the steer's outcome"
+        if a.json:
+            print(json.dumps({"session": s, "steer": st, "reply": None, "note": note}, indent=2))
+        else:
+            print(f"note: {note}", file=sys.stderr)
+        raise SystemExit(STEER_UNSETTLED_EXIT)
     while True:
-        got = _api(settings, token, "GET", path, timeout=60)
+        got = _kept(settings, token, path)
+        if got is None:
+            gone()
         if got["message"]["state"] in ("done", "failed"):
             break
     # N is over; its steer settles with it (in that same transaction, or by the sweep on this very read): a few more
@@ -1289,7 +1310,9 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
         if (got.get("steer") or {}).get("outcome"):
             break
         time.sleep(0.5)
-        got = _api(settings, token, "GET", path.replace("wait=25&", ""), timeout=60)
+        got = _kept(settings, token, path.replace("wait=25&", ""))
+        if got is None:
+            gone()
     s, m, sv = got["session"], got["message"], got.get("steer") or {}
     reply = s["reply"] if s.get("reply_for") == m["n"] else None
     outcome = sv.get("outcome")

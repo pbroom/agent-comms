@@ -59,6 +59,7 @@ REFUSED = {
     "unsettled": "a steer into message {n} of this session is not settled yet",
     "took": "the turn in flight (message {n}) already took a steer",
     "big": f"the steer's text is over {STEER_MAX_BYTES:,} bytes as it is written to the agent",
+    "encoding": "the steer's text is not valid Unicode (it has an unpaired surrogate): it could never be sent as UTF-8",
     "schema": "a steer cannot ask for its result as data (output_schema): the reply that answers it is the turn's",
     "spawn": "may_spawn and spawn_share do not go with a steer",
 }
@@ -119,6 +120,31 @@ def encoded_size(text: str) -> int:
     return len(json.dumps(text).encode())
 
 
+def utf8(text: str) -> bool:
+    """The text can be sent as UTF-8 (no unpaired surrogate): the hub's answers are UTF-8 JSON (R2-08)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def serialised(answer: Any) -> bool:
+    """The listing's answer can be written as the HTTP layer writes it (UTF-8 JSON, no NaN): only then is an offer
+    in it exposed (R2-08)."""
+    try:
+        json.dumps(answer, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def has_steers(r: dict) -> bool:
+    """Without a query: the session ever took a steer (`accept` marks it). One that never did needs no steer read on
+    an ordinary read (part K)."""
+    return r.get("steered") is True
+
+
 # ---------------------------------------------------------------- accepting
 
 
@@ -159,6 +185,8 @@ def target(board: Board, c, r: dict, by_parent: bool, text: str, *, schema: bool
         return None, REFUSED["unsettled"].format(n=open_["into"])
     if get(c, r["session_id"], n) is not None:
         return None, REFUSED["took"].format(n=n)
+    if not utf8(text):
+        return None, REFUSED["encoding"]       # before anything is stored, on every path (R2-08)
     if encoded_size(text) > STEER_MAX_BYTES:
         return None, REFUSED["big"]
     if schema:
@@ -183,6 +211,7 @@ def accept(c, r: dict, m: dict, text: str, kind: str, by: dict, who: str, rid: s
                 if isinstance(v, dict) and float(v.get("at") or 0) > now - hosted.RECEIPT_SECONDS}
         keep[hosted._receipt_key(rid, by)] = {"steer": m["n"], "at": now}
         r["receipts"] = keep
+    r["steered"] = True         # (`has_steers`: a session that never took one is never read for steers)
     r["updated_at"] = now
     _put(c, _key(r["session_id"], m["n"]), s, who, now)
     _put(c, hosted.SESSION_PREFIX + r["session_id"], r, who, now)
@@ -350,14 +379,30 @@ def _settled(c, s: dict, ext: dict | None, now: float) -> dict:
     return s
 
 
-def stale(conn, session_id: str) -> bool:
-    """Read only: the session has an unsettled steer whose N is settled or gone (the re-upgrade sweep's work)."""
+def stale(conn, session_id: str, r: dict | None = None) -> bool:
+    """Read only: the session has an unsettled steer whose N is settled or gone (the re-upgrade sweep's work). With
+    its record `r`: no query at all for a session that never took a steer (`has_steers`), else one scan."""
+    if r is not None and not has_steers(r):
+        return False
     for s in steers(conn, session_id):
         if s.get("outcome") is None:
             m = _get(conn, hosted._msg_key(session_id, s["into"]))
             if not isinstance(m, dict) or m.get("state") in hosted.SETTLED:
                 return True
     return False
+
+
+def sweep(board: Board, r: dict) -> dict:
+    """On a read: a steer whose N is already settled (an older hub settled N, or a path that left it) is settled by
+    the one rule, whatever its node does (S2-11: an offline node never polls, so the listing's sweep never runs).
+    Nothing else of the session is touched (R2-10: a parent's retry and wait read through it too). The session as
+    it is stored now."""
+    if not stale(board.conn, r["session_id"], r):
+        return r
+    from . import db
+    with db.write_tx(board.conn) as c:
+        settle_unsettled(c, hosted._session(c, r["session_id"]), board.now())
+    return hosted._session(board.conn, r["session_id"])
 
 
 def settle_unsettled(c, r: dict, now: float) -> None:
