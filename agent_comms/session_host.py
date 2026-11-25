@@ -213,6 +213,18 @@ class SteerSlot:
     # (R9-02) The process this attempt was taken for. The slot goes when that process is let go of
     # (`_release_steer`); a cut is only ever made for the current process's own slot.
     process: Any = field(default=None, repr=False, compare=False)
+    # Claude steering (review round 1, ruling A): what the one adjudicator (`_steer_adjudicate`) has taken as
+    # evidence for this attempt, before N's end: a deviation while it was live (`lost`: no S turn can be proved).
+    lost: bool = False
+
+    def contact_ran_out(self, now: float) -> bool:
+        """The attempt's own contact clock (not an authoritative omission) has run out: latched, for good."""
+        with self.lock:
+            if self.cover_until is None:
+                return False
+            if self.revoked is None and now >= self.cover_until:
+                self.revoked = "contact"
+            return self.revoked == "contact"
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -255,6 +267,7 @@ class _Held:
     fenced_at: float | None = None
     decided: dict | None = None
     after: list = field(default_factory=list)
+    lost: bool = False              # evidence says nothing later can prove S quiet: the finalizer, at once
 
 
 @dataclass
@@ -609,9 +622,9 @@ class SessionHost:
         # (R7-04) A stop has begun (`steer_stopping` was called, its latch perhaps not set yet): a drain takes no next
         # batch, so a waiting stop never loses the latch's lock to it.
         self._stop_pending = False
-        # A stop of every turn (`stop_turns`, `stop_all`) is under way: a held end (Claude steering) is published at
-        # its point, as main's, reading nothing more (the shutdown simplification).
-        self._every_turn = False
+        # A stop of every turn (`stop_turns`, `stop_all`), or an unexpected error's end of a session (rule 5), is under
+        # way: a held end (Claude steering) is published at its point, at once, reading nothing more.
+        self._at_once = False
         # A test's hook at a slot's installation (`steer_offer`): "before" and "after" outside the latch's lock,
         # "inside" under it. None in production.
         self.steer_install_hook: Callable[[str, Session], None] | None = None
@@ -1197,6 +1210,11 @@ class SessionHost:
         # handling. Every drain in the pass shares one deadline (`one_drain_budget`; in the node's pass, the one of the
         # whole hold of its lock).
         with self.one_drain_budget():
+            # (Claude steering, review round 1, ruling B) A held end the finalizer decided is published once its
+            # deadline passes, checked here first, before any read can fail.
+            for s in list(self.sessions.values()):
+                if s.held is not None:
+                    self._hold_deadline(s, now, out)
             # Every exit first: a leader that went by itself leaving members of its group is registered as stopping
             # (`_reap`) before this pass starts any process, so nothing it starts goes beside such a group.
             for s in list(self.sessions.values()):
@@ -1206,15 +1224,47 @@ class SessionHost:
                         self._reap(s, now, out)
                     except Exception as e:
                         log.exception("session %s failed", s.session_id)
-                        if not s.ended:
-                            self._end(s, f"host error: {type(e).__name__}", now, out)    # (rule 2: no drain)
+                        self._host_error(s, e, now, out)    # (rule 2: no drain; rule 5: a held end at once)
             for s in list(self.sessions.values()):
                 try:
                     self._pass(s, now, out)
                 except Exception as e:
                     log.exception("session %s failed", s.session_id)
-                    if not s.ended:
-                        self._end(s, f"host error: {type(e).__name__}", now, out)
+                    self._host_error(s, e, now, out)
+
+    def _hold_deadline(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        """Ruling B: the bounded publication's deadline, independent of any read (an error here is logged; the held
+        end is then published at once: rule 5)."""
+        try:
+            self._hold_fence(s, now, out)
+        except Exception:
+            log.exception("session %s: could not publish a held end at its deadline", s.session_id)
+            self._publish_now(s, out)
+
+    def _host_error(self, s: Session, e: Exception, now: float, out: list[HostEvent]) -> None:
+        """An unexpected error in a session's pass: main ends the session (`_end`). "Shutdown simplified" rule 5: a
+        held end (Claude steering) is published at once from the evidence in hand, nothing deferred and nothing read;
+        and whatever happened, no held end and no `ended` is ever stranded behind a later read (ruling B)."""
+        try:
+            if not s.ended:
+                self._at_once = True
+                try:
+                    self._end(s, f"host error: {type(e).__name__}", now, out)
+                finally:
+                    self._at_once = False
+        finally:
+            self._publish_now(s, out)
+
+    def _publish_now(self, s: Session, out: list[HostEvent]) -> None:
+        """A held end still there (whatever failed): published now, S by what was adjudicated."""
+        held = s.held
+        if held is None:
+            return
+        if held.decided is None:
+            held.decided = ({"outcome": "next_turn", "why": "own_turn_cut", "result": {
+                "ok": False, "detail": STEER_S_CUT.format(why="a host error")[:300], "denials": [], "meta": {},
+                "text": "", "answered": False}} if held.s_turn else {"outcome": "unconfirmed", "why": "turn_cut"})
+        self._publish_hold(s, out, held.decided)
 
     def _pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
         gates = self._steps(s, now, out)
@@ -1292,6 +1342,13 @@ class SessionHost:
         return len(lines)       # (how many lines it read: a drain reads on while there are any)
 
     def _on_event(self, s: Session, ev: Event, now: float, out: list[HostEvent]) -> None:
+        if (ev.steer is not None or ev.turn == "steer") and ev.steer not in ("n_with_s", "n_without_s", "s_only"):
+            if self._steer_adjudicate(s, ev, now, out):
+                if ev.kind == "turn_started":
+                    self._check_access(s, ev, now, out)
+                return
+            if ev.kind == "usage" and not ev.usage:
+                return      # (evidence alone)
         if ev.kind == "ready":
             if getattr(s.provider, "reports_sandbox", False):
                 # Codex: the answer to thread/start (or resume) names the thread's sandbox. It ends a session
@@ -1309,24 +1366,10 @@ class SessionHost:
                 s.busy_since = None
             self._save_state()
         elif ev.kind == "turn_started":
-            # The kill switch. The session's access was decided from its command line before it started; what the
-            # process says it really runs this turn with can only end it: bypassed where it was not started as
-            # full, not bypassed where it was, more than read-only where that was asked, or nothing verifiable where
-            # the access asked for depends on it.
-            problem = (session_access.verify(s.asked, s.access, ev.mode, ev.tools)
-                       if getattr(s.provider, "verifies_mode", False) else None)
-            if problem is not None:
-                log.warning("session %s: %s", s.session_id, problem)
-                self._end(s, problem, now, out)
+            if not self._check_access(s, ev, now, out):
                 return
-            if s.access == "full" and ev.mode == "bypassPermissions":
-                s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
             if ev.turn == "steer":
-                # S's own turn began (Claude steering): a fresh turn timeout for it, while N's end is held. Its
-                # access was checked above; no message's turn starts.
-                if s.held is not None and s.held.fenced_at is None:
-                    s.held.s_turn, s.busy_since = True, now
-                return
+                return      # (S's own turn: `_steer_adjudicate`)
             if ev.turn == "other":
                 # Not the turn in flight (the adapter's evidence, providers.OWNERS: a turn the CLI started itself, or
                 # another `init` inside the turn's own bracket): its access was checked above, and that is all.
@@ -1349,12 +1392,7 @@ class SessionHost:
                 s.busy_since = None     # the check is over; the turn's own clock starts when it is written
         elif ev.kind == "turn_ended":
             if ev.turn == "steer":
-                # S's own turn ended (Claude steering): the hold ends with N's native end, `next_turn`, S's result.
-                if s.held is not None and s.held.fenced_at is None:
-                    self._publish_hold(s, out, {"outcome": "next_turn", "why": "own_turn", "result": {
-                        "ok": bool(ev.ok), "detail": ev.detail[:300], "denials": list(ev.denials),
-                        "meta": dict(ev.meta), "text": ev.text, "answered": bool(ev.answered)}})
-                return
+                return      # (S's own turn: `_steer_adjudicate`)
             if ev.turn == "other":
                 # A turn the CLI started itself ended, or a result that is no message's (providers.OWNERS): the turn
                 # in flight, if any, is not settled by it (Claude turn correlation).
@@ -1380,7 +1418,7 @@ class SessionHost:
                             detail=detail, text=ev.text,
                             answered=bool(ev.answered),     # the adapter's word: the provider took the turn
                             restarted_by=s.restart_by if by_restart else None)
-            steer = self._steer_end(s, msg.id, native=bool(ev.answered))
+            steer = self._steer_end(s, msg.id, native=bool(ev.answered), evidence=ev.steer)
             if steer is HOLD:
                 s.in_flight = msg       # held: N stays in flight here until its end is published
                 self._hold(s, end, now, out)
@@ -1389,6 +1427,12 @@ class SessionHost:
             self._forget_restart(s)     # the old turn has settled: the restart's message is the next ordinary one
             self._save_state()
         elif ev.kind == "approval_requested":
+            if s.held is not None:
+                # (Claude steering) N's end is held: an approval request now is the steer's own turn's, or the CLI's,
+                # never N's (N is over); it is said in the log, and nothing of N changes.
+                log.info("session %s: an approval request while the end of message %s is held (not that turn's)",
+                         s.session_id, s.held.end.message_id)
+                return
             s.denials, s.waiting = ev.denials, True
             out.append(HostEvent(s.session_id, "approval_requested", s.in_flight.id if s.in_flight else None,
                                  denials=ev.denials))
@@ -1409,6 +1453,22 @@ class SessionHost:
             self._save_state()
             self._fail_start(s, ev.detail or "the agent process refused to start the session", out)
             self._stop(s, now)
+
+    def _check_access(self, s: Session, ev: Event, now: float, out: list[HostEvent]) -> bool:
+        """The kill switch, on every `init` (whatever turn it starts: a message's, the CLI's own, a steer's own). The
+        session's access was decided from its command line before it started; what the process says it really runs
+        this turn with can only end it: bypassed where it was not started as full, not bypassed where it was, more
+        than read-only where that was asked, or nothing verifiable where the access asked for depends on it. False:
+        the session ended."""
+        problem = (session_access.verify(s.asked, s.access, ev.mode, ev.tools)
+                   if getattr(s.provider, "verifies_mode", False) else None)
+        if problem is not None:
+            log.warning("session %s: %s", s.session_id, problem)
+            self._end(s, problem, now, out)
+            return False
+        if s.access == "full" and ev.mode == "bypassPermissions":
+            s.confirmed_by = s.child    # Claude took the mode: while THIS process lives a child may be `full`
+        return True
 
     def note_usage(self, key: str | None, observations, now: float) -> None:
         """Keep each window's newest observation for runner `key` (`usage`: key -> window -> observation | {at}),
@@ -1457,6 +1517,8 @@ class SessionHost:
             self._correct_start_mode(s)
         was_ready, was_checking = s.ready, s.checking
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
+        if s.held is not None and s.held.fenced_at is not None:
+            self._publish_hold(s, out, s.held.decided)     # its group is gone: published before any cleanup (B)
         self.groups.gone(s.group_token)      # the whole group is gone
         s.group_token = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
@@ -1472,8 +1534,6 @@ class SessionHost:
             s.transcript_fd = None
         if not stopped:
             self._went_by_itself(s, code, was_ready, was_checking, out)
-        if s.held is not None and s.held.fenced_at is not None:
-            self._publish_hold(s, out, s.held.decided)     # its group is gone: the bounded publication, now
         self._release_steer(s)
         self._forget_restart(s)     # nothing is left to interrupt
         s.held_since = None
@@ -1599,7 +1659,7 @@ class SessionHost:
             if (s.held is not None and s.busy_since is not None
                     and now - s.busy_since < self.timeout_minutes * 60):
                 return      # the drain found S's own turn begun: its fresh clock holds (part D)
-        if s.held is None and getattr(s.provider, "steer_hold_state", lambda: None)() == "ambiguous":
+        if s.held is None and s.steer is not None and s.steer.lost and s.steer.outcome is None:
             self._fail(s, STEER_UNATTRIBUTED, out)  # (part A's third exception: N's result was never attributed)
         else:
             self._fail(s, self._timeout_detail(), out)
@@ -2037,6 +2097,12 @@ class SessionHost:
 
     def _steer_count(self, s: Session, slot: SteerSlot, n: int) -> None:
         """(The attempt's lock held.) What a write of `n` bytes did to the frame: written whole, or taken in part."""
+        self._steer_count_bytes(s, slot, n)
+        facts = getattr(s.provider, "steer_facts", None)
+        if facts is not None and slot.sent > 0:
+            facts(sent=slot.sent)       # (Claude: no order fallback for N in THIS attempt once a byte went)
+
+    def _steer_count_bytes(self, s: Session, slot: SteerSlot, n: int) -> None:
         start, length = slot.mark
         start -= n
         if start + length <= 0:
@@ -2047,10 +2113,6 @@ class SessionHost:
         else:
             slot.mark = (start, length)
             if start < 0:       # some of it is in the pipe: completed within STEER_PARTIAL_SECONDS, or cut
-                if slot.sent == 0:
-                    sent = getattr(s.provider, "steer_sent", None)
-                    if sent is not None:
-                        sent()      # (Claude: no order fallback for N from now on)
                 slot.sent = -start
                 if slot.partial_since is None:
                     slot.partial_since = self.clock()
@@ -2140,9 +2202,10 @@ class SessionHost:
         self._stop(s, now, at_signal=True)      # (R8-01) the cut's own stop, with or without a drain
         self._save_state()
 
-    def _steer_end(self, s: Session, msg_id: str, native: bool) -> dict | None:
+    def _steer_end(self, s: Session, msg_id: str, native: bool, evidence: str | None = None) -> dict | None:
         """N (`msg_id`) ended, natively (the provider's own end of it) or not (the host gave it up): the outcome of the
-        steer into it, decided now, once (part F's table)."""
+        steer into it, decided now, once (part F's table; for Claude, from the typed evidence of N's end, `evidence`,
+        as the one adjudicator's rules say: `_steer_adjudicate`)."""
         slot = s.steer
         if slot is None or slot.into != msg_id or slot.outcome is not None:
             return None
@@ -2161,15 +2224,25 @@ class SessionHost:
                 outcome = {"outcome": "unconfirmed", "why": "partial"}
             elif not native:
                 outcome = {"outcome": "unconfirmed", "why": "turn_cut"}     # N ended with the process, or given up
+            elif getattr(s.provider, "steer_named", None) is not None:
+                # Claude (review round 1, ruling A): N's own result with exactly [N, S] is `in_turn`; the S-only
+                # result inside N's own bracket is N's, S `unconfirmed`; any other native end of N with S written
+                # whole holds N's end (S is queued in the CLI): `_hold`.
+                if evidence == "n_with_s":
+                    outcome = {"outcome": "in_turn", "why": "answered"}
+                elif evidence == "s_only":
+                    outcome = {"outcome": "unconfirmed", "why": "s_only"}
+                else:
+                    return HOLD
             else:
                 said = getattr(s.provider, "steer_result", lambda: None)()
-                if said == "hold":
-                    return HOLD     # Claude: S is queued in the CLI, N's end is held (`_hold`); nothing decided
                 outcome = ({"outcome": "in_turn", "why": "answered"} if said == "ok" else
                            {"outcome": "not_delivered", "why": "refused"} if said == "refused" else
-                           {"outcome": "unconfirmed", "why": "s_only"} if said == "s_only" else
                            {"outcome": "unconfirmed", "why": "no_answer" if said is None else "other_answer"})
             slot.outcome = outcome
+        done = getattr(s.provider, "steer_done", None)
+        if done is not None:
+            done()      # (Claude: the attempt is retired before any further frame is read)
         if slot.mark is None or s.child is None:
             s.steer = None      # decided, and nothing of it is left to write
         log.info("session %s: the steer into message %s: %s (%s)", s.session_id, msg_id, outcome["outcome"],
@@ -2179,16 +2252,62 @@ class SessionHost:
     def _hold(self, s: Session, end: HostEvent, now: float, out: list[HostEvent]) -> None:
         """N's native end came and a steer written whole into N is not settled by it: N's end is held (module text).
         N stays in flight (nothing else is written; the node reports nothing of N), on the bound of a turn timeout
-        from now, and the checkpoint (`held`: N's native end, as it came) goes to the node once."""
-        s.held = _Held(end, now)
+        from now, and the checkpoint (`held`: N's native end, as it came) goes to the node once. In an incarnation
+        already unverified, or after a deviation in this attempt, nothing can prove S quiet: the finalizer, at once
+        (`_hold_pass`)."""
+        slot = s.steer
+        s.held = _Held(end, now, lost=bool(slot is not None and slot.lost) or not getattr(s.provider, "verified", True))
         s.busy_since = now
+        facts = getattr(s.provider, "steer_facts", None)
+        if facts is not None:
+            facts(phase="held")
         out.append(HostEvent(s.session_id, "held", end.message_id, ok=end.ok, denials=end.denials,
                              meta=dict(end.meta), detail=end.detail, text=end.text, answered=end.answered))
         log.info("session %s: the end of message %s is held while the steer into it is unresolved", s.session_id,
                  end.message_id)
 
+    def _steer_adjudicate(self, s: Session, ev: Event, now: float, out: list[HostEvent]) -> bool:
+        """THE one adjudicator of the evidence for a Claude steer S after N's native end, and of a deviation before it
+        (review round 1, ruling A; N's end itself is `_steer_end`'s, called from here's caller under the same latch).
+        Inside the stop latch's lock: evidence read once the node began to stop never counts (rule 2), so the stop of
+        every turn decides S by what was adjudicated before. It decides, records and publishes; the adapter only
+        classified. True: the event was S's own (no message's), and nothing more of it is handled."""
+        slot, held = s.steer, s.held
+        own = ev.turn == "steer"
+        if ev.steer is None or slot is None or slot.outcome is not None:
+            return own
+        with self._steer_stop_lock:
+            if slot.stopping or self.steer_stopped:
+                return own      # after the latch: no evidence counts for S
+            if ev.steer == "lost":
+                slot.lost = True
+                if held is not None:
+                    held.lost = True
+                return own
+            if held is None or held.fenced_at is not None:
+                return own      # N's end (n_with_s, n_without_s, s_only) is decided at N's end (`_steer_end`)
+            if ev.steer == "s_open" and not held.s_turn:
+                held.s_turn, s.busy_since = True, now     # S's own turn: a fresh clock (part D)
+                facts = getattr(s.provider, "steer_facts", None)
+                if facts is not None:
+                    facts(phase="s_turn")
+                return True
+            if ev.steer == "s_end" and held.s_turn:
+                self._publish_hold(s, out, {"outcome": "next_turn", "why": "own_turn", "result": {
+                    "ok": bool(ev.ok), "detail": ev.detail[:300], "denials": list(ev.denials), "meta": dict(ev.meta),
+                    "text": ev.text, "answered": bool(ev.answered)}})
+                return True
+            if ev.steer == "s_consumed" and not held.s_turn:
+                self._publish_hold(s, out, {"outcome": "unconfirmed", "why": "consumed"})
+                return own
+        return own
+
     def _publish_hold(self, s: Session, out: list[HostEvent], steer: dict) -> None:
-        """N's end, once: its native end unaltered plus S's outcome (`steer`), then what waited behind it."""
+        """N's end, once: its native end unaltered plus S's outcome (`steer`), then what waited behind it. The
+        attempt is retired in the adapter FIRST, before any further frame is read (ruling A)."""
+        done = getattr(s.provider, "steer_done", None)
+        if done is not None:
+            done()
         held, s.held = s.held, None
         slot = s.steer
         if slot is not None and slot.into == held.end.message_id:
@@ -2202,13 +2321,17 @@ class SessionHost:
                  steer["outcome"], steer["why"])
         out.append(dataclasses.replace(held.end, steer=dict(steer)))
         out.extend(held.after)
-        self._save_state()
+        try:
+            self._save_state()
+        except Exception:
+            log.exception("session %s: could not record the sessions' state after a held end", s.session_id)
 
     def _finalize_hold(self, s: Session, why: str, out: list[HostEvent]) -> None:
-        """The finalizer (part D) on any end the host makes of a held N: S as what was read decides it (`next_turn`
-        failed if S's own turn was proved, else `unconfirmed`). Published at once when the process is gone, at a stop
-        of every turn or shutdown (main's point), or once the node began to stop; otherwise after the caller's stop,
-        when the group is gone or 2 x kill_grace has passed (`_hold_fence`)."""
+        """The finalizer (part D) on any end the host makes of a held N: S as what was adjudicated decides it
+        (`next_turn` failed if S's own turn was proved, else `unconfirmed`). Published at once when the process is
+        gone, at a stop of every turn, at shutdown, at an unexpected error's end (rule 5), or once the node began to
+        stop; otherwise after the caller's stop, when the group is gone or 2 x kill_grace has passed (`_hold_fence`,
+        checked first in every tick, before any read: ruling B)."""
         held = s.held
         if held.decided is None:
             if held.s_turn:
@@ -2217,7 +2340,7 @@ class SessionHost:
                                            "meta": {}, "text": "", "answered": False}}
             else:
                 held.decided = {"outcome": "unconfirmed", "why": "turn_cut"}
-        if s.child is None or self._every_turn or self.steer_stopped:
+        if s.child is None or self._at_once or self.steer_stopped:
             self._publish_hold(s, out, held.decided)
             return
         if held.fenced_at is None:
@@ -2225,7 +2348,8 @@ class SessionHost:
 
     def _hold_fence(self, s: Session, now: float, out: list[HostEvent]) -> None:
         """A held end the finalizer decided: published once the process is gone or the bound of the stop has
-        passed (2 x kill_grace from it); a member that lingers longer stays under main's stopping-group barrier."""
+        passed (2 x kill_grace from it); a member that lingers longer stays under main's stopping-group barrier.
+        Called first for every session in every tick, before any read (ruling B), and after each reap."""
         held = s.held
         if held is None or held.fenced_at is None:
             return
@@ -2233,19 +2357,24 @@ class SessionHost:
             self._publish_hold(s, out, held.decided)
 
     def _hold_pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
-        """What the adapter's evidence says of a held end, after the pass's reads: S consumed by another bracket ends
-        the hold (`unconfirmed`); a deviation means nothing later can prove S quiet: the finalizer, at once."""
-        held = s.held
+        """After the pass's reads, for a held end: the finalizer at once when the adjudicated evidence says nothing
+        can prove S quiet (`lost`), or when the attempt's own contact clock ran out or the node's write authority is
+        gone (the cut, as for any live attempt: ruling A)."""
+        held, slot = s.held, s.steer
         if held is None or held.fenced_at is not None or s.child is None or s.stopping_since is not None:
             return
-        state = getattr(s.provider, "steer_hold_state", lambda: None)()
-        if state == "consumed":
-            self._publish_hold(s, out, {"outcome": "unconfirmed", "why": "consumed"})
-        elif state == "lost":
-            now = self._drain_before_stop(s, now, out)
-            if s.held is held:
-                self._fail(s, "the process could not show that the steer was settled", out)
-                self._stop(s, now, at_signal=True)
+        why = None
+        if held.lost:
+            why = "the process could not show that the steer was settled"
+        elif slot is not None and (slot.contact_ran_out(now) or (
+                self.steer_authority is not None and not self.steer_authority(s))):
+            why = "the steer's contact with the hub ran out"
+        if why is None:
+            return
+        now = self._drain_before_stop(s, now, out)
+        if s.held is held:
+            self._fail(s, why, out)
+            self._stop(s, now, at_signal=True)
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
         try:
@@ -2465,14 +2594,14 @@ class SessionHost:
         hub, so nobody could see or stop the turn). Idle processes and the sessions themselves stay."""
         out: list[HostEvent] = []
         now = self.clock()
-        self._every_turn = True     # a held end is published here, at main's point (the shutdown simplification)
+        self._at_once = True     # a held end is published here, at main's point (the shutdown simplification)
         try:
             for s in self.sessions.values():
                 if s.child is not None and s.busy and not s.ended:
                     self._fail(s, detail[:300], out)
                     self._stop(s, now)
         finally:
-            self._every_turn = False
+            self._at_once = False
         if out:
             self._save_state()
         return out
@@ -2486,13 +2615,13 @@ class SessionHost:
         out: list[HostEvent] = []
         now = self.clock()
         live = [s for s in self.sessions.values() if s.child is not None]
-        self._every_turn = True     # a held end is published here, at main's point (the shutdown simplification)
+        self._at_once = True     # a held end is published here, at main's point (the shutdown simplification)
         try:
             for s in live:
                 self._fail(s, "the session host shut down", out)
                 self._stop(s, now)
         finally:
-            self._every_turn = False
+            self._at_once = False
         def going(s: Session) -> bool:
             return s.child.poll() is None or self.group_alive(s.child.pid)
         deadline = self.clock() + self.kill_grace

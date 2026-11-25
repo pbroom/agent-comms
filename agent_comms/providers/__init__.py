@@ -50,6 +50,11 @@ KINDS = ("ready", "turn_started", "turn_ended", "approval_requested", "fatal", "
 # of a steer written into the turn in flight, after that turn's end (Claude steering, DESIGN_NOTES "Mid-turn steering,
 # step 3"): the host never settles a message by it either, and reads it only for the steer it holds.
 OWNERS = ("order", "own", "other", "steer")
+# Claude steering's typed evidence for the steer attempt the host holds (`Event.steer`; providers/claude.py, session_host
+# `_steer_adjudicate`): what ONE frame proves about S, given the attempt's facts, never more. N's own result with S
+# in it, or without; the S-only result inside N's own bracket; S's own turn opened, or ended (with its result); S
+# consumed by another bracket's terminal result; verification lost while the attempt is live.
+EVIDENCE = ("n_with_s", "n_without_s", "s_only", "s_open", "s_end", "s_consumed", "lost")
 # What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"; steering:
 # "Mid-turn steering, loose contract"). Codex's adapter steers (`turn/steer` into a turn proved to be the message's);
 # Claude's steers only in a verified process of a version that passed gate M8 (step 3: providers/claude.py STEER_MODES).
@@ -146,12 +151,15 @@ class Event:
     answered: bool = field(default=False, compare=False)     # turn_ended: the provider took the turn (above)
     usage: list[dict[str, Any]] | None = field(default=None, compare=False)     # `usage` only (above)
     turn: str = field(default="order", compare=False)     # turn_started / turn_ended: whose turn (OWNERS, above)
+    steer: str | None = field(default=None, compare=False)    # Claude steering: typed evidence (EVIDENCE, above)
 
     def __post_init__(self):
         if self.kind not in KINDS:
             raise ValueError(f"unknown provider event kind {self.kind!r}")
         if self.turn not in OWNERS:
             raise ValueError(f"unknown turn owner {self.turn!r}")
+        if self.steer is not None and self.steer not in EVIDENCE:
+            raise ValueError(f"unknown steer evidence {self.steer!r}")
 
 
 class ProviderSession(Protocol):

@@ -770,16 +770,20 @@ def test_the_three_outcome_mode_an_init_echoing_s_proves_nothing(henv, monkeypat
 
 
 def test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn(henv, monkeypatch):
-    """Only an `init` echoing EXACTLY [S] opens S's own turn; [S, X] mentions S and proves nothing (H-2): its
-    terminal result listing S consumed it, `unconfirmed`."""
+    """Review round 1, ruling A: only an `init` listing exactly [S] opens S's own turn. [S, X] matches no predicate:
+    it neither opens, ends nor releases anything for S, and an [S] result in no bracket after it releases nothing
+    either; the hold runs to its bound (the finalizer: `unconfirmed`)."""
     s, child, n = steered(henv, monkeypatch)
     child.emit(owned(n))
     henv.host.tick()
     child.emit(vinit(S, "0be7c0de-0000-4000-8000-000000000001"))
     assert henv.host.tick() == [] and not s.held.s_turn
     child.emit(owned(S, text="?"))
-    [end] = ends(henv.host.tick())
-    assert end.steer == {"outcome": "unconfirmed", "why": "consumed"}
+    assert henv.host.tick() == [] and s.held is not None
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    [end] = ends(out) or ends(henv.host.tick())
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
 
 def test_o_a_checkpoint_whose_steer_was_never_listed_is_refused(env):
@@ -845,3 +849,241 @@ def test_o_a_checkpoint_for_a_queued_message_or_a_settled_n_is_refused_with_its_
     tick(env)
     r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"message": 1}})
     assert r.status_code == 409 and "it is settled" in r.text
+
+
+# ---------------------------------------------------------------- review round 1: the blockers' replays
+
+
+def _next_turn_done(henv, monkeypatch):
+    """N held, S's own turn opened and ended: `next_turn` published. (session, child)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S), owned(S, text="S"))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and s.held is None
+    return s, child
+
+
+def _ordinary_turn(henv, child, mid, text="M's reply"):
+    henv.host.send(SID, f"message {mid}", message_id=mid)
+    out = henv.host.tick()
+    assert (("delivered", mid) in [(e.kind, e.message_id) for e in out]), out
+    m = uuid_of(child)
+    child.emit(vinit(m), owned(m, text=text))
+    return [e for e in henv.host.tick() if e.message_id == mid]
+
+
+@pytest.mark.parametrize("how", ["next_turn", "consumed"])
+def test_r1_b1_after_publication_the_next_ordinary_turn_is_its_own(henv, monkeypatch, how):
+    """Blocker 1 (Sol's replay): result[N], init[S], result[S], then init[M], result[M]: M's frames are M's (and the
+    same after `consumed`): the attempt is retired before any further frame is read."""
+    if how == "next_turn":
+        s, child = _next_turn_done(henv, monkeypatch)
+    else:
+        s, child, n = steered(henv, monkeypatch)
+        child.emit(owned(n))
+        henv.host.tick()
+        child.emit(vinit(), owned(S, text="took S") | {"origin": NOTIFY})
+        [end] = ends(henv.host.tick())
+        assert end.steer["why"] == "consumed"
+    got = _ordinary_turn(henv, child, "2")
+    assert [(e.kind, e.ok, e.text) for e in got if e.kind == "turn_ended"] == [("turn_ended", True, "M's reply")]
+    assert ("turn_started", "2") in [(e.kind, e.message_id) for e in got]
+
+
+def test_r1_b1_a_cli_turn_in_the_same_read_as_ss_result_holds_the_barrier(henv, monkeypatch):
+    """Blocker 1: S's result and an unmarked `init` in the same read: the CLI's own turn opens after publication,
+    so the next message waits behind it (step 1's barrier), as without a steer."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n))
+    henv.host.tick()
+    child.emit(vinit(S), owned(S, text="S"), vinit())
+    assert ends(henv.host.tick())[0].steer["outcome"] == "next_turn"
+    assert s.provider.holds_turns(), "the CLI's own turn is open"
+    henv.host.send(SID, "next", message_id="2")
+    henv.host.tick()
+    assert s.writing is None and s.inbox and s.inbox[0].id == "2", "the next message waits behind the CLI's turn"
+
+
+def test_r1_b1_a_second_steer_into_a_later_turn_works_as_the_first(henv, monkeypatch):
+    s, child = _next_turn_done(henv, monkeypatch)
+    henv.host.send(SID, "second", message_id="2")
+    henv.host.tick()
+    m = uuid_of(child)
+    child.emit(vinit(m))
+    henv.host.tick()
+    s2 = "5e7e7e7e-0000-4000-8000-000000000002"
+    henv.host.steer_offer(SID, "2", s2, TEXT, authorized=True)
+    henv.host.tick()
+    child.emit(owned(m, s2, text="M with S2"))
+    [end] = [e for e in henv.host.tick() if e.kind == "turn_ended"]
+    assert end.message_id == "2" and end.steer == {"outcome": "in_turn", "why": "answered"}
+
+
+def test_r1_b1_an_approval_request_in_ss_own_turn_is_not_ns(henv, monkeypatch):
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n))
+    henv.host.tick()
+    child.emit(vinit(S), {"type": "control_request", "request_id": "x",
+                          "request": {"subtype": "can_use_tool", "tool_name": "Bash"}})
+    out = henv.host.tick()
+    assert not [e for e in out if e.kind == "approval_requested"] and not s.waiting
+    child.emit(owned(S, text="S"))
+    henv.host.tick()
+    assert not s.waiting
+
+
+@pytest.mark.parametrize("init", [
+    {"user_message_uuids": [S, S]}, {"user_message_uuids": S}, {"user_message_uuids": [S], "origin": NOTIFY},
+    {"user_message_uuids": [S], "claude_code_version": "2.1.329"},
+    {"user_message_uuids": [S], "capabilities": ["interrupt_receipt_v1"]}],
+    ids=["twice", "scalar", "notification", "other_version", "no_lifecycle"])
+def test_r1_b2_only_the_exact_init_opens_ss_own_turn(henv, monkeypatch, init):
+    """Blocker 2: S's own turn opens only on an `init` listing exactly [S], no origin, of a version in STEER_MODES
+    with the lifecycle capability; none of these does, and none makes a later [S] result `next_turn`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n))
+    henv.host.tick()
+    frame = {k: v for k, v in vinit().items() if k != "user_message_uuids"} | init
+    child.emit(frame)
+    henv.host.tick()
+    assert s.held is None or not s.held.s_turn
+    child.emit(owned(S, text="S"))
+    out = henv.host.tick()
+    assert all(e.steer is None or e.steer["outcome"] != "next_turn" for e in ends(out))
+
+
+def test_r1_b2_a_late_n_s_result_in_the_hold_is_no_evidence(henv, monkeypatch):
+    """Blocker 2 (departure 3 overruled): a late [N, S] during the hold releases nothing; S's own turn that follows
+    gives S's own reply, never the late frame's."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(owned(n, S, text="late"))
+    assert henv.host.tick() == [] and s.held is not None
+    child.emit(vinit(S), owned(S, text="S's own"))
+    [end] = ends(henv.host.tick())
+    assert end.text == "N" and end.steer["result"]["text"] == "S's own"
+
+
+def test_r1_b2_an_s_x_result_before_ns_end_is_not_ns_reply(henv, monkeypatch):
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(S, "0be7c0de-0000-4000-8000-000000000001", text="not N's"))
+    assert not ends(henv.host.tick()) and s.in_flight.id == "1"
+    child.emit(owned(n, S, text="N's"))
+    [end] = ends(henv.host.tick())
+    assert end.text == "N's"
+
+
+def test_r1_b2_an_unverifying_init_in_the_hold_finalizes_it(henv, monkeypatch):
+    """Blocker 2: an unmarked `init` of a version not VERIFIED during the hold loses verification: typed `lost`, the
+    finalizer at once, S `unconfirmed`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n))
+    henv.host.tick()
+    child.emit(vinit(version="2.1.329"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"} and child.terminated
+
+
+def test_r1_b3_evidence_after_the_stop_latch_never_counts(henv, monkeypatch):
+    """Blocker 3 (Sol's replay): hold N, set the latch, then S's buffered init and result: not `next_turn`; the stop
+    of every turn publishes N's held end with S by what was adjudicated before (`unconfirmed`)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.steer_stopping()
+    child.emit(vinit(S), owned(S, text="S"))
+    out = henv.host.tick() + henv.host.stop_all()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r1_b3_evidence_after_the_latch_in_ss_own_turn_is_next_turn_cut(henv, monkeypatch):
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S))
+    henv.host.tick()
+    henv.host.steer_stopping()
+    child.emit(owned(S, text="S"))
+    out = henv.host.tick() + henv.host.stop_all()
+    [end] = ends(out)
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+
+
+@pytest.mark.parametrize("when", ["held", "s_turn"])
+def test_r1_b3_the_steers_contact_running_out_in_the_hold_cuts_it(henv, monkeypatch, when):
+    """Blocker 3: the attempt's own contact clock runs out during the hold (listing GETs do not renew it): the cut,
+    the finalizer, N's held end unaltered; S `unconfirmed`, or `next_turn` failed when its own turn was proved."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    if when == "s_turn":
+        child.emit(vinit(S))
+        henv.host.tick()
+    henv.clock.advance(21)
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and child.terminated
+    assert end.steer["outcome"] == ("unconfirmed" if when == "held" else "next_turn")
+
+
+def test_r1_b4_a_read_error_while_held_publishes_n_and_ended_at_once(henv, monkeypatch):
+    """Blocker 4 (rule 5): a read that raises while N's end is held: N's held end and `ended`, at once."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+
+    def broken():
+        raise OSError("read failed")
+    child.read_lines = broken
+    out = henv.host.tick()
+    kinds = [(e.kind, e.message_id) for e in out]
+    assert ("turn_ended", "1") in kinds and ("ended", None) in kinds
+    assert kinds.index(("turn_ended", "1")) < kinds.index(("ended", None))
+    assert ends(out)[0].text == "N"
+
+
+def test_r1_b4_a_fenced_end_is_published_at_its_deadline_whatever_the_reads_do(henv, monkeypatch):
+    """Blocker 4 (ruling B): a close fenced N's held end; the reads fail on every later tick; the deadline, checked
+    first in the tick, still publishes N's end and `ended`, once."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    henv.host.close(SID, "closed")
+
+    def broken():
+        raise OSError("read failed")
+    child.read_lines = broken
+    got = []
+    for _ in range(5):
+        henv.clock.advance(5)
+        got += henv.host.tick()
+    assert len(ends(got)) == 1 and [e.kind for e in got].count("ended") == 1
+
+
+def test_r1_s2_byte_evidence_is_per_attempt(henv, monkeypatch):
+    """Should 2 (Sol's replay): S1 written into N1; then S2 staged into N2 with zero bytes and retired; a plain
+    result for N2 is N2's, as on main (only an attempt a byte of which went forbids the order fallback)."""
+    s, child = _next_turn_done(henv, monkeypatch)
+    henv.host.send(SID, "second", message_id="2")
+    henv.host.tick()
+    m = uuid_of(child)
+    child.emit(vinit(m))
+    henv.host.tick()
+    child.accept = 0
+    s2 = "5e7e7e7e-0000-4000-8000-000000000002"
+    henv.host.steer_offer(SID, "2", s2, TEXT, authorized=True)
+    henv.host.tick()
+    henv.host.steer_revoke(SID, s2, "omitted")
+    henv.host.tick()
+    child.accept = None
+    child.emit(plain(text="N2's"))
+    [end] = [e for e in henv.host.tick() if e.kind == "turn_ended"]
+    assert end.message_id == "2" and end.text == "N2's" and s.provider.verified
