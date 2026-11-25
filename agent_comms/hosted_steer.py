@@ -50,6 +50,8 @@ STEER_LINE = ("If you are still working on that turn, take this into account the
 REFUSED = {
     "off": "steering is switched off on this hub ([dispatch.sessions] steer = false)",
     "unreadable": "steering is off on this hub: its [dispatch.sessions] settings could not be read",
+    "rejected": ("steering is off on this hub: its settings were rejected at the last reload (fix board.toml or "
+                 "board.local.toml; until they load, no new steer is taken)"),
     "ended": "the session has ended",
     "closing": "the session is being closed",
     "protocol": ("its node {node} speaks session protocol {tree}; steering needs {need} (update the node: `board node` "
@@ -103,27 +105,43 @@ def unsettled(conn, session_id: str) -> dict | None:
     return next((s for s in steers(conn, session_id) if s.get("outcome") is None), None)
 
 
-_unreadable_said: set[str] = set()     # the settings errors already said in the hub's log (one line each)
+_unreadable_last: str | None = None     # the settings error last said in the hub's log (one line per change)
 
 
 def off_reason(board: Board) -> str | None:
-    """`[dispatch.sessions] steer` on the hub (default on, also with no such table): None when on, else why new steers
-    are refused. Off for a drain: those already accepted are offered and settled as ever. A table that does not
-    validate (a value of the wrong type, an unknown key) turns steering OFF, as it leaves main's other settings of
-    that table at their defaults, which are off: the switch a rollback relies on fails closed (pre-merge review).
-    The hub says so once per error."""
+    """`[dispatch.sessions] steer` on the hub: None when steering is on, else why new steers are refused. Steers
+    accepted before are offered and settled as ever (the listing reads no setting). Fails closed (pre-merge review,
+    review round 11):
+    - "rejected": the hub's latest settings reload was rejected (`Board.settings_error`, set by `reload_settings`
+      and cleared by its next successful reload; it logs the rejection itself). The last good settings stay in force
+      for everything else, as on main; the edit may be the very one that turns steering off.
+    - "unreadable": the settings in force do not validate: `[dispatch]` or `[dispatch.sessions]` present but not a
+      table (`dispatch = false`, `sessions = []`), a value of the wrong type, an unknown key. Main's other readers
+      of that table fall back to their defaults, which are off. Said once in the hub's log per change of the error.
+    - "off": `steer = false`.
+    Absent (no `[dispatch]`, or no `[dispatch.sessions]`), steering is on: the design's default."""
+    import contextlib
     from .dispatch import SessionsConfig
+    global _unreadable_last
+    lock = getattr(board, "_settings_lock", None)
+    with lock if lock is not None else contextlib.nullcontext():
+        # ONE reading of the reload status and the table it goes with (as agent_accounts._snapshot reads them)
+        rejected, d = getattr(board, "settings_error", None), getattr(board.s, "dispatch", None)
+    if rejected is not None:
+        return "rejected"
     try:
-        on = SessionsConfig.from_dict((board.s.dispatch or {}).get("sessions", {})).steer
+        if d is not None and not isinstance(d, dict):
+            raise ValueError("[dispatch] must be a table")
+        on = SessionsConfig.from_dict((d or {}).get("sessions", {})).steer
     except (ValueError, AttributeError) as e:
-        what = str(e) if isinstance(e, ValueError) else "[dispatch] is not a table"
-        if what not in _unreadable_said:
-            _unreadable_said.add(what)
+        what = str(e)
+        if what != _unreadable_last:
+            _unreadable_last = what
             log.warning("the hub's [dispatch.sessions] settings could not be read (%s): steering is off until they "
                         "can be", what)
         return "unreadable"
+    _unreadable_last = None     # (read again: a recurrence is said again)
     return None if on else "off"
-
 
 
 def encoded_size(text: str) -> int:
