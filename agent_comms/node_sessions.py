@@ -226,6 +226,7 @@ class SessionRunner:
         self._last_contact = clock()
         self.lock = threading.Lock()                  # the host, between the loop, the watchdog and shutdown()
         self.watched: list[HostEvent] = []            # what the watchdog's self-stop reported, for the loop to post
+        self.watched_steer: list[HostEvent] = []      # ... of a steer attempt's session: posted before LOST detection
         # When the node was last seen past its self-stop deadline, or None: from then on nothing starts until a
         # listing from a fetch SENT after that moment has been applied (`_may_start`, `pass_once`).
         self.latched_at: float | None = None
@@ -379,6 +380,8 @@ class SessionRunner:
         return "restarted_by" not in event or "restart" in self.hub_features or self.features_known
 
     def _emit(self, events: list[HostEvent]) -> None:
+        if self.watched_steer:  # (a steer attempt's watched ends first, as in `pass_once`)
+            events, self.watched_steer = self.watched_steer + list(events), []
         if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
             events, self.watched = self.watched + list(events), []
         for e in events:
@@ -459,8 +462,19 @@ class SessionRunner:
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
                 sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
-                answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
-                self.report_ack[sid] = (sent, answer.get("in_flight") if isinstance(answer, dict) else None)
+                try:
+                    answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                except httpx.HTTPStatusError as e:
+                    if getattr(e.response, "status_code", None) != 422 or not any("steer" in x for x in body["events"]):
+                        raise
+                    # A hub that named `steer` refuses it now (rolled back): N's end goes again at once, in this very
+                    # flush (the last one of a shutdown included), without the extension (S2-07).
+                    log.warning("the hub refused the report for session %s with a steer outcome (422): sending it "
+                                "again without the outcome", sid)
+                    body["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
+                    sent = self.clock()
+                    answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=body)
+                self._ack_report(sid, sent, answer)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
@@ -571,6 +585,15 @@ class SessionRunner:
             if self.stopping.is_set():
                 return ok
             now = self.clock()
+            if self.watched_steer:
+                # What the watchdog drained or decided about a steer attempt (N's native end, a cut) goes into the
+                # report queue BEFORE the listing is reconciled, so no synthetic LOST of N can come ahead of it (S2-06).
+                for e in self.watched_steer:
+                    if e.kind == "ended":
+                        self.ending.add(e.session_id)
+                        self.queue.pop(e.session_id, None)
+                    self._add(e.session_id, self._event(e))
+                self.watched_steer = []
             if data is not None:
                 self._reconcile(data, fetch_sent)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
@@ -604,6 +627,11 @@ class SessionRunner:
         if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
             log.warning("the hub's session list is not one; ignoring it")     # never read as "no sessions"
             return
+        # What this listing's hub says it takes, read FIRST: only a listing that names `steer` speaks for steers
+        # (an offer, or an omission that revokes); any other fences them (S2-05).
+        named = data.get("features")
+        features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
+        steer_aware = "steer" in features
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
         # Roots first, then each level under the one above it: a child is only opened under a parent that is open
@@ -710,11 +738,14 @@ class SessionRunner:
                                     "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
             self.queue[sid] = queue
-            self._steer_listed(sid, view, fetch_sent)
+            self._steer_listed(sid, view, fetch_sent, steer_aware)
         for sid, s in self.host.sessions.items():
             live = self.host.steer_live(sid)
             if live is not None and sid not in listed:
-                self.host.steer_revoke(sid, live[1], "omitted")     # not listed at all: an omission too
+                if steer_aware:
+                    self.host.steer_revoke(sid, live[1], "omitted")     # not listed at all: an omission too
+                else:
+                    self.host.steer_fence(sid)
             if sid not in listed and not s.ended:
                 # The hub ended it (closed while this node was away, or its record is gone): it must not go on.
                 self.dropped.add(sid)
@@ -738,12 +769,17 @@ class SessionRunner:
             for sid in [x for x in self.worktrees if x not in listed and x not in self.host.sessions]:
                 self._drop_worktree(sid)
         self.version = data.get("version") if isinstance(data.get("version"), str) else None
-        named = data.get("features")
-        features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
-        if ("restart" in features and "restart" not in self.hub_features) or (
-                "steer" in features and "steer" not in self.hub_features):
-            self.reported.clear()       # a hub that takes `modes` (or `steer` in them) now: every session says it again
+        if "restart" in features and "restart" not in self.hub_features:
+            self.reported.clear()       # a hub that takes `modes` now: every session says it again
+        elif "steer" in features and "steer" not in self.hub_features:
+            # ... and one that takes `steer` in them now: only a session whose report gains it says it again (S2-09);
+            # a Claude session's status, unchanged, is not resent.
+            for sid, st in self.status.items():
+                if "steer" in st[4]:
+                    self.reported.pop(sid, None)
         self.hub_features, self.features_known = features, True
+        for sid in [x for x in self.report_ack if x not in self.host.sessions]:
+            del self.report_ack[sid]        # acknowledgements are kept for open sessions only (S2-13)
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 
@@ -1006,7 +1042,7 @@ class SessionRunner:
             if s.ended and s.child is None:
                 self.host.forget(sid)
                 for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree,
-                          self.parent_of):
+                          self.parent_of, self.report_ack, self.steer_seen):
                     d.pop(sid, None)
                 # The session is gone here, so "the hub no longer lists it: report nothing" has done its work. It
                 # must be lifted BEFORE the worktree is looked at: that its worktree was removed is the one thing
@@ -1031,14 +1067,31 @@ class SessionRunner:
     # ------------------------------------------------------------ write authority for steers (the module text)
 
     def note_hello(self, sent: float) -> None:
-        """node.py: a hello the hub acknowledged, SENT at `sent` (this loop's clock)."""
-        self.hello_ack = max(self.hello_ack, sent)
+        """node.py: a hello the hub acknowledged, SENT at `sent` (this loop's clock). Authority that has run out by
+        now is latched as lost BEFORE this acknowledgement counts (S2-03): one sent before the deadline and read
+        after it never revives it."""
+        with self.lock:
+            self._steer_watch(self.clock())
+            self.hello_ack = max(self.hello_ack, sent)
+
+    def _ack_report(self, sid: str, sent: float, answer: Any) -> None:
+        """A report the hub acknowledged, SENT at `sent`: evidence for exactly this session and the integer turn its
+        answer names in flight (never a bool or another session's answer), counted only after authority that has
+        run out by now was latched as lost (S2-03). Kept only for a session open here (S2-13)."""
+        with self.lock:
+            self._steer_watch(self.clock())
+            if sid not in self.host.sessions:
+                self.report_ack.pop(sid, None)
+                return
+            ok = isinstance(answer, dict) and answer.get("session_id") == sid
+            n = answer.get("in_flight") if ok else None
+            self.report_ack[sid] = (sent, n if type(n) is int else None)
 
     def _steer_contact(self, sid: str, n: int, hello: float, reports: dict) -> float:
         """The send time of the latest hub-acknowledged evidence that this node holds N: a hello, or a report on the
-        session whose answer named N as its turn in flight."""
+        session whose answer named N (an integer, exactly) as its turn in flight."""
         sent, in_flight = reports.get(sid, (float("-inf"), None))
-        return max(hello, sent if in_flight == n else float("-inf"))
+        return max(hello, sent if type(in_flight) is int and type(n) is int and in_flight == n else float("-inf"))
 
     def _steer_check(self, sid: str, n: int, now: float) -> bool:
         """The write authority for N holds NOW, and has held without a break since it was granted (`steer_seen`: the
@@ -1064,11 +1117,17 @@ class SessionRunner:
         self.host.steer_revoke(s.session_id, slot.uuid, "contact")
         return False
 
-    def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None) -> None:
+    def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
         """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or
-        an omission (the held steer is revoked for good)."""
-        item = view.get("steer")
+        an omission (the held steer is revoked for good). `aware`: the listing names `steer` among its features;
+        one that does not (an older hub, or a capability not known) only FENCES the held steer: nothing of it is
+        written, no offer of its is taken, nothing is revoked (S2-05)."""
         live = self.host.steer_live(sid)
+        if not aware:
+            if live is not None:
+                self.host.steer_fence(sid)
+            return
+        item = view.get("steer")
         ok = (isinstance(item, dict) and type(item.get("into")) is int and isinstance(item.get("uuid"), str)
               and 0 < len(item["uuid"]) <= 64 and isinstance(item.get("text"), str) and item["text"].strip() != "")
         if not ok:
@@ -1182,9 +1241,10 @@ class SessionRunner:
                 if stopped and now - due > allowed:
                     log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop held "
                                 "its lock that long (limit e)", now - due)
-                self.watched += stopped
+                self.watched += [e for e in stopped if e.steer is None]
+                self.watched_steer += [e for e in stopped if e.steer is not None]
             self._steer_watch(now)
-            self.watched += self.host.steer_deadlines()     # a half-written steer frame past its limit is cut
+            self.watched_steer += self.host.steer_deadlines()   # a half-written steer frame past its limit is cut
             for sid, at in self.host.kill_due():
                 if now - at > allowed:
                     log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the session "
@@ -1224,7 +1284,7 @@ class SessionRunner:
         with self.lock:
             # Every session holding a steer attempt is drained first: a native end already in its pipe counts.
             try:
-                self.watched += self.host.drain()
+                self.watched_steer += self.host.drain()
             except Exception:
                 log.exception("could not drain the sessions holding a steer")
             for s in self.host.sessions.values():
