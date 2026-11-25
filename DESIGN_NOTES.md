@@ -11041,9 +11041,17 @@ result turns and claims, and CLI text. The named changes:
   The golden's `zz_parity` (recorded on d4b92e5, normalized on its own so every earlier key keeps its placeholders)
   pins three runs against main: a cancel of a queued task right after the watchdog stopped the child's turn
   (R3-07's case), a shutdown with three ordinary sessions, and a flush under way when shutdown begins. No ordinary
-  difference remains. (Stronger, provisionally, under "Shutdown simplified", rule 7: with a steer attempt live too,
-  shutdown and every multi-session stop are main's, event for event and in timing, for every ordinary session and for
-  the steered one except the steer outcome its N end carries.) (A hello sent again after a 422 is now dated from the attempt that got through: that date is
+  difference remains. (Provisionally, under "Shutdown simplified", as ruled in review round 6:) with a steer attempt
+  live too, shutdown and every multi-session stop are main's event for event, for every ordinary session and for the
+  steered one except the steer outcome its N end carries. In TIMING one bounded difference is allowed: in a hold of
+  the node's loop lock in which a live attempt's turn ends on a single-session path (its exit, its timeout, a broken
+  pipe, a close, a cancel of it, the contact cut), its drain reads inline, within ONE drain budget for the whole hold
+  (STEER_DRAIN_SECONDS, 2 s, shared by the listing's reconciliation and both ticks). So ordinary sessions later in that
+  hold may act up to 2 s later than on main (plus at most one read, which can run past the deadline). Nothing
+  ordinary ever happens earlier than on main, and the ordinary sessions' events and signals keep main's order. Their
+  dating stays main's (the pass's own time), so an ordinary SIGKILL is never sent before main would send it, and its
+  grace measured from the actual SIGTERM may be up to that budget shorter. A steered session's signal is dated when it
+  is sent. (A hello sent again after a 422 is now dated from the attempt that got through: that date is
   the node's own steer evidence, never on the wire.)
 
 **The proof.** The golden recording (tests/golden_schema_free.py, fixtures/schema_free_main.json) is re-pinned to main
@@ -12660,12 +12668,13 @@ R4-03 to R4-08.
    live turn, and the contact cut. A pass that can touch several sessions shares ONE drain deadline,
    STEER_DRAIN_SECONDS (2 s) in all, from its first drain (`SessionHost.one_drain_budget`): `tick`, `steer_deadlines`
    (the watchdog's cuts) and the node's reconciliation of one listing (its closes and cancels). An attempt that cannot
-   be drained in what is left is stopped without a drain (rule 2). (Replaced in review round 5, R5-03, see "Review
-   round 5": `tick` keeps main's order for every session, a live attempt's exit or turn end is discovered and its
-   group fenced where main does it, and only its drain and N's decision wait until the pass's other work is done.
-   The first build's `_pass_groups`, the ordinary sessions' both loops first, is gone.) `_drain_before_stop`
-   returns the time to date the stop by, so no SIGTERM is backdated. The watchdog makes its cuts only after main's
-   SIGKILLs.
+   be drained in what is left is stopped without a drain (rule 2). (Review round 6 replaces round 5's deferral: a
+   live attempt's turn end is settled inline, at exactly the point main settles that process, its drain first and
+   then main's own handling with nothing cleared, reset or spawned in between; the one budget is per hold of the
+   node's loop lock. See "Review round 6" and part K's timing statement.) `_drain_before_stop` returns the clock
+   after the drain, so a steered SIGTERM is dated when it is sent. The watchdog makes its cuts only after main's
+   SIGKILLs. The stop latch is the evidence cutoff for every steer: no cut begins after it, a drain stops reading at
+   it, and N's own end read after it is no evidence for S.
 4. A 422 on a report carrying a steer outcome gets one immediate plain retry in the same flush: synchronous, with
    main's per-call timeout, each attempt with its own payload built from the unchanged body (R4-03). A failed call
    made under a listing's features forgets only those (`SessionRunner.features_gen`, counted at every listing): a
@@ -12675,9 +12684,10 @@ R4-03 to R4-08.
    (R4-08).
 6. R4-01 (b) stays: the stopping flag marks every held record before it is set, so no byte of S is written after the
    node began to stop.
-7. Parity, now stronger (part K): with no steer live, everything is main's, as before. With a steer live, shutdown and
-   multi-session stops are also main's, event for event and in timing, for every ordinary session, and for the
-   steered session too except the steer outcome carried on N's end.
+7. Parity (part K): with no steer live, everything is main's, as before. With a steer live, shutdown and
+   multi-session stops are also main's event for event, for every ordinary session, and for the steered session too
+   except the steer outcome carried on N's end. In timing, the bound of part K applies (round 6): one drain budget
+   per hold of the loop lock, never earlier than main, main's order.
 
 **What it withdraws.**
 - Design R11-04 (part O's bullet) and part O's "shutdown drains a live attempt across read budgets" row.
@@ -12703,12 +12713,16 @@ R4-03 to R4-08.
   within the listing's events. Not built.)
 - (Withdrawn in review round 5, R5-03: a live attempt's exit is discovered and fenced where main does it.)
 
-**What remains of structure 2, and every caller.**
-- `SessionHost._drain_before_stop`, called by `_reap` (a group left behind; the exit), `_hold_to_timeout` (after the
+**What remains of structure 2, and every caller** (as of review round 6: the drain, the one budget per hold, the
+stop latch as the cutoff).
+- `SessionHost._drain_before_stop` (inline; its reads `_drain_reads`, each under the stop latch's lock), called by
+  `_reap` (a group left behind; the exit, before anything of the process is let go of), `_hold_to_timeout` (after the
   interrupt; the plain branch), `_write` (a broken pipe), `close`, `cancel` (the live turn only) and `_steer_cut`.
-- `SessionHost.live_attempt`, used by those callers (round 5: `_pass_groups` is gone).
-- `SessionHost.one_drain_budget`, entered by `tick`, `steer_deadlines` and `SessionRunner.pass_once` around
-  `_reconcile` (round 5, R5-04: around the whole hold of the loop's lock).
+- `SessionHost.live_attempt`, used by those callers.
+- `SessionHost.one_drain_budget`, entered by `tick` (`_tick`), `steer_deadlines` and `SessionRunner.pass_once`
+  around its whole hold of the loop's lock.
+- The stop latch (`SessionHost.steer_stopped`, `_steer_stop_lock`): set by `steer_stopping`, read by
+  `_steer_gate_locked`, `steer_offer`, `_steer_cut`, `_drain_reads` and `_steer_end`.
 - STEER_DRAIN_SECONDS and STEER_DRAIN_READS.
 - `SessionRunner.watched_steer`, which now carries only the watchdog's cuts (S2-06's order before LOST, a
   single-session stop).
@@ -13074,3 +13088,148 @@ Scratchpad `mutate7.py`: the earlier rows whose lines this round changed, rewrit
   - `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (13 s, 23 checks).
   - `~/.codex/config.toml` sha256 unchanged through all of them:
     d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+### Review round 6 (on 85f0af0: CHANGES, three blockers, two shoulds) and what changed
+
+The reviewer judged the rebase clean for Claude. R5-01, R5-03 (the checkout barrier), R5-05, R5-06 and R4-01 (b)
+are resolved. All three blockers came from round 5's deferred drain. The coordinator withdrew the deferral: it bought
+"an ordinary session is never delayed by a drain" at the price of a second place where an old process is settled.
+Each blocker has a test that fails on 85f0af0's code by its behavioural assertion; this was checked on an export of
+85f0af0 with this round's tests. The owner's decision on the simplified shutdown rule is still pending.
+
+**Removed:**
+- `SessionHost._defer` and `_run_deferred`, and the deferral list in `_tick`;
+- `Session.draining`, and the pending-drain branches in `_pass`, `_read` and `_reap`;
+- `_reap_gone`, folded back into main's reap;
+- `_fence_then_decide` and its callers' deferral (the timeout's two branches, a broken pipe);
+- the cut's deferral;
+- `_kills_due`.
+
+Round 5's leftover (a steered session's next process starting after the ordinary sessions of its pass) is gone
+with the deferral. A live attempt's turn end is settled inline again, at exactly the point main settles that process.
+The bounded drain comes first, then main's own handling of that process, with nothing cleared, reset or spawned in
+between.
+
+**The pass now** (session_host.py):
+- `tick` (1132) is main's guarded wrapper.
+- `_tick` (1147) enters the one drain budget (1152). Inside the node's `pass_once`, that is the budget of the whole
+  hold of the loop's lock.
+- Loop 1 is main's reads and reaps for every session.
+- Loop 2 is main's `_pass` (1172), that is `_steps` (1176) then `_mark`. `_steps` runs: reads and reap; the unearned
+  write-timer check; `_take_back` (1189); `_decide` (1194); timeouts; the stopping branch; `_restart_pass`,
+  `_steer_pass` and `_write`.
+- A live attempt's drain (`_drain_before_stop`, 1066; its reads `_drain_reads`, 1041) runs inline in the same places
+  main settles the process:
+  - the reap's surviving-group branch (1372) and its exit (1381), before anything of the process is let go of;
+  - the turn timeout after the interrupt (1490) and the plain branch (1519);
+  - a cancel of the live turn (1783) and a broken pipe (2197);
+  - `close`;
+  - the cut (`_steer_cut`, 1993).
+
+**Findings:**
+- **R6-01** [blocker] The stop latch did not bound a cut or a drain.
+  - **Fix.** The stop latch is the evidence cutoff for every steer.
+    - A cut takes ownership under the latch's lock (session_host.py:2005). It cannot begin once the latch is set
+      (it then does nothing at all), and the latch is never set between its check and its first act.
+    - A drain looks at the latch before each read and makes the read under the latch's lock (1056). It stops reading
+      once the latch is set, and the latch is never set in the middle of a read.
+    - N's own end read after the latch is no evidence for S (`_steer_end`, 2024): `unconfirmed` once a byte was
+      written, `not_delivered` with none (rule 2).
+    - Main's ordinary handling of N and its pipe cleanup are unchanged.
+  - **Tests:**
+    - `test_r6_01_a_cut_that_meets_the_stop_latch_does_nothing`: the watchdog's precheck passes, then shutdown
+      publishes as the gate is asked. Nothing is read or signalled, and the frame stays partial.
+    - `test_r6_01_a_drain_reading_when_the_stop_latch_is_set_reads_no_more_and_nothing_after_counts`: the latch is
+      set during a close's first drain read. No further read is made, and the outcome is `unconfirmed`
+      (`turn_cut`), never `in_turn`.
+- **R6-02** [blocker] A timed-out, interrupted turn whose completion is behind the pass's own reads was reported
+  `ok=True`.
+  - **Fix.** The deferral is gone, so the exit's drain runs before the reap clears anything. The interrupted turn's
+    completion is read with `interrupted_at` still set.
+  - **Test:** `test_r6_02_a_timed_out_turn_whose_completion_is_behind_the_first_read_reports_the_timeout`. Here
+    only the drain reaches the completion. It is reported as main reports it when its read finds it: a timeout,
+    `ok=False`, with the timeout's detail. On 85f0af0 it is `ok=True`.
+- **R6-03** [blocker] A queued successor could start before the old process was settled.
+  - **Fix.** The deferral is gone. Nothing starts for a session until its old process is settled and cleaned up as
+    on main.
+  - **Test:** `test_r6_03_a_successor_never_starts_before_the_old_process_is_settled`. N+1 is queued in the host's
+    FIFO, and the process exits in the second loop. At the spawn, N is decided and the old process and transcript
+    are let go of. The new process's transcript stays open. On 85f0af0 the spawn comes with N still in flight.
+- **R6-04** [should] A steered signal could be backdated. Every steered single-session stop is now dated by the
+  clock after its drain, when it is sent. `_kills_due` is gone, so no SIGKILL comes before its grace from the actual
+  SIGTERM. Ordinary sessions keep main's dating (part K's timing statement). Covered by the bound test below
+  (`stopping_since` equals the time each steered SIGTERM was sent).
+- **R6-05** [should] The golden's echo allowance (`_item_echo`) now nulls a stripped id only in the userMessage item's
+  own `clientId`, and only for the start it answers in that transcript: that start's thread (`STARTS`), and the turn
+  this transcript's answer to that start named (`_turns_answered`).
+  - **Test:** `test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start`. Two known start ids swapped, the
+    right id in another thread, and the id in another field are all kept, so they would differ from main.
+  - The golden itself still passes: every echo in it is its own start's.
+- **The bound (part K's timing statement).** `test_sd_one_drain_budget_per_pass_bounds_how_late_an_ordinary_session_acts`
+  replaces `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it`. Four noisy steered sessions
+  and two ordinary ones reach their timeouts in one pass.
+  - The four share one 2 s deadline.
+  - The ordinary session before them is stopped at the pass's time. The one after them is stopped at most one budget
+    later, never earlier.
+  - Both ordinary sessions are dated with the pass's time, and every signal comes in main's order.
+  - Each steered stop is dated when it was sent.
+- **The comparison.** `_shutdown_run` now logs every start in the global order, in place of a final count.
+- **The model.** Three new events:
+  - `stop_at_cut`: shutdown between a cut's precheck and its ownership, through `steer_cut_hook`;
+  - `stop_in_drain`: shutdown during a drain read, through `steer_drain_hook`;
+  - `loop2_exit`: a second-loop exit with a successor queued. The checker requires that nothing starts before the
+    old process is settled, and that the new process's transcript is not closed.
+
+  Each has a scripted reach test:
+  - `test_model_reach_r6_01_the_stop_between_the_watchdogs_precheck_and_its_cut`
+  - `test_model_reach_r6_01_the_stop_during_a_drain_read`
+  - `test_model_reach_r6_03_a_second_loop_exit_with_a_queued_successor`
+
+  `install_race` and `stop_mid_pass` now also freeze the evidence at the latch. Over the 200 seeded sequences, the
+  stop at a cut fired in 2, the stop in a drain in 8, the second-loop exit in 36, the installation race in 5, the stop
+  mid-pass in 5 and the mixed pass in 21.
+- **Removed tests** (they asserted the deferral):
+  - `test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then`
+  - `test_r5_gap_a_cut_in_a_pass_never_delays_an_ordinary_timeout`
+  - `test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass[False|True]`
+- **Rewritten tests:**
+  - `test_rebase_a_claude_budget_and_a_codex_drain_never_meet` no longer claims an order against the drain. It now
+    asserts that no decision is made inside a drain, that Claude has its one decision point, that the drain reads only
+    Codex, and that Codex has no gate reading or budget.
+
+**Runs** at 3b74d69. The last code commit is aba070b; the commits after it change only tests and the golden.
+- `uv run pytest -q -p no:cacheprovider`: 4434 passed, 10 skipped.
+- The stand-in e2e in full: PASS (165 s, 345 checks).
+- `--only steering` with stand-ins: PASS (115 s, 57 checks).
+- `--only correlation` with stand-ins: PASS (11 s, 24 checks).
+- `--only steering` with the real Codex (codex-cli 0.171.0): PASS (64 s, 27 checks).
+- `--only steer` with the real Codex: PASS (34 s, 28 checks).
+- `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (14 s, 23 checks).
+- `~/.codex/config.toml` sha256 unchanged through all of them:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+**Gap tests** (added after the mutation run below):
+- `test_r6_gap_the_latch_waits_for_a_cuts_check_and_first_act`.
+- `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress`. Both run on threads, with a lock that says whether it was found held.
+- `test_r6_gap_ns_own_end_read_after_the_latch_is_no_evidence_for_s`.
+
+### Mutation check, review round 6
+
+Scratchpad `mutate8.py`. Round 5's R5-03 and R5-04 rows are withdrawn with the code they mutated: the deferral, the pending pipe, the kills between reads, and the fence-then-decide. The rows whose lines changed were rewritten, and one or more rows were added per change of this round. Every other earlier row stands as recorded. Each mutation was applied alone to an export of b39aff4. Of 14 run, 10 were caught on the first run. 3 of the 4 missed got the gap tests above and were caught when run again on 3b74d69. The other one is equivalent.
+
+| mutation | caught by |
+| --- | --- |
+| S2 the drain stops at N's end | `test_r3_04_a_sessions_drain_stops_once_ns_end_is_read` |
+| SD tick is one pass | `test_sd_one_drain_budget_per_pass_bounds_how_late_an_ordinary_session_acts` |
+| R6-02 the exit's drain before anything is let go of | `test_r3_05_a_native_end_behind_buffered_output_wins_over_the_reap` |
+| R6-02 the surviving group's drain before the stop | `test_sd_gap_a_reap_whose_group_is_left_behind_drains_first` |
+| R6-02 the timeout's drain (after the interrupt) | `test_r3_05_a_native_end_behind_buffered_output_wins_over_the_turn_timeout` |
+| R6-01 a cut cannot begin once stopping | `test_model_random_sequences_of_the_node_and_host_write_authority[2]` |
+| R6-01 a cut's check under the latch's lock | `test_r6_gap_the_latch_waits_for_a_cuts_check_and_first_act` (a test added after this run) |
+| R6-01 a drain stops reading at the latch | `test_r6_01_a_drain_reading_when_the_stop_latch_is_set_reads_no_more_and_nothing_after_counts` |
+| R6-01 a drain's read under the latch's lock | `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress` (a test added after this run) |
+| R6-01 N's end after the latch is no evidence | `test_r6_gap_ns_own_end_read_after_the_latch_is_no_evidence_for_s` (a test added after this run) |
+| R6-04 a steered stop dated when sent | `test_sd_one_drain_budget_per_pass_bounds_how_late_an_ordinary_session_acts` |
+| R6-05 the item's own field | EQUIVALENT: the JSON check after the replacement already requires that what was nulled is the item's own `clientId` (an id elsewhere in the line is kept) |
+| R6-05 the start it answers | `test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start` |
+| R6-05 the turn it answers | `test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start` |
