@@ -11043,15 +11043,22 @@ result turns and claims, and CLI text. The named changes:
   (R3-07's case), a shutdown with three ordinary sessions, and a flush under way when shutdown begins. No ordinary
   difference remains. (Provisionally, under "Shutdown simplified", as ruled in review round 6:) with a steer attempt
   live too, shutdown and every multi-session stop are main's event for event, for every ordinary session and for the
-  steered one except the steer outcome its N end carries. In TIMING one bounded difference is allowed: in a hold of
-  the node's loop lock in which a live attempt's turn ends on a single-session path (its exit, its timeout, a broken
-  pipe, a close, a cancel of it, the contact cut), its drain reads inline, within ONE drain budget for the whole hold
-  (STEER_DRAIN_SECONDS, 2 s, shared by the listing's reconciliation and both ticks). So ordinary sessions later in that
-  hold may act up to 2 s later than on main (plus at most one read, which can run past the deadline). Nothing
-  ordinary ever happens earlier than on main, and the ordinary sessions' events and signals keep main's order. Their
-  dating stays main's (the pass's own time), so an ordinary SIGKILL is never sent before main would send it, and its
-  grace measured from the actual SIGTERM may be up to that budget shorter. A steered session's signal is dated when it
-  is sent. (A hello sent again after a 422 is now dated from the attempt that got through: that date is
+  steered one except the steer outcome its N end carries. In TIMING (qualified in review round 7, R7-03):
+  - The traversal order and the deadline checks are main's.
+  - In a hold of the node's loop lock in which a live attempt's turn ends on a single-session path (its exit, its
+    timeout, a broken pipe, a close, a cancel of it, the contact cut), its drain reads inline, within ONE drain
+    budget for the whole hold (STEER_DRAIN_SECONDS, 2 s, shared by the listing's reconciliation and both ticks).
+  - So, in such a hold, readiness and poll timing may shift:
+    - ordinary sessions later in it may act up to that budget later than on main, plus the last read's overrun past
+      the deadline;
+    - an ordinary process's SIGKILL can come at the hold's second tick rather than at main's next poll (after its
+      deadline, never before it);
+    - ordinary events that become readable during a drain can be emitted in a different order than on main;
+    - an ordinary SIGTERM sent late carries main's pass timestamp, which shortens its actual grace by up to the drain
+      delay, the last read's overrun included.
+  - These are accepted under the simplified rule, pending the owner's decision.
+  - A steering-owned stop (a live attempt's, or the cut's) is dated by a clock read as its SIGTERM is sent (R7-02).
+  (A hello sent again after a 422 is now dated from the attempt that got through: that date is
   the node's own steer evidence, never on the wire.)
 
 **The proof.** The golden recording (tests/golden_schema_free.py, fixtures/schema_free_main.json) is re-pinned to main
@@ -12670,7 +12677,9 @@ R4-03 to R4-08.
    (the watchdog's cuts) and the node's reconciliation of one listing (its closes and cancels). An attempt that cannot
    be drained in what is left is stopped without a drain (rule 2). (Review round 6 replaces round 5's deferral: a
    live attempt's turn end is settled inline, at exactly the point main settles that process, its drain first and
-   then main's own handling with nothing cleared, reset or spawned in between; the one budget is per hold of the
+   then main's own handling, with none of the settlement state (adapter, turn state, transcript) cleared or reset
+   and nothing spawned in between. The broken-pipe and cut paths do clear the already-unwritable output buffer
+   before draining. The one budget is per hold of the
    node's loop lock. See "Review round 6" and part K's timing statement.) `_drain_before_stop` returns the clock
    after the drain, so a steered SIGTERM is dated when it is sent. The watchdog makes its cuts only after main's
    SIGKILLs. The stop latch is the evidence cutoff for every steer: no cut begins after it, a drain stops reading at
@@ -13107,8 +13116,9 @@ Each blocker has a test that fails on 85f0af0's code by its behavioural assertio
 
 Round 5's leftover (a steered session's next process starting after the ordinary sessions of its pass) is gone
 with the deferral. A live attempt's turn end is settled inline again, at exactly the point main settles that process.
-The bounded drain comes first, then main's own handling of that process, with nothing cleared, reset or spawned in
-between.
+The bounded drain comes first, then main's own handling of that process. None of the settlement state (adapter,
+turn state, transcript) is cleared or reset, and nothing is spawned, in between. (Round 7's wording: the broken-pipe
+and cut paths do clear the already-unwritable output buffer before draining.)
 
 **The pass now** (session_host.py):
 - `tick` (1132) is main's guarded wrapper.
