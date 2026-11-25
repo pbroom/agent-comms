@@ -206,6 +206,9 @@ class SessionRunner:
         # The evidence above, between the loop, node.py's hellos and the watchdog: its own short lock, never the
         # host's (R2-09). Order: the host's lock (where held), then this, then an attempt's.
         self.ack_lock = threading.RLock()
+        # (R8-04) The steer diagnostics already said, each once per held attempt (or report) and reason: (session,
+        # what, why). Kept for open sessions only.
+        self._said: set = set()
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
@@ -506,8 +509,9 @@ class SessionRunner:
                     except Exception as e:
                         if getattr(getattr(e, "response", None), "status_code", None) != 422:
                             raise
-                        log.warning("the hub refused the report for session %s with a steer outcome (422): sending "
-                                    "it again without the outcome", sid)
+                        self._say_once((sid, "422", tuple(x.get("message") for x in body["events"] if "steer" in x)),
+                                       logging.WARNING, "the hub refused the report for session %s with a steer "
+                                       "outcome (422): sending it again without the outcome", sid)
                         plain = {k: v for k, v in body.items() if k != "events"}
                         plain["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
                         sent = self.clock()
@@ -833,6 +837,7 @@ class SessionRunner:
         self.features_gen += 1
         for sid in [x for x in self.report_ack if x not in self.host.sessions]:
             del self.report_ack[sid]        # acknowledgements are kept for open sessions only (S2-13)
+        self._said = {k for k in self._said if k[0] in self.host.sessions}
 
     # ------------------------------------------------------------ child sessions (hosted_tree.py)
 
@@ -1222,19 +1227,36 @@ class SessionRunner:
             return
         n = item["into"]
         if held is not None and held.uuid == item["uuid"] and held.into != str(n):
-            log.warning("session %s: its steer offered for another turn: not taken", sid)
+            self._say_once((sid, held.uuid, "another turn"), logging.WARNING,
+                           "session %s: its steer offered for another turn: not taken", sid)
             return
         if held is not None and held.uuid != item["uuid"]:
             self.host.steer_revoke(sid, held.uuid, "omitted", held.into)
         fetch = self.last_fetch if self.last_fetch is not None and self.last_fetch[0] == fetch_sent else None
         big = len(json.dumps(item["text"]).encode()) > STEER_MAX_BYTES
+        why = err = None
         with self.ack_lock:     # no acknowledgement slips between the walk and the record's creation
             fresh, cover = self._offer_contact(sid, n, fetch, self.clock())
             try:
-                self.host.steer_offer(sid, str(n), item["uuid"], item["text"], authorized=fresh and not big,
-                                      refused="too_big" if big else None, cover_until=cover)
+                why = self.host.steer_offer(sid, str(n), item["uuid"], item["text"], authorized=fresh and not big,
+                                            refused="too_big" if big else None, cover_until=cover)
             except (LookupError, ValueError) as e:
-                log.warning("session %s: a steer offer could not be taken: %s", sid, e)
+                err = e
+        # (R8-04) Said outside the evidence lock (slow stderr never holds up an acknowledgement's publication), and
+        # once per held attempt (or offered steer) and reason, however many listings repeat it.
+        if why is not None:
+            self._say_once((sid, held.uuid if held is not None else item["uuid"], why), logging.INFO,
+                           "session %s: a steer offer that is %s: not taken", sid, why)
+        if err is not None:
+            self._say_once((sid, item["uuid"], f"{type(err).__name__}: {err}"), logging.WARNING,
+                           "session %s: a steer offer could not be taken: %s", sid, err)
+
+    def _say_once(self, key: tuple, level: int, msg: str, *args) -> None:
+        """A steer diagnostic, logged the first time its key is seen (R8-04)."""
+        if key in self._said:
+            return
+        self._said.add(key)
+        log.log(level, msg, *args)
 
     def _steer_watch(self, now: float) -> None:
         """Loss is one-way: a held attempt whose contact ran out is latched lost, in its own record. Called by the loop
