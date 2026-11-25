@@ -11438,9 +11438,15 @@ writes nothing, and settles every steer `not_delivered` (`not_owned`): it refuse
   the process exits included:
   `test_o_n_ended_with_the_process_after_a_byte_is_unconfirmed_even_with_a_matched_receipt[exit|timeout|cancel|close|stop_turns|stop_all]`,
   `test_e2e_in_process_a_partition_after_the_write_ends_n_with_the_self_stop_unconfirmed`.
-- R11-04 as far as step 2 has it (a Codex steer attempt, no hold): `signal()` drains first:
-  `test_host_drain_reads_a_native_end_before_a_shutdowns_signal`,
-  `test_e2e_in_process_shutdown_drains_a_steer_attempt_first`.
+- R11-04 as far as step 2 has it: WITHDRAWN provisionally ("Shutdown simplified"): shutdown is main's and reads
+  nothing first, S decided by what was already read, and no byte of S goes once the node began to stop:
+  `test_sd_shutdown_with_a_live_steer_is_mains_for_every_session_event_for_event_and_in_time[written|unwritten|in_turn]`,
+  `test_sd_a_stop_of_every_turn_reads_nothing_more_and_s_is_what_was_read[stop_turns|stop_all|self_stop]`,
+  `test_e2e_in_process_shutdown_decides_s_by_what_was_read_before_it[False|True]`,
+  `test_o_shutdown_reads_nothing_before_its_sigterm`,
+  `test_r5_01_a_slot_installed_after_the_stop_latch_is_born_stopped_and_never_written`,
+  `test_r5_01_a_slot_being_installed_when_the_stop_latch_is_set_is_marked_by_it`,
+  `test_r5_02_a_gate_failed_for_stopping_does_nothing_else`.
 - Not step 2's (Claude's hold, checkpoint and finalizer, step 3; or step 1's bracket cases, already on main): the
   checkpoint conditions, the timeout drain of a proved S start, `signal()`/`stop_all` during a hold, the queued S at
   close, R8-05, round 12's stop deadline, R11-01.
@@ -12641,7 +12647,7 @@ R4-03 to R4-08.
 
 **The rule.**
 1. Node shutdown and every multi-session stop are main's, a steer attempt live or not: `SessionRunner.signal`
-   (every SIGTERM at once, nothing read first), `drain`/`shutdown` (main's final flush, in main's order with main's
+   (every SIGTERM at once, nothing read first), `SessionRunner.shutdown` (main's final flush, in main's order with main's
    per-call timeouts), `node.shut_down` (the kill deadline set before the sessions are signalled, R4-07), `stop_all`,
    `stop_turns` and the watchdog's self-stop (its ends in main's `watched` queue, so the hub hears LOST first, as on
    main). Nothing is drained before a signal, no signal is reordered, no grace or kill deadline moves, no report is
@@ -12654,10 +12660,12 @@ R4-03 to R4-08.
    live turn, and the contact cut. A pass that can touch several sessions shares ONE drain deadline,
    STEER_DRAIN_SECONDS (2 s) in all, from its first drain (`SessionHost.one_drain_budget`): `tick`, `steer_deadlines`
    (the watchdog's cuts) and the node's reconciliation of one listing (its closes and cancels). An attempt that cannot
-   be drained in what is left is stopped without a drain (rule 2). In `tick` the sessions holding no live attempt get
-   both of the pass's loops first, in main's order and at the pass's time; the sessions holding one come after, each
-   dated when its work is done (`_pass_groups`; `_drain_before_stop` returns the time to date the stop by, so no
-   SIGTERM is backdated). The watchdog makes its cuts only after main's SIGKILLs.
+   be drained in what is left is stopped without a drain (rule 2). (Replaced in review round 5, R5-03, see "Review
+   round 5": `tick` keeps main's order for every session, a live attempt's exit or turn end is discovered and its
+   group fenced where main does it, and only its drain and N's decision wait until the pass's other work is done.
+   The first build's `_pass_groups`, the ordinary sessions' both loops first, is gone.) `_drain_before_stop`
+   returns the time to date the stop by, so no SIGTERM is backdated. The watchdog makes its cuts only after main's
+   SIGKILLs.
 4. A 422 on a report carrying a steer outcome gets one immediate plain retry in the same flush: synchronous, with
    main's per-call timeout, each attempt with its own payload built from the unchanged body (R4-03). A failed call
    made under a listing's features forgets only those (`SessionRunner.features_gen`, counted at every listing): a
@@ -12693,15 +12701,14 @@ R4-03 to R4-08.
   on main. Every other stop, signal, timeout and kill of an ordinary session is main's in time. (Deferring those
   drains to the end of the reconciliation would remove even this, at the cost of moving the steered session's events
   within the listing's events. Not built.)
-- In a pass with a live attempt, its exit is registered after the ordinary sessions' passes. None of them can start
-  a turn in N's checkout meanwhile, because the hub keeps that checkout busy until N's end is reported.
+- (Withdrawn in review round 5, R5-03: a live attempt's exit is discovered and fenced where main does it.)
 
 **What remains of structure 2, and every caller.**
 - `SessionHost._drain_before_stop`, called by `_reap` (a group left behind; the exit), `_hold_to_timeout` (after the
   interrupt; the plain branch), `_write` (a broken pipe), `close`, `cancel` (the live turn only) and `_steer_cut`.
-- `SessionHost.live_attempt`, used by those callers and by `_pass_groups`.
+- `SessionHost.live_attempt`, used by those callers (round 5: `_pass_groups` is gone).
 - `SessionHost.one_drain_budget`, entered by `tick`, `steer_deadlines` and `SessionRunner.pass_once` around
-  `_reconcile`.
+  `_reconcile` (round 5, R5-04: around the whole hold of the loop's lock).
 - STEER_DRAIN_SECONDS and STEER_DRAIN_READS.
 - `SessionRunner.watched_steer`, which now carries only the watchdog's cuts (S2-06's order before LOST, a
   single-session stop).
@@ -12832,3 +12839,169 @@ equivalent.
 | SD every listing counted | `test_sd_r4_03_a_refusal_answered_after_a_newer_listing_keeps_that_listings_features` |
 | SD the kill deadline before the signal (R4-07) | `test_sd_r4_07_the_kill_deadline_is_mains_with_and_without_a_steer` |
 | SD the self-stop's ends in main's queue | `test_o_the_watchdog_with_a_fully_written_steer_a_valid_receipt_and_no_native_end` |
+
+### Review round 5 (on fa4e42d: CHANGES, four blockers, one should, one nit) and what changed
+
+The reviewer judged the simplified shutdown rule sound under parts C, D and F. R4-01 (a), R4-02 and R4-09 are
+resolved, and R4-03 to R4-08 are fixed or gone. The rebase leaves Claude's paths untouched. The listing-order choice
+(A) and the watchdog's order (kills before cuts) are kept. The first build's "ordinary sessions first, both loops"
+is overruled (R5-03). The owner's decision on the simplified rule is still pending. These commits build on it and
+go with it if it is dropped.
+
+Each finding has a test that fails on fa4e42d's code by its behavioural assertion; this was checked on an export of
+fa4e42d with this round's tests. The one exception is the slot-being-installed case of R5-01, which needs the
+latch's lock and so cannot run there.
+
+- **R5-01** [blocker] A slot installed after shutdown's snapshot could be written after the stopping event.
+  - **Fix.** There is now one host-level steering stop latch, `SessionHost.steer_stopped`.
+    - `steer_stopping` sets it and marks every held record as one step, under `_steer_stop_lock`. Each record is
+      marked under its own lock, so a write already inside its critical section has returned before the mark.
+    - A slot is installed under the same lock (`steer_offer`). One installed after the latch is born stopped.
+    - `_steer_gate_locked` reads the latch inside the record's critical section.
+    - `_Stopping.set` publishes the event only after `steer_stopping` returns.
+    - So no byte of S is written once the event is observable: not for a slot that existed, one being installed, or
+      one installed later.
+  - **Tests.**
+    - `test_r5_01_a_slot_installed_after_the_stop_latch_is_born_stopped_and_never_written` (installed later; on
+      fa4e42d the write lands after the event).
+    - `test_r5_01_a_slot_being_installed_when_the_stop_latch_is_set_is_marked_by_it` (being installed; through
+      `steer_install_hook` and a lock that signals the waiting stop).
+    - `test_r4_gap_a_write_checked_after_the_records_were_marked_is_refused_though_the_flag_is_not_set_yet`
+      (existing).
+    - `test_r4_gap_an_attempt_made_after_the_node_began_to_stop_is_never_written` now asserts the slot is born
+      stopped.
+- **R5-02** [blocker] A partial slot marked by shutdown while a pass held the host lock was cut, read and signalled
+  ahead of shutdown's ordered signals.
+  - **Fix.** Once stopping, a gate failure does nothing else: no cut, no drain, no read, no signal. This covers
+    `_steer_hold_failed`, `_steer_pass` (which returns at once) and `steer_deadlines` (which skips the record).
+  - `_write` sends nothing of a buffer whose frame stays queued. Without this, the rest of the buffer, frame
+    included, would have gone out in the plain write after the boundary refused it.
+  - The frame stays as it is, a partial frame stays partial, and the multi-session stop decides N by rule 2.
+  - **Test:** `test_r5_02_a_gate_failed_for_stopping_does_nothing_else` (the stop begins at the boundary through
+    `steer_write_hook`).
+- **R5-03** [blocker] With the first build's reordering, ordinary B could start in the checkout of steered A's
+  surviving group.
+  - **Fix.** Main's discovery order is restored. `_pass_groups` is gone, and `tick` (session_host.py:1147) is main's
+    pass for every session, in main's order and at the pass's time.
+  - A live attempt's turn end is discovered and its group fenced at exactly the point main does it. This covers:
+    - the reap's surviving-group branch (session_host.py:1379), which runs `_stop`;
+    - the exit branch (1399), which releases the process and frees the checkout and admission slot as main does,
+      keeping the pipe open (`_reap_gone`);
+    - the turn timeout's two branches (1531, 1562) and a broken pipe (2208), through `_fence_then_decide`, which
+      runs `_stop` now;
+    - the cut in a tick (2002).
+  - Only the drain and N's decision wait (`_defer`, 1055). They run after both of the pass's loops
+    (`_run_deferred`, 1065, called at 1182), within the pass's one deadline.
+  - While its drain is pending, the session's own pass does only main's reaping of its fenced group (`_pass`, 1191).
+    That reaping frees the checkout if the group went meanwhile, as main would.
+  - The drain's reads count as N's evidence: `draining` lifts the drop of a stopping process's events for that drain
+    only.
+  - A fenced group blocks starts exactly as on main while its drain is pending.
+  - Close and cancel, called by the node outside a tick, drain inline as before, within the hold's one deadline.
+  - **Test:** `test_r5_03_a_steered_leaders_surviving_group_is_fenced_before_anything_starts`. On fa4e42d, B starts
+    beside the fenced group.
+- **R5-04** [should] A listing reconciliation and a tick in the same lock hold each spent a fresh 2 s drain budget.
+  - **Fix.** One drain deadline per hold of the loop's lock: `pass_once` (node_sessions.py:632) holds one
+    `one_drain_budget` for the whole hold. That covers the reconciliation's closes and cancels, both ticks, and their
+    deferred drains. The watchdog's hold has one for its cuts (`steer_deadlines`).
+  - Every SIGKILL that falls due while a drain reads is sent between the drain's reads (`_kills_due`, from
+    `_drain_reads`, session_host.py:1043).
+  - **Worst case now.** The watchdog is kept out by drains for at most one budget (2 s) per hold, on top of main's
+    own work in that hold. A kill that falls due during a drain is late by at most one read.
+  - **Tests:** `test_r5_04_one_drain_deadline_for_a_whole_hold_of_the_loops_lock` and
+    `test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then`.
+- **R5-05** [blocker] On a rolled-back hub, a steer-only 422 cleared every feature, so a later ordinary report in the
+  same flush lost `answered`.
+  - **Fix.** A steer-carrying report's first attempt spares a 422 (`_call(spare_422=True)`, node_sessions.py:504).
+    After a plain retry that got through, only `steer` is forgotten, and only while that listing generation stands
+    (node_sessions.py:518). Every feature the retry confirmed stays.
+  - A failed plain retry forgets everything in `_call`, as main does for a failed report.
+  - **Test:** `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer`. B's body is compared with a run
+    without the steer outcome and has the same events, with `answered`. Its `modes` lack `steer`, as main's node
+    never names it. Its other fields are equal except the wall-clock `seq` and the run's own checkout path. On
+    fa4e42d, `answered` is gone.
+- **R5-06** [nit] Rule 1 no longer names a `drain`; it names `SessionRunner.shutdown`. Part O's active inventory now
+  names the provisional rule's tests. The "Shutdown simplified" subsection's rule 3 and its lists say what round 5
+  replaced.
+
+**The e2e script's M5 probe** (scripts/session-host-e2e.py, `LineReader`) now waits on a selector instead of
+`select()`. `select()` refuses a descriptor above 1024, which the full suite reached in one process after this
+round's tests. `test_r3_gap_the_join_probe_fails_at_once_on_an_answer_naming_another_turn` failed in the suite. With
+1100 descriptors open, every probe test fails before the change and passes after it.
+
+**The parity comparison** (`_shutdown_run`) now keeps ONE log in global order. It holds every SIGTERM, SIGKILL and
+pipe read of every session, and every report batch posted (its session, its time, its keys, its events with a steer
+outcome stripped), plus the starts made during the shutdown. That log is compared with the steer-free run. Each
+session is opened in its own pass, so the host's order, which main's signals follow, is the same in both runs. A
+report's `seq` is a wall-clock stamp and is left out. All three cases pass.
+
+**The model** gains three events:
+- `install_race`: the stop begins before, inside or after a slot's installation.
+- `stop_mid_pass`: the stop begins at a write boundary while a pass holds the lock, for example with a partial frame.
+  The checker then fails if the steered process is signalled before the multi-session stop.
+- `mixed_exit`: the steered leader exits leaving its group, while an ordinary session in the same checkout waits to
+  start in that very pass. The checker fails if it starts.
+
+Each event has a scripted reach test: `test_model_reach_r5_01_the_stop_races_a_slots_installation[before|inside|after]`,
+`test_model_reach_r5_02_the_stop_begins_while_a_pass_holds_the_lock_with_a_partial_frame` and
+`test_model_reach_r5_03_a_mixed_pass_in_a_shared_checkout`. Over the 200 seeded sequences, the installation race
+fired in 14, the stop mid-pass in 4 and the mixed pass in 32. On fa4e42d's code the seeded sequences fail on the
+mixed pass and on the stop mid-pass.
+
+**What is still not exactly main's.** A steered session whose N ends in a pass is decided after the ordinary sessions'
+work in that pass. If its next message were already in its inbox, its next process would start after theirs. On main,
+the node hands a session's next message over only after N's end, so the inbox is empty there.
+
+**Runs** after the last code commit (3e8c5e5):
+- `uv run pytest -q -p no:cacheprovider`: 4364 passed, 10 skipped. The run before the probe fix, at 1b7832d, had one
+  failure, the descriptor limit above.
+- The stand-in e2e in full: PASS (164 s, 345 checks).
+- `--only steering` with stand-ins: PASS (114 s, 57 checks).
+- `--only correlation` with stand-ins: PASS (12 s, 24 checks).
+- `--only steering` with the real Codex (codex-cli 0.171.0, gpt-6-luna): PASS (64 s, 27 checks).
+- `--only steer` with the real Codex: PASS (32 s, 28 checks).
+- `~/.codex/config.toml` sha256 before, between and after the real runs:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+**Gap tests** (added after the mutation run below):
+- `test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass[True]`: a reap whose group is left behind.
+- `test_r5_gap_a_cut_in_a_pass_never_delays_an_ordinary_timeout`.
+- `test_r5_gap_a_fenced_pipe_stays_open_for_its_drain_when_the_group_goes_in_the_same_pass`.
+- `test_r5_gap_the_watchdogs_cut_does_nothing_once_the_node_is_stopping`.
+- `test_r5_gap_a_failed_retry_answered_after_a_newer_listing_keeps_that_listings_features`.
+
+### Mutation check, review round 5
+
+Scratchpad `mutate7.py`: the earlier rows whose lines this round changed, rewritten, and one or more per change. The first build's `SD ordinary sessions first in a pass`, `SD a live session dated when handled` and `SD a listing is one pass` are withdrawn with the code they mutated, replaced by the R5-03 and R5-04 rows. Every other earlier row stands as recorded. Each mutation was applied alone to an export of 645ae6b, then the same test set with -x, the file restored. Of 29 run, 17 were caught on the first run. 5 of the 12 missed got the gap tests above and were caught when run again on 1b7832d. The other 7 are equivalent, each with its reason.
+
+| mutation | caught by |
+| --- | --- |
+| R4-01b stopping is a write condition | EQUIVALENT: a record is marked only with the latch set (by the stop, or at birth after it), so the gate's latch check already refuses whenever the mark would |
+| R4-01b every record is marked | `test_r5_01_a_slot_being_installed_when_the_stop_latch_is_set_is_marked_by_it` |
+| S2 the drain stops at N's end | `test_r3_04_a_sessions_drain_stops_once_ns_end_is_read` |
+| S2 only a live attempt is drained | EQUIVALENT: the mutated check also drains a session whose N is decided (it returns at once) or whose process is stopping with N in flight (which does not occur: every stop fails N first, or defers that with its own drain) |
+| S2 the timeout drains (outside a tick) | EQUIVALENT: unreachable; a turn's timeout is judged only in a tick, where the drain is deferred |
+| SD one deadline per pass | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| SD tick is one pass | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| SD a refusal forgets only its listing's features | `test_r5_gap_a_failed_retry_answered_after_a_newer_listing_keeps_that_listings_features` (a test added after this run) |
+| R5-01 the gate reads the latch | EQUIVALENT for writes: every record is marked (existing ones by the stop, under their own locks; new ones at birth), so a write the mark does not stop returned before the stop did, which the rule allows |
+| R5-01 born stopped | `test_r5_01_a_slot_installed_after_the_stop_latch_is_born_stopped_and_never_written` |
+| R5-01 installed under the latch's lock | EQUIVALENT for writes: a slot installed unmarked while the stop runs is still refused by the gate's latch check |
+| R5-01 the latch and the marks as one step | `test_r5_01_a_slot_being_installed_when_the_stop_latch_is_set_is_marked_by_it` |
+| R5-01 the latch is set | `test_r5_01_a_slot_installed_after_the_stop_latch_is_born_stopped_and_never_written` |
+| R5-02 a stopped gate cuts nothing | `test_model_reach_r5_02_the_stop_begins_while_a_pass_holds_the_lock_with_a_partial_frame` |
+| R5-02 a stopped pass does nothing | EQUIVALENT: without it the pass reaches `_steer_hold_failed`, which does nothing once stopping; only an unwritten frame is taken out of the buffer, `not_delivered` either way |
+| R5-02 the watchdog cuts nothing once stopping | `test_r5_gap_the_watchdogs_cut_does_nothing_once_the_node_is_stopping` (a test added after this run) |
+| R5-02 nothing of a held frame's buffer goes | `test_model_random_sequences_of_the_node_and_host_write_authority[0]` |
+| R5-03 a surviving group fenced at discovery | `test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass[True]` (a test added after this run) |
+| R5-03 an exit discovered and released at once | `test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass` |
+| R5-03 a timeout or a broken pipe fenced at once | `test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it` |
+| R5-03 a cut in a tick fenced at once | `test_r5_gap_a_cut_in_a_pass_never_delays_an_ordinary_timeout` (a test added after this run) |
+| R5-03 a deferred session does only main's reaping | EQUIVALENT: a deferred session is either fenced (its full pass is main's stopping branch: the same reaping) or let go of with N still in flight (its pass has nothing to do: no process, and busy with N) |
+| R5-03 a deferred drain's reads count | `test_sd_gap_a_reap_whose_group_is_left_behind_drains_first` |
+| R5-03 the drains after the pass | `test_s2_02_the_rest_of_a_half_frame_goes_only_while_every_gate_holds[turn_gate]` |
+| R5-03 a fenced pipe kept for its drain | `test_r5_gap_a_fenced_pipe_stays_open_for_its_drain_when_the_group_goes_in_the_same_pass` (a test added after this run) |
+| R5-04 one budget for the hold | `test_sd_the_cancels_of_one_listing_share_one_drain_deadline` |
+| R5-04 kills between a drain's reads | `test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then` |
+| R5-05 a steer-only 422 spares the features | `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer` |
+| R5-05 only steer forgotten | `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer` |
