@@ -319,7 +319,8 @@ def main(argv: list[str] | None = None) -> None:
                         "flight and run this one next instead; auto: start at once if the session is idle, else "
                         "queue (it never restarts); steer: put it into the turn in flight (one of yours, with nothing "
                         "queued behind it; one steer per turn), whose result says whether it was taken in. With "
-                        "--wait and steer: exit 5 when it was not delivered (send it again), 6 when not confirmed")
+                        "--wait and steer: exit 5 when it was not delivered (send it again), 6 when not confirmed, 7 when "
+                        "no outcome is known")
     x.add_argument("--request-id", metavar="X", help="idempotency: a retry with the same id returns the message the "
                                                      "first call sent instead of sending another")
     x.add_argument("--wait", action="store_true", help="wait for the turn to end and print the reply (exit 1 if it failed)")
@@ -884,8 +885,7 @@ def _fmt_hosted(s: dict) -> str:
             f"{s['agent']}" + (f" (account folder {s['account_home']})" if s.get("account_home") else "")
             + f" in {s['project']} on node {s['node']}{where}, turns {s['turns']}, queued {s['queued']}"
             + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else "")
-            + (f", steer unsettled (into message {s['steer_unsettled'].get('into')})"
-               if isinstance(s.get("steer_unsettled"), dict) else ""))
+            + _fmt_unsettled(s))
 
 
 def _fmt_access(s: dict) -> str:
@@ -909,7 +909,13 @@ def _fmt_child(s: dict) -> str:
             + (f", message {s['in_flight']} in flight" if s.get("in_flight") is not None else "")
             + (f", started by {s['spawned_by'].get('agent')}"
                + (" (interactive)" if s["spawned_by"].get("kind") == "interactive" else "")
-               if isinstance(s.get("spawned_by"), dict) else ""))
+               if isinstance(s.get("spawned_by"), dict) else "")
+            + _fmt_unsettled(s))      # the drain's check, on a child's row too (S2-10)
+
+
+def _fmt_unsettled(s: dict) -> str:
+    return (f", steer unsettled (into message {s['steer_unsettled'].get('into')})"
+            if isinstance(s.get("steer_unsettled"), dict) else "")
 
 
 def _fmt_grant(g: dict) -> str:
@@ -983,6 +989,12 @@ def _fmt_hosted_detail(s: dict) -> str:
                                                               " (results of its child sessions)"
                                                               if m.get("kind") == "child" else "")
                      + _fmt_mode(m) + (f" {m['detail']}" if m.get("detail") else ""))
+        if isinstance(m.get("steer"), dict):
+            # The steer into this turn, as its terminal status stands (S2-12): plain `show` says it too.
+            st = m["steer"]
+            lines.append("    steer: " + (STEER_WORDS.get(st.get("outcome"), str(st.get("outcome")))
+                                          + (f" ({st['why']})" if st.get("why") else "")
+                                          if st.get("outcome") else "not settled yet"))
         if isinstance(m.get("output"), dict):
             lines.append("    " + _fmt_verdict(m["output"]))
     if s.get("results") or s.get("results_dropped"):
@@ -1237,6 +1249,8 @@ def _session_cmd(a, out, settings: Settings, token: str) -> None:
 
 
 STEER_EXIT = {"not_delivered": 5, "unconfirmed": 6}     # `send --mode steer --wait` (DESIGN_NOTES part H)
+STEER_UNSETTLED_EXIT = 7    # ... and no terminal steer status to report (S2-11, S2-12): never a success
+STEER_SETTLE_POLLS = 12     # after N's end, how many more polls the steer's own status is waited for
 STEER_WORDS = {"in_turn": "taken into the turn", "not_delivered": "not delivered: send it again if you still want it",
                "unconfirmed": "not confirmed: delivery could not be confirmed, and the agent may have read it"}
 
@@ -1255,12 +1269,13 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
     if not a.wait:
         return out(r, info)
     if st.get("state") == "expired":
+        # A receipt-only retry does not wait (S2-12): its steer, and the outcome it had, are no longer kept.
         note = "the steer is no longer kept on the hub, and neither is the outcome it had"
         if a.json:
             print(json.dumps({"session": s, "steer": st, "reply": None, "note": note}, indent=2))
         else:
             print(info + f"\nnote: {note}", file=sys.stderr)
-        raise SystemExit(6)
+        raise SystemExit(STEER_UNSETTLED_EXIT)
     if not a.json:
         print(info, file=sys.stderr)
     path = f"/api/hosted-sessions/{quote(s['session_id'], safe='')}/messages/{st['into']}?wait=25&steer=1"
@@ -1268,6 +1283,13 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
         got = _api(settings, token, "GET", path, timeout=60)
         if got["message"]["state"] in ("done", "failed"):
             break
+    # N is over; its steer settles with it (in that same transaction, or by the sweep on this very read): a few more
+    # reads at most, and success is reported only on a terminal steer status (S2-11).
+    for _ in range(STEER_SETTLE_POLLS):
+        if (got.get("steer") or {}).get("outcome"):
+            break
+        time.sleep(0.5)
+        got = _api(settings, token, "GET", path.replace("wait=25&", ""), timeout=60)
     s, m, sv = got["session"], got["message"], got.get("steer") or {}
     reply = s["reply"] if s.get("reply_for") == m["n"] else None
     outcome = sv.get("outcome")
@@ -1285,6 +1307,8 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
             print("the steer's text, to send again:\n" + text, file=sys.stderr)
     if outcome in STEER_EXIT:
         raise SystemExit(STEER_EXIT[outcome])
+    if outcome != "in_turn":
+        raise SystemExit(STEER_UNSETTLED_EXIT)      # no terminal status: never exit 0 with "not settled"
     if m["state"] != "done":
         raise SystemExit(1)
 

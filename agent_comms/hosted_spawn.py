@@ -1301,7 +1301,9 @@ def _own_steer(conn, r: dict, caller_id: str | None) -> dict:
     mine = [s for s in hosted_steer.steers(conn, r["session_id"])
             if s.get("kind") == "task" and isinstance(s.get("by"), dict) and s["by"].get("session") == caller_id
             and caller_id is not None]
-    return {"steer": hosted_steer.view(mine[-1])} if mine else {}
+    # The latest as `steer`, and every one still kept, by the turn it went into (S2-12).
+    return {"steer": hosted_steer.view(mine[-1]), "steers": {str(s["into"]): hosted_steer.view(s) for s in mine}} \
+        if mine else {}
 
 
 def _in_flight_request(conn, r: dict) -> dict:
@@ -1814,22 +1816,31 @@ def steer_waited(board: Board, parent: str | None, child: str, n: int, taken: di
     from the record, read FIRST; then, without the result, where it went (a turn of the caller's, another call), or
     only if the steer is still unsettled, that it is."""
     from . import hosted_steer
-    status = hosted_steer.view(hosted_steer.get(board.conn, child, n))
-    out: dict = {"steer_status": status}
-    if taken is not None:
-        return out
-    if parent is not None:
-        x = hosted_results.claimed(board.conn, parent, child, n)
-        if x is not None:
-            return out | {"note": CLAIMED_ELSEWHERE.format(n=x["n"])}
-        went = [x for x in hosted_results._results(board.conn, parent) if x.get("child") == child
-                and x.get("message") == n and x.get("state") in ("queued", "delivered")]
-        if went:
-            return out | {"note": STEER_WENT.format(n=went[-1]["n"])}
-    if status is None or status.get("outcome") is None:
-        return out | {"note": STEER_UNSETTLED}
-    return out | {"note": "the steer is settled; the turn's result was not taken within the wait (it comes as a turn "
-                          "of yours, or through board_session_status)"}
+
+    def read(conn) -> dict:
+        # The status and where the result went, in ONE snapshot (S2-12): a settlement between two reads can never
+        # pair an accepted steer with a delivered result.
+        status = hosted_steer.view(hosted_steer.get(conn, child, n))
+        out: dict = {"steer_status": status}
+        if taken is not None:
+            return out
+        if parent is not None:
+            x = hosted_results.claimed(conn, parent, child, n)
+            if x is not None:
+                return out | {"note": CLAIMED_ELSEWHERE.format(n=x["n"])}
+            went = [x for x in hosted_results._results(conn, parent) if x.get("child") == child
+                    and x.get("message") == n and x.get("state") in ("queued", "delivered")]
+            if went:
+                return out | {"note": STEER_WENT.format(n=went[-1]["n"])}
+        if status is None or status.get("outcome") is None:
+            return out | {"note": STEER_UNSETTLED}
+        return out | {"note": "the steer is settled; the turn's result was not taken within the wait (it comes as a "
+                              "turn of yours, or through board_session_status)"}
+    return hosted.in_snapshot(board, read)
+
+
+STEER_EXPIRED = ("already sent for this request id, and no longer kept on the hub: its outcome is not known any more "
+                 "(nothing was waited for)")
 
 
 def _owner_or_grant(board: Board, caller: Caller) -> None:

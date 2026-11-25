@@ -633,7 +633,7 @@ every command takes `--json`. One session per agent and project at a time (child
 ```bash
 uv run board session send <id> "Stop; do the README first" --mode restart --wait
 uv run board session send <id> "..." --mode auto --request-id fix-1      # a retry with the same id sends nothing new
-uv run board session send <id> "Also cover the CLI" --mode steer --wait  # exit 0 or 1 by the turn; 5 not delivered, 6 not confirmed
+uv run board session send <id> "Also cover the CLI" --mode steer --wait  # exit 0 or 1 by the turn; 5 not delivered, 6 not confirmed, 7 no outcome known
 ```
 
 A steer (DESIGN_NOTES "Mid-turn steering, loose contract") is refused with the reason when steering is switched off on

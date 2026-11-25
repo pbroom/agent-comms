@@ -255,6 +255,8 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
             if out["result"] is None:
                 await threaded(lambda: not_taken(out, out["child"]["parent"], out["child"]["id"],
                                                  out["message"]["n"]))
+        elif wait and isinstance(out.get("steer"), dict) and out["steer"].get("state") == "expired":
+            out |= {"steer_status": None, "note": hosted_spawn.STEER_EXPIRED}     # nothing to wait for (S2-12)
         elif wait and isinstance(out.get("steer"), dict) and type(out["steer"].get("into")) is int:
             # One 45 s wait for the result of the turn the steer went into (message N); the answer then carries the
             # steer's terminal status, read from its record before anything says it is unsettled.

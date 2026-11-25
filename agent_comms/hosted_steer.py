@@ -242,8 +242,10 @@ def due(conn, node: str) -> bool:
 
 def offer(board: Board, c, node: str, tree: int, now: float, shown: dict) -> None:
     """Inside the listing's write transaction, before the answer is built: each unsettled steer of this node's
-    sessions is settled if its N is (the sweep), withdrawn if a check fails, or offered (`shown`: session id -> the
-    listing item), with `listed_at` set on its first offer. Never raises: a fault offers nothing (an omission)."""
+    sessions is settled if its N is (the sweep), withdrawn if a check fails, or a candidate (`shown`: session id ->
+    the listing item). `listed_at` is set by the renderer, and only for an entry it renders (`stamp`, S2-08). All or
+    nothing: a fault rolls back every write made here (a savepoint) and offers nothing. Never raises."""
+    c.execute("SAVEPOINT steer_offer")
     try:
         for (key, value) in c.execute("""SELECT key, value FROM board_state WHERE key >= ? AND key < ?
                                          AND json_valid(value) AND json_extract(value, '$.outcome') IS NULL""",
@@ -264,13 +266,29 @@ def offer(board: Board, c, node: str, tree: int, now: float, shown: dict) -> Non
                 s |= {"withdrawn_at": now, "withdrawn": why, "updated_at": now}
                 _put(c, key, s, "hub", now)
                 continue
-            if s.get("listed_at") is None:
-                s |= {"listed_at": now, "updated_at": now}
-                _put(c, key, s, "hub", now)
             shown[r["session_id"]] = {"into": s["into"], "uuid": s["uuid"], "text": s["text"]}
+        c.execute("RELEASE SAVEPOINT steer_offer")
     except Exception:
         hosted_wake_complain()
         shown.clear()
+        c.execute("ROLLBACK TO SAVEPOINT steer_offer")
+        c.execute("RELEASE SAVEPOINT steer_offer")
+
+
+def renderable(c, r: dict, tree: int) -> bool:
+    """The renderer may show this session's steer: the request speaks protocol 5, the node's recorded protocol is
+    5, and the session's reported modes name `steer` (S2-08)."""
+    from . import hosted_tree
+    return (int(tree) >= STEER_PROTOCOL and hosted_tree.node_protocol(c, r.get("node") or "") >= STEER_PROTOCOL
+            and "steer" in (r.get("modes") or []))
+
+
+def stamp(c, session_id: str, n: int, now: float) -> None:
+    """An offer rendered into the answer, in the listing's write transaction: its first exposure (`listed_at`)."""
+    s = get(c, session_id, n)
+    if s is not None and s.get("outcome") is None and s.get("listed_at") is None:
+        s |= {"listed_at": now, "updated_at": now}
+        _put(c, _key(session_id, n), s, "hub", now)
 
 
 def hosted_wake_complain() -> None:
@@ -280,8 +298,11 @@ def hosted_wake_complain() -> None:
 
 def _offer_problem(board: Board, c, r: dict, m: dict, s: dict, tree: int, now: float) -> str | None:
     """Why this steer may not be offered now (each check made again at every offer), or None."""
-    if tree < STEER_PROTOCOL:
-        return "protocol"           # an older node must never be offered a steer
+    from . import hosted_tree
+    if tree < STEER_PROTOCOL or hosted_tree.node_protocol(c, r.get("node") or "") < STEER_PROTOCOL:
+        return "protocol"           # an older node must never be offered a steer (J: a fetch below 5 withdraws it)
+    if "steer" not in (r.get("modes") or []):
+        return "modes"              # the session's process no longer says it can steer
     if r.get("state") == "ended" or r.get("stop"):
         return "ended"
     if m.get("state") != "delivered" or r.get("in_flight") != s["into"]:
@@ -327,6 +348,16 @@ def _settled(c, s: dict, ext: dict | None, now: float) -> dict:
     s |= {"outcome": outcome, "why": why, "settled_at": now, "text": "", "updated_at": now}
     _put(c, _key(s["session_id"], s["into"]), s, "hub", now)
     return s
+
+
+def stale(conn, session_id: str) -> bool:
+    """Read only: the session has an unsettled steer whose N is settled or gone (the re-upgrade sweep's work)."""
+    for s in steers(conn, session_id):
+        if s.get("outcome") is None:
+            m = _get(conn, hosted._msg_key(session_id, s["into"]))
+            if not isinstance(m, dict) or m.get("state") in hosted.SETTLED:
+                return True
+    return False
 
 
 def settle_unsettled(c, r: dict, now: float) -> None:

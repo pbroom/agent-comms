@@ -1070,7 +1070,14 @@ def _settle(board: Board, r: dict) -> dict:
     has a turn in flight, and one being closed is closed. The node stops its own turns well before that
     (node_sessions.py), so the failed turn is not still running somewhere."""
     now = board.now()
-    from . import hosted_tree
+    from . import hosted_steer, hosted_tree
+    if hosted_steer.stale(board.conn, r["session_id"]):
+        # A steer whose N is already settled (an older hub settled N, or a path that left it): settled here by the
+        # one rule, whatever its node does (S2-11: an offline node never polls, so the listing's sweep never runs).
+        with db.write_tx(board.conn) as c:
+            stored = _session(c, r["session_id"])
+            hosted_steer.settle_unsettled(c, stored, board.now())
+        r = _session(board.conn, r["session_id"])
     if not hosted_tree.orphaned(board.conn, r) and not _lost(board.conn, r, now):
         return r
     with db.write_tx(board.conn) as c:
@@ -1260,7 +1267,13 @@ def _listed(board: Board, p: Principal, tree: bool = False, shown: dict | None =
         # parent's live process.
         held = bool(spawns and hosted_tree.is_child(r) and r.get("access") == "full"
                     and any(hosted_tree.subtree_open(board, board.conn, r, every).values()))
-        steer = (shown or {}).get(r["session_id"]) if int(tree) >= 5 else None
+        from . import hosted_steer
+        steer = (shown or {}).get(r["session_id"])
+        if steer is not None:
+            if hosted_steer.renderable(board.conn, r, tree):
+                hosted_steer.stamp(board.conn, r["session_id"], steer["into"], board.now())     # first exposure
+            else:
+                steer = None
         out.append({k: r.get(k) for k in ("session_id", "agent", "runtime", "project", "model", "stop")}
                    | {"resume": r.get("resume") is True, "messages": msgs,
                       # The stamp of the last status applied (`report`): the node stamps above it, whatever its
