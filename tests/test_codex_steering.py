@@ -3555,6 +3555,41 @@ def test_r7_04_a_waiting_stop_goes_ahead_of_the_next_drain_batch(henv):
     assert reads == [1], "no next batch once a stop is waiting"
 
 
+def test_rebase_114_the_steering_log_lines_reach_the_node_log_once_each_and_never_the_steer_text():
+    """(The rebase onto #114: `board node`'s INFO lines now reach node.log.) Under `node.log_to_stderr`, in a fresh
+    interpreter: a steer taken in part and cut past its limit logs the cut's WARNING and the outcome's INFO once
+    each, with the time and the level, and no line carries the steer's text."""
+    import re
+    import subprocess
+    import sys
+    from pathlib import Path
+    tests = Path(__file__).resolve().parent
+    code = """
+import pathlib, tempfile
+from agent_comms.node import log_to_stderr
+log_to_stderr()
+import test_codex_steering as t
+henv = t._a_henv(pathlib.Path(tempfile.mkdtemp()))
+host, s, child, _ = t.partial(henv)
+henv.clock.advance(t.STEER_PARTIAL_SECONDS)
+host.steer_deadlines()
+print(s.stopping_since is not None)
+"""
+    r = subprocess.run([sys.executable, "-c", code], cwd=tests.parent, capture_output=True, text=True, timeout=120,
+                       env={"PATH": "/usr/bin:/bin", "PYTHONPATH": f"{tests.parent}:{tests}"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["True"], "the cut stopped the process"
+    lines = r.stderr.splitlines()
+    stamp = r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}"
+    cut = [x for x in lines if "could not be written whole" in x]
+    outcome = [x for x in lines if "the steer into message" in x]
+    assert len(cut) == 1 and re.fullmatch(stamp + r" WARNING agent_comms\.session_host: session \S+: a steer to its "
+                                          r"process could not be written whole: the process is stopped", cut[0]), lines
+    assert len(outcome) == 1 and re.fullmatch(stamp + r" INFO agent_comms\.session_host: session \S+: the steer into "
+                                              r"message a: unconfirmed \(partial\)", outcome[0]), lines
+    assert not [x for x in lines if TEXT in x or "PINEAPPLE" in x], "no line carries the steer's text"
+
+
 def test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start():
     """R6-05: the golden's allowance for Codex's echo nulls a stripped id only in the userMessage item's own
     `clientId`, and only for the start it answers in that transcript (that start's thread, the turn this transcript's
