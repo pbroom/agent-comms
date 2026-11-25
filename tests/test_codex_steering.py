@@ -2023,3 +2023,73 @@ def test_o_the_cap_at_the_exact_boundary_after_a_parents_frame(env, monkeypatch,
     else:
         with pytest.raises(Conflict, match=re.escape(hosted_steer.REFUSED["big"])):
             hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=text, mode="steer")
+
+
+def test_s2_08_a_fault_rolls_back_a_withdrawal_made_earlier_in_that_offer(env, monkeypatch):
+    a, b = two_steered_roots(env)
+    real = hosted_steer._offer_problem
+    calls = []
+
+    def first_withdrawn_second_fails(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            return "checkout"
+        raise RuntimeError("a fault on the second steer")
+    monkeypatch.setattr(hosted_steer, "_offer_problem", first_withdrawn_second_fails)
+    listing(env)
+    assert all(steer_rec(env, x)["withdrawn_at"] is None for x in (a, b)), "the withdrawal was rolled back too"
+    monkeypatch.setattr(hosted_steer, "_offer_problem", real)
+
+
+def test_s2_03_a_hello_acknowledged_after_the_deadline_never_revives_authority(env):
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    t0 = runner.steer_seen[sid]
+    runner.hello_ack, runner.report_ack[sid] = t0, (t0, 1)
+    env.clock.advance(node_sessions.STEER_CONTACT_SECONDS + 1)
+    runner.note_hello(t0 + 74)              # sent before the deadline, acknowledged after it
+    assert s.steer.revoked == "contact"
+
+
+def test_s2_13_a_forgotten_sessions_ack_goes_with_it(env):
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    assert sid in runner.report_ack
+    env.human.post(f"/api/hosted-sessions/{sid}/close")
+    runner.client = _GetsOnly(env.laptop)   # no report is acknowledged from here on
+    for _ in range(6):
+        tick(env)
+        env.clock.advance(node_sessions.RETRY_SECONDS)
+        if sid not in runner.host.sessions:
+            break
+    assert sid not in runner.host.sessions and sid not in runner.report_ack and sid not in runner.steer_seen
+
+
+def test_s2_02_a_partial_frames_5_s_count_from_its_first_byte_on_a_fresh_clock(henv):
+    """The pass that writes the first bytes is slow (its reads take 4 s each): the 5 s start at that write, not at
+    the pass's start, so a frame completed 1 s later is not cut."""
+    host, s, child, _ = host_n(henv)
+    child.accept = 10
+    real = child.read_lines
+
+    def slow():
+        henv.clock.advance(4)
+        return real()
+    child.read_lines = slow
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    child.read_lines = real
+    assert 0 < s.steer.sent < s.steer.length
+    henv.clock.advance(1)
+    child.accept = None
+    host.tick()
+    assert s.stopping_since is None and len(steers_of(child)) == 1, "completed within its 5 s"
+
+
+def test_s2_01_an_answer_with_any_other_key_is_no_evidence():
+    p, _ = proved()
+    [req] = cx.sent(p.steer(TEXT))
+    p.steer_written()
+    p.feed(cx.line({"id": req["id"], "result": {"turnId": cx.TURN}, "unexpected": 1}))
+    p.feed(cx.line(cx.completed()))
+    assert p.steer_result() == "other"
