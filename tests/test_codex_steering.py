@@ -572,17 +572,6 @@ def test_cells_every_slot_state_by_every_end_of_n(henv, state, end):
     assert (ended.steer["outcome"], ended.steer["why"]) == STEER_CELLS[(state, end)]
 
 
-def test_host_drain_reads_a_native_end_before_a_shutdowns_signal(henv):
-    host, s, child, _ = host_n(henv)
-    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
-    host.tick()
-    [req] = steers_of(child)
-    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("done"), cx.completed())
-    [end] = ended_of(host.drain())
-    assert end.steer["outcome"] == "in_turn" and end.ok
-    assert ended_of(host.stop_all()) == [], "N's end is emitted once"
-
-
 # ------------------------------------------------------------ the hub: accepting and refusing (part H)
 
 
@@ -1103,13 +1092,21 @@ def test_e2e_in_process_a_partition_after_the_write_ends_n_with_the_self_stop_un
     assert steer_rec(env, sid)["outcome"] == "unconfirmed", "written, and N ended with its process"
 
 
-def test_e2e_in_process_shutdown_drains_a_steer_attempt_first(env):
+@pytest.mark.parametrize("read_first", [False, True])
+def test_e2e_in_process_shutdown_decides_s_by_what_was_read_before_it(env, read_first):
+    """(The shutdown simplification, rule 2.) S answered and N's native end in the pipe: read before the shutdown,
+    they decide (`in_turn`); unread, shutdown reads nothing to find out, and S is `unconfirmed`."""
     sid, child, req = steered(env)
     child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("done"), cx.completed())
+    if read_first:
+        tick(env)
     env.node.sessions.signal()
     env.node.sessions.shutdown()
     rec = steer_rec(env, sid)
-    assert msg(env, sid, 1)["state"] == "done" and rec["outcome"] == "in_turn", "its native end, drained, counts"
+    if read_first:
+        assert msg(env, sid, 1)["state"] == "done" and rec["outcome"] == "in_turn"
+    else:
+        assert msg(env, sid, 1)["state"] == "failed" and (rec["outcome"], rec["why"]) == ("unconfirmed", "turn_cut")
 
 
 # ------------------------------------------------------------ the parent's steer (H), its result and its wait
@@ -1716,33 +1713,16 @@ def test_s2_06_a_native_end_the_watchdog_drained_reaches_the_hub_before_any_lost
     assert (steer_rec(env, sid)["outcome"], steer_rec(env, sid)["why"]) == ("unconfirmed", "partial")
 
 
-@pytest.mark.parametrize("how", ["close", "cancel", "stop_turns", "stop_all"])
+@pytest.mark.parametrize("how", ["close", "cancel"])
 def test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first(henv, how):
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
     host.tick()
     [req] = steers_of(child)
     child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
-    events = (host.close(SID, "closed") if how == "close" else host.cancel(SID, "a", "cancelled") if how == "cancel"
-              else host.stop_turns("no contact") if how == "stop_turns" else host.stop_all())
+    events = host.close(SID, "closed") if how == "close" else host.cancel(SID, "a", "cancelled")
     [end] = ended_of(events)
     assert end.ok and end.text == "native" and end.steer == {"outcome": "in_turn", "why": "answered"}
-
-
-def test_s2_06_shutdown_drains_a_native_end_larger_than_one_read(henv):
-    """Part O: a native end that takes many reads (one line per read here) is drained whole."""
-    host, s, child, _ = host_n(henv)
-    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
-    host.tick()
-    [req] = steers_of(child)
-
-    def one_at_a_time():
-        return [child.stdout.popleft()] if child.stdout else []
-    child.read_lines = one_at_a_time
-    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), *[cx.message(f"note {i}", phase="commentary")
-                                                           for i in range(40)], cx.message("native"), cx.completed())
-    [end] = ended_of(host.stop_all())
-    assert end.ok and end.text == "native" and end.steer["outcome"] == "in_turn"
 
 
 def test_o_a_codex_partial_cut_a_close_and_a_late_reap_end_n_once(henv):
@@ -2286,7 +2266,7 @@ def _fragmented(child, chunks: int):
     child.read_lines = read
 
 
-@pytest.mark.parametrize("how", ["close", "stop_turns", "stop_all"])
+@pytest.mark.parametrize("how", ["close"])
 def test_r2_05_a_drain_goes_on_while_reads_make_progress_without_a_line(henv, how):
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
@@ -2294,9 +2274,7 @@ def test_r2_05_a_drain_goes_on_while_reads_make_progress_without_a_line(henv, ho
     [req] = steers_of(child)
     child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
     _fragmented(child, 3)
-    events = (host.close(SID, "closed") if how == "close" else host.stop_turns("no contact") if how == "stop_turns"
-              else host.stop_all())
-    [end] = ended_of(events)
+    [end] = ended_of(host.close(SID, "closed"))
     assert end.ok and end.text == "native" and end.steer == {"outcome": "in_turn", "why": "answered"}
 
 
@@ -2309,7 +2287,7 @@ def test_r2_05_the_cut_reads_while_reads_make_progress_without_a_line(henv):
     assert end.ok and end.text == "finished first" and s.stopping_since is not None
 
 
-@pytest.mark.parametrize("how", ["close", "stop_all"])
+@pytest.mark.parametrize("how", ["close"])
 def test_r2_05_a_drain_error_neither_skips_the_stop_nor_loses_what_was_read(henv, how):
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
@@ -2330,7 +2308,7 @@ def test_r2_05_a_drain_error_neither_skips_the_stop_nor_loses_what_was_read(henv
         return real()
     child.read_lines = read
     try:
-        events = host.close(SID, "closed") if how == "close" else host.stop_all()
+        events = host.close(SID, "closed")
     except OSError:
         pytest.fail("a drain error skipped the stop and lost what was read")
     [end] = ended_of(events)
@@ -2338,50 +2316,13 @@ def test_r2_05_a_drain_error_neither_skips_the_stop_nor_loses_what_was_read(henv
     assert s.ended or s.child is None or s.stopping_since is not None, "the stop went on"
 
 
-class _Timed:
-    """The node's client with each POST taking `takes` seconds of the fake clock, cut short (ReadTimeout) when the
-    call's own timeout is shorter; the first report carrying a steer outcome is refused (422)."""
-
-    def __init__(self, env, takes):
-        self.env, self.takes, self.calls = env, takes, []
-
-    def request(self, method, path, **kw):
-        if method != "POST":
-            return self.env.laptop.request(method, path, **kw)
-        t = kw.get("timeout")
-        limit = 20.0 if t is None else (t.read if isinstance(t, httpx.Timeout) else float(t))
-        self.calls.append(limit)
-        if limit < self.takes:
-            self.env.clock.advance(limit)
-            raise httpx.ReadTimeout("timed out")
-        self.env.clock.advance(self.takes)
-        if any("steer" in e for e in (kw.get("json") or {}).get("events", [])):
-            return httpx.Response(422, json={"detail": "extra field"}, request=httpx.Request(method, "http://hub" + path))
-        return self.env.laptop.request(method, path, **kw)
-
-
-def test_r2_06_a_reports_retry_fits_in_what_is_left_of_one_calls_budget(env):
-    from agent_comms.session_host import HostEvent
-    runner = env.node.sessions
-    sid, child = codex_turn_in_flight(env)
-    runner.client = _Timed(env, 15.0)
-    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
-    runner._emit([HostEvent(sid, "turn_ended", "1", ok=True, text="the end", answered=True,
-                            steer={"outcome": "unconfirmed", "why": "turn_cut"})])
-    t0 = env.clock()
-    runner._flush()
-    assert env.clock() - t0 <= 20.0, "the pair took no longer than one call: the shutdown's wait outlasts it"
-    assert node_sessions.REPORT_WAIT_SECONDS > 20.0
-    assert any(x == sid for x, _ in runner.pending), "not sent: kept for the next flush, never dropped"
-
-
-def test_r2_06_a_flush_under_way_when_shutdown_begins_posts_no_other_session(env):
+def test_r2_06_a_flush_under_way_when_shutdown_begins_is_mains_with_a_steer_live(env):
+    """(The shutdown simplification, rule 1; R4-04 goes with it.) Shutdown begins while a flush is posting, a steer
+    attempt live: the flush goes on as on main, every session's report posted."""
     from agent_comms.session_host import HostEvent
     runner = env.node.sessions
     a, ca = codex_turn_in_flight(env)
     b, cb = codex_turn_in_flight(env, project=P2)
-    # (Review round 3, the parity rule: this applies only while a steer attempt is live; b holds one here. With none,
-    # the flush is main's: test_k_parity_a_flush_overlapping_shutdown_with_no_steer_is_mains.)
     post_steer(env, b)
     tick(env)
     assert runner.host.attempts()
@@ -2397,8 +2338,7 @@ def test_r2_06_a_flush_under_way_when_shutdown_begins_posts_no_other_session(env
     runner._emit([HostEvent(a, "turn_ended", "1", ok=True, text="a", answered=True),
                   HostEvent(b, "turn_ended", "1", ok=True, text="b", answered=True)])
     runner._flush()
-    assert len(posted) == 1, "the lock is held for one report at most once shutdown waits for it"
-    assert [x for x, _ in runner.pending] == [b], "the other session's end is kept for shutdown's own flush"
+    assert len(posted) >= 2 and runner.pending == [], "main's flush: every report posted"
     runner.stopping.clear()
 
 
@@ -2704,11 +2644,13 @@ def test_o_the_watchdog_with_a_fully_written_steer_a_valid_receipt_and_no_native
     env.clock.advance(runner.self_stop_seconds + 1)     # no hub call meanwhile: the self-stop is due
     runner.enforce_deadlines()
     assert any(e.kind == "turn_ended" and e.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
-               for e in runner.watched_steer)
+               for e in runner.watched), "main's self-stop, its end in main's queue"
     env.node.hello()
     tick(env)
     assert msg(env, sid, 1)["state"] == "failed"
-    assert (steer_rec(env, sid)["outcome"], steer_rec(env, sid)["why"]) == ("unconfirmed", "turn_cut")
+    # (The shutdown simplification: the self-stop is main's, so the hub hears LOST first, as on main, and the
+    # self-stop's end with the host's word comes after it: S settles by the hub's own rule, `unconfirmed`.)
+    assert (steer_rec(env, sid)["outcome"], steer_rec(env, sid)["why"]) == ("unconfirmed", "no_word")
 
 
 @pytest.mark.parametrize("written", ["partial", "full"])
@@ -2738,7 +2680,9 @@ def test_o_an_authoritative_omission_through_reconciliation_after_a_partial_or_f
             "fully written before the omission: N's own answer decides"
 
 
-def test_o_shutdown_reads_the_pipe_before_its_sigterm(env):
+def test_o_shutdown_reads_nothing_before_its_sigterm(env):
+    """(The shutdown simplification, rule 1; part O's shutdown-drain row is withdrawn.) The signal is main's: what
+    the process wrote is not read first, and nothing is queued for the hub by it."""
     sid, child, req = steered(env)
     child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
     unread = []
@@ -2749,8 +2693,8 @@ def test_o_shutdown_reads_the_pipe_before_its_sigterm(env):
         return real()
     child.terminate = terminate
     env.node.sessions.signal()
-    assert unread == [0], "what the process wrote was read before SIGTERM"
-    assert any(e.kind == "turn_ended" and e.text == "native" for e in env.node.sessions.watched_steer)
+    assert unread == [3], "nothing was read before SIGTERM"
+    assert env.node.sessions.watched_steer == [] and env.node.sessions.watched == []
     env.node.sessions.stopping.clear()
 
 
@@ -2819,7 +2763,7 @@ class _Model:
         self.acks: list[tuple[float, float]] = []       # (sent, received): hellos, and reports naming N
         self.g: float | None = None
         self.held = self.omitted = self.fenced = self.n_ended = self.cancelling = False
-        self.native = self.answered = self.answer_read = False
+        self.native = self.answered = self.answer_read = self.frozen = False
         self.gates = {"turn": True, "bind": True, "may": True}
 
     def ack(self, sent, received):
@@ -2854,7 +2798,7 @@ class _Model:
 
 STEER_LINE = b'"method": "turn/steer"'
 EVENTS = ["pass", "local", "hello", "step", "gate", "accept", "answer", "end", "cancel_live", "cancel_queued", "stop",
-          "watchdog", "boundary_ack"]
+          "watchdog", "boundary_ack", "shutdown"]
 
 
 def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
@@ -2899,6 +2843,8 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
     def read():
         lines = real_read()
         for x in lines:
+            if model.frozen:
+                continue        # (a shutdown began: what is read now is after N was decided, rule 2)
             if (seen.frames and b'"turnId"' in x and b'"result"' in x and model.answered
                     and not model.n_ended):
                 model.answer_read = True
@@ -2916,7 +2862,7 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
                     model.n_ended = True
             return got
         return wrapped
-    for name in ("tick", "cancel", "stop_turns", "steer_deadlines", "drain", "close", "stop_all"):
+    for name in ("tick", "cancel", "stop_turns", "steer_deadlines", "close", "stop_all"):
         setattr(host, name, ends_of(getattr(host, name)))
     t_gate, m_gate = host.turn_gate, host.may_start
     host.turn_gate = lambda sess: model.gates["turn"] and (t_gate is None or t_gate(sess))
@@ -2981,7 +2927,7 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
 
     plan = script if script is not None else [None] * steps
     for i, step in enumerate(plan):
-        ev = step[0] if step is not None else rnd.choices(EVENTS, weights=[10, 4, 4, 6, 3, 3, 3, 1, 1, 1, 1, 2, 3])[0]
+        ev = step[0] if step is not None else rnd.choices(EVENTS, weights=[10, 4, 4, 6, 3, 3, 3, 1, 1, 1, 1, 2, 3, 1])[0]
         arg = step[1] if step is not None else None
         if ev == "pass":
             if arg is None:
@@ -3059,6 +3005,16 @@ def _run_model(tmp_path, seed: int, steps: int = 30, script=None):
                 model.ack(sent, env.clock())
                 log_.append(f"  ({i}) the boundary's hello published at {env.clock()}")
             host.steer_write_hook = at_boundary
+        elif ev == "shutdown":
+            # (The shutdown simplification:) main's shutdown, a steer live or not: every SIGTERM at once, nothing
+            # read first; S's outcome is what the host had read when it began (rule 2). It ends the sequence.
+            log_.append(f"{i} the node shuts down (signal, then stop_all)")
+            model.frozen = True
+            runner.signal()
+            with runner.lock:
+                runner._emit(host.stop_all())
+            _check(child, seen, model, log_)
+            break
         _check(child, seen, model, log_)
     # (Round 4, R3-11:) every sequence ends: N ends natively if nothing ended it, local passes read it, and the host
     # must then have said N's end. Without this a sequence that never ended N checked no settlement at all.
@@ -3347,20 +3303,6 @@ def test_r2_10_the_waits_answer_sweeps_first(env):
     assert out["steer_status"]["outcome"] == "unconfirmed" and out.get("note") != hs.STEER_UNSETTLED
 
 
-def test_r2_06_no_retry_is_made_with_under_a_second_of_the_budget_left(env):
-    from agent_comms.session_host import HostEvent
-    runner = env.node.sessions
-    sid, child = codex_turn_in_flight(env)
-    timed = _Timed(env, 19.5)
-    runner.client = timed
-    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
-    runner._emit([HostEvent(sid, "turn_ended", "1", ok=True, text="the end", answered=True,
-                            steer={"outcome": "unconfirmed", "why": "turn_cut"})])
-    runner._flush()
-    assert len(timed.calls) == 1, "half a second left: no retry in this flush"
-    assert any(x == sid for x, _ in runner.pending), "kept for the next flush"
-
-
 def _fetch_with(env, during, before=None):
     """The node's first fetch of an offer of S, sent 70 s after a hello, with `during(t0)` run while it is out; its
     reports are taken but their answers name no turn (only what the test adds is evidence). Returns the child."""
@@ -3638,24 +3580,6 @@ def _endless(child, clock, step=0.5):
     return reads
 
 
-def test_r3_04_shutdown_drains_every_session_within_one_deadline(env):
-    runner = env.node.sessions
-    children = []
-    for project in (PROJECT, P2, P3):
-        sid, child = codex_turn_in_flight(env, project=project)
-        post_steer(env, sid)
-        children.append(child)
-    tick(env)
-    assert all(runner.host.sessions[x].steer is not None for x in runner.host.sessions)
-    for child in children:
-        _endless(child, env.clock)
-    t = env.clock()
-    runner.signal()
-    assert env.clock() - t <= 2.0 + 0.5, "one deadline for the whole shutdown, not one per session"
-    assert all(c.terminated for c in children)
-    runner.stopping.clear()
-
-
 def test_r3_04_a_sessions_drain_stops_once_ns_end_is_read(henv):
     host, s, child, _ = host_n(henv)
     host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
@@ -3672,30 +3596,8 @@ def test_r3_04_a_sessions_drain_stops_once_ns_end_is_read(henv):
         child.bytes_read = getattr(child, "bytes_read", 0) + 4096     # more bytes after N's end
         return []
     child.read_lines = read
-    [end] = ended_of(host.drain())
+    [end] = ended_of(host.close(SID, "closed"))     # (a single-session stop: the only kind that drains now)
     assert end.ok and end.text == "native" and len(reads) == 1, "N's end read: nothing more is drained"
-
-
-def test_r3_04_the_grace_starts_at_the_actual_sigterm(env):
-    from agent_comms import node as node_mod
-    sid, child = codex_turn_in_flight(env)
-    post_steer(env, sid)
-    tick(env)
-    child.exits_on_terminate = False
-    _endless(child, env.clock)
-    times = {}
-    real_term, real_kill = child.terminate, child.kill
-
-    def term():
-        times.setdefault("term", env.clock())
-        return real_term()
-
-    def kill():
-        times.setdefault("kill", env.clock())
-        return real_kill()
-    child.terminate, child.kill = term, kill
-    node_mod.shut_down(env.node)
-    assert times["kill"] - times["term"] >= env.node.config.kill_grace_seconds, "the whole grace after the SIGTERM"
 
 
 def _steered_answered(henv):
@@ -3745,38 +3647,6 @@ def test_r3_05_a_native_end_behind_buffered_output_wins_over_a_broken_pipe(henv)
     assert ends[0].steer == {"outcome": "not_delivered", "why": "not_written"}
 
 
-def test_r3_06_a_report_exchange_has_a_total_deadline_whatever_the_transport_does(env, monkeypatch):
-    """A slow drip: the hub's answer never comes until the test lets it, every byte inside any per-operation timeout.
-    The exchange of a report carrying a steer outcome is given up at its total deadline, and the end stays queued.
-    (Round 4: no measured time: the answer is held until the flush has RETURNED, which it could do only by its own
-    deadline.)"""
-    import threading
-    from agent_comms.session_host import HostEvent
-    monkeypatch.setattr(node_sessions, "REPORT_PAIR_SECONDS", 0.5)
-    monkeypatch.setattr(node_sessions, "REPORT_FIRST_SECONDS", 0.4, raising=False)
-    monkeypatch.setattr(node_sessions, "REPORT_RETRY_SECONDS", 0.1, raising=False)
-    runner = env.node.sessions
-    sid, child = codex_turn_in_flight(env)
-    gate = threading.Event()
-
-    class Drip:
-        def request(self, method, path, **kw):
-            if method == "POST":
-                gate.wait()             # held until the flush below has returned
-            return env.laptop.request(method, path, **kw)
-    runner.client = Drip()
-    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
-    runner._emit([HostEvent(sid, "turn_ended", "1", ok=True, text="the end", answered=True,
-                            steer={"outcome": "unconfirmed", "why": "turn_cut"})])
-    flush = threading.Thread(target=runner._flush, daemon=True)
-    flush.start()
-    flush.join(60)
-    returned = not flush.is_alive()
-    gate.set()
-    assert returned, "the flush waited for the hub's answer: no total deadline"
-    assert any(x == sid for x, _ in runner.pending)
-
-
 class _Durations:
     """The node's client with each POST taking the next of `takes` seconds of the fake clock (cut short when the
     call's own timeout is shorter); a report carrying a steer outcome that gets through is refused (422)."""
@@ -3801,8 +3671,8 @@ class _Durations:
 
 
 def test_r3_06_the_final_flush_sends_ns_end_plainly_after_a_slow_refusal(env):
-    """Shutdown's last flush: the report with N's steer outcome takes 19.5 s and is refused (422). N's end still
-    goes, plainly, in the retry's own reserved time: never left behind on exit."""
+    """Shutdown's last flush, as any flush (the shutdown simplification, rule 4): the report with N's steer outcome
+    takes 19.5 s and is refused (422); N's end goes again at once, plainly, with main's per-call timeout."""
     from agent_comms.session_host import HostEvent
     runner = env.node.sessions
     sid, child = codex_turn_in_flight(env)
@@ -4034,7 +3904,8 @@ def test_r3_gap_the_plain_timeout_with_a_frame_queued_drains_first(henv):
     assert [e.text for e in ends] == ["native"]
 
 
-def test_r3_gap_shutdown_signals_the_sessions_holding_no_steer_before_it_drains(env):
+def test_r3_gap_shutdown_signals_every_session_at_once_a_steer_live_or_not(env):
+    """(The shutdown simplification, rule 1.) Main's signal: every SIGTERM at once, the steered session's too."""
     runner = env.node.sessions
     a, ca = codex_turn_in_flight(env)
     post_steer(env, a)
@@ -4048,13 +3919,21 @@ def test_r3_gap_shutdown_signals_the_sessions_holding_no_steer_before_it_drains(
         at.setdefault("b", env.clock())
         return real()
     cb.terminate = term
+    real_a = ca.terminate
+
+    def term_a():
+        at.setdefault("a", env.clock())
+        return real_a()
+    ca.terminate = term_a
     t = env.clock()
     runner.signal()
-    assert at.get("b") == t, "the session holding no steer got its SIGTERM before the drain began"
+    assert at == {"a": t, "b": t}, "both at once, nothing drained"
     runner.stopping.clear()
 
 
-def test_r3_gap_the_final_flush_posts_the_steer_carrying_report_first(env):
+def test_r3_gap_the_final_flush_posts_in_mains_order(env):
+    """(The shutdown simplification, rule 1.) The final flush is main's: sessions in the order their events came,
+    a steer outcome or not."""
     from agent_comms.session_host import HostEvent
     runner = env.node.sessions
     a, ca = codex_turn_in_flight(env)
@@ -4075,7 +3954,7 @@ def test_r3_gap_the_final_flush_posts_the_steer_carrying_report_first(env):
     runner.stopping.set()
     runner._flush(final=True)
     runner.stopping.clear()
-    assert order[0] == b, "the report with the steer outcome first, in the shutdown's own flush"
+    assert order[:2] == [a, b], "main's order"
 
 
 def test_r3_gap_a_childs_result_reads_no_steer_when_the_child_never_took_one(env, monkeypatch):
@@ -4083,6 +3962,362 @@ def test_r3_gap_a_childs_result_reads_no_steer_when_the_child_never_took_one(env
     reads = _steer_reads(monkeypatch)
     end_turn(env, child, "the task's answer")       # its result is made for the parent
     assert [r for r in reads if kid in r[1]] == []
+
+
+# ------------------------------------------------------------ shutdown simplified (provisional: owner decision pending)
+
+
+def _shutdown_run(tmp_path, steer: bool, case: str):
+    """One node shutdown (node.shut_down) with the Codex session A (message 1 in flight) and three ordinary sessions:
+    B (Codex, in flight, ignores SIGTERM), C (Claude, in flight) and D (Claude, idle). With `steer`, a human steer into
+    A's turn: `written` (written whole, its answer and N's native end in the pipe, NOT read), `unwritten` (A's turn
+    never proved: nothing written) or `in_turn` (answered and N ended natively, read before the stop began). Without,
+    the same steps with no steer. Returns ({session: [(what, seconds after the shutdown began)]}, {session: the
+    events posted during it, steer stripped}, A's steer record or None, A's session id)."""
+    from agent_comms import node as node_mod
+    env = session_env(tmp_path, dispatch=TREE, config=tree_config)
+    a, ca = codex_turn_in_flight(env, prove=case != "unwritten")
+    if steer:
+        post_steer(env, a)
+        tick(env)
+    b, cb = codex_turn_in_flight(env, project=P2)
+    c = start(env, "three", project=P3)["session_id"]
+    d = start(env, "four", project=P2)["session_id"]
+    tick(env)
+    answer(env, d, "four's reply")
+    tick(env)
+    if case in ("written", "in_turn"):
+        reqs = steers_of(ca)
+        assert len(reqs) == (1 if steer else 0)
+        if steer:
+            answer_steer(ca, reqs[0], {"turnId": cx.TURN})
+        ca.emit(cx.message("native"), cx.completed())
+        if case == "in_turn":
+            tick(env)       # N's native end and its evidence are read before the stop begins
+    else:
+        assert steers_of(ca) == []
+    runner = env.node.sessions
+    cb.exits_on_terminate = False
+    names = {a: "A", b: "B", c: "C", d: "D"}
+    log, posted, t0 = {}, {}, []
+    for sid, name in names.items():
+        ch = runner.host.sessions[sid].child
+        if ch is None:
+            continue
+        for what in ("terminate", "kill", "read_lines"):
+            real = getattr(ch, what)
+
+            def rec(*args, real=real, what=what, name=name, **kw):
+                if t0:
+                    log.setdefault(name, []).append((what, env.clock() - t0[0]))
+                return real(*args, **kw)
+            setattr(ch, what, rec)
+    real_client = runner.client
+
+    class Recording:
+        def request(self, method, path, **kw):
+            if t0 and method == "POST" and path.startswith("/api/nodes/sessions/"):
+                name = names.get(path.rsplit("/", 1)[-1])
+                if name is not None:
+                    posted.setdefault(name, []).extend({k: v for k, v in e.items() if k != "steer"}
+                                                       for e in (kw.get("json") or {}).get("events", []))
+            return real_client.request(method, path, **kw)
+    runner.client = Recording()
+    t0.append(env.clock())
+    node_mod.shut_down(env.node)
+    rec = steer_rec(env, a) if steer else None
+    return log, posted, rec, a
+
+
+@pytest.mark.parametrize("case, want", [("written", ("unconfirmed", "turn_cut")),
+                                        ("unwritten", ("not_delivered", "not_owned")),
+                                        ("in_turn", ("in_turn", "answered"))])
+def test_sd_shutdown_with_a_live_steer_is_mains_for_every_session_event_for_event_and_in_time(tmp_path, case, want):
+    """The shutdown simplification, rules 1, 2 and 7: node shutdown with a live steer attempt and three ordinary
+    sessions is the steer-free run (the golden pins that one to main) event for event and in time: every SIGTERM,
+    SIGKILL and pipe read of every session at the same moment, the same events posted for each (the steered
+    session's N end differing only by its steer outcome). S's outcome is what was read before the stop began."""
+    plain = _shutdown_run(tmp_path / "plain", False, case)
+    steered_ = _shutdown_run(tmp_path / "steered", True, case)
+    assert steered_[0] == plain[0], "every signal, kill and read at main's moment"
+    assert steered_[1] == plain[1], "the same events for every session"
+    assert "B" in plain[0] and any(w == "kill" for w, _ in plain[0]["B"]), "(the run has a SIGKILL to compare)"
+    assert (steered_[2]["outcome"], steered_[2]["why"]) == want
+
+
+@pytest.mark.parametrize("how", ["stop_turns", "stop_all", "self_stop"])
+def test_sd_a_stop_of_every_turn_reads_nothing_more_and_s_is_what_was_read(env, how):
+    """Rules 1 and 2: with S written whole, its answer and N's native end in the pipe unread, a stop of every turn,
+    shutdown's stop_all and the watchdog's self-stop read nothing before they fail N (stop_all's one read after the
+    kill is main's), so S is `unconfirmed` (`turn_cut`)."""
+    sid, child, req = steered(env)
+    answer_steer(child, req, {"turnId": cx.TURN})
+    child.emit(cx.message("native"), cx.completed())
+    runner = env.node.sessions
+    host = runner.host
+    reads, real = [], child.read_lines
+
+    def read():
+        reads.append(len(child.stdout))
+        return real()
+    child.read_lines = read
+    if how == "stop_turns":
+        events = host.stop_turns("no contact")
+    elif how == "stop_all":
+        events = host.stop_all()
+    else:
+        env.clock.advance(runner.self_stop_seconds + 1)
+        runner.enforce_deadlines()
+        events = runner.watched
+    [end] = ended_of(events)
+    assert not end.ok and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+    assert reads == ([3] if how == "stop_all" else []), "no read beyond main's"
+
+
+def _codex_steered_in(host, henv, sid, uuid):
+    """(The host test helpers' host_n for another session of the same host.) A Codex session `sid` whose message `a`
+    is in flight and proved, with a steer offered and written whole."""
+    host.open(sid, agent="codex", runtime="codex-cli", project=PROJECT)
+    host.send(sid, "long", message_id="a")
+    host.tick()
+    child = henv.spawner.children[-1]
+    codex_ready(host, child)
+    host.tick()
+    st = last_start(child)
+    child.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED, user_item(st["params"]["clientUserMessageId"]))
+    host.tick()
+    if uuid is not None:
+        host.steer_offer(sid, "a", uuid, TEXT, authorized=True)
+        host.tick()
+        assert len(steers_of(child)) == 1
+    return child
+
+
+def _endless_after_first(child, clock, step=0.5, free=2):
+    """As `_endless`, but the first `free` reads cost no time (the pass's own two reads of every session, which main
+    makes too): only a drain's reads take the clock on."""
+    child.bytes_read = 0
+    reads = []
+
+    def read():
+        if len(reads) >= free:
+            clock.advance(step)
+        reads.append(1)
+        child.bytes_read += 4096
+        return []
+    child.read_lines = read
+    return reads
+
+
+def test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it(henv):
+    """R4-06, Sol's 8 s case: four steered sessions, each still writing without end, and one ordinary session reach
+    their turn timeout in the same pass. The ordinary one is stopped first, at the pass's own time (never delayed
+    nor backdated by a drain); the four share ONE 2 s drain deadline (not 2 s each), and each is stopped when its
+    turn comes, dated then."""
+    import uuid as uuid_mod
+    from agent_comms.session_host import STEER_DRAIN_SECONDS
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    ids = [SID] + [str(uuid_mod.uuid4()) for _ in range(4)]
+    host.sessions.pop(SID)
+    kids = {}
+    for i, sid in enumerate(ids[1:]):
+        kids[sid] = _codex_steered_in(host, henv, sid, f"u{i}")
+    plain = ids[0]
+    kids[plain] = _codex_steered_in(host, henv, plain, None)       # opened last: main's order handles it last
+    henv.clock.advance(31 * 60)
+    host.tick()                                 # every turn's interrupt is written
+    henv.clock.advance(henv.config.kill_grace_seconds)
+    signalled = {}
+    for sid, ch in kids.items():
+        ch.exits_on_terminate = False       # (each stays stopping, so its stop's time can be read)
+        real = ch.terminate
+
+        def term(real=real, sid=sid):
+            signalled.setdefault(sid, henv.clock())
+            return real()
+        ch.terminate = term
+        if sid != plain:
+            _endless_after_first(ch, henv.clock)
+    t = henv.clock()
+    events = host.tick()
+    assert signalled[plain] == t and host.sessions[plain].stopping_since == t, "the ordinary stop is main's"
+    assert henv.clock() - t <= STEER_DRAIN_SECONDS + 0.5, "one drain deadline for the whole pass"
+    for sid in ids[1:]:
+        assert host.sessions[sid].stopping_since == signalled[sid], "each stop dated when it was sent"
+    assert len(ended_of(events)) == 5
+    assert all(e.steer == {"outcome": "unconfirmed", "why": "turn_cut"} for e in ended_of(events) if e.session_id != plain)
+
+
+def test_sd_the_cancels_of_one_listing_share_one_drain_deadline(env):
+    """Rule 3: a listing that cancels two steered turns, each process still writing without end, is one pass: its
+    two cancels share ONE drain deadline (2 s in all, not 2 s each)."""
+    import json as json_
+    from agent_comms.session_host import STEER_DRAIN_SECONDS
+    runner = env.node.sessions
+    a, ca = codex_turn_in_flight(env)
+    post_steer(env, a)
+    b, cb = codex_turn_in_flight(env, project=P2)
+    post_steer(env, b)
+    tick(env)
+    assert len(steers_of(ca)) == 1 and len(steers_of(cb)) == 1
+    data = listing(env)
+    for e in data["sessions"]:
+        if e["session_id"] in (a, b):
+            e["messages"][0]["cancel"] = True
+    _endless(ca, env.clock)
+    _endless(cb, env.clock)
+
+    class Hub:
+        def request(self, method, path, **kw):
+            if method == "GET" and path == "/api/nodes/sessions":
+                return httpx.Response(200, json=json_.loads(json_.dumps(data)),
+                                      request=httpx.Request(method, "http://hub" + path))
+            return env.laptop.request(method, path, **kw)
+    runner.client = Hub()
+    took, real = [], runner._reconcile
+
+    def reconcile(*args, **kw):
+        t = env.clock()
+        try:
+            return real(*args, **kw)
+        finally:
+            took.append(env.clock() - t)
+    runner._reconcile = reconcile
+    runner.fresh, runner.last_sync = False, float("-inf")
+    runner.pass_once(wait=0)
+    assert took and took[0] <= STEER_DRAIN_SECONDS + 0.5, "one drain deadline for the listing's cancels"
+    assert ca.terminated and cb.terminated
+
+
+def test_sd_r4_07_the_kill_deadline_is_mains_with_and_without_a_steer(tmp_path):
+    """R4-07: node.shut_down's ordinary kill deadline starts before the sessions are signalled, as on main, however
+    long signalling takes, with a live steer attempt or none."""
+    from agent_comms import node as node_mod
+    for steer in (False, True):
+        env = session_env(tmp_path / f"s{steer}", dispatch=TREE, config=tree_config)
+        sid, child = codex_turn_in_flight(env)
+        if steer:
+            post_steer(env, sid)
+            tick(env)
+            assert env.node.sessions.host.attempts()
+        child.exits_on_terminate = False
+        runner = env.node.sessions
+        real_signal = runner.signal
+
+        def slow_signal(real_signal=real_signal, env=env):
+            env.clock.advance(2.0)          # signalling takes 2 s (the host's lock, many sessions)
+            return real_signal()
+        runner.signal = slow_signal
+        times, real_kill = {}, child.kill
+
+        def kill(real_kill=real_kill, env=env):
+            times.setdefault("kill", env.clock())
+            return real_kill()
+        child.kill = kill
+        t = env.clock()
+        node_mod.shut_down(env.node)
+        grace = env.node.config.kill_grace_seconds
+        assert abs(times["kill"] - (t + grace)) <= 0.25, f"steer {steer}: the kill is due at main's deadline"
+
+
+def _steer_end_event(sid):
+    from agent_comms.session_host import HostEvent
+    return HostEvent(sid, "turn_ended", "1", ok=True, text="the end", answered=True,
+                     steer={"outcome": "unconfirmed", "why": "turn_cut"})
+
+
+def test_sd_r4_03_the_retry_never_changes_the_first_requests_payload(env):
+    """Rule 4: after a 422 the plain retry is built from its own payload: the first request's body, as the transport
+    was given it, still carries the outcome afterwards."""
+    import copy
+    runner = env.node.sessions
+    sid, child = codex_turn_in_flight(env)
+    given = []
+
+    class RefusesSteer:
+        def request(self, method, path, **kw):
+            if method == "POST" and path == f"/api/nodes/sessions/{sid}":
+                given.append((kw["json"], copy.deepcopy(kw["json"])))
+                if any("steer" in e for e in kw["json"].get("events", [])):
+                    return httpx.Response(422, json={"detail": "extra field"},
+                                          request=httpx.Request(method, "http://hub" + path))
+            return env.laptop.request(method, path, **kw)
+    runner.client = RefusesSteer()
+    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
+    runner._emit([_steer_end_event(sid)])
+    assert runner._flush()
+    assert len(given) == 2 and given[0][0] == given[0][1], "the first request's payload is unchanged"
+    assert any("steer" in e for e in given[0][0]["events"]) and not any("steer" in e for e in given[1][0]["events"])
+    assert msg(env, sid, 1)["state"] == "done"
+
+
+def test_sd_r4_03_a_refusal_answered_after_a_newer_listing_keeps_that_listings_features(env):
+    """Rule 4: the refusal of a report sent under one listing's features comes after a newer listing was applied:
+    the newer features stand (a later steer outcome is not stripped), and N's end still goes, plainly."""
+    runner = env.node.sessions
+    sid, child = codex_turn_in_flight(env)
+    newer = listing(env)
+
+    class StaleRefusal:
+        def request(self, method, path, **kw):
+            if method == "POST" and path == f"/api/nodes/sessions/{sid}" and any(
+                    "steer" in e for e in kw["json"].get("events", [])):
+                runner._reconcile(newer)        # a newer listing is applied while this report is out
+                return httpx.Response(422, json={"detail": "extra field"},
+                                      request=httpx.Request(method, "http://hub" + path))
+            return env.laptop.request(method, path, **kw)
+    runner.client = StaleRefusal()
+    runner._reconcile(listing(env))
+    assert "steer" in runner.hub_features
+    runner._emit([_steer_end_event(sid)])
+    assert runner._flush()
+    assert "steer" in runner.hub_features and runner.features_known, "a stale refusal never forgets newer features"
+    assert "steer" in runner._for_hub({"kind": "turn_ended", "message": 2, "steer": {"outcome": "in_turn"}})
+    assert msg(env, sid, 1)["state"] == "done"
+
+
+def test_sd_r4_03_the_final_flush_is_any_flush(env):
+    """Rule 4: in shutdown's final flush a report carrying a steer outcome whose first attempt fails in transport is
+    not retried there (only a 422 is): it stays queued, as in any flush."""
+    runner = env.node.sessions
+    sid, child = codex_turn_in_flight(env)
+    posts = []
+
+    class Fails:
+        def request(self, method, path, **kw):
+            if method == "POST" and path == f"/api/nodes/sessions/{sid}":
+                posts.append(1)
+                raise httpx.ReadTimeout("timed out")
+            return env.laptop.request(method, path, **kw)
+    runner.client = Fails()
+    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
+    runner._emit([_steer_end_event(sid)])
+    runner.stopping.set()
+    assert not runner._flush(final=True)
+    runner.stopping.clear()
+    assert posts == [1], "one attempt, as any flush makes"
+    assert any(x == sid for x, _ in runner.pending)
+
+
+def test_sd_r4_08_an_unexpected_error_ends_the_session_by_rule_2_without_a_drain(env):
+    """R4-08: an unexpected host error that ends a session (`_end` from `tick`) reads nothing more: S, written whole,
+    with its answer and N's native end still in the pipe, is `unconfirmed` (`turn_cut`)."""
+    sid, child, req = steered(env)
+    answer_steer(child, req, {"turnId": cx.TURN})
+    child.emit(cx.message("native"), cx.completed())
+    host = env.node.sessions.host
+    calls, real = [], child.read_lines
+
+    def read():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("an unexpected error")
+        return real()
+    child.read_lines = read
+    [end] = ended_of(host.tick())
+    assert not end.ok and end.detail.startswith("session ended: host error"), "ended by the error, no drain first"
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
 
 def test_r3_gap_the_join_probe_fails_at_once_on_an_answer_naming_another_turn(tmp_path):
