@@ -1294,9 +1294,15 @@ def _steer_sent(a, out, settings: Settings, token: str, r: dict, text: str) -> N
         # Message N (and the steer with it) is no longer kept on the hub (R2-10). An outcome the send's own answer
         # already said is kept, with its exit (R3-10); otherwise the outcome is not known: exit 7.
         known = st.get("outcome")
-        note = (f"message {st['into']} is no longer kept on the hub; the steer's outcome, from the send's answer: "
-                f"{STEER_WORDS.get(known, known)}" if known in STEER_EXIT else
-                f"message {st['into']} is no longer kept on the hub, and neither is the steer's outcome")
+        if known in STEER_EXIT:
+            note = (f"message {st['into']} is no longer kept on the hub; the steer's outcome, from the send's answer: "
+                    f"{STEER_WORDS.get(known, known)}")
+        elif known == "in_turn":
+            # (R4-09) S's outcome is known; only N's own result, and so the exit it would give, is not.
+            note = (f"the steer's outcome is known from the send's answer: {STEER_WORDS['in_turn']}; message "
+                    f"{st['into']} is no longer kept on the hub, so its own result and exit status are not available")
+        else:
+            note = f"message {st['into']} is no longer kept on the hub, and neither is the steer's outcome"
         if a.json:
             print(json.dumps({"session": s, "steer": st, "reply": None, "note": note}, indent=2))
         else:
