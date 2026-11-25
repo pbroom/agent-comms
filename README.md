@@ -654,12 +654,25 @@ about what the model did with it: `in_turn` is evidence that Codex admitted it i
    steer until a reload succeeds). Then check that the hub refuses new steers:
    `uv run board session send <an ended session's id> "check" --mode steer` must answer "cannot steer into session
    ...: steering is switched off on this hub ([dispatch.sessions] steer = false)". The switch is read before anything
-   about the session, and nothing is sent; any other reason means steering is still on.
+   about the session, and the check sends nothing. It does the hub's usual read-time housekeeping, so it may settle a
+   steer that was already stale.
+   - Any other answer fails to confirm the rollback setting. That includes the "rejected" refusal (the latest
+     reload of the settings was rejected) and the "could not be read" and "directly under [dispatch]" refusals.
+     These also refuse new steers, but they mean the settings files are not what you think: fix them and check
+     again.
 2. Wait until `uv run board session list` shows no session with a steer unsettled. Each settles when its turn ends.
-3. Roll back the nodes.
-4. At the hub's cut-over: stop this hub, remove the `steer` key, then start the older hub. An older hub's parser
-   rejects `steer` as an unknown key, even `steer = false` (it would leave that whole table at its defaults). Do not
-   remove the key before this hub stops: while it still serves, no `steer` key means steering on, the default.
+3. Roll back every node first, then restart the agent sessions on the hub machine.
+   - This must come before step 4. A long-lived process on the hub machine, such as an agent's stdio MCP server,
+     keeps running this version's code until it restarts.
+   - Once the key is removed in step 4, such a process would read no key, so steering would be on. It could then
+     accept a parent's steer into a child whose node still speaks session protocol 5.
+   - The older hub never offers that steer, so no node ever writes it, but the parent is told it was accepted. The
+     steer stays unsettled until a newer hub returns.
+   - Once the nodes are back on the older protocol, the protocol check refuses such a steer.
+4. At the hub's cut-over: stop this hub, remove the `steer` key from every settings file the older hub reads, then
+   start the older hub. An older hub's parser rejects `steer` as an unknown key, even `steer = false` (it would leave
+   that whole table at its defaults). Do not remove the key before this hub stops: while it still serves, no `steer`
+   key means steering on, the default.
 
 The older hub reads the same board.local.toml, so the key has to go at the cut-over itself. A steer left unsettled
 through a downgrade is settled `unconfirmed`, or `not_delivered` if it never reached a node, when the newer hub

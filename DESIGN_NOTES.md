@@ -11015,10 +11015,21 @@ before nodes. Before installing an older hub over one with mid-turn steering, in
    edit keeps the last good settings and refuses every new steer until a reload succeeds. Then check that new steers
    are refused: `uv run board session send <an ended session's id> "check" --mode steer` must answer with the
    switch's words ("steering is switched off on this hub ([dispatch.sessions] steer = false)"). The switch is read
-   before anything about the session, so nothing is sent.
+   before anything about the session, so nothing is sent (the usual read-time housekeeping may settle a steer that
+   was already stale). Any other answer fails to confirm the rollback setting, the "rejected", "unreadable" and
+   "misplaced" refusals included: they refuse new steers too, but the settings files are not what the operator
+   thinks (follow-up after #115).
 2. Wait until `uv run board session list` shows no session with a steer unsettled.
-3. Roll back the nodes.
-4. At the hub's cut-over: stop this hub, remove the `steer` key, then start the older hub. An older hub's parser
+3. Roll back every node, then restart the agent sessions on the hub machine. This has to come before step 4
+   (follow-up after #115).
+   - A long-lived process on the hub machine (an agent's stdio MCP server) runs this version's code until it
+     restarts. Once the key is gone it reads no key, steering on, and could accept a parent's steer into a child on a
+     node still at protocol 5.
+   - The older hub never offers that steer, so no node writes it, but the parent is told it was accepted and it stays
+     unsettled until a newer hub returns.
+   - With the nodes back on the older protocol, the protocol check refuses it.
+4. At the hub's cut-over: stop this hub, remove the `steer` key from every settings file the older hub reads, then
+   start the older hub. An older hub's parser
    rejects `steer` as an unknown key, even `steer = false`, and would leave that whole table at its defaults.
    Removed earlier, while this hub still serves, the missing key means steering on (the default).
 The older hub reads the same board.local.toml, so I found no cleaner way without building something new. A steer
@@ -13829,3 +13840,33 @@ test set with -x; the file was then restored. All 8 were caught on the first run
 | R11-3 one line per change of the error | `test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off[string]` |
 | R11-3 one remembered error (the last) | `test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off[string]` |
 | R11-3 a good read forgets the error | `test_r11_3_the_unreadable_warning_keeps_one_entry_and_says_one_line_per_change` |
+
+### Follow-up after #115
+
+The known follow-ups the PR body of #115 listed, from review round 12 and the independent reviewer's final verdict
+on 6998a54. Branch `claude/codex-steering-followup`, from origin/main 2b84f42.
+
+- **The switch in the wrong place** (Sol, should). A cold start with `steer` placed directly under `[dispatch]`
+  instead of `[dispatch.sessions]` left steering on. Startup does not validate `[dispatch]`, and the switch saw no
+  `[dispatch.sessions]`.
+  - `off_reason` now returns "misplaced" for a `steer` key directly under `[dispatch]`, whatever its value. New
+    steers are refused with "steering is off on this hub: its settings set steer directly under [dispatch]; the
+    switch is [dispatch.sessions] steer". The hub's one warning (per change of the error) names the right place.
+  - Steers accepted before are offered and settled as ever.
+  - Nothing else about startup validation changed; `[dispatch]` is not validated generally.
+  - A reload already refused it: `Board.reload_settings` rejects `[dispatch] steer` as an unknown key and keeps the
+    last good settings, so new steers are refused as "rejected" until a reload succeeds.
+  - Tests:
+    - `test_followup_a_steer_key_directly_under_dispatch_at_a_cold_start_turns_steering_off[false|true|"off"]`, on a
+      Board built from a board.toml on disk.
+    - `test_followup_a_misplaced_steer_key_refuses_new_steers_with_words_that_name_the_right_place`.
+    - `test_followup_a_misplaced_steer_key_at_a_reload_is_rejected_as_any_unknown_key`, which pins the reload path
+      as it already was.
+    - The first two fail on 2b84f42 by their assertions.
+- **The rollback check's answer** (Sol, nit). Any answer other than the switch's explicit words fails to confirm
+  the rollback setting, the "rejected", "unreadable" and "misplaced" refusals included. The check sends nothing,
+  and does the usual read-time settling. Both are now said in the README and part J.
+- **Step 3 before step 4** (the independent reviewer, nit). Roll back every node, and restart the agent sessions on
+  the hub machine, before the key is removed at the cut-over. The README and part J now say why: a long-lived
+  process still running this code would read no key, steering on, and could accept a parent's steer that no node
+  ever writes.
