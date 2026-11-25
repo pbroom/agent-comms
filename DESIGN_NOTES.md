@@ -13005,3 +13005,69 @@ Scratchpad `mutate7.py`: the earlier rows whose lines this round changed, rewrit
 | R5-04 kills between a drain's reads | `test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then` |
 | R5-05 a steer-only 422 spares the features | `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer` |
 | R5-05 only steer forgotten | `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer` |
+
+### Rebase onto main 06dfe82 (#112, the no-progress budget in counted time)
+
+- **The rebase.** The backup branch `backup/codex-steering-d6474c1` sits at d6474c1. Then `git rebase origin/main`
+  onto 06dfe82. Main's `providers/claude.py` and `tests/test_claude_correlation.py` are identical here. Of main's
+  `tests/test_structured_results.py`, only the two golden tests carry step 2's `named=True`, as before (K's named
+  changes for a run with no steer).
+- **The fixture.** Not re-recorded. Against main's fixture, which #112 did not change, every value main has is
+  byte-identical except `transcripts`, with its one Codex echo line as in every round. The added keys are still
+  `listing_p5`, `node_bodies` and `zz_parity`.
+- **Conflicts**, each listed with the commit it was in (the commits as they were before the rebase):
+  - 718c279, node_sessions.py `__init__`: both; main's `may_start_query`, then step 2's authority fields.
+  - 1156f6b, session_host.py `__init__`: both; main's `may_start_query` and `_in_tick`, then `steer_authority`.
+    Also in `_steps`, the auto-merged steer cut's bare `return` was made `return gates`, since main's `_steps`
+    returns its gate reading.
+  - 10201f6, tests/golden_schema_free.py `_run`: main's logs filter, the `told` allowance, then step 2's
+    `listing_p5` and `named`. Main's `TOLD`/`told` come before step 2's `NAMED` block.
+  - 64d8859, the same `_run`: step 2's `node_bodies`, then main's logs filter.
+  - d93de91, the same file: both; main's `TOLD`/`told`, then step 2's `_parity`.
+  - b6baf3d, session_host.py `tick`: main's re-entrancy-guarded `tick` kept. Its `_tick` takes that commit's one
+    drain budget and `_pass_order`, and calls main's `_pass` (`_steps`, then `_mark`).
+  - 8eebd46, `_tick`: that commit's `_pass_groups` loops inside main's `_tick`, which returns nothing.
+  - 6f151b2, round 5's pass:
+    - `tick` is main's guarded wrapper.
+    - `_tick` has one deferral list per pass, set in `_tick` itself; `tick` is not re-entrant, so the round 5
+      "outer" test is gone.
+    - Main's two loops run at main's `now`, then `_run_deferred`, inside the one drain budget.
+    - `_pass` is the `draining` skip, then main's `_steps` and `_mark`.
+    - `_read` is main's (no `_earn`), with `and not s.draining`.
+- **The pass on the rebased code** (session_host.py):
+  - `tick` (1159) is main's guarded wrapper.
+  - `_tick` (1174) sets the deferral list (1175) and enters the drain budget (1177). Inside the node's
+    `pass_once`, the budget is the one for the whole hold of the loop's lock (node_sessions.py:633); nested, it
+    shares that one.
+  - Loop 1 is main's reads and reaps. A live attempt's exit is fenced or released right there (1418, 1438) and
+    only its drain is deferred (`_defer`, 1067).
+  - Loop 2 is `_pass` (1208) for each session. A session whose drain is pending does only main's reaping of its
+    fenced group (1209). Every other session runs main's `_steps` (1221): reads and reap; main's write-timer check
+    for an unearned staged line; `_take_back` (1234); the one decision point `_decide` (1239, defined at 1749);
+    timeouts; the stopping branch; `_restart_pass`, `_steer_pass` and `_write`. Then `_mark`.
+  - In `_hold_to_timeout`, a live attempt's timeout is fenced right there (1578, 1609, through
+    `_fence_then_decide`, 1617). So are a broken pipe (2300) and a cut in a tick (2104).
+  - After both loops comes `_run_deferred` (1202, defined at 1077), within the budget.
+- **Claude and Codex never meet in it.**
+  - A slot is made only for a provider whose modes name `steer`. Claude's adapter names none, so a Claude session
+    never has a live attempt, is never deferred, and its `_steer_pass` returns at once.
+  - A Codex session never has a budget. `_decide` returns before any gate reading unless the process is a verified
+    Claude incarnation (`_correlated`), so `_read_gates` is never reached for it. A Codex session whose drain is
+    pending never enters `_steps` at all.
+  - The deferred drain reads a Codex process's lines after every session's decision in the pass and makes no
+    decision. Main's rule, that nothing about a budget is decided from reading lines, is untouched.
+  - Test: `test_rebase_a_claude_budget_and_a_codex_drain_never_meet`. A verified Claude session holds M with its
+    budget counting while a Codex live attempt's exit is drained in the same pass. Claude's decision comes before
+    the drain; the drain reads only Codex and makes no decision; no gate reading or budget exists for Codex; no
+    slot or steer byte exists for Claude.
+
+- **Runs** at bf3d81c (the rebased code with its one test):
+  - `uv run pytest -q -p no:cacheprovider`: 4425 passed, 10 skipped.
+  - The stand-in e2e in full: PASS (165 s, 345 checks).
+  - `--only steering` with stand-ins: PASS (111 s, 57 checks).
+  - `--only correlation` with stand-ins: PASS (12 s, 24 checks).
+  - `--only steering` with the real Codex (codex-cli 0.171.0): PASS (60 s, 27 checks).
+  - `--only steer` with the real Codex: PASS (32 s, 28 checks).
+  - `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (13 s, 23 checks).
+  - `~/.codex/config.toml` sha256 unchanged through all of them:
+    d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
