@@ -469,12 +469,16 @@ class LineReader:
         self.fd, self.buf = fd, b""
 
     def next(self, deadline: float) -> bytes | None:
-        import select
+        import selectors
         while b"\n" not in self.buf:
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
-            ready, _, _ = select.select([self.fd], [], [], left)
+            # (Review round 5:) a selector, not select(): select() refuses a descriptor above FD_SETSIZE (1024), which
+            # a long test run in one process reaches.
+            with selectors.DefaultSelector() as sel:
+                sel.register(self.fd, selectors.EVENT_READ)
+                ready = sel.select(left)
             if not ready:
                 return None
             chunk = os.read(self.fd, 65536)
