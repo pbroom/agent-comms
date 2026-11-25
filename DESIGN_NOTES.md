@@ -10748,6 +10748,15 @@ sends SIGTERM before `stop_all`'s bookkeeping, so it first drains every session 
 holding (steps 1 and 2), and `stop_all` emits the decided end in place of its `_fail` after its own bounded wait (its
 kill grace, then SIGKILL).
 
+(Ruled after step 2's review round 2:) The 5 s limit on a frame taken in part is the LAST check before each write,
+on a clock read after every gate callback has returned (R2-03): a callback that takes time cannot carry the write
+past it. A drain (and the cut's read) goes on while its reads make progress, a complete line or bytes taken into a
+line not complete yet, for at most STEER_DRAIN_SECONDS (2 s on the host's clock) and STEER_DRAIN_READS (4,096
+reads); it never stops merely because one read returned no line (R2-05). A drain error ends the reading only: what
+was read before it is reported, and the stop goes on. A cancel drains only when it stops the live turn (N in flight
+or being written); a cancel of a message behind N reads nothing, and every event a cancel returns is reported, in
+order (R2-04).
+
 ### E. Write authority, and the checkout
 
 **Write authority** (E-2, G-1). The node writes a steer only while its contact is fresh by the hub's own evidence: its
@@ -10757,6 +10766,14 @@ since, (iii) it holds at write time, and (iv) the request's age, on a monotonic 
 is read. Loss is one-way: a node that has lost contact writes no new steer, a held offer is revoked for good, and a
 running hold ends through the finalizer (D). While a steer is written or a hold runs, the session loop posts the
 session's status at least every 20 s.
+
+(Ruled after step 2's review round 2:) Contact is continuous by RECEIPT time: each acknowledgement counts from when
+it is received until 75 s after it was sent, so (ii) holds across every acknowledgement received while the fetch was
+out, each received before the one before it ran out (R2-07: an acknowledgement at 0, the fetch sent at 70, a renewal
+sent at 72 and acknowledged before 75, the answer read at 78 holds). An acknowledgement is published under the ack
+state's own short lock, never the host's (R2-09): a break is latched there, before the acknowledgement counts
+(S2-03), and the host is told at once only when its lock is free; otherwise its next write boundary, the loop or the
+watchdog finds the latch. With no steer held a hello takes no lock of the host's, as on main.
 
 **The checkout.** Steering changes nothing in dispatch. A written steer is part of the running turn for checkout
 purposes (A's fourth exception): N is delivered on the hub for as long as its end is held, so main's existing rules
@@ -10789,8 +10806,9 @@ key for repeats); `text` (until settled); `listed_at` (set once, below); `cancel
 `settled_at` (null until set once, at N's end); `withdrawn_at` (set once, below); for `next_turn` a `result` (S's
 `ok`, `detail`, `denials`, its own `meta`, kept apart from N's and never added, and its reply); `request_id`,
 `sent_by` (the session's receipts gain `{"steer": N, "at"}`, seven days from acceptance). N's message gains `held`
-(the checkpoint) during a hold. No session field is added. One steer per N, one unsettled per session, no checkout
-reservation of its own.
+(the checkpoint) during a hold. No session field is added, but one: `steered: true` on a session that ever took a
+steer (review round 2, section 4: so that no other session is read for steers; K, "Reads"; a decision for the
+coordinator). One steer per N, one unsettled per session, no checkout reservation of its own.
 
 **Every offer** (G-1). EVERY offer of S, not only the first, is made in the listing's write transaction
 (`hosted_wake.listing`'s `deliver`, made due by an eligible steer), which first revalidates: S unsettled; N delivered
@@ -10814,7 +10832,15 @@ names `steer` is authoritative: its omission of S revokes S for good. A listing 
 or a capability not known) fences: no offer of its is taken, no byte of S is written while fenced, nothing is
 revoked; a zero-byte frame fenced may be written later only if a later authoritative listing still lists S and the
 contact clock was never broken. (S2-07:) The 422 retry without the extension happens in that same flush, the last
-one of a shutdown included.
+one of a shutdown included. (Ruled after review round 2, R2-02:) A fence lifts only on a fresh offer (inside the
+contact clock by send time, its answer read within 20 s, within the cap), from an authoritative listing, of the same
+S (uuid) for the same N; a stale listing, or one naming S for another turn, never lifts it. A gate other than the
+fence that fails while the frame waits out of the buffer is latched: S is revoked and never written. (R2-06:) A
+report's first attempt and its 422 retry share one budget from the first send, REPORT_PAIR_SECONDS (20 s, the read
+timeout of one call): the retry gets only what is left (and is not made with less than 1 s; the report stays queued),
+so the pair takes no longer than one call and fits in shutdown's wait for the report lock (REPORT_WAIT_SECONDS, 25 s).
+A flush that is not shutdown's own stops between sessions once shutdown has begun, so it holds that lock for at most
+one report while shutdown waits, and what is left goes in shutdown's final flush.
 
 **The checkpoint** (E-1). On entering a hold the host emits a `held` notice (N's native result, capped as an end's).
 The node sends it alone, in a report of its own with no events, after that session's pending events, only when the
@@ -10855,7 +10881,10 @@ protocol is below 5; `modes` lack `steer`; no turn in flight; a wake or result t
 cancelled; N was asked for its result as data ("this turn was asked for data; restart it or queue instead", F-5);
 anything queued behind N (R7, covering a waiting restart); a steer of this session unsettled; N already took one; the
 text over the cap (D); `output_schema`; `may_spawn` or `spawn_share` with it. A restart is refused while N's steer is
-unsettled.
+unsettled. (Ruled after step 2's review round 2, R2-08:) text that cannot be sent as UTF-8 (an unpaired surrogate) is
+refused, "the steer's text is not valid Unicode", on every path (HTTP, CLI, MCP, a parent's send: all reach
+`hosted_steer.target`), before anything is stored; and `listed_at` is stamped only once the listing's answer it is
+in can be written as the HTTP layer writes it.
 
 **The steer send answer**, since a steer has no message number of its own: `{"steer": {"session", "into": N,
 "outcome": null, "state": "accepted"}, "message": null, "mode": "steer", "why": "..."}`; a retry answers the same
@@ -10888,6 +10917,9 @@ prints N's reply (or main's line that a later turn replaced it), then for `next_
 turn, for `next_turn`) completed, 1 if not, 5 for `not_delivered` (with the text this call sent, never for a retry), 6
 for `unconfirmed`. (Ruled after step 2's review round 1:) success only on a terminal steer status; with none (still
 unsettled after N's end, or a receipt-only retry whose steer is no longer kept, which does not wait) it exits 7.
+(R2-10:) so does a wait whose N (with its steer) is no longer kept on the hub when it reads it: the outcome is not
+known. A parent's retry and its wait answer sweep first (a steer whose N is settled where it was not is settled
+before it is read), and a result still queued for the parent is said to be queued, not delivered.
 `board session list` marks a session "steer unsettled" while it has one (the drain's check), children's rows too.
 `--output-schema` with `--mode steer` is refused before sending. No dashboard view yet, no audit post.
 
@@ -10941,6 +10973,11 @@ result turns and claims, and CLI text. The named changes:
   (default on); the status posts of E, only while a steer is active.
 - **Text** (step 2): the `board_session_send` description, `--mode` help, and the parent cancel's words ("cancellation
   requested; a turn that had already completed keeps its result").
+- **Reads** (step 2, named after review round 2): a session that ever took a steer is marked on its record
+  (`steered: true`, set by `accept`); for every other session no steer record is read on an ordinary read (the
+  settle-time sweep, the human view's `steer_unsettled`, a parent's child view, the restart refusal). What remains, for
+  a session that took one: on each human or parent read, one range scan of that session's steer records for the
+  sweep's check (S2-11) and one for the view; none takes a write lock unless a steer is stale.
 
 **The proof.** The golden recording (tests/golden_schema_free.py, fixtures/schema_free_main.json) is re-pinned to main
 at d4b92e5 and extended (listings at protocol 4 and 5, Claude and Codex, a restart, an `auto` send, every bracket
@@ -11455,7 +11492,11 @@ Scratchpad `mutate.py`: each change applied alone to the file it names, then tes
 Each: the clause, what was built, why (the most conservative reading where the design is silent or the code
 differs). As of review round 1 (below): the omission bullet is replaced by S2-05's rule, the protocol-4 and the H
 bullets are rulings now written into parts J and H, the CLI's exit 6 for an expired retry is now exit 7, and the
-"observed on main" bullet is settled for steers by S2-06.
+"observed on main" bullet is settled for steers by S2-06. As of review round 2: the omission rule (departure 2) is
+fully built (R2-02: only a fresh offer of S for N lifts a fence; a gate lost while fenced is latched); departure 11 is
+fully built (R2-10: a wait whose N is no longer kept exits 7); departure 15 is fully built for steers (R2-04: a cancel
+drains only the live turn and every event it returns is reported; R2-05: reads go on while they make progress). For
+a session that holds NO steer, main's order (a watchdog's self-stop end after a synthetic LOST) is unchanged.
 - F, "N ended with the process: unconfirmed if any byte was written": read literally for every end the HOST makes
   (exit, a timeout it gives up on, cancel, close, self-stop, shutdown, the cut): `unconfirmed` (`turn_cut`), also
   after a valid matched receipt and after a valid refusal. Only Codex's own end of N (`turn/completed`) applies the
@@ -11771,3 +11812,298 @@ Scratchpad `mutate2.py`: round 0's mutations whose lines did not change, round 0
 | F integer code | `test_f_what_the_steer_request_was_answered_before_ns_end[answer7-other]` |
 | F quoted id | `test_f_what_the_steer_request_was_answered_before_ns_end[answer5-other]` |
 | F no-turn words | `test_f_what_the_steer_request_was_answered_before_ns_end[answer12-other]` |
+
+
+### Review round 2 (on 35c9e98: CHANGES, 12 new findings) and what changed
+
+Every finding was checked against the code before it was fixed; none was disputed. Each has a test that fails on
+35c9e98's code by its behavioural assertion (checked by running this round's tests against that commit's code,
+exported from git: 37 of the 60 new cases fail there, each on an assertion about behaviour (or `pytest.fail` where
+the old code raised), none for a missing helper or field; the 23 that pass there are the positive replays, the part
+O coverage cases, seven of the model's eight blocks, and the parameter cases that were already right). The rulings
+are written into parts D, E, G, H and K.
+
+- **R2-01** [blocker] A `jsonrpc` is accepted only absent or exactly "2.0"; a proof id (the turn/start answer's turn,
+  the item's turn) must be a nonempty string; a mismatch refusal needs a nonempty found id other than the expected
+  one; anything else is no evidence. Tests: `test_r2_01_a_jsonrpc_other_than_absent_or_2_0_is_no_evidence[...]`,
+  `test_r2_01_a_mismatch_refusal_needs_a_nonempty_found_id_other_than_the_expected[...]`,
+  `test_r2_01_an_empty_proof_id_never_proves_a_turn[answer|item|both]`.
+- **R2-02** [blocker] The fence lifts only on a fresh, cap-valid offer from an authoritative listing of the same S for
+  the same N (`steer_offer` now needs `authorized` and `into`); a gate other than the fence that fails while the frame
+  waits out of the buffer is latched (`gate`) and the request retired. Tests:
+  `test_r2_02_only_a_fresh_offer_of_the_same_steer_for_the_same_n_lifts_a_fence[stale|another_n]`,
+  `test_r2_02_a_gate_lost_while_the_frame_waits_out_of_the_buffer_is_latched[turn_gate|unbound|may_start|authority]`,
+  `test_r2_02_an_expired_re_offer_after_a_fence_never_lifts_it` (part O: through the node).
+- **R2-03** [blocker] `_steer_gate` asks the 5 s limit last, on a clock read after every callback. Test:
+  `test_r2_03_the_5_s_limit_is_asked_after_every_gate_callback` (the final gate starts at 4.95 s, its callback returns
+  at 5.05 s: no byte more, the cut).
+- **R2-04** [blocker] `cancel` drains only when it stops the live turn; the node reports every event a cancel
+  returns. Tests: `test_r2_04_cancelling_a_queued_message_behind_n_never_drops_ns_native_end` (the reviewer's case: a
+  human N in an agent's child, the parent's queued task cancelled while N's native end is in the pipe),
+  `test_r2_04_a_cancel_of_a_message_behind_n_reads_nothing_of_the_process`.
+- **R2-05** [blocker] `_read_out`: reads go on while they make progress (a line, or bytes into one: the piped child's
+  `bytes_read`), for at most 2 s and 4,096 reads; it never raises, so an error neither skips the stop nor loses what
+  was read; the cut reads the same way. Tests:
+  `test_r2_05_a_drain_goes_on_while_reads_make_progress_without_a_line[close|stop_turns|stop_all]`,
+  `test_r2_05_the_cut_reads_while_reads_make_progress_without_a_line`,
+  `test_r2_05_a_drain_error_neither_skips_the_stop_nor_loses_what_was_read[close|stop_all]`.
+- **R2-06** [blocker] The 422 retry gets what is left of REPORT_PAIR_SECONDS (20 s from the first send), never under
+  1 s; a non-final flush stops between sessions once shutdown began. Tests:
+  `test_r2_06_a_reports_retry_fits_in_what_is_left_of_one_calls_budget` (first attempt 15 s and 422: the retry gets
+  5 s; the pair takes 20 s, under the 25 s wait; the end stays queued),
+  `test_r2_06_a_flush_under_way_when_shutdown_begins_posts_no_other_session`.
+- **R2-07** [should] Each fetch keeps the acknowledgements received while it was out (`fetch_acks`: receipt time,
+  send time, about which session and N), and the offer's contact walks them by receipt time. Test:
+  `test_r2_07_a_renewal_acknowledged_while_the_first_offers_fetch_was_out_keeps_the_contact` (Sol's sequence).
+- **R2-08** [blocker] `hosted_steer.target` refuses text with an unpaired surrogate ("encoding") before anything is
+  stored, on every path; the renderer stamps `listed_at` only once the whole answer serialises as the HTTP layer
+  writes it. Tests: `test_r2_08_steer_text_that_is_not_utf_8_is_refused_on_every_path_before_anything_is_stored` (HTTP
+  and a parent's send; the CLI posts through HTTP, the MCP tool calls the parent's send),
+  `test_r2_08_listed_at_is_stamped_only_for_an_answer_that_could_be_written`.
+- **R2-09** [blocker] The ack state (`hello_ack`, `report_ack`, `steer_seen`, `steer_into`, `steer_broken`,
+  `fetch_acks`) has its own lock (`ack_lock`); `note_hello` and `_ack_report` latch a break there and tell the host only
+  when its lock is free (`_revoke_broken`, non-blocking); `_steer_check` honours the latch. Tests:
+  `test_r2_09_an_acknowledgement_is_published_while_the_host_is_busy` (part O: ack receipt while the host is busy),
+  `test_r2_09_with_no_steer_a_hello_never_takes_the_hosts_lock`.
+- **R2-10** [should] A parent's retry (`_resent`) and the wait's answer (`steer_waited`) sweep first
+  (`hosted_steer.sweep`, the steer part of the human read's `_settle` and nothing else of it, so an ordinary retry
+  reads as on main); a carrier still
+  queued is said queued (`STEER_QUEUED`); the CLI's wait exits 7 when N is no longer kept (`_kept`: a 404). Tests:
+  `test_r2_10_a_parents_retry_sweeps_first_and_never_says_accepted_for_a_terminal_n`,
+  `test_r2_10_a_queued_carrier_is_said_queued_not_delivered`,
+  `test_r2_10_a_retention_miss_between_the_post_and_the_first_get_exits_7`.
+- **R2-11** [should] The golden's `modes` allowance applies only to report bodies of sessions the run recorded as
+  Codex (`_codex_sessions`). Test: `test_r2_11_the_modes_allowance_is_for_recorded_codex_sessions_only`.
+- **R2-12** [should] The join probe is `M5Join` (both observations, in either order, before T's OWN completion: that
+  thread and that turn) read through `LineReader` (never a blocking read past the deadline). Replays against a
+  stand-in app-server (`_probe`): reply first, item first, and another turn's completion before the item (positive);
+  an observation after T's completion, and a silent stream (negative, one per new rule; the second fails on 35c9e98
+  by blocking). Tests: `test_r2_12_the_join_probe_takes_both_observations_before_ts_own_completion[...]`,
+  `test_r2_12_the_join_probe_refuses_an_observation_after_ts_completion`,
+  `test_r2_12_the_join_probe_never_blocks_past_its_deadline`. Rerun on the real CLI below.
+- **Part O's gaps** (section 3), added: ack receipt while the host is busy (R2-09); literal 12,288-byte assertions on
+  both seams (`test_o_the_12288_byte_cap_on_both_seams_literally[0|1]`: 12,288 is written out in the test, never read
+  from the code); a deadline crossing inside the final gate (R2-03); a real watchdog case with a fully written S, a
+  valid receipt and no native end (`test_o_the_watchdog_with_a_fully_written_steer_a_valid_receipt_and_no_native_end`:
+  `unconfirmed`, `turn_cut`); an expired re-offer after fencing (R2-02); partial and full omission through
+  reconciliation (`test_o_an_authoritative_omission_through_reconciliation_after_a_partial_or_full_write[partial|full]`);
+  a read that consumes bytes and returns no lines (R2-05); observation before SIGTERM
+  (`test_o_shutdown_reads_the_pipe_before_its_sigterm`); an overlapping turn timeout and close with a lingering group
+  (`test_o_a_turn_timeout_and_a_close_overlapping_with_a_lingering_group_end_n_once`); the MCP stub asserting one 45 s
+  wait (`test_o_the_mcp_steer_wait_is_one_45_s_wait`).
+- **Section 4, outside K**: a session that never took a steer is not read for steers (the `steered` marker, part G and
+  K "Reads"); test `test_k_a_session_that_never_took_a_steer_is_never_read_for_steers`. What remains is named in K.
+- **The model test** (`test_model_random_sequences_of_the_node_and_host_write_authority[0..7]`, 200 seeded sequences
+  of 30 steps in the suite; 1,000 more of 40 steps run once by hand): the real node and host, a scripted hub client and
+  the fake Codex process, against `_Model`, a reference model written in the test from the rules (contact by receipt
+  time, fresh offers, fences, omissions, gates, N's end, the 5 s). Checked after every step: no byte of S without
+  authority at that instant, S at most once, nothing of S after N ended, a broken clock never heals (the model's
+  contact is the whole interval since the grant), one outcome for S on N's first end and the one the evidence allows.
+  The seed and every step are printed on failure. On this round's code it found nothing new. Run against 35c9e98 it
+  fails (seed 4019: a stale offer, then a listing naming S for another turn, lifts the fence and S is written without
+  authority: R2-02).
+- **Departures** (section 2): 2 is now fully built (R2-02); 3 was already; 11 is fully built (R2-10's exit 7 on a
+  retention miss); 15 is fully built for steers (R2-04, R2-05). Main's order for a session holding NO steer (the
+  watchdog's self-stop end after a synthetic LOST) is unchanged, as before.
+- **Runs** (the e2e after the last code commit, 921d496): `uv run pytest -q -p no:cacheprovider` 4269 passed, 10
+  skipped (with the mutation check's gap tests); the stand-in e2e in full: PASS (164 s, 345 checks);
+  `--only steering` with stand-ins: PASS (112 s, 57 checks); `--only steering` with the real Codex (codex-cli 0.171.0,
+  gpt-6-luna): PASS (73 s, 27 checks); `--only steer` with the real Codex: PASS (34 s, 28 checks). `~/.codex/config.toml`
+  sha256 before, between and after the real runs: d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+- **M5, rerun on the real CLI with round 2's probe** (codex-cli 0.171.0): fresh start: clientId
+  0331d4d0-8f0b-45cd-90a9-2f3dfb0d869e in turn 01a2107d-2201-7381-8512-59ca0822833f of thread
+  01a2107d-1f97-76d2-8f1b-df764d437f1d; the steer `in_turn`, reply "The command finished successfully. PINEAPPLE". Join:
+  A's turn 01a2107d-7efe-7fb1-84c4-2d80bc9fa995; J's clientId bc630cd4-f0ea-4f1b-892a-e7ea8283fe20 came in A's turn of
+  thread 01a2107d-7ed4-7ed0-965d-f67afada1189, the answer to J named A's turn, both before A's own `turn/completed`
+  (`M5Join`, read through `LineReader`). Q4 (a parent's steer, wait=true): `in_turn`. S4: `in_turn`, reply "The command
+  finished. PINEAPPLE". The limit of part N (no turn-id reuse before the old end is seen) is still not tested.
+- **The mutation check's gaps** (below), each with a test added after its first run:
+  `test_r2_05_a_drain_that_keeps_making_progress_stops_at_its_time_bound`,
+  `test_r2_05_the_piped_child_counts_the_bytes_a_read_takes_into_a_line_not_complete_yet` (a real piped child),
+  `test_r2_06_no_retry_is_made_with_under_a_second_of_the_budget_left`,
+  `test_r2_07_an_acknowledgement_received_after_the_contact_ran_out_is_a_break_even_during_a_fetch`,
+  `test_r2_07_an_acknowledgement_for_another_turn_never_bridges_a_break`,
+  `test_r2_07_what_an_earlier_fetch_saw_never_bridges_a_break_in_this_one`,
+  `test_r2_09_a_break_latched_while_the_host_was_busy_is_kept_for_good`, `test_r2_10_the_waits_answer_sweeps_first`.
+
+### Mutation check, review round 2
+
+Scratchpad `mutate3.py`: round 1's mutations whose lines did not change, those whose lines changed (rewritten for the new code) and one or more per decision round 2 added; each applied alone, then the same tests (-x; tests/test_structured_results.py whole now), the file restored. 160 of 175 caught (152 on the first run; the 8 it missed that were not equivalent got a test each, below, and were run again: all 8 caught); the other 15 are equivalent, each with its reason.
+
+| mutation | caught by |
+| --- | --- |
+| H off | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H ended | `test_h_refused_once_the_session_has_ended` |
+| H closing | `test_h_refused_for_a_wake_turn_and_a_closing_or_ended_session` |
+| H protocol | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H idle | `test_h_refused_while_the_record_names_a_turn_in_flight_that_is_settled` |
+| H kind | `test_h_refused_for_a_wake_turn_and_a_closing_or_ended_session` |
+| H parent foreign | `test_h_a_parent_may_not_steer_a_turn_the_human_started_nor_the_human_one_the_parent_started` |
+| H human foreign | `test_h_a_parent_may_not_steer_a_turn_the_human_started_nor_the_human_one_the_parent_started` |
+| H cancelled | `test_h_refused_while_the_turn_is_being_cancelled` |
+| H data | `test_h_refused_for_claude_idle_wake_result_and_data_turns` |
+| H queued | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H unsettled | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H took | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H cap | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H schema | `test_h_every_refusal_of_a_human_steer_with_its_words` |
+| H spawn | `test_h_a_parent_may_not_steer_a_turn_the_human_started_nor_the_human_one_the_parent_started` |
+| O ended | `test_g_a_steer_into_a_session_being_closed_is_withdrawn_at_its_next_offer` |
+| O in flight | `test_g_a_steer_whose_n_is_no_longer_the_turn_in_flight_is_withdrawn` |
+| O cancelled | `test_g_a_failed_check_withdraws_for_good_even_when_it_later_holds_again[cancelled]` |
+| O expired | `test_g_a_failed_check_withdraws_for_good_even_when_it_later_holds_again[expired]` |
+| O checkout | `test_g_a_failed_check_withdraws_for_good_even_when_it_later_holds_again[checkout]` |
+| O withdrawn one-way | `test_g_an_older_node_is_never_offered_a_steer_and_that_withdraws_it` |
+| O sweep | `test_j_the_reupgrade_sweep_settles_a_steer_an_older_hub_left_and_leaves_n_as_it_was` |
+| O version covers | `test_g_every_offer_is_made_in_the_listings_write_transaction_and_sets_listed_at_once` |
+| O fallback shows none | `test_g_an_offer_whose_transaction_fails_after_it_was_made_is_shown_by_no_later_build` |
+| O due | `test_g_every_offer_is_made_in_the_listings_write_transaction_and_sets_listed_at_once` |
+| G ext needs listed for in_turn | `test_g_the_one_precedence_rule_on_the_nodes_end[False-ext1-want1]` |
+| G rule 2 | `test_g_the_one_precedence_rule_on_the_nodes_end[True-None-want5]` |
+| G ext keys | `test_g_the_one_precedence_rule_on_the_nodes_end[True-ext9-want9]` |
+| G ext outcome | `test_g_the_one_precedence_rule_on_the_nodes_end[True-ext7-want7]` |
+| G ext why | `test_g_the_one_precedence_rule_on_the_nodes_end[True-ext8-want8]` |
+| G settle once | `test_g_settle_never_revises_a_settled_steer` |
+| G apply ext | `test_g_the_owning_hosts_extension_decides_in_turn` |
+| G lost | `test_g_a_lost_node_settles_it_by_the_rule` |
+| G end | `test_g_end_settles_it_by_the_rule[close_away]` |
+| G restart interlock | `test_h_a_restart_waits_for_an_unsettled_steer` |
+| G prune settled | `test_g_a_settled_steer_is_pruned_with_ns_message_and_the_session` |
+| G human retry | `test_h_a_human_steer_into_a_codex_turn_is_accepted_and_answered_as_a_steer` |
+| G receipt | `test_h_a_human_steer_into_a_codex_turn_is_accepted_and_answered_as_a_steer` |
+| G list mark | `test_h_show_message_and_list_say_where_the_steer_stands` |
+| G result field | `test_h_a_parent_steers_its_own_codex_child_charged_one_turn_and_its_result_carries_the_outcome` |
+| G result line | `test_h_a_parent_steers_its_own_codex_child_charged_one_turn_and_its_result_carries_the_outcome` |
+| G parent charge | `test_h_a_parent_steers_its_own_codex_child_charged_one_turn_and_its_result_carries_the_outcome` |
+| G parent retry | `test_h_a_parents_retry_inside_the_transaction_answers_the_same_steer` |
+| G cli exit | `test_h_send_mode_steer_wait_exits_0_5_6_and_prints_ns_reply[unconfirmed-6]` |
+| G cli schema | `test_h_output_schema_with_mode_steer_is_refused_before_sending` |
+| E offer age | `test_r7_05_the_offers_age_is_read_on_the_monotonic_clock_when_its_answer_is_read` |
+| E omission | `test_e_a_listing_that_omits_the_steer_revokes_it` |
+| E authority revokes | EQUIVALENT: the same pass's `_steer_watch` (before the host's tick) and the watchdog revoke it anyway |
+| E status posts | `test_e_the_status_is_posted_at_least_every_20_s_while_a_steer_is_held` |
+| E node cap | `test_e_the_node_holds_the_text_to_the_cap_again` |
+| E hello send time | `test_o_a_hellos_contact_counts_from_when_it_was_sent_not_when_its_answer_came` |
+| J extension feature | `test_j_the_extension_goes_only_to_a_hub_that_names_steer_and_ns_end_never_waits_for_it` |
+| J modes | `test_j_modes_say_steer_only_to_a_hub_that_steers` |
+| D in flight | EQUIVALENT: a slot is made only for the turn in flight and its outcome is decided at that turn's end; the gate also needs N's outcome open |
+| D unbound | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[unbound]` |
+| D may_start | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[may_start]` |
+| D turn_gate | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[turn_gate]` |
+| D authority | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[authority]` |
+| D no turn behind a half frame | EQUIVALENT: S2-02's cut at N's end precedes any staging, so no next turn is ever behind a half frame |
+| D end zero-byte | EQUIVALENT: the write-boundary hold unqueues a zero-byte frame once N's end closes the gate |
+| D end not_owned | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[not_proved]` |
+| D end partial | `test_s2_02_after_ns_end_the_rest_of_a_half_frame_never_goes_the_process_is_cut` |
+| D end host-made | `test_o_n_ended_with_the_process_after_a_byte_is_unconfirmed_even_with_a_matched_receipt[exit]` |
+| D end refused | `test_host_the_answer_table_at_ns_end[answer0-outcome0]` |
+| D fail carries outcome | `test_d_the_cut_a_partial_frame_that_cannot_be_completed_stops_the_process[time]` |
+| D native flag | EQUIVALENT: only Codex's refused turn/start is a non-answered provider end, and no steer can be written before its proof, which needs an answer |
+| D dedupe | EQUIVALENT: a slot clears only at N's end or cut, after which N is never in flight again |
+| D offer only for in flight | `test_host_a_steer_for_a_turn_not_in_flight_or_a_second_one_is_never_taken` |
+| D cut stops | `test_s2_02_after_ns_end_the_rest_of_a_half_frame_never_goes_the_process_is_cut` |
+| D cut fails N | `test_s2_02_the_rest_of_a_half_frame_goes_only_while_every_gate_holds[turn_gate]` |
+| F owns needs answer turn in item turns | `test_f_no_proof_no_write` |
+| F snapshot before end | `test_f_what_the_steer_request_was_answered_before_ns_end[answer0-ok]` |
+| F client id on turn/start | `test_f_a_turn_is_proved_the_messages_by_its_answer_and_its_clientid_item_in_either_order[answer_first]` |
+| F retire | EQUIVALENT: a late answer to a retired request finds no steer and no other request: it changes nothing either way (only the log line is lost) |
+| F steers | `test_s2_01_a_double_answer_with_a_success_and_a_refusal_is_unconfirmed_through_the_host` |
+| H cli | `test_h_refused_for_claude_idle_wake_result_and_data_turns` |
+| O request protocol | `test_g_an_older_node_is_never_offered_a_steer_and_that_withdraws_it` |
+| O recorded protocol | `test_s2_08_modes_and_the_recorded_protocol_are_rechecked_at_every_offer[recorded]` |
+| O modes | `test_s2_08_modes_and_the_recorded_protocol_are_rechecked_at_every_offer[modes]` |
+| O listed once | `test_g_every_offer_is_made_in_the_listings_write_transaction_and_sets_listed_at_once` |
+| O renderable | `test_s2_08_listed_at_only_for_an_entry_rendered_into_the_answer` |
+| O savepoint rollback | `test_s2_08_a_fault_rolls_back_a_withdrawal_made_earlier_in_that_offer` |
+| G wait unsettled after read | `test_o_on_a_wait_timeout_the_steer_status_is_read_before_the_sender_is_told_it_is_unsettled` |
+| G one snapshot | `test_s2_12_the_wait_reads_status_and_disposition_in_one_snapshot` |
+| G steers by N | `test_s2_12_status_shows_every_retained_steer_by_n` |
+| G MCP expired no wait | `test_s2_12_an_expired_mcp_retry_does_not_wait` |
+| G CLI expired exit | `test_s2_12_a_receipt_only_retry_with_wait_does_not_wait` |
+| G CLI unsettled exit | `test_s2_11_the_cli_wait_never_exits_0_without_a_terminal_steer_status` |
+| G show prints | `test_s2_12_plain_show_prints_the_steers_outcome` |
+| G child marker | `test_s2_10_the_drain_list_marks_an_unsettled_steer_on_a_child_row` |
+| E report names N | `test_s2_03_an_ack_names_exactly_this_session_and_an_integer_n` |
+| E ack identity session | `test_s2_03_an_ack_names_exactly_this_session_and_an_integer_n` |
+| E ack identity int | `test_s2_03_an_ack_names_exactly_this_session_and_an_integer_n` |
+| E watchdog revoke | `test_e_the_watchdog_revokes_on_acknowledged_send_times` |
+| E watchdog cut | `test_e_the_node_watchdog_cuts_a_half_written_frame_past_its_limit` |
+| E steer ends before LOST | `test_s2_06_a_native_end_the_watchdog_drained_reaches_the_hub_before_any_lost` |
+| E featureless fences | `test_s2_05_a_listing_that_does_not_name_steer_fences_and_revokes_nothing[False]` |
+| E capabilities first | `test_s2_05_a_listing_that_does_not_name_steer_fences_and_revokes_nothing[False]` |
+| E unlisted fences | EQUIVALENT: an unlisted session is closed in the same reconcile, which ends its slot anyway |
+| E 422 retry | `test_k_an_older_hub_takes_ns_stripped_end_behind_its_real_report_route_and_the_sweep_settles_s` |
+| E steer discovery | `test_s2_09_discovering_steer_resends_only_a_session_whose_report_gains_it` |
+| E ack prune | `test_s2_13_ack_entries_are_kept_for_open_sessions_only` |
+| J drain | `test_o_shutdown_reads_the_pipe_before_its_sigterm` |
+| D authorized | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[unauthorized]` |
+| D gate needs N open | EQUIVALENT: the in-flight check already requires N to be the turn in flight, which implies its outcome is open |
+| D fresh clock at the write | EQUIVALENT: the gate reads its own clock after its callbacks (R2-03), so the boundary's `now` no longer feeds the 5 s check; it only dates the cut's stop, by at most one pass |
+| D gate at the write | `test_r2_03_the_5_s_limit_is_asked_after_every_gate_callback` |
+| D partial_since fresh | `test_s2_02_a_partial_frames_5_s_count_from_its_first_byte_on_a_fresh_clock` |
+| D fence keeps the frame | `test_s2_05_a_fenced_zero_byte_frame_goes_later_as_the_same_request` |
+| D same request after a fence | `test_s2_05_a_fenced_zero_byte_frame_goes_later_as_the_same_request` |
+| D steer written | `test_host_writes_the_steer_once_when_every_condition_holds_and_it_is_in_turn` |
+| D drain close | `test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first[close]` |
+| D drain stop_turns | `test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first[stop_turns]` |
+| D drain stop_all | `test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first[stop_all]` |
+| D pass holds a queued frame | `test_s2_02_after_ns_end_the_rest_of_a_half_frame_never_goes_the_process_is_cut` |
+| F once per turn | `test_f_a_turn_is_proved_the_messages_by_its_answer_and_its_clientid_item_in_either_order[answer_first]` |
+| F spent | `test_s2_04_a_zero_byte_frame_whose_gate_fails_is_revoked_and_a_recovered_gate_never_writes_it` |
+| F written | `test_s2_01_an_answer_read_before_the_frame_was_fully_written_is_no_evidence` |
+| F extra keys | `test_s2_01_an_answer_with_any_other_key_is_no_evidence` |
+| F ok names T | `test_f_what_the_steer_request_was_answered_before_ns_end[answer1-other]` |
+| F ok exact keys | `test_f_what_the_steer_request_was_answered_before_ns_end[answer10-other]` |
+| F integer code | `test_f_what_the_steer_request_was_answered_before_ns_end[answer7-other]` |
+| F no-turn words | `test_f_what_the_steer_request_was_answered_before_ns_end[answer12-other]` |
+| O stamp only rendered | `test_g_every_offer_is_made_in_the_listings_write_transaction_and_sets_listed_at_once` |
+| G sweep on read | `test_s2_11_a_steer_whose_n_is_terminal_settles_on_a_read_with_its_node_offline` |
+| E latch before report ack | `test_s2_03_an_ack_sent_before_the_deadline_and_read_after_it_never_revives_authority` |
+| E latch before hello ack | `test_s2_03_a_hello_acknowledged_after_the_deadline_never_revives_authority` |
+| E ack forget | `test_s2_13_a_forgotten_sessions_ack_goes_with_it` |
+| D revoked | `test_host_writes_nothing_unless_every_condition_holds_and_says_not_delivered[revoked]` |
+| D refused | EQUIVALENT: `steer_offer` never authorizes a refused slot, and the write needs `authorized` |
+| D fenced | `test_s2_05_a_listing_that_does_not_name_steer_fences_and_revokes_nothing[False]` |
+| D partial limit | `test_s2_02_the_5_s_limit_is_read_on_a_fresh_clock_at_the_write` |
+| D unfence on offer | `test_s2_05_a_listing_that_does_not_name_steer_fences_and_revokes_nothing[False]` |
+| D drain across reads | `test_s2_06_shutdown_drains_a_native_end_larger_than_one_read` |
+| D drain cancel | `test_s2_06_a_direct_stop_drains_a_live_steer_attempt_first[cancel]` |
+| F exclusive | `test_f_what_the_steer_request_was_answered_before_ns_end[answer9-other]` |
+| F quoted id | `test_f_what_the_steer_request_was_answered_before_ns_end[answer5-other]` |
+| R2-01 jsonrpc | `test_r2_01_a_jsonrpc_other_than_absent_or_2_0_is_no_evidence[1.0-other]` |
+| R2-01 proof id nonempty (answer) | EQUIVALENT: one of three checks of one rule: an empty T is still never proved, since no empty id enters the owned set (the item check) and `owns` needs a nonempty T |
+| R2-01 proof id nonempty (item) | EQUIVALENT: one of three checks of one rule: an empty id in the owned set never matches, since T is never empty (the answer check) |
+| R2-01 proof id nonempty (owns) | EQUIVALENT: one of three checks of one rule: T is never empty (the answer check), so `is not None` and `_proof_id` agree |
+| R2-01 found nonempty | `test_r2_01_a_mismatch_refusal_needs_a_nonempty_found_id_other_than_the_expected[-other]` |
+| R2-01 found differs | `test_r2_01_a_mismatch_refusal_needs_a_nonempty_found_id_other_than_the_expected[01a1fe39-5945-7782-b043-ba8a65280ee8-other]` |
+| R2-02 fresh to unfence | `test_r2_02_only_a_fresh_offer_of_the_same_steer_for_the_same_n_lifts_a_fence[stale]` |
+| R2-02 same N to unfence | `test_r2_02_only_a_fresh_offer_of_the_same_steer_for_the_same_n_lifts_a_fence[another_n]` |
+| R2-02 cached frame latch | `test_r2_02_a_gate_lost_while_the_frame_waits_out_of_the_buffer_is_latched[turn_gate]` |
+| R2-03 limit after callbacks | `test_r2_03_the_5_s_limit_is_asked_after_every_gate_callback` |
+| R2-04 drain only live | `test_r2_04_a_cancel_of_a_message_behind_n_reads_nothing_of_the_process` |
+| R2-04 emit every cancel event | EQUIVALENT: with R2-04's other half (a cancel drains only the live turn), a cancel of a message not held here reads nothing and returns no event: dropping its events drops nothing |
+| R2-05 progress by bytes | `test_r2_05_a_drain_goes_on_while_reads_make_progress_without_a_line[close]` |
+| R2-05 time bound | `test_r2_05_a_drain_that_keeps_making_progress_stops_at_its_time_bound` (a test added after this run) |
+| R2-05 drain never raises | `test_r2_05_a_drain_error_neither_skips_the_stop_nor_loses_what_was_read[close]` |
+| R2-05 cut reads across | `test_r2_05_the_cut_reads_while_reads_make_progress_without_a_line` |
+| R2-05 byte counter | `test_r2_05_the_piped_child_counts_the_bytes_a_read_takes_into_a_line_not_complete_yet` (a test added after this run) |
+| R2-06 retry budget | `test_r2_06_a_reports_retry_fits_in_what_is_left_of_one_calls_budget` |
+| R2-06 retry minimum | `test_r2_06_no_retry_is_made_with_under_a_second_of_the_budget_left` (a test added after this run) |
+| R2-06 stop between sessions | `test_r2_06_a_flush_under_way_when_shutdown_begins_posts_no_other_session` |
+| R2-07 continuity across fetch acks | `test_r2_07_a_renewal_acknowledged_while_the_first_offers_fetch_was_out_keeps_the_contact` |
+| R2-07 receipt break | `test_r2_07_an_acknowledgement_received_after_the_contact_ran_out_is_a_break_even_during_a_fetch` (a test added after this run) |
+| R2-07 only evidence for N | `test_r2_07_an_acknowledgement_for_another_turn_never_bridges_a_break` (a test added after this run) |
+| R2-07 fetch acks reset | `test_r2_07_what_an_earlier_fetch_saw_never_bridges_a_break_in_this_one` (a test added after this run) |
+| R2-08 utf8 refusal | `test_r2_08_steer_text_that_is_not_utf_8_is_refused_on_every_path_before_anything_is_stored` |
+| R2-08 stamp after serialisation | `test_r2_08_listed_at_is_stamped_only_for_an_answer_that_could_be_written` |
+| R2-09 hello under host lock | `test_r2_09_an_acknowledgement_is_published_while_the_host_is_busy` |
+| R2-09 broken latch counts | `test_r2_09_a_break_latched_while_the_host_was_busy_is_kept_for_good` (a test added after this run) |
+| R2-10 retry sweeps | `test_r2_10_a_parents_retry_sweeps_first_and_never_says_accepted_for_a_terminal_n` |
+| R2-10 wait sweeps | `test_r2_10_the_waits_answer_sweeps_first` (a test added after this run) |
+| R2-10 queued not delivered | `test_r2_10_a_queued_carrier_is_said_queued_not_delivered` |
+| R2-10 retention miss exit 7 | `test_r2_10_a_retention_miss_between_the_post_and_the_first_get_exits_7` |
+| R2-11 codex only | `test_r2_11_the_modes_allowance_is_for_recorded_codex_sessions_only` |
+| R2-12 T's own completion | `test_r2_12_the_join_probe_takes_both_observations_before_ts_own_completion[another_turns_completion_is_not_ts]` |
+| R2-12 both before completion | `test_r2_12_the_join_probe_refuses_an_observation_after_ts_completion` |
+| R2-12 deadline read | `test_r2_12_the_join_probe_never_blocks_past_its_deadline` |
+| K no read without a steer | `test_h_a_restart_waits_for_an_unsettled_steer` |
