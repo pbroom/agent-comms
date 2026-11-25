@@ -547,7 +547,9 @@ def test_a_parents_restart_on_a_downgraded_hub_is_delivered_to_the_parent_as_an_
 
 
 def test_a_node_that_goes_silent_with_a_restart_pending_runs_the_restart_once_when_it_is_back(senv):
-    """AC-08, for a restart: the hub settles the old turn as lost; the node, back, writes the message once."""
+    """AC-08, for a restart: the hub settles the old turn as lost; the node, back, writes the message once. The old
+    turn, which the hub's listing no longer names, is stopped with its process (checkout hardening D-1, N1), so the
+    message goes to the next process."""
     sid, proc = a_turn(senv)
     post_send(senv, sid, "start over", mode="restart")
     tick(senv)
@@ -555,7 +557,10 @@ def test_a_node_that_goes_silent_with_a_restart_pending_runs_the_restart_once_wh
     assert msg(senv, sid, 1)["state"] == "failed" and msg(senv, sid, 2)["state"] == "queued"
     interrupted(senv, proc, sid)
     tick(senv)
-    assert msg(senv, sid, 2)["state"] == "delivered" and users(proc).count("start over") == 1
+    procs = senv.node.session_spawner.children
+    assert proc.terminated and procs[-1] is not proc
+    assert msg(senv, sid, 2)["state"] == "delivered" and [c for c in procs if "start over" in users(c)] == [procs[-1]]
+    assert users(procs[-1]).count("start over") == 1
     assert msg(senv, sid, 1)["detail"].startswith("node_lost"), "the late end changes nothing settled"
 
 

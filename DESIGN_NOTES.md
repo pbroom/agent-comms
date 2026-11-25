@@ -10669,3 +10669,12 @@ start-up; and drop `board node check` if a restart of the machine is accepted as
 | H2-13, H3-11, H4-10, H5-05, H6-05, H7-05, H7-06, H8-04, H9-02, H10-03, H10-06, H12-05 costs and scope | corrected (also: the 1 s bound on reading the launch step's status, whose sum over several starts can delay the watchdog and is named in K; a node that hosts no sessions asks the registry directly; question 4's alternative): the delay of parking, the wait for a Codex turn the host knows of, the cut-off of a Claude turn, the second account (D-2, G, K, questions 1 and 7) |
 | H1-14, H2-14, H3-14, H4-11, H5-08, H6-06, H6-07, H7-07, H8-06, H8-07, H9-03, H9-04, H10-04, H10-05, H11-03, H11-04, H12-04, H12-06 baseline claims; conditions for code review | corrected in B, D, G, K and M; the conditions are part O (an explicit `user` kind, the kernel's raw start time); the live-reap gap main has is named (K) |
 | H1-15, H2-15, H3-13, H5-09 trims | taken: no waiting-run marker, no release command, no descriptor left in the provider, no parking when something else already holds the run, one log line for an `unknown` entry, no disk syncs for the launch record, and no second start-time probe after a spawn (H6-08, H7-08) |
+
+**Build note, step 1 (2026-11-25).** Built as D-1 says, on main at 17c43de; the code still matched the design at
+every point step 1 rests on (only the line numbers had moved). Two things the build found: a restart's interrupt and
+its message in the inbox are held at once only while the session's process is going down (the host skips its
+restart pass then, so the listing's next ask stays), which is the case J's test drives; and main's `_reconcile`
+raises on a listed `messages` that is not iterable (an int, `null`), before D-1 is reached. That is unchanged here
+(D-1 acts only on a list) and is left as a follow-up. One test of main described the behaviour N1 names and
+was changed with it: after a node returns, a restart whose old turn the hub counted lost now goes to the next
+process, the old one being stopped (tests/test_session_restart_hub.py, AC-08).

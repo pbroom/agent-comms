@@ -564,6 +564,12 @@ runner is any agent CLI, not only Claude or Codex: for example `"gemini" = ["gem
 is due for a project the hub has no checkout of, the hub assigns it to a live node that has that project and a runner
 for the agent. The node starts it with its own settings and reports back. See DESIGN_NOTES "Nodes".
 
+One `board node` per OS user and machine: it holds a lock on `~/.local/state/agent-comms/node.lock` (the account's
+home directory as the system gives it, whatever `HOME` or `AGENT_COMMS_HOME` say) for as long as it runs, and a
+second one says so and exits. A node from before this lock does not take it: stop the old node before starting a
+new one, as every upgrade does. A turn or a run the hub no longer lists is stopped on the node (DESIGN_NOTES
+"Checkout hardening for all turns and runs", D-1).
+
 ### Hosted sessions (`board session`)
 
 A dispatched run is one process per prompt: once it is going you cannot tell it anything. A hosted session is one
