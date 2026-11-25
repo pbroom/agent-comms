@@ -461,6 +461,65 @@ asyncio.run(main())
 """
 
 
+class LineReader:
+    """Lines from a pipe, never blocking past a deadline (R2-12): `next(deadline)` is the next complete line, or None
+    once `deadline` (time.monotonic) has passed; EOFError when the pipe closed."""
+
+    def __init__(self, fd: int):
+        self.fd, self.buf = fd, b""
+
+    def next(self, deadline: float) -> bytes | None:
+        import select
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready, _, _ = select.select([self.fd], [], [], left)
+            if not ready:
+                return None
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                raise EOFError("the pipe closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line + b"\n"
+
+
+class M5Join:
+    """Gate M5 on a join, from the app-server's lines (R2-12): after a turn/start J (request `rid`, `clientId` j)
+    while turn T of thread `tid` runs, BOTH the answer to J's request and a userMessage item of that thread with J's
+    clientId, in either order, BEFORE T's own turn/completed (that thread and that turn; another turn's completion is
+    not T's). `feed(m)`: "proved" once both came in time, "late" when T completed first, else None."""
+
+    def __init__(self, tid: str, t: str, rid, j: str):
+        self.tid, self.t, self.rid, self.j = tid, t, rid, j
+        self.answer: dict | None = None
+        self.item: dict | None = None
+
+    def feed(self, m) -> str | None:
+        if not isinstance(m, dict):
+            return None
+        p = m.get("params") if isinstance(m.get("params"), dict) else {}
+        it = p.get("item") if isinstance(p.get("item"), dict) else {}
+        if m.get("id") == self.rid and "method" not in m and ("result" in m) != ("error" in m) \
+                and self.answer is None:
+            self.answer = m
+        elif (m.get("method") in ("item/started", "item/completed") and p.get("threadId") == self.tid
+              and it.get("type") == "userMessage" and it.get("clientId") == self.j and self.item is None):
+            self.item = m
+        elif (m.get("method") == "turn/completed" and p.get("threadId") == self.tid
+              and isinstance(p.get("turn"), dict) and p["turn"].get("id") == self.t):
+            return None if self.answer is not None and self.item is not None else "late"
+        return "proved" if self.answer is not None and self.item is not None else None
+
+    def holds(self) -> bool:
+        """Both observations name T: the answer's turn and the item's turn."""
+        a = ((self.answer or {}).get("result") or {}).get("turn") or {}
+        ip = (self.item or {}).get("params") or {}
+        return (a.get("id") == self.t and ip.get("turnId") == self.t and ip.get("threadId") == self.tid
+                and (ip.get("item") or {}).get("type") == "userMessage")
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -1343,12 +1402,18 @@ codex = true
             proc.stdin.write((json.dumps(msg) + "\n").encode())
             proc.stdin.flush()
 
-        def until(pred, seconds=120) -> dict:
-            deadline = time.monotonic() + seconds
+        reader = LineReader(proc.stdout.fileno())
+
+        def until(pred, seconds=None) -> dict:
+            # (`m5_seconds`: a test's shorter limit; the probe's own is 120 s)
+            deadline = time.monotonic() + (seconds if seconds is not None else getattr(self, "m5_seconds", 120.0))
             while time.monotonic() < deadline:
-                line = proc.stdout.readline()
-                if not line:
-                    raise SystemExit("FAIL: the Codex app-server of the M5 probe exited")
+                try:
+                    line = reader.next(deadline)     # never a blocking read past the deadline (R2-12)
+                except EOFError:
+                    raise SystemExit("FAIL: the Codex app-server of the M5 probe exited") from None
+                if line is None:
+                    break
                 raw.write(line.decode())
                 try:
                     m = json.loads(line)
@@ -1376,26 +1441,17 @@ codex = true
                   and ((m.get("params") or {}).get("item") or {}).get("type") == "commandExecution")
             send({"id": 4, "method": "turn/start", "params": {"threadId": tid, "clientUserMessageId": j, "input": [
                 {"type": "text", "text": "Also include the word KIWI."}]}})
-            # Both observations, in either order (S2-14): the answer to J's request, and a userMessage item of THIS
-            # thread with J's clientId; then the thread's turn/completed (or the item, if it comes after that).
-            seen: dict = {}
+            # Both observations, in either order (S2-14), before T's OWN completion (R2-12): the answer to J's
+            # request, and a userMessage item of THIS thread with J's clientId.
+            watch, said = M5Join(tid, t, 4, j), []
 
-            def j_item(m) -> bool:
-                p = m.get("params") or {}
-                it = p.get("item") or {}
-                return (m.get("method") in ("item/started", "item/completed") and p.get("threadId") == tid
-                        and it.get("type") == "userMessage" and it.get("clientId") == j)
-
-            def both(m) -> bool:
-                if m.get("id") == 4 and ("result" in m or "error" in m):
-                    seen.setdefault("answer", m)
-                if j_item(m):
-                    seen.setdefault("item", m)
-                if m.get("method") == "turn/completed" and (m.get("params") or {}).get("threadId") == tid:
-                    seen["done"] = True
-                return "answer" in seen and "item" in seen and "done" in seen
-            until(both)
-            joined, item = seen["answer"], seen["item"]
+            def decided(m) -> bool:
+                said.append(watch.feed(m))
+                return said[-1] is not None
+            until(decided)
+            if said[-1] != "proved":
+                raise SystemExit("FAIL: M5 (join): T completed before both the answer to J and J's item came")
+            joined, item = watch.answer, watch.item
         finally:
             try:
                 proc.stdin.close()
@@ -1406,11 +1462,9 @@ codex = true
         print(f"  M5 raw evidence (join): turn A {t} (clientUserMessageId {a}); turn/start J clientUserMessageId {j}")
         print(f"    answer to J: {json.dumps(joined)[:300]}")
         print(f"    J's item:    {json.dumps(item)[:400]}")
-        self.check(((joined.get("result") or {}).get("turn") or {}).get("id") == t
-                   and (item.get("params") or {}).get("turnId") == t and (item.get("params") or {}).get("threadId") == tid
-                   and ((item.get("params") or {}).get("item") or {}).get("type") == "userMessage",
+        self.check(watch.holds(),
                    "M5 (join): the answer to J's turn/start names the active turn T, and J's userMessage item, with "
-                   "J's clientId, came in T")
+                   "J's clientId, came in T, both before T's own turn/completed")
 
     def _q3_refusals(self, real: bool, model: list[str]) -> None:
         print("\n[Q3] the refusals: a Claude turn; the cap; a second steer; a restart while one is unsettled")

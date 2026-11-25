@@ -266,9 +266,21 @@ def _modes_named(body, where: str) -> None:
         NAMED.append(("report_modes", where))
 
 
+def _codex_sessions(out: dict) -> set:
+    """The session ids the run recorded as Codex sessions (`host.session.<id>` with runtime codex-cli): K's `modes`
+    allowance is for those only (R2-11), so a Claude report that names `steer` is never hidden."""
+    sids = set()
+    for key in ("records", "seq_records"):
+        for k, rec in (out.get(key) or {}).items():
+            if k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "codex-cli":
+                sids.add(k[len("host.session."):])
+    return sids
+
+
 def step2_named(out: dict) -> None:
     """Take K's named changes out of the raw run, in place (module text), each recorded in NAMED."""
     CLIENT_IDS.clear()
+    codex = _codex_sessions(out)
     out["stdin"] = [[_codex_line(x) for x in lines] for lines in out.get("stdin", [])]
     out["transcripts"] = {k: [_item_echo(x) for x in lines] for k, lines in (out.get("transcripts") or {}).items()}
     for url, body in out.get("node_bodies") or []:
@@ -276,8 +288,8 @@ def step2_named(out: dict) -> None:
                 and body["session_host"].get("tree") == 5:
             body["session_host"]["tree"] = 4        # K: `tree` 5 on fetch and hello
             NAMED.append(("hello_tree", url))
-        else:
-            _modes_named(body, url)
+        elif url.startswith("/api/nodes/sessions/") and url[len("/api/nodes/sessions/"):] in codex:
+            _modes_named(body, url)     # a recorded Codex session's report only (R2-11)
     for name, case in (out.get("host_cases") or {}).items():
         case["stdin"] = [[_codex_line(x) for x in lines] for lines in case["stdin"]]
         _events_named(case["passes"], name)
