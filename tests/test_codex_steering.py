@@ -3618,6 +3618,20 @@ def test_r3_05_a_native_end_behind_buffered_output_wins_over_the_reap(henv):
     assert ends[0].steer == {"outcome": "in_turn", "why": "answered"}
 
 
+def test_sd_gap_a_reap_whose_group_is_left_behind_drains_first(henv):
+    """(The simplification's mutation check found no test of the reap's other branch:) the process exited leaving
+    members of its group, with N's native end still behind buffered output: it is drained first, and N's own end
+    wins."""
+    host, s, child, req = _steered_answered(henv)
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    _fragmented(child, 2)
+    child.code = 0
+    henv.groups.add(child.pid)          # a member of its group lingers
+    ends = ended_of(host.tick())
+    assert [(e.ok, e.text) for e in ends] == [(True, "native")]
+    assert ends[0].steer == {"outcome": "in_turn", "why": "answered"}
+
+
 def test_r3_05_a_native_end_behind_buffered_output_wins_over_the_turn_timeout(henv):
     host, s, child, req = _steered_answered(henv)
     henv.clock.advance(30 * 60)
@@ -4178,6 +4192,41 @@ def test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass(henv
     events = host.tick()
     assert at.get("plain") == t and host.sessions[SID].stopping_since == t, "the ordinary timeout is main's"
     assert {e.session_id for e in ended_of(events)} == {SID, steered_id}
+
+
+def test_sd_gap_the_watchdogs_cuts_in_one_call_share_one_drain_deadline(henv):
+    """(Found by the simplification's mutation check.) Two half-written frames past their limit, each process still
+    writing without end, are cut by one call of the watchdog's `steer_deadlines`: one drain deadline for both."""
+    import uuid as uuid_mod
+    from agent_comms.session_host import STEER_DRAIN_SECONDS
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    host.sessions.pop(SID)
+    kids = []
+    for i in range(2):
+        sid = str(uuid_mod.uuid4())
+        host.open(sid, agent="codex", runtime="codex-cli", project=PROJECT)
+        host.send(sid, "long", message_id="a")
+        host.tick()
+        child = henv.spawner.children[-1]
+        codex_ready(host, child)
+        host.tick()
+        st = last_start(child)
+        child.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED,
+                   user_item(st["params"]["clientUserMessageId"]))
+        host.tick()
+        child.accept = 10
+        host.steer_offer(sid, "a", f"u{i}", TEXT, authorized=True)
+        host.tick()
+        assert 0 < host.sessions[sid].steer.sent < host.sessions[sid].steer.length
+        kids.append(child)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    for child in kids:
+        _endless(child, henv.clock)
+    t = henv.clock()
+    ends = ended_of(host.steer_deadlines())
+    assert len(ends) == 2 and all(e.steer["outcome"] == "unconfirmed" for e in ends)
+    assert henv.clock() - t <= STEER_DRAIN_SECONDS + 0.5, "one drain deadline for the call's cuts"
 
 
 def test_sd_the_cancels_of_one_listing_share_one_drain_deadline(env):
