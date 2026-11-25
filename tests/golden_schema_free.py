@@ -24,6 +24,15 @@ takes out of the RAW run, before anything is normalized, exactly these and recor
 Anything else that looks similar stays, and differs. The run also fetches the listing at protocol 5 (`listing_p5`).
 
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
+
+Claude steering, step 3 (review round 1, ruling D): the same run with every Claude process reporting the version
+steering is enabled for (`record(version="2.1.330")`: the sequences' `init`, and every other `init` a test helper
+writes, name it with its capabilities), recorded against main's code (d11ff99) in
+tests/fixtures/schema_free_main_330.json, and compared with ADDED KEYS ONLY (`added_only`): every value main has is
+byte-identical; a dict may carry keys main's does not (each recorded in ADDED); and the one named change, step 3's
+`held` feature just before `steer` in a listing's `features` (part K), is taken out and recorded in NAMED.
+
+    PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json 2.1.330
 """
 import itertools
 import json
@@ -34,12 +43,20 @@ import uuid
 from pathlib import Path
 
 
-def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False) -> dict:
+def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False, version=None) -> dict:
     """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
     `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`).
-    `named`: take out what mid-turn steering's step 2 names for a run with no steer (`step2_named`), likewise."""
+    `named`: take out what mid-turn steering's step 2 names for a run with no steer (`step2_named`), likewise.
+    `version`: the Claude Code version every Claude process's `init` reports (step 3's parity: see the module text);
+    None: as before (the sequences report OTHER_VERSION, every other process none)."""
     import logging
+    import test_hosted_tree
     from agent_comms.providers import claude
+    global VERSION
+    real_began, VERSION = test_hosted_tree.began, version or OTHER_VERSION
+    if version is not None:
+        test_hosted_tree.began = lambda *a, **kw: real_began(*a, **kw) | {"claude_code_version": version,
+                                                                          "capabilities": CAPS}
     counter = itertools.count(1)
     real_hex, real_uuid4 = secrets.token_hex, uuid.uuid4
     secrets.token_hex = lambda n=32: format(next(counter), "x").rjust(2 * n, "0")[-2 * n:]
@@ -63,6 +80,7 @@ def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = Fal
         board.removeHandler(keep)
         board.setLevel(level)
         secrets.token_hex, uuid.uuid4 = real_hex, real_uuid4
+        test_hosted_tree.began, VERSION = real_began, OTHER_VERSION
         if had:
             claude.VERIFIED = before
         elif hasattr(claude, "VERIFIED"):
@@ -433,6 +451,7 @@ def step2_named(out: dict) -> None:
 
 CAPS = ["msg_lifecycle_v1", "interrupt_receipt_v1"]     # what Claude Code 2.1.330's `init` lists, among others
 OTHER_VERSION = "2.1.329"   # what the sequences' processes report: frames shaped as 2.1.330 writes them
+VERSION = OTHER_VERSION     # (record(version=...) sets it for one run)
 NOTIFY = {"kind": "task-notification", "producer": "session-task"}
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 # The allowance, on raw bytes (`allowed`): the uuid key a user line carries, last ...
@@ -544,7 +563,7 @@ def _sequences(env, out: dict, allow: bool) -> None:
         call, proc = proc_of(env, sid)
         # Another version than the one VERIFIED (2.1.330 since the switch-on), so that the production setting is the
         # case-2 baseline: a process reporting any version the adapter does not verify.
-        ev = began(sid, *as_started(call["argv"])) | {"claude_code_version": OTHER_VERSION, "capabilities": CAPS}
+        ev = began(sid, *as_started(call["argv"])) | {"claude_code_version": VERSION, "capabilities": CAPS}
         u = line_id(proc)
         return ev | ({"user_message_uuids": [u]} if echo_ and u else {})
 
@@ -852,9 +871,58 @@ def normalized(value, tmp: Path) -> dict:
     return json.loads(text)
 
 
+# ------------------------------------------------------------ Claude steering, step 3 (review round 1, ruling D)
+
+ADDED: list = []        # the keys the last `added_only` found in ours and not in main's: (where, key)
+
+
+def step3_named(out: dict) -> None:
+    """Take step 3's named changes (part K) out of a run, in place, each recorded in NAMED: `held` just before `steer`
+    at the end of a listing's `features` (the checkpoint's own feature, ruling C); and `steer` first in the `modes` of
+    a CLAUDE session (its record, and the node's report for it) whose process reports the version steering is enabled
+    for: ["steer", "restart"] where main has ["restart"]. A Codex session's modes are main's already and stay."""
+    for key in ("listing", "seq_listing", "listing_p5"):
+        features = (out.get(key) or {}).get("features")
+        if isinstance(features, list) and features[-2:] == ["held", "steer"]:
+            del features[-2]
+            NAMED.append(("features_held", key))
+    codex = _codex_sessions(out)
+    for k, rec in (out.get("seq_records") or {}).items():
+        if (k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "claude-code"
+                and rec.get("modes") == ["steer", "restart"]):
+            rec["modes"] = ["restart"]
+            NAMED.append(("claude_modes", k))
+    for url, body in out.get("node_bodies") or []:
+        sid = url[len("/api/nodes/sessions/"):] if url.startswith("/api/nodes/sessions/") else None
+        if sid and sid not in codex and isinstance(body, dict) and body.get("modes") == ["steer", "restart"]:
+            body["modes"] = ["restart"]
+            NAMED.append(("claude_report_modes", url))
+
+
+def added_only(ours, main, where: str = "") -> list:
+    """Where `ours` differs from `main` other than by keys added to a dict: [] when every value main has is
+    byte-identical in ours (lists the same length, element by element; scalars equal, of the same type). The keys
+    added are recorded in ADDED."""
+    if isinstance(main, dict) and isinstance(ours, dict):
+        bad = []
+        for k in main:
+            if k not in ours:
+                bad.append(f"{where}/{k}: missing")
+            else:
+                bad += added_only(ours[k], main[k], f"{where}/{k}")
+        ADDED.extend((where, k) for k in ours if k not in main)
+        return bad
+    if isinstance(main, list) and isinstance(ours, list):
+        if len(main) != len(ours):
+            return [f"{where}: {len(ours)} items, main has {len(main)}"]
+        return [x for i, (a, b) in enumerate(zip(ours, main)) for x in added_only(a, b, f"{where}[{i}]")]
+    same = type(ours) is type(main) and json.dumps(ours, sort_keys=True) == json.dumps(main, sort_keys=True)
+    return [] if same else [f"{where}: {json.dumps(ours)[:200]} != {json.dumps(main)[:200]}"]
+
+
 if __name__ == "__main__":
     import tempfile
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     with tempfile.TemporaryDirectory() as d:
-        result = record(Path(d))
+        result = record(Path(d), version=sys.argv[2] if len(sys.argv) > 2 else None)
     Path(sys.argv[1]).write_text(json.dumps(result, indent=1, sort_keys=True) + "\n")

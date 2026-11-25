@@ -800,6 +800,68 @@ def test_step2s_named_changes_are_each_there_and_are_only_what_k_names(tmp_path)
     assert "clientUserMessageId" not in main and '"steer"' not in main
 
 
+def _main_330():
+    return json.loads((Path(__file__).parent / "fixtures" / "schema_free_main_330.json").read_text())
+
+
+def test_with_the_enabled_version_and_no_steer_every_value_mains_has_is_byte_identical(tmp_path):
+    """Claude steering, step 3 (review round 1, ruling D): every Claude process reports 2.1.330, the version steering
+    is enabled for (VERIFIED and STEER_MODES as shipped), and no steer is sent. tests/fixtures/schema_free_main_330.json
+    is golden_schema_free.py's recording of main's code (d11ff99) for the same run: node report and hello bodies, hub
+    records and views, the listings, CLI text, every process's raw stdin and raw transcript, host events, log lines,
+    and round 3's parity runs (a cancel against the watchdog, a shutdown with turns in flight, a flush overlapping
+    it). This checkout's run, once step 3's named changes are taken out (step3_named, part K), has every value main's
+    has byte for byte, and adds no key anywhere."""
+    from agent_comms.providers import claude
+    assert claude.STEER_MODES == {"2.1.330": "next_turn"} and "2.1.330" in claude.VERIFIED
+    import golden_schema_free as g
+    ours = g.record(tmp_path, version="2.1.330")
+    g.NAMED.clear()
+    g.step3_named(ours)
+    g.ADDED.clear()
+    assert g.added_only(json.loads(json.dumps(ours, sort_keys=True)), _main_330()) == []
+    assert g.ADDED == [], "no key added anywhere"
+
+
+def test_the_330_run_is_the_enabled_version_and_step3s_named_changes_are_only_what_k_names(tmp_path):
+    """The recording is of verified 2.1.330 processes (main's own log says correlation is on for each), with no hold
+    and no checkpoint; what step3_named takes is exactly `held` before `steer` in each listing's features and `steer`
+    first in the modes of a Claude session on 2.1.330 (its record and its reports); a Codex session's modes stay."""
+    main = _main_330()
+    on = [x for x in main["logs"] if x[2].endswith("reports Claude Code 2.1.330; turn correlation is on for it")]
+    assert len(on) >= 3, "main's run verified the processes"
+    import golden_schema_free as g
+    raw = json.loads(json.dumps(g.record(tmp_path, version="2.1.330"), sort_keys=True))
+    events = [e for got in raw["host_events"] for e in got] + [e for c in raw["host_cases"].values()
+                                                               for got in c["passes"] for e in got]
+    assert events and not any(e["kind"] == "held" for e in events), "no hold: no steer was sent"
+    assert all(e.get("steer") is None for e in events)
+    assert not any("held" in b for _, b in raw["node_bodies"]), "no checkpoint was posted"
+    assert all(raw[k]["features"][-2:] == ["held", "steer"] for k in ("listing", "seq_listing", "listing_p5"))
+    claude_recs = {k: r for k, r in raw["seq_records"].items()
+                   if k.startswith("host.session.") and r.get("runtime") == "claude-code"}
+    assert any(r["modes"] == ["steer", "restart"] for r in claude_recs.values())
+    codex = [r for k, r in raw["seq_records"].items() if k.startswith("host.session.") and r["runtime"] == "codex-cli"]
+    g.NAMED.clear()
+    g.step3_named(raw)
+    kinds = {k for k, _ in g.NAMED}
+    assert kinds == {"features_held", "claude_modes", "claude_report_modes"}
+    assert codex and all(r["modes"] == ["steer", "restart"] for r in codex), "Codex's modes are main's: kept"
+    assert "\"held\"" not in json.dumps(main)
+
+
+def test_added_only_lets_through_added_keys_and_nothing_else():
+    import golden_schema_free as g
+    main = {"a": [1, {"b": "x"}], "c": None}
+    g.ADDED.clear()
+    assert g.added_only({"a": [1, {"b": "x", "new": 2}], "c": None, "d": 0}, main) == []
+    assert sorted(g.ADDED) == [("", "d"), ("/a[1]", "new")]
+    for bad in ({"a": [1, {"b": "y"}], "c": None}, {"a": [1, {"b": "x"}]}, {"a": [1, {"b": "x"}, 3], "c": None},
+                {"a": [True, {"b": "x"}], "c": None}, {"a": [1.0, {"b": "x"}], "c": None},
+                {"a": [1, {"b": "x"}], "c": 0}):
+        assert g.added_only(bad, main), bad
+
+
 def test_step2s_allowance_takes_only_the_adapters_own_turn_start_line():
     """Anything that only looks like the named Codex key is kept (so it differs from main's)."""
     import golden_schema_free as g
