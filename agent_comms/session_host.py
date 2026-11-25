@@ -64,8 +64,10 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   unexpected error (`_end` from `tick`) are main's, whether or not a steer is live: they read nothing more, and S's
   outcome is what was already read (N's native end with its evidence, else `unconfirmed` once a byte was written and
   `not_delivered` with none). Only a single-session stop of a live attempt's turn (reap, the turn timeout, a broken
-  pipe, close, a cancel of the live turn, the cut) first reads what it wrote (`_drain_before_stop`), within one
-  shared STEER_DRAIN_SECONDS per host pass, and after every session holding no live attempt has had its turn in it.
+  pipe, close, a cancel of the live turn, the cut) first reads what it wrote (`_drain_before_stop`), inline, where
+  main settles that process, within one shared STEER_DRAIN_SECONDS per hold of the node's lock. The stop latch
+  (`steer_stopping`) is the evidence cutoff for every steer: no cut begins, no drain reads and no native end counts
+  for S once it is set.
 """
 from __future__ import annotations
 
@@ -313,9 +315,6 @@ class Session:
     # this host ever took (a repeated offer of one is never a second attempt).
     steer: SteerSlot | None = None
     steered: set = field(default_factory=set)
-    # A live attempt's deferred drain is reading its process now (`_run_deferred`): its process was fenced (stopping)
-    # at main's point in the pass, and what it wrote is read for N's own end before N is decided (R5-03).
-    draining: bool = False
 
     @property
     def unbound(self) -> bool:
@@ -576,9 +575,10 @@ class SessionHost:
         # A test's hook at a slot's installation (`steer_offer`): "before" and "after" outside the latch's lock,
         # "inside" under it. None in production.
         self.steer_install_hook: Callable[[str, Session], None] | None = None
-        # During `tick`: the live attempts whose drain and N's decision wait until every session's work in the pass is
-        # done (R5-03): [(session, the process to read, the decision)]. None outside a tick.
-        self._deferred: list | None = None
+        # Tests' hooks: at a cut, before it takes ownership under the latch's lock (`_steer_cut`), and before each of a
+        # drain's reads (`_drain_reads`). None in production.
+        self.steer_cut_hook: Callable[[Session], None] | None = None
+        self.steer_drain_hook: Callable[[Session], None] | None = None
         self._recovered = False
         self._next_message = 0
         # Runner key -> window -> the latest plan usage a session of that runner's provider reported for it (`usage`
@@ -1038,57 +1038,30 @@ class SessionHost:
             self._drain_deadline = self.clock() + STEER_DRAIN_SECONDS
         return self._drain_deadline
 
-    def _drain_reads(self, s: Session, into: str, child: Any, now: float, out: list[HostEvent],
-                     deadline: float) -> None:
-        """The drain's reads of `child` (the session's process, which may be fenced or already gone): while N is in
-        flight, they make progress and the deadline has not passed. Between reads, every SIGKILL that has fallen due
-        meanwhile is sent (R5-04): a drain never holds an ordinary kill back. Never raises."""
+    def _drain_reads(self, s: Session, into: str, now: float, out: list[HostEvent], deadline: float) -> None:
+        """The drain's reads of the session's process: while N is in flight, they make progress and the deadline has
+        not passed. Each read is made under the stop latch's lock, after a look at the latch (review round 6, R6-01):
+        once the node began to stop the drain reads no more, so nothing read after that cutoff is evidence for S (and
+        the latch is never set in the middle of a read). Never raises."""
         try:
             for _ in range(STEER_DRAIN_READS):
-                if s.in_flight is None or s.in_flight.id != into:
+                if s.child is None or s.in_flight is None or s.in_flight.id != into:
                     break       # N's end is read (or N is no longer in flight): nothing more is needed
                 if self.clock() >= deadline:
                     break       # the pass's deadline has passed
-                before = getattr(child, "bytes_read", None)
-                got = self._read(s, now, out, child=child)
-                after = getattr(child, "bytes_read", None)
-                self._kills_due()
+                hook = self.steer_drain_hook
+                if hook is not None:
+                    hook(s)
+                with self._steer_stop_lock:
+                    if self.steer_stopped:
+                        break   # (R6-01) the evidence cutoff: the node began to stop
+                    before = getattr(s.child, "bytes_read", None)
+                    got = self._read(s, now, out)
+                after = getattr(s.child, "bytes_read", None) if s.child is not None else before
                 if (not got and (before is None or after == before)) or self.clock() >= deadline:
                     break
         except Exception:
             log.exception("session %s: could not read what its process wrote before stopping it", s.session_id)
-
-    def _kills_due(self) -> None:
-        """(R5-04) Every process group whose grace after its SIGTERM is over is killed now, as `kill_due` does."""
-        now = self.clock()
-        for o in list(self.sessions.values()):
-            self._kill_if_due(o, now)
-
-    def _defer(self, s: Session, child: Any, decide: Callable[[float], None]) -> bool:
-        """(R5-03) Inside a tick: a live attempt's drain and N's decision wait until every session's work in the pass
-        is done; the caller has already done, at main's point, all that main does there for other sessions (the
-        exit's discovery, the group's fence). True when deferred; False outside a tick (the caller drains now)."""
-        if self._deferred is None:
-            return False
-        s.draining = True
-        self._deferred.append((s, s.steer.into, child, decide))
-        return True
-
-    def _run_deferred(self, out: list[HostEvent]) -> None:
-        """(R5-03) After every session's work in the pass: each deferred drain, within the pass's shared deadline (an
-        attempt that cannot be drained in what is left is decided without one, rule 2), then its decision."""
-        while self._deferred:
-            s, into, child, decide = self._deferred.pop(0)
-            try:
-                self._drain_reads(s, into, child, self.clock(), out, self._drain_deadline_now())
-            finally:
-                s.draining = False
-            try:
-                decide(self.clock())
-            except Exception as e:
-                log.exception("session %s failed", s.session_id)
-                if not s.ended:
-                    self._end(s, f"host error: {type(e).__name__}", self.clock(), out)
 
     def _drain_before_stop(self, s: Session, now: float, out: list[HostEvent]) -> float:
         """The drain, called only on the single-session paths that end a live steer attempt's turn (reap, the turn
@@ -1103,8 +1076,8 @@ class SessionHost:
         is unchanged), else the clock after the drain, so no signal after it is backdated."""
         if not self.live_attempt(s):
             return now
-        self._drain_reads(s, s.steer.into, s.child, now, out, self._drain_deadline_now())
-        return self.clock()
+        self._drain_reads(s, s.steer.into, now, out, self._drain_deadline_now())
+        return self.clock()     # (R6-04) what follows, a signal included, is dated when it is done
 
     @contextmanager
     def one_drain_budget(self):
@@ -1172,49 +1145,31 @@ class SessionHost:
         return out
 
     def _tick(self, now: float, out: list[HostEvent]) -> None:
-        self._deferred = []     # (`tick` is not re-entrant: one list per pass)
-        try:
-            with self.one_drain_budget():
-                # Main's pass, in main's order, at the pass's `now`, for every session (R5-03). Every exit first: a
-                # leader that went by itself leaving members of its group is registered as stopping (`_reap`) before
-                # this pass starts any process, so nothing it starts goes beside such a group. A live steer attempt's
-                # exit, timeout, broken pipe or cut is discovered and its group fenced right there, as main does;
-                # only its drain and N's decision wait (`_defer`) ...
-                for s in list(self.sessions.values()):
-                    if s.child is not None and s.stopping_since is None:
-                        try:
-                            self._read(s, now, out)
-                            self._reap(s, now, out)
-                        except Exception as e:
-                            log.exception("session %s failed", s.session_id)
-                            if not s.ended:
-                                self._end(s, f"host error: {type(e).__name__}", now, out)    # (rule 2: no drain)
-                for s in list(self.sessions.values()):
+        # Main's pass, in main's order, at the pass's `now`, for every session. A live steer attempt's turn end is
+        # settled inline, where main settles that process (review round 6): its bounded drain there, then main's own
+        # handling. Every drain in the pass shares one deadline (`one_drain_budget`; in the node's pass, the one of the
+        # whole hold of its lock).
+        with self.one_drain_budget():
+            # Every exit first: a leader that went by itself leaving members of its group is registered as stopping
+            # (`_reap`) before this pass starts any process, so nothing it starts goes beside such a group.
+            for s in list(self.sessions.values()):
+                if s.child is not None and s.stopping_since is None:
                     try:
-                        self._pass(s, now, out)
+                        self._read(s, now, out)
+                        self._reap(s, now, out)
                     except Exception as e:
                         log.exception("session %s failed", s.session_id)
                         if not s.ended:
-                            self._end(s, f"host error: {type(e).__name__}", now, out)
-                # ... until every session's work in the pass is done (each session's own `_steps`, and in it its one
-                # decision point, included): then the drains, within the pass's one deadline. Only a Codex live
-                # attempt is ever deferred (`live_attempt`: a slot only for a provider that steers).
-                self._run_deferred(out)
-        finally:
-            for x in self._deferred or []:      # (only after an error that escaped the pass itself)
-                x[0].draining = False
-            self._deferred = None
+                            self._end(s, f"host error: {type(e).__name__}", now, out)    # (rule 2: no drain)
+            for s in list(self.sessions.values()):
+                try:
+                    self._pass(s, now, out)
+                except Exception as e:
+                    log.exception("session %s failed", s.session_id)
+                    if not s.ended:
+                        self._end(s, f"host error: {type(e).__name__}", now, out)
 
     def _pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
-        if s.draining:
-            # (R5-03) A Codex live attempt whose drain and N's decision wait for the end of the pass: only main's
-            # reaping of its fenced group (which discovers a group gone and frees its checkout, as main does at this
-            # point). No `_steps`, so no decision point: a Codex session has no budget (`_decide` returns at once for
-            # it: `_correlated` is a verified Claude incarnation's).
-            if s.child is not None and s.stopping_since is not None:
-                self._kill_if_due(s, now)
-                self._reap(s, now, out)
-            return
         gates = self._steps(s, now, out)
         self._mark(s, now, gates)
 
@@ -1257,9 +1212,9 @@ class SessionHost:
                 self._reap(s, now, out)     # a write that failed stopped it
         return gates
 
-    def _read(self, s: Session, now: float, out: list[HostEvent], child: Any = None) -> int:
+    def _read(self, s: Session, now: float, out: list[HostEvent]) -> int:
         keep = getattr(s.provider, "transcript_line", None)
-        lines = (s.child if child is None else child).read_lines()
+        lines = s.child.read_lines()
         for line in lines:
             # The transcript keeps what the process wrote, except what the provider says must not be kept (Claude's
             # answer to `get_settings`: the settings in force, which can hold credentials): its own record instead.
@@ -1267,7 +1222,7 @@ class SessionHost:
             if s.ended:
                 continue
             events, replies = s.provider.feed(line)
-            if s.stopping_since is not None and not s.draining:
+            if s.stopping_since is not None:
                 # This process's turn was already given up: its late turn events are dropped. That the provider's
                 # session exists still counts, or the next process would start it anew and be refused.
                 # (Not for a provider with a handshake: its `ready` says only that an id was issued, see `_write`.)
@@ -1414,18 +1369,6 @@ class SessionHost:
             if s.stopping_since is None:
                 # It went by itself, leaving members of its group behind (a tool it started, say).
                 self._read(s, now, out)
-                live = self.live_attempt(s)
-                if live and self._deferred is not None:
-                    # (R5-03) A live steer attempt: the group is fenced here, as main fences it; the drain and N's
-                    # decision wait for the end of the pass.
-                    if not s.ready:
-                        self._correct_start_mode(s)
-                    ready, checking = s.ready, s.checking
-                    log.warning("session %s: its process exited (code %s) and left members of its group: stopping "
-                                "them", s.session_id, code)
-                    self._stop(s, now)
-                    self._defer(s, s.child, lambda at: self._went_by_itself(s, code, ready, checking, out))
-                    return
                 now = self._drain_before_stop(s, now, out)      # a live steer attempt: all it wrote first (R3-05)
                 if not s.ready:
                     self._correct_start_mode(s)
@@ -1435,23 +1378,9 @@ class SessionHost:
                 self._stop(s, now)
             return      # its leader is gone, but not its group: nothing starts beside that, nothing is reported reaped
         self._read(s, now, out)     # what it wrote on its way out (a result that just made it still counts)
-        if self.live_attempt(s) and self._deferred is not None:
-            # (R5-03) A live steer attempt's exit: discovered here, its process let go of and its checkout freed as
-            # main does at this point; the drain (of the pipe, kept open), N's decision and the rest wait.
-            if not s.ready:
-                self._correct_start_mode(s)
-            self._reap_gone(s, code, now, out, defer=True)
-            return
         self._drain_before_stop(s, now, out)      # a live steer attempt: all it wrote, across reads (R3-05)
         if not s.ready:
             self._correct_start_mode(s)
-        self._reap_gone(s, code, now, out, defer=False)
-
-    def _reap_gone(self, s: Session, code: int, now: float, out: list[HostEvent], defer: bool) -> None:
-        """The process and its whole group are gone: let go of it (main's reap). With `defer` (R5-03), the pipe stays
-        open for the deferred drain, and closing it, N's decision and what follows wait for the end of the pass. A
-        session whose deferred drain is already pending (fenced earlier in this pass) keeps its pipe for that drain."""
-        pending = s.draining
         was_ready, was_checking = s.ready, s.checking
         child, s.child, s.proc_start, s.ready = s.child, None, None, False
         self.groups.gone(s.group_token)      # the whole group is gone
@@ -1461,36 +1390,19 @@ class SessionHost:
         s.outbuf.clear()
         if s.steer is not None and s.steer.outcome is not None:
             s.steer = None          # its turn is decided and its process is gone: nothing more of it is written
-        def rest(at: float) -> None:
-            close = getattr(child, "close", None)
-            if close is not None:
-                close()
-            if s.transcript_fd is not None:
-                os.close(s.transcript_fd)
-                s.transcript_fd = None
-            if not stopped:
-                self._went_by_itself(s, code, was_ready, was_checking, out)
-            if s.steer is not None and s.steer.outcome is not None:
-                s.steer = None
-            self._forget_restart(s)     # nothing is left to interrupt
-            s.held_since = None
-            self._save_state()
-        if defer:
-            self._defer(s, child, rest)
-        elif pending:
-            # Fenced earlier in this pass (its group left behind) and gone now: the pending drain still reads this
-            # pipe; it is closed after that drain's decision.
-            for i, (x, into, c, decide) in enumerate(self._deferred or []):
-                if x is s:
-                    def then(at, decide=decide):
-                        decide(at)
-                        rest(at)
-                    self._deferred[i] = (x, into, c, then)
-                    break
-            else:
-                rest(now)
-        else:
-            rest(now)
+        close = getattr(child, "close", None)
+        if close is not None:
+            close()
+        if s.transcript_fd is not None:
+            os.close(s.transcript_fd)
+            s.transcript_fd = None
+        if not stopped:
+            self._went_by_itself(s, code, was_ready, was_checking, out)
+        if s.steer is not None and s.steer.outcome is not None:
+            s.steer = None
+        self._forget_restart(s)     # nothing is left to interrupt
+        s.held_since = None
+        self._save_state()
 
     LINGER_LOG_SECONDS = 60.0       # how often a process group that outlives its SIGKILL is said again
 
@@ -1575,8 +1487,6 @@ class SessionHost:
         if s.interrupted_at is not None:
             if now - s.interrupted_at >= self.kill_grace:     # the provider's own interrupt did not end the turn
                 if self.live_attempt(s):
-                    if self._fence_then_decide(s, now, out, self._timeout_detail()):
-                        return
                     now = self._drain_before_stop(s, now, out)      # (R3-05)
                     if s.in_flight is None and s.writing is None:
                         return
@@ -1606,27 +1516,11 @@ class SessionHost:
             s.interrupted_at = now
             return
         if self.live_attempt(s):
-            if self._fence_then_decide(s, now, out, self._timeout_detail()):
-                return
             now = self._drain_before_stop(s, now, out)      # a native end behind buffered output is N's own (R3-05)
             if s.in_flight is None and s.writing is None:
                 return
         self._fail(s, self._timeout_detail(), out)
         self._stop(s, now)
-
-    def _fence_then_decide(self, s: Session, now: float, out: list[HostEvent], detail: str) -> bool:
-        """(R5-03) Inside a tick, a live attempt's turn given up (the timeout, a broken pipe, the cut): its process is
-        stopped now, at main's point (SIGTERM, its checkout fenced), and N is failed with `detail` after the deferred
-        drain, unless that drain read N's own end. True when so deferred."""
-        if self._deferred is None:
-            return False
-        child = s.child
-        self._stop(s, now)
-
-        def decide(at: float) -> None:
-            if s.in_flight is not None or s.writing is not None:
-                self._fail(s, detail, out)
-        return self._defer(s, child, decide)
 
     def _unwritten(self, s: Session) -> None:
         """At the end of the turn a restart's interrupt was for: if not one byte of it reached the process (a pipe that
@@ -2101,21 +1995,18 @@ class SessionHost:
         is read (N's own end may be there), N is reported honestly (its native result if it had one, else failed with
         STEER_CUT) and the process is stopped."""
         slot = s.steer
-        log.warning("session %s: a steer to its process could not be written whole: the process is stopped",
-                    s.session_id)
-        s.outbuf.clear()
-        if self.live_attempt(s) and self._deferred is not None:
-            # (R5-03) In a tick: stopped now, N decided after the deferred drain.
-            child = s.child
-            self._stop(s, now)
-
-            def decide(at: float) -> None:
-                if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into:
-                    self._fail(s, STEER_CUT, out)
-                s.steer = None
-                self._save_state()
-            self._defer(s, child, decide)
-            return
+        hook = self.steer_cut_hook
+        if hook is not None:
+            hook(s)
+        with self._steer_stop_lock:
+            # (R6-01) The cut takes ownership under the stop latch's lock: it cannot begin once the node began to stop
+            # (the stop of every turn decides N then, nothing else is done here), and the latch is never set in the
+            # middle of this check and the cut's first act. Its drain stops reading at the latch.
+            if self.steer_stopped:
+                return
+            log.warning("session %s: a steer to its process could not be written whole: the process is stopped",
+                        s.session_id)
+            s.outbuf.clear()
         now = self._drain_before_stop(s, now, out)    # across reads while they make progress (R2-05); never raises
         if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into:
             self._fail(s, STEER_CUT, out)
@@ -2129,6 +2020,8 @@ class SessionHost:
         slot = s.steer
         if slot is None or slot.into != msg_id or slot.outcome is not None:
             return None
+        if slot.stopping:
+            native = False      # (R6-01) N's own end read after the stop latch is no evidence for S (rule 2)
         if slot.mark is not None and slot.sent == 0:
             self._steer_unqueue(s, slot)
             outcome = {"outcome": "not_delivered", "why": "not_written"}
@@ -2300,8 +2193,6 @@ class SessionHost:
             # handshake the message that made the process start is still in the inbox: it fails here too.
             s.outbuf.clear()
             detail = f"could not write to the process: {type(n).__name__}"
-            if self.live_attempt(s) and self._fence_then_decide(s, now, out, detail):
-                return
             if self.live_attempt(s):
                 now = self._drain_before_stop(s, now, out)      # a native end behind buffered output is N's own
             if (s.provider.waits_for_ready and not s.ready) or s.checking:
