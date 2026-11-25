@@ -6402,7 +6402,7 @@ def test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off(env, ca
     from agent_comms.dispatch import SpawnConfig
     sid, child = codex_turn_in_flight(env)
     post_steer(env, sid)                    # accepted while the setting was read
-    getattr(hosted_steer, "_unreadable_said", set()).clear()     # (each error is said once per process)
+    hosted_steer._unreadable_last = None     # (each change of the error is said once)
     caplog.set_level(logging.INFO, logger="agent_comms")
     off = json.loads(json.dumps(env.board.s.dispatch))
     off["sessions"]["steer"] = False
@@ -6511,3 +6511,197 @@ def test_pm_4_the_75_s_is_defined_once():
     assert node_sessions.STEER_CONTACT_SECONDS is session_host.STEER_CONTACT_SECONDS == 75.0
     assert "STEER_CONTACT_SECONDS = " not in open(node_sessions.__file__).read()
     assert not hasattr(hosted_steer, "any_unsettled")
+
+
+# ------------------------------------------------------------ review round 11: the switch through a real reload
+
+
+REJECTED_WORDS = ("steering is off on this hub: its settings were rejected at the last reload (fix board.toml or "
+                  "board.local.toml; until they load, no new steer is taken)")
+OFF_WORDS = "steering is switched off on this hub ([dispatch.sessions] steer = false)"
+
+
+def _settings_file(env, sessions="", extra="") -> None:
+    """The hub's settings as a board.toml on disk (this env's own [server] paths and [dispatch] table, with
+    `sessions` lines in [dispatch.sessions] and `extra` tables after), so `Board.reload_settings` reads it."""
+    nodes = TREE["nodes"]["laptop"]
+    path = env.tmp / "board.toml"
+    path.write_text(f'[server]\ndb_path = "{env.board.s.db_path}"\nagents_path = "{env.board.s.agents_path}"\n'
+                    f'[dispatch.nodes.laptop]\nprojects = {json.dumps(nodes["projects"])}\n'
+                    f'agents = {json.dumps(nodes["agents"])}\n'
+                    f'[dispatch.sessions]\n{sessions}[dispatch.sessions.spawn]\nenabled = true\n{extra}')
+    env.board.s.config_path = path
+
+
+def test_r11_1_a_rejected_reload_refuses_new_steers_until_a_reload_succeeds(env):
+    """Review round 11's replay: the hub runs with steering on (its settings reloaded from disk); the file is edited
+    to `steer = false` with a typo in a sibling key; `Board.reload_settings` rejects it and keeps the last good
+    settings (steering on in them). New steers are refused, saying the settings were rejected at the last reload,
+    and nothing is stored. The fix (a valid `steer = false`) loads: refused as off. Then `steer = true`: taken."""
+    sid, child = codex_turn_in_flight(env)
+    _settings_file(env, "steer = true\n")
+    assert env.board.reload_settings(force=True) is True and env.board.settings_error is None
+    _settings_file(env, "steer = false\nmax_lvie = 3\n")
+    assert env.board.reload_settings(force=True) is False
+    assert env.board.s.dispatch["sessions"].get("steer") is True, "the last good settings stay (steering on in them)"
+    refusal(env, sid, REJECTED_WORDS)
+    assert steer_rec(env, sid) is None
+    _settings_file(env, "steer = false\n")
+    assert env.board.reload_settings(force=True) is True
+    refusal(env, sid, OFF_WORDS)
+    _settings_file(env, "steer = true\n")
+    assert env.board.reload_settings(force=True) is True
+    post_steer(env, sid)
+    assert steer_rec(env, sid) is not None
+
+
+def test_r11_1_a_reload_rejected_for_another_table_refuses_new_steers_until_it_is_fixed(env):
+    """A reload rejected for a reason in a completely different table (`[web] session_days = 0`): new steers are
+    refused until a reload succeeds; once the fix loads, they are taken again."""
+    sid, child = codex_turn_in_flight(env)
+    _settings_file(env, extra="[web]\nsession_days = 0\n")
+    assert env.board.reload_settings(force=True) is False and "session_days" in env.board.settings_error
+    refusal(env, sid, REJECTED_WORDS)
+    _settings_file(env, extra="[web]\nsession_days = 7\n")
+    assert env.board.reload_settings(force=True) is True
+    post_steer(env, sid)
+    assert steer_rec(env, sid) is not None
+
+
+def test_r11_1_a_steer_accepted_before_a_rejected_reload_is_still_offered_and_settled(env):
+    sid, child = codex_turn_in_flight(env)
+    post_steer(env, sid)
+    _settings_file(env, "steer = false\nmax_lvie = 3\n")
+    assert env.board.reload_settings(force=True) is False
+    tick(env)
+    [req] = steers_of(child)
+    answer_steer(child, req, {"turnId": cx.TURN})
+    end_turn(env, child)
+    assert steer_rec(env, sid)["outcome"] == "in_turn"
+
+
+def test_r11_1_a_rejected_reload_is_otherwise_mains(env, caplog):
+    """Nothing else a rejected reload does changes (core.py is main's): it returns False, keeps the very same last
+    good [dispatch] table and every other setting, records main's error text, logs main's one warning, and the
+    steering code says nothing at the reload (the hub's line about it is main's own)."""
+    import logging
+    from agent_comms import hosted_tree
+    _settings_file(env, "steer = true\n")
+    assert env.board.reload_settings(force=True) is True
+    table, limits, gen = env.board.s.dispatch, env.board.limits(), env.board.settings_generation
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    _settings_file(env, "steer = false\nmax_lvie = 3\n")
+    assert env.board.reload_settings(force=True) is False
+    assert env.board.s.dispatch is table and env.board.limits() == limits and env.board.settings_generation == gen
+    assert env.board.settings_error == "ValueError: unknown setting [dispatch.sessions] max_lvie"
+    assert hosted_tree.spawn_config(env.board).enabled is True, "spawning keeps its last good settings"
+    said = [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
+    assert said == [("agent_comms.core", "WARNING", "settings not reloaded; keeping the last good settings: "
+                     "ValueError: unknown setting [dispatch.sessions] max_lvie")], said
+    assert env.board.configuration_status(env.p["human"])["state"] == "stale"
+
+
+@pytest.mark.parametrize("body, want", [
+    ("dispatch = false\n", "unreadable"), ("dispatch = []\n", "unreadable"),
+    ("[dispatch]\nsessions = false\n", "unreadable"), ("[dispatch]\nsessions = []\n", "unreadable"),
+    ('[dispatch]\nsessions = ""\n', "unreadable"),
+    ("", None), ("[dispatch]\n", None), ("[dispatch.sessions]\n", None), ("[dispatch.sessions]\nsteer = false\n", "off")])
+def test_r11_2_at_startup_a_present_value_that_is_not_a_table_is_unreadable_and_an_absent_one_is_on(tmp_path, body,
+                                                                                                    want):
+    """Review round 11, item 2: a hub started with `[dispatch]` or `[dispatch.sessions]` present but not a table
+    (`dispatch = false`, `dispatch = []`, `sessions = false`, `sessions = []`, `sessions = ""`) refuses new
+    steers ("unreadable"); absent, steering is on. The hub starts with such a file, as on main, and main's other
+    readers keep their defaults (spawning off)."""
+    from agent_comms import hosted_tree
+    from agent_comms.config import Settings
+    from agent_comms.core import Board
+    from agent_comms.dispatch import SpawnConfig
+    path = tmp_path / "board.toml"
+    server = f'[server]\ndb_path = "{tmp_path / "b.db"}"\nagents_path = "{tmp_path / "a.toml"}"\n'
+    path.write_text(body + server if body.startswith("dispatch =") else server + body)
+    board = Board(Settings.load(path))
+    assert hosted_steer.off_reason(board) == want
+    if want == "unreadable":
+        assert hosted_tree.spawn_config(board) == SpawnConfig()
+
+
+def test_r11_3_the_unreadable_warning_keeps_one_entry_and_says_one_line_per_change(caplog, monkeypatch):
+    """Review round 11, item 3: 100 distinct unknown keys, each read twice, keep ONE remembered error and say one
+    line per change (100); the same error read 50 times says one line; after a good read, the same error is said
+    again."""
+    import logging
+    from types import SimpleNamespace
+    monkeypatch.setattr(hosted_steer, "_unreadable_last", None)
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    board = lambda d: SimpleNamespace(s=SimpleNamespace(dispatch=d))     # noqa: E731
+
+    def lines():
+        return [r for r in caplog.records if "settings could not be read" in r.getMessage()]
+    for k in range(100):
+        for _ in range(2):
+            assert hosted_steer.off_reason(board({"sessions": {f"key_{k}": 1}})) == "unreadable"
+    assert len(lines()) == 100 and isinstance(hosted_steer._unreadable_last, str)
+    assert not hasattr(hosted_steer, "_unreadable_said")
+    caplog.clear()
+    for _ in range(50):
+        hosted_steer.off_reason(board({"sessions": {"steer": "false"}}))
+    assert len(lines()) == 1
+    assert hosted_steer.off_reason(board({"sessions": {}})) is None and hosted_steer._unreadable_last is None
+    hosted_steer.off_reason(board({"sessions": {"steer": "false"}}))
+    assert len(lines()) == 2
+
+
+def test_r11_4_the_rollback_check_on_an_ended_session_names_the_switch_and_sends_nothing(env):
+    """Review round 11, item 4: the README's rollback check. `board session send <an ended session> x --mode steer`
+    answers with the switch's own words while steering is off (the switch is read before anything about the
+    session), and with "the session has ended" while it is on; nothing is ever sent."""
+    sid, child = codex_turn_in_flight(env)
+    end_turn(env, child)
+    assert env.human.post(f"/api/hosted-sessions/{sid}/close").status_code == 200
+    for _ in range(3):
+        tick(env)
+    refusal(env, sid, hosted_steer.REFUSED["ended"])
+    env.board.s.dispatch = json.loads(json.dumps(env.board.s.dispatch))
+    env.board.s.dispatch["sessions"]["steer"] = False
+    refusal(env, sid, OFF_WORDS)
+    assert steer_rec(env, sid) is None
+
+
+def test_r11_1_a_decision_during_a_recovering_reload_sees_the_new_table_never_the_old_one_without_the_error(env):
+    """`Board.reload_settings` clears `settings_error` before it publishes the new [dispatch] table. After a rejected
+    reload (steering on in the last good settings), the fix turns steering off; a steer decision made while the
+    reload is held exactly between those two assignments waits for it (the reload's own lock), and reads "off":
+    never "no error" beside the old table, which would let a steer in."""
+    import dataclasses
+    import threading
+    board = env.board
+    _settings_file(env, "steer = true\n")
+    assert board.reload_settings(force=True) is True
+    _settings_file(env, "steer = true\nmax_lvie = 3\n")
+    assert board.reload_settings(force=True) is False and hosted_steer.off_reason(board) == "rejected"
+    _settings_file(env, "steer = false\n")      # the fix: steering off
+    reached, go, out = threading.Event(), threading.Event(), {}
+
+    class Gate(type(board.s)):
+        def __setattr__(self, name, value):
+            if name == "dispatch" and getattr(self, "_armed", False):
+                assert board.settings_error is None, "(the error is cleared first, as on main)"
+                reached.set()
+                go.wait(10)
+            object.__setattr__(self, name, value)
+    gated = Gate(**{f.name: getattr(board.s, f.name) for f in dataclasses.fields(board.s)})
+    object.__setattr__(gated, "_armed", True)
+    board.s = gated
+    writer = threading.Thread(target=lambda: out.update(applied=board.reload_settings(force=True)))
+    writer.start()
+    assert reached.wait(10), "the reload is between the two assignments"
+    reader = threading.Thread(target=lambda: out.update(why=hosted_steer.off_reason(board)))
+    reader.start()
+    reader.join(0.3)
+    alive = reader.is_alive()
+    go.set()
+    writer.join(10)
+    reader.join(10)
+    object.__setattr__(gated, "_armed", False)
+    assert alive, "the decision waits for the reload to finish"
+    assert out["applied"] is True and out["why"] == "off", "it read the new table"
