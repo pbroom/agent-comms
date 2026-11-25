@@ -642,7 +642,8 @@ class ClaudeSession:
             return
         listed = self._steer in echoed(ev, "user_message_uuid", "user_message_uuids")
         self._steer_said = "ok" if listed else "hold" if self._steer_full else None
-        self._hold = "waiting" if self._steer_said == "hold" else None
+        # Held in an incarnation already unverified: nothing later can prove S quiet (G-2): the finalizer, at once.
+        self._hold = ("waiting" if self._verified else "lost") if self._steer_said == "hold" else None
 
     def _steer_frame_result(self, ev: dict) -> str | None:
         """A `result` after a byte of S went: whose it is, or None when the ordinary table applies (module text)."""

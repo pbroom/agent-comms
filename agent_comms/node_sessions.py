@@ -241,6 +241,7 @@ class SessionRunner:
                              f"{self.shutdown_bound:g} s to stop a session's process after the hub last heard from it, "
                              f"and the hub waits at most {SHUTDOWN_BOUND_MAX:g} s")
         self.pending: list[tuple[str, dict]] = []     # (session id, event) not yet taken by the hub, oldest first
+        self.checkpoints: dict[str, dict] = {}       # Claude steering: a held end's checkpoint, sent once (`_checkpoint`)
         self.queue: dict[str, list[dict]] = {}        # session id -> the hub's queued messages not yet handed over
         self.handed: dict[str, int] = self._load_handed()
         self.ending: set[str] = set()                 # sessions this node reported (or is reporting) ended
@@ -427,10 +428,41 @@ class SessionRunner:
         if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
             events, self.watched = self.watched + list(events), []
         for e in events:
+            if e.kind == "held":
+                self._checkpoint(e)     # (Claude steering: a report of its own, never one of the events)
+                continue
             if e.kind == "ended":
                 self.ending.add(e.session_id)
                 self.queue.pop(e.session_id, None)
             self._add(e.session_id, self._event(e))
+
+    def _checkpoint(self, e: HostEvent) -> None:
+        """The checkpoint of a held end (Claude steering, part G): sent alone, in a report of its own, after that
+        session's pending events, only when the hub's last listing named `steer` and what it takes is known. It never
+        waits, never holds, reorders or joins an ordinary event, and is dropped (logged) on refusal or failure, never
+        resent."""
+        if e.message_id is None or not e.message_id.isdigit() or e.session_id in self.dropped:
+            return
+        if not ("steer" in self.hub_features and self.features_known):
+            log.info("session %s: the checkpoint of message %s is not sent: the hub has not said it takes it",
+                     e.session_id, e.message_id)
+            return
+        self.checkpoints[e.session_id] = {"message": int(e.message_id), "ok": bool(e.ok), "detail": e.detail[:300],
+                                          "denials": list(e.denials), "meta": dict(e.meta), "text": e.text,
+                                          "answered": bool(e.answered)}
+
+    def _post_checkpoint(self, sid: str) -> None:
+        """One try (the checkpoint's rules above); called once nothing of the session is pending before it."""
+        held = self.checkpoints.pop(sid, None)
+        if held is None:
+            return
+        try:
+            self._call("POST", f"/api/nodes/sessions/{sid}", json={"events": [], "held": held, "seq": self._stamp()},
+                       spare_422=True)
+        except Exception as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent again", sid,
+                        held["message"], code if code is not None else type(e).__name__)
 
     def _flush(self, final: bool = False) -> bool:
         """Post what the hub has not taken yet, per session and in order. False: the hub could not be reached (the
@@ -472,6 +504,7 @@ class SessionRunner:
             if sid not in order:
                 order.append(sid)
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
+        order += [sid for sid in self.checkpoints if sid not in order]
         sent_items: set[int] = set()
         for sid in order:
             # In order, up to the first event this hub may not take yet (`_takes`): nothing of the session overtakes
@@ -485,6 +518,8 @@ class SessionRunner:
                 mine.append((i, e))
             events = [e for _, e in mine]
             if not events and (self.status.get(sid) is None or self.reported.get(sid) == self.status.get(sid)):
+                if sid in self.checkpoints and not any(x == sid for x, _ in self.pending):
+                    self._post_checkpoint(sid)      # nothing of the session pending before it
                 continue        # only events this hub does not take wait for this session: nothing to post now
             # A field the hub has not named as one it takes (its listing's `features`) is not sent: a hub from
             # before it refuses the whole report, and its turn ends would be lost.
@@ -560,6 +595,8 @@ class SessionRunner:
                 self.reported[sid] = status
                 self.sent[sid] = body["seq"]
             sent_items |= {i for i, _ in mine}
+            if sid in self.checkpoints and all(i in sent_items for i, (x, _) in enumerate(self.pending) if x == sid):
+                self._post_checkpoint(sid)          # after that session's pending events (part G)
         self._drop_sent(sent_items)
         return True
 

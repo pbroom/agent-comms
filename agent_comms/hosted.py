@@ -1032,6 +1032,10 @@ def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) ->
         r.update(stored)
         return
     detail = (detail or "ended")[:300]
+    from . import hosted_steer
+    for m in _messages(c, r["session_id"]):
+        if m.get("state") not in SETTLED and hosted_steer.native(m) is not None:
+            _apply(c, r, hosted_steer.held_end(m), by, now, results=results)     # G: N's native result, once
     cut = []        # the messages this end fails, as they were (a child's parent is told of each)
     for m in _messages(c, r["session_id"]):
         if m.get("state") not in SETTLED:
@@ -1094,6 +1098,10 @@ def _settle(board: Board, r: dict) -> dict:
             _end(c, r, "closed by the human (its node went silent)", "hub", now, results=results)
         else:
             for m in _messages(c, r["session_id"]):
+                from . import hosted_steer
+                if m.get("state") == "delivered" and hosted_steer.native(m) is not None:
+                    _apply(c, r, hosted_steer.held_end(m), "hub", now, results=results)     # G: N's native result
+                    continue
                 if m.get("state") == "delivered":
                     closed = _closed(m, now, ok=False, code="node_lost")
                     m |= {"state": "failed", "ok": False, "text": "", "ended_at": now, "updated_at": now,
@@ -1479,6 +1487,12 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
                 m["started_at"] = now
                 hosted_results.carried(c, r, m, True, now)
     else:
+        from . import hosted_steer
+        if hosted_steer.native(m) is not None:
+            # G's one rule for N's native fields: a committed checkpoint decides them, on every settling path; only
+            # the owning host's word on S (this end's extension) is taken from the event.
+            ev = hosted_steer.held_end(m) | {"steer": ev.get("steer")}
+            m.pop("held", None)
         ok = ev["ok"] is True
         detail = ev["detail"] or ("" if ok else "the agent reported that the turn failed"
                                   + (f" ({ev['meta']['subtype']})" if isinstance(ev["meta"].get("subtype"), str) else ""))
@@ -1524,7 +1538,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
 
 def report(board: Board, p: Principal, session_id: Any, events: Any = None, state: Any = None, pid: Any = None,
            resume: Any = None, seq: Any = None, provider_id: Any = None, access: Any = None,
-           worktree: Any = None, ceiling: Any = None, checkout: Any = None, modes: Any = None) -> dict:
+           worktree: Any = None, ceiling: Any = None, checkout: Any = None, modes: Any = None,
+           held: Any = None) -> dict:
     """`modes`: what the session's adapter on the node can do with a turn in flight (providers.MODES: restart, and
     steer, which no adapter says yet), as the node says; `restart_target` reads it, and nothing else decides it.
     The node reports what happened in one of its sessions, in order (`events`: delivered, turn_started,
@@ -1542,7 +1557,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
     node sends them only to a hub that asked (the listing's `access`). `ceiling` (a root's): the most a child may
     have under it now, which is `full` only once the session's process has confirmed full access; `checkout` (a
     root's): the directory it runs in there. A `worktree_removed` event is the one thing applied to a session that
-    has ended: the node removes a child's worktree after its process is gone."""
+    has ended: the node removes a child's worktree after its process is gone.
+    `held` (Claude steering, step 3): the checkpoint of N's held native end, in a report of its own with no events
+    (hosted_steer.checkpoint: write-once, refused with a conflict when it does not fit)."""
     nodes._require_node(board, p)
     events = _events([] if events is None else events)
     if state is not None and state not in SESSION_STATES:
@@ -1588,6 +1605,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
                 _put(c, SESSION_PREFIX + r["session_id"], r, p.name, now)
             return _node_view(r)
         results = _results_on(board)
+        if held is not None:
+            from . import hosted_steer
+            hosted_steer.checkpoint(c, r, held, now, p.name)
         for ev in events:
             _apply(c, r, ev, p.name, now, results=results)
             if r["state"] == "ended":

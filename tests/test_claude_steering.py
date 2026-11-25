@@ -334,3 +334,498 @@ def test_the_checkpoint_carries_ns_native_end_once(henv, monkeypatch):
     [held] = [e for e in out if e.kind == "held"]
     assert held.message_id == "1" and held.ok and held.text == "native" and held.answered
     assert henv.host.tick() == []
+
+
+# ---------------------------------------------------------------- the node and the hub (test_hosted_sessions' env)
+
+from agent_comms import hosted, hosted_results, hosted_steer, node_sessions  # noqa: E402
+from test_hosted_sessions import make_node, msg, session_env, show, start, tick, written  # noqa: E402
+from test_hosted_tree import TREE, proc_of, tree_config  # noqa: E402
+from test_session_host import result as plain_result  # noqa: E402
+
+
+@pytest.fixture
+def env(tmp_path):
+    """A hub with child sessions on; its node hosts Claude (VERIFIED and STEER_MODES as shipped)."""
+    return session_env(tmp_path, dispatch=TREE, config=tree_config)
+
+
+def cinit(sid, *uuids) -> dict:
+    ev = {"type": "system", "subtype": "init", "session_id": sid, "permissionMode": "dontAsk", "tools": ["Read"],
+          "claude_code_version": V, "capabilities": ["msg_lifecycle_v1", "interrupt_receipt_v1"]}
+    return ev | ({"user_message_uuids": list(uuids)} if uuids else {})
+
+
+def cresult(sid, *uuids, text="ok", **kw) -> dict:
+    return plain_result(sid, text=text, **kw) | (
+        {"user_message_uuid": uuids[0], "user_message_uuids": list(uuids)} if uuids else {})
+
+
+def claude_steered(env):
+    """A Claude root, N (message 1) in flight in its owned bracket, a human steer accepted, offered and written."""
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env)
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    assert r.status_code == 200, r.text
+    tick(env)
+    tick(env)
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    s_line = [x for x in written(child) if x.get("uuid") == rec["uuid"]]
+    assert s_line and s_line[0]["message"]["content"] == TEXT, "S written once, with its own uuid"
+    return sid, child, n, rec["uuid"]
+
+
+def test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply(env):
+    """Through the node and the hub: N's result lists only N, so its end is held and checkpointed (`held` on N's
+    record, out of every view); S's own turn follows, and N settles once: its native result, `next_turn`, S's
+    reply in the steer record (the session's reply stays N's)."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)          # the host holds N's end; the next flush sends the checkpoint (a report of its own)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert m["state"] == "delivered" and m["held"]["text"] == "N's reply" and m["held"]["ok"] is True
+    view = show(env, sid)
+    assert view["in_flight"] == 1 and "held" not in json.dumps(view), "the checkpoint is in no view"
+    child.emit(cinit(sid, s_uuid), cresult(sid, s_uuid, text="PINEAPPLE"))
+    tick(env)
+    m = msg(env, sid, 1)
+    assert m["state"] == "done" and show(env, sid)["reply"] == "N's reply"
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    assert rec["outcome"] == "next_turn" and rec["result"]["reply"] == "PINEAPPLE" and rec["result"]["ok"] is True
+    assert m["steer"]["outcome"] == "next_turn" and m["steer"]["result"]["reply"] == "PINEAPPLE"
+    assert "held" not in hosted._get(env.board.conn, hosted._msg_key(sid, 1)), "cleared with N's settlement"
+
+
+def test_e2e_in_process_in_turn_needs_no_hold(env):
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, s_uuid, text="DONE PINEAPPLE"))
+    tick(env)
+    assert msg(env, sid, 1)["state"] == "done"
+    assert hosted_steer.get(env.board.conn, sid, 1)["outcome"] == "in_turn"
+    assert "held" not in hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+
+
+def test_o_the_checkpoint_is_write_once_and_only_for_its_delivered_n(env):
+    """Part O: the checkpoint is write-once, for the exact assigned node, a delivered N in flight and a listed,
+    unresolved steer into it; refused once N is settled."""
+    sid, child, n, s_uuid = claude_steered(env)
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "first", "answered": True}
+    assert env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held}).status_code == 200
+    again = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"text": "second"}})
+    assert again.status_code == 409 and "already has one" in again.text
+    assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["held"]["text"] == "first"
+    other = env.human.post("/api/nodes/sessions/" + sid, json={"held": held})
+    assert other.status_code in (401, 403, 404), "only the session's assigned node"
+    wrong = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"message": 2}})
+    assert wrong.status_code == 409
+
+
+def test_o_a_checkpoint_for_a_turn_with_no_listed_steer_is_refused(env):
+    sid = start(env, "a turn")["session_id"]
+    tick(env)
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held})
+    assert r.status_code == 409 and "took no steer" in r.text
+
+
+@pytest.mark.parametrize("path", ["lost_node", "close", "replacement_node"])
+def test_g_a_committed_checkpoint_decides_ns_native_fields_on_every_settling_path(env, path):
+    """G's one rule: once a checkpoint is committed, every settlement of N uses N's native result, S by the rule
+    (`unconfirmed`, listed, no host's word on N's own end)."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="native reply"))
+    tick(env, times=2)
+    assert "held" in hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    if path == "lost_node":
+        env.clock.advance(hosted.nodes.NODE_LOST_SECONDS + 1)
+        show(env, sid)
+    elif path == "close":
+        with hosted.db.write_tx(env.board.conn) as c:
+            r = hosted._session(c, sid)
+            hosted._end(c, r, "closed", "hub", env.clock())
+            hosted._put(c, hosted.SESSION_PREFIX + sid, r, "hub", env.clock())
+    else:
+        node2 = make_node(env, config=env.node.config, log_dir=env.tmp / "laptop-logs")
+        node2.sessions.recover()
+        node2.hello()
+        tick(env, node2)
+        tick(env, node2)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert m["state"] == "done" and m["ok"] is True and "held" not in m, path
+    assert show(env, sid)["reply"] == "native reply"
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    assert (rec["outcome"], rec["why"]) == ("unconfirmed", "no_word")
+
+
+def test_g_without_a_checkpoint_ns_end_is_as_on_main(env):
+    """No checkpoint committed (the loss exception, A): a lost node fails N as main does, S by the rule."""
+    sid, child, n, s_uuid = claude_steered(env)
+    env.clock.advance(hosted.nodes.NODE_LOST_SECONDS + 1)
+    view = show(env, sid)
+    assert view["messages"][0]["state"] == "failed" and view["messages"][0]["steer"]["outcome"] == "unconfirmed"
+
+
+def test_h_the_extension_carries_next_turn_with_ss_result_and_a_malformed_one_is_ignored():
+    good = {"outcome": "next_turn", "why": "own_turn", "result": {"ok": True, "detail": "", "denials": [], "meta": {},
+                                                                    "text": "S", "answered": True}}
+    assert hosted_steer.extension(good)["result"]["text"] == "S"
+    assert hosted_steer.extension({"outcome": "next_turn", "why": "own_turn"}) is None
+    assert hosted_steer.extension(good | {"result": {"ok": "yes"}}) is None
+    assert hosted_steer.extension({"outcome": "in_turn", "why": "answered", "result": good["result"]}) is None
+
+
+def test_h_the_parents_result_record_and_the_renderer_for_next_turn():
+    """H, "One result for N": N's raw reply apart, S's reply as a field, the combined text for every renderer;
+    the current renderer shows N's reply in its markers, the hub's line outside them, then S's reply in its own."""
+    x = {"n": 3, "child": "c", "name": "kid", "agent": "claude", "message": 2, "outcome": "completed", "ok": True,
+         "detail": "", "denials": [], "reply": "N's reply",
+         "text": "N's reply\n\n" + hosted_results.STEER_JOIN + "\nS's reply",
+         "steer": {"outcome": "next_turn", "why": "own_turn", "ok": True, "detail": "", "reply": "S's reply"}}
+    text = hosted_results.render([x], token="tok")
+    lines = text.splitlines()
+    i, j = lines.index("N's reply"), lines.index("S's reply")
+    assert lines[i + 2] == hosted_results.STEER_LINES["next_turn"] and i < j
+    assert lines[i - 1] == "<<<child-output tok>>>" and lines[j - 1] == "<<<child-output tok>>>"
+    assert hosted_results.STEER_JOIN not in text, "the current renderer does not use the combined text"
+
+
+# ---------------------------------------------------------------- with no steer sent: parity (part K)
+
+
+def _no_steer_run(henv, monkeypatch, caplog, seed, modes):
+    """One seeded sequence of a verified Claude session's frames with no steer ever sent: owned turns, turns the CLI
+    started itself, notifications, competing inits, results with no echo, exits and timeouts. Returns everything
+    observable: host events, stdin bytes, every log record of the package, every gate callback, and the modes."""
+    import logging
+    import random
+    from test_claude_correlation import failed
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    monkeypatch.setattr(claude, "STEER_MODES", modes)
+    from test_dispatch import FakeProcs, FakeSpawner
+    from test_session_host import FakeSessionChild
+    caplog.clear()
+    caplog.set_level(logging.DEBUG, logger="agent_comms")
+    henv.spawner = FakeSpawner(child=FakeSessionChild)
+    henv.procs = FakeProcs(henv.spawner)
+    henv.host = make_host(henv, timeout_minutes=1)
+    calls = []
+    henv.host.may_start = lambda: calls.append("may_start") or True
+    henv.host.turn_gate = lambda sess: calls.append("turn_gate") or True
+    henv.host.steer_authority = lambda sess: calls.append("authority") or True
+    rnd = random.Random(seed)
+    s = open_session(henv)
+    seen, modes_seen, n = [], [], 0
+    for _ in range(25):
+        child = henv.spawner.children[-1] if henv.spawner.children else None
+        act = rnd.choice(["send", "send", "own", "cli", "note", "compete", "plain", "error", "wait", "exit"])
+        if act == "send" and not s.inbox:
+            n += 1
+            henv.host.send(SID, f"turn {n}", message_id=str(n))
+        elif child is not None and act == "own":
+            u = uuid_of(child) if child.stdin else None
+            child.emit(*((vinit(u), owned(u, text="r")) if u else (vinit(),)))
+        elif child is not None and act == "cli":
+            child.emit(vinit(), foreign())
+        elif child is not None and act == "note":
+            child.emit(nonturn())
+        elif child is not None and act == "compete":
+            child.emit(vinit())
+        elif child is not None and act == "plain":
+            child.emit(plain(text="?"))
+        elif child is not None and act == "error":
+            child.emit(failed())
+        elif child is not None and act == "exit":
+            child.code = 0
+        henv.clock.advance(rnd.choice([1, 5, 30, 61]))
+        seen.append([(e.kind, e.message_id, e.ok, e.detail, e.text, e.steer) for e in henv.host.tick()])
+        modes_seen.append(henv.host.modes(SID) if SID in henv.host.sessions else ())
+    logs = [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
+    stdin = [c.stdin for c in henv.spawner.children]
+    return {"events": seen, "logs": logs, "stdin": [__import__("re").sub(rb'"uuid": "[^"]+"', b'"uuid": "u"', x)
+                                                    for x in stdin], "calls": calls}, modes_seen
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_k_with_no_steer_sent_a_claude_session_is_the_build_that_never_steers(henv, monkeypatch, caplog, seed):
+    """Part K, the parity rule for step 3: with no steer sent, every Claude frame's handling, host event, stdin byte,
+    log line and gate callback is that of the same tree with STEER_MODES empty (no Claude version steers: step 2's
+    Claude, on main at 2b84f42); the one named change is `modes` (a verified 2.1.330 process says `steer`)."""
+    import copy
+    ours, our_modes = _no_steer_run(henv, monkeypatch, caplog, seed, copy.deepcopy(claude.STEER_MODES))
+    base, base_modes = _no_steer_run(henv, monkeypatch, caplog, seed, {})
+    assert ours == base
+    assert all("steer" not in m for m in base_modes)
+    assert [tuple(x for x in m if x != "steer") for m in our_modes] == [tuple(m) for m in base_modes]
+
+
+# ---------------------------------------------------------------- the model: seeded sequences, an independent reference
+
+
+class _Model:
+    """This test's own reading of part D's tables for one written steer (independent of the adapter and the host):
+    N's bracket open and owned, S written whole, T = 60 s. It says what N's one end must carry."""
+
+    def __init__(self, t0):
+        self.phase, self.comp, self.verified, self.amb = "n", False, True, False
+        self.bracket, self.s_turn, self.since, self.t0 = None, False, t0, t0
+        self.end = None         # (outcome, why, native text or None, S's result ok or None)
+        self.native = None
+
+    def finish(self, outcome, why, s_ok=None):
+        if self.end is None:
+            self.end = (outcome, why, self.native, s_ok)
+
+    def finalize(self):
+        self.finish(*(("next_turn", "own_turn_cut", False) if self.s_turn else ("unconfirmed", "turn_cut")))
+
+    def frame(self, kind):
+        if self.end is not None:
+            return
+        if self.phase == "n":
+            if kind == "n_res_ns":
+                self.native = "N:ns"
+                self.finish("in_turn", "answered")
+            elif kind == "n_res_n":
+                self.native = "N:n"
+                if self.verified:
+                    self.phase, self.since = "h", self.now
+                else:
+                    self.phase = "lost"
+                    self.finalize()
+            elif kind in ("s_res", "cli_takes_s"):
+                if self.verified and not self.comp:
+                    self.native = "S:" + kind
+                    self.finish("unconfirmed", "s_only")
+                else:
+                    self.verified, self.amb = False, True
+            elif kind in ("compete", "s_init", "cli_open"):
+                if self.verified:
+                    self.comp = True
+            elif kind in ("plain", "error"):
+                self.verified, self.amb = False, True
+            return
+        # the hold (verified). A result that lists S is a bracket's terminal result consuming S (a late one listing N
+        # and S too); one listing only N (already settled) is nobody's.
+        if kind in ("s_res", "cli_takes_s", "n_res_ns"):
+            if self.bracket == "s":
+                self.native_s = True
+                self.finish("next_turn", "own_turn", True)
+            else:
+                self.finish("unconfirmed", "consumed")
+        elif kind == "s_init":
+            if self.bracket is None:
+                self.bracket, self.s_turn, self.since = "s", True, self.now
+        elif kind in ("cli_open", "compete"):
+            if self.bracket is None:
+                self.bracket = "cli"
+        elif kind == "cli_end":
+            if self.bracket == "cli":
+                self.bracket = None
+        elif kind == "plain":
+            if self.bracket == "s":
+                self.finish("next_turn", "own_turn", True)
+            else:
+                self.finalize()
+        elif kind == "error":
+            if self.bracket != "s":
+                self.finalize()
+
+    def host_end(self, how):
+        """A host-made end of N: in the hold, the finalizer; before N's native end, N fails and S `turn_cut`."""
+        if self.end is not None:
+            return
+        if self.phase == "n":
+            self.finish("unconfirmed", "turn_cut")
+        else:
+            self.finalize()
+
+
+FRAMES = {"n_res_ns": lambda n: owned(n, S, text="N:ns"), "n_res_n": lambda n: owned(n, text="N:n"),
+          "s_res": lambda n: owned(S, text="S:s_res"),
+          "cli_takes_s": lambda n: owned(S, text="S:cli_takes_s") | {"origin": NOTIFY},
+          "s_init": lambda n: vinit(S), "cli_open": lambda n: vinit(), "cli_end": lambda n: foreign(),
+          "compete": lambda n: vinit("0be7c0de-0000-4000-8000-000000000000"), "plain": lambda n: plain(text="?"),
+          "error": lambda n: result(subtype="error_during_execution", is_error=True, text=""),
+          "note": lambda n: nonturn()}
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_model_claude_steer_sequences_against_an_independent_reference(henv, monkeypatch, seed, request):
+    """Seeded sequences of every frame part D's tables name (and exits, cancels, closes, stops of every turn and the
+    clock) after a written steer: the host publishes N's end exactly once, with the outcome, the why, N's native
+    reply and S's own result the reference model reads; a close's `ended` comes after it; nothing is written to the
+    process once S is decided. Reach is asserted over the 200 seeds (test_model_reach)."""
+    import random
+    rnd = random.Random(seed)
+    s, child, n = steered(henv, monkeypatch)
+    model = _Model(henv.clock())
+    model.now = henv.clock()
+    got, kinds_seen = [], []
+    for _ in range(rnd.randint(1, 20)):
+        if s.held is None:
+            kind = rnd.choice(list(FRAMES) * 3 + ["n_res_n"] * 8 + ["wait", "wait", "exit", "cancel", "close",
+                                                                    "stop_turns"])
+        elif s.held.s_turn:     # S's own turn runs: its result, or an end the host makes of it
+            kind = rnd.choice(["s_res"] * 3 + ["plain", "error", "note", "cli_end", "wait", "wait", "exit", "cancel",
+                                               "close", "stop_turns"])
+        else:       # held: S's own turn, and every end the host can make of it, more often
+            kind = rnd.choice(["s_init"] * 4 + ["s_res", "cli_takes_s", "cli_open", "cli_end", "note", "plain", "error",
+                                                "compete", "n_res_ns", "wait", "wait", "wait", "exit", "cancel",
+                                                "close", "stop_turns"])
+        kinds_seen.append(kind)
+        out = []
+        if kind in FRAMES:
+            child.emit(FRAMES[kind](n))
+            model.frame(kind)
+            out = henv.host.tick()
+        elif kind == "wait":
+            henv.clock.advance(rnd.choice([10, 30, 61]))
+            model.now = henv.clock()
+            if model.end is None and model.now - model.since >= 60:
+                model.host_end("timeout")
+            out = henv.host.tick()
+        elif kind == "exit":
+            child.code = 0
+            model.host_end("exit")
+            out = henv.host.tick()
+        elif kind == "cancel":
+            model.host_end("cancel")
+            out = henv.host.cancel(SID, "1", "cancelled") + henv.host.tick()
+        elif kind == "close":
+            model.host_end("close")
+            out = henv.host.close(SID, "closed") + henv.host.tick()
+        elif kind == "stop_turns":
+            model.host_end("stop")
+            out = henv.host.stop_turns("lost the hub")
+        got += out
+        if model.end is not None and kind not in ("wait",):
+            for _ in range(3):
+                got += henv.host.tick()
+        model.now = henv.clock()
+        if model.end is not None and ends(got):
+            break
+        if s.ended or (s.child is None and not s.held):
+            break
+    for _ in range(60):     # the drain: the bound and the bounded stop run out
+        if ends(got):
+            break
+        henv.clock.advance(5)
+        model.now = henv.clock()
+        if model.end is None and model.now - model.since >= 60:
+            model.host_end("timeout")
+        got += henv.host.tick()
+    mine = ends(got)
+    assert len(mine) == 1, (seed, kinds_seen, got)
+    end = mine[0]
+    want_outcome, want_why, native, s_ok = model.end
+    assert (end.steer["outcome"], end.steer["why"]) == (want_outcome, want_why), (seed, kinds_seen, end.steer)
+    if native is not None and want_why not in ("turn_cut",) or (native is not None and model.phase == "h"):
+        assert end.text == native, (seed, kinds_seen, end.text, native)
+    if want_outcome == "next_turn":
+        assert end.steer["result"]["ok"] is s_ok, (seed, kinds_seen, end.steer)
+    kinds = [e.kind for e in got]
+    if "ended" in kinds:
+        assert kinds.index("ended") > kinds.index("turn_ended"), (seed, kinds_seen)
+    reach = request.config.cache.get("claude_steer_reach", {}) if False else None  # (counted in test_model_reach)
+    _REACH.append((want_outcome, want_why, tuple(kinds_seen)))
+
+
+_REACH: list = []
+
+
+def test_model_reach():
+    """The model's walks reach every row of the Claude outcome tables (run after the 200 seeds, in file order)."""
+    if len(_REACH) < 200:
+        pytest.skip("run with the model's seeds")
+    rows = {(o, w) for o, w, _ in _REACH}
+    for row in [("in_turn", "answered"), ("next_turn", "own_turn"), ("next_turn", "own_turn_cut"),
+                ("unconfirmed", "consumed"), ("unconfirmed", "s_only"), ("unconfirmed", "turn_cut")]:
+        assert row in rows, (row, sorted(rows))
+    counts = {row: sum(1 for o, w, _ in _REACH if (o, w) == row) for row in rows}
+    assert all(c >= 3 for c in counts.values()), counts
+    assert any("compete" in k and o == "unconfirmed" for o, _, k in _REACH), "an ambiguity after a competing init"
+
+
+# ---------------------------------------------------------------- rules the mutation check asked a test for
+
+
+def test_the_three_outcome_mode_an_init_echoing_s_proves_nothing(henv, monkeypatch):
+    """Part L's result (i)'s other branch, for a version recorded THREE: an `init` echoing exactly [S] opens no
+    S-owned turn; the hold ends only when that bracket's TERMINAL result lists S: `unconfirmed` (consumed), never
+    `next_turn`."""
+    monkeypatch.setattr(claude, "STEER_MODES", {V: claude.THREE})
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n))
+    henv.host.tick()
+    child.emit(vinit(S))
+    assert henv.host.tick() == [] and not s.held.s_turn
+    child.emit(owned(S, text="S's reply"))
+    [end] = ends(henv.host.tick())
+    assert end.steer == {"outcome": "unconfirmed", "why": "consumed"}
+
+
+def test_an_init_that_mentions_s_with_another_uuid_opens_no_s_turn(henv, monkeypatch):
+    """Only an `init` echoing EXACTLY [S] opens S's own turn; [S, X] mentions S and proves nothing (H-2): its
+    terminal result listing S consumed it, `unconfirmed`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n))
+    henv.host.tick()
+    child.emit(vinit(S, "0be7c0de-0000-4000-8000-000000000001"))
+    assert henv.host.tick() == [] and not s.held.s_turn
+    child.emit(owned(S, text="?"))
+    [end] = ends(henv.host.tick())
+    assert end.steer == {"outcome": "unconfirmed", "why": "consumed"}
+
+
+def test_o_a_checkpoint_whose_steer_was_never_listed_is_refused(env):
+    """Part O: the checkpoint needs a LISTED, unresolved steer into N (a steer the node never saw cannot be held)."""
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    child.emit(cinit(sid, written(child)[-1]["uuid"]))
+    tick(env)
+    with hosted.db.write_tx(env.board.conn) as c:
+        r = hosted._session(c, sid)
+        m = hosted._get(c, hosted._msg_key(sid, 1))
+        hosted_steer.accept(c, r, m, TEXT, "user", {"human": True}, "human", None, env.clock())
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held})
+    assert r.status_code == 409 and "never listed" in r.text
+
+
+def test_h_a_parents_next_turn_result_record_keeps_ns_reply_apart_and_combines_the_text(env):
+    """H through `hosted_results.turn`: the record keeps N's raw reply (`reply`), S's result as the steer's fields,
+    and the combined text (N's reply, a blank line, the plain line, S's reply) in `text`; never for a data turn."""
+    with hosted.db.write_tx(env.board.conn) as c:
+        child = {"session_id": "c" * 8, "steered": True}
+        s = {"session_id": child["session_id"], "into": 2, "kind": "task", "outcome": "next_turn", "why": "own_turn",
+             "result": {"ok": True, "detail": "", "denials": [], "meta": {}, "reply": "S's reply"}}
+        hosted.nodes._put(c, hosted_steer._key(child["session_id"], 2), s, "hub", env.clock())
+        captured = {}
+        orig = hosted_results._add
+        hosted_results._add = lambda c_, ch, fields, now, kept=False: captured.update(fields)
+        try:
+            hosted_results.turn(c, child, {"n": 2, "kind": "task"}, ok=True, delivered=True, detail="",
+                                text="N's reply", denials=[], now=env.clock())
+        finally:
+            hosted_results._add = orig
+    assert captured["reply"] == "N's reply" and captured["steer"]["reply"] == "S's reply"
+    assert captured["text"] == "N's reply\n\n" + hosted_results.STEER_JOIN + "\nS's reply"
+
+
+def test_g_the_checkpoint_goes_only_to_a_hub_that_names_steer(env):
+    """Part G: the node sends the checkpoint only when the hub's last listing named `steer` and what it takes is
+    known; otherwise it is not sent (logged), and N's end is never held for it."""
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    runner.hub_features, runner.features_known = {"answered", "restart"}, True
+    runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x")])
+    assert runner.checkpoints == {}
+    runner.hub_features = {"answered", "restart", "steer"}
+    runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x")])
+    assert runner.checkpoints["5e551011-0000-4000-8000-000000000000"]["text"] == "x"
+    assert runner.pending == [], "the checkpoint is no event of the session's"

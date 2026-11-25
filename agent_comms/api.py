@@ -95,6 +95,7 @@ class NodeSessionReportIn(Body):
     ceiling: str | None = None      # a root: the most a child may have under it now (full only once confirmed)
     checkout: str | None = None     # a root: the directory it runs in on the node
     modes: list[str] | None = None  # what the session's adapter can do with a turn in flight (restart)
+    held: Any = None    # Claude steering: the checkpoint of N's held native end (hosted_steer.checkpoint)
 
 
 class HostedStartIn(Body):
@@ -943,7 +944,7 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
         out = hosted.report(board, p, session_id, [e.model_dump() for e in body.events],
                             body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
                             access=body.access, worktree=body.worktree, ceiling=body.ceiling,
-                            checkout=body.checkout, modes=body.modes)
+                            checkout=body.checkout, modes=body.modes, held=body.held)
         hosted.note_contact(board, p)           # whatever path it took: a successful call of the session loop
         return out
 
