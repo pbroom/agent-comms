@@ -93,7 +93,7 @@ import httpx
 
 from . import session_access, session_worktrees
 from .dispatch import DispatchConfig
-from .session_host import HostEvent, SessionHost, received_under
+from .session_host import STEER_CONTACT_SECONDS, HostEvent, SessionHost, received_under
 
 log = logging.getLogger("agent_comms.node_sessions")
 
@@ -134,7 +134,8 @@ BAD_OFFER_LOG_SECONDS = 300.0   # a session's offers that cannot be taken are sa
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
 SESSION_PROTOCOL = 5        # `tree` on every fetch and hello: 2 spawn, 3 the hold, 4 restart, 5 steer (hosted_tree)
-STEER_CONTACT_SECONDS = 75.0    # write authority: the last hub-acknowledged hello or report naming N, sent within this
+# Write authority: the last hub-acknowledged hello or report naming N, sent within STEER_CONTACT_SECONDS (75 s,
+# defined once, in session_host, where the attempt's record renews by it) ...
 STEER_OFFER_AGE = 20.0          # ... and an offer is used only from a fetch younger than this when its answer is read
 STEER_STATUS_SECONDS = 20.0     # while a steer is held, the session's status is posted at least this often
 STEER_MAX_BYTES = 12_288        # hosted_steer.STEER_MAX_BYTES (named here, so the node does not import the hub's module)

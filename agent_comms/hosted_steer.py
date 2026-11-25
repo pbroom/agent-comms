@@ -23,6 +23,7 @@ one. One steer per N, one unsettled per session.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from typing import Any
@@ -30,6 +31,8 @@ from typing import Any
 from . import hosted
 from .core import Board, Conflict
 from .nodes import _get, _put
+
+log = logging.getLogger(__name__)
 
 STEER_PREFIX = "host.steer."        # <session id>.<N>: the steer bound to message N (one per N)
 STEER_PROTOCOL = 5                  # a node's `tree` that knows steers (node_sessions.SESSION_PROTOCOL)
@@ -46,6 +49,7 @@ STEER_LINE = ("If you are still working on that turn, take this into account the
               "do the work it asks.")
 REFUSED = {
     "off": "steering is switched off on this hub ([dispatch.sessions] steer = false)",
+    "unreadable": "steering is off on this hub: its [dispatch.sessions] settings could not be read",
     "ended": "the session has ended",
     "closing": "the session is being closed",
     "protocol": ("its node {node} speaks session protocol {tree}; steering needs {need} (update the node: `board node` "
@@ -99,20 +103,27 @@ def unsettled(conn, session_id: str) -> dict | None:
     return next((s for s in steers(conn, session_id) if s.get("outcome") is None), None)
 
 
-def any_unsettled(conn) -> bool:
-    return conn.execute("""SELECT 1 FROM board_state WHERE key >= ? AND key < ? AND json_valid(value)
-                           AND json_extract(value, '$.outcome') IS NULL LIMIT 1""",
-                        hosted._range(STEER_PREFIX)).fetchone() is not None
+_unreadable_said: set[str] = set()     # the settings errors already said in the hub's log (one line each)
 
 
-def enabled(board: Board) -> bool:
-    """`[dispatch.sessions] steer` on the hub (default on). Off for a drain: new steers are refused; those already
-    accepted are offered and settled as ever."""
+def off_reason(board: Board) -> str | None:
+    """`[dispatch.sessions] steer` on the hub (default on, also with no such table): None when on, else why new steers
+    are refused. Off for a drain: those already accepted are offered and settled as ever. A table that does not
+    validate (a value of the wrong type, an unknown key) turns steering OFF, as it leaves main's other settings of
+    that table at their defaults, which are off: the switch a rollback relies on fails closed (pre-merge review).
+    The hub says so once per error."""
     from .dispatch import SessionsConfig
     try:
-        return SessionsConfig.from_dict((board.s.dispatch or {}).get("sessions", {})).steer
-    except (ValueError, AttributeError):
-        return True
+        on = SessionsConfig.from_dict((board.s.dispatch or {}).get("sessions", {})).steer
+    except (ValueError, AttributeError) as e:
+        what = str(e) if isinstance(e, ValueError) else "[dispatch] is not a table"
+        if what not in _unreadable_said:
+            _unreadable_said.add(what)
+            log.warning("the hub's [dispatch.sessions] settings could not be read (%s): steering is off until they "
+                        "can be", what)
+        return "unreadable"
+    return None if on else "off"
+
 
 
 def encoded_size(text: str) -> int:
@@ -153,8 +164,9 @@ def target(board: Board, c, r: dict, by_parent: bool, text: str, *, schema: bool
     """N, the turn in flight a steer from this sender would go into, or (None, why not). In the caller's write
     transaction, after its request-id lookup, in H's order."""
     from . import hosted_tree
-    if not enabled(board):
-        return None, REFUSED["off"]
+    off = off_reason(board)
+    if off is not None:
+        return None, REFUSED[off]
     if r.get("state") == "ended":
         return None, REFUSED["ended"]
     if r.get("stop"):
