@@ -942,14 +942,15 @@ def test_r4_a_sols_timing_m_goes_back_to_the_inbox_and_is_staged_afresh(henv, mo
 def test_r4_a_an_init_first_read_on_the_old_deadline_unstages_before_any_timeout(henv, monkeypatch):
     """Review round 5 (C5-01) edited this replay: M's one no-progress budget began at its staging (t=0), so at t=60,
     when the init is first read, M is unstaged and its budget is spent: the 7b restart, not a failure (and not the
-    t=120 of round 4, which gave the inbox a fresh interval). The next process gives it one fresh budget."""
+    t=120 of round 4, which gave the inbox a fresh interval). Its second budget starts at that restart (review
+    round 7, C7-02: was "the next process gives it one fresh budget")."""
     short_host(henv, monkeypatch)
     s, child = staged_zero(henv)
     henv.clock.advance(60)                              # the old write deadline, and only now the CLI's init is read
     child.emit(vinit())
     evs = henv.host.tick()
     assert not settled(evs, "1") and child.terminated == 1 and [m.id for m in s.inbox] == ["1"], "7b at t=60"
-    assert s.inbox[0].recovered and s.inbox[0].blocked_since is None
+    assert s.inbox[0].recovered and s.inbox[0].blocked_since == henv.clock()
     assert b'"next"' not in child.stdin
 
 
@@ -1350,51 +1351,316 @@ def test_c6_parity_with_verified_empty_no_message_ever_gets_a_budget(henv, monke
     assert end.detail == "timed out after 30 minutes", "main's write timer"
 
 
-def test_c6_property_random_sequences_never_write_twice_or_out_of_order_and_resolve_within_two_budgets(
-        henv, monkeypatch):
-    """Random walks over {send, zero-byte pipe, open pipe, the CLI's turn opens, it closes, a downgrade, M's own
-    result, a binding change, a time step} on a verified host (timeout 60 s, passes every 5 s). For every message:
-    written at most once over all processes, never after a message sent behind it, and, from the first pass at which
-    it is the head with nothing in flight, resolved (written, or failed) within two budgets plus one pass."""
+# --- review round 7: the 7b recovery is earned (C7-01); a budgeted head with no process (C7-02)
+
+
+def candidate_run(henv, monkeypatch, verified, script):
+    """A fresh session (timeout 60 s) whose first process's pipe takes nothing: M is staged before any `init` (the
+    process is only a candidate while some version is VERIFIED), then `script`: (seconds to advance, frames to emit)
+    per pass. What the run shows outside: every pass's events, every process's stdin without the uuid key, how often
+    each was stopped, how many there were, and what is left in the inbox."""
+    import dataclasses
+    from test_dispatch import FakeProcs, FakeSpawner
+    monkeypatch.setattr(claude, "VERIFIED", frozenset(verified))
+    henv.spawner = FakeSpawner(child=_ZeroPipe)
+    henv.procs = FakeProcs(henv.spawner)
+    henv.host = make_host(henv, timeout_minutes=1)
+    s = open_session(henv)
+    henv.host.send(SID, "next", message_id="1")
+    passes = [[dataclasses.asdict(e) for e in henv.host.tick()]]
+    assert s.writing.id == "1" and s.child is not None and henv.spawner.children[0].stdin == b""
+    staged = s.turn_at is not None
+    for dt, frames in script:
+        henv.clock.advance(dt)
+        if frames:
+            henv.spawner.children[-1].emit(*frames)
+        passes.append([dataclasses.asdict(e) for e in henv.host.tick()])
+    return {"passes": passes, "stdin": [UUID_KEY.sub(b"}\n", c.stdin) for c in henv.spawner.children],
+            "stops": [c.terminated for c in henv.spawner.children], "inbox": [m.id for m in s.inbox],
+            "staged_tracked": staged}
+
+
+@pytest.mark.parametrize("frames", [[vinit(version="2.1.329")], []], ids=["unqualified_init", "no_init"])
+def test_c7_01_a_candidate_that_never_verifies_is_mains_write_timer_and_failure(henv, monkeypatch, frames):
+    """Sol's sequence (and a candidate that never writes an `init`): M staged with zero bytes before the first
+    `init`, which reports 2.1.329 (or never comes); at t=60 main fails M by its write timer and stops the process,
+    with no restart and no requeue: every pass's events, the stdin and the stops are main's, byte for byte (the
+    uuid key on that one staged line aside). The byte span was tracked meanwhile (it is needed had it verified)."""
+    script = [(5, frames), (55, []), (1, []), (60, [])]
+    ours = candidate_run(henv, monkeypatch, {V}, script)
+    main = candidate_run(henv, monkeypatch, (), script)
+    assert ours["staged_tracked"] and not main["staged_tracked"]
+    del ours["staged_tracked"], main["staged_tracked"]
+    assert ours == main
+    [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended"]
+    assert (end["message_id"], end["delivered"], end["ok"]) == ("1", False, False)
+    assert end["detail"] == henv.host._timeout_detail() and ours["passes"][2] == [end], "at t=60, by main's timer"
+    assert ours["stops"] == [1] and ours["inbox"] == [], "no restart, no requeue"
+
+
+def test_c7_01_a_candidate_that_verifies_at_t30_and_then_blocks_earns_the_7b(henv, monkeypatch):
+    """Staged at t=0 before any `init`; at t=30 the process verifies and begins a turn of its own (M back to the
+    inbox, held): M was held under a verified process during its budget, so at t=60 it is the 7b restart; the next
+    process writes it once."""
+    run = candidate_run(henv, monkeypatch, {V}, [(30, [vinit()]), (30, [])])
+    s = henv.host.sessions[SID]
+    assert not [e for p in run["passes"] for e in p if e["kind"] == "turn_ended"]
+    assert run["stops"][0] == 1 and len(run["stops"]) <= 2 and set(run["stdin"]) == {b""}
+    assert (s.writing or s.inbox[0]).id == "1" and (s.writing or s.inbox[0]).recovered
+    henv.spawner.child = FakeSessionChild               # the next process's pipe is open
+    henv.spawner.children[-1].accept = None             # (if it is already there)
+    henv.host.tick()
+    henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert len(henv.spawner.children) == 2 and fresh.turns() == ["next"] and fresh.terminated == 0
+    valid_stdin(*henv.spawner.children, once=["next"])
+
+
+def test_c7_01_verified_then_downgraded_keeps_the_7b_it_earned(henv, monkeypatch):
+    """Staged at t=0 before any `init`; verified at t=20 (a turn of its own: M back to the inbox), downgraded at
+    t=40 by a plain result (M staged again, zero bytes): the budget was earned at t=20, the downgrade does not take
+    it away (C6-01), so at t=60 it is the 7b restart."""
+    run = candidate_run(henv, monkeypatch, {V}, [(20, [vinit()]), (20, [plain()]), (20, [])])
+    s = henv.host.sessions[SID]
+    assert not [e for p in run["passes"] for e in p if e["kind"] == "turn_ended"]
+    assert run["stops"][0] == 1 and set(run["stdin"]) == {b""}
+    msg = s.writing or s.inbox[0]
+    assert msg.id == "1" and msg.recovered
+
+
+def test_c7_01_a_verification_and_a_downgrade_read_in_one_pass_still_earn_it(henv, monkeypatch):
+    """The process verifies and is downgraded by frames read in ONE pass (an init that qualifies, then a plain result
+    of the CLI's own turn): M was staged, with its budget, under a verified process, so the budget was earned, line
+    by line, and at t=60 it is the 7b restart, not main's failure."""
+    run = candidate_run(henv, monkeypatch, {V}, [(10, [vinit(), plain()]), (50, [])])
+    s = henv.host.sessions[SID]
+    assert not [e for p in run["passes"] for e in p if e["kind"] == "turn_ended"]
+    msg = s.writing or s.inbox[0]
+    assert run["stops"][0] == 1 and msg.id == "1" and msg.recovered and set(run["stdin"]) == {b""}
+
+def test_c7_01_an_unqualified_runner_never_restarts_for_a_blocked_message_whatever_the_frames(henv, monkeypatch):
+    """The same with frames that would hold a verified process (a bracket opened and closed): a process whose first
+    `init` reports 2.1.329 holds nothing, unstages nothing, and fails M at main's time, as main does."""
+    script = [(5, [vinit(version="2.1.329")]), (10, [foreign()]), (10, [vinit()]), (35, []), (1, [])]
+    ours = candidate_run(henv, monkeypatch, {V}, script)
+    main = candidate_run(henv, monkeypatch, (), script)
+    del ours["staged_tracked"], main["staged_tracked"]
+    assert ours == main and ours["stops"] == [1] and ours["inbox"] == []
+
+
+def held_then_unbound(henv, monkeypatch):
+    """Timeout 60 s, a verified idle session, the CLI's own turn open; M sent at t=0 is held (its budget from t=0);
+    the binding changes, so once the turn closes the process is stopped for it. Returns (session, child, t0)."""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    t0 = henv.clock()
+    emit(henv, child, vinit())
+    henv.host.send(SID, "next", message_id="1")
+    assert henv.host.tick() == [] and s.inbox[0].blocked_since == t0 and s.inbox[0].earned
+    s.bind = "e" * 64
+    return s, child, t0
+
+
+def test_c7_02_sols_sequence_the_replacement_needed_anyway_is_the_recovery(henv, monkeypatch):
+    """The CLI's turn closes at t=59: the binding change stops the verified child; its group is reaped only at t=61,
+    after M's budget ran out: the one replacement IS the recovery (M marked recovered, its second budget from then),
+    it is not stopped, and it writes M once."""
+    s, child, t0 = held_then_unbound(henv, monkeypatch)
+    henv.clock.advance(59)
+    henv.groups.add(child.pid)                          # its group outlives it for a moment
+    assert emit(henv, child, foreign()) == [] and child.terminated == 1
+    henv.clock.advance(2)                               # t=61
+    henv.groups.discard(child.pid)
+    evs = henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert len(henv.spawner.children) == 2 and fresh.terminated == 0 and ("delivered", "1") in [
+        (e.kind, e.message_id) for e in evs]
+    assert fresh.turns() == ["next"] and s.in_flight.recovered
+    henv.host.tick()
+    assert fresh.terminated == 0
+    valid_stdin(child, fresh, once=["next"])
+
+
+def unbound_and_gone(henv, monkeypatch):
+    """As above, with the process stopped and reaped at t=10; then no slot (admission denied)."""
+    s, child, t0 = held_then_unbound(henv, monkeypatch)
+    henv.clock.advance(10)
+    henv.host.admit = lambda sess: False
+    emit(henv, child, foreign())                        # stopped and reaped in this pass; no slot for the next
+    assert s.child is None and [m.id for m in s.inbox] == ["1"] and child.terminated == 1
+    return s, child, t0
+
+
+def test_c7_02_admission_denied_past_the_first_budget_the_spawn_when_admitted_is_the_recovery(henv, monkeypatch):
+    s, child, t0 = unbound_and_gone(henv, monkeypatch)
+    henv.clock.advance(50)                              # t=60: the first budget is spent with no process
+    assert henv.host.tick() == [] and s.inbox[0].recovered and s.inbox[0].blocked_since == t0 + 60
+    assert len(henv.spawner.children) == 1, "nothing spawned while no slot"
+    henv.clock.advance(30)                              # t=90: a slot
+    henv.host.admit = None
+    evs = henv.host.tick()
+    fresh = henv.spawner.children[-1]
+    assert len(henv.spawner.children) == 2 and ("delivered", "1") in [(e.kind, e.message_id) for e in evs]
+    henv.host.tick()
+    assert fresh.terminated == 0 and fresh.turns() == ["next"]
+
+
+def test_c7_02_admission_denied_past_the_second_budget_fails_it_without_spawning(henv, monkeypatch):
+    s, child, t0 = unbound_and_gone(henv, monkeypatch)
+    henv.clock.advance(50)
+    henv.host.tick()                                    # t=60: recovered, its second budget from now
+    henv.clock.advance(59)
+    assert henv.host.tick() == []
+    henv.clock.advance(1)                               # t=120, and a slot just then
+    henv.host.admit = None
+    [end] = settled(henv.host.tick(), "1")
+    assert (end.delivered, end.ok) == (False, False) and "busy with a turn of its own" in end.detail
+    henv.host.tick()
+    assert len(henv.spawner.children) == 1 and not s.inbox, "nothing spawned for it"
+
+
+@pytest.mark.parametrize("gone_at", [100, 130])
+def test_c7_02_a_delayed_reap_past_the_deadline(henv, monkeypatch, gone_at):
+    """Stopped at t=10 for the binding, its group gone only at t=100 (or t=130): the budget runs on meanwhile, every
+    pass. At t=60 it is spent: M is recovered (nothing more to stop); reaped at t=100, the one replacement writes M;
+    still there at t=120, M fails without a spawn for it."""
+    s, child, t0 = held_then_unbound(henv, monkeypatch)
+    henv.clock.advance(10)
+    henv.groups.add(child.pid)
+    emit(henv, child, foreign())
+    assert child.terminated == 1 and s.child is child
+    for t in range(15, gone_at + 1, 5):
+        henv.clock.advance(5)
+        if t == gone_at:
+            henv.groups.discard(child.pid)
+        evs = henv.host.tick()
+        if t == 60:
+            assert s.inbox[0].recovered and s.inbox[0].blocked_since == t0 + 60 and child.terminated == 1
+        if t == 120 and gone_at == 130:
+            [end] = settled(evs, "1")
+            assert end.delivered is False and not s.inbox
+    if gone_at == 100:
+        fresh = henv.spawner.children[-1]
+        assert len(henv.spawner.children) == 2 and fresh.turns() == ["next"] and fresh.terminated == 0
+    else:
+        henv.host.tick()
+        assert len(henv.spawner.children) == 1
+
+
+def test_c7_property_random_sequences_every_message_has_one_outcome_in_time(henv, monkeypatch):
+    """Seeded random walks (review rounds 6 and 7) on a host with 2.1.330 VERIFIED, timeout T = 60 s, over: sends; the
+    live pipe taking nothing, everything, or a few bytes per write (partial writes); the NEXT process's pipe starting
+    so; the CLI's own turn opening and closing; a downgrade; the in-flight message's own result; an init reporting
+    2.1.329; a binding change; a process group that outlives its stop (a delayed reap) and its release; admission
+    denied and granted; and time steps from 1 s to past two budgets, so a deadline can pass between two reads. Then a
+    drain (slots, groups and pipes released, the clock running on). Every process starts as a candidate, and one
+    that is never sent an init never verifies. Asserted, for every message sent:
+    - exactly one outcome (delivered, or failed undelivered), recorded with its time; none is skipped;
+    - written whole at most once over all processes, never after a message sent behind it; written iff delivered;
+    - with a no-progress budget (first seen from b0): progress (a byte accepted) or its outcome by P(P(b0 + T) + T),
+      P(x) the first pass at or after x: two budgets plus one pass, for a failure as for a delivery; after progress,
+      its outcome by P(progress + T) (main's write timer);
+    - never budgeted but staged at s0: its outcome by P(s0 + T) (main's write timer);
+    - the 7b restart (`recovered`) only for a message seen budgeted under a process verified at the time (each line
+      read, and each pass's end), C7-01.
+    A failure names the seed and every step."""
+    import bisect
     import random
+    from types import SimpleNamespace
+    from test_dispatch import FakeProcs, FakeSpawner
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
-    T, STEP = 60.0, 5.0
-    for seed in range(60):
+    T = 60.0
+    feed, watch = ClaudeSession.feed, {"see": lambda: None}
+
+    def feeding(self, line):
+        got = feed(self, line)
+        watch["see"]()      # verification is observed line by line, as the host observes it
+        return got
+
+    monkeypatch.setattr(ClaudeSession, "feed", feeding)
+    for seed in range(80):
         rnd = random.Random(seed)
-        from test_dispatch import FakeProcs, FakeSpawner
-        from test_session_host import FakeSessionChild
-        henv.spawner = FakeSpawner(child=FakeSessionChild)
+        start = {"accept": None}
+
+        class Child(FakeSessionChild):
+            def __init__(self, pid, exits_on_terminate=True):
+                super().__init__(pid, exits_on_terminate)
+                self.accept = start["accept"]
+
+        henv.groups.clear()
+        henv.spawner = FakeSpawner(child=Child)
         henv.procs = FakeProcs(henv.spawner)
         henv.host = make_host(henv, timeout_minutes=T / 60)
+        slot = {"ok": True}
+        henv.host.admit = lambda sess: slot["ok"]
         s = henv.host.open(SID, agent="claude", runtime="claude-code", project="/work/repo")
-        sent, head_since, written_at, failed = [], {}, {}, set()
+        sent, outcome, extra, steps, pass_times = [], {}, [], [], []
+        budget0, progress, staged0, seen_verified = {}, {}, {}, set()
+
+        def holder():
+            m = s.writing if s.writing is not None and s.turn_at is not None else (
+                s.inbox[0] if s.writing is None and s.inbox else None)
+            return m if m is not None and m.blocked_since is not None else None
+
+        def see():
+            m = holder()
+            if m is not None and s.child is not None and s.provider.verified:
+                seen_verified.add(m.id)
+
+        watch["see"] = see
+
+        def record(mid, kind):
+            if mid in outcome:
+                extra.append((mid, kind, henv.clock()))
+            else:
+                outcome[mid] = (kind, henv.clock())
+
+        def tick():
+            pass_times.append(henv.clock())
+            for e in henv.host.tick():
+                if e.kind == "delivered":
+                    record(e.message_id, "delivered")
+                elif e.kind == "turn_ended" and not e.delivered:
+                    record(e.message_id, "failed")
+                elif e.kind == "turn_ended" and outcome.get(e.message_id, ("?",))[0] != "delivered":
+                    extra.append((e.message_id, "ended, never delivered", henv.clock()))
+                elif e.kind == "ended":
+                    for mid in e.undelivered:
+                        record(mid, "failed")
+            for m in list(s.inbox) + [s.writing]:
+                if m is None:
+                    continue
+                if m.blocked_since is not None:
+                    budget0.setdefault(m.id, m.blocked_since)
+                elif m.id in budget0 and m is s.writing and s.turn_at is None:
+                    progress.setdefault(m.id, henv.clock())     # a byte of it accepted: its budget is over
+            if s.writing is not None:
+                staged0.setdefault(s.writing.id, henv.clock())
+            see()
+            for m in list(s.inbox) + [s.writing, s.in_flight]:
+                if m is not None and m.recovered and m.id not in seen_verified:
+                    extra.append((m.id, "a 7b restart it never earned", henv.clock()))
 
         def proc():
             return henv.spawner.children[-1] if henv.spawner.children and s.child is not None else None
 
-        def tick():
-            for e in henv.host.tick():
-                if e.kind == "delivered":
-                    written_at.setdefault(e.message_id, henv.clock())
-                elif e.kind == "turn_ended" and not e.delivered:
-                    failed.add(e.message_id)
-            if s.inbox and not s.busy and s.child is not None:
-                head_since.setdefault(s.inbox[0].id, henv.clock())
-            if s.writing is not None and s.writing.id not in written_at:
-                head_since.setdefault(s.writing.id, henv.clock())
-
         for k in range(70):
             p = proc()
-            action = rnd.choice(["send", "send", "zero", "open", "bracket", "close", "downgrade", "own", "bind",
-                                 "step", "step", "step"])
+            action = rnd.choice(["send", "send", "zero", "open", "partial", "next", "bracket", "close", "downgrade",
+                                 "own", "other", "bind", "linger", "release", "deny", "admit"])
+            arg = None
             if action == "send" and len(sent) < 6:
-                mid = f"m{len(sent)}"
-                sent.append(mid)
-                henv.host.send(SID, f"text {mid}", message_id=mid)
+                arg = f"m{len(sent)}"
+                sent.append(arg)
+                henv.host.send(SID, f"text {arg}", message_id=arg)
             elif action == "zero" and p is not None:
                 p.accept = 0
             elif action == "open" and p is not None:
                 p.accept = None
+            elif action == "partial" and p is not None:
+                p.accept = arg = rnd.choice([1, 3, 7])
+            elif action == "next":
+                start["accept"] = arg = rnd.choice([None, 0, 3])
             elif action == "bracket" and p is not None:
                 p.emit(vinit())
             elif action == "close" and p is not None:
@@ -1403,29 +1669,59 @@ def test_c6_property_random_sequences_never_write_twice_or_out_of_order_and_reso
                 p.emit(plain())
             elif action == "own" and p is not None and s.in_flight is not None:
                 u = uuid_of(p)
-                p.emit(vinit(u) if u else vinit(), owned(u) if u else plain())
+                p.emit(*((vinit(u), owned(u)) if u else (plain(),)))
+            elif action == "other" and p is not None:
+                p.emit(vinit(version="2.1.329"))
             elif action == "bind":
                 s.bind = None if s.bind else "e" * 64
-            henv.clock.advance(STEP)
+            elif action == "linger" and p is not None:
+                henv.groups.add(p.pid)
+            elif action == "release":
+                henv.groups.clear()
+            elif action in ("deny", "admit"):
+                slot["ok"] = action == "admit"
+            dt = rnd.choice([1, 5, 5, 5, 10, 30, 65, 125])
+            steps.append((action, arg, dt))
+            henv.clock.advance(dt)
             tick()
-        for _ in range(int(3 * T / STEP) + 2):        # drain: no new frames, the clock runs on
-            henv.clock.advance(STEP)
+        slot["ok"], start["accept"] = True, None
+        henv.groups.clear()
+        if proc() is not None:
+            proc().accept = None
+        for _ in range(150):                            # drain: 750 s, no new frames
+            henv.clock.advance(5)
             tick()
-        texts = [json.loads(x)["message"]["content"] for c in henv.spawner.children
-                 for x in c.stdin.split(b"\n")[:-1] if json.loads(x).get("type") == "user"]
-        for c in henv.spawner.children:
-            valid_stdin(c)
-        order = [t.split(" ", 1)[1] for t in texts]
-        assert len(order) == len(set(order)), (seed, "written twice", order)
-        assert order == [m for m in sent if m in order], (seed, "out of order", order, sent)
-        for m in sent:
-            if m in written_at or m in failed:
-                if m in written_at and m in head_since:
-                    assert written_at[m] - head_since[m] <= 2 * T + STEP, (seed, m, "resolved late")
-                continue
-            if m in head_since:
-                assert henv.clock() - head_since[m] <= 2 * T + STEP, (seed, m, "unresolved", s.state)
 
+        def first_pass(x):
+            i = bisect.bisect_left(pass_times, x - 1e-9)
+            return pass_times[i] if i < len(pass_times) else float("inf")
+
+        try:
+            assert not extra, ("a second outcome", extra)
+            assert sorted(outcome) == sorted(sent), ("every message one outcome", sorted(outcome), sent)
+            texts = [json.loads(x)["message"]["content"] for c in henv.spawner.children
+                     for x in c.stdin.split(b"\n")[:-1] if json.loads(x).get("type") == "user"]
+            for c in henv.spawner.children:
+                # Whole lines, each one object; a process stopped in the middle of a line (a partial write and
+                # main's write timer) may end with that line's beginning, never with anything appended to it.
+                valid_stdin(SimpleNamespace(stdin=c.stdin[:c.stdin.rfind(b"\n") + 1]))
+                assert c.stdin.endswith(b"\n") or c.stdin == b"" or c.terminated or c.killed, "only a stopped one"
+            order = [t.split(" ", 1)[1] for t in texts]
+            assert len(order) == len(set(order)), ("written twice", order)
+            assert order == [m for m in sent if m in order], ("out of order", order, sent)
+            assert set(order) == {m for m, (kind, _) in outcome.items() if kind == "delivered"}, (
+                "written iff delivered", order, outcome)
+            for m in sent:
+                kind, at = outcome[m]
+                if m in budget0:
+                    bound = first_pass(first_pass(budget0[m] + T) + T)
+                    assert min(at, progress.get(m, at)) <= bound, (m, kind, at, "budget from", budget0[m], bound)
+                    if m in progress:
+                        assert at <= first_pass(progress[m] + T), (m, kind, at, "after progress", progress[m])
+                elif m in staged0:
+                    assert at <= first_pass(staged0[m] + T), (m, kind, at, "main's write timer from", staged0[m])
+        except AssertionError as e:
+            raise AssertionError(f"seed {seed}: {e}; steps {steps}") from None
 
 # --- the barrier, its bound and its clock, the access check, interrupt readiness
 
