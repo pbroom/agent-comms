@@ -10888,7 +10888,7 @@ ExitTimeOut (60 s, scripts/install-launchagents.py), holds a shutdown with a liv
 kill grace (10 s by default), the loop's join (1 s), the wait for a report under way (at most 25 s) and the first
 steer report (at most 20 s): 58 s. Every report that carries no outcome is main's one call. While a steer attempt
 is live, a flush that is not shutdown's own stops between sessions once shutdown has begun; with none live it goes on
-as on main. (WITHDRAWN, provisionally, by "Shutdown simplified" at the end of step 2's notes: the total deadline,
+as on main. (WITHDRAWN by "Shutdown simplified" at the end of step 2's notes, decided by the owner, 2026-11-25: the total deadline,
 `_call_by`, the reserved retry, the steer-first final flush, the stop between sessions and the 58 s budget are gone;
 a report carrying an outcome gets main's call and, after a 422 only, one plain synchronous retry.) (R3-09:) a stored steer that cannot be rendered as an offer (`_malformed`: its uuid or text not a short
 string, not UTF-8, empty or over the cap; a prerelease record, say) is withdrawn like any failed check, so the rest of
@@ -11041,7 +11041,7 @@ result turns and claims, and CLI text. The named changes:
   The golden's `zz_parity` (recorded on d4b92e5, normalized on its own so every earlier key keeps its placeholders)
   pins three runs against main: a cancel of a queued task right after the watchdog stopped the child's turn
   (R3-07's case), a shutdown with three ordinary sessions, and a flush under way when shutdown begins. No ordinary
-  difference remains. (Provisionally, under "Shutdown simplified", as ruled in review round 6:) with a steer attempt
+  difference remains. (Under "Shutdown simplified", as ruled in review round 6 and decided by the owner, 2026-11-25:) with a steer attempt
   live too, shutdown and every multi-session stop are main's event for event, for every ordinary session and for the
   steered one except the steer outcome its N end carries. In TIMING (qualified in review round 7, R7-03):
   - The traversal order and the deadline checks are main's.
@@ -11056,7 +11056,7 @@ result turns and claims, and CLI text. The named changes:
     - ordinary events that become readable during a drain can be emitted in a different order than on main;
     - an ordinary SIGTERM sent late carries main's pass timestamp, which shortens its actual grace by up to the drain
       delay, the last read's overrun included.
-  - These are accepted under the simplified rule, pending the owner's decision.
+  - These are accepted under the simplified rule, decided by the owner, 2026-11-25.
   - A steering-owned stop (a live attempt's, or the cut's) is dated by a clock read as its SIGTERM is sent (R7-02).
   (A hello sent again after a 422 is now dated from the attempt that got through: that date is
   the node's own steer evidence, never on the wire.)
@@ -11191,7 +11191,7 @@ Design-level questions are closed; these go to code review (F-6, the round-5 rev
   full write still needs its outcome tracked; omission alone never abandons N or erases S's dedupe state;
 - (R11-04) shutdown before the hold exists: `signal()` drains every live steer attempt first, including one still
   waiting for N's result, and a native result larger than one `read_lines()` budget (dispatch.py line 1613) is drained
-  across reads, since one `_read` does not necessarily empty the pipe; (WITHDRAWN, provisionally, with part O's
+  across reads, since one `_read` does not necessarily empty the pipe; (WITHDRAWN, decided by the owner, 2026-11-25, with part O's
   "shutdown drains a live attempt across read budgets" row, by "Shutdown simplified": shutdown reads nothing first,
   and S's outcome is what was already read)
 - (round 12) the stop deadline while the process is already marked stopping, with an overlapping timeout, close
@@ -11372,7 +11372,8 @@ hardening (Q); buffering Codex frames that come before the start reply (R3-06).
   by the loop and by the deadline watchdog. Any applied listing that does not list a held steer revokes it. The node
   holds the text to the cap again (`too_big`: never written, `not_delivered`). While a steer is held, the session's
   status is posted at least every 20 s. The extension and `steer` in `modes` go only to a hub that names `steer`;
-  N's end never waits for feature discovery. `signal()` drains every session holding a steer before its SIGTERM.
+  N's end never waits for feature discovery. (WITHDRAWN by "Shutdown simplified", decided by the owner, 2026-11-25: `signal()` drained
+  every session holding a steer before its SIGTERM; it is main's now and reads nothing first.)
 - **The host** (session_host.py): the `SteerSlot`, offered (`steer_offer`, dedupe by uuid, only for the turn in
   flight), revoked (`steer_revoke`), written by `_steer_pass` only while N's attempt may run here (D's authority:
   authorized, not revoked or refused, N in flight, live and not stopping, the binding, the turn gate, `may_start`,
@@ -11453,7 +11454,7 @@ writes nothing, and settles every steer `not_delivered` (`not_owned`): it refuse
   the process exits included:
   `test_o_n_ended_with_the_process_after_a_byte_is_unconfirmed_even_with_a_matched_receipt[exit|timeout|cancel|close|stop_turns|stop_all]`,
   `test_e2e_in_process_a_partition_after_the_write_ends_n_with_the_self_stop_unconfirmed`.
-- R11-04 as far as step 2 has it: WITHDRAWN provisionally ("Shutdown simplified"): shutdown is main's and reads
+- R11-04 as far as step 2 has it: WITHDRAWN ("Shutdown simplified", decided by the owner, 2026-11-25): shutdown is main's and reads
   nothing first, S decided by what was already read, and no byte of S goes once the node began to stop:
   `test_sd_shutdown_with_a_live_steer_is_mains_for_every_session_event_for_event_and_in_time[written|unwritten|in_turn]`,
   `test_sd_a_stop_of_every_turn_reads_nothing_more_and_s_is_what_was_read[stop_turns|stop_all|self_stop]`,
@@ -11592,8 +11593,8 @@ rejected before it touches anything, R3-02; a fresh re-offer is judged at receip
 outcome's exit on a retention miss (R3-10); departure 15 is fully built for steers by the one drain on every failing
 path, the shutdown-wide deadline and the grace from the actual SIGTERM (R3-04, R3-05), and an unheld cancel that
 returned nothing emits nothing, so main's order is kept for a session holding no steer (R3-07). (Departure 15's
-shutdown part, the shutdown-wide drain and the grace from the actual SIGTERM, is withdrawn provisionally by "Shutdown
-simplified": shutdown is main's; its single-session part stays.) As of review round 4, see "One-way authority, after round 4" in the round 4 subsection for what departure 2's one-way rule now covers
+shutdown part, the shutdown-wide drain and the grace from the actual SIGTERM, is withdrawn by "Shutdown
+simplified", decided by the owner, 2026-11-25: shutdown is main's; its single-session part stays.) As of review round 4, see "One-way authority, after round 4" in the round 4 subsection for what departure 2's one-way rule now covers
 and what is left.
 - F, "N ended with the process: unconfirmed if any byte was written": read literally for every end the HOST makes
   (exit, a timeout it gives up on, cancel, close, self-stop, shutdown, the cut): `unconfirmed` (`turn_cut`), also
@@ -12651,13 +12652,13 @@ caught on the first run; the 4 missed (all R4-01 (b)) got the two gap tests abov
 | R4-02 the receipt after the lock (the helper reads the clock before the lock) | `test_r4_02_an_acknowledgements_receipt_is_read_after_the_records_lock_is_taken` |
 | R4-09 in_turn says the outcome is known (the branch removed) | `test_r4_09_a_known_in_turn_with_n_pruned_says_the_outcome_and_that_ns_status_is_unavailable` |
 
-### Shutdown simplified (provisional: owner decision pending)
+### Shutdown simplified (decided by the owner, 2026-11-25)
 
-**Status.** Built on the coordinator's recommended option while the owner's answer to the shutdown scope question
-(does a steered turn at node shutdown need more than main's shutdown?) is open. If the owner chooses the other
-option, these commits are dropped as a unit: b6baf3d (code), eb67e0e (tests), 8eebd46 (the two-loop order), 7551759
-(the gap tests) and the notes commit that adds this subsection. The branch before them is kept as
-`backup/codex-steering-4d1088a`. It replaces round 3's structure 2 for multi-session stops and shutdown, and settles
+**Status.** Decided by the owner on 2026-11-25 ("Simplify shutdown"), in answer to the shutdown scope question (does
+a steered turn at node shutdown need more than main's shutdown? No). It was built first on the coordinator's
+recommended option while that question was open: b6baf3d (code), eb67e0e (tests), 8eebd46 (the two-loop order),
+7551759 (the gap tests) and the notes commit that adds this subsection; the branch before them is kept as
+`backup/codex-steering-4d1088a`. What it withdrew and what it costs are kept below as the record. It replaces round 3's structure 2 for multi-session stops and shutdown, and settles
 R4-03 to R4-08.
 
 **The rule.**
@@ -12868,8 +12869,8 @@ equivalent.
 The reviewer judged the simplified shutdown rule sound under parts C, D and F. R4-01 (a), R4-02 and R4-09 are
 resolved, and R4-03 to R4-08 are fixed or gone. The rebase leaves Claude's paths untouched. The listing-order choice
 (A) and the watchdog's order (kills before cuts) are kept. The first build's "ordinary sessions first, both loops"
-is overruled (R5-03). The owner's decision on the simplified rule is still pending. These commits build on it and
-go with it if it is dropped.
+is overruled (R5-03). The owner's decision on the simplified rule was then pending (decided by the owner, 2026-11-25). These
+commits build on it.
 
 Each finding has a test that fails on fa4e42d's code by its behavioural assertion; this was checked on an export of
 fa4e42d with this round's tests. The one exception is the slot-being-installed case of R5-01, which needs the
@@ -12944,7 +12945,7 @@ latch's lock and so cannot run there.
     never names it. Its other fields are equal except the wall-clock `seq` and the run's own checkout path. On
     fa4e42d, `answered` is gone.
 - **R5-06** [nit] Rule 1 no longer names a `drain`; it names `SessionRunner.shutdown`. Part O's active inventory now
-  names the provisional rule's tests. The "Shutdown simplified" subsection's rule 3 and its lists say what round 5
+  names the simplified rule's tests. The "Shutdown simplified" subsection's rule 3 and its lists say what round 5
   replaced.
 
 **The e2e script's M5 probe** (scripts/session-host-e2e.py, `LineReader`) now waits on a selector instead of
@@ -13104,7 +13105,7 @@ The reviewer judged the rebase clean for Claude. R5-01, R5-03 (the checkout barr
 are resolved. All three blockers came from round 5's deferred drain. The coordinator withdrew the deferral: it bought
 "an ordinary session is never delayed by a drain" at the price of a second place where an old process is settled.
 Each blocker has a test that fails on 85f0af0's code by its behavioural assertion; this was checked on an export of
-85f0af0 with this round's tests. The owner's decision on the simplified shutdown rule is still pending.
+85f0af0 with this round's tests. The owner's decision on the simplified shutdown rule was then pending (decided by the owner, 2026-11-25).
 
 **Removed:**
 - `SessionHost._defer` and `_run_deferred`, and the deferral list in `_tick`;
@@ -13289,7 +13290,7 @@ assertion, except as noted; this was checked on an export of 37d1804 with this r
     `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress` now asserts that the waiting stop went ahead of the
     next batch.
 - **R7-03** [should] Part K's timing statement is qualified as the reviewer puts it, and accepted under the simplified
-  rule, pending the owner:
+  rule (then pending the owner; decided by the owner, 2026-11-25):
   - the traversal order and the deadline checks are main's;
   - in a hold where a live attempt's turn ends, readiness and poll timing may shift;
   - an ordinary kill can come at the second tick rather than at main's next poll (after its deadline, never before
@@ -13443,8 +13444,9 @@ was checked on an export of 2af03c4 with this round's tests.
     - `_steer_end`'s settlement of an outcome;
     - a cut's admission: its check, and its clearing of the buffer;
     - a slot's installation: a few assignments.
-  - A batch's admission reads the latch and `_stop_pending` once inside the lock, so no batch begins after the stop
-    announced itself. A cut, a settlement and an installation can still take the lock ahead of the setter; each reads
+  - A batch's admission reads the latch and `_stop_pending` once inside the lock, so no batch is admitted after the
+    stop announced itself (one admitted just before may still enter its `read_lines` after it, if its thread is
+    preempted: review round 10's nit). A cut, a settlement and an installation can still take the lock ahead of the setter; each reads
     the latch once inside it. A cut that begins after the latch is set does nothing, a settlement then counts nothing
     for S, and a slot installed then is born stopped. The wait is therefore bounded by how many such short sections
     other threads start in the meantime, not by one.
@@ -13540,7 +13542,7 @@ check runs inside `_check`.
 ### Review round 9 (on f7e2025: APPROVED given the simplified shutdown rule; two shoulds, one nit) and what changed
 
 The reviewer judged R8-01 to R8-03 resolved and R8-04 partly resolved, and `_stop_from` sound. The only remaining
-merge condition is the owner's decision on the simplified shutdown rule. The backup branch
+merge condition was then the owner's decision on the simplified shutdown rule (decided by the owner, 2026-11-25). The backup branch
 `backup/codex-steering-f7e2025` sits at f7e2025. Each test named below fails on f7e2025's code by its assertion; this
 was checked on an export of f7e2025 with this round's tests.
 
@@ -13634,3 +13636,91 @@ again. Two are equivalent, as stated.
 | R9-01 the 422 said once per report | `test_r8_04_a_refused_report_retried_again_is_said_once` |
 | R9-01 the 422 key goes when its events leave the queue | `test_r8_04_a_refused_report_retried_again_is_said_once` |
 | R9-01 the 422 prune keeps only queued events | `test_r8_04_a_refused_report_retried_again_is_said_once` |
+
+### Pre-merge review (on 6907b6c: OK to merge, no blockers, two shoulds, seven nits), review round 10's nit, and what changed
+
+The owner decided the shutdown rule on 2026-11-25 ("Simplify shutdown"): "Shutdown simplified" stands, and the notes
+above now say so where they called it provisional. Review round 10 (Sol) APPROVED 6907b6c. An independent pre-merge
+review said "OK to merge" on 6907b6c. The backup branch `backup/codex-steering-6907b6c` sits at 6907b6c. The
+production lines changed this round are only the setting's reading, its refusal text, the 75 s constant's
+definition and the removed function. Items 1, 2 and 4 are gaps in the tests, not bugs: their tests pass on 6907b6c,
+and each is caught by its mutation row below. Item 3's tests fail on 6907b6c by their assertions.
+
+- **1** [should] The write boundary's one critical section had no test of the gap between the check and the write.
+  - `test_pm_1_a_break_published_between_the_boundarys_check_and_its_write_comes_after_the_write`.
+  - At the gate's last step (the contact clock, after the boundary's "before" hook) the clock passes the 75 s, and a
+    hello is acknowledged from another thread. The acknowledgement comes to the attempt's lock (the lock signals it)
+    and waits. The steer's bytes go with nothing latched; the break is latched after the write returned.
+  - With the check moved out of the lock, the break is latched before the write.
+- **2** [should] A parent's steer against its ceiling and its turn limit, through `hosted_spawn.send`.
+  - `test_pm_2_a_parents_steer_above_its_ceiling_now_is_refused_and_charges_and_stores_nothing`: the grant is
+    narrowed to read-only after a workspace child was started. Refused with ABOVE_NOW's words; no steer record, no
+    charge, nothing written.
+  - `test_pm_2_a_parents_steer_at_its_turn_limit_is_refused_and_charges_and_stores_nothing`: with
+    `max_turns_without_human` reached, refused (LimitReached) both by the check before the transaction (no request
+    id) and by the one inside it (with a request id, where it is the only check). The mutation check found that the
+    first version reached only the check before the transaction; the request-id case was added.
+- **3** [nit, fixed] The switch fails closed. `hosted_steer.off_reason` replaces `enabled()`.
+  - It returns None when steering is on, "off" for `steer = false`, and "unreadable" when `[dispatch.sessions]`
+    does not validate (a value of the wrong type, an unknown key, `[dispatch]` not a table).
+  - Unreadable: new steers are refused with "steering is off on this hub: its [dispatch.sessions] settings could not
+    be read". The hub logs "the hub's [dispatch.sessions] settings could not be read (...): steering is off until
+    they can be" once per distinct error.
+  - Steers accepted before are offered and settled as with `steer = false`: the listing reads no setting.
+  - The listing's `features` are the same as with `steer = false` (they name report fields the hub takes, not the
+    switch), so they still include `steer`.
+  - No table at all (`dispatch` None, `{}`, or `sessions` empty) is on, as designed.
+  - Main's other settings of that table are untouched. A table that does not validate already gives `spawn_config`
+    its defaults, which are off (no spawning), and the wake limits theirs. Steering now goes the same way: off.
+  - Tests:
+    - `test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off[string|type|sibling_typo]`, for
+      `steer = "false"`, `steer = 0` and `max_lvie = 3`. On 6907b6c a new steer was taken (refused only as
+      "not settled yet").
+    - `test_pm_3_with_no_sessions_table_steering_is_on_as_designed`.
+- **4** [nits]
+  - A human steer starts the tree's count of turns without the human over, and a refused one does not:
+    `test_pm_4_a_human_steer_starts_the_trees_count_of_turns_without_the_human_over`.
+  - The offer age's other branch (a hello acknowledged between a 20 s old answer and its reconciliation):
+    `test_pm_4_an_offer_older_than_20_s_is_unusable_also_when_a_hello_is_acknowledged_before_it_is_applied`.
+  - The gate's own latch check: a frame queued in an earlier pass (not a byte taken), then the records marked and the
+    latch set while the node's own flag still says yes. The pipe opens and nothing of S goes:
+    `test_pm_4_a_frame_queued_before_the_stop_is_refused_at_the_boundary_by_the_gates_own_latch_check`.
+  - The 75 s renewal: an acknowledgement sent at 150 holds just under 225, and has run out at 225 and just over
+    (latched): `test_pm_4_the_75_s_renewal_boundary[...]`.
+  - The 75 s is defined once, in session_host. node_sessions imports it: `test_pm_4_the_75_s_is_defined_once`.
+  - `hosted_steer.any_unsettled` is removed. Nothing imported or called it (searched in agent_comms, tests, scripts
+    and the README).
+  - "What was built" no longer says `signal()` drains first: that line is marked withdrawn, like the others.
+- **Review round 10's nit**: the R8-03 paragraph says "no batch is admitted after the stop announced itself". A batch
+  admitted just before may still enter its `read_lines` after it, if its thread is preempted.
+
+**Runs** at eec46e7. The last code commit is cc8dcb2; ea234fd and eec46e7 add tests only.
+- `uv run pytest -q -p no:cacheprovider`: 4477 passed, 10 skipped.
+- The stand-in e2e in full: PASS (166 s).
+- `--only steering` with stand-ins: PASS (113 s).
+- `--only correlation` with stand-ins: PASS (12 s).
+- `--only steering` with the real Codex: PASS (59 s).
+- `--only steer` with the real Codex: PASS (40 s).
+- `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (15 s).
+- `~/.codex/config.toml` sha256 unchanged through all of them, from this round's baseline:
+  bfac656f32e12383e8b896251417c689cd827260e8344885fc0cc5568eb7257d. (It changed earlier today, at 11:15, when the
+  ChatGPT desktop app updated itself and rewrote it: not a run of this branch.)
+
+### Mutation check, pre-merge review
+
+Scratchpad `mutate12.py`, one row per rule items 1 to 4 pin. Each row was applied alone to an export of ea234fd, and
+the steering test set was run with -x; then the file was restored. 9 of 10 were caught on the first run. The missed
+row (the in-transaction turn limit) got the request-id case and was caught when run again, on the tests of eec46e7.
+
+| mutation | caught by |
+| --- | --- |
+| PM-1 the boundary's check inside the attempt's lock (check moved before the lock) | `test_pm_1_a_break_published_between_the_boundarys_check_and_its_write_comes_after_the_write` |
+| PM-2 a parent's steer under its ceiling now (ABOVE_NOW check off) | `test_pm_2_a_parents_steer_above_its_ceiling_now_...` |
+| PM-2 a parent's steer within its turn limit (`_check_limits("turns")` removed) | `test_pm_2_a_parents_steer_at_its_turn_limit_...` (the request-id case, added after the first run) |
+| PM-3 an unreadable table turns steering off (returns on) | `test_pm_3_..._turns_steering_off[string]` |
+| PM-3 the refusal says the setting could not be read (says "off") | `test_pm_3_..._turns_steering_off[string]` |
+| PM-3 the hub says it once | `test_pm_3_..._turns_steering_off[string]` |
+| PM-4 a human steer resets the tree's count | `test_pm_4_a_human_steer_starts_the_trees_count_...` |
+| PM-4 the offer age where a hello came after the answer | `test_pm_4_an_offer_older_than_20_s_is_unusable_also_when_...` |
+| PM-4 the gate's own stop-latch check | `test_pm_4_a_frame_queued_before_the_stop_is_refused_at_the_boundary_...` |
+| PM-4 the renewal by exactly 75 s (76) | `test_pm_4_the_75_s_renewal_boundary[-0.001-True]` |
