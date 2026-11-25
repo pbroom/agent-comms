@@ -13243,3 +13243,127 @@ Scratchpad `mutate8.py`. Round 5's R5-03 and R5-04 rows are withdrawn with the c
 | R6-05 the item's own field | EQUIVALENT: the JSON check after the replacement already requires that what was nulled is the item's own `clientId` (an id elsewhere in the line is kept) |
 | R6-05 the start it answers | `test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start` |
 | R6-05 the turn it answers | `test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start` |
+
+### Review round 7 (on 37d1804: CHANGES, one blocker, three shoulds, one nit) and what changed, and the rebase onto 7456971
+
+The reviewer judged the deferral gone, with no second settlement place. R6-02, R6-03 and R6-05 are resolved, and so
+is R5-04 under the revised rule. No lock cycle was found, and Claude's path and no-steer parity are unchanged. The
+backup branch `backup/codex-steering-37d1804` sits at 37d1804. Each finding's test fails on 37d1804's code by its
+assertion, except as noted; this was checked on an export of 37d1804 with this round's tests.
+
+- **R7-01** [blocker] S's evidence eligibility is now the ONE global latch, read under `_steer_stop_lock`.
+  - In `_steer_end`, where a terminal event or a receipt becomes S's outcome, the outcome is decided inside that
+    lock (`_steer_end`: `slot.stopping or self.steer_stopped`). It is therefore linearized with `steer_stopping`
+    setting the latch.
+  - Evidence processed once the latch is set never counts for S, whether or not that slot was marked yet.
+  - N's own result is handled exactly as on main.
+  - The per-slot mark remains what makes a slot unwritable.
+  - Test, Sol's two-slot replay through barriers:
+    `test_r7_01_evidence_read_while_shutdown_marks_another_slot_never_counts_for_s[True|False]`. Shutdown has set
+    the latch and is blocked marking A, with A's lock held by another thread, when B's ordinary read takes B's
+    answer and N's end. N settles as on main. S is `unconfirmed` (`turn_cut`) when written, and `not_delivered`
+    (`not_written`) when not. On 37d1804 the written case says `in_turn`; the unwritten case is the same on both.
+- **R7-02** [should] Every steering-owned stop is dated by a clock read as its SIGTERM is sent, after any drain and
+  any wait on the group registry.
+  - "Steering-owned" means the process's next stop after a live attempt's drain, or the cut's stop, with or without
+    a drain. This is `Session.steer_owned`, read by `_stop`. Main's `_stop` is otherwise unchanged.
+  - The flag goes with the process (cleared when it is let go of). It is also cleared when a timeout's drain reads
+    N's own end and so no stop follows.
+  - No SIGKILL comes before the grace from the actual SIGTERM.
+  - Test: `test_r7_02_a_cut_with_no_drain_is_dated_when_its_sigterm_is_sent`. N ends with S taken in part, so the
+    cut has no drain; the pass time is 0 and the clock 20. SIGTERM is dated 20, and no kill is due until the grace
+    from then has passed. On 37d1804 the SIGTERM was dated 0, so the kill was due at once.
+- **R7-04** [should] The evidence critical section is now only the read itself.
+  - A drain makes the read alone (`read_lines`) under the latch's lock. Its bookkeeping (transcript, events, state)
+    comes after (`_take_lines`, main's body of `_read`). Its outcome is still decided on the latch (R7-01), so a
+    line read just before the cutoff and processed after it counts nothing for S.
+  - The cut's log line is outside the lock.
+  - A stop that has begun (`_stop_pending`, set by `steer_stopping` before it takes the lock) makes a drain take no
+    next batch.
+  - The bound this gives: once `steer_stopping` is called, the latch is set after at most the one read already in
+    progress (a non-blocking `read_lines`), or after a cut's check and its clearing of the buffer, or after an
+    installation's few assignments. Then it marks each held record under that record's lock, waiting for a write
+    already inside one.
+  - What remains: a single read already in progress, and that per-record wait.
+  - Test: `test_r7_04_a_waiting_stop_goes_ahead_of_the_next_drain_batch`. Also,
+    `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress` now asserts that the waiting stop went ahead of the
+    next batch.
+- **R7-03** [should] Part K's timing statement is qualified as the reviewer puts it, and accepted under the simplified
+  rule, pending the owner:
+  - the traversal order and the deadline checks are main's;
+  - in a hold where a live attempt's turn ends, readiness and poll timing may shift;
+  - an ordinary kill can come at the second tick rather than at main's next poll (after its deadline, never before
+    it);
+  - ordinary events that become readable during a drain can be emitted in a different order;
+  - an ordinary SIGTERM sent late with main's pass timestamp shortens the actual grace by up to the drain delay,
+    including the last read's overrun.
+- **R7-05** [nit] The golden's `_item_echo` now says that two starts genuinely joining the same thread and turn are
+  not told apart (the fixture has no such pair). If joins are recorded, the echo should also be bound to its process
+  and its input.
+- **The notes' wording** "nothing cleared" is now exact: the settlement state (adapter, turn state, transcript) is
+  kept, and the broken-pipe and cut paths clear the already-unwritable output buffer before draining.
+
+**The rebase onto 7456971** (#114: `node.log_to_stderr()` at the top of `node.run`; one stderr handler at INFO on the
+`agent_comms` logger with propagate off; the "run waits" line logged at INFO once per run, then DEBUG).
+- No conflict. node.py keeps main's lines exactly; this branch's node.py lines are only the hello's send time,
+  `note_hello` and one comment.
+- The protocol-5 hello and acknowledgement publication sit beside #114's setup and its wait-log deduplication
+  without touching them. The e2e runs below exercise both.
+- Shutdown publication and signal order were replayed on the rebased code: the shutdown comparison
+  (`test_sd_shutdown_with_a_live_steer_is_mains_...`) and the R5-01, R6-01 and R7-01 tests all pass.
+- Under the new handler, the cut's WARNING and the outcome's INFO come out once each, with time and level, and
+  carry no steer text: `test_rebase_114_the_steering_log_lines_reach_the_node_log_once_each_and_never_the_steer_text`
+  runs this in a fresh interpreter.
+- **Every log line this branch adds** (none prints steer text, message text, tokens or environment values):
+  - node_sessions, WARNING: "the hub refused the report for session %s with a steer outcome (422): sending it again
+    without the outcome". Prints the session id. Once per refused report.
+  - node_sessions, WARNING: "session %s: its steer offered for another turn: not taken". Prints the session id. Once
+    per applied listing that names the held uuid for another N; the hub makes no such offer by design, but if it
+    did, this would repeat each pass.
+  - node_sessions, WARNING: "session %s: a steer offer could not be taken: %s". Prints the session id and the host's
+    ValueError or LookupError text ("a steer's ids must be short strings", or an unknown session). Once per such
+    offer.
+  - providers/codex, INFO: "a late answer to a turn/steer retired with its turn (request %s): it changes nothing".
+    Prints the JSON-RPC request id. Once per late answer.
+  - session_host, INFO: "session %s: a steer offer that is not the held attempt: not taken". Prints the session id.
+    Once per applied listing that offers another attempt while one is held (rare: one steer per N).
+  - session_host, ERROR with traceback: "session %s: could not read what its process wrote before stopping it".
+    Prints the session id and the read's exception. Once per failed drain.
+  - session_host, WARNING: "session %s: a steer to its process could not be written whole: the process is stopped".
+    Prints the session id. Once per cut.
+  - session_host, INFO: "session %s: the steer into message %s: %s (%s)". Prints the session id, N's message id, the
+    outcome and its why. Once per attempt.
+
+**Runs** at 9b1744d, on 7456971. The last code commit is f992139; the commits after it change tests only.
+- `uv run pytest -q -p no:cacheprovider`: 4447 passed, 10 skipped.
+- The stand-in e2e in full: PASS (162 s, 345 checks).
+- `--only steering` with stand-ins: PASS (112 s, 57 checks).
+- `--only correlation` with stand-ins: PASS (12 s, 24 checks).
+- `--only steering` with the real Codex (codex-cli 0.171.0): PASS (64 s, 27 checks).
+- `--only steer` with the real Codex: PASS (32 s, 28 checks).
+- `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (15 s, 23 checks).
+- `~/.codex/config.toml` sha256 unchanged through all of them:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+**Gap tests** (added after the mutation runs below):
+- `test_r7_gap_a_drained_stop_is_dated_after_the_registrys_wait`.
+- `test_r7_gap_an_ordinary_stop_after_a_steered_process_keeps_mains_dating`.
+- `test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind[after_interrupt|plain]`. It found the flag left set after a drain that read N's end: cleared in f992139.
+- The waiting-stop assertion in `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress`.
+
+### Mutation check, review round 7
+
+Scratchpad `mutate9.py`, one or more rows per change of A. Each was applied alone to an export of the rebased code, then the same test set with -x, the file restored. 3 of 8 were caught on the first run. Two rows were added with the flag's clearing. The missed rows got the gap tests above and were caught when run again; the two R7-01 rows are equivalent to each other (belt and braces).
+
+| mutation | caught by |
+| --- | --- |
+| R7-01 S's evidence on the global latch | EQUIVALENT given the lock: the decision waits for the latch's lock, which the stop holds until it has marked every record, so the record's own mark already says it |
+| R7-01 the decision under the latch's lock | EQUIVALENT given the global check: the latch is read itself (set before any mark), so a record not marked yet is still excluded |
+| R7-02 a steering-owned stop dated at its SIGTERM | `test_r7_02_a_cut_with_no_drain_is_dated_when_its_sigterm_is_sent` |
+| R7-02 the cut's stop is steering-owned | `test_r7_02_a_cut_with_no_drain_is_dated_when_its_sigterm_is_sent` |
+| R7-02 a drained stop is steering-owned | `test_r7_gap_a_drained_stop_is_dated_after_the_registrys_wait` (a test added after the first run) |
+| R7-02 the flag goes with the process | `test_r7_gap_an_ordinary_stop_after_a_steered_process_keeps_mains_dating` (a test added after the first run) |
+| R7-04 a waiting stop goes first | `test_r7_04_a_waiting_stop_goes_ahead_of_the_next_drain_batch` |
+| R7-04 the stop says it is waiting | `test_r6_gap_the_latch_waits_for_a_drain_read_in_progress` (a test added after the first run) |
+| R7-02 a timeout drain that ends N clears the flag (after the interrupt) | `test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind` |
+| R7-02 a timeout drain that ends N clears the flag (plain) | `test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind[plain]` (a test added after the second run) |
