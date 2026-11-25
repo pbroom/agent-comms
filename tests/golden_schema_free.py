@@ -12,7 +12,8 @@ host's events in order and the board's log lines. It promises two cases (`record
 - the VERIFIED set as shipped (2.1.330), which these processes do not report (OTHER_VERSION): main's but for the
   allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines STAGED before each
   process's first `init` (a line staged then may be written after that init, as the zero-byte case's is, still
-  carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them.
+  carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them; and,
+  in the logs, the one INFO line per process saying that turn correlation is off for it (`told`).
 
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
 """
@@ -143,8 +144,22 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
     _sequences(env, out, allow)
     _host_cases(tmp_path, out, allow)
     out["host_events"] = events
-    out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:")]
+    out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:") and not (allow and told(x, REMOVED))]
     return normalized(out, tmp_path)
+
+
+TOLD = re.compile(r"Claude session \S+: this process reports Claude Code (2\.1\.329|no version); turn correlation is "
+                  r"off for it \(attributed by order\)")
+
+
+def told(entry: list, removed: list) -> bool:
+    """The allowance in the logs: the INFO line each Claude process's first `init` gets while some version is
+    VERIFIED (how the owner sees whether turn correlation is on), for a process that reports another version, or
+    none. Nothing else in the logs is taken out."""
+    if entry[:2] == ["agent_comms.providers.claude", "INFO"] and TOLD.fullmatch(entry[2]):
+        removed.append(("log", entry[2]))
+        return True
+    return False
 
 
 # ------------------------------------------------------------ Claude turn correlation (DESIGN_NOTES, 2026-11-24)

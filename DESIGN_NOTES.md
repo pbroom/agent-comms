@@ -9171,23 +9171,37 @@ zero-turn task notification `result` did the same to a turn in flight.
   for Codex always, the host runs main's code paths, main's `_held` included. In a verified incarnation the
   barrier's own rules (`_barrier`) apply: the next message waits, `park` and the max_live eviction skip the
   session, and
-  - **one no-progress budget per message** (review round 5, C5-01; it replaces C2-03's deadline): a message not
-    one byte of whose line was accepted carries ONE turn timeout from the first moment it is blocked or staged in a
-    process that can be verified (`_Message.blocked_since`), kept across unstages, restagings, the end of the CLI's
-    turns and a downgrade; only an accepted byte ends it (progress). A successor's budget starts when it becomes the
-    head and is first blocked or staged. **One invariant, in one place** (review round 6): a message with a budget is
-    governed by it until the first byte of its line is accepted, whatever the process's verification state is
-    then; every staging and timeout decision about it goes through the one check, `_spent`: the inbox hold
-    (`_barrier`), the head before it is staged (`_write`: also on the pass at which a bracket closes, C6-02, and
-    after a downgrade), and a staged message with not one byte accepted (`_hold_to_timeout`: its budget, never the
-    staging's write timer), and (review round 7, C7-02) the head with NO process: before admission and before a
-    spawn (`_write`), and while the old process goes down (`_pass`), every pass. Its byte span (`turn_at`,
+  - **one no-progress budget per message, in COUNTED time** (review round 5, C5-01, which replaced C2-03's
+    deadline; counted time since the follow-up after the switch-on, which replaced the wall clock): a message not
+    one byte of whose line was accepted carries ONE turn timeout of counted time from the first moment it is held
+    or staged in a process that can be verified (`_Message.counted`, seconds; None: no budget), kept across
+    unstages, restagings, the end of the CLI's turns and a downgrade; only an accepted byte ends it (progress). A
+    successor's budget starts when it becomes the head and is first held or staged. **Counted time** is time in
+    which the agent's process is what holds the message back, exactly two states (`_counting`): (b) staged with not
+    one byte of its line accepted, in a live process; (a) first in the inbox, a live process, nothing on the host
+    side withholding it (no handshake or settings check pending, `may_start`, the turn gate), and the CLI's own turn
+    open (`holding`); a new binding while that turn runs is (a), for the host would restart for it at once and waits
+    only for the agent's turn. Nothing else counts: no process, one going down (the restart for a binding
+    included), the turn gate closed, `may_start` false, a stopping group in the checkout, no slot; there the message
+    waits exactly as on main, without limit, and the budget neither stops nor fails anything. **One place adds it**
+    (`_budget`, every pass, after the reads and before any timeout or write decision): the interval since the
+    previous pass counts iff the message was in a counted state at BOTH ends, the end of the previous pass
+    (`_Message.counted_at`, set by `_mark` as every pass ends) and now. Conservative: it never counts time in which
+    the host may have withheld it or the CLI's turn may have ended (a pass that first reads the turn's result sees
+    it ended), and loses at most one pass interval each time the message enters or leaves a counted state.
+    **One place compares it** (`_spent`, called only by `_budget`, in a counted state, so with a live process): a
+    budget is acted on at the very pass at which it reaches the timeout; that pass writes nothing else (the next
+    process, after a restart, starts at the next pass). So an unwritten budgeted message accumulates at most two
+    timeouts of counted time, each plus one pass; its wall time is unbounded only by host-side waits, as on main.
+    With no process the budget is never consulted: a spent budget is acted on at once, in its counted state, so none
+    is ever left spent for a later pass. Its byte span (`turn_at`,
     `turn_len`) is tracked whenever it has a budget, also in a process no longer verifiable (C6-01), and in a
     candidate (a process whose first `init` is not read yet: it may still verify); unstaging on a NEW bracket still
     needs a verifiable process, the budget does not. **The 7b restart is earned** (review round 7, C7-01): a spent
-    first budget is the 7b restart only if the message was held or staged, during that budget, under a process that
-    WAS verified (its first `init` read, its version in VERIFIED, `_Message.earned`, set where verification is
-    observed: each line read, the hold, a staging; a later downgrade does not take it away), or it is the second
+    first budget is the 7b restart only if the message was in a counted state, during that budget, under a process
+    that WAS verified (its first `init` read, its version in VERIFIED, `_Message.earned`, set where verification is
+    observed: each line read, the hold, a staging, each budget step; a wait the host imposes earns nothing; a later
+    downgrade does not take it away), or it is the second
     budget of a message that earned its first. Otherwise (a candidate that never verifies, or reports another
     version) the budget is dropped at its deadline and the message is on main's path: main's write timer, which runs
     out at that very pass (the staging started both), main's failure, at main's time, with no restart and no
@@ -9210,14 +9224,13 @@ zero-turn task notification `result` did the same to a turn in flight.
     (C1-02);
   - **when the budget is spent with no byte written the message is not failed the first time** (rule 7b, below,
     `_spent`, an earned budget only): the process is stopped, the message stays (or, staged, goes back unstaged)
-    first in the inbox, and its second budget starts then (review round 7: it was "the next process gives it ONE
-    fresh budget"; starting it at the restart bounds the wait also when no process can start for it). With no
-    process at that moment (stopped for its binding, say, and not reaped yet, or no slot) the one it needs anyway IS
-    its restart: nothing is stopped, and the process that starts is not stopped for it. Once per message
+    first in the inbox, and its second budget starts from nothing (counted time, so the wait for the next process
+    to start counts nothing; review round 7's "the replacement is the recovery" with no process is gone with it:
+    a budget is acted on only where it is reached, with a live process). Once per message
     (`_Message.recovered`): a second spent budget fails it as main's `_held` fails it, with its own words since
     review round 8 ("not one byte of the message was accepted by the agent's process in two periods of N minutes;
     the message was not written": what was observed, as a held message and a pipe that takes nothing look alike),
-    with nothing spawned for it. That bounds the restarts at one per message and the wait at two budgets.
+    That bounds the restarts at one per message and the agent's holding back at two budgets.
 - **Interrupt readiness** (`takes_interrupt`) in a verified process needs M's owned bracket; the interrupt receipt
   counts only once M's own `init` came. Unverified: as main.
 - Codex attribution is unchanged.
@@ -9756,10 +9769,12 @@ that emitted no `init` until later would carry the key on every line staged befo
 4. The inbox hold: while Claude runs a turn of its own the next message waits, unstaged, in the inbox (`park` and
    the max_live eviction skip the session meanwhile); a staged message none of whose bytes was accepted goes back
    to the inbox when such a turn is seen; a successful zero-turn notification with no model activity closes it.
-5. The no-progress budget: a message that has no byte of its line accepted for one turn timeout, and was held or
-   staged during it under a process that was verified (review round 7), causes ONE process restart (it then goes to
-   the next process, never written twice; with no process at that moment, the one that starts is that restart); a
-   second such timeout fails it as main fails a message held behind Codex's own turn, with nothing started for it.
+5. The no-progress budget: a message that has no byte of its line accepted for one turn timeout of COUNTED time
+   (time in which the agent's process holds it back: a turn of its own while nothing on the node withholds it, or a
+   pipe that takes none of it; the follow-up after the switch-on), and was in such a state under a process that was
+   verified (review round 7), causes ONE process restart (it then goes to the next process, never written twice); a
+   second such timeout fails it as main fails a message held behind Codex's own turn. Waits the node imposes (a
+   gate, no slot, no process) count nothing and are main's.
    The budget governs the message until a byte of it is accepted, also if its process is attributed by order
    meanwhile (review round 6). On main it would have been written into Claude's own turn at once (or failed by the
    write timer if the pipe took nothing). A message staged in a process that never verifies (another version, or
@@ -9779,6 +9794,11 @@ it, above).
 - Rollback: there is no runtime switch. Revert the one allowlist line (`VERIFIED = frozenset({"2.1.330"})` back to
   `frozenset()` in agent_comms/providers/claude.py, or revert this commit), deploy the node (both Macs run one), and
   restart `board node`. Sessions started after the restart are main's; a session's history is unaffected.
+- How to see that it is on (the follow-up after the switch-on): for each Claude process, at its first `init`,
+  logger `agent_comms.providers.claude`, INFO: `Claude session <id>: this process reports Claude Code <version>;
+  turn correlation is on for it`, or `... turn correlation is off for it (attributed by order)` (another version,
+  `no version`, or no `msg_lifecycle_v1`). After a Claude Code update every process says `off` with the new
+  version until that version is verified and added. Never written with VERIFIED empty.
 - After enabling, watch the node log (`board node`'s output) for these lines:
   - a downgrade (a process attributed by order from then on), logger `agent_comms.providers.claude`, WARNING:
     `Claude session <id>: this process is attributed by order from now on: <reason>`. An occasional one is the
@@ -9788,15 +9808,19 @@ it, above).
     progress for <N> minutes (not one byte of it accepted on stdin); its process is stopped and the message, never
     written, waits for the next one`. It says what was seen, not why (review round 8): the CLI busy with a turn of
     its own and a process that does not read its input look alike here.
-  - the same restart when no process was running at that moment (stopped for a new binding and not gone yet, or
-    no slot): `session <id>: message <msg> made no progress for <N> minutes (not one byte of it accepted on
-    stdin); with its process gone or going down, the next one to start, needed anyway, is its one restart`.
   - an undelivered timeout (the second budget: the message fails, never written), logger `agent_comms.session_host`,
     WARNING: `session <id>: message <msg> made no progress for a second <N> minutes (not one byte of it accepted on
     stdin); it fails, never written`; the asker sees the failure `not one byte of the message was accepted by the
     agent's process in two periods of <N> minutes; the message was not written`.
-  - `made no progress` matches all three; `for a second` only the failure. None of them is ever written with
-    VERIFIED empty.
+  - What the two can mean, since the follow-up (counted time): <N> minutes in which the agent's process held the
+    message back, either by a turn of its own (a background agent's, say) while nothing on the node withheld the
+    message, or by a pipe that took none of the staged line, added up over the message's life and across a
+    downgrade, not necessarily in one stretch. What they cannot mean: a wait the node itself imposes (a parent's
+    turn or its parked process, the self-stop deadline, a stopping process group in the checkout, no slot, no
+    process, a process going down) counts nothing and never leads to either line; nor a runner of another version
+    (it gets main's write timer, `timed out after <N> minutes`). The restart line with "with its process gone or
+    going down" of round 8 is no longer written.
+  - `made no progress` matches both; `for a second` only the failure. Neither is ever written with VERIFIED empty.
   - and, at INFO, `session <id>: message <msg>, not one byte of it written, waits again: the agent began a turn of
     its own` (an unstage; expected now and then, not a fault).
 - What a runner of any other version (2.1.329, a later release, anything not in VERIFIED) sees: main's behaviour,
@@ -9806,6 +9830,104 @@ it, above).
   nothing else differs. A message blocked in such a process from its first line fails by main's write timer, at
   main's time, with no restart and no requeue (review round 7, C7-01). None of the log lines above is written for
   it, except the downgrade line when a process that DID verify stops qualifying.
+
+### Follow-up after the switch-on (2026-11-25; on main 17c43de, the pre-merge review of #109 and #110)
+
+The pre-merge reviewer (both PRs OK to merge) found two shoulds and some nits; the coordinator ruled.
+- **The budget ran while the host itself withheld the message** (both reviews' should; reproduced by the
+  reviewer's probe): a verified `full` child whose CLI ran a turn of its own when M arrived (budget from t=0), the
+  turn over at t=5 but the parent's process parked (`_turn_allowed` False): at one timeout the child's process was
+  restarted, at two M failed "not one byte ... accepted by the agent's process", though nothing was ever offered.
+  On main M waits for the gate. The same held for `may_start`, a stopping group, admission and the binding path.
+  Ruling: the budget counts only time in which the agent's process holds the message back (the invariant above,
+  restated): accumulated seconds on the message (`counted`), one adder (`_budget`, with the both-ends rule), one
+  comparison (`_spent`); C7-02's "admission denied past the second budget fails the message" is withdrawn. What
+  changed in the code: `_Message.blocked_since` is now `counted` and `counted_at`; `_budget` and `_mark` added;
+  `_spent` is called only from `_budget`; the checks with no process (`_write`) and while a process goes down
+  (`_pass`), the head check before staging and `_barrier`'s check are gone; `_earn` earns only in a counted state.
+  The log line for a restart with no process ("with its process gone or going down ...") is gone with them: a
+  budget is acted on only where it is reached, with a live process.
+- **One choice beyond the ruling's letter**: a new binding while the CLI runs a turn of its own COUNTS (state a).
+  The ruling lists "unbound" among the waits that do not count; but there the host would restart the process at
+  once and waits only for the agent's turn (main's Claude path does not wait at all), and the property test found
+  the cost of not counting it: a binding change while the CLI's turn never ends left the message waiting for ever
+  (seed 311). The restart for the binding itself (the old process going down, the next one starting) counts
+  nothing. C1-02's test keeps its expectation.
+- **How to see that it is on** (should 2): one INFO line per Claude process at its first `init`, while some version
+  is VERIFIED: `Claude session <id>: this process reports Claude Code <version>; turn correlation is on for it`,
+  or `... is off for it (attributed by order)` (another version, no version, or no `msg_lifecycle_v1`); a process
+  that never writes an `init` says nothing. Never with VERIFIED empty (`test_c9_with_verified_empty_*`; main's logs
+  in the golden's case 1 untouched); the golden's case 2 (2.1.329) takes the off line out as part of its allowance
+  (`told`), and the allowance test checks that it is only that line.
+- **Nits**: the stale bound in providers/claude.py's module text and `holds_turns`, and session_host.py's module
+  text; "VERIFIED ships empty" / "as shipped" wording in tests/test_claude_correlation.py and the e2e script; the
+  README now says other versions get the `uuid` key on lines staged before their first `init`, and that the log
+  says whether correlation is on; the C7-01 docstrings say they compare with this tree run with VERIFIED empty.
+- **Tests first** (all failed on main's session_host): `test_c9_a_host_gate_that_withholds_the_message_counts_nothing`
+  (the reviewer's sequence with the turn gate, and `may_start`, the gate closing after or during the CLI's turn:
+  300 s, nothing stopped or failed, written once when it opens); `test_c9_no_process_counts_nothing_*` (a stopping
+  group, or no slot, after the process exits: 300 s, nothing; the 30 s already counted kept);
+  `test_c9_a_pass_that_first_sees_the_turn_ended_counts_nothing_before_it`; `test_c9_gate_flapping_*` (gate closed
+  and open by turns while the CLI's turns and a blocked pipe use the open intervals: the outcome within two timeouts
+  of counted time, measured from the passes' own record, the wall time longer); the INFO line's tests; and
+  `test_c9_property_random_sequences_in_counted_time`, replacing round 7's: bounds in counted time (a wrapper of
+  `_budget` records each decision: counted time is added only in a counted state, only for an interval whose
+  earlier end was the previous pass's end in a counted state, and then exactly that interval; never while a gate
+  the test closed withholds the message; the budget acts only at T; no budget holds more than T plus one step; the
+  end-of-pass mark matches the test's own reading of the state), the host-side gates in the generator (turn gate,
+  `may_start`, admission, a stopping group), and C9-01 closed: the fake's write records which process took bytes of
+  each message's line, and a prefix on one with the line on another fails it. 200 seeds in the suite; 4000 once.
+  Two more from the mutation check: `test_c9_after_a_7b_the_old_process_going_down_counts_nothing` (its adapter
+  still shows the CLI's turn open) and `test_c9_a_message_staged_in_a_verified_process_earned_its_7b_*` (the first
+  line of the next pass downgrades it).
+- **Replays whose expectations changed** (each says why in its docstring):
+  `test_r4_a_sols_timing_*` (the pass at t=95 first sees the turn ended: the 50 s before count nothing, and the
+  downgraded process writes M at t=95, no restart); `test_r4_d_a_staged_m_with_no_bracket_*`, `test_c5_01_sols_*`
+  and the C6-02 pair (the next process starts at the pass after the restart, not in it); `test_c5_01_the_budget_
+  is_spent_while_m_is_staged_again_*` (7b at 30 min + 10 s: the 10 s before the pass that saw the turn closed);
+  `test_c5_01_a_write_opportunity_*` (passes every minute; 7b at t=31: the minute before the pass that saw the turn
+  closed); `test_c6_01_*` both (passes every 5 s; t=125 and t=65 instead of t=120 and t=60, one pass lost at the
+  turn's end, still the budget and not a write timer); `test_c6_02_a_result_first_read_*` (passes every 15 s while
+  the turn runs, so the budget is spent at t=60 as before; the single-jump case is now its own test, which writes
+  M); `test_c7_01_verified_then_downgraded_*` (7b at t=80, not t=60); the C7-02 tests (the binding's restart, a
+  delayed reap and no slot count nothing: M is not recovered, and with no slot for 300 s it waits and is written
+  when one comes; `..._past_the_second_budget_fails_it_without_spawning` became
+  `test_c7_02_admission_denied_for_two_timeouts_m_waits_and_is_written_when_a_slot_comes`); state assertions on
+  `blocked_since` now on `counted`/`counted_at`. Unchanged: C1-02, C2-03, round 4's other replays, C7-01's other
+  tests, C8-03's.
+
+**Mutation check** (the follow-up; scratchpad `correlation/mutate11.py`: round 7's rows on the new code, the rows whose lines the follow-up changed rewritten for it, and rows for the new lines; each change applied alone, then tests/test_claude_correlation.py, test_providers_claude.py, test_session_restart.py, test_session_host.py and the golden tests run): 85 of 89 caught. Four rows first came up missed and were re-run alone (`mutation11_reruns.txt`): one was stale (an unstage resetting the old `blocked_since`; now it resets `counted`), and two found gaps, each closed by a new test (`test_c9_a_message_staged_in_a_verified_process_earned_*`, `test_c9_after_a_7b_the_old_process_going_down_*`). The rows left are EQUIVALENT: `turns >= 0` in C3-01 (as since round 3); the staged message's return in `_hold_to_timeout`, in two forms (a staged message's counted time equals its wall time since that staging, and its budget is checked earlier in the same pass, so the write timer can never run out first); and `_earn`'s counted-state condition (a budget exists only after a counted state, and a staged message is in one whenever its process verifies, so a message with an unearned budget is never first under a verified process in a state that does not count). The rows on the changed and new lines (the others are round 7's, all caught again), with the count of failing tests:
+
+| row or rule | caught by |
+| --- | --- |
+| C5-01 \| ... an unstage gives no new interval | `test_c5_01_a_write_opportunity_with_no_byte_accepted_does_not_restart_the_budget` (6) |
+| gate: VERIFIED is {2.1.330} | `test_another_version_is_attributed_by_order_and_its_lines_after_its_first_init_are_mains` (4) |
+| C5-01 \| the budget starts at the first staging | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (8) |
+| C5-01 \| ... or at the first hold | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (21) |
+| C5-01 \| an accepted byte ends the budget | `test_c5_01_an_accepted_byte_ends_the_budget` (2) |
+| C5-01 \| the budget is one turn timeout (of counted time) | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (25) |
+| 7b \| the first spent budget keeps the message for the next process | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (21) |
+| 7b \| ... once per message | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (13) |
+| 7b \| ... and its second budget starts from nothing | `test_c5_01_sols_alternating_sequence_is_bounded_at_two_budgets_with_nothing_written` (9) |
+| C6-01 \| a budgeted message's bytes are tracked whatever the verification | `test_c6_01_a_downgrade_does_not_free_a_budgeted_message_from_its_budget` (3) |
+| C6-01 \| a budgeted staged message is governed by its budget, not the write timer | equivalent: none (0) |
+| C7-01 \| an unearned first budget is dropped (main's path) | `test_c7_01_a_candidate_that_never_verifies_is_mains_write_timer_and_failure[no_init]` (5) |
+| C7-01 \| only a verified process earns it | `test_c7_01_a_candidate_that_never_verifies_is_mains_write_timer_and_failure[no_init]` (5) |
+| C7-01 \| earned when held | `test_c7_02_a_delayed_reap_past_the_deadline[100]` (9) |
+| C7-01 \| earned when staged under a verified process | `test_c9_a_message_staged_in_a_verified_process_earned_its_7b_though_the_next_read_downgrades_it` (1) |
+| C9 \| counted only with a live process, not one going down | `test_c9_after_a_7b_the_old_process_going_down_counts_nothing` (1) |
+| C9 \| ... not while the turn gate withholds it | `test_c9_a_host_gate_that_withholds_the_message_counts_nothing[turn_gate-during_the_turn]` (3) |
+| C9 \| ... nor while may_start does | `test_c9_a_host_gate_that_withholds_the_message_counts_nothing[may_start-during_the_turn]` (2) |
+| C9 \| ... nor once the CLI's turn is over | `test_c5_01_a_write_opportunity_with_no_byte_accepted_does_not_restart_the_budget` (10) |
+| C9 \| an interval counts only if its earlier end was counted | `test_c9_property_random_sequences_in_counted_time` (2) |
+| C9 \| ... and its later end | `test_c5_01_a_write_opportunity_with_no_byte_accepted_does_not_restart_the_budget` (16) |
+| C9 \| the mark at every pass's end | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (33) |
+| C9 \| a pass whose budget acted writes nothing else | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (16) |
+| C9 \| earned only in a counted state | equivalent: none (0) |
+| C9 \| the staged message's return (equivalent: its budget runs out first) | equivalent: none (0) |
+| C9 \| the INFO line only while some version is VERIFIED | `test_c9_with_verified_empty_no_process_says_whether_turn_correlation_is_on` (2) |
+| C9 \| ... once per process | `test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on[2.1.330-caps0-reports` (4) |
+| C9 \| ... on only for a qualifying first init | `test_c9_each_process_says_at_its_first_init_whether_turn_correlation_is_on[2.1.330-caps2-reports` (5) |
 
 ### Not done
 

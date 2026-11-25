@@ -35,8 +35,12 @@ messages and drives `tick()`; everything the host learned in a pass comes back a
   main's. In a verified incarnation a message is never held while staged: the inbox owns the hold. A staged turn
   not one byte of which was accepted when the CLI is seen to begin a turn of its own is taken back (`_unstage`:
   only its own bytes leave the buffer) and put first in the inbox again; once any byte of it is accepted the write
-  owns it, as on main. The hold's deadline belongs to the continuously blocked message, and at that deadline a
-  message none of whose bytes was ever written is not failed but kept for the next process, once.
+  owns it, as on main. The wait is bounded by the message's own no-progress budget, in COUNTED time: only time in
+  which the agent's process is what holds it back (its own turn while nothing on the host side withholds it, or
+  its pipe taking none of the staged line), kept across unstages, restagings and a downgrade (`_budget`, `_spent`).
+  A first spent budget that was earned under a verified process is one restart, the message never written and kept
+  for the next process; a second one fails it. Host-side waits (no process, one going down, the turn gate,
+  `may_start`, a stopping group, no slot, a binding to take) count nothing and are main's, without limit.
 - A provider with a handshake (`waits_for_ready`) gets `handshake_seconds` for it, not the turn timeout.
 - Restart (DESIGN_NOTES "Restarting a running turn"): the caller asks for the turn in flight to be interrupted in-band
   for the message that replaces it (`interrupt_for`); that message itself is the caller's next ordinary message and
@@ -127,12 +131,15 @@ class _Message:
     id: str
     text: str
     kind: str = "user"      # providers.TURN_KINDS: whose turn it is, passed on to the provider with the text
-    # Turn correlation's no-progress budget (`_spent`): since when this message, not one byte of its line accepted
-    # yet, has been blocked or staged; whether it was held or staged, during that budget, under a process that was
-    # verified at the time (`earned`: only then is a spent first budget the 7b restart, C7-01); and whether its one 7b
-    # restart is spent. On the message itself, so they go when it goes (and survive an unstage, a restage and a
-    # downgrade).
-    blocked_since: float | None = field(default=None, compare=False)
+    # Turn correlation's no-progress budget (`_budget`, `_spent`), for a message not one byte of whose line was
+    # accepted yet: `counted`, the seconds of COUNTED time so far (None: it has no budget), and `counted_at`, the
+    # time of the last pass that ENDED with it in a counted state (None: the last one did not); whether it was in a
+    # counted
+    # state, during its first budget, under a process that was verified at the time (`earned`: only then is a spent
+    # first budget the 7b restart, C7-01); and whether its one 7b restart is spent. On the message itself, so they go
+    # when it goes (and survive an unstage, a restage and a downgrade).
+    counted: float | None = field(default=None, compare=False)
+    counted_at: float | None = field(default=None, compare=False)
     earned: bool = field(default=False, compare=False)
     recovered: bool = field(default=False, compare=False)
 
@@ -844,9 +851,14 @@ class SessionHost:
         return out
 
     def _pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
+        self._steps(s, now, out)
+        self._mark(s, now)
+
+    def _steps(self, s: Session, now: float, out: list[HostEvent]) -> None:
         if s.child is not None:
             self._read(s, now, out)
             self._reap(s, now, out)
+        acted = not s.ended and self._budget(s, now, out)   # after the reads, before any timeout or write decision
         if s.child is not None and s.stopping_since is None and not s.ended:
             self._hold_to_timeout(s, now, out)
         if s.child is not None and s.stopping_since is not None:
@@ -854,9 +866,9 @@ class SessionHost:
             self._reap(s, now, out)
             if s.child is not None:
                 self._lingering(s, now)
-                if not s.ended and not s.busy and s.inbox and s.inbox[0].blocked_since is not None:
-                    self._spent(s, s.inbox[0], now, out)    # its budget runs on while that goes down (C7-02)
                 return      # still going down: nothing new starts beside it
+        if acted:
+            return      # the budget stopped its process (or failed it) in this pass: what comes next, the next pass
         if not s.ended:
             self._restart_pass(s, now, out)
             self._write(s, now, out)
@@ -1111,12 +1123,13 @@ class SessionHost:
             # not one byte of it accepted and the CLI runs a turn of its own, so it goes back to the inbox. Seen here,
             # after the pass's reads and before any timeout is looked at or anything is written (`_pass`).
             self._unstage(s, now, out)
-        if s.writing is not None and s.turn_at is not None and s.writing.blocked_since is not None:
-            # A budgeted message staged with not one byte accepted is governed by its budget (`_spent`), whatever the
-            # process's verification is now, not by this staging's write timer (C5-01, C6-01) ...
-            if self._spent(s, s.writing, now, out) or s.writing.blocked_since is not None:
-                return
-            # ... unless the budget was never earned (C7-01): then main's write timer, below, as on main.
+        if s.writing is not None and s.turn_at is not None and s.writing.counted is not None:
+            # A budgeted message staged with not one byte accepted is governed by its budget (`_budget`, earlier in
+            # this pass), whatever the process's verification is now, not by this staging's write timer (C5-01,
+            # C6-01) ...
+            return
+            # ... unless the budget was never earned and is dropped (C7-01): then main's write timer, below, as on
+            # main (it runs out at that very pass: the staging started both, and a staged message's time all counts).
         if s.busy_since is None:
             return
         if s.interrupted_at is not None:
@@ -1217,66 +1230,106 @@ class SessionHost:
     def _barrier(self, s: Session, now: float, out: list[HostEvent]) -> bool:
         """The write barrier of a verified Claude incarnation (`holds_turns`: a turn the CLI started itself runs),
         owned by the inbox: True, its first message waits (never one being written: `_unstage`). The wait is
-        bounded by the message's one no-progress budget (`_spent`)."""
+        bounded by the message's one no-progress budget, in counted time (`_budget`, `_spent`), also on the binding
+        path (`unbound`), where only the CLI's own turn stands between the message and the restart it needs."""
         if not self.holding(s):
             return False
         msg = s.inbox[0]
-        if msg.blocked_since is None:
-            msg.blocked_since = now
+        if msg.counted is None:
+            msg.counted = 0.0
         self._earn(s)
-        self._spent(s, msg, now, out)
         return True
 
+    def _holder(self, s: Session) -> _Message | None:
+        """The message whose budget can run now: the one staged with not one byte of its line accepted, or the first
+        in the inbox with nothing being written or in flight."""
+        if s.writing is not None:
+            return s.writing if s.turn_at is not None else None
+        return s.inbox[0] if s.inbox and s.in_flight is None else None
+
+    def _counting(self, s: Session, msg: _Message) -> bool:
+        """Is `msg` in a COUNTED state now, one in which the agent's process is what holds it back? Exactly two:
+        (b) it is staged with not one byte of its line accepted, in a live process; (a) it is first in the inbox,
+        a live process exists, nothing on the host side withholds it (no handshake or settings check pending,
+        `may_start`, the turn gate) and the CLI's own turn is open (`holding`). Nothing else counts: no process, one
+        going down (the restart for a new binding included), the turn gate closed, `may_start` false, a stopping
+        group, no slot. A new binding while the CLI's turn runs is (a): the host would restart the process for it at
+        once, and waits only because the agent runs a turn of its own (and main's Claude path waits for no such turn
+        at all). (The gates are asked last, and only for a message with a budget: never with VERIFIED empty.)"""
+        if s.child is None or s.stopping_since is not None or s.ended:
+            return False
+        if s.writing is not None:
+            return s.writing is msg and s.turn_at is not None
+        if s.in_flight is not None or not s.inbox or s.inbox[0] is not msg:
+            return False
+        if s.checking or (s.provider.waits_for_ready and not s.ready) or not self.holding(s):
+            return False
+        return ((self.turn_gate is None or self.turn_gate(s)) and (self.may_start is None or self.may_start()))
+
+    def _budget(self, s: Session, now: float, out: list[HostEvent]) -> bool:
+        """THE one place that adds counted time, once every pass, after its reads and before any timeout or write
+        decision. The interval since the last pass counts only if the message was in a counted state at BOTH its
+        ends: at the end of the last pass (`counted_at`, set by `_mark`) and now, after this pass's reads
+        (`_counting`). Conservative: time in which the host may have withheld it, or the CLI's turn may have ended
+        (the pass that first reads its result sees it ended), is never counted; it loses at most one pass interval
+        each time the message enters or leaves a counted state. Then `_spent`, the one comparison, in that counted
+        state (a live process exists): a budget is acted on at the pass at which it is reached, and only in a
+        counted state, so the budget never stops a process nor fails a message while the host withholds it. True
+        when it acted (the 7b restart, or the failure): nothing else is written in that pass."""
+        msg = self._holder(s)
+        if msg is None or msg.counted is None or not self._counting(s, msg):
+            return False
+        if msg.counted_at is not None:
+            msg.counted += now - msg.counted_at
+        self._earn(s)
+        return self._spent(s, msg, now, out)
+
+    def _mark(self, s: Session, now: float) -> None:
+        """The end of every pass: one end of the next interval (`_budget`). The message whose budget can run is in a
+        counted state as the pass ends, or it is not; a message with no budget, or none, leaves nothing."""
+        msg = self._holder(s)
+        if msg is not None and msg.counted is not None:
+            msg.counted_at = now if self._counting(s, msg) else None
+
     def _earn(self, s: Session) -> None:
-        """Where a process's verification is observed (each line it writes, the hold, a staging): the message whose
-        budget runs (staged with not one byte accepted, or first in the inbox with nothing being written) is under a
-        process that is verified now, so a spent first budget of it is the 7b restart (C7-01). A later downgrade does
-        not take that away; a candidate that never verifies, or turns out another version, never gives it."""
+        """Where a process's verification is observed (each line it writes, the hold, a staging, each pass): the
+        message whose budget runs is in a counted state under a process that is verified now, so a spent first
+        budget of it is the 7b restart (C7-01). A later downgrade does not take that away; a candidate that never
+        verifies, or turns out another version, never gives it; nor does a wait the host imposes (not counted)."""
         if not self._correlated(s):
             return
-        msg = s.writing if s.writing is not None and s.turn_at is not None else (
-            s.inbox[0] if s.writing is None and s.inbox else None)
-        if msg is not None and msg.blocked_since is not None:
+        msg = self._holder(s)
+        if msg is not None and msg.counted is not None and self._counting(s, msg):
             msg.earned = True
 
     def _spent(self, s: Session, msg: _Message, now: float, out: list[HostEvent]) -> bool:
-        """THE one check of a message's no-progress budget (C5-01, C6-01, C6-02): every staging decision and every
-        timeout decision about a budgeted message goes through it (the inbox hold, `_barrier`; the head before it is
-        staged, also on the pass at which a bracket closes or after a downgrade, `_write`; a staged message with not
-        one byte accepted, `_hold_to_timeout`). A message has a budget once it is blocked or staged in a process
-        that can be verified (`blocked_since`), and from then on that budget governs it until the first byte of its
-        line is accepted, whatever the process's verification state is meanwhile; with VERIFIED empty no message
-        ever has one, and its path is main's. ONE turn timeout from the first moment, kept across unstages,
-        restagings, the end of the CLI's turns and a downgrade; only an accepted byte ends it (`_write`). It is
-        also checked with no process (`_write`, before admission and spawn) and while the old one goes down
-        (`_pass`), C7-02. When it is spent:
-        - a first budget that was not EARNED (`earned`: the message was never held or staged, during it, under a
-          process verified at the time; a candidate that never verified, or reported another version) is dropped:
-          False, and the message is on main's path from here (a staged one: main's write timer, which runs out at
-          this very pass, as its staging began both; C7-01);
+        """THE one comparison of a message's no-progress budget with the turn timeout, made only by `_budget`, in a
+        counted state (a live process exists). A message gets a budget once it is held, or staged, in a process
+        that can be verified (`counted`, from 0), and from then on that budget governs it until the first byte of
+        its line is accepted (`_write`), whatever the process's verification state is meanwhile; with VERIFIED
+        empty no message ever has one, and its path is main's. It counts only COUNTED time (`_counting`), kept
+        across unstages, restagings, the end of the CLI's turns and a downgrade. When it reaches the timeout:
+        - a first budget that was not EARNED (`earned`: never in a counted state under a process verified at the
+          time; a candidate that never verified, or reported another version) is dropped: False, and the message is
+          on main's path from here (a staged one: main's write timer, which runs out at this very pass; C7-01);
         - an earned first budget is the 7b restart: True; the message stays (or goes back, unstaged) first in the
-          inbox, its second budget starts now, and its process is stopped; with no process the one it needs anyway
-          is its restart (nothing to stop, nothing stopped once it starts);
-        - a second budget: True; it fails as main's `_held` fails it, never written, and nothing starts for it.
-        So an unwritten message waits at most two budgets, and the first one never fails it."""
-        if msg.blocked_since is None or now - msg.blocked_since < self.timeout_minutes * 60:
+          inbox, its second budget starts from nothing, and its process is stopped;
+        - a second budget: True; it fails as main's `_held` fails it, never written.
+        So an unwritten budgeted message accumulates at most two timeouts of counted time (each plus at most one
+        pass), and the first one never fails it; its wall time is unbounded only by host-side waits, as on main."""
+        if msg.counted is None or msg.counted < self.timeout_minutes * 60:
             return False
         if not msg.recovered and not msg.earned:
-            msg.blocked_since = None        # never under a verified process: main's path (C7-01)
+            msg.counted = msg.counted_at = None     # never counted under a verified process: main's path (C7-01)
             return False
         if s.writing is msg:
             self._unstage(s, now, out)      # exactly its own bytes leave the buffer: it is first in the inbox again
         if not msg.recovered:
-            msg.recovered, msg.blocked_since = True, now
-            if s.child is not None and s.stopping_since is None:
-                log.warning("session %s: message %s made no progress for %g minutes (not one byte of it accepted on "
-                            "stdin); its process is stopped and the message, never written, waits for the next one",
-                            s.session_id, msg.id, self.timeout_minutes)
-                self._stop(s, now)
-            else:
-                log.warning("session %s: message %s made no progress for %g minutes (not one byte of it accepted on "
-                            "stdin); with its process gone or going down, the next one to start, needed anyway, is its "
-                            "one restart", s.session_id, msg.id, self.timeout_minutes)
+            msg.recovered, msg.counted, msg.counted_at = True, 0.0, None
+            log.warning("session %s: message %s made no progress for %g minutes (not one byte of it accepted on "
+                        "stdin); its process is stopped and the message, never written, waits for the next one",
+                        s.session_id, msg.id, self.timeout_minutes)
+            self._stop(s, now)
             self._save_state()
             return True
         log.warning("session %s: message %s made no progress for a second %g minutes (not one byte of it accepted "
@@ -1456,10 +1509,6 @@ class SessionHost:
         if s.child is None:
             if not s.inbox:
                 return
-            head = s.inbox[0]
-            if (head.blocked_since is not None and self._spent(s, head, now, out)
-                    and not (s.inbox and s.inbox[0] is head)):
-                return      # its second budget: failed, nothing spawned for it (C7-02)
             if self.may_start is not None and not self.may_start():
                 return      # the node is past its self-stop deadline: nothing starts (node_sessions `_may_start`)
             if self.groups.blocked(s.cwd):
@@ -1469,9 +1518,6 @@ class SessionHost:
             self._spawn(s, now, out)
             if s.child is None:
                 return
-        if (not s.busy and s.inbox and s.inbox[0].blocked_since is not None
-                and self._spent(s, s.inbox[0], now, out)):
-            return      # spent before it could be staged: 7b, or main's failure (C6-02: also when the bracket closed)
         if not s.busy and s.inbox and s.unbound:
             # The write boundary for the binding: a message is never written to a process started without the binding
             # the session has now (or with one it no longer has), also one that came into the inbox during the
@@ -1502,14 +1548,14 @@ class SessionHost:
             # can be verified), so main's write path is untouched otherwise.
             # ... and for a message with a budget, whatever the process's verification is now: its budget governs it
             # until a byte of it is accepted (C6-01).
-            track = getattr(s.provider, "barrier_before_first_byte", False) or s.writing.blocked_since is not None
+            track = getattr(s.provider, "barrier_before_first_byte", False) or s.writing.counted is not None
             s.turn_at = len(s.outbuf) if track else None
             for data in s.provider.turn(s.writing.text, kind=s.writing.kind):
                 s.outbuf += data
             if s.turn_at is not None:
                 s.turn_len = len(s.outbuf) - s.turn_at
-                if s.writing.blocked_since is None:
-                    s.writing.blocked_since = now       # its no-progress budget starts (`_spent`)
+                if s.writing.counted is None:
+                    s.writing.counted = 0.0             # its no-progress budget starts (`_budget`)
                 self._earn(s)
             self._save_state()      # the turn is on record before its first byte is written
         if s.writing is not None and s.unbound:
@@ -1554,7 +1600,7 @@ class SessionHost:
                 # no-progress budget is over)
                 s.turn_at = s.turn_at - n if n <= s.turn_at else None
                 if s.turn_at is None and s.writing is not None:
-                    s.writing.blocked_since = None
+                    s.writing.counted = s.writing.counted_at = None
             if s.restart_mark is not None:
                 start, length = s.restart_mark
                 s.restart_mark = (start - n, length)    # where its bytes are now; below zero: some are written

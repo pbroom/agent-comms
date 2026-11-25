@@ -751,9 +751,11 @@ def test_the_allowance_is_the_uuid_before_each_processs_first_init_its_echoes_an
     assert named and named <= set(ids), "every echo and lifecycle row is for a line that carried a uuid"
     g.record(tmp_path / "allowed", verified=BASELINE, allow=True)
     kinds = {k for k, _ in g.REMOVED}
-    assert kinds == {"stdin", "echo", "lifecycle"} and sum(k == "stdin" for k, _ in g.REMOVED) == len(ids)
+    assert kinds == {"stdin", "echo", "lifecycle", "log"} and sum(k == "stdin" for k, _ in g.REMOVED) == len(ids)
+    assert all("turn correlation is off for it" in u for k, u in g.REMOVED if k == "log"), "only the off line"
     taken = {u for k, u in g.REMOVED if k == "stdin"}
-    assert {u for k, u in g.REMOVED if k != "stdin"} <= taken, "each echo or lifecycle row names a line taken"
+    assert {u for k, u in g.REMOVED if k in ("echo", "lifecycle")} <= taken, (
+        "each echo or lifecycle row names a line taken")
     none = g.record(tmp_path / "empty", verified=frozenset())
     assert "user_message_uuid" not in json.dumps(none["transcripts"]) and "command_lifecycle" not in json.dumps(
         none["transcripts"]) and '\\"uuid\\"' not in json.dumps(none["stdin"])

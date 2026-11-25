@@ -85,7 +85,7 @@ X2. M3: the node is restarted, so the session's next process is started with `--
 X3. M7 (in part): a long turn (`sleep 12`) restarted with `--mode restart --wait`: its aborted `result`
     (`aborted_tools`) still echoes the interrupted line's uuid; the restart's message is answered.
 X4. (stand-ins only) The fix: a turn the CLI starts itself (`bg`) right after one turn is NOT taken for the next
-    message's; that message gets its own reply. (With VERIFIED empty, as shipped, it would be, exactly as on main:
+    message's; that message gets its own reply. (With VERIFIED empty it would be, exactly as on main:
     tests/test_claude_correlation.py.)
 With --claude-bin: five small haiku turns.
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
