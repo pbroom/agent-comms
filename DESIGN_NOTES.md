@@ -9171,59 +9171,59 @@ zero-turn task notification `result` did the same to a turn in flight.
   for Codex always, the host runs main's code paths, main's `_held` included. In a verified incarnation the
   barrier's own rules (`_barrier`) apply: the next message waits, `park` and the max_live eviction skip the
   session, and
-  - **one no-progress budget per message, in COUNTED time** (review round 5, C5-01, which replaced C2-03's
-    deadline; counted time since the follow-up after the switch-on, which replaced the wall clock): a message not
-    one byte of whose line was accepted carries ONE turn timeout of counted time from the first moment it is held
-    or staged in a process that can be verified (`_Message.counted`, seconds; None: no budget), kept across
-    unstages, restagings, the end of the CLI's turns and a downgrade; only an accepted byte ends it (progress). A
-    successor's budget starts when it becomes the head and is first held or staged. **Counted time** is time in
-    which the agent's process is what holds the message back, exactly two states (`_counting`), both in a live
-    process with nothing on the host side withholding the message (`_withheld`, ONE list for both: no handshake or
-    settings check pending, `may_start`, the turn gate; review round 10): (b) staged with not one byte of its line
-    accepted, in a process started with the binding the session has now; (a) first in the inbox with the CLI's own
-    turn open (`holding`); a new binding while that turn runs is (a), for the host would restart for it at once and
-    waits only for the agent's turn. Nothing else counts: no process, one going down (the restart for a binding
-    included), the turn gate closed, `may_start` false, a stopping group in the checkout, no slot; there the message
-    waits exactly as on main, without limit, and the budget neither stops nor fails anything. A staged message the
-    host withholds is main's: the turn gate closing withdraws it (TURN_WITHDRAWN) and a new binding does
-    (BINDING_CHANGED), later in that pass, as on main; with `may_start` false it stays staged (main keeps writing
-    it), charged nothing, and main's write timer from its staging governs it. **One clock** (review round 11): at
-    every pass a message staged with not one byte accepted is governed by exactly one clock: an EARNED message's
-    budget while its counted state holds (`_hold_to_timeout` then leaves it to `_budget`), otherwise main's write
-    timer from the staging, exactly as on main (main's failure, detail and time), for verified, other-version and
-    no-init processes alike. **An unearned message is on main's path, entirely** (review round 12): its write timer is
-    its one clock at every pass, whatever its counted state; its budget keeps the byte span (so the line can be taken
-    back should the process verify) and keeps counting, but neither acts nor suppresses anything until `earned`.
-    The host's gates are sampled once per TICK (`_gates`; review round 13), before any of its reads, for the
-    earning in its first drain, the budget, its end mark and the write timer's choice alike, and with no side
-    effect (`may_start_query`). The order in a pass (review round 10): the reads; a staged message
-    the CLI's new turn takes back (`_take_back`, the unstage); then the budget; then timeouts and writes, where
-    main's withdrawals happen. **One place adds it**
-    (`_budget`, every pass, after the reads and the take-back, before any timeout or write decision): the interval
-    since the
-    previous pass counts iff the message was in a counted state at BOTH ends, the end of the previous pass
-    (`_Message.counted_at`, set by `_mark` as every pass ends) and now. Conservative: it never counts time in which
-    the host may have withheld it or the CLI's turn may have ended (a pass that first reads the turn's result sees
-    it ended), and loses at most one pass interval each time the message enters or leaves a counted state.
-    **One place compares it** (`_spent`, called only by `_budget`, in a counted state, so with a live process): a
-    budget is acted on at the very pass at which it reaches the timeout; that pass writes nothing else (the next
-    process, after a restart, starts at the next pass). So an unwritten budgeted message accumulates at most two
-    timeouts of counted time, each plus one pass; its wall time is unbounded only by host-side waits, as on main.
-    With no process the budget is never consulted: a spent budget is acted on at once, in its counted state, so none
-    is ever left spent for a later pass. Its byte span (`turn_at`,
-    `turn_len`) is tracked whenever it has a budget, also in a process no longer verifiable (C6-01), and in a
-    candidate (a process whose first `init` is not read yet: it may still verify); unstaging on a NEW bracket still
-    needs a verifiable process, the budget does not. **The 7b restart is earned** (review round 7, C7-01): a spent
-    first budget is the 7b restart only if the message was in a counted state, during that budget, under a process
-    that WAS verified (its first `init` read, its version in VERIFIED, `_Message.earned`, set where verification is
-    observed: each line read, the hold, a staging, each budget step; a wait the host imposes earns nothing; a later
-    downgrade does not take it away), or it is the second
-    budget of a message that earned its first. Otherwise (a candidate that never verifies, or reports another
-    version) the message is on main's path, entirely: main's write timer is its one clock, main's failure, at main's
-    time, with no restart and no requeue; its budget never acts (review round 12; before it, the budget was dropped
-    at its deadline, which the write timer reached at the same pass). A verification read in the pass at which the budget is found spent counts (the pass's reads come
-    first, as for C6-02). A message with no budget, in a process that cannot be verified, is main's path, untouched:
-    with VERIFIED empty no message ever gets one;
+  - **one no-progress budget per message, in COUNTED time, from its earning** (review round 5, C5-01, which
+    replaced C2-03's deadline; counted time since the follow-up after the switch-on; restated in review round 14):
+    - **Evidence and decision are separate.** While the host reads a process's lines (any drain), it records only
+      EVIDENCE on the message in the budget position (first in the inbox with nothing written or in flight, or
+      staged with not one byte accepted): that a verified process was observed while it held that position
+      (`_Message.evidence`, `_evidence`). It records it as each drain begins and after each line,
+      and only then. Every read is preceded by such a moment, the process's verification changes only with a line,
+      and the message's position only between drains (which the next drain's start sees), so a line that carries no
+      evidence (a lifecycle row, a usage report, assistant text of a turn already attributed) adds none. No gate is
+      read while lines are read, by any path.
+    - **One decision point per session per tick** (`_decide`, called from `_steps`): `tick` first drains every
+      session's process (its first drain: reads and reaps, in session order), then makes each session's pass in
+      session order; a session's pass reads and reaps it again (its second drain), takes back a staged line its
+      CLI's new turn holds (`_take_back`), and then decides, before any timeout or write. So the decision follows
+      every read and reap of that tick that comes before it: all first drains, the earlier sessions' passes, and its
+      own second drain. There, and only there, the gates are read, once, and only for a message with evidence or a
+      budget (`_read_gates`: the turn gate and `may_start_query`, which never sets the node's latch); that one
+      reading serves whether the message becomes earned, the budget's interval and comparison (`_spent`), the write
+      timer's choice of clock (`_hold_to_timeout`) and the pass's end mark (`_mark`).
+    - **Earned** at a decision point, with evidence, if its counted state holds in that reading. Only then does it
+      have a budget at all (`counted`, from zero; no provisional accounting): an unearned message accumulates no
+      counted time, and the budget machinery reads no gate and asks no callback for it (an other-version or no-init
+      runner, or a verified process not observed while it held the position, gets main's sequence of `may_start` and
+      turn-gate calls, exactly). Its byte span is still tracked for a candidate (a process whose first `init` is not
+      read yet), so the line can be taken back once the process verifies; main's write timer is its one clock
+      (review round 12). Kept across unstages, restagings, the end of the CLI's turns and a downgrade; only an
+      accepted byte ends it (progress).
+    - **Counted time** is time in which the agent's process is what holds the message back, exactly two states
+      (`_counting`), both in a live process with nothing on the host side withholding the message (`_withheld`, ONE
+      list for both: no handshake or settings check pending, `may_start`, the turn gate; review round 10): (b) staged
+      with not one byte of its line accepted, in a process started with the binding the session has now; (a) first
+      in the inbox with the CLI's own turn open (`holding`); a new binding while that turn runs is (a). Nothing else
+      counts: no process, one going down (the restart for a binding included), the turn gate closed, `may_start`
+      false, a stopping group in the checkout, no slot; there the message waits exactly as on main, and the budget
+      neither stops nor fails anything. A staged message the host withholds is main's: the turn gate closing
+      withdraws it (TURN_WITHDRAWN) and a new binding does (BINDING_CHANGED), as on main; with `may_start` false it
+      stays staged (main keeps writing it), and main's write timer governs it.
+    - **One clock** (review rounds 11 and 12): at every pass a message staged with not one byte accepted is
+      governed by exactly one clock: an earned message's budget while its counted state holds in the decision's
+      reading, otherwise main's write timer from the staging, exactly as on main.
+    - **The interval** since the last pass counts iff the message was in a counted state at BOTH ends: the end of
+      the last pass (`counted_at`, set by `_mark` from the decision's reading) and the decision now. Conservative: it
+      loses at most one pass interval each time the message enters or leaves a counted state, and counts nothing
+      before the earning (the first interval runs from the earning pass's end).
+    - **The comparison** (`_spent`, only from `_decide`, in a counted state, so with a live process): a first spent
+      budget is the 7b restart (the message stays, or goes back unstaged, first in the inbox; its process is
+      stopped; its second budget from nothing); a second fails it as main's `_held` fails it. The pass that acts
+      writes nothing else.
+    - **The bound** (review round 14): main's write timer up to the earning, then two budgets of counted time, each
+      plus one pass; never a failure earlier than main's (the 7b needs a whole budget counted after the earning,
+      which is itself no earlier than the staging, and the failure a second). Its wall time is unbounded only by
+      host-side waits, as on main. With VERIFIED empty no message ever has evidence, so none has a budget, and its
+      path is main's;
   - **the inbox owns the hold: a message is never held while staged** (review round 4). While the adapter reports an
     unattributed bracket, the next message stays in the inbox, unstaged. If a message is staged and not one byte of
     its user line was accepted when the bracket is seen open (`_hold_to_timeout`, after the pass's reads and before
@@ -10164,6 +10164,74 @@ Sol: round 12's replays hold; the hand-over and C7-01 hold.
 | C13 \| the accounting reads the side-effect-free query | `test_c13_the_budget_never_calls_the_stateful_may_start_more_than_main` (2) |
 | C13 \| the node wires the query | `test_c13_the_nodes_may_start_query_never_sets_the_latch` (1) |
 | C13 \| the query never sets the latch | `test_c13_the_nodes_may_start_query_never_sets_the_latch` (1) |
+
+#### Review round 14 (Sol, on 64b879d: CHANGES, one blocker) and what changed
+
+Sol: round 13's items resolved. The blocker: a child's first drain could cache an open parent gate before the host
+saw the parent's exit in its own drain; a harmless `command_lifecycle` frame of the child's at t=120 then made the
+host spend the second budget, fail M and stop the child although the parent gate had closed; without that frame M
+stayed queued. Rounds 12 to 14 each found one more ordering of this kind around the gate sample and the provisional
+budget, so the coordinator ruled the two things that create them away (the invariant above, restated):
+- **A, evidence and decision separate**: `_evidence` replaces `_earn`; no gate is read while lines are read.
+- **B, one decision point per session per tick**: `_decide`, in `_steps` (session_host.py), after the session's
+  second drain and take-back; the tick's order is: every session's first drain (`_tick`'s first loop), then each
+  session's pass in turn (`_tick`'s second loop: second drain, take-back, decision, timeouts, the stopping branch,
+  writes, end mark). One gate reading there serves the earning, the budget, the write timer's choice and `_mark`.
+  The tick-level sample cache (`Session.gates`, `_gates`) and `_ticking` are gone.
+- **C, no provisional accounting**: an unearned message has no budget (`counted` None) and costs no callback;
+  counting starts from zero at the earning. `_barrier` and the staging no longer create a budget; `_spent`'s guard
+  for an unearned budget is dead and gone.
+- **D**: `tick` raises if re-entered (`test_c14_tick_is_not_re_entrant`).
+Tests (the frame variant, the callback traces and the guard failed on 64b879d):
+`test_c14_a_frame_with_no_evidence_cannot_decide_against_a_closed_parent_gate[no_frame, lifecycle_frame]` (Sol's
+sequence: M waits in both, 55 s counted, nothing stopped); `test_c14_no_extra_callback_for_a_runner_that_never_
+verifies[other, no_init]` (every `may_start`, `may_start_query` and turn-gate call, with its time, equal to the
+VERIFIED-empty run, across a blocked pipe, the latch, a closed parent gate and a binding change; no query at all);
+the property test made metamorphic (each seed walked twice, the second time with lifecycle rows, usage reports and
+assistant text of an attributed turn written among the others: every outcome and time identical), its model
+adapted (evidence as it reads it, at each drain's start and line; earned exactly when it has the evidence and reads
+the counted state at a decision; no budget and nothing counted before; the host's `earned` equal to its own).
+Round 13's first-drain transitions under the new rule:
+- the latch closing with a qualifying init and a downgrade in the drain: the drain records evidence only; the
+  decision after it reads the latch closed, so M is not earned while it stays closed (main's write timer is its
+  clock); at t=60 the latch reopens and that decision earns it, so its budget, not the overdue write timer, governs,
+  and the line is written at t=60 (main's turn timer, which runs from the staging, then ends the turn at t=65); with
+  VERIFIED empty main times it out at t=60. (It was main's timeout at t=60 in round 13.)
+- the latch reopening with the same batch: earned at that decision (t=20), the 7b at t=80, as in round 13.
+Replays whose times or states changed (counting now starts at the earning):
+- the `staged_zero` helper makes a second pass at the same time (the decision after the staging earns the message),
+  so the replays built on it keep their times; the same second pass in `test_c12_a_verified_stage_latched_*` and
+  `test_c12_the_gates_are_read_once_per_pass` (outcomes unchanged);
+- `test_c7_01_a_candidate_that_verifies_at_t30_and_then_blocks_earns_the_7b`: the 7b at t=90 (was t=60): earned at
+  t=30, nothing counted before;
+- `test_c7_01_verified_then_downgraded_keeps_the_7b_it_earned`: t=100 (was t=80): earned at t=20, the interval to
+  t=40 lost at the turn's end;
+- `test_c7_01_a_verification_and_a_downgrade_read_in_one_pass_still_earn_it`: t=70 (was t=60): earned at t=10;
+- `test_c9_a_message_staged_in_a_verified_process_earned_*`: t=65 (was t=60): evidence at the staging, earned at the
+  next decision, t=5;
+- `test_c11_the_latch_closing_and_opening_again_*`: earned at t=5 (0 counted then; it was 5), the latch from t=10;
+  written at t=50 as before;
+- `test_c11_latched_but_not_silent_*[verified]`: same outcome; the message has evidence and is never earned (it had a
+  provisional budget);
+- `test_c13_the_latch_closing_with_*`: as above (written at t=60, then main's turn timer);
+- `test_c13_the_budget_never_calls_the_stateful_may_start_more_than_main`: the query is not read at all now (it was,
+  for the provisional budget); `test_c13_outside_a_tick_the_gates_are_read_afresh` is gone with the sample.
+For the owner: the warnings' wording is unchanged; a no-progress restart now comes one timeout of counted time after
+the message was EARNED (in production a pass after its staging or hold, about 0.2 s), so for a candidate that
+verifies late it comes later than before, never earlier than main's write timer.
+
+**Mutation check** (round 14; scratchpad `correlation/mutate17.py`: the rows on evidence, the decision point, the earning and the re-entrancy guard): 8 of 8 caught. A first version also recorded evidence at the decision point and as each pass ended, and set the interval's end at the earning; the mutation check showed those redundant (each covered by the next drain's start, or overwritten by `_mark`), and they are gone: evidence is recorded while lines are read, and only then.
+
+| row or rule | caught by |
+| --- | --- |
+| C14 \| evidence as each drain begins | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (47) |
+| C14 \| ... after each line read | `test_c13_the_latch_closing_with_a_verifying_init_and_a_downgrade_in_the_first_drain_earns_nothing` (4) |
+| C14 \| no gate read, no earning, without evidence | `test_c12_a_reopened_latch_leaves_an_unearned_line_on_mains_write_timer` (14) |
+| C14 \| earning needs the counted state | `test_c11_the_latch_closing_and_opening_again_before_the_write_timer_the_budget_resumes` (3) |
+| C14 \| the decision's reading chooses the write timer's clock | `test_c12_a_candidate_that_verifies_while_latched_earns_at_the_first_counted_pass` (7) |
+| C14 \| ... and the pass's end mark | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (44) |
+| C14 \| tick is not re-entrant | `test_c14_tick_is_not_re_entrant` (1) |
+| C14 \| counting starts from zero at the earning | `test_c10_a_binding_change_and_a_new_turn_early_restart_for_the_binding_once_it_ends` (41) |
 
 ### Not done
 
