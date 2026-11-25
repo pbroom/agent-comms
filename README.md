@@ -626,14 +626,44 @@ every command takes `--json`. One session per agent and project at a time (child
 | mode | what the message does | Claude Code | Codex |
 | --- | --- | --- | --- |
 | `queue` (default) | its own turn: at once if the session is idle, after the turns ahead of it otherwise | yes | yes |
-| `steer` | (into the turn in flight) not available yet: refused, "mid-turn steering is not available yet; use restart to redirect a running turn, or queue" | not yet | not yet |
+| `steer` | puts your message into the turn in flight (one you sent, with nothing queued behind it, not one asked for its result as data; one steer per turn). It is no message of its own: the answer names the turn it went into, and that turn's result carries the steer's outcome: `in_turn` (taken into it), `not_delivered` (it never reached the agent: send it again, for example as a queued message) or `unconfirmed` (delivery could not be confirmed, and the agent may have read it) | not yet: refused (its adapter does not steer) | yes (`turn/steer` into a turn proved to be your message's) |
 | `restart` | interrupts the turn in flight and runs your message next; refused while other messages are queued for the session; the interrupted turn ends `failed`, "interrupted by a restart: message N replaced it" (one that finished by itself first, or whose CLI refused the interrupt, keeps its own outcome) | yes | yes |
 | `auto` | starts at once when the session is idle, else queues behind the turn in flight; it never restarts; the answer's `why` says which | yes | yes |
 
 ```bash
 uv run board session send <id> "Stop; do the README first" --mode restart --wait
 uv run board session send <id> "..." --mode auto --request-id fix-1      # a retry with the same id sends nothing new
+uv run board session send <id> "Also cover the CLI" --mode steer --wait  # exit 0 or 1 by the turn; 5 not delivered, 6 not confirmed, 7 no outcome known
 ```
+
+A steer (DESIGN_NOTES "Mid-turn steering, loose contract") is refused with the reason when steering is switched off on
+the hub (`[dispatch.sessions] steer = false`), the session is ended or closing, its node is older than this version
+(session protocol 5), its agent CLI cannot steer, no turn is in flight, the turn in flight is a wake or a
+result-delivery turn or one you did not send (a turn the session's parent started is the parent's to steer), it is
+being cancelled or was asked for its result as data, something is queued behind it, a steer of the session is not
+settled yet, the turn already took one, or the text is over 12,288 bytes as written to the agent. A restart is refused
+while a steer is unsettled. `--wait` prints the turn's reply and the steer's outcome; with `--output-schema` it is
+refused before anything is sent. `board session list` marks a session with a steer unsettled. Nothing is promised
+about what the model did with it: `in_turn` is evidence that Codex admitted it into that turn.
+
+**Before installing an older hub over one with mid-turn steering**, in this order:
+
+1. On the running hub, set `steer = false` under `[dispatch.sessions]` in its board.local.toml (or board.toml).
+   Check that it loaded: `board_configuration_status` (or `GET /api/configuration`) must not show the state `stale`,
+   and the settings page shows no reload error (a rejected edit keeps the last good settings, and refuses every new
+   steer until a reload succeeds). Then check that the hub refuses new steers:
+   `uv run board session send <an ended session's id> "check" --mode steer` must answer "cannot steer into session
+   ...: steering is switched off on this hub ([dispatch.sessions] steer = false)". The switch is read before anything
+   about the session, and nothing is sent; any other reason means steering is still on.
+2. Wait until `uv run board session list` shows no session with a steer unsettled. Each settles when its turn ends.
+3. Roll back the nodes.
+4. At the hub's cut-over: stop this hub, remove the `steer` key, then start the older hub. An older hub's parser
+   rejects `steer` as an unknown key, even `steer = false` (it would leave that whole table at its defaults). Do not
+   remove the key before this hub stops: while it still serves, no `steer` key means steering on, the default.
+
+The older hub reads the same board.local.toml, so the key has to go at the cut-over itself. A steer left unsettled
+through a downgrade is settled `unconfirmed`, or `not_delivered` if it never reached a node, when the newer hub
+returns. Deploy hubs before nodes, as always.
 
 A restart is refused with the reason when no turn is in flight, when the turn in flight is a wake or a
 result-delivery turn (the session finishes those untouched), when it is being cancelled, when other messages are

@@ -79,6 +79,8 @@ class HostedEventIn(Body):
     detail: str = ""
     text: str = ""
     answered: StrictBool = False    # turn_ended: the provider itself ended the turn (session_host.HostEvent.answered)
+    steer: Any = None   # turn_ended: the owning host's word on the steer into it (hosted_steer.extension: a malformed
+                        # one is ignored there, never refused here)
 
 
 class NodeSessionReportIn(Body):
@@ -1005,9 +1007,12 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
                            output_schema=body.output_schema)
 
     @app.get("/api/hosted-sessions/{session_id}/messages/{n}")
-    async def hosted_message(request: Request, session_id: str, n: int, wait: float = 0, p: Principal = P):
+    async def hosted_message(request: Request, session_id: str, n: int, wait: float = 0, steer: bool = False,
+                             p: Principal = P):
+        # steer=1: with the terminal status of the steer into that turn (hosted_steer.view), for `send --mode steer`
         from . import hosted
-        return await hosted.message_wait(board, p, session_id, n, wait, waiter_gone(request))
+        kw = {"steer": True} if steer else {}
+        return await hosted.message_wait(board, p, session_id, n, wait, waiter_gone(request), **kw)
 
     @app.post("/api/hosted-sessions/{session_id}/close")
     def hosted_close(session_id: str, p: Principal = P):

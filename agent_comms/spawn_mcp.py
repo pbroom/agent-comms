@@ -229,10 +229,15 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
         "restart interrupts the child's turn in flight (one you gave it, with nothing else queued) and runs the "
         "message next (the interrupted turn's result says `interrupted`, and is not sent to you as a turn); auto "
         "starts the child at "
-        "once when it is idle and otherwise queues (the answer's `why` says which); steer is not available yet. A "
-        "restart that cannot be done is refused with the reason. Each message is a child turn of your budget. Its "
-        "reply comes back to you as a result, as for board_session_spawn (wait=true waits up to 45 s for it). "
-        "request_id makes a retry return the same message."
+        "once when it is idle and otherwise queues (the answer's `why` says which); steer puts the message into the "
+        "child's turn in flight (one you gave it, with nothing queued behind it, not one asked for its result as data; "
+        "one steer per turn): it is no message of its own, the answer says `steer` with no message number, and that "
+        "turn's result carries the steer's outcome: in_turn (taken into it), not_delivered (it never reached the "
+        "agent: send it again if you still want it) or unconfirmed (it may have been read: do not assume either way). "
+        "A restart or a steer that cannot be done is refused with the reason. Each message or steer is a child turn of "
+        "your budget. Its reply comes back to you as a result, as for board_session_spawn (wait=true waits up to 45 s "
+        "for it; for a steer, for the result of the turn it went into, with the steer's status). "
+        "request_id makes a retry return the same message or steer."
         + PROJECT + OUTPUT + UNTRUSTED + warning))
     async def board_session_send(child: str, message: str | None = None, may_spawn: bool | None = None,
                                  spawn_share: int | None = None, wait: bool = False, project: str | None = None,
@@ -250,6 +255,15 @@ def install(mcp, board, principal: Callable, ident: Callable, run: Callable, war
             if out["result"] is None:
                 await threaded(lambda: not_taken(out, out["child"]["parent"], out["child"]["id"],
                                                  out["message"]["n"]))
+        elif wait and isinstance(out.get("steer"), dict) and out["steer"].get("state") == "expired":
+            out |= {"steer_status": None, "note": hosted_spawn.STEER_EXPIRED}     # nothing to wait for (S2-12)
+        elif wait and isinstance(out.get("steer"), dict) and type(out["steer"].get("into")) is int:
+            # One 45 s wait for the result of the turn the steer went into (message N); the answer then carries the
+            # steer's terminal status, read from its record before anything says it is unsettled.
+            n = out["steer"]["into"]
+            out["result"] = await take(out["child"]["parent"], p.name, out["child"]["id"], n, hosted_spawn.WAIT_MAX)
+            out |= await threaded(lambda: hosted_spawn.steer_waited(board, out["child"]["parent"], out["child"]["id"],
+                                                                   n, out["result"]))
         return out
 
     @mcp.tool(description=(

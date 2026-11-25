@@ -2118,6 +2118,107 @@
   ],
   "version": "0000000000000018"
  },
+ "listing_p5": {
+  "features": [
+   "answered",
+   "restart"
+  ],
+  "node": "laptop",
+  "sessions": [
+   {
+    "access": null,
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000014",
+    "messages": [
+     {
+      "kind": "user",
+      "n": 3,
+      "state": "delivered"
+     }
+    ],
+    "model": null,
+    "project": "/work/repo",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": "workspace",
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000015",
+    "effort": null,
+    "isolation": "shared",
+    "messages": [],
+    "model": null,
+    "parent": "00000000-0000-0000-0000-000000000001",
+    "project": "/work/repo",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000004",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": "workspace",
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000016",
+    "effort": null,
+    "isolation": "shared",
+    "messages": [],
+    "model": null,
+    "parent": "00000000-0000-0000-0000-000000000001",
+    "project": "/work/repo",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000003",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": "workspace",
+    "agent": "claude",
+    "bind": "0000000000000000000000000000000000000000000000000000000000000017",
+    "effort": null,
+    "isolation": "shared",
+    "messages": [],
+    "model": null,
+    "parent": "00000000-0000-0000-0000-000000000001",
+    "project": "/work/repo",
+    "resume": false,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000002",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": null,
+    "agent": "claude",
+    "messages": [],
+    "model": null,
+    "project": "/work/second",
+    "resume": true,
+    "runtime": "claude-code",
+    "session_id": "00000000-0000-0000-0000-000000000007",
+    "status_seq": 0,
+    "stop": null
+   },
+   {
+    "access": null,
+    "agent": "codex",
+    "messages": [],
+    "model": null,
+    "project": "/work/third",
+    "resume": true,
+    "runtime": "codex-cli",
+    "session_id": "00000000-0000-0000-0000-000000000008",
+    "status_seq": 0,
+    "stop": null
+   }
+  ],
+  "version": "0000000000000019"
+ },
  "logs": [
   [
    "agent_comms.session_host",
@@ -2336,6 +2437,1735 @@
    "worktree_removed_at": null
   }
  },
+ "node_bodies": [
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 1
+     }
+    ],
+    "modes": [],
+    "pid": 1000,
+    "resume": false,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 1
+     },
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 1,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "root reply"
+     }
+    ],
+    "modes": [],
+    "pid": 1000,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 1
+     }
+    ],
+    "modes": [],
+    "pid": 1001,
+    "resume": false,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 1
+     },
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 1,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "the human child's reply"
+     }
+    ],
+    "modes": [],
+    "pid": 1001,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 2
+     }
+    ],
+    "modes": [],
+    "pid": 1000,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 1
+     }
+    ],
+    "modes": [],
+    "pid": 1002,
+    "resume": false,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+   {
+    "access": "workspace",
+    "events": [],
+    "modes": [],
+    "pid": null,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 1
+     },
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 1,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "the agent child's reply"
+     }
+    ],
+    "modes": [],
+    "pid": 1002,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 2
+     }
+    ],
+    "modes": [],
+    "pid": 1002,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 2
+     },
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 2,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "the follow-up's reply"
+     }
+    ],
+    "modes": [],
+    "pid": 1002,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 1
+     }
+    ],
+    "modes": [],
+    "pid": 1003,
+    "resume": false,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000002",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 1
+     }
+    ],
+    "modes": [],
+    "pid": 1004,
+    "resume": false,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 1
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 1,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "pair"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 2
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 2
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 2,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 0,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": ""
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 3
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 3
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 3
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 3,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "reinit"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 4
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 4
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 4,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "background: FINISHED"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 5
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 5,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "no init"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 6
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 6
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "interrupted by a restart: message 7 replaced it",
+      "kind": "turn_ended",
+      "message": 6,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": true,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "error_during_execution",
+       "terminal_reason": "aborted_tools"
+      },
+      "ok": false,
+      "restarted_by": 7,
+      "text": ""
+     },
+     {
+      "kind": "delivered",
+      "message": 7
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 7
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 7,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "replaced"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 8
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 8
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 8,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "auto"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 9
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 9
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 9,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": true,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "error_during_execution",
+       "terminal_reason": "completed"
+      },
+      "ok": false,
+      "text": "background: FINISHED"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 10
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 10
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 10,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": true,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "error_during_execution",
+       "terminal_reason": "completed"
+      },
+      "ok": false,
+      "text": "broke"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 11
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 11
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 11,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": true,
+       "num_turns": 0,
+       "stop_reason": "end_turn",
+       "subtype": "error_during_execution",
+       "terminal_reason": "completed"
+      },
+      "ok": false,
+      "text": ""
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 12
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 12
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 12,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": true,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "error_during_execution",
+       "terminal_reason": "completed"
+      },
+      "ok": false,
+      "text": "background: FINISHED"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 13
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 13
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 13,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "whose"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 14
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 14,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "no init"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 15
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 15
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1003,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/hello",
+   {
+    "max_concurrent": 2,
+    "projects": [
+     "/work/repo",
+     "/work/second",
+     "/work/third"
+    ],
+    "runners": [
+     "claude-code",
+     "codex-cli"
+    ],
+    "session_host": {
+     "runners": {
+      "claude-code": [
+       "read-only",
+       "workspace"
+      ],
+      "codex-cli": [
+       "read-only",
+       "workspace"
+      ]
+     },
+     "tree": 4
+    },
+    "sessions": {
+     "max_live": 4
+    }
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": false,
+      "delivered": true,
+      "denials": [],
+      "detail": "timed out after 30 minutes",
+      "kind": "turn_ended",
+      "message": 2,
+      "meta": {},
+      "ok": false,
+      "text": ""
+     },
+     {
+      "kind": "delivered",
+      "message": 3
+     }
+    ],
+    "modes": [],
+    "pid": 1005,
+    "resume": true,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": false,
+      "delivered": true,
+      "denials": [],
+      "detail": "timed out after 30 minutes",
+      "kind": "turn_ended",
+      "message": 15,
+      "meta": {},
+      "ok": false,
+      "text": ""
+     }
+    ],
+    "modes": [],
+    "pid": null,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000002",
+   {
+    "access": "workspace",
+    "events": [
+     {
+      "answered": false,
+      "delivered": true,
+      "denials": [],
+      "detail": "timed out after 30 minutes",
+      "kind": "turn_ended",
+      "message": 1,
+      "meta": {},
+      "ok": false,
+      "text": ""
+     }
+    ],
+    "modes": [],
+    "pid": null,
+    "resume": false,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 16
+     }
+    ],
+    "modes": [],
+    "pid": 1006,
+    "resume": true,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 16,
+      "meta": {
+       "is_error": true,
+       "num_turns": 0,
+       "subtype": "error_during_execution"
+      },
+      "ok": false,
+      "text": ""
+     }
+    ],
+    "modes": [],
+    "pid": null,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 17
+     }
+    ],
+    "modes": [],
+    "pid": 1007,
+    "resume": true,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 17
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1007,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 17,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "resumed"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1007,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 18
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1007,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 18
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1007,
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 18,
+      "meta": {
+       "duration_ms": 2537,
+       "is_error": false,
+       "num_turns": 1,
+       "stop_reason": "end_turn",
+       "subtype": "success",
+       "terminal_reason": "completed"
+      },
+      "ok": true,
+      "text": "again"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1007,
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000008",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1008,
+    "resume": false,
+    "seq": 0,
+    "state": "starting"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000008",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "delivered",
+      "message": 1
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1008,
+    "provider_id": "00000000-0000-0000-0000-000000000006",
+    "resume": true,
+    "seq": 0,
+    "state": "running"
+   }
+  ],
+  [
+   "/api/nodes/sessions/00000000-0000-0000-0000-000000000008",
+   {
+    "access": "workspace",
+    "ceiling": "workspace",
+    "checkout": "<tmp>/checkout",
+    "events": [
+     {
+      "kind": "turn_started",
+      "message": 1
+     },
+     {
+      "answered": true,
+      "delivered": true,
+      "denials": [],
+      "detail": "",
+      "kind": "turn_ended",
+      "message": 1,
+      "meta": {
+       "duration_ms": 1227,
+       "status": "completed"
+      },
+      "ok": true,
+      "text": "codex answer"
+     }
+    ],
+    "modes": [
+     "restart"
+    ],
+    "pid": 1008,
+    "provider_id": "00000000-0000-0000-0000-000000000006",
+    "resume": true,
+    "seq": 0,
+    "state": "idle"
+   }
+  ]
+ ],
  "records": {
   "host.msg.00000000-0000-0000-0000-000000000001.1": {
    "created_at": 0,
@@ -7665,6 +9495,7 @@
   "00000000-0000-0000-0000-000000000008.jsonl": [
    "{\"id\": 1, \"result\": {\"userAgent\": \"agent-comms/0.171.0 (Mac OS 27.0.1; arm64) unknown (agent-comms; 0.1.0)\", \"codexHome\": \"/Users/someone/.codex\", \"platformFamily\": \"unix\", \"platformOs\": \"macos\"}}",
    "{\"id\": 2, \"result\": {\"thread\": {\"id\": \"00000000-0000-0000-0000-000000000006\", \"sessionId\": \"00000000-0000-0000-0000-000000000006\", \"preview\": \"\", \"ephemeral\": false, \"status\": {\"type\": \"idle\"}, \"path\": \"/Users/someone/.codex/sessions/2026/11/21/rollout-2026-11-21T08-08-52-00000000-0000-0000-0000-000000000006.jsonl\", \"cwd\": \"/Users/someone/work/checkout\", \"cliVersion\": \"0.171.0\", \"originator\": \"agent-comms\", \"source\": \"vscode\", \"turns\": []}, \"model\": \"gpt-6-luna\", \"modelProvider\": \"openai\", \"cwd\": \"/Users/someone/work/checkout\", \"approvalPolicy\": \"never\", \"approvalsReviewer\": \"user\", \"sandbox\": {\"type\": \"readOnly\", \"networkAccess\": false}, \"reasoningEffort\": \"high\"}}",
+   "{\"method\": \"item/completed\", \"params\": {\"threadId\": \"00000000-0000-0000-0000-000000000006\", \"turnId\": \"00000000-0000-0000-0000-000000000009\", \"item\": {\"type\": \"userMessage\", \"id\": \"item-golden\", \"clientId\": null, \"content\": [{\"type\": \"text\", \"text\": \"seq codex\"}]}}}",
    "{\"id\": 3, \"result\": {\"turn\": {\"id\": \"00000000-0000-0000-0000-000000000009\", \"rootTurnId\": \"00000000-0000-0000-0000-000000000009\", \"items\": [], \"itemsView\": \"notLoaded\", \"status\": \"inProgress\", \"error\": null, \"startedAt\": null, \"completedAt\": null, \"durationMs\": null}}}",
    "{\"method\": \"turn/started\", \"params\": {\"threadId\": \"00000000-0000-0000-0000-000000000006\", \"turn\": {\"id\": \"00000000-0000-0000-0000-000000000009\", \"rootTurnId\": \"00000000-0000-0000-0000-000000000009\", \"items\": [], \"itemsView\": \"notLoaded\", \"status\": \"inProgress\", \"error\": null, \"startedAt\": null, \"completedAt\": null, \"durationMs\": null}}}",
    "{\"method\": \"item/completed\", \"params\": {\"threadId\": \"00000000-0000-0000-0000-000000000006\", \"turnId\": \"00000000-0000-0000-0000-000000000009\", \"completedAtMs\": 1795266534914, \"item\": {\"type\": \"agentMessage\", \"id\": \"msg_0541684f\", \"text\": \"a note\", \"phase\": \"commentary\", \"memoryCitation\": null}}}",
@@ -8128,5 +9959,566 @@
     "sessions": 4
    }
   ]
+ },
+ "zz_parity": {
+  "cancel": {
+   "bodies": [
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [
+       {
+        "kind": "turn_started",
+        "message": 1
+       },
+       {
+        "answered": true,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {
+         "duration_ms": 2537,
+         "is_error": false,
+         "num_turns": 1,
+         "stop_reason": "end_turn",
+         "subtype": "success",
+         "terminal_reason": "completed"
+        },
+        "ok": true,
+        "text": "root reply"
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000002",
+     {
+      "access": "workspace",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [],
+      "modes": [],
+      "pid": null,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000002",
+     {
+      "access": "workspace",
+      "events": [
+       {
+        "delivered": true,
+        "detail": "the node restarted while this turn was in flight; it was not replayed",
+        "kind": "turn_ended",
+        "message": 1,
+        "ok": false
+       },
+       {
+        "delivered": false,
+        "detail": "cancelled by the session that started it",
+        "kind": "turn_ended",
+        "message": 2,
+        "ok": false
+       },
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the node had no hub contact for 90 seconds and stopped the turn",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 2
+       }
+      ],
+      "modes": [],
+      "pid": 1002,
+      "resume": true,
+      "seq": 0,
+      "state": "starting"
+     }
+    ]
+   ],
+   "kid": [
+    {
+     "created_at": 0,
+     "delivered_at": 0,
+     "denials": [],
+     "detail": "the node restarted while this turn was in flight; it was not replayed",
+     "ended_at": 0,
+     "kind": "task",
+     "n": 1,
+     "ok": false,
+     "session_id": "00000000-0000-0000-0000-000000000002",
+     "state": "failed"
+    },
+    {
+     "created_at": 0,
+     "delivered_at": null,
+     "denials": [],
+     "detail": "cancelled by the session that started it",
+     "ended_at": 0,
+     "kind": "task",
+     "n": 2,
+     "ok": false,
+     "session_id": "00000000-0000-0000-0000-000000000002",
+     "state": "failed"
+    }
+   ]
+  },
+  "overlap": {
+   "bodies": [
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": true,
+        "text": "a's end"
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": true,
+        "text": "b's end"
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ]
+   ],
+   "left_after_the_loops_flush": [],
+   "sessions": [
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": true,
+      "session_id": "00000000-0000-0000-0000-000000000003",
+      "state": "done"
+     }
+    ],
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": true,
+      "session_id": "00000000-0000-0000-0000-000000000004",
+      "state": "done"
+     }
+    ]
+   ]
+  },
+  "shutdown": {
+   "bodies": [
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000005",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000006",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1002,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "turn_started",
+        "message": 1
+       },
+       {
+        "answered": true,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {
+         "duration_ms": 2537,
+         "is_error": false,
+         "num_turns": 1,
+         "stop_reason": "end_turn",
+         "subtype": "success",
+         "terminal_reason": "completed"
+        },
+        "ok": true,
+        "text": "three's reply"
+       }
+      ],
+      "modes": [],
+      "pid": 1002,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000005",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000006",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [],
+      "modes": [],
+      "pid": null,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ]
+   ],
+   "sessions": [
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "the session host shut down",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": false,
+      "session_id": "00000000-0000-0000-0000-000000000005",
+      "state": "failed"
+     }
+    ],
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "the session host shut down",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": false,
+      "session_id": "00000000-0000-0000-0000-000000000006",
+      "state": "failed"
+     }
+    ],
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": true,
+      "session_id": "00000000-0000-0000-0000-000000000007",
+      "state": "done"
+     }
+    ]
+   ]
+  }
  }
 }

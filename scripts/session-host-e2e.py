@@ -63,8 +63,10 @@ once the wake's grace has passed.
 Then the send modes on a running turn (`--only steer` runs nothing else; DESIGN_NOTES "Restarting a running turn"),
 for a Claude session (an agent of its own, whose runner may also run `sleep`) and a Codex one:
 S1/S4. A long turn (the stand-in holds it until the script releases it; a real model runs `sleep 12`), then
-    `--mode steer`: refused with the reason (R6: mid-turn steering is not available yet), nothing is sent, and the
-    turn runs to its end.
+    `--mode steer` (DESIGN_NOTES "Mid-turn steering", step 2). Claude (S1): refused with the reason (its adapter does
+    not steer), nothing is sent, and the turn runs to its end. Codex (S4): taken as a steer into that turn (no message
+    of its own); its `turn/steer` is written once; `--mode steer --wait` (a retry with the same request id) prints
+    the turn's reply and exits 0 with the steer `in_turn`.
 S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long turn ends `interrupted by a restart:
     message N replaced it` (the provider said the interrupt ended it), the new message is written only after that
     end, as an ordinary turn, and answered (kiwi), and the same process took it (the in-band interrupt).
@@ -88,6 +90,32 @@ X4. (stand-ins only) The fix: a turn the CLI starts itself (`bg`) right after on
     message's; that message gets its own reply. (With VERIFIED empty it would be, exactly as on main:
     tests/test_claude_correlation.py.)
 With --claude-bin: five small haiku turns.
+Then mid-turn steering, step 2 (`--only steering` runs nothing else; DESIGN_NOTES "Mid-turn steering, loose
+contract" and "Mid-turn steering, step 2: Codex steering, as built"), on a hub and a node of their own with child
+sessions on, after every scenario below has stopped its own (Q0). With --codex-bin the Codex sessions are real
+(gate M5 is measured on that CLI); the Claude ones are the stand-in unless --claude-bin.
+Q1. M5 on a fresh start: a Codex root with a long turn; its turn/start carries `clientUserMessageId` N; the answer
+    to that request names T and a userMessage item with N's clientId comes in T (the node's transcript; printed raw).
+    Then `send --mode steer`: written once as `turn/steer` with `expectedTurnId` T; `--wait` (a retry) exits 0 with
+    the steer `in_turn`, Codex having answered that request naming T before T's `turn/completed`.
+Q2. M5 on a join: with the real CLI, a probe of its own app-server (the node's flags, a fresh directory of the run):
+    a long turn A, then a turn/start J while A runs: the answer names A's turn and J's clientId item comes in it
+    (printed raw). With the stand-in, through the node: a turn/start the thread joins (`join-own`), proved and
+    steered (`in_turn`).
+Q3. The refusals: a Claude turn (its adapter does not steer); the cap (12,288 bytes); a second steer while one is
+    unsettled; a restart while it is unsettled; `--output-schema` with a steer (refused before sending);
+    `board session list` marks it; after N's end no turn is in flight.
+Q4. A parent (the spawning agent's stand-in session, with a spawn grant) steers its Codex child through its own
+    board server: `board_session_send(mode=steer, wait=true)` takes the child's result for that turn with the steer
+    `in_turn`, and the result's text carries the hub's line outside the child's markers.
+Q5. (stand-in only) Codex refuses the steer (`not_delivered`, exit 5), answers an internal error and never answers
+    (`unconfirmed`, exit 6).
+Q6. (stand-in only) The node restarts after the steer was written: N ends with its process, the steer is
+    `unconfirmed`, the session goes on and the steer is never written again.
+Q7. (stand-in only, and only with `--only steering`: it takes 82 s) A partition before the steer could be written
+    (the turn not proved yet): the hub is stopped (SIGSTOP) past the node's 75 s contact clock; once it is back and
+    the turn proved, the steer is still never written; N completes and the steer is `not_delivered`.
+Q8. Stop; nothing is left; the user's Codex config.toml is unchanged (with --codex-bin).
 Last, parent and child sessions (`--only tree` runs nothing else; `--only claude`, `--only codex` and --with-board
 skip it). Everything above ran with child sessions OFF, as shipped. The hub and the node are then started again over
 the same temp directory with `[dispatch.sessions.spawn] enabled = true` on the hub, and on the node a worktree
@@ -243,8 +271,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -429,6 +459,75 @@ async def main():
 
 asyncio.run(main())
 """
+
+
+class LineReader:
+    """Lines from a pipe, never blocking past a deadline (R2-12): `next(deadline)` is the next complete line, or None
+    once `deadline` (time.monotonic) has passed; EOFError when the pipe closed."""
+
+    def __init__(self, fd: int):
+        self.fd, self.buf = fd, b""
+
+    def next(self, deadline: float) -> bytes | None:
+        import selectors
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            # (Review round 5:) a selector, not select(): select() refuses a descriptor above FD_SETSIZE (1024), which
+            # a long test run in one process reaches.
+            with selectors.DefaultSelector() as sel:
+                sel.register(self.fd, selectors.EVENT_READ)
+                ready = sel.select(left)
+            if not ready:
+                return None
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                raise EOFError("the pipe closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line + b"\n"
+
+
+class M5Join:
+    """Gate M5 on a join, from the app-server's lines (R2-12): after a turn/start J (request `rid`, `clientId` j)
+    while turn T of thread `tid` runs, BOTH the answer to J's request and a userMessage item of that thread with J's
+    clientId, in either order, BEFORE T's own turn/completed (that thread and that turn; another turn's completion is
+    not T's). `feed(m)`: "proved" once both came in time, "late" when T completed first, else None."""
+
+    def __init__(self, tid: str, t: str, rid, j: str):
+        self.tid, self.t, self.rid, self.j = tid, t, rid, j
+        self.answer: dict | None = None
+        self.item: dict | None = None
+
+    def feed(self, m) -> str | None:
+        if not isinstance(m, dict):
+            return None
+        p = m.get("params") if isinstance(m.get("params"), dict) else {}
+        it = p.get("item") if isinstance(p.get("item"), dict) else {}
+        if (type(m.get("id")) is int and m["id"] == self.rid and "method" not in m
+                and ("result" in m) != ("error" in m) and self.answer is None):
+            # (an integer id only: 4.0 is not request 4, R3-12) The answer must name T: one naming another turn
+            # fails the probe at once.
+            named = ((m.get("result") or {}).get("turn") or {}).get("id") if isinstance(m.get("result"), dict) else None
+            if named != self.t:
+                return "wrong"
+            self.answer = m
+        elif (m.get("method") in ("item/started", "item/completed") and p.get("threadId") == self.tid
+              and p.get("turnId") == self.t and it.get("type") == "userMessage" and it.get("clientId") == self.j
+              and self.item is None):
+            self.item = m       # (only an item of T itself: one in another turn never takes its place, R3-12)
+        elif (m.get("method") == "turn/completed" and p.get("threadId") == self.tid
+              and isinstance(p.get("turn"), dict) and p["turn"].get("id") == self.t):
+            return None if self.answer is not None and self.item is not None else "late"
+        return "proved" if self.answer is not None and self.item is not None else None
+
+    def holds(self) -> bool:
+        """Both observations name T: the answer's turn and the item's turn."""
+        a = ((self.answer or {}).get("result") or {}).get("turn") or {}
+        ip = (self.item or {}).get("params") or {}
+        return (a.get("id") == self.t and ip.get("turnId") == self.t and ip.get("threadId") == self.tid
+                and (ip.get("item") or {}).get("type") == "userMessage")
 
 
 def free_port() -> int:
@@ -1044,7 +1143,7 @@ codex = true
         else:
             long1, long2 = f"hold {hold1} for the steer", f"hold {hold2} for the restart"
         steer = "IMPORTANT UPDATE: in your final reply also include the exact word PINEAPPLE."
-        steer_no = "mid-turn steering is not available yet; use restart to redirect a running turn, or queue"
+        steer_no = "this session's agent CLI cannot steer into a running turn (its node says so)"
         restart = "Reply with exactly the word: kiwi" if real else "kiwi"
         idle = "Reply with exactly the word: apple" if real else "apple"
 
@@ -1066,14 +1165,34 @@ codex = true
         sid = json.loads(out)["session"]["session_id"]
         running(sid, 1)
         pid = self.show(sid)["pid"]
-        # R6: no session steers yet; the send is refused with the reason and nothing is made for it.
-        out, err, _ = self.board("session", "send", sid, steer, "--mode", "steer", ok=False)
-        self.check(steer_no in err, "a steer is refused with the reason, and nothing is sent")
-        self.check(len(self.show(sid)["messages"]) == 1, "no message was made for it")
-        if not real:
-            hold1.touch()
-        m1 = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 90)
-        self.check(m1 is not None and m1["state"] == "done", "the long turn ran to its end untouched")
+        if label == "Claude":
+            # Step 2: Claude's adapter does not steer; the send is refused with the reason and nothing is made for it.
+            out, err, _ = self.board("session", "send", sid, steer, "--mode", "steer", ok=False)
+            self.check(steer_no in err, "a steer is refused with the reason, and nothing is sent")
+            self.check(len(self.show(sid)["messages"]) == 1, "no message was made for it")
+            if not real:
+                hold1.touch()
+            m1 = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 90)
+            self.check(m1 is not None and m1["state"] == "done", "the long turn ran to its end untouched")
+        else:
+            # Step 2: Codex takes it into that turn (`turn/steer` with expectedTurnId); no message of its own.
+            out, _, _ = self.board("session", "send", sid, steer, "--mode", "steer", "--request-id", f"{tag}4",
+                                   "--json")
+            sent = json.loads(out)
+            self.check(sent["message"] is None and sent["steer"]["into"] == 1, "taken as a steer into message 1")
+            self.check(len(self.show(sid)["messages"]) == 1, "no message was made for it")
+            deadline = time.monotonic() + 20
+            while not any(x.get("method") == "turn/steer" for x in self.codex_stdin()) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not real:
+                hold1.touch()
+            rc, out, _ = self.board_rc("session", "send", sid, steer, "--mode", "steer", "--request-id", f"{tag}4",
+                                       "--wait", "--json")
+            data = json.loads(out) if out.strip().startswith("{") else {}
+            print(f"  exit {rc}; steer {(data.get('steer') or {}).get('outcome')}; reply {data.get('reply')!r}")
+            self.check(rc == 0 and (data.get("steer") or {}).get("outcome") == "in_turn"
+                       and sum(x.get("method") == "turn/steer" for x in self.codex_stdin()) == 1,
+                       "written once into that turn, taken in (in_turn); the turn ran to its end")
         self._restart_and_auto(label, sid, pid, real, long2, restart, idle, hold2, running, tag, steps, 2)
 
     def _restart_and_auto(self, label, sid, pid, real, long2, restart, idle, hold2, running, tag, steps, k) -> None:
@@ -1111,6 +1230,421 @@ codex = true
         while self.show(sid)["state"] != "ended" and time.monotonic() < deadline:
             time.sleep(0.2)
         self.check(self.show(sid)["state"] == "ended" and gone(pid), "closed, and its process is gone")
+
+    # ------------------------------------------------------------ mid-turn steering, step 2 (--only steering)
+
+    STEER_TEXT = "IMPORTANT UPDATE (Q): in your final reply also include the exact word PINEAPPLE."
+    LONG = ("Run this exact shell command once, with your shell tool, and nothing else first: `sleep 12`. When it has "
+            "finished, reply with one short sentence.")
+
+    def _running(self, sid: str, n: int, real: bool) -> None:
+        m = self.message(sid, n, lambda m: m["state"] == "delivered", 90)
+        self.check(m is not None and m["state"] == "delivered", f"message {n}'s turn is in flight")
+        deadline = time.monotonic() + 60
+        while self.show(sid)["state"] != "running" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if real:
+            time.sleep(5)       # into the command the model runs
+            m = next(m for m in self.show(sid)["messages"] if m["n"] == n)
+            if m["state"] != "delivered":
+                raise SystemExit(f"FAIL: the model ended the long turn within 5 s ({m['state']}: {m['detail']!r}): "
+                                 "nothing to steer into")
+
+    def _frames(self, sid: str) -> list[dict]:
+        try:
+            return self.transcript(sid)
+        except OSError:
+            return []
+
+    def _m5_proof(self, sid: str, rid: int, client_id: str | None, seconds: float = 60) -> tuple[str | None, dict, dict]:
+        """M5 from the session's transcript: (T, the answer to the turn/start request `rid`, the userMessage item
+        whose clientId is `client_id`), waiting for both."""
+        deadline = time.monotonic() + seconds
+        answer = item = {}
+        while time.monotonic() < deadline:
+            frames = self._frames(sid)
+            answer = next((f for f in frames if f.get("id") == rid and isinstance(f.get("result"), dict)), {})
+            item = next((f for f in frames if f.get("method") in ("item/started", "item/completed")
+                         and ((f.get("params") or {}).get("item") or {}).get("type") == "userMessage"
+                         and client_id is not None
+                         and ((f.get("params") or {}).get("item") or {}).get("clientId") == client_id), {})
+            if answer and item:
+                break
+            time.sleep(0.2)
+        t = ((answer.get("result") or {}).get("turn") or {}).get("id")
+        return t, answer, item
+
+    def _steer_lines(self, text: str) -> list[dict]:
+        return [x for x in self.codex_stdin() if x.get("method") == "turn/steer"
+                and text in json.dumps((x.get("params") or {}).get("input"))]
+
+    def _wait_steer_line(self, text: str, seconds: float = 20) -> dict | None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            got = self._steer_lines(text)
+            if got:
+                return got[-1]
+            time.sleep(0.1)
+        return None
+
+    def _close(self, sid: str) -> None:
+        self.board("session", "close", sid)
+        self.check(self.wait_ended(sid, 40)["state"] == "ended", "closed")
+
+    def _codex_root(self, text: str, model: list[str]) -> tuple[str, int, str | None]:
+        """A Codex root started with `text` (not waited for): (its id, its turn/start request id, the clientId)."""
+        before = len(self.codex_stdin())
+        out, _, _ = self.board("session", "start", str(self.project), text, "--agent", CODEX_AGENT, *model, "--json")
+        sid = json.loads(out)["session"]["session_id"]
+        deadline = time.monotonic() + 60
+        start = None
+        while start is None and time.monotonic() < deadline:
+            start = next((x for x in self.codex_stdin()[before:] if x.get("method") == "turn/start"), None)
+            time.sleep(0.1)
+        if start is None:
+            raise SystemExit("FAIL: no turn/start was written for the Codex session")
+        return sid, start["id"], (start.get("params") or {}).get("clientUserMessageId")
+
+    def steering_scenario(self) -> None:
+        """Q1-Q7 (the module text)."""
+        real = self.real_codex
+        model = ["--model", self.args.codex_model]
+        print("\n[Q0] a hub and a node of their own, child sessions on; the Codex agent is "
+              + (f"the real CLI ({self.args.codex_bin})" if real else "the stand-in"))
+        self._q1_fresh(real, model)
+        self._q2_join(real, model)
+        self._q3_refusals(real, model)
+        self._q4_parent(real, model)
+        if not real:
+            self._q5_answers(model)
+            self._q6_node_restart(model)
+            if self.args.only == "steering":
+                self._q7_partition(model)
+
+    def _q1_fresh(self, real: bool, model: list[str]) -> None:
+        print("\n[Q1] M5 on a fresh start, then a human steer: board session send <id> <text> --mode steer --wait")
+        hold = self.tmp / "q1-release"
+        sid, rid, client_id = self._codex_root(self.LONG if real else f"hold {hold} q1", model)
+        self._running(sid, 1, real)
+        t, answer, item = self._m5_proof(sid, rid, client_id)
+        print(f"  M5 raw evidence (fresh start): turn/start request {rid} clientUserMessageId {client_id}")
+        print(f"    answer: {json.dumps(answer)[:400]}")
+        print(f"    item:   {json.dumps(item)[:500]}")
+        self.check(t is not None and item and (item.get("params") or {}).get("turnId") == t
+                   and (item.get("params") or {}).get("threadId") == self.show(sid).get("provider_id"),
+                   "M5 (fresh start): the answer to N's turn/start names T, and a userMessage item with N's clientId "
+                   "came in T")
+        out, _, _ = self.board("session", "send", sid, self.STEER_TEXT, "--mode", "steer", "--request-id", "q1",
+                               "--json")
+        sent = json.loads(out)
+        self.check(sent["message"] is None and sent["steer"]["into"] == 1 and sent["steer"]["state"] == "accepted",
+                   "the steer is accepted as a steer into message 1, with no message of its own")
+        line = self._wait_steer_line(self.STEER_TEXT)
+        print(f"  written: {json.dumps(line)[:300]}")
+        self.check(line is not None and line["params"].get("expectedTurnId") == t,
+                   "turn/steer was written once, with expectedTurnId T (the proved turn)")
+        if not real:
+            hold.touch()
+        rc, out, err = self.board_rc("session", "send", sid, self.STEER_TEXT, "--mode", "steer", "--request-id", "q1",
+                                     "--wait", "--json")
+        data = json.loads(out) if out.strip().startswith("{") else {}
+        steer = data.get("steer") or {}
+        print(f"  exit {rc}; steer {steer.get('outcome')} ({steer.get('why')}); reply {data.get('reply')!r}")
+        frames = self._frames(sid)
+        ans = next((f for f in frames if line and f.get("id") == line["id"]), None)
+        end = next((i for i, f in enumerate(frames) if f.get("method") == "turn/completed"
+                    and ((f.get("params") or {}).get("turn") or {}).get("id") == t), None)
+        print(f"    its answer: {json.dumps(ans)[:300]}")
+        self.check(rc == 0 and steer.get("outcome") == "in_turn" and ans is not None
+                   and (ans.get("result") or {}).get("turnId") == t and end is not None and frames.index(ans) < end,
+                   "in_turn: Codex answered that very turn/steer naming T before T's turn/completed; exit 0")
+        self.check(len(self._steer_lines(self.STEER_TEXT)) == 1, "the retry with --wait sent nothing again")
+        if real:
+            print(f"  the reply {'says' if 'pineapple' in (data.get('reply') or '').lower() else 'does not say'} "
+                  "PINEAPPLE (in_turn is evidence that Codex admitted it, not of what the model did)")
+        else:
+            self.check("STEERED: " + self.STEER_TEXT.upper() in (data.get("reply") or ""),
+                       "the stand-in read the steer in that turn")
+        self._close(sid)
+
+    def _q2_join(self, real: bool, model: list[str]) -> None:
+        print("\n[Q2] M5 on a join: a turn/start while the thread runs a turn is answered with THAT turn")
+        if real:
+            self._m5_join_probe()
+            return
+        hold = self.tmp / "q2-release"
+        sid, rid, client_id = self._codex_root(f"hold {hold} join-own q2", model)
+        self._running(sid, 1, real)
+        t, answer, item = self._m5_proof(sid, rid, client_id)
+        frames = self._frames(sid)
+        began = next((i for i, f in enumerate(frames) if f.get("method") == "turn/started"
+                      and ((f.get("params") or {}).get("turn") or {}).get("id") == t), None)
+        self.check(t is not None and began is not None and began < frames.index(answer)
+                   and (item.get("params") or {}).get("turnId") == t,
+                   "the turn began before the answer, which named it; N's clientId item came in it: proved")
+        text = "steer into the joined turn"
+        self.board("session", "send", sid, text, "--mode", "steer", "--request-id", "q2")
+        line = self._wait_steer_line(text)
+        self.check(line is not None and line["params"]["expectedTurnId"] == t, "the steer went into the joined turn")
+        hold.touch()
+        rc, out, _ = self.board_rc("session", "send", sid, text, "--mode", "steer", "--request-id", "q2",
+                                   "--wait", "--json")
+        self.check(rc == 0 and json.loads(out)["steer"]["outcome"] == "in_turn", "in_turn; exit 0")
+        self._close(sid)
+
+    def _m5_join_probe(self) -> None:
+        """The real CLI, its own app-server in a fresh directory of this run, as the node starts it (plugins and apps
+        off, every configured MCP server off, read-only sandbox, approvals never): a long turn A, then a turn/start J
+        while A runs (a join), then a turn/steer into A. Raw lines kept and printed."""
+        work = self.tmp / "m5-join"
+        work.mkdir(exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True, timeout=60, env=self.env)
+        argv = [self.args.codex_bin, "app-server", "--disable", "plugins", "--disable", "apps", *self.codex_quiet(),
+                "-c", 'model_reasoning_effort="low"', "--listen", "stdio://"]
+        proc = subprocess.Popen(argv, cwd=str(work), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=open(self.tmp / "logs" / "m5-join.stderr", "w"), env=self.codex_env())
+        self.pids.add(proc.pid)
+        lines: list[dict] = []
+        raw = open(self.tmp / "logs" / "m5-join.jsonl", "w")
+
+        def send(msg: dict) -> None:
+            raw.write(">> " + json.dumps(msg) + "\n")
+            proc.stdin.write((json.dumps(msg) + "\n").encode())
+            proc.stdin.flush()
+
+        reader = LineReader(proc.stdout.fileno())
+
+        def until(pred, seconds=None) -> dict:
+            # (`m5_seconds`: a test's shorter limit; the probe's own is 120 s)
+            deadline = time.monotonic() + (seconds if seconds is not None else getattr(self, "m5_seconds", 120.0))
+            while time.monotonic() < deadline:
+                try:
+                    line = reader.next(deadline)     # never a blocking read past the deadline (R2-12)
+                except EOFError:
+                    raise SystemExit("FAIL: the Codex app-server of the M5 probe exited") from None
+                if line is None:
+                    break
+                raw.write(line.decode())
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    continue
+                lines.append(m)
+                if isinstance(m, dict) and "id" in m and "method" in m:
+                    send({"id": m["id"], "error": {"code": -32601, "message": "no approval surface"}})
+                if pred(m):
+                    return m
+            raise SystemExit("FAIL: the M5 probe timed out")
+        try:
+            send({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "agent-comms", "version": "0.1.0"},
+                                                               "capabilities": {}}})
+            until(lambda m: m.get("id") == 1)
+            send({"method": "initialized", "params": {}})
+            send({"id": 2, "method": "thread/start", "params": {"sandbox": "read-only", "approvalPolicy": "never",
+                                                                 "model": self.args.codex_model}})
+            tid = until(lambda m: m.get("id") == 2)["result"]["thread"]["id"]
+            a, j = str(uuid.uuid4()), str(uuid.uuid4())
+            send({"id": 3, "method": "turn/start", "params": {"threadId": tid, "clientUserMessageId": a, "input": [
+                {"type": "text", "text": "Run the shell command `sleep 8` and then reply with exactly the word DONE."}]}})
+            t = until(lambda m: m.get("id") == 3)["result"]["turn"]["id"]
+            until(lambda m: m.get("method") == "item/started"
+                  and ((m.get("params") or {}).get("item") or {}).get("type") == "commandExecution")
+            send({"id": 4, "method": "turn/start", "params": {"threadId": tid, "clientUserMessageId": j, "input": [
+                {"type": "text", "text": "Also include the word KIWI."}]}})
+            # Both observations, in either order (S2-14), before T's OWN completion (R2-12): the answer to J's
+            # request, and a userMessage item of THIS thread with J's clientId.
+            watch, said = M5Join(tid, t, 4, j), []
+
+            def decided(m) -> bool:
+                said.append(watch.feed(m))
+                return said[-1] is not None
+            until(decided)
+            if said[-1] != "proved":
+                raise SystemExit("FAIL: M5 (join): " + ("the answer to J named another turn" if said[-1] == "wrong" else
+                                                         "T completed before both the answer to J and J's item came"))
+            joined, item = watch.answer, watch.item
+        finally:
+            try:
+                proc.stdin.close()
+                proc.wait(30)
+            except Exception:
+                proc.kill()
+            raw.close()
+        print(f"  M5 raw evidence (join): turn A {t} (clientUserMessageId {a}); turn/start J clientUserMessageId {j}")
+        print(f"    answer to J: {json.dumps(joined)[:300]}")
+        print(f"    J's item:    {json.dumps(item)[:400]}")
+        self.check(watch.holds(),
+                   "M5 (join): the answer to J's turn/start names the active turn T, and J's userMessage item, with "
+                   "J's clientId, came in T, both before T's own turn/completed")
+
+    def _q3_refusals(self, real: bool, model: list[str]) -> None:
+        print("\n[Q3] the refusals: a Claude turn; the cap; a second steer; a restart while one is unsettled")
+        hold = self.tmp / "q3-release"
+        # A Claude session (its adapter does not steer: its node never says `steer`): refused with that reason, which
+        # comes before whether a turn is in flight at all.
+        first = "Reply with exactly the word: ready" if self.real else "ready"
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", AGENT, "--model", "haiku",
+                               "--wait", "--json")
+        cl = json.loads(out)["session"]["session_id"]
+        rc, _, err = self.board_rc("session", "send", cl, self.STEER_TEXT, "--mode", "steer")
+        self.check(rc != 0 and "cannot steer into a running turn (its node says so)" in err
+                   and len(self.show(cl)["messages"]) == 1,
+                   "Claude: refused with the reason (its adapter does not steer), nothing is made")
+        self._close(cl)
+        sid, _, _ = self._codex_root(self.LONG if real else f"hold {hold} q3", model)
+        self._running(sid, 1, real)
+        rc, _, err = self.board_rc("session", "send", sid, "x" * 12_300, "--mode", "steer")
+        self.check(rc != 0 and "over 12,288 bytes" in err, "the bound: a steer over 12,288 bytes is refused")
+        self.board("session", "send", sid, self.STEER_TEXT, "--mode", "steer")
+        for argv, words, what in (
+                (["send", sid, "again", "--mode", "steer"], "is not settled yet", "a second steer while one is unsettled"),
+                (["send", sid, "redo", "--mode", "restart"], "a restart waits for it", "a restart while it is unsettled"),
+                (["send", sid, "x", "--mode", "steer", "--output-schema", '{"type": "object"}'], "does not go with",
+                 "--output-schema with a steer, before sending")):
+            rc, _, err = self.board_rc("session", *argv)
+            self.check(rc != 0 and words in err, f"refused: {what}")
+        out, _, _ = self.board("session", "list")
+        self.check("steer unsettled (into message 1)" in out, "board session list marks the steer unsettled")
+        if not real:
+            hold.touch()
+        self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 120)
+        rc, _, err = self.board_rc("session", "send", sid, "late", "--mode", "steer")
+        self.check(rc != 0 and "no turn is in flight" in err, "after N's end: no turn in flight, refused")
+        self._close(sid)
+
+    def _q4_parent(self, real: bool, model: list[str]) -> None:
+        print("\n[Q4] a parent steers its Codex child with board_session_send(mode=steer, wait=true)")
+        first = "Reply with exactly the word: ready" if self.real else "ready"
+        out, _, _ = self.board("session", "start", str(self.project), first, "--agent", SPAWN_AGENT, "--model",
+                               "haiku", "--wait", "--json")
+        rid = json.loads(out)["session"]["session_id"]
+        self.board("session", "grant", str(self.project), "--agent", SPAWN_AGENT, "--access", "workspace",
+                   "--hours", "1")
+        hold, busy = self.tmp / "q4-release", self.tmp / "q4-parent"
+        if not self.real:
+            # The parent is in a turn of its own meanwhile (as a parent that waits is), so the child's result waits
+            # for it and the wait takes it; an idle parent would get it as its next turn (the answer then says so).
+            self.board("session", "send", rid, f"hold {busy} q4 parent")
+            self._running(rid, 2, False)
+        task = self.LONG if real else f"hold {hold} q4"
+        [made] = self.mcp_calls(SPAWN_AGENT, [["board_session_spawn", {
+            "task": task, "child_agent": CODEX_AGENT, "access": "read-only",
+            **({"model": self.args.codex_model} if real else {})}]], rid)
+        if made["error"]:
+            raise SystemExit(f"FAIL: the Codex child was refused: {made['text'][:600]}")
+        kid = json.loads(made["text"])["child"]["id"]
+        self._running(kid, 1, real)
+        got: list = []
+        steer = "Also say PLUM in your reply." if real else "plum please"
+        th = threading.Thread(target=lambda: got.append(self.mcp_calls(SPAWN_AGENT, [["board_session_send", {
+            "child": kid, "message": steer, "mode": "steer", "wait": True}]], rid)))
+        th.start()
+        line = self._wait_steer_line(steer, 60)
+        if not real:
+            hold.touch()
+        th.join(120)
+        [sent] = got[0] if got else [{"error": True, "text": "no answer"}]
+        out = json.loads(sent["text"]) if not sent["error"] else {}
+        res = (out.get("result") or {}).get("result") or {}
+        print(f"  answer: steer {out.get('steer')}; status {out.get('steer_status')}; result steer {res.get('steer')}"
+              + (f"; ERROR {sent['text'][:600]}" if sent["error"] else ""))
+        self.check(line is not None and "A message sent while your turn was running" in json.dumps(line),
+                   "the parent's text went in the follow-up frame that says what it is")
+        self.check(out.get("message", 1) is None and (out.get("steer_status") or {}).get("outcome") == "in_turn",
+                   "the answer carries the steer's terminal status, read from its record: in_turn")
+        if res or not self.real:
+            self.check((res.get("steer") or {}).get("outcome") == "in_turn",
+                       "wait=true took the child's result for that turn, with the steer's outcome in_turn")
+            text = (out.get("result") or {}).get("text") or ""
+            self.check("\nYour steer into this turn: taken into it.\n<<<child-output " in text,
+                       "the result's text carries the hub's line, outside the child's markers")
+            if not real:
+                self.check("STEERED: [AGENT-COMMS] A MESSAGE SENT WHILE YOUR TURN WAS RUNNING" in text
+                           and "PLUM PLEASE" in text, "the stand-in child read the steer, in its frame, in its turn")
+        else:
+            print(f"  (the idle real parent got the result as its next turn: {out.get('note')!r})")
+            self.check("went to you as a turn" in (out.get("note") or ""), "the answer says where the result went")
+        if not self.real:
+            busy.touch()
+        self.board("session", "close", rid)
+        self.check(all(self.wait_ended(x, 40)["state"] == "ended" for x in (rid, kid)), "closed, with its child")
+
+    def _q5_answers(self, model: list[str]) -> None:
+        print("\n[Q5] stand-in only: Codex refuses the steer; answers an internal error; never answers")
+        for knob, code, outcome in (("refuse-steer", 5, "not_delivered"), ("internal-error-steer", 6, "unconfirmed"),
+                                    ("no-steer-answer", 6, "unconfirmed")):
+            hold = self.tmp / f"q5-{knob}"
+            sid, _, _ = self._codex_root(f"hold {hold} {knob}", model)
+            self._running(sid, 1, False)
+            text = f"steer for {knob}"
+            got: list = []
+            # The first call waits (in a thread) while the stand-in's turn is held; then a retry with its request id.
+            th = threading.Thread(target=lambda: got.append(self.board_rc(
+                "session", "send", sid, text, "--mode", "steer", "--request-id", knob, "--wait")))
+            th.start()
+            self._wait_steer_line(text)
+            hold.touch()
+            th.join(120)
+            rc, out, err = got[0] if got else (None, "", "")
+            words = {"not_delivered": "steer: not delivered", "unconfirmed": "steer: not confirmed"}[outcome]
+            print(f"  {knob}: exit {rc}; {[x for x in err.splitlines() if x.startswith('steer:')]}")
+            self.check(rc == code and words in err
+                       and (text in err.split("steer:", 1)[-1]) == (outcome == "not_delivered"),
+                       f"{knob}: {outcome}, exit {code}" + (", with the text this call sent, to send again"
+                                                            if code == 5 else ""))
+            rc, out, err = self.board_rc("session", "send", sid, text, "--mode", "steer", "--request-id", knob,
+                                         "--wait")
+            self.check(rc == code and words in err and text not in err.split("steer:", 1)[-1],
+                       "a retry with --wait answers the same, and never prints the text")
+            self.check(self.show(sid)["messages"][0]["steer"]["outcome"] == outcome, "show says it too")
+            self._close(sid)
+
+    def _q6_node_restart(self, model: list[str]) -> None:
+        print("\n[Q6] stand-in only: the node restarts after the steer was written: unconfirmed, never sent again")
+        hold = self.tmp / "q6-release"
+        sid, _, _ = self._codex_root(f"hold {hold} q6", model)
+        self._running(sid, 1, False)
+        text = "steer before the restart"
+        self.board("session", "send", sid, text, "--mode", "steer")
+        self.check(self._wait_steer_line(text) is not None, "written")
+        self.restart_node()
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 60)
+        view = self.show(sid)
+        self.check(m is not None and m["state"] == "failed"
+                   and view["messages"][0]["steer"]["outcome"] == "unconfirmed",
+                   "N ended with its process; the steer is unconfirmed")
+        hold.touch()
+        out, _, _ = self.board("session", "send", sid, "after the restart", "--wait")
+        self.check("AFTER THE RESTART" in out and len(self._steer_lines(text)) == 1,
+                   "the session goes on in a new process, and the steer was never sent again")
+        self._close(sid)
+
+    def _q7_partition(self, model: list[str]) -> None:
+        print("\n[Q7] stand-in only (--only steering): a partition before the steer could be written: its authority "
+              "lapses and is lost for good")
+        hold = self.tmp / "q7-release"
+        sid, _, _ = self._codex_root(f"hold {hold} late-item q7", model)
+        self._running(sid, 1, False)
+        text = "steer across a partition"
+        self.board("session", "send", sid, text, "--mode", "steer")
+        time.sleep(2)           # offered: the node holds it, unwritten (the turn is not proved yet)
+        self.check(self._steer_lines(text) == [], "offered and held, not written: N's turn is not proved yet")
+        hub = next(p for n, p in self.procs if n == "hub")
+        print("  the hub is stopped (SIGSTOP) for 82 s: no hello or report of the node is acknowledged")
+        hub.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(82)
+        finally:
+            hub.send_signal(signal.SIGCONT)
+        Path(str(hold) + ".item").touch()       # the proof comes now
+        time.sleep(4)
+        self.check(self._steer_lines(text) == [], "contact is back and the turn is proved: still never written")
+        hold.touch()
+        m = self.message(sid, 1, lambda m: m["state"] in ("done", "failed"), 60)
+        steer = self.show(sid)["messages"][0].get("steer") or {}
+        self.check(m is not None and m["state"] == "done" and (steer.get("outcome"), steer.get("why"))
+                   == ("not_delivered", "not_written"), "N completed; the steer: not delivered (never written)")
+        self._close(sid)
 
     # ------------------------------------------------------------ Claude turn correlation (X1-X4)
 
@@ -1443,7 +1977,10 @@ codex = true
     def enable_tree(self) -> None:
         """The settings of the tree scenario, written while nothing runs: child sessions on (hub); a worktree
         directory in the temp directory and the runners described in the module text (node). Full access is NOT
-        allowed on the node at first (`node_settings`)."""
+        allowed on the node at first (`node_settings`). Once per run (the steering scenario uses them too)."""
+        if getattr(self, "tree_enabled", False):
+            return
+        self.tree_enabled = True
         agents = self.hub_home / "agents.toml"
         for name in (FULL_AGENT, GRANT_AGENT, MODE_AGENT, RESTRICTED_AGENT, WORK_AGENT):
             create_agent(agents, name, "claude-code")
@@ -3271,7 +3808,8 @@ def main() -> int:
     ap.add_argument("--codex-model", default="gpt-6-luna", metavar="NAME",
                     help="with --codex-bin: the model of the hosted Codex session (default gpt-6-luna, the cheapest "
                          "one codex-cli 0.171.0 lists)")
-    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured", "check", "correlation"),
+    ap.add_argument("--only", choices=("claude", "codex", "tree", "steer", "structured", "check", "correlation",
+                                       "steering"),
                     help="run only that scenario: one agent's, parent and child sessions, the send modes on a "
                          "running turn, results as data (D1-D8), or the in-turn check alone (D7-D8) "
                          "(default: all)")
@@ -3295,12 +3833,13 @@ def main() -> int:
         args.codex_bin = os.path.abspath(os.path.expanduser(args.codex_bin))
         if os.path.basename(args.codex_bin) != "codex" or not os.access(args.codex_bin, os.X_OK):
             ap.error("--codex-bin must be an executable named codex")
-    if args.with_board and args.only in ("codex", "tree", "steer", "structured", "check", "correlation"):
+    if args.with_board and args.only in ("codex", "tree", "steer", "structured", "check", "correlation", "steering"):
         ap.error("--with-board is a Claude scenario")
     codex, claude = args.only in (None, "codex") and not args.with_board, args.only in (None, "claude")
     tree = args.only in (None, "tree") and not args.with_board
     steer = args.only in (None, "steer") and not args.with_board
     correlation = args.only in (None, "correlation") and not args.with_board
+    steering = args.only in (None, "steering") and not args.with_board     # Q0-Q8: its own hub and node, last
     structured = args.only in (None, "structured") and not args.with_board
     check = args.only == "check"        # the in-turn check's scenarios alone (D7-D8; structured runs them too)
     run = Run(args)
@@ -3308,7 +3847,7 @@ def main() -> int:
         print("agent: " + (f"real Claude Code at {args.claude_bin}, --model haiku" if run.real
                            else "stand-in (tests/stand_in_claude.py), no model")
               + (", with the temp board's MCP tools" if args.with_board else ""))
-    if codex or tree or steer or structured or check:
+    if codex or tree or steer or structured or check or steering:
         print("codex agent: " + (f"real Codex at {args.codex_bin}, --model {args.codex_model}" if run.real_codex
                                  else "stand-in (tests/stand_in_codex.py), no model"))
     print(f"temp directory: {run.tmp}")
@@ -3322,7 +3861,7 @@ def main() -> int:
     try:
         signal.signal(signal.SIGTERM, terminated)
         config_before, claude_before = None, run.claude_settings() if run.real else None
-        if (codex or tree or steer or structured or check) and run.real_codex:
+        if (codex or tree or steer or structured or check or steering) and run.real_codex:
             run.fresh_git_checkout()
             config_before = run.codex_config()      # before Codex is run for anything, `codex mcp list` included
         run.write_settings()
@@ -3386,6 +3925,16 @@ def main() -> int:
                 run.check(run.claude_settings() == claude_before,
                           "the user's own Claude settings files (~/.claude/settings.json, settings.local.json) are "
                           "what they were before the run: the settings fixtures live in the temp directory only")
+        if steering:
+            # Its own hub and node, with child sessions on (the tree scenario's settings), after the others stopped.
+            run.enable_tree()
+            run.start_services()
+            run.steering_scenario()
+            print("\n[Q8] stopping the node (SIGTERM) and the hub")
+            run.stop()
+            run.check(run.leftovers() == [], "no session process is left behind")
+            if run.real_codex:
+                run.check_codex_config(config_before)
         print("\nPASS")
         return 0
     except SystemExit as e:

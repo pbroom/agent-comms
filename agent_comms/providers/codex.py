@@ -30,8 +30,19 @@ Restart (measured on codex-cli 0.171.0, DESIGN_NOTES "Restarting a running turn"
   (`interrupt_turn`, `interrupted`); a `turn/start` written after that starts a NEW turn as usual (a restart's
   message). An `interrupted` end counts as the restart's only once Codex answered THAT `turn/interrupt` request with
   success and the turn that ended is the one it named (R5-01): Codex ends a turn `interrupted` for other causes too,
-  and a rejected or unanswered request interrupted nothing. `turn/steer` was measured too (DESIGN_NOTES) but is not
-  used: no adapter steers yet (R6).
+  and a rejected or unanswered request interrupted nothing.
+Mid-turn steering (DESIGN_NOTES "Mid-turn steering, loose contract", part F; measured on codex-cli 0.171.0, gate M5
+in "Mid-turn steering, step 2: Codex steering, as built"):
+- Every `turn/start` carries `clientUserMessageId` (a fresh random id for the turn's message, N): Codex echoes it as
+  the `clientId` of the `userMessage` item in the turn that took the input, on a fresh start (the answer names a new
+  turn T, then the item comes in T) and on a join (a `turn/start` while a turn is active is answered with THAT turn,
+  and the item comes in it later, once the model reads it).
+- A steer is written only for a turn PROVED to be N's: the answer to N's exact `turn/start` request names T and a
+  `userMessage` item with N's `clientId` was reported in T, in either order (`owns`). Then `turn/steer {threadId,
+  expectedTurnId: T, input}` (`steer`): Codex enforces the target, and answers `{turnId}` at once, or refuses with
+  -32600 ("no active turn to steer", "expected active turn id `X` but found `Y`", "expectedTurnId must not be
+  empty"). What that very request was answered before N's `turn/completed` is kept for the host (`steer_result`); a
+  later answer is logged and changes nothing. Never `next_turn`: a refused or unanswered steer is never sent again.
 Plan usage (account_pools.py; from the protocol schema codex-cli 0.171.0 generates, `codex app-server
 generate-json-schema`, and checked against lines recorded from real hosted sessions on 2026-11-22/23,
 tests/fixtures/rate_limit_samples.jsonl: `limitId` "codex", `primary` a 10080-minute window, `secondary` null:
@@ -48,11 +59,21 @@ DESIGN_NOTES "Account pools"). `primary` and `secondary` may each be null:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 
 from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_model, validate_session_id
 
+log = logging.getLogger("agent_comms.providers.codex")
+# Codex's refusals of a `turn/steer` before it admitted it (-32600, measured on 0.171.0): the steer never reached the
+# turn, so it is not delivered.
+STEER_NO_TURN = "no active turn to steer"
+# "expected active turn id `X` but found `Y`": evidence only when X is the very id that request named and Y is a
+# nonempty id other than X (a refusal that found the very turn it expected contradicts itself: no evidence, R2-01).
+STEER_OTHER_TURN = re.compile(r"expected active turn id `([^`]*)` but found `([^`]*)`")
+# ("expectedTurnId must not be empty" is Codex's third refusal; this adapter never sends an empty id, so as an answer
+# to one of its requests it is no evidence of anything.)
 THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 FEATURE_RE = re.compile(r"[A-Za-z0-9_]{1,80}")
@@ -97,6 +118,45 @@ DECLINES = {
     "execCommandApproval": ("commandExecution", {"decision": {"denied": {"rejection": NO_SURFACE}}}),
     "applyPatchApproval": ("fileChange", {"decision": {"denied": {"rejection": NO_SURFACE}}}),
 }
+
+
+def _steer_answer(msg: dict, steer: dict) -> str:
+    """What one answer to a `turn/steer` request is evidence of: "ok" (a success naming the very turn the request
+    named), "refused" (Codex's -32600 refusal of that request), or "other" (anything else, which is no evidence:
+    `unconfirmed`). Only an exclusive, well-formed answer (exactly one of `result` and `error`, nothing else but `id`
+    and a `jsonrpc` that is absent or exactly "2.0") read after every byte of the request was written; an integer
+    code; a quoted expected id equal to the request's and a found id that is nonempty and different (R2-01)."""
+    if not steer.get("written") or set(msg) - {"id", "result", "error", "jsonrpc"} or ("result" in msg) == (
+            "error" in msg) or msg.get("jsonrpc", "2.0") != "2.0" or not _proof_id(steer.get("turn")):
+        return "other"
+    if "result" in msg:
+        result = msg["result"]
+        ok = (isinstance(result, dict) and set(result) == {"turnId"} and isinstance(result["turnId"], str)
+              and result["turnId"] == steer["turn"])
+        return "ok" if ok else "other"
+    err = msg["error"]
+    if (not isinstance(err, dict) or type(err.get("code")) is not int or err["code"] != -32600
+            or not isinstance(err.get("message"), str) or set(err) - {"code", "message", "data"}):
+        return "other"
+    if err["message"] == STEER_NO_TURN:
+        return "refused"
+    quoted = STEER_OTHER_TURN.fullmatch(err["message"])
+    return ("refused" if quoted is not None and quoted.group(1) == steer["turn"] and quoted.group(2)
+            and quoted.group(2) != quoted.group(1) else "other")
+
+
+def _proof_id(value) -> bool:
+    """A turn id that can be half of a steer's proof: a nonempty string (R2-01)."""
+    return isinstance(value, str) and value != ""
+
+
+def _fresh_id() -> str:
+    """A random id in uuid4's form, from os.urandom (never uuid.uuid4, which a test may make deterministic)."""
+    b = bytearray(os.urandom(16))
+    b[6] = (b[6] & 0x0F) | 0x40
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = b.hex()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
 
 
 def _line(message: dict) -> bytes:
@@ -260,7 +320,7 @@ def _error_text(error) -> str:
 class CodexSession:
     waits_for_ready = True      # initialize and thread/start (or thread/resume) come before any turn
     reports_sandbox = True      # ... and their answer names the thread's sandbox: `ready` carries it (`mode`)
-    steers = False              # R6: `turn/steer` is not used yet (module text)
+    steers = True               # `turn/steer` into a turn proved to be the message's (module text, `owns`)
     restarts = True             # turn/interrupt, whose turn then ends `interrupted`
 
     def __init__(self):
@@ -283,6 +343,9 @@ class CodexSession:
         self._ready = self._dead = False
         self._own_turn: str | None = None       # a turn Codex began in this thread that no message here started
         self._by_interrupt = False              # the last turn that ended was ended by the restart's interrupt
+        self._retired: set[int] = set()         # steer requests retired with their turn (a late answer is logged)
+        self._steer_final: str | None = None    # what the last ended turn's steer request was answered (`steer_result`)
+        self._client_id: str | None = None      # the turn in flight's message id, as `clientUserMessageId`
         self._end_turn()
 
     def _end_turn(self) -> None:
@@ -290,6 +353,13 @@ class CodexSession:
         # still comes belongs to no later turn.
         self._pending.pop(self._start_id, None)
         self._pending.pop(getattr(self, "_restart_id", None), None)
+        steer = getattr(self, "_steer", None)
+        if steer is not None and self._pending.pop(steer["id"], None) is not None:
+            self._retired.add(steer["id"])      # unanswered by the turn's end: an answer that still comes is logged
+        self._steer: dict | None = None         # the turn's one `turn/steer`: {"id", "turn", "answer", "written"}
+        self._steer_spent = False               # this turn's steer was taken back: no second request in this turn
+        self._answer_turn: str | None = None    # the turn the answer to THIS turn/start named (the proof's T)
+        self._owned_in: set[str] = set()        # turns in which a userMessage item with this turn's clientId came
         self._start_id = None
         self._turn_open = self._started = False
         self._turn_id: str | None = None
@@ -337,9 +407,51 @@ class CodexSession:
         params = {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]}
         if self._effort is not None:
             params["effort"] = self._effort     # "for this turn and subsequent turns": sent each time (a resume too)
+        # The message's own id, which Codex echoes as the `clientId` of the userMessage item of the turn that took it
+        # (the steer's proof, `owns`). Last, so the line is main's with one key added. Random, not uuid4's generator.
+        self._client_id = _fresh_id()
+        params["clientUserMessageId"] = self._client_id
+        self._steer_final = None
         data = self._request("turn/start", params)
         self._start_id = self._next_id
         return [data]
+
+    # ------------------------------------------------------------ steering (module text)
+
+    def owns(self) -> bool:
+        """The turn in flight is PROVED to be this message's: the answer to its turn/start named T, and a userMessage
+        item with its clientId was reported in T (either order)."""
+        return (self._turn_open and not self._dead and _proof_id(self._answer_turn)
+                and self._answer_turn in self._owned_in)
+
+    def steer(self, text: str) -> list[bytes] | None:
+        """`turn/steer` into the proved turn, once per turn; None while it is not proved (nothing is written)."""
+        if not self.owns() or self._steer is not None or self._steer_spent or not isinstance(text, str):
+            return None
+        data = self._request("turn/steer", {"threadId": self.thread_id, "expectedTurnId": self._answer_turn,
+                                            "input": [{"type": "text", "text": text}]})
+        self._steer = {"id": self._next_id, "turn": self._answer_turn, "answer": None, "written": False}
+        return [data]
+
+    def steer_written(self) -> None:
+        """The host: every byte of the steer's frame is in the pipe. Only an answer read after this is evidence."""
+        if self._steer is not None:
+            self._steer["written"] = True
+
+    def steer_retire(self) -> None:
+        """The steer's frame was taken back with not one byte of it written: its request id is retired (never
+        answered, never sent)."""
+        if self._steer is not None:
+            self._pending.pop(self._steer["id"], None)
+            self._retired.add(self._steer["id"])
+            self._steer = None
+            self._steer_spent = True    # never a second request in this turn (a recovered gate writes nothing)
+
+    def steer_result(self) -> str | None:
+        """What the steer request of the turn that just ended (its `turn/completed`) was answered before that end:
+        "ok" (success naming the proved turn), "refused" (one of Codex's three -32600 refusals), "other" (any other
+        answer), or None (no answer, or no steer)."""
+        return self._steer_final
 
     def holds_turns(self) -> bool:
         """Codex is running a turn of its own in this thread (one no message here started). A `turn/start` written
@@ -418,6 +530,9 @@ class CodexSession:
     def _answered(self, rid, msg: dict) -> tuple[list[Event], list[bytes]]:
         method = self._pending.pop(rid, None) if isinstance(rid, int) else None
         if method is None:
+            if isinstance(rid, int) and rid in self._retired:
+                self._retired.discard(rid)
+                log.info("a late answer to a turn/steer retired with its turn (request %s): it changes nothing", rid)
             return [], []
         result = msg.get("result")
         failed = "error" in msg or not isinstance(result, dict)
@@ -462,6 +577,10 @@ class CodexSession:
             kind = sandbox.get("type") if isinstance(sandbox, dict) else None
             return [Event("ready", provider_id=tid,
                           mode=kind if isinstance(kind, str) and NAME_RE.fullmatch(kind) else None)], []
+        if self._steer is not None and rid == self._steer["id"]:
+            # The steer's own request (`steer`): kept, for N's end (`_steer_answer`).
+            self._steer["answer"] = _steer_answer(msg, self._steer)
+            return [], []
         if method == "turn/interrupt" and rid == self._restart_id:
             self._restart_ok = not failed       # the restart's own request: only a success counts (`interrupted`)
             return [], []
@@ -477,6 +596,8 @@ class CodexSession:
             turn = result.get("turn")
             if isinstance(turn, dict) and isinstance(turn.get("id"), str):
                 self._turn_id = turn["id"]
+                # (the proof's T: only from the answer to this very request, and only a nonempty id: R2-01)
+                self._answer_turn = turn["id"] if _proof_id(turn["id"]) else None
         return [], []       # turn/interrupt's answer, either way: the turn's own end says what happened
 
     def _asked(self, rid, method: str) -> tuple[list[Event], list[bytes]]:
@@ -499,6 +620,11 @@ class CodexSession:
         if not self._turn_open:
             self._between_turns(method, params)
             return [], []
+        if method in ("item/started", "item/completed"):
+            item = params.get("item")
+            if (isinstance(item, dict) and item.get("type") == "userMessage" and self._client_id is not None
+                    and item.get("clientId") == self._client_id and _proof_id(params.get("turnId"))):
+                self._owned_in.add(params["turnId"])    # the message's input is in that turn (the proof's other half)
         if method == "turn/started":
             turn = params.get("turn")
             tid = turn.get("id") if isinstance(turn, dict) else None
@@ -631,5 +757,6 @@ class CodexSession:
         # (The restart's request is this turn's: `turn/completed` is read only for the turn in flight, and
         # `_end_turn` retires the request with the turn.)
         self._by_interrupt = self._restart_ok
+        self._steer_final = self._steer["answer"] if self._steer is not None else None   # read before this end
         self._end_turn()
         return event

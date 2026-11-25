@@ -851,6 +851,7 @@ def test_effort_goes_with_every_codex_turn(senv):
     assert p._params["sandbox"] == "read-only"
     p.thread_id = cx.THREAD
     turn = json.loads(p.turn("hello")[0])
+    assert cx.UUID4.fullmatch(turn["params"].pop("clientUserMessageId")), "K (step 2): the message's own id, last"
     assert turn["method"] == "turn/start" and turn["params"] == {
         "threadId": cx.THREAD, "input": [{"type": "text", "text": "hello"}], "effort": "low"}
     plain = CodexSession()
@@ -2356,9 +2357,9 @@ def test_a_runner_that_names_its_own_directory_is_held_against_where_the_parent_
     node = make_node(senv, config=config, log_dir=senv.tmp / "b-logs")
     node.hello()
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 4, "runners": {"claude-code": ["read-only", "workspace"],
+    assert info["session_host"] == {"tree": 5, "runners": {"claude-code": ["read-only", "workspace"],
                                                            "codex-cli": ["read-only", "workspace"]},
-                                    "dirs": {"codex-cli": str(here)}}
+                                    "dirs": {"codex-cli": str(here)}}      # (K, step 2: `tree` 5)
     sid = start(senv)["session_id"]
     # (a status that says the access and not yet where the session runs, as an earlier node version's would)
     senv.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [], "state": "idle", "access": "workspace",
@@ -2434,15 +2435,15 @@ def test_a_node_that_does_not_declare_the_child_protocol_is_listed_no_child(senv
                              "status_seq"}, "... and that as before there were trees"
     declared = {x["session_id"]: x for x in senv.laptop.get("/api/nodes/sessions", params={"tree": 1}).json()["sessions"]}
     assert set(declared) == {sid, kid} and declared[kid]["parent"] == sid and declared[sid]["access"] is None
-    assert spy.gets and all(params.get("tree") == 4 for _, params in spy.gets), "this node says so every time"
+    assert spy.gets and all(params.get("tree") == 5 for _, params in spy.gets), "this node says so every time"
     assert msg(senv, kid, 1)["state"] == "queued"
 
 
 def test_children_need_a_node_whose_latest_hello_declares_the_protocol(senv):
     """S5. Creation requires current support, and a child whose node no longer has it is not left closing for ever."""
     [info] = [n for n in nodes.nodes(senv.board) if n["node"] == "laptop"]
-    assert info["session_host"] == {"tree": 4, "runners": {"claude-code": ["read-only", "workspace"],
-                                                           "codex-cli": ["read-only", "workspace"]}}
+    assert info["session_host"] == {"tree": 5, "runners": {"claude-code": ["read-only", "workspace"],
+                                                           "codex-cli": ["read-only", "workspace"]}}   # (K: `tree` 5)
     sid = root(senv)
     kid = child(senv, sid)["session_id"]
     hello = {"projects": [PROJECT, P2, P3], "runners": ["claude-code", "codex-cli"], "sessions": {"max_live": 4}}

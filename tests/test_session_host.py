@@ -1127,7 +1127,9 @@ def test_a_hosted_codex_session_writes_only_the_handshake_before_it_is_ready(hen
 
     child.emit(cx.reply(2, cx.THREAD_RESULT), cx.THREAD_STARTED)
     assert kinds(host.tick()) == [("delivered", mid)]
-    assert written(child)[3] == {"id": 3, "method": "turn/start", "params": {
+    start = written(child)[3]
+    assert cx.UUID4.fullmatch(start["params"].pop("clientUserMessageId")), "K (step 2): the message's own id"
+    assert start == {"id": 3, "method": "turn/start", "params": {
         "threadId": cx.THREAD, "input": [{"type": "text", "text": "the message"}]}}
     assert (s.state, s.provider_id, s.resume) == ("running", cx.THREAD, True)
     assert json.loads((henv.log_dir / PROVIDER_FILE).read_text()) == {SID: cx.THREAD}

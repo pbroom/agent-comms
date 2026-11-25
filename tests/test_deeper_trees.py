@@ -1235,7 +1235,7 @@ def test_r3_n3_nothing_is_started_under_a_full_child_on_a_node_that_does_not_kee
             nodes_mod._put(c, nodes_mod.NODE_PREFIX + "laptop", info, "laptop", senv.clock())
 
     node = full_node(senv, "n3", max_live=3)
-    assert nodes_mod._get(senv.board.conn, nodes_mod.NODE_PREFIX + "laptop")["session_host"]["tree"] == 4
+    assert nodes_mod._get(senv.board.conn, nodes_mod.NODE_PREFIX + "laptop")["session_host"]["tree"] == 5  # (K, step 2)
     grant(senv, access="full")
     r = root(senv, node=node)
     answer(senv, r, node=node)

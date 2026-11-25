@@ -15,6 +15,14 @@ host's events in order and the board's log lines. It promises two cases (`record
   carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them; and,
   in the logs, the one INFO line per process saying that turn correlation is off for it (`told`).
 
+Mid-turn steering, step 2 (DESIGN_NOTES "Mid-turn steering, step 2: Codex steering, as built"; the design's K) adds
+what K names for a run in which no steer is sent, and nothing else: `named` (`record(named=True)`, `step2_named`)
+takes out of the RAW run, before anything is normalized, exactly these and records what it took (`NAMED`):
+- the Codex wire: `clientUserMessageId` (a fresh uuid4), the last key of each `turn/start` line's params;
+- the protocol: `steer` at the end of a listing's `features`, and `steer` in a Codex session record's `modes`;
+- the host's events: a `steer` key whose value is None (the field of a turn's end that carries a steer's outcome).
+Anything else that looks similar stays, and differs. The run also fetches the listing at protocol 5 (`listing_p5`).
+
     PYTHONPATH=<main's tree>:<main's tree>/tests python tests/golden_schema_free.py OUT.json    # (re)record
 """
 import itertools
@@ -26,9 +34,10 @@ import uuid
 from pathlib import Path
 
 
-def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
+def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False) -> dict:
     """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
-    `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`)."""
+    `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`).
+    `named`: take out what mid-turn steering's step 2 names for a run with no steer (`step2_named`), likewise."""
     import logging
     from agent_comms.providers import claude
     counter = itertools.count(1)
@@ -49,7 +58,7 @@ def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
     board.addHandler(keep)
     board.setLevel(logging.INFO)
     try:
-        return _run(tmp_path, logs, allow)
+        return _run(tmp_path, logs, allow, named)
     finally:
         board.removeHandler(keep)
         board.setLevel(level)
@@ -60,7 +69,7 @@ def record(tmp_path: Path, verified=None, allow: bool = False) -> dict:
             del claude.VERIFIED
 
 
-def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
+def _run(tmp_path: Path, logs: list, allow: bool, named: bool = False) -> dict:
     import dataclasses
     from agent_comms import cli, hosted, hosted_results, hosted_spawn as hs
     from test_hosted_sessions import session_env, show, start, tick, written
@@ -69,6 +78,20 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
     env = session_env(tmp_path, dispatch=TREE, config=tree_config)
     out: dict = {}
     events: list = []
+    # The node's raw report and hello bodies, as it sends them (review round 1: the golden's limits). A report's
+    # `seq` is the wall clock in ns (node_sessions._stamp): taken out here, the same on main's code and this one.
+    bodies: list = []
+    node_client = env.node.sessions.client
+    real_request = node_client.request
+
+    def recording(method, url, *args, **kw):
+        if method == "POST" and (url == "/api/nodes/hello" or str(url).startswith("/api/nodes/sessions/")):
+            body = json.loads(json.dumps(kw.get("json")))
+            if isinstance(body, dict) and "seq" in body:
+                body["seq"] = 0
+            bodies.append([str(url), body])
+        return real_request(method, url, *args, **kw)
+    node_client.request = recording
     host = env.node.sessions.host
     real_tick = host.tick
 
@@ -144,7 +167,16 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
     _sequences(env, out, allow)
     _host_cases(tmp_path, out, allow)
     out["host_events"] = events
+    out["node_bodies"] = bodies
     out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:") and not (allow and told(x, REMOVED))]
+    # The listing at protocol 5 (step 2's): with no steer, what a protocol-4 fetch gets (main's code answers it so).
+    out["listing_p5"] = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json()
+    # Review round 3, the parity rule: with no steer attempt live, a cancel, a shutdown and a flush overlapping it are
+    # main's, event for event and report for report.
+    out["zz_parity"] = _parity(tmp_path)     # (named to sort last: the ids before it keep their placeholders)
+    NAMED.clear()
+    if named:
+        step2_named(out)
     return normalized(out, tmp_path)
 
 
@@ -160,6 +192,239 @@ def told(entry: list, removed: list) -> bool:
         removed.append(("log", entry[2]))
         return True
     return False
+def _parity(tmp_path: Path) -> dict:
+    """Three runs with no steer, each on a hub and node of its own, recording every report body the node sends (its
+    wall-clock `seq` zeroed), in order, and what the sessions show after (review round 3, the parity rule):
+    - a parent cancels its child's queued task while the node's watchdog has just stopped the child's turn in flight
+      (R3-07's case: no cancel held here, the watchdog's end not reported yet);
+    - a shutdown with several ordinary sessions, two with a turn in flight and one idle;
+    - a flush under way when shutdown begins (the loop's own flush, then shutdown's)."""
+    from agent_comms import hosted_spawn as hs
+    from agent_comms.session_host import HostEvent
+    from test_hosted_sessions import P2, P3, session_env, show, start, tick
+    from test_hosted_tree import TREE, answer, tree_config
+
+    def recorded(name):
+        env = session_env(tmp_path / f"parity-{name}", dispatch=TREE, config=tree_config)
+        bodies: list = []
+        node_client = env.node.sessions.client
+        real = node_client.request
+
+        def recording(method, url, *args, **kw):
+            if method == "POST" and str(url).startswith("/api/nodes/sessions/"):
+                body = json.loads(json.dumps(kw.get("json")))
+                if isinstance(body, dict) and "seq" in body:
+                    body["seq"] = 0
+                bodies.append([str(url), body])
+            return real(method, url, *args, **kw)
+        node_client.request = recording
+        return env, bodies
+
+    def bound(env, sid):
+        hs.ensure_secret(env.board)
+        return hs.Ident(hosted=sid, key=hs.bind_key(env.board.conn, sid), claimed=True)
+
+    out: dict = {}
+    env, bodies = recorded("cancel")
+    root = start(env, "first")["session_id"]
+    tick(env)
+    answer(env, root, "root reply")
+    project = show(env, root)["project"]
+    env.human.post("/api/spawn-grants", json={"project": project, "agents": ["claude"], "access": "workspace",
+                                              "hours": 1})
+    kid = hs.spawn(env.board, env.p["claude"], bound(env, root), task="the task", agent="claude")["child"]["id"]
+    tick(env)
+    hs.send(env.board, env.p["claude"], bound(env, root), kid, message="a task behind it")
+    runner = env.node.sessions
+    env.clock.advance(runner.self_stop_seconds + 1)
+    runner.enforce_deadlines()          # the watchdog stops the child's turn: its end waits for the loop
+    hs.cancel(env.board, env.p["claude"], bound(env, root), kid)
+    tick(env, times=3)
+    out["cancel"] = {"bodies": bodies, "kid": show(env, kid)["messages"]}
+
+    env, bodies = recorded("shutdown")
+    a = start(env, "one")["session_id"]
+    b = start(env, "two", project=P2)["session_id"]
+    c = start(env, "three", project=P3)["session_id"]
+    tick(env)
+    answer(env, c, "three's reply")
+    runner = env.node.sessions
+    runner.signal()
+    runner.kill()
+    runner.shutdown()
+    out["shutdown"] = {"bodies": bodies, "sessions": [show(env, x)["messages"] for x in (a, b, c)]}
+
+    env, bodies = recorded("overlap")
+    a = start(env, "one")["session_id"]
+    b = start(env, "two", project=P2)["session_id"]
+    tick(env)
+    runner = env.node.sessions
+    real = runner.client.request
+
+    def stops_after_first(method, url, *args, **kw):
+        if method == "POST" and str(url).startswith("/api/nodes/sessions/"):
+            runner.stopping.set()           # shutdown begins while this report is on its way
+        return real(method, url, *args, **kw)
+    runner.client.request = stops_after_first
+    runner._emit([HostEvent(a, "turn_ended", "1", ok=True, text="a's end"),
+                  HostEvent(b, "turn_ended", "1", ok=True, text="b's end")])
+    runner._flush()
+    left = [[x, e] for x, e in runner.pending]
+    runner.client.request = real
+    runner.shutdown()
+    out["overlap"] = {"bodies": bodies, "left_after_the_loops_flush": left,
+                      "sessions": [show(env, x)["messages"] for x in (a, b)]}
+    return out
+
+
+# ------------------------------------------------------------ mid-turn steering, step 2 (the design's K)
+
+NAMED: list = []        # what the last run with `named` took out: (kind, where)
+CLIENT_ID = re.compile(r', "clientUserMessageId": "(' + r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+                       + r')"\}\}$')
+CLIENT_IDS: set = set()
+STARTS: dict = {}       # (round 6, R6-05) a stripped id -> (its turn/start's threadId, that request's id)
+
+
+def _codex_line(line: str) -> str:
+    """A Codex `turn/start` line without its `clientUserMessageId`, only when it is exactly that line of the adapter:
+    the key last in its params, a fresh uuid4, the rest a turn/start of main's shape."""
+    m = CLIENT_ID.search(line)
+    if not m or m.group(1) in CLIENT_IDS:
+        return line
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return line
+    params = ev.get("params") if isinstance(ev, dict) else None
+    if (not isinstance(params, dict) or ev.get("method") != "turn/start" or list(ev) != ["id", "method", "params"]
+            or list(params)[-1] != "clientUserMessageId" or params["clientUserMessageId"] != m.group(1)):
+        return line
+    stripped = line[:m.start()] + "}}"
+    if json.loads(stripped) != {**ev, "params": {k: v for k, v in params.items() if k != "clientUserMessageId"}}:
+        return line
+    CLIENT_IDS.add(m.group(1))
+    STARTS[m.group(1)] = (params.get("threadId"), ev.get("id"))
+    NAMED.append(("client_id", m.group(1)))
+    return stripped
+
+
+def _events_named(passes: list, where: str) -> None:
+    for got in passes:
+        for e in got:
+            if isinstance(e, dict) and "steer" in e and e["steer"] is None and list(e)[-1] == "steer":
+                del e["steer"]
+                NAMED.append(("host_event", where))
+
+
+def cx_thread() -> str:
+    import test_providers_codex as cx
+    return cx.THREAD
+
+
+def cx_turn() -> str:
+    import test_providers_codex as cx
+    return cx.TURN
+
+
+ITEM = re.compile(r'"clientId": "([0-9a-f-]{36})"')
+
+
+def _turns_answered(lines: list) -> dict:
+    """In one transcript: each request id -> the turn ids its answers named (`result.turn.id`)."""
+    out: dict = {}
+    for x in lines:
+        try:
+            ev = json.loads(x)
+        except ValueError:
+            continue
+        result = ev.get("result") if isinstance(ev, dict) else None
+        turn = result.get("turn") if isinstance(result, dict) else None
+        if isinstance(turn, dict) and isinstance(turn.get("id"), str) and "id" in ev:
+            out.setdefault(ev["id"], set()).add(turn["id"])
+    return out
+
+
+def _item_echo(line: str, answered: dict | None = None) -> str:
+    """Codex's echo of a stripped `clientUserMessageId` in a userMessage item (K: "echoed as the userMessage item's
+    clientId"), back to the null main's run has, only for an id `_codex_line` took and only in such an item.
+    (Round 6, R6-05:) only in the item's own `clientId` field, and only for the start it answers in this transcript:
+    the item's thread is that start's, and its turn is the one this transcript's answer to that start named
+    (`answered`), so two starts' ids swapped are not taken. (Round 7, R7-05: two starts that genuinely join the same
+    thread AND turn, Codex's join, are not told apart by this: their ids could be swapped and still be taken. The
+    fixture records no such pair. If the golden records joins, bind each echo also to its process (the transcript's
+    process, by the start's stdin) and to its input (the start's `input` text against the item's `content`).)"""
+    m = ITEM.search(line)
+    if not m or m.group(1) not in CLIENT_IDS:
+        return line
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return line
+    params = ev.get("params") if isinstance(ev, dict) else None
+    item = params.get("item") if isinstance(params, dict) else None
+    if not isinstance(item, dict) or ev.get("method") not in ("item/started", "item/completed") or item.get("type") != "userMessage":
+        return line
+    if item.get("clientId") != m.group(1):
+        return line
+    thread, rid = STARTS.get(m.group(1), (None, None))
+    if params.get("threadId") != thread or params.get("turnId") not in (answered or {}).get(rid, ()):
+        return line
+    nulled = line[:m.start()] + '"clientId": null' + line[m.end():]
+    if json.loads(nulled) != {**ev, "params": {**params, "item": {**item, "clientId": None}}}:
+        return line
+    NAMED.append(("client_id_echo", m.group(1)))
+    return nulled
+
+
+def _modes_named(body, where: str) -> None:
+    """A report body's `modes` with `steer` first (a Codex session to a hub that steers: K)."""
+    if isinstance(body, dict) and isinstance(body.get("modes"), list) and body["modes"][:1] == ["steer"]:
+        body["modes"] = body["modes"][1:]
+        NAMED.append(("report_modes", where))
+
+
+def _codex_sessions(out: dict) -> set:
+    """The session ids the run recorded as Codex sessions (`host.session.<id>` with runtime codex-cli): K's `modes`
+    allowance is for those only (R2-11), so a Claude report that names `steer` is never hidden."""
+    sids = set()
+    for key in ("records", "seq_records"):
+        for k, rec in (out.get(key) or {}).items():
+            if k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "codex-cli":
+                sids.add(k[len("host.session."):])
+    return sids
+
+
+def step2_named(out: dict) -> None:
+    """Take K's named changes out of the raw run, in place (module text), each recorded in NAMED."""
+    CLIENT_IDS.clear()
+    STARTS.clear()
+    codex = _codex_sessions(out)
+    out["stdin"] = [[_codex_line(x) for x in lines] for lines in out.get("stdin", [])]
+    out["transcripts"] = {k: [_item_echo(x, _turns_answered(lines)) for x in lines]
+                          for k, lines in (out.get("transcripts") or {}).items()}
+    for url, body in out.get("node_bodies") or []:
+        if url == "/api/nodes/hello" and isinstance((body or {}).get("session_host"), dict) \
+                and body["session_host"].get("tree") == 5:
+            body["session_host"]["tree"] = 4        # K: `tree` 5 on fetch and hello
+            NAMED.append(("hello_tree", url))
+        elif url.startswith("/api/nodes/sessions/") and url[len("/api/nodes/sessions/"):] in codex:
+            _modes_named(body, url)     # a recorded Codex session's report only (R2-11)
+    for name, case in (out.get("host_cases") or {}).items():
+        case["stdin"] = [[_codex_line(x) for x in lines] for lines in case["stdin"]]
+        _events_named(case["passes"], name)
+    _events_named(out.get("host_events") or [], "host_events")
+    for key in ("listing", "seq_listing", "listing_p5"):
+        features = (out.get(key) or {}).get("features")
+        if isinstance(features, list) and features[-1:] == ["steer"]:
+            features.pop()
+            NAMED.append(("features", key))
+    for key in ("records", "seq_records"):
+        for k, rec in (out.get(key) or {}).items():
+            if (k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "codex-cli"
+                    and isinstance(rec.get("modes"), list) and rec["modes"][:1] == ["steer"]):
+                rec["modes"] = rec["modes"][1:]
+                NAMED.append(("modes", k))
 
 
 # ------------------------------------------------------------ Claude turn correlation (DESIGN_NOTES, 2026-11-24)
@@ -395,6 +660,12 @@ def _sequences(env, out: dict, allow: bool) -> None:
     tick(env)
     child = env.node.session_spawner.children[-1]
     codex_handshake(env, child)
+    # Codex's echo of the turn's message id (its userMessage item's `clientId`), as 0.171.0 writes it: the id the
+    # turn/start carried, or null for one that carried none (main's).
+    start_line = [json.loads(x) for x in child.stdin.split(b"\n") if x and b'"turn/start"' in x][-1]
+    child.emit({"method": "item/completed", "params": {"threadId": cx_thread(), "turnId": cx_turn(), "item": {
+        "type": "userMessage", "id": "item-golden", "clientId": start_line["params"].get("clientUserMessageId"),
+        "content": [{"type": "text", "text": "seq codex"}]}}})
     codex_turn(env, child, "codex answer")
     seq["codex"] = show(env, cid)
     out["seq"] = seq
@@ -544,6 +815,11 @@ def _host_cases(tmp_path: Path, out: dict, allow: bool) -> None:
 
 def normalized(value, tmp: Path) -> dict:
     """The run's temporary directory and time stamps out (both differ by run), everything else as it is."""
+    if isinstance(value, dict) and "zz_parity" in value:
+        # Round 3's parity runs are normalized on their own, so the placeholders of everything else are what they
+        # were before they were added.
+        rest = normalized({k: v for k, v in value.items() if k != "zz_parity"}, tmp)
+        return rest | {"zz_parity": normalized(value["zz_parity"], tmp)}
     text = json.dumps(value, sort_keys=True)
     for t in sorted({str(tmp), str(tmp.resolve())}, key=len, reverse=True):
         text = text.replace(t, "<tmp>")

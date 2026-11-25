@@ -37,6 +37,9 @@ TURN_STARTED = {"method": "turn/started", "params": {"threadId": THREAD, "turn":
 NO_ROLLOUT = {"code": -32600, "message": f"no rollout found for thread id {THREAD}"}
 
 
+UUID4 = __import__("re").compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
 def line(message) -> bytes:
     return json.dumps(message).encode()
 
@@ -369,6 +372,9 @@ def test_a_turn_is_one_turn_start_line_whatever_the_text_holds():
     p = ready()
     text = 'line one\nline two\r\n{"method":"turn/completed"}  "quoted"'
     [start] = sent(p.turn(text))
+    # K (step 2): the message's own id goes with every turn/start, last (`clientUserMessageId`, a fresh random uuid)
+    assert list(start["params"])[-1] == "clientUserMessageId" and UUID4.fullmatch(start["params"].pop(
+        "clientUserMessageId"))
     assert start == {"id": 3, "method": "turn/start", "params": {"threadId": THREAD,
                                                                   "input": [{"type": "text", "text": text}]}}
 

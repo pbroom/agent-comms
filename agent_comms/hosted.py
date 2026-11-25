@@ -40,8 +40,8 @@ an optional model name and the message text.
   results, delivered to its parent as a turn whose text the hub writes.
 - A message may be sent with a mode (DESIGN_NOTES "Restarting a running turn"): `queue` (the default: everything
   above), `restart` (interrupt the turn in flight and run this one next), `auto` (start at once if the session is
-  idle, else queue behind the turn in flight; it never restarts by itself; the answer says which) or `steer`, which
-  is refused for every session for now (R6). `restart_target` decides, in the transaction that enqueues it: refused
+  idle, else queue behind the turn in flight; it never restarts by itself; the answer says which) or `steer` (put
+  the message into the turn in flight: hosted_steer.py, which is not a message at all). `restart_target` decides, in the transaction that enqueues it: refused
   with the reason when the node's protocol, the session's agent CLI, the turn in flight or its kind do not allow it,
   or when other messages are queued (R7: a restart never runs out of order). Such a message is an ordinary queued
   message with `mode` and `into` (the turn it replaces): its node interrupts that turn, and runs it next as it
@@ -76,7 +76,6 @@ SEND_MODES = ("auto", "queue", "steer", "restart")
 MODE_FIELDS = ("mode", "into", "restarted_by", "replaced")     # on a message sent with a mode, and what came of it
 RECEIPT_SECONDS = 7 * 86400     # how long a request id is remembered (`receipts`), past its message's own record
 REFUSED = {
-    "steer": "mid-turn steering is not available yet; use restart to redirect a running turn, or queue",
     "protocol": ("its node {node} speaks session protocol {tree}; restarting needs {need} (update the node: `board "
                  "node` from this version)"),
     "cli": "this session's agent CLI cannot restart a running turn (its node says so)",
@@ -86,6 +85,7 @@ REFUSED = {
     "cancelled": "the turn in flight (message {n}) is being cancelled",
     "queued": ("{k} message(s) are already queued for this session; a restart would have to jump them: cancel them "
                "or send with queue"),
+    "steered": "a steer into the turn in flight (message {n}) is not settled yet: a restart waits for it",
 }
 KIND_WORDS = {"wake": "a wake turn (board posts for its agent)",
               "child": "a result-delivery turn (its children's results)"}
@@ -99,8 +99,9 @@ SHOW_MESSAGES = 20                 # the most recent messages `show` lists
 KEEP_ENDED_SECONDS = 7 * 86400     # an ended session's record is kept this long
 KEEP_SETTLED_SECONDS = 86400       # a settled message's record, in a session that goes on
 NODE_WAIT_MAX = 25                 # seconds one long-poll of a node may wait
-NODE_REPORT_FEATURES = ("answered", "restart")  # report fields this hub takes beyond the first ones (`_listed`);
-                                                # `restart`: `modes`, and `restarted_by` on a turn's end
+NODE_REPORT_FEATURES = ("answered", "restart", "steer")  # report fields this hub takes beyond the first ones
+                                                # (`_listed`); `restart`: `modes`, and `restarted_by` on a turn's end;
+                                                # `steer`: the steer extension on a turn's end (hosted_steer.py)
 HUMAN_WAIT_MAX = 30                # ... and one of the human's CLI
 WAIT_POLL_SECONDS = 0.25           # how often a waiting call re-reads the database
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -241,6 +242,10 @@ def _human_view(board: Board, r: dict) -> dict:
     home = account_home(board.conn, r)
     if home is not None:        # the account folder its node says this agent's runner uses (agent_accounts.py)
         out["account_home"] = home
+    from . import hosted_steer
+    steering = hosted_steer.unsettled(board.conn, r["session_id"]) if hosted_steer.has_steers(r) else None
+    if steering is not None:    # a steer not settled yet (hosted_steer.py): the drain's check, `board session list`
+        out["steer_unsettled"] = {"into": steering["into"]}
     if isinstance(r.get("pool"), dict):     # the pool its agent was chosen from, and why (account_pools.py)
         out["pool"] = {"name": r["pool"].get("name"), "why": r["pool"].get("why")}
     from . import hosted_tree
@@ -546,6 +551,11 @@ def _prune(c, now: float) -> None:
             c.execute("DELETE FROM board_state WHERE key >= ? AND key < ?",
                       _range(f"{hosted_results.RESULT_PREFIX}{r['session_id']}."))
             c.execute("DELETE FROM board_state WHERE key = ?", (hosted_results.OUTBOX_PREFIX + r["session_id"],))
+            from . import hosted_steer
+            if hosted_steer.has_steers(r):
+                hosted_steer.prune_session(c, r["session_id"])    # its steers, with the session
+    from . import hosted_steer
+    hosted_steer.prune_orphans(c)       # steer rows of sessions that are gone
 
 
 def _enqueue(c, r: dict, kind: str, text: str, by: str, now: float, output: dict | None = None) -> dict:
@@ -656,18 +666,28 @@ def send(board: Board, p: Principal, session_id: Any, text: Any, mode: Any = "qu
             check = False       # (the session's own refusal comes below, as on main)
         output, text_asked, why = ask(text, output_schema, "human", check=check)
         text = text_asked or text
-    from . import hosted_spawn, hosted_tree
+    from . import hosted_spawn, hosted_steer, hosted_tree
     rid = hosted_tree._request_id(request_id)
     _settle(board, _session(board.conn, session_id))
     with db.write_tx(board.conn) as c:
         now = board.now()       # read under the write lock
         r = _session(c, session_id)
         by = {"human": p.name}
+        was, steer = hosted_steer.sent_before(c, r, rid, by, now)
+        if was:         # a steer already sent with this request id: the same steer, never this call's text
+            return {"session": _human_view(board, r)} | hosted_steer.answer(steer, False)
         hit = sent_before(c, r, rid, by, now)
         if hit is not None:
             if output_schema is None:
                 return {"session": _human_view(board, r), "message": _msg_view(hit), "created": False}
             return retried_answer(board, c, r, hit)
+        if mode == "steer":
+            m, refused = hosted_steer.target(board, c, r, False, text, schema=output_schema is not None)
+            if refused:
+                raise hosted_steer.refuse(r, refused)
+            s = hosted_steer.accept(c, r, m, text, "user", by, p.name, rid, now)
+            hosted_spawn.human_messaged(c, r, now)     # the human's own word, as for any send of the human's
+            return {"session": _human_view(board, r)} | hosted_steer.answer(s, True)
         if why:
             raise Invalid(why)
         how = send_mode(c, r, mode, by_parent=False)
@@ -717,6 +737,10 @@ def restart_target(c, r: dict, by_parent: bool) -> tuple[dict | None, str | None
         return None, REFUSED["cancelled"].format(n=n)
     if int(r.get("queued") or 0) > 0:
         return None, REFUSED["queued"].format(k=int(r["queued"]))
+    from . import hosted_steer
+    steering = hosted_steer.unsettled(c, r["session_id"]) if hosted_steer.has_steers(r) else None
+    if steering is not None:
+        return None, REFUSED["steered"].format(n=steering["into"])
     return m, None
 
 
@@ -730,7 +754,7 @@ def send_mode(c, r: dict, mode: str, by_parent: bool) -> dict:
     if mode == "queue":
         return {"mode": "queue", "into": None, "why": None}
     if mode == "steer":
-        raise Conflict(f"cannot steer into session {r['session_id']}: {REFUSED['steer']}")
+        raise Invalid("a steer is not a message: hosted_steer decides it (hosted.send, hosted_spawn.send)")
     if mode == "auto":
         busy = r.get("in_flight") is not None or int(r.get("queued") or 0) > 0
         return {"mode": "queue", "into": None,
@@ -807,6 +831,11 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
         out = _human_view(board, r)
         msgs = _messages(c, r["session_id"])[-SHOW_MESSAGES:]
         out["messages"] = _labelled(c, r, msgs, "whole")
+        from . import hosted_steer
+        for v in out["messages"] if hosted_steer.has_steers(r) else ():     # (none read for a session never steered)
+            s = hosted_steer.view(hosted_steer.get(c, r["session_id"], v.get("n")))
+            if s is not None:       # a steer into this turn (hosted_steer.py): its terminal status
+                v["steer"] = s
         data = _result_data(r, next((m for m in msgs if m.get("n") == r.get("reply_for")), None))
     finally:
         c.execute("ROLLBACK")
@@ -825,8 +854,9 @@ def show(board: Board, p: Principal, session_id: Any) -> dict:
     return out
 
 
-def message(board: Board, p: Principal, session_id: Any, n: Any) -> dict:
-    """One message and its session (the reply included): what `--wait` polls."""
+def message(board: Board, p: Principal, session_id: Any, n: Any, steer: bool = False) -> dict:
+    """One message and its session (the reply included): what `--wait` polls. `steer`: with the steer into that
+    turn's terminal status (hosted_steer.view; None when it took none)."""
     _human(board, p, "read a hosted session")
     _settle(board, _session(board.conn, session_id))
     # One snapshot for both reads: a turn that completes between them would otherwise show its message `done` beside
@@ -838,6 +868,10 @@ def message(board: Board, p: Principal, session_id: Any, n: Any) -> dict:
         if not isinstance(m, dict):
             raise NotFound(f"session {r['session_id']} has no message {n}")
         out = {"message": _labelled(c, r, [m], "whole")[0], "session": _human_view(board, r)}
+        if steer:
+            from . import hosted_steer
+            out["steer"] = (hosted_steer.view(hosted_steer.get(c, r["session_id"], n)) if hosted_steer.has_steers(r)
+                            else None)
         data = _result_data(r, m)
         return out if data is None else out | {"result_data": data}
     return in_snapshot(board, read)
@@ -1010,6 +1044,8 @@ def _end(c, r: dict, detail: str, by: str, now: float, results: bool = False) ->
             _put(c, _msg_key(r["session_id"], m["n"]), m, by, now)
     r |= {"state": "ended", "error": detail, "ended_at": now, "updated_at": now, "pid": None, "queued": 0,
           "in_flight": None}
+    from . import hosted_steer
+    hosted_steer.settle_unsettled(c, r, now)    # a steer settles with its turn, by the one rule (no host's word here)
     from . import hosted_tree
     hosted_tree.cascade(c, r, by, now)      # however a parent ended, its children are closed
     from . import hosted_results
@@ -1036,7 +1072,8 @@ def _settle(board: Board, r: dict) -> dict:
     has a turn in flight, and one being closed is closed. The node stops its own turns well before that
     (node_sessions.py), so the failed turn is not still running somewhere."""
     now = board.now()
-    from . import hosted_tree
+    from . import hosted_steer, hosted_tree
+    r = hosted_steer.sweep(board, r)
     if not hosted_tree.orphaned(board.conn, r) and not _lost(board.conn, r, now):
         return r
     with db.write_tx(board.conn) as c:
@@ -1065,6 +1102,8 @@ def _settle(board: Board, r: dict) -> dict:
                     if closed:
                         m["output"] = closed
                     _put(c, _msg_key(r["session_id"], m["n"]), m, "hub", now)
+                    from . import hosted_steer
+                    hosted_steer.settle(c, r, m["n"], None, now)     # its steer, by the rule: no host's word
                     r["last_result"] = {"message": m["n"], "ok": False, "detail": m["detail"], "denials": [],
                                         "meta": {}, "at": now}
                     from . import hosted_results
@@ -1103,11 +1142,23 @@ def node_sessions(board: Board, p: Principal, tree: bool = False, applied: Any =
     # wakes were checked (hosted_results.deliver): so they are made and shown on what is stored then.
     # An agent's task for a child is shown with its text only once it is reserved here too (`_reserve_tasks`, in the
     # same write transaction): from then on the dispatcher counts its checkout busy (hosted_wake.turn_projects).
-    out = hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree),
+    # A steer (hosted_steer.py) is offered only from this same write transaction, after every check is made again,
+    # and the answer shows exactly what was offered in it: the build right after `deliver`, inside that transaction,
+    # takes the offers (once); any other build (a read snapshot, the wake fallback after a rollback) shows none.
+    from . import hosted_steer
+    offers: list = []
+
+    def deliver(c, now):
+        hosted_results.deliver(board, c, p.name, now)
+        _reserve_tasks(board, c, p.name, now)
+        offers.append({})
+        hosted_steer.offer(board, c, p.name, int(tree), now, offers[-1])
+
+    out = hosted_wake.listing(board, p.name, lambda: _listed(board, p, tree, offers.pop() if offers else None),
                               due=lambda conn: (hosted_results.due(board, conn, p.name)
-                                                or _tasks_due(board, conn, p.name)),
-                              deliver=lambda c, now: (hosted_results.deliver(board, c, p.name, now),
-                                                      _reserve_tasks(board, c, p.name, now)))
+                                                or _tasks_due(board, conn, p.name)
+                                                or hosted_steer.due(conn, p.name)),
+                              deliver=deliver)
     if tree >= hosted_tree.SPAWN_PROTOCOL:      # (only a node of the protocol says what it applied)
         _note_listing(board, p.name, out.get("version"), t0)
     return out
@@ -1168,8 +1219,9 @@ def _note_session_loop(board: Board, node: str, applied: Any, bound: Any) -> Non
         _put(c, LOOP_PREFIX + node, loop, "hub", board.now())
 
 
-def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
-    """node_sessions' answer, read inside the transaction hosted_wake.listing opened."""
+def _listed(board: Board, p: Principal, tree: bool = False, shown: dict | None = None) -> dict:
+    """node_sessions' answer, read inside the transaction hosted_wake.listing opened. `shown`: the steers offered in
+    this very transaction (hosted_steer.offer), session id -> item; only a node of protocol 5 is ever offered one."""
     nodes._require_node(board, p)       # again, in that transaction: a pause may have landed since the first check
     from . import hosted_spawn, hosted_tree
     spawn = hosted_tree.spawn_config(board).enabled
@@ -1177,7 +1229,7 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
     # and the messages whose turn their starter cancelled. Nothing of it for an earlier node, or with spawn off.
     spawns = spawn and int(tree) >= hosted_tree.SPAWN_PROTOCOL
     restarts = int(tree) >= hosted_tree.RESTART_PROTOCOL   # a node that restarts: a message's mode and turn
-    out, mark = [], []
+    out, mark, stamps = [], [], []
     every = _sessions(board.conn)
     for r in sorted(every, key=lambda r: r["session_id"]):
         if (r.get("node") != p.name or r.get("state") == "ended" or (hosted_tree.is_child(r) and not tree)
@@ -1211,6 +1263,13 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
         # parent's live process.
         held = bool(spawns and hosted_tree.is_child(r) and r.get("access") == "full"
                     and any(hosted_tree.subtree_open(board, board.conn, r, every).values()))
+        from . import hosted_steer
+        steer = (shown or {}).get(r["session_id"])
+        if steer is not None:
+            if hosted_steer.renderable(board.conn, r, tree):
+                stamps.append((r["session_id"], steer["into"]))
+            else:
+                steer = None
         out.append({k: r.get(k) for k in ("session_id", "agent", "runtime", "project", "model", "stop")}
                    | {"resume": r.get("resume") is True, "messages": msgs,
                       # The stamp of the last status applied (`report`): the node stamps above it, whatever its
@@ -1221,15 +1280,30 @@ def _listed(board: Board, p: Principal, tree: bool = False) -> dict:
                    | hosted_tree.node_extra(r, bool(spawn and tree), hosted_spawn.bind_key(board.conn, r["session_id"])
                                             if spawns and hosted_spawn.gives_binding(board.conn, r, board.now())
                                             else None)
-                   | ({"subtree_open": True} if held else {}))
+                   | ({"subtree_open": True} if held else {})
+                   # A steer offered in this transaction (N's number, S's uuid for the host's dedupe, its text).
+                   | ({"steer": steer} if steer is not None else {}))
         mark.append([r["session_id"], r.get("stop"), [[m["n"], m["state"]] + (["cancel"] if m.get("cancel") else [])
                                                       + ([m["held"]] if m.get("held") else []) for m in msgs],
-                     "bind" in out[-1], held])  # a binding given or withdrawn, a subtree open or not: news
+                     "bind" in out[-1], held]
+                    + ([[steer["into"], steer["uuid"]]] if steer is not None else []))  # (with none: as before)
     version = hashlib.sha256(json.dumps(mark).encode()).hexdigest()[:16]
     # What this hub takes in a node's reports beyond what every hub took: a node sends such a field only to a hub
     # that names it here, so a newer node's reports reach an older hub exactly as before (its strict model refuses an
     # unknown field, and the report would be lost).
-    return {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
+    answer = {"node": p.name, "sessions": out, "version": version, "features": list(NODE_REPORT_FEATURES)}
+    if stamps:
+        from . import hosted_steer
+        # A steer's first exposure (`listed_at`), in this transaction, only once the answer it is in can be written
+        # as the HTTP layer writes it (R2-08): one that could not be sent was never exposed.
+        if hosted_steer.serialised(answer):
+            for sid, n in stamps:
+                hosted_steer.stamp(board.conn, sid, n, board.now())
+        else:
+            import logging
+            logging.getLogger("agent_comms.hosted").warning(
+                "the session listing for node %s could not be written as JSON: no steer in it counts as listed", p.name)
+    return answer
 
 
 def checkout_runs(board: Board) -> tuple[list[dict], list[dict]]:
@@ -1344,11 +1418,15 @@ def _events(events: Any) -> list[dict]:
         answered = ev.get("answered", False)
         if not isinstance(answered, bool):
             raise Invalid("answered must be true or false")
+        from . import hosted_steer
+        # The steer extension on a turn's end: validated on its own, and a malformed one is ignored (N's end is
+        # taken either way).
+        steer = hosted_steer.extension(ev.get("steer")) if ev.get("kind") == "turn_ended" else None
         out.append({"kind": ev["kind"], "message": n, "ok": ok, "delivered": ev.get("delivered") is not False,
                     "detail": detail, "text": cap_reply(text), "denials": denials, "meta": meta,
                     # turn_ended: the provider itself ended the turn (session_host.HostEvent.answered); a node
                     # from before the field says nothing, which counts as not known
-                    "answered": answered, "restarted_by": restarted_by})
+                    "answered": answered, "restarted_by": restarted_by, "steer": steer})
     return out
 
 
@@ -1414,6 +1492,10 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
             closed = _closed(m, now, ok=ok, code=None if ok else _turn_code(detail, reached), reply=ev["text"])
             if closed:
                 m["output"] = closed
+        from . import hosted_steer
+        # N's steer, if it took one, settles here, once, by the one rule: this end's extension (the owning host's
+        # word) when it carries a valid one, else unconfirmed if it was ever listed, else not delivered.
+        hosted_steer.settle(c, r, n, ev.get("steer"), now)
         if m.get("kind") == hosted_results.KIND:
             # A turn its provider started was confirmed then (above); one the provider itself ended, with a success
             # or an error of its own (`answered`), is confirmed now. One the host gave up on was not: its results go
@@ -1434,6 +1516,8 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
         c.execute("""DELETE FROM board_state WHERE key >= ? AND key < ? AND updated_at < ? AND json_valid(value)
                      AND json_extract(value, '$.state') IN ('done', 'failed')""",
                   (*_range(f"{MSG_PREFIX}{sid}."), now - KEEP_SETTLED_SECONDS))
+        if hosted_steer.has_steers(r):
+            hosted_steer.prune_settled(c, sid)      # a settled steer goes with its message
     m["updated_at"] = now
     _put(c, _msg_key(sid, n), m, by, now)
 
@@ -1581,8 +1665,9 @@ async def node_sessions_wait(board: Board, p: Principal, wait: Any = 0, seen: An
                        lambda out: seen is None or out["version"] != seen, seconds, gone)
 
 
-async def message_wait(board: Board, p: Principal, session_id: Any, n: Any, wait: Any = 0, gone=None) -> dict:
+async def message_wait(board: Board, p: Principal, session_id: Any, n: Any, wait: Any = 0, gone=None,
+                       steer: bool = False) -> dict:
     """`message`, held back for up to `wait` seconds until the message's turn is over."""
     seconds = _wait_seconds(wait, HUMAN_WAIT_MAX)
-    return await _poll(lambda: message(board, p, session_id, n), lambda out: out["message"]["state"] in SETTLED,
-                       seconds, gone)
+    return await _poll(lambda: message(board, p, session_id, n, steer=steer),
+                       lambda out: out["message"]["state"] in SETTLED, seconds, gone)

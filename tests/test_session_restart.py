@@ -156,9 +156,10 @@ def test_claude_counts_an_abort_as_the_interrupts_only_after_a_success_receipt_f
     assert not t.interrupted(failed), "a failure that is no abort is the turn's own, receipt or not"
 
 
-def test_codex_never_steers_and_its_interrupt_is_turn_interrupt_with_the_turns_id():
+def test_codex_steers_and_its_interrupt_is_turn_interrupt_with_the_turns_id():
     p = cx.ready()
-    assert providers.modes(p) == ("restart",) and p.steers is False and not hasattr(p, "steer")
+    # Step 2: Codex's adapter steers (tests/test_codex_steering.py); the restart is as it was.
+    assert providers.modes(p) == ("steer", "restart") and p.steers is True and hasattr(p, "steer")
     p.turn("long")
     assert p.interrupt_turn() is None, "Codex has not named the turn yet"
     p.feed(cx.reply(3, cx.TURN_REPLY))
