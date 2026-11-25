@@ -682,7 +682,12 @@ def test_wait_exits_0_3_and_4_with_their_words(offenv, monkeypatch, capsys):
 # ------------------------------------------------------------ with no schema, byte for byte as on main
 
 
-BASELINE = frozenset({"0.0.0-golden-baseline"})    # a version VERIFIED that the recorded processes do not report
+BASELINE = None     # the VERIFIED set as shipped ({"2.1.330"}): the recorded processes report another version
+
+
+def golden_other_version():
+    import golden_schema_free
+    return golden_schema_free.OTHER_VERSION
 
 
 def _main_fixture():
@@ -710,9 +715,11 @@ def test_with_no_schema_every_frame_record_answer_listing_and_cli_text_is_mains(
 
 
 def test_with_a_verified_version_the_processes_do_not_report_it_is_mains_but_for_the_allowance(tmp_path):
-    """An explicitly unverified baseline (VERIFIED names a version these processes do not report): main's run, raw
-    bytes, host events and logs included, once the allowance is taken out of the raw stdin and transcripts
+    """The production setting (VERIFIED = {2.1.330}, these processes report another version, OTHER_VERSION): main's
+    run, raw bytes, host events and logs included, once the allowance is taken out of the raw stdin and transcripts
     (golden_schema_free.allowed); the next test asserts the allowance is there, and is only that."""
+    from agent_comms.providers import claude
+    assert claude.VERIFIED and golden_other_version() not in claude.VERIFIED, "production: another version"
     import golden_schema_free
     _same(golden_schema_free.record(tmp_path, verified=BASELINE, allow=True), _main_fixture())
 

@@ -9392,7 +9392,7 @@ none`, every user line with its own uuid unless named), and the e2e's correlatio
   (`replay`): each line comes back as a `user` frame with `isReplay` and the line's uuid (a CLI-made one when the
   line had none) before the turn's reply.
 
-**VERIFIED stays empty in this commit** (the coordinator's ruling 11).
+**VERIFIED was empty through review round 5**; it is {"2.1.330"} since the switch-on (below).
 
 ### Review round 1 (Sol, on 2abac71: CHANGES, 2 blockers, 6 shoulds, 1 nit) and what changed
 
@@ -9721,10 +9721,96 @@ The final lines (logger `agent_comms.session_host`, WARNING):
 Mutation re-check (scratchpad `correlation/mutate10.py`): the eight rows of the round-7 table whose change falls in
 `_spent`, where the wording changed, and a new one that swaps HELD for the write timer's detail: 9 of 9 caught.
 
+### The switch-on: VERIFIED = {"2.1.330"}
+
+The one change: `claude.VERIFIED = frozenset({"2.1.330"})`. No runtime setting or environment switch. What it forced:
+- the test that pinned the empty set now pins {"2.1.330"} (`test_verified_is_2_1_330_only`), and a new one shows a
+  process reporting another version is attributed by order with main's bytes after its first init;
+- the tests of main's exact bytes and of the unverified path set VERIFIED empty for themselves
+  (test_providers_claude, test_session_host, test_session_restart, and the correlation tests that say so);
+- test_session_restart's `init` frames report "2.1.330-unverified" (they pin the restart's order-attributed path);
+  the stand-in already reports "2.1.330-stand-in", and the e2e's correlation scenario still puts that version in
+  VERIFIED in its own node process (NODE_VERIFIED);
+- the golden's sequence processes report another version (OTHER_VERSION, "2.1.329"; the frames keep 2.1.330's
+  shapes), so its case 2 now runs on the VERIFIED set as shipped; the main fixture was re-recorded on d4b92e5 for
+  that and changed in exactly the 18 `init` lines that carry the version string.
+How the golden still shows a process of any OTHER version is main's: case 1 (`verified=frozenset()`) is byte for
+byte main's with no allowance at all, as before; case 2 runs with VERIFIED as shipped and processes reporting
+2.1.329, and is main's in every key (hub records, views, listings, CLI text, host events pass by pass, logs, raw
+stdin, raw transcripts) except the allowance: the `uuid` key on each line STAGED (put in the node's buffer for the pipe) before the process's
+first `init` was read, and the echo fields and lifecycle rows Claude writes for such a line (C1-05: while some
+version is VERIFIED a line staged before the first `init` carries a uuid, because the process might still be that
+version). So such a process is not byte-identical to main: for a runner that emits an `init` on its first turn
+(Claude Code does: the init comes before the first turn's reply, and the host stages the next line only after a
+turn ends) that is one line, the first, with that one key and what Claude writes for it, and nothing else; a runner
+that emitted no `init` until later would carry the key on every line staged before it.
+
+**Every observable difference from main of a real Claude Code 2.1.330 hosted session** (for the PR body):
+1. Every user line the node writes carries a fresh random `uuid` key (the last key; the `message` bytes are main's).
+2. The session's transcript on the node gains Claude's `command_lifecycle` rows (three or four per turn, about 150
+   bytes each) and the echo fields on `init`, `assistant`, `thinking_tokens` and `result` frames; with
+   `--replay-user-messages`, replayed `user` frames name the uuid. The transcript has no file cap.
+3. Attribution by evidence: a turn Claude starts by itself (a background Agent finishing after your turn) is no
+   message's: it no longer ends the next message with the notification's reply, and that message's own result is
+   no longer dropped; a zero-turn notification ends no turn; a re-init inside a turn starts nothing.
+4. The inbox hold: while Claude runs a turn of its own the next message waits, unstaged, in the inbox (`park` and
+   the max_live eviction skip the session meanwhile); a staged message none of whose bytes was accepted goes back
+   to the inbox when such a turn is seen; a successful zero-turn notification with no model activity closes it.
+5. The no-progress budget: a message that has no byte of its line accepted for one turn timeout, and was held or
+   staged during it under a process that was verified (review round 7), causes ONE process restart (it then goes to
+   the next process, never written twice; with no process at that moment, the one that starts is that restart); a
+   second such timeout fails it as main fails a message held behind Codex's own turn, with nothing started for it.
+   The budget governs the message until a byte of it is accepted, also if its process is attributed by order
+   meanwhile (review round 6). On main it would have been written into Claude's own turn at once (or failed by the
+   write timer if the pipe took nothing). A message staged in a process that never verifies (another version, or
+   no `init` yet) is main's: main's write timer, main's failure, at main's time.
+6. Interrupt readiness (restart) needs the message's own `init`: an interrupt is not written during a turn Claude
+   started itself.
+7. Errors: an error result that does not list the message's id, once the message is fully written, settles it by
+   order as on main, and the process is attributed by order from then on; while the message is not yet written,
+   only a foreign terminal result (non-human origin, one or more turns) ends Claude's turn.
+8. Any deviation from the measured formats makes that process attributed by order (main's behaviour) for the rest
+   of its life; a new process is checked again.
+Unchanged: every frame and record the hub writes, the protocol, the CLI, Codex sessions, and Claude processes that
+report any other version (apart from the uuid on the line staged before the first `init` and what Claude writes for
+it, above).
+
+**For the owner: rollback and what to watch.**
+- Rollback: there is no runtime switch. Revert the one allowlist line (`VERIFIED = frozenset({"2.1.330"})` back to
+  `frozenset()` in agent_comms/providers/claude.py, or revert this commit), deploy the node (both Macs run one), and
+  restart `board node`. Sessions started after the restart are main's; a session's history is unaffected.
+- After enabling, watch the node log (`board node`'s output) for these lines:
+  - a downgrade (a process attributed by order from then on), logger `agent_comms.providers.claude`, WARNING:
+    `Claude session <id>: this process is attributed by order from now on: <reason>`. An occasional one is the
+    designed fallback; one for every process means the format changed (a new Claude Code release is not in
+    VERIFIED and would not log this; a 2.1.330 process that does is worth a look).
+  - a no-progress restart, logger `agent_comms.session_host`, WARNING: `session <id>: message <msg> made no
+    progress for <N> minutes (not one byte of it accepted on stdin); its process is stopped and the message, never
+    written, waits for the next one`. It says what was seen, not why (review round 8): the CLI busy with a turn of
+    its own and a process that does not read its input look alike here.
+  - the same restart when no process was running at that moment (stopped for a new binding and not gone yet, or
+    no slot): `session <id>: message <msg> made no progress for <N> minutes (not one byte of it accepted on
+    stdin); with its process gone or going down, the next one to start, needed anyway, is its one restart`.
+  - an undelivered timeout (the second budget: the message fails, never written), logger `agent_comms.session_host`,
+    WARNING: `session <id>: message <msg> made no progress for a second <N> minutes (not one byte of it accepted on
+    stdin); it fails, never written`; the asker sees the failure `not one byte of the message was accepted by the
+    agent's process in two periods of <N> minutes; the message was not written`.
+  - `made no progress` matches all three; `for a second` only the failure. None of them is ever written with
+    VERIFIED empty.
+  - and, at INFO, `session <id>: message <msg>, not one byte of it written, waits again: the agent began a turn of
+    its own` (an unstage; expected now and then, not a fault).
+- What a runner of any other version (2.1.329, a later release, anything not in VERIFIED) sees: main's behaviour,
+  frames, records, timers and failures, except the `uuid` key on the line(s) staged before its first `init` was read
+  (and what Claude writes for such a line). Until that init the host cannot know the version, so it treats the
+  process as a candidate: the line carries the key and its bytes are tracked; once the init shows another version,
+  nothing else differs. A message blocked in such a process from its first line fails by main's write timer, at
+  main's time, with no restart and no requeue (review round 7, C7-01). None of the log lines above is written for
+  it, except the downgrade line when a process that DID verify stops qualifying.
+
 ### Not done
 
 - Steering (the steering design's D to J, steps 2 and 3), `steers`, any hub, record or protocol change.
-- No version in VERIFIED (above).
+- No version in VERIFIED but 2.1.330 (the switch-on, above).
 - The adapter cannot read stderr in `feed`: the launch refusal row rests on the incarnation not being verified
   before its first `init` (so by order, as main), and on `session_exists` reading stderr as before.
 - Codex keeps main's host behaviour entirely, `_held` included (review round 2's ruling).

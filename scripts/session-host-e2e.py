@@ -71,8 +71,8 @@ S2/S5. A long turn (`sleep 12` again), then `--mode restart --wait`: the long tu
 S3/S6. `--mode auto` on the idle session: a turn of its own, written within --max-latency.
 With --claude-bin and --codex-bin those sessions are real (three small turns each).
 Then Claude turn correlation (`--only correlation` runs nothing else; DESIGN_NOTES "Claude turn correlation"), for a
-Claude session of its own agent (its runner may run `sleep`). VERIFIED ships empty, so a node writes no uuid at all;
-these steps run on a hub and a node of their own, after the scenarios above have stopped theirs and before any
+Claude session of its own agent (its runner may run `sleep`). VERIFIED ships {2.1.330}, which the stand-in does not
+report; these steps run on a hub and a node of their own, after the scenarios above have stopped theirs and before any
 below start (X0), the node with the CLI's own version (`claude --version`; the stand-in's "2.1.330-stand-in") put
 in VERIFIED in that node process alone (NODE_VERIFIED), so its lines carry a fresh uuid and its processes are
 attributed by evidence; X5 stops them and checks nothing is left. The release gates are measured here on the real

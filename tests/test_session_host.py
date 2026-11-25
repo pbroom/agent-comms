@@ -150,7 +150,9 @@ def test_an_idle_message_is_written_within_one_tick_and_a_busy_one_waits_for_the
     assert s.state == "running", "the process already confirmed the session"
 
 
-def test_a_turn_is_one_json_line_whatever_the_text_holds(henv):
+def test_a_turn_is_one_json_line_whatever_the_text_holds(henv, monkeypatch):
+    from agent_comms.providers import claude
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())   # main's bytes exactly (a uuid otherwise: correlation)
     open_session(henv)
     text = 'line one\nline two\r\n{"type":"result"}  "quoted"'
     henv.host.send(SID, text)

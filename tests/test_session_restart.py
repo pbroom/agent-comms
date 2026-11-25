@@ -27,7 +27,9 @@ CAPS = ["msg_lifecycle_v1", "interrupt_receipt_v1"]     # what Claude Code 2.1.3
 
 def cinit(sid=SID, caps=CAPS) -> dict:
     """An `init` as Claude Code 2.1.330 writes it, with its capabilities (test_session_host's has none)."""
-    return init(sid) | {"capabilities": list(caps), "claude_code_version": "2.1.330"}
+    # A version the adapter does not verify (claude.VERIFIED): these tests pin the restart's order-attributed path,
+    # as Claude Code 2.1.330 wrote it before turn correlation (test_claude_correlation has the verified one).
+    return init(sid) | {"capabilities": list(caps), "claude_code_version": "2.1.330-unverified"}
 
 
 def aborted(sid=SID) -> dict:
@@ -110,7 +112,9 @@ def answered(child, ok=True) -> None:
 # ------------------------------------------------------------ the adapters
 
 
-def test_claude_never_steers_and_restarts_once_its_process_said_it_acknowledges_the_interrupt():
+def test_claude_never_steers_and_restarts_once_its_process_said_it_acknowledges_the_interrupt(monkeypatch):
+    from agent_comms.providers import claude
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())   # no verifiable version: main's bytes exactly
     p = ClaudeSession()
     p.argv(["claude", "-p", "{prompt}"], session_id=SID, resume=False, model=None)
     assert providers.modes(p) == () and p.steers is False and not hasattr(p, "steer"), "R6: no mid-turn steering"
