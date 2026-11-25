@@ -128,15 +128,6 @@ def shutdown_bound(self_stop_seconds: float, kill_grace: float, watch_seconds: f
     return float(self_stop_seconds + kill_grace + 2 * (watch + LOCK_SLACK_SECONDS))
 JOIN_SECONDS = 1.0          # shutdown waits this long for a pass in progress; a loop waiting at the hub is not waited for
 REPORT_WAIT_SECONDS = 25.0  # ... and this long for a report the loop is in the middle of posting (CALL_TIMEOUT is 20 s)
-# A report that carries a steer outcome (only such a report has a retry, S2-07) is one exchange of at most
-# REPORT_PAIR_SECONDS by the wall clock, whatever the transport does (R3-06: a TOTAL deadline, `_call_by`, not
-# httpx's per-operation timeouts): its first attempt gets REPORT_FIRST_SECONDS, and the plain retry without the
-# outcome has its own reserved REPORT_RETRY_SECONDS, never skipped (after a 422, and in the final flush also after a
-# first attempt that failed in transport). So it fits in shutdown's wait for the report lock (REPORT_WAIT_SECONDS) and
-# the final flush never leaves N's end behind for want of time. Every other report is main's: one call, as ever.
-REPORT_PAIR_SECONDS = 20.0
-REPORT_FIRST_SECONDS = 15.0
-REPORT_RETRY_SECONDS = REPORT_PAIR_SECONDS - REPORT_FIRST_SECONDS
 ACK_LOG_MAX = 512           # acknowledgements kept for the continuity of a fetch (`_publish_ack`, `_offer_contact`)
 MAX_BATCH = 100             # events in one report
 HANDED_FILE = "node-session-handed.json"   # session id -> number of the last message handed to its host
@@ -247,6 +238,7 @@ class SessionRunner:
         self.version: str | None = None
         self.hub_features: set[str] = set()           # report fields the hub named as taken (its listing's `features`)
         self.features_known = False                   # ... as a listing applied since the last failed call said
+        self.features_gen = 0                         # ... counted up at every listing that sets them (`_call`'s gen)
         self.refused: set[str] = set()                # sessions whose last report a hub that named it refused (422)
         self.last_sync = float("-inf")
         self.retry_at = float("-inf")
@@ -353,7 +345,7 @@ class SessionRunner:
 
     # ------------------------------------------------------------ hub calls
 
-    def _call(self, method: str, path: str, **kw) -> Any:
+    def _call(self, method: str, path: str, *, gen: int | None = None, **kw) -> Any:
         # The contact counts from when the call was SENT: the hub records it at or after that (hosted.note_contact),
         # so the node's self-stop clock never runs behind the hub's (`shutdown_bound`).
         sent = self.clock()
@@ -363,35 +355,13 @@ class SessionRunner:
         except Exception:
             # Whatever answers next may be another hub (one rolled back to an earlier version): until a fetch says
             # again which report fields it takes, none beyond the first ones are sent (`_for_hub`), and an event that
-            # needs one waits (`_takes`).
-            self.hub_features, self.features_known = set(), False
+            # needs one waits (`_takes`). A call made under a listing's features (`gen`: a report carrying a steer
+            # outcome) forgets only THOSE: a refusal of it that comes after a newer listing leaves that one's (R4-03).
+            if gen is None or gen == self.features_gen:
+                self.hub_features, self.features_known = set(), False
             raise
         self._renew_contact(sent)
         return r.json()
-
-    def _call_by(self, deadline: float, method: str, path: str, **kw) -> Any:
-        """`_call` held to a TOTAL deadline on this loop's clock (R3-06): the call runs in a worker thread with
-        per-operation timeouts no longer than what is left, and is given up at the deadline however the transport
-        behaves (a slow drip of bytes included); TimeoutError then. A call given up may still complete at the hub:
-        that is the same as any timed-out report (its `seq` keeps a late one from undoing a later one)."""
-        left = deadline - self.clock()
-        if left <= 0:
-            raise TimeoutError("no time left for this report")
-        box: dict = {}
-
-        def go():
-            try:
-                box["answer"] = self._call(method, path, timeout=httpx.Timeout(left, connect=min(5.0, left)), **kw)
-            except BaseException as e:      # (handed to the caller)
-                box["error"] = e
-        worker = threading.Thread(target=go, name="hosted-sessions-report", daemon=True)
-        worker.start()
-        worker.join(left)       # (this loop's clock is the monotonic clock: its seconds are real seconds)
-        if worker.is_alive():
-            raise TimeoutError(f"the report exchange ran past its {left:.1f} s deadline")
-        if "error" in box:
-            raise box["error"]
-        return box.get("answer")
 
     def _add(self, session_id: str, event: dict) -> None:
         if session_id not in self.dropped:
@@ -454,7 +424,7 @@ class SessionRunner:
         with self.report_lock:
             if self.stopping.is_set() and not final:
                 return False
-            return self._post_pending(final)
+            return self._post_pending()
 
     wall_ns = staticmethod(time.time_ns)
 
@@ -479,26 +449,14 @@ class SessionRunner:
             self.seq_unsaved = True
         return self.seq
 
-    def _post_pending(self, final: bool = False) -> bool:
+    def _post_pending(self) -> bool:
         order: list[str] = []
         for sid, _ in self.pending:
             if sid not in order:
                 order.append(sid)
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
-        steering = any("steer" in e for _, e in self.pending)
-        if final and steering:
-            # Shutdown's own flush: the sessions whose ends carry a steer outcome first (each session's own events
-            # stay in order), so their exchanges fit in the shutdown's budget. Only while one is pending.
-            carrying = {sid for sid, e in self.pending if "steer" in e}
-            order = [sid for sid in order if sid in carrying] + [sid for sid in order if sid not in carrying]
         sent_items: set[int] = set()
         for sid in order:
-            if self.stopping.is_set() and not final and (steering or self.host.attempts()):
-                # Shutdown began during this flush while a steer attempt is live: it waits for this lock
-                # (REPORT_WAIT_SECONDS), and what is left goes in its own final flush, so no steer's end is lost to
-                # that wait (R2-06). With none live the flush goes on as on main (the parity rule, round 3).
-                self._drop_sent(sent_items)
-                return False
             # In order, up to the first event this hub may not take yet (`_takes`): nothing of the session overtakes
             # it, so the hub applies them as they happened.
             mine = []
@@ -529,25 +487,28 @@ class SessionRunner:
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
                 sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
-                carries = any("steer" in x for x in body["events"])
                 path = f"/api/nodes/sessions/{sid}"
-                try:
-                    if carries:
-                        answer = self._call_by(sent + REPORT_FIRST_SECONDS, "POST", path, json=body)
-                    else:
-                        answer = self._call("POST", path, json=body)        # main's call
-                except Exception as e:
-                    code = getattr(getattr(e, "response", None), "status_code", None)
-                    if not carries or not (code == 422 or (final and code is None)):
-                        raise
-                    # A hub that named `steer` refuses it now (rolled back), or, in shutdown's last flush, the first
-                    # attempt did not get through: N's end goes again at once, in this very flush, without the
-                    # extension (S2-07), in its own reserved slice (R3-06).
-                    log.warning("the report for session %s with a steer outcome did not go (%s): sending it again "
-                                "without the outcome", sid, code or type(e).__name__)
-                    body["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
-                    sent = self.clock()
-                    answer = self._call_by(sent + REPORT_RETRY_SECONDS, "POST", path, json=body)
+                if not any("steer" in x for x in body["events"]):
+                    answer = self._call("POST", path, json=body)        # main's call
+                else:
+                    # A report carrying a steer outcome: main's call, and after a 422 (a hub that named `steer`
+                    # refuses it now: rolled back) one plain retry at once, in this very flush, synchronous, with
+                    # main's per-call timeout (S2-07, R4-03). Each attempt has its own payload, built from `body`,
+                    # which neither changes; both are made under this listing's features (`gen`), so a refusal
+                    # never forgets those of a newer listing. In the final flush exactly the same.
+                    gen = self.features_gen
+                    first = json.loads(json.dumps(body))
+                    try:
+                        answer = self._call("POST", path, json=first, gen=gen)
+                    except Exception as e:
+                        if getattr(getattr(e, "response", None), "status_code", None) != 422:
+                            raise
+                        log.warning("the hub refused the report for session %s with a steer outcome (422): sending "
+                                    "it again without the outcome", sid)
+                        plain = {k: v for k, v in body.items() if k != "events"}
+                        plain["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
+                        sent = self.clock()
+                        answer = self._call("POST", path, json=plain, gen=gen)
                 self._ack_report(sid, sent, answer)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
@@ -675,7 +636,8 @@ class SessionRunner:
                     self._add(e.session_id, self._event(e))
                 self.watched_steer = []
             if data is not None:
-                self._reconcile(data, fetch_sent)
+                with self.host.one_drain_budget():      # every close or cancel in it shares one drain deadline
+                    self._reconcile(data, fetch_sent)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
                 # above): what waits in an inbox may start again, in `tick` below. Only a listing from a fetch SENT
                 # after the latch was set: one sent before may have been built before the hub decided.
@@ -861,6 +823,7 @@ class SessionRunner:
                 if "steer" in st[4]:
                     self.reported.pop(sid, None)
         self.hub_features, self.features_known = features, True
+        self.features_gen += 1
         for sid in [x for x in self.report_ack if x not in self.host.sessions]:
             del self.report_ack[sid]        # acknowledgements are kept for open sessions only (S2-13)
 
@@ -1349,14 +1312,15 @@ class SessionRunner:
                 if stopped and now - due > allowed:
                     log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop held "
                                 "its lock that long (limit e)", now - due)
-                self.watched += [e for e in stopped if e.steer is None]
-                self.watched_steer += [e for e in stopped if e.steer is not None]
-            self._steer_watch(now)
-            self.watched_steer += self.host.steer_deadlines()   # a half-written steer frame past its limit is cut
+                self.watched += stopped     # (main's, a steer's end too: the shutdown simplification)
             for sid, at in self.host.kill_due():
                 if now - at > allowed:
                     log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the session "
                                 "loop held its lock that long (limit e)", sid, now - at)
+            # Then, after every deadline of main's has been met (a cut's drain must never delay them, R4-06): loss
+            # is one-way, and a half-written steer frame past its limit is cut.
+            self._steer_watch(now)
+            self.watched_steer += self.host.steer_deadlines()
 
     def _watch(self) -> None:
         while not self.stopping.wait(self.watch_seconds):
@@ -1388,31 +1352,14 @@ class SessionRunner:
     def signal(self) -> None:
         """The first step of a shutdown: SIGTERM to every session process, now. No waiting and no reporting, so the
         node can go on to stop its ordinary runs at once (node.run); `shutdown()` does the rest."""
-        self.stopping.set()
+        self.stopping.set()     # (R4-01: every held steer record is marked first: no steer byte after this)
         with self.lock:
-            # Review round 3, structure 2 (the shutdown's part): every session holding NO live steer attempt gets its
-            # SIGTERM at once, as on main; then those that hold one are drained (`SessionHost.drain`: one deadline for
-            # the whole shutdown, each stopping as soon as N's own end is read), and get theirs. node.shut_down starts
-            # the grace after this returns.
-            live = {s.session_id for s in self.host.sessions.values() if self.host.live_attempt(s)}
-
-            def term(s):
+            for s in self.host.sessions.values():
                 if s.child is not None:
                     try:
                         s.child.terminate()
                     except Exception:
                         log.exception("could not signal session %s", s.session_id)
-            for s in self.host.sessions.values():
-                if s.session_id not in live:
-                    term(s)
-            if live:
-                try:
-                    self.watched_steer += self.host.drain()
-                except Exception:
-                    log.exception("could not drain the sessions holding a steer")
-                for s in self.host.sessions.values():
-                    if s.session_id in live:
-                        term(s)
 
     def _going(self, s) -> bool:
         return s.child is not None and (s.child.poll() is None or self.host.group_alive(s.child.pid))
