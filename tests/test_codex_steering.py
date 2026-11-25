@@ -3200,8 +3200,23 @@ def _record_stops(host, clock, seen):
     its caller asked for the SIGTERM's dating, the time it recorded, when its SIGTERM went, the call chain, and each
     drain in that chain (live or not, and whether it advanced the time). Observed from outside `_stop`."""
     import sys
-    seen.stops, drains = [], []
+    seen.stops, drains, born, cuts = [], [], [], []
     real_stop, real_drain = host._stop, host._drain_before_stop
+    real_offer, real_cut = host.steer_offer, host._steer_cut
+
+    def offer(session_id, *a, **kw):
+        # (R9-02) each slot and the process it was taken for, as the offer installs it
+        s_ = host.sessions.get(session_id)
+        before = s_.steer if s_ is not None else None
+        got = real_offer(session_id, *a, **kw)
+        if s_ is not None and s_.steer is not None and s_.steer is not before:
+            born.append((s_.steer, s_.child))
+        return got
+
+    def cut(s_, now, out):
+        slot = s_.steer
+        cuts.append((sys._getframe(0), any(x is slot and c is s_.child for x, c in born)))
+        return real_cut(s_, now, out)
 
     def drain(s_, now, out):
         live = host.live_attempt(s_)
@@ -3228,16 +3243,19 @@ def _record_stops(host, clock, seen):
             names = [x.f_code.co_name for x in chain]
             caller = next((x for x in chain if x.f_code.co_name in STEERING_CALLERS), None)
             mine = [(live, a_, b_) for fr, live, a_, b_ in drains if any(fr is x for x in chain)]
+            own = [ok for fr, ok in cuts if any(fr is x for x in chain)]
             seen.stops.append(dict(now=now, at=at, since=s_.stopping_since, terms=list(terms), names=names,
-                                   caller=caller.f_code.co_name if caller is not None else None, drains=mine))
-    host._stop, host._drain_before_stop = stop, drain
+                                   caller=caller.f_code.co_name if caller is not None else None, drains=mine,
+                                   cut_own=own))
+    host._stop, host._drain_before_stop, host.steer_offer, host._steer_cut = stop, drain, offer, cut
 
 
 def _check_stop_dating(seen, fail):
     """R8-01's property: every stop's recorded time is the time its caller passed (main's) unless it was issued by a
     single-session steering caller in that call, after its own live drain or as the cut; then it is the clock read
     as its SIGTERM was sent. Every bulk or ordinary stop (stop_turns, stop_all, the self-stop, a refusal, a timeout
-    with no live attempt, a later stop of a once-steered session) is dated exactly as on main."""
+    with no live attempt, a later stop of a once-steered session) is dated exactly as on main. And (R9-02) a cut
+    stops only the process its slot was taken for."""
     for k, r in enumerate(getattr(seen, "stops", [])):
         bulk = any(n in ("stop_turns", "stop_all") for n in r["names"])
         if not r["at"]:
@@ -3250,6 +3268,8 @@ def _check_stop_dating(seen, fail):
             fail(f"stop {k} ({r['names'][:4]}): dated at its SIGTERM, but issued by a bulk or ordinary caller")
         if r["caller"] != "_steer_cut" and not any(live for live, _, _ in r["drains"]):
             fail(f"stop {k} ({r['caller']}): dated at its SIGTERM with no live drain of its own in that call")
+        if r["caller"] == "_steer_cut" and not all(r["cut_own"]):
+            fail(f"stop {k}: a cut of a slot that was not taken for the process it stops (R9-02)")
         if r["terms"] and r["since"] != r["terms"][0]:
             fail(f"stop {k} ({r['caller']}): recorded {r['since']}, its SIGTERM went at {r['terms'][0]}")
 
@@ -3912,11 +3932,12 @@ def test_r8_03_a_stop_announced_as_a_batch_is_admitted_stops_the_drain_inside_th
     assert reads == [1], "no batch admitted once the stop announced itself"
 
 
-def _offers(env, mutate, passes=3):
-    """`passes` listings, each with the session's steer entry changed by `mutate(entry)`."""
+def _offers(env, mutate, passes=3, data=None):
+    """`passes` listings, each with the session's steer entry changed by `mutate(entry)` (of `data`, a listing taken
+    earlier, or one taken now)."""
     import json as json_
     runner = env.node.sessions
-    data = listing(env)
+    data = listing(env) if data is None else data
 
     class Hub:
         def request(self, method, path, **kw):
@@ -4007,6 +4028,20 @@ def test_r8_04_a_refused_report_retried_again_is_said_once(env, caplog):
     assert posts == [422, 503] * 3, posts
     said = [r for r in caplog.records if "the hub refused the report for session" in r.getMessage()]
     assert len(said) == 1, [r.getMessage() for r in said]
+    assert _said_keys(runner) == 1
+    # (R9-01) the plain retry gets through: the report leaves the queue, and its key with it
+    real = Hub.request
+
+    def plain_taken(self, method, path, **kw):
+        if method == "POST" and not any("steer" in e for e in kw["json"].get("events", [])):
+            return env.laptop.request(method, path, **kw)
+        return real(self, method, path, **kw)
+    Hub.request = plain_taken
+    runner.client = env.laptop
+    runner._reconcile(listing(env))
+    runner.client = Hub()
+    assert runner._flush()
+    assert runner.pending == [] and _said_keys(runner) == 0, "the key went with the report"
 
 
 def test_r8_04_a_failed_drain_is_logged_with_its_exception_type_only(henv, caplog):
@@ -4028,6 +4063,108 @@ def test_r8_04_a_failed_drain_is_logged_with_its_exception_type_only(henv, caplo
     assert "/home/someone" not in caplog.text and "Permission denied" not in caplog.text
 
 
+def test_r9_02_a_host_reused_after_stop_all_with_a_partial_steer_runs_its_next_process_normally(henv):
+    """R9-02: `stop_all` with S taken in part settles S (`unconfirmed`, `partial`) and lets the process go, and its
+    slot with it; the same host is used again: the replacement handshakes and runs its turn, nothing is cut, and the
+    old steer offered again into the new turn is never written (its uuid is remembered)."""
+    host, s, child, _ = partial(henv)
+    ends = ended_of(host.stop_all())
+    assert ends and ends[0].steer == {"outcome": "unconfirmed", "why": "partial"}
+    assert s.child is None and "u1" in s.steered
+    released = s.steer is None
+    host.send(SID, "next", message_id="b")
+    host.tick()
+    new = henv.spawner.children[-1]
+    assert new is not child
+    codex_ready(host, new)
+    host.tick()
+    assert new.terminated == 0 and s.stopping_since is None, "the replacement is not cut before its handshake"
+    st = last_start(new)
+    new.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED, user_item(st["params"]["clientUserMessageId"]))
+    host.tick()
+    henv.clock.advance(STEER_PARTIAL_SECONDS + 1)
+    host.steer_deadlines()
+    host.tick()
+    assert s.stopping_since is None and new.terminated == 0, "the replacement is not cut"
+    host.steer_offer(SID, "b", "u1", TEXT, authorized=True)
+    host.tick()
+    assert s.steer is None and steers_of(new) == [], "the old steer is never written again"
+    new.emit(cx.message("done"), cx.completed())
+    [end] = ended_of(host.tick())
+    assert end.message_id == "b" and end.ok and end.steer is None
+    assert released, "the slot went with its process"
+
+
+def _said_keys(runner) -> int:
+    """How many steer diagnostics the node keeps, whatever the shape of its caches (R9-01)."""
+    return (len(getattr(runner, "_said", ())) + sum(len(r) for _, r in getattr(runner, "_said_held", {}).values())
+            + len(getattr(runner, "_said_422", ())) + len(getattr(runner, "_said_bad", {})))
+
+
+def test_r9_01_a_hundred_fresh_malformed_offers_keep_one_key_and_say_one_line_per_interval(env, caplog):
+    """R9-01: 100 listings, each offering a steer with a fresh uuid that cannot be taken (a 301-digit `into`),
+    against one open session: the diagnostics keep one entry for it, and say one line per BAD_OFFER_LOG_SECONDS;
+    after the interval, one more."""
+    import itertools
+    import logging
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    fresh = itertools.count()
+    caplog.set_level(logging.INFO, logger="agent_comms")
+    base = listing(env)
+    _offers(env, lambda e: e["steer"].update(into=10 ** 300, uuid=f"{next(fresh):08d}-0000-4000-8000-000000000000"),
+            passes=100, data=base)
+    said = [r for r in caplog.records if "a steer offer could not be taken" in r.getMessage()]
+    assert len(said) == 1, len(said)
+    assert _said_keys(runner) == 1, _said_keys(runner)
+    env.clock.advance(node_sessions.BAD_OFFER_LOG_SECONDS)
+    _offers(env, lambda e: e["steer"].update(into=10 ** 300, uuid=f"{next(fresh):08d}-0000-4000-8000-000000000000"),
+            passes=3, data=base)
+    said = [r for r in caplog.records if "a steer offer could not be taken" in r.getMessage()]
+    assert len(said) == 2 and _said_keys(runner) == 1
+    # the session closes: once the node lets it go, nothing of it is kept
+    assert env.human.post(f"/api/hosted-sessions/{sid}/close").status_code == 200
+    for _ in range(3):
+        tick(env)
+    assert sid not in runner.host.sessions and _said_keys(runner) == 0
+
+
+def test_r9_01_a_held_attempts_reasons_go_with_its_slot_and_a_new_attempt_is_said_afresh(env, caplog):
+    """R9-01: the held attempt A is offered for another turn (said once over three listings), then offered as
+    another attempt (a new reason: said too). N ends: A's slot is released, and its reasons go at the next listing.
+    The next turn's attempt B, offered for another turn, is said afresh."""
+    import logging
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    a = s.steer.uuid
+    caplog.set_level(logging.INFO, logger="agent_comms")
+
+    def said(words):
+        return [r for r in caplog.records if words in r.getMessage()]
+    _offers(env, lambda e: e["steer"].update(into=2))
+    _offers(env, lambda e: e["steer"].update(uuid="0" * 8 + "-0000-4000-8000-" + "0" * 12))
+    assert len(said("offered for another turn")) == 1 and len(said("not the held attempt")) == 1
+    assert _said_keys(runner) == 2
+    end_turn(env, child)
+    assert s.steer is None, "N ended: A's slot is released"
+    runner.fresh, runner.last_sync = False, float("-inf")
+    runner.pass_once(wait=0)
+    assert _said_keys(runner) == 0, "A's reasons went with its slot"
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": "next"})
+    assert r.status_code == 200, r.text
+    tick(env)
+    st = last_start(child)
+    child.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED)
+    tick(env)
+    post_steer(env, sid)
+    tick(env)
+    b = s.steer.uuid
+    assert b != a
+    _offers(env, lambda e: e["steer"].update(into=3))
+    assert len(said("offered for another turn")) == 2, "B's reason is said afresh"
+    assert _said_keys(runner) == 1
+
+
 HOST_OPS = ["offer", "partial", "whole", "tick", "tick", "answer", "n_end", "step5", "step75", "timeout", "cut",
             "cancel", "close", "stop_turns", "stop_all", "broken", "group_left", "registry", "slow_poll", "next"]
 
@@ -4035,7 +4172,8 @@ HOST_OPS = ["offer", "partial", "whole", "tick", "tick", "answer", "n_end", "ste
 def _host_sequence(tmp_path, seed, steps=14):
     """One random sequence of host operations on a steered session (every single-session steering path, every bulk
     and ordinary stop, a stop of a session that once had a steer, slow registry and probes), with every stop that
-    begins recorded by `_record_stops`. Returns (the stops, the steps)."""
+    begins recorded by `_record_stops`. Returns (the stops, the steps, whether a new process followed a `stop_all`
+    that let a partial steer's process go)."""
     import random
     from types import SimpleNamespace
     rnd = random.Random(seed)
@@ -4043,7 +4181,7 @@ def _host_sequence(tmp_path, seed, steps=14):
     host, s, child, _ = host_n(henv)
     seen = SimpleNamespace()
     _record_stops(host, henv.clock, seen)
-    steps_, k = [], 0
+    steps_, k, reused = [], 0, False
     prefix = rnd.choice([[], ["offer", "tick"], ["partial", "offer", "tick"]])     # often a live attempt to begin with
     for j in range(steps):
         op = prefix[j] if j < len(prefix) else rnd.choice(HOST_OPS)
@@ -4082,7 +4220,9 @@ def _host_sequence(tmp_path, seed, steps=14):
             elif op == "stop_turns":
                 host.stop_turns("the node had no hub contact")
             elif op == "stop_all":
+                partial_held = s.steer is not None and s.steer.mark is not None and s.steer.sent > 0
                 host.stop_all()
+                reused = reused or (partial_held and "partial-stopped")
             elif op == "broken":
                 child.broken = True
             elif op == "group_left":
@@ -4099,6 +4239,8 @@ def _host_sequence(tmp_path, seed, steps=14):
                 host.send(SID, "next", message_id=f"m{len(steps_)}")
                 host.tick()
                 c = henv.spawner.children[-1]
+                if c is not child and reused == "partial-stopped":
+                    reused = True       # (R9-02) a new process after stop_all let a partial steer's process go
                 if c is not child and not c.stdin:
                     codex_ready(host, c)
                     host.tick()
@@ -4110,7 +4252,7 @@ def _host_sequence(tmp_path, seed, steps=14):
             pass            # an operation this state does not allow (a closed session, no start yet)
         if s.ended:
             break
-    return seen.stops, steps_
+    return seen.stops, steps_, reused is True
 
 
 def test_r8_01_property_every_stop_is_dated_as_on_main_unless_a_steering_caller_issued_it(tmp_path):
@@ -4122,7 +4264,8 @@ def test_r8_01_property_every_stop_is_dated_as_on_main_unless_a_steering_caller_
     from types import SimpleNamespace
     reach = Counter()
     for seed in range(300):
-        stops, steps_ = _host_sequence(tmp_path / f"h{seed}", seed)
+        stops, steps_, reused = _host_sequence(tmp_path / f"h{seed}", seed)
+        reach["reused after a partial stop_all"] += reused
 
         def fail(why, steps_=steps_, seed=seed):
             raise AssertionError(f"{why}\n  seed {seed}: {steps_}")
@@ -4134,6 +4277,7 @@ def test_r8_01_property_every_stop_is_dated_as_on_main_unless_a_steering_caller_
         assert reach[("at", caller)], (caller, sorted(reach.items()))
     for caller in ("stop_turns", "stop_all", "close", "_hold_to_timeout", "cancel"):
         assert reach[("main", caller)], (caller, reach)
+    assert reach["reused after a partial stop_all"], "R9-02's reuse is reached"
 
 
 def test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start():
