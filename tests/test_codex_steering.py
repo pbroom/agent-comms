@@ -6369,11 +6369,14 @@ def test_pm_2_a_parents_steer_above_its_ceiling_now_is_refused_and_charges_and_s
 
 def test_pm_2_a_parents_steer_at_its_turn_limit_is_refused_and_charges_and_stores_nothing(env):
     """Pre-merge review, item 2: the tree has used its child turns without the human (`max_turns_without_human`):
-    the parent's steer is refused (LimitReached), through its real send path; nothing is stored or charged."""
+    the parent's steer is refused (LimitReached), through its real send path, both by the check before the
+    transaction (no request id) and by the one inside it (with a request id, the only check: a retry must find its
+    first answer, never a limit); nothing is stored or charged."""
     sid, kid, used = _child_at_its_limits(env, max_turns_without_human=1)
-    with pytest.raises(hs.LimitReached):
-        hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
-    assert steer_rec(env, kid) is None and budget(env)["seq"] == used
+    for rid in (None, "p-limit"):
+        with pytest.raises(hs.LimitReached):
+            hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer", request_id=rid)
+        assert steer_rec(env, kid) is None and budget(env)["seq"] == used
 
 
 def _malformed(env, how):
@@ -6399,7 +6402,7 @@ def test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off(env, ca
     from agent_comms.dispatch import SpawnConfig
     sid, child = codex_turn_in_flight(env)
     post_steer(env, sid)                    # accepted while the setting was read
-    hosted_steer._unreadable_said.clear()
+    getattr(hosted_steer, "_unreadable_said", set()).clear()     # (each error is said once per process)
     caplog.set_level(logging.INFO, logger="agent_comms")
     off = json.loads(json.dumps(env.board.s.dispatch))
     off["sessions"]["steer"] = False
@@ -6409,7 +6412,7 @@ def test_pm_3_a_sessions_table_that_does_not_validate_turns_steering_off(env, ca
     _malformed(env, how)
     assert hosted_tree.spawn_config(env.board) == SpawnConfig(), "main's other settings: their defaults"
     for _ in range(2):
-        refusal(env, sid, hosted_steer.REFUSED["unreadable"])
+        refusal(env, sid, "steering is off on this hub: its [dispatch.sessions] settings could not be read")
     said = [r for r in caplog.records if "settings could not be read" in r.getMessage()]
     assert len(said) == 1 and r"steering is off" in said[0].getMessage()
     assert env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json().get("features") == features_off
