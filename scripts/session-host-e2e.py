@@ -501,12 +501,18 @@ class M5Join:
             return None
         p = m.get("params") if isinstance(m.get("params"), dict) else {}
         it = p.get("item") if isinstance(p.get("item"), dict) else {}
-        if m.get("id") == self.rid and "method" not in m and ("result" in m) != ("error" in m) \
-                and self.answer is None:
+        if (type(m.get("id")) is int and m["id"] == self.rid and "method" not in m
+                and ("result" in m) != ("error" in m) and self.answer is None):
+            # (an integer id only: 4.0 is not request 4, R3-12) The answer must name T: one naming another turn
+            # fails the probe at once.
+            named = ((m.get("result") or {}).get("turn") or {}).get("id") if isinstance(m.get("result"), dict) else None
+            if named != self.t:
+                return "wrong"
             self.answer = m
         elif (m.get("method") in ("item/started", "item/completed") and p.get("threadId") == self.tid
-              and it.get("type") == "userMessage" and it.get("clientId") == self.j and self.item is None):
-            self.item = m
+              and p.get("turnId") == self.t and it.get("type") == "userMessage" and it.get("clientId") == self.j
+              and self.item is None):
+            self.item = m       # (only an item of T itself: one in another turn never takes its place, R3-12)
         elif (m.get("method") == "turn/completed" and p.get("threadId") == self.tid
               and isinstance(p.get("turn"), dict) and p["turn"].get("id") == self.t):
             return None if self.answer is not None and self.item is not None else "late"
@@ -1450,7 +1456,8 @@ codex = true
                 return said[-1] is not None
             until(decided)
             if said[-1] != "proved":
-                raise SystemExit("FAIL: M5 (join): T completed before both the answer to J and J's item came")
+                raise SystemExit("FAIL: M5 (join): " + ("the answer to J named another turn" if said[-1] == "wrong" else
+                                                         "T completed before both the answer to J and J's item came"))
             joined, item = watch.answer, watch.item
         finally:
             try:
