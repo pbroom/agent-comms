@@ -3347,18 +3347,20 @@ def test_r6_gap_the_latch_waits_for_a_cuts_check_and_first_act(henv, monkeypatch
     calls `steer_stopping` on another thread: the stop waits until the cut's first act is done, never sets the latch
     in the middle of it. Barriers only."""
     import threading
-    from agent_comms import session_host as sh
     host, s, child, _ = partial(henv)
     henv.clock.advance(STEER_PARTIAL_SECONDS)
     inside, go, stopped = threading.Event(), threading.Event(), threading.Event()
-    real_warning = sh.log.warning
 
-    def warning(msg, *a, **kw):
-        if "could not be written whole" in str(msg) and not inside.is_set():
-            inside.set()
-            assert go.wait(30)
-        return real_warning(msg, *a, **kw)
-    monkeypatch.setattr(sh.log, "warning", warning)
+    class Pausing(bytearray):
+        """The cut's first act (its buffer cleared, under the latch's lock) waits here for the test (round 7: the
+        cut's log line is outside the lock now)."""
+
+        def clear(self):
+            if not inside.is_set():
+                inside.set()
+                assert go.wait(30)
+            return super().clear()
+    s.outbuf = Pausing(s.outbuf)
     lock = _Contended(host._steer_stop_lock)
     host._steer_stop_lock = lock
     cutter = threading.Thread(target=host.steer_deadlines)
@@ -3436,6 +3438,121 @@ def test_r6_gap_ns_own_end_read_after_the_latch_is_no_evidence_for_s(henv):
     [end] = ended_of(host.tick())
     assert end.ok and end.text == "native", "main's handling of N"
     assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+@pytest.mark.parametrize("written", [True, False])
+def test_r7_01_evidence_read_while_shutdown_marks_another_slot_never_counts_for_s(henv, written):
+    """R7-01, Sol's two-slot replay: shutdown has set the latch and is blocked marking A's record (A's lock held by
+    another thread, an acknowledgement say) when B's ordinary read takes B's valid answer and N's own end. N settles
+    as on main (ok, its text); S's outcome is decided on the one global latch, not on B's not-yet-made mark:
+    `unconfirmed` (`turn_cut`) with S written, `not_delivered` with none. Barriers only."""
+    import threading
+    import uuid as uuid_mod
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    host.sessions.pop(SID)
+    a, b = str(uuid_mod.uuid4()), str(uuid_mod.uuid4())
+    _codex_steered_in(host, henv, a, "ua")                  # A first: the stop marks it first
+    cb = _codex_steered_in(host, henv, b, None)
+    sb = host.sessions[b]
+    if written:
+        host.steer_offer(b, "a", "ub", TEXT, authorized=True)
+        host.tick()
+        [req] = steers_of(cb)
+        cb.emit(cx.reply(req["id"], {"turnId": cx.TURN}))
+    else:
+        host.steer_offer(b, "a", "ub", TEXT, authorized=False)      # held, never written
+        host.tick()
+        assert steers_of(cb) == []
+    cb.emit(cx.message("native"), cx.completed())
+    lock_a = _SignalLock(host.sessions[a].steer.lock)
+    host.sessions[a].steer.lock = lock_a
+    stop_lock = _SignalLock(host._steer_stop_lock)
+    host._steer_stop_lock = stop_lock
+    held, release, out = threading.Event(), threading.Event(), []
+
+    def hold_a():
+        lock_a.quiet = threading.get_ident()
+        with lock_a:
+            held.set()
+            assert release.wait(30)
+    holder = threading.Thread(target=hold_a)
+    holder.start()
+    assert held.wait(30)
+    stopper = threading.Thread(target=host.steer_stopping)
+    stop_lock.quiet = None
+    stopper.start()
+    assert lock_a.waiting.wait(30), "the stop is blocked marking A"
+    assert host.steer_stopped and not sb.steer.stopping, "the latch is set, B's record not marked yet"
+    stop_lock.waiting.clear()
+    stop_lock.quiet = stopper.ident
+    progress = threading.Event()
+    stop_lock.waiting = progress
+
+    def read_b():
+        try:
+            host._read(sb, henv.clock(), out)       # B's ordinary read, as the host's pass makes it
+        finally:
+            progress.set()
+    reader = threading.Thread(target=read_b)
+    reader.start()
+    assert progress.wait(30), "B's read either finished or came to the latch's lock"
+    release.set()
+    for th in (holder, stopper, reader):
+        th.join(30)
+    [end] = ended_of(out)
+    assert end.ok and end.text == "native", "N settles as on main"
+    want = {"outcome": "unconfirmed", "why": "turn_cut"} if written else {"outcome": "not_delivered",
+                                                                           "why": "not_written"}
+    assert end.steer == want
+
+
+def test_r7_02_a_cut_with_no_drain_is_dated_when_its_sigterm_is_sent(henv):
+    """R7-02: N ends natively with S taken in part (its outcome decided, its frame still in the buffer), so the pass's
+    cut has no drain. The pass began at 0; the cut comes at 20 (the clock moved on in the pass). Its SIGTERM is dated
+    20, when it is sent, and no SIGKILL comes before the grace from then."""
+    host, s, child, _ = partial(henv)
+    child.emit(cx.message("native"), cx.completed())
+
+    def later(sess):
+        henv.clock.advance(20)                  # the pass's earlier work took 20 s
+    host.steer_cut_hook = later
+    sent, real = [], child.terminate
+
+    def term():
+        sent.append(henv.clock())
+        return real()
+    child.terminate = term
+    child.exits_on_terminate = False
+    t = henv.clock()
+    ends = ended_of(host.tick())
+    host.steer_cut_hook = None
+    assert ends and ends[0].steer == {"outcome": "unconfirmed", "why": "partial"}
+    assert sent == [t + 20] and s.stopping_since == t + 20, "dated when the SIGTERM was sent"
+    assert host.kill_due() == [] and not child.killed, "no SIGKILL before the grace from the SIGTERM"
+    henv.clock.advance(host.kill_grace)
+    assert [x for x, _ in host.kill_due()] == [SID]
+
+
+def test_r7_04_a_waiting_stop_goes_ahead_of_the_next_drain_batch(henv):
+    """R7-04: once a stop has begun (it may still wait for the latch's lock), a drain takes no next batch: it does
+    not take the lock again, and reads no more."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert len(steers_of(child)) == 1
+    child.bytes_read = 0
+    reads = []
+
+    def read():
+        reads.append(1)
+        if len(reads) == 1:
+            host._stop_pending = True           # a stop has begun, on another thread, between two batches
+        child.bytes_read += 4096
+        return []
+    child.read_lines = read
+    host.close(SID, "closed")
+    assert reads == [1], "no next batch once a stop is waiting"
 
 
 def test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start():

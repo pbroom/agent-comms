@@ -350,7 +350,10 @@ def _item_echo(line: str, answered: dict | None = None) -> str:
     clientId"), back to the null main's run has, only for an id `_codex_line` took and only in such an item.
     (Round 6, R6-05:) only in the item's own `clientId` field, and only for the start it answers in this transcript:
     the item's thread is that start's, and its turn is the one this transcript's answer to that start named
-    (`answered`), so two starts' ids swapped are not taken."""
+    (`answered`), so two starts' ids swapped are not taken. (Round 7, R7-05: two starts that genuinely join the same
+    thread AND turn, Codex's join, are not told apart by this: their ids could be swapped and still be taken. The
+    fixture records no such pair. If the golden records joins, bind each echo also to its process (the transcript's
+    process, by the start's stdin) and to its input (the start's `input` text against the item's `content`).)"""
     m = ITEM.search(line)
     if not m or m.group(1) not in CLIENT_IDS:
         return line
