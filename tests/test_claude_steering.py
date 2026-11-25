@@ -7,6 +7,8 @@ held, the checkpoint, the finalizer and the bounded publication. Every steer her
 boundary and outcome rules: nothing of those is copied."""
 import json
 
+import httpx
+
 import pytest
 
 from agent_comms.providers import claude
@@ -361,9 +363,10 @@ def cresult(sid, *uuids, text="ok", **kw) -> dict:
         {"user_message_uuid": uuids[0], "user_message_uuids": list(uuids)} if uuids else {})
 
 
-def claude_steered(env):
+def claude_steered(env, project=None):
     """A Claude root, N (message 1) in flight in its owned bracket, a human steer accepted, offered and written."""
-    sid = start(env, "a long turn")["session_id"]
+    from conftest import PROJECT
+    sid = start(env, "a long turn", project=project or PROJECT)["session_id"]
     tick(env)
     child = proc_of(env, sid)[1]
     n = written(child)[-1]["uuid"]
@@ -562,195 +565,6 @@ def test_k_with_no_steer_sent_a_claude_session_is_the_build_that_never_steers(he
     assert [tuple(x for x in m if x != "steer") for m in our_modes] == [tuple(m) for m in base_modes]
 
 
-# ---------------------------------------------------------------- the model: seeded sequences, an independent reference
-
-
-class _Model:
-    """This test's own reading of part D's tables for one written steer (independent of the adapter and the host):
-    N's bracket open and owned, S written whole, T = 60 s. It says what N's one end must carry."""
-
-    def __init__(self, t0):
-        self.phase, self.comp, self.verified, self.amb = "n", False, True, False
-        self.bracket, self.s_turn, self.since, self.t0 = None, False, t0, t0
-        self.end = None         # (outcome, why, native text or None, S's result ok or None)
-        self.native = None
-
-    def finish(self, outcome, why, s_ok=None):
-        if self.end is None:
-            self.end = (outcome, why, self.native, s_ok)
-
-    def finalize(self):
-        self.finish(*(("next_turn", "own_turn_cut", False) if self.s_turn else ("unconfirmed", "turn_cut")))
-
-    def frame(self, kind):
-        if self.end is not None:
-            return
-        if self.phase == "n":
-            if kind == "n_res_ns":
-                self.native = "N:ns"
-                self.finish("in_turn", "answered")
-            elif kind == "n_res_n":
-                self.native = "N:n"
-                if self.verified:
-                    self.phase, self.since = "h", self.now
-                else:
-                    self.phase = "lost"
-                    self.finalize()
-            elif kind in ("s_res", "cli_takes_s"):
-                if self.verified and not self.comp:
-                    self.native = "S:" + kind
-                    self.finish("unconfirmed", "s_only")
-                else:
-                    self.verified, self.amb = False, True
-            elif kind in ("compete", "s_init", "cli_open"):
-                if self.verified:
-                    self.comp = True
-            elif kind in ("plain", "error"):
-                self.verified, self.amb = False, True
-            return
-        # the hold (verified). A result that lists S is a bracket's terminal result consuming S (a late one listing N
-        # and S too); one listing only N (already settled) is nobody's.
-        if kind in ("s_res", "cli_takes_s", "n_res_ns"):
-            if self.bracket == "s":
-                self.native_s = True
-                self.finish("next_turn", "own_turn", True)
-            else:
-                self.finish("unconfirmed", "consumed")
-        elif kind == "s_init":
-            if self.bracket is None:
-                self.bracket, self.s_turn, self.since = "s", True, self.now
-        elif kind in ("cli_open", "compete"):
-            if self.bracket is None:
-                self.bracket = "cli"
-        elif kind == "cli_end":
-            if self.bracket == "cli":
-                self.bracket = None
-        elif kind == "plain":
-            if self.bracket == "s":
-                self.finish("next_turn", "own_turn", True)
-            else:
-                self.finalize()
-        elif kind == "error":
-            if self.bracket != "s":
-                self.finalize()
-
-    def host_end(self, how):
-        """A host-made end of N: in the hold, the finalizer; before N's native end, N fails and S `turn_cut`."""
-        if self.end is not None:
-            return
-        if self.phase == "n":
-            self.finish("unconfirmed", "turn_cut")
-        else:
-            self.finalize()
-
-
-FRAMES = {"n_res_ns": lambda n: owned(n, S, text="N:ns"), "n_res_n": lambda n: owned(n, text="N:n"),
-          "s_res": lambda n: owned(S, text="S:s_res"),
-          "cli_takes_s": lambda n: owned(S, text="S:cli_takes_s") | {"origin": NOTIFY},
-          "s_init": lambda n: vinit(S), "cli_open": lambda n: vinit(), "cli_end": lambda n: foreign(),
-          "compete": lambda n: vinit("0be7c0de-0000-4000-8000-000000000000"), "plain": lambda n: plain(text="?"),
-          "error": lambda n: result(subtype="error_during_execution", is_error=True, text=""),
-          "note": lambda n: nonturn()}
-
-
-@pytest.mark.parametrize("seed", range(200))
-def test_model_claude_steer_sequences_against_an_independent_reference(henv, monkeypatch, seed, request):
-    """Seeded sequences of every frame part D's tables name (and exits, cancels, closes, stops of every turn and the
-    clock) after a written steer: the host publishes N's end exactly once, with the outcome, the why, N's native
-    reply and S's own result the reference model reads; a close's `ended` comes after it; nothing is written to the
-    process once S is decided. Reach is asserted over the 200 seeds (test_model_reach)."""
-    import random
-    rnd = random.Random(seed)
-    s, child, n = steered(henv, monkeypatch)
-    model = _Model(henv.clock())
-    model.now = henv.clock()
-    got, kinds_seen = [], []
-    for _ in range(rnd.randint(1, 20)):
-        if s.held is None:
-            kind = rnd.choice(list(FRAMES) * 3 + ["n_res_n"] * 8 + ["wait", "wait", "exit", "cancel", "close",
-                                                                    "stop_turns"])
-        elif s.held.s_turn:     # S's own turn runs: its result, or an end the host makes of it
-            kind = rnd.choice(["s_res"] * 3 + ["plain", "error", "note", "cli_end", "wait", "wait", "exit", "cancel",
-                                               "close", "stop_turns"])
-        else:       # held: S's own turn, and every end the host can make of it, more often
-            kind = rnd.choice(["s_init"] * 4 + ["s_res", "cli_takes_s", "cli_open", "cli_end", "note", "plain", "error",
-                                                "compete", "n_res_ns", "wait", "wait", "wait", "exit", "cancel",
-                                                "close", "stop_turns"])
-        kinds_seen.append(kind)
-        out = []
-        if kind in FRAMES:
-            child.emit(FRAMES[kind](n))
-            model.frame(kind)
-            out = henv.host.tick()
-        elif kind == "wait":
-            henv.clock.advance(rnd.choice([10, 30, 61]))
-            model.now = henv.clock()
-            if model.end is None and model.now - model.since >= 60:
-                model.host_end("timeout")
-            out = henv.host.tick()
-        elif kind == "exit":
-            child.code = 0
-            model.host_end("exit")
-            out = henv.host.tick()
-        elif kind == "cancel":
-            model.host_end("cancel")
-            out = henv.host.cancel(SID, "1", "cancelled") + henv.host.tick()
-        elif kind == "close":
-            model.host_end("close")
-            out = henv.host.close(SID, "closed") + henv.host.tick()
-        elif kind == "stop_turns":
-            model.host_end("stop")
-            out = henv.host.stop_turns("lost the hub")
-        got += out
-        if model.end is not None and kind not in ("wait",):
-            for _ in range(3):
-                got += henv.host.tick()
-        model.now = henv.clock()
-        if model.end is not None and ends(got):
-            break
-        if s.ended or (s.child is None and not s.held):
-            break
-    for _ in range(60):     # the drain: the bound and the bounded stop run out
-        if ends(got):
-            break
-        henv.clock.advance(5)
-        model.now = henv.clock()
-        if model.end is None and model.now - model.since >= 60:
-            model.host_end("timeout")
-        got += henv.host.tick()
-    mine = ends(got)
-    assert len(mine) == 1, (seed, kinds_seen, got)
-    end = mine[0]
-    want_outcome, want_why, native, s_ok = model.end
-    assert (end.steer["outcome"], end.steer["why"]) == (want_outcome, want_why), (seed, kinds_seen, end.steer)
-    if native is not None and want_why not in ("turn_cut",) or (native is not None and model.phase == "h"):
-        assert end.text == native, (seed, kinds_seen, end.text, native)
-    if want_outcome == "next_turn":
-        assert end.steer["result"]["ok"] is s_ok, (seed, kinds_seen, end.steer)
-    kinds = [e.kind for e in got]
-    if "ended" in kinds:
-        assert kinds.index("ended") > kinds.index("turn_ended"), (seed, kinds_seen)
-    reach = request.config.cache.get("claude_steer_reach", {}) if False else None  # (counted in test_model_reach)
-    _REACH.append((want_outcome, want_why, tuple(kinds_seen)))
-
-
-_REACH: list = []
-
-
-def test_model_reach():
-    """The model's walks reach every row of the Claude outcome tables (run after the 200 seeds, in file order)."""
-    if len(_REACH) < 200:
-        pytest.skip("run with the model's seeds")
-    rows = {(o, w) for o, w, _ in _REACH}
-    for row in [("in_turn", "answered"), ("next_turn", "own_turn"), ("next_turn", "own_turn_cut"),
-                ("unconfirmed", "consumed"), ("unconfirmed", "s_only"), ("unconfirmed", "turn_cut")]:
-        assert row in rows, (row, sorted(rows))
-    counts = {row: sum(1 for o, w, _ in _REACH if (o, w) == row) for row in rows}
-    print("MODEL REACH", sorted(counts.items()))
-    assert all(c >= 3 for c in counts.values()), counts
-    assert any("compete" in k and o == "unconfirmed" for o, _, k in _REACH), "an ambiguity after a competing init"
-
-
 # ---------------------------------------------------------------- rules the mutation check asked a test for
 
 
@@ -830,7 +644,7 @@ def test_g_the_checkpoint_goes_only_to_a_hub_that_names_steer(env):
     runner.hub_features, runner.features_known = {"answered", "restart"}, True
     runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x")])
     assert runner.checkpoints == {}
-    runner.hub_features = {"answered", "restart", "steer"}
+    runner.hub_features = {"answered", "restart", "steer", "held"}
     runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x")])
     assert runner.checkpoints["5e551011-0000-4000-8000-000000000000"]["text"] == "x"
     assert runner.pending == [], "the checkpoint is no event of the session's"
@@ -1087,3 +901,499 @@ def test_r1_s2_byte_evidence_is_per_attempt(henv, monkeypatch):
     child.emit(plain(text="N2's"))
     [end] = [e for e in henv.host.tick() if e.kind == "turn_ended"]
     assert end.message_id == "2" and end.text == "N2's" and s.provider.verified
+
+
+# ---------------------------------------------------------------- review round 1: the checkpoint's transport (C)
+
+
+def test_r1_b5_a_refused_checkpoint_never_strips_another_sessions_steer_outcome(env, monkeypatch):
+    """Blocker 5 (Sol's replay): A's checkpoint is refused (409); B's later end still carries its valid steer
+    extension: the checkpoint's own call forgets no feature and renews nothing."""
+    from agent_comms.core import Conflict
+    from test_hosted_sessions import P2
+    a, a_child, a_n, a_s = claude_steered(env)
+    b, b_child, b_n, b_s = claude_steered(env, project=P2)
+    monkeypatch.setattr(hosted_steer, "checkpoint", lambda *x, **k: (_ for _ in ()).throw(Conflict("refused")))
+    a_child.emit(cresult(a, a_n, text="A"))
+    tick(env, times=2)
+    runner = env.node.sessions
+    assert {"steer", "held"} <= runner.hub_features and runner.features_known, "nothing forgotten"
+    b_child.emit(cresult(b, b_n, b_s, text="B with S"))
+    tick(env)
+    assert hosted_steer.get(env.board.conn, b, 1)["outcome"] == "in_turn", "B's extension was taken"
+
+
+def test_r1_c_the_checkpoint_has_its_own_short_call_outside_the_report_lock(env):
+    """Ruling C: the checkpoint is posted with CHECKPOINT_SECONDS at most, after the report lock is let go; a stall
+    or failure of it is logged, and nothing else of the flush depends on it."""
+    runner = env.node.sessions
+    seen = []
+
+    class Client:
+        def request(self, method, path, **kw):
+            free = runner.report_lock.acquire(blocking=False)
+            if free:
+                runner.report_lock.release()
+            seen.append((path, kw.get("timeout"), not free))
+            raise httpx.ReadTimeout("stalled")
+    real = runner.client
+    runner.client = Client()
+    try:
+        runner._post_checkpoints({"5e551011-0000-4000-8000-000000000000": {"message": 1}})
+    finally:
+        runner.client = real
+    assert seen == [("/api/nodes/sessions/5e551011-0000-4000-8000-000000000000", node_sessions.CHECKPOINT_SECONDS,
+                     False)]
+
+
+def test_r1_c_a_step_2_hub_that_names_steer_gets_no_checkpoint(env):
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
+    runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x", answered=True)])
+    assert runner.checkpoints == {}
+
+
+def test_r1_c_the_hub_refuses_impossible_checkpoints(env):
+    """Should 1: only a Claude session's steer is held; `answered` true is required; an ended session answers an
+    explicit refusal, not success."""
+    sid, child, n, s_uuid = claude_steered(env)
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x"}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held})
+    assert r.status_code == 409 and "malformed" in r.text, "answered missing"
+    with hosted.db.write_tx(env.board.conn) as c:
+        rec = hosted._session(c, sid)
+        rec["runtime"] = "codex-cli"
+        hosted._put(c, hosted.SESSION_PREFIX + sid, rec, "hub", env.clock())
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"answered": True}})
+    assert r.status_code == 409 and "Claude" in r.text
+    with hosted.db.write_tx(env.board.conn) as c:
+        rec = hosted._session(c, sid)
+        rec["runtime"] = "claude-code"
+        hosted._end(c, rec, "closed", "hub", env.clock())
+        hosted._put(c, hosted.SESSION_PREFIX + sid, rec, "hub", env.clock())
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"answered": True}})
+    assert r.status_code == 409 and "has ended" in r.text
+
+
+def test_r1_c_next_turn_is_taken_only_for_a_claude_steer():
+    r = {"session_id": "x", "steered": True, "runtime": "codex-cli"}
+    ext = {"outcome": "next_turn", "why": "own_turn", "result": {"ok": True, "detail": "", "denials": [],
+                                                                 "meta": {}, "text": "S", "answered": True}}
+
+    class C:
+        def execute(self, *a):
+            raise AssertionError("not read")
+    seen = {}
+    orig = hosted_steer.get, hosted_steer._settled
+    hosted_steer.get = lambda c, sid, n: {"session_id": sid, "into": n, "outcome": None, "listed_at": 1.0}
+    hosted_steer._settled = lambda c, s, e, now: seen.update(ext=e) or s
+    try:
+        hosted_steer.settle(C(), r, 1, ext, 0.0)
+    finally:
+        hosted_steer.get, hosted_steer._settled = orig
+    assert seen["ext"] is None, "a Codex session's next_turn is an impossible shape: rule 2"
+
+
+def test_r1_c_nonfinite_metadata_is_left_out_on_both_sides():
+    fields = hosted_steer.turn_fields({"ok": True, "meta": {"cost": float("nan"), "n": 2, "x": float("inf")},
+                                       "answered": True})
+    assert fields["meta"] == {"n": 2}
+    assert node_sessions._finite({"a": float("-inf"), "b": 1.5}) == {"b": 1.5}
+
+
+def test_r1_c_the_reupgrade_sweep_clears_a_stale_checkpoint(env):
+    """Should 1: an older hub settled N during a downgrade with its checkpoint still on it: the sweep settles S by
+    the rule and clears `held`."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N"))
+    tick(env, times=2)
+    with hosted.db.write_tx(env.board.conn) as c:
+        m = hosted._get(c, hosted._msg_key(sid, 1))
+        m["state"] = "done"         # what an older hub's settlement leaves: N settled, the steer and `held` not
+        hosted._put(c, hosted._msg_key(sid, 1), m, "hub", env.clock())
+    show(env, sid)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert "held" not in m and hosted_steer.get(env.board.conn, sid, 1)["outcome"] == "unconfirmed"
+
+
+def test_r1_s3_a_claimed_next_turn_keeps_both_blocks_and_ss_failure():
+    """Should 3 (Sol's replay): a parent's `wait=true` claim of a `next_turn` result whose S failed: N's reply and
+    S's reply each in their own untrusted block, the hub's line between, S's failure reason kept."""
+    from agent_comms import hosted_spawn
+    x = {"n": 3, "child": "c", "name": "kid", "agent": "claude", "message": 2, "outcome": "completed", "ok": True,
+         "detail": "", "denials": [], "reply": "N's reply", "state": "pending",
+         "text": "N's reply\n\n" + hosted_results.STEER_JOIN + "\nS's partial",
+         "steer": {"outcome": "next_turn", "why": "own_turn", "ok": False, "detail": "its own turn was cut: closed",
+                   "reply": "S's partial"}}
+    got = hosted_spawn.taken(hosted_results.view_one(x, text=True))
+    lines = got["text"].splitlines()
+    assert "N's reply" in lines and "S's partial" in lines and hosted_results.STEER_JOIN not in got["text"]
+    assert any("its own turn was cut: closed" in line for line in lines)
+    assert got["result"]["steer"] == {"outcome": "next_turn", "why": "own_turn", "ok": False,
+                                      "detail": "its own turn was cut: closed"}
+
+
+def test_r1_s3_a_retry_whose_n_is_pruned_keeps_a_known_next_turn(monkeypatch, capsys):
+    """Should 3: `send --mode steer --wait` retried after N was pruned: a `next_turn` the send's answer already
+    said is said again (S's outcome known), N's own result not available: exit 7."""
+    import types
+    from agent_comms import cli
+    monkeypatch.setattr(cli, "_kept", lambda *a, **k: None)
+    a = types.SimpleNamespace(wait=True, json=False)
+    r = {"session": {"session_id": "5e551011-0000-4000-8000-000000000000", "name": "s", "agent": "claude",
+                     "state": "idle"},
+         "steer": {"session": "5e551011-0000-4000-8000-000000000000", "into": 1, "outcome": "next_turn",
+                   "state": "settled"}, "created": False, "why": "retry"}
+    monkeypatch.setattr(cli, "_fmt_hosted", lambda s: "s")
+    with pytest.raises(SystemExit) as e:
+        cli._steer_sent(a, lambda *x: None, None, "t", r, "text")
+    assert e.value.code == cli.STEER_UNSETTLED_EXIT
+    assert cli.STEER_WORDS["next_turn"] in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- the model (review round 1, ruling D)
+
+
+class _M2:
+    """This test's own reading of ruling A's predicates and part D's tables, for one attempt (never the adapter's
+    or the host's state): the phase, the brackets, verification and time, from the frames this test chose."""
+
+    def __init__(self, now, bytes_):
+        self.phase = "n"            # n, held, s_turn, done
+        self.bracket = "own"        # own (N's), cli, s, None
+        self.comp, self.verified, self.lost = False, True, False
+        self.bytes, self.n_start, self.since, self.cover = bytes_, now, None, None
+        self.end = None             # (outcome, why, N's text or None, S's reply or None, S ok or None)
+        self.native = None
+        self.host_cut = False       # the turn ended by a host-made end: its process is stopped
+
+    def finish(self, outcome, why, s_reply=None, s_ok=None):
+        if self.end is None:
+            self.end, self.phase = (outcome, why, self.native, s_reply, s_ok), "done"
+
+    def cut(self):
+        if self.end is not None:
+            return
+        self.host_cut = True
+        if self.phase == "n":
+            self.finish("unconfirmed", "turn_cut") if self.bytes else self.finish("not_delivered", None)
+        elif self.phase == "s_turn":
+            self.finish("next_turn", "own_turn_cut", s_ok=False)
+        else:
+            self.finish("unconfirmed", "turn_cut")
+
+    def frame(self, kind):
+        if self.end is not None:
+            return
+        p = self.phase
+        if p == "n":
+            if not self.bytes:
+                # No byte went: as without a steer (step 1). N's result, a plain one, an unlisted error, and one
+                # echoing only S's uuid (forgotten when the attempt was retired: a uuid this process never got) all
+                # end N, as on main.
+                if kind in ("res_n", "res_ns", "res_s", "plain", "error"):
+                    self.native = {"res_n": "N", "res_ns": "N", "res_s": "S-only", "plain": "?", "error": ""}[kind]
+                    if kind == "error":
+                        self.verified = False   # (step 1's rule 10: by order, and unverified from now on)
+                    self.finish("not_delivered", None)
+                return
+            if kind == "res_ns":
+                self.native = "N"
+                self.finish("in_turn", "answered")
+            elif kind == "res_n":
+                self.native = "N"
+                if self.verified and not self.lost:
+                    self.phase, self.bracket, self.since = "held", None, self.now
+                else:
+                    self.phase = "held"
+                    self.cut()
+            elif kind == "res_s":
+                if self.verified and self.bracket == "own" and not self.comp:
+                    self.native = "S-only"
+                    self.finish("unconfirmed", "s_only")
+                elif self.verified and self.bracket == "own" and self.comp:
+                    self.verified, self.lost = False, True
+            elif kind in ("compete", "cli_open", "s_init", "s_init_bad"):
+                if self.verified:
+                    self.comp = True
+            elif kind in ("plain", "error"):
+                if self.verified:
+                    self.verified, self.lost = False, True
+        elif p == "held":
+            if kind == "s_init" and self.bracket is None and self.verified:
+                self.phase, self.bracket, self.since = "s_turn", "s", self.now
+            elif kind == "s_init_bad" and self.bracket is None and self.verified:
+                self.bracket = "cli"        # a notification-origin [S]: a bracket that proves nothing
+            elif kind in ("cli_open", "compete") and self.bracket is None:
+                self.bracket = "cli"
+            elif kind == "cli_end" and self.bracket == "cli":
+                self.bracket = None
+            elif kind == "cli_takes_s" and self.bracket == "cli":
+                self.finish("unconfirmed", "consumed")
+            elif kind in ("plain", "error"):
+                self.verified = False
+                self.cut()
+        elif p == "s_turn":
+            if kind == "s_res":
+                self.finish("next_turn", "own_turn", s_reply="S's reply", s_ok=True)
+            elif kind == "s_err":
+                self.finish("next_turn", "own_turn", s_reply="", s_ok=False)
+
+    def clock(self, now, T=60.0):
+        self.now = now
+        if self.end is not None:
+            return
+        if self.phase == "n" and now - self.n_start >= T:
+            self.cut()
+        elif self.phase in ("held", "s_turn") and now - self.since >= T:
+            self.cut()
+        elif self.phase in ("held", "s_turn") and self.cover is not None and now >= self.cover:
+            self.cut()
+
+
+def _m2_frames(n, s_):
+    other = "0be7c0de-0000-4000-8000-000000000009"
+    return {"res_n": owned(n, text="N"), "res_ns": owned(n, s_, text="N"), "res_s": owned(s_, text="S-only"),
+            "compete": vinit(other), "cli_open": vinit(), "cli_end": foreign(), "note": nonturn(),
+            "plain": plain(text="?"), "error": result(subtype="error_during_execution", is_error=True, text=""),
+            "s_init": vinit(s_), "s_init_bad": vinit(s_) | {"origin": NOTIFY},
+            "cli_takes_s": owned(s_, text="took S") | {"origin": NOTIFY}, "late_ns": owned(n, s_, text="late"),
+            "s_res": owned(s_, text="S's reply"),
+            "s_err": result(subtype="error_max_turns", is_error=True, text="")}
+
+
+_MENU = {"n": ["res_n", "res_n", "res_n", "res_ns", "res_s", "compete", "cli_open", "cli_end", "note", "plain",
+               "error"],
+         "held": ["s_init", "s_init", "s_init", "s_init_bad", "cli_open", "cli_open", "cli_end", "cli_takes_s",
+                  "cli_takes_s", "cli_takes_s", "late_ns", "note", "plain", "error"],
+         "s_turn": ["s_res", "s_res", "s_err", "note", "cli_end", "late_ns", "plain"]}
+
+
+def test_model_claude_steer_walks_against_an_independent_reference(henv, monkeypatch):
+    """Ruling D: 300 seeded walks of one Claude session over up to two turns, each turn with no steer or a steer
+    written whole, in part (then completed or cut at 5 s), or not at all (queued and retired with zero bytes);
+    frames chosen from this test's OWN model phase (never production's), one to three per read; and host-made ends
+    (the clock, an exit, a cancel, a close, a stop of every turn, the stop latch then shutdown, the attempt's contact
+    clock running out). Each turn's end is published exactly once, with the outcome, the why, N's reply and S's own
+    reply and `ok` the reference reads; `ended` comes after it; a turn after a steered one is its own. Reach: every
+    outcome row (`in_turn`, `next_turn` ok and cut, `consumed`, `s_only`, `unconfirmed` cut and partial,
+    `not_delivered`) is reached, counted here, whatever runs before."""
+    import random
+    from test_dispatch import FakeProcs, FakeSpawner
+    from test_session_host import FakeSessionChild
+    from agent_comms.session_host import STEER_CUT
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    reach: dict = {}
+    for seed in range(300):
+        rnd = random.Random(seed)
+        henv.spawner = FakeSpawner(child=FakeSessionChild)
+        henv.procs = FakeProcs(henv.spawner)
+        henv.host = make_host(henv, timeout_minutes=1)
+        henv.host.steer_authority = lambda sess: True
+        s, child = idle_host(henv)
+        ended_seen, log, verified = False, [seed], True
+        for turn in range(1, 3):
+            mid = str(turn)
+            henv.host.send(SID, f"turn {turn}", message_id=mid)
+            assert ("delivered", mid) in [(e.kind, e.message_id) for e in henv.host.tick()], log
+            n = uuid_of(child)
+            child.emit(vinit(n))
+            assert ("turn_started", mid) in [(e.kind, e.message_id) for e in henv.host.tick()], log
+            s_ = f"5e7e7e7e-0000-4000-8000-00000000000{turn}"
+            write = rnd.choice(["none", "full", "full", "full", "partial", "partial_cut", "zero"])
+            if not verified:
+                write = "none"      # (the model's own reading: an unverified incarnation never steers)
+            log.append((turn, write))
+            got: list = []
+            model = None
+            if write != "none":
+                cover = rnd.choice([None, None, 40.0])
+                henv.host.steer_offer(SID, mid, s_, TEXT, authorized=True,
+                                      cover_until=None if cover is None else henv.clock() + cover)
+                if write == "zero":
+                    child.accept = 0
+                    got += henv.host.tick()
+                    henv.host.steer_revoke(SID, s_, "omitted")
+                    got += henv.host.tick()
+                    child.accept = None
+                elif write.startswith("partial"):
+                    child.accept = 5
+                    got += henv.host.tick()
+                    if write == "partial_cut":
+                        child.accept = 0
+                        henv.clock.advance(6)
+                        got += henv.host.tick()
+                    child.accept = None
+                    got += henv.host.tick()
+                else:
+                    got += henv.host.tick()
+                model = _M2(henv.clock(), 0 if write == "zero" else 1)
+                model.now = henv.clock()
+                model.cover = None if cover is None else model.n_start + cover - (0 if write != "partial_cut" else 6)
+            if write == "partial_cut":
+                # the cut: N failed with STEER_CUT, S unconfirmed (partial), the process stopped
+                mine = [e for e in got if e.kind == "turn_ended" and e.message_id == mid]
+                assert len(mine) == 1 and mine[0].detail == STEER_CUT, log
+                assert mine[0].steer == {"outcome": "unconfirmed", "why": "partial"}, (log, mine)
+                reach[("unconfirmed", "partial")] = reach.get(("unconfirmed", "partial"), 0) + 1
+                break
+            if model is None:
+                # no steer: an ordinary turn, as main
+                child.emit(owned(n, text="M"))
+                mine = [e for e in henv.host.tick() if e.kind == "turn_ended" and e.message_id == mid]
+                assert [(e.ok, e.text, e.steer) for e in mine] == [(True, "M", None)], log
+                continue
+            stopped = False
+            for _ in range(rnd.randint(1, 10)):
+                if model.end is not None and [e for e in got if e.kind == "turn_ended" and e.message_id == mid]:
+                    break
+                act = rnd.choice(["frames"] * 6 + ["wait", "wait", "exit", "cancel", "close", "stop", "latch"])
+                log.append(act)
+                if act == "frames":
+                    # One to three frames in one read, each chosen from the model's phase after the one before; the
+                    # read stops at the frame that ends the turn in the model (what follows is the next turn's).
+                    kinds = []
+                    for _ in range(rnd.randint(1, 3)):
+                        k = rnd.choice(_MENU[model.phase])
+                        kinds.append(k)
+                        model.frame(k)
+                        if model.end is not None:
+                            break
+                    log.append(kinds)
+                    frames = _m2_frames(n, s_)
+                    child.emit(*[frames[k] for k in kinds])
+                    got += henv.host.tick()
+                elif act == "wait":
+                    henv.clock.advance(rnd.choice([5, 20, 45, 61]))
+                    model.clock(henv.clock())
+                    got += henv.host.tick()
+                elif act == "exit":
+                    child.code = 0
+                    model.cut()
+                    got += henv.host.tick()
+                    stopped = True
+                elif act == "cancel":
+                    model.cut()
+                    got += henv.host.cancel(SID, mid, "cancelled") + henv.host.tick()
+                    stopped = True
+                elif act == "close":
+                    model.cut()
+                    got += henv.host.close(SID, "closed") + henv.host.tick()
+                    stopped = True
+                elif act == "stop":
+                    model.cut()
+                    got += henv.host.stop_turns("lost the hub")
+                    stopped = True
+                else:   # the stop latch, then shutdown: evidence after the latch never counts
+                    henv.host.steer_stopping()
+                    frames = _m2_frames(n, s_)
+                    child.emit(frames["s_init"], frames["s_res"])
+                    model.cut()
+                    got += henv.host.tick() + henv.host.stop_all()
+                    stopped = True
+                model.clock(henv.clock())
+                if stopped:
+                    break
+            for _ in range(40):         # the drain: bounds, the bounded stop
+                if [e for e in got if e.kind == "turn_ended" and e.message_id == mid]:
+                    break
+                henv.clock.advance(5)
+                model.clock(henv.clock())
+                got += henv.host.tick()
+            mine = [e for e in got if e.kind == "turn_ended" and e.message_id == mid]
+            assert len(mine) == 1, (log, got)
+            end = mine[0]
+            want_outcome, want_why, native, s_reply, s_ok = model.end
+            assert end.steer is not None and end.steer["outcome"] == want_outcome, (log, end.steer, model.end)
+            if want_why is not None:
+                assert end.steer["why"] == want_why, (log, end.steer, model.end)
+            if native is not None and want_outcome != "not_delivered":
+                assert end.text == native, (log, end.text, native)
+            if want_outcome == "next_turn":
+                assert end.steer["result"]["ok"] is s_ok, (log, end.steer)
+                if s_ok:
+                    assert end.steer["result"]["text"] == s_reply, (log, end.steer)
+            kinds_out = [e.kind for e in got]
+            if "ended" in kinds_out:
+                assert kinds_out.index("ended") > kinds_out.index("turn_ended"), log
+                ended_seen = True
+            row = (want_outcome, want_why if want_why else "")
+            if want_outcome == "next_turn":
+                row = ("next_turn", "ok" if s_ok else "cut")
+            reach[row] = reach.get(row, 0) + 1
+            verified = model.verified
+            if stopped or ended_seen or model.host_cut or (want_outcome == "next_turn" and not s_ok):
+                break       # (the model's own reading: the process was stopped, or S's turn left it unverified)
+    for row in [("in_turn", "answered"), ("next_turn", "ok"), ("next_turn", "cut"), ("unconfirmed", "consumed"),
+                ("unconfirmed", "s_only"), ("unconfirmed", "turn_cut"), ("unconfirmed", "partial"),
+                ("not_delivered", "")]:
+        assert reach.get(row, 0) >= 3, (row, sorted(reach.items()))
+    print("MODEL REACH", sorted(reach.items()))
+
+
+# ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
+
+M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
+M8_N, M8_S = "00000000-0000-4000-8000-00000000000e", "00000000-0000-4000-8000-00000000005e"
+M8_SID = "00000000-0000-4000-8000-00000000a8a8"
+
+
+def _m8_runs():
+    names = (M8_DIR / "MANIFEST").read_text().split()
+    # S is written into N in every scenario but cli_take and cli_late (there the probe wrote S after N had ended,
+    # into a turn the CLI started: no steer can be, since one is written only while N is in flight)
+    return [x for x in names if not x.startswith(("cli_take", "cli_late"))]
+
+
+def test_m8_the_manifest_is_36_runs_of_thirteen_scenarios():
+    """The run accounting (ruling E): 36 runs, 3 of each of 13 scenarios (the race at 3, 5 and 7 s is three)."""
+    names = (M8_DIR / "MANIFEST").read_text().split()
+    scenarios = sorted({x.rsplit("-", 1)[0] for x in names})
+    assert len(names) == 36 and len(scenarios) == 13, (len(names), scenarios)
+    assert all(sum(1 for x in names if x.rsplit("-", 1)[0] == sc) in (2, 3) for sc in scenarios)
+    assert len(_m8_runs()) == 30
+
+
+@pytest.mark.parametrize("run", _m8_runs())
+def test_m8_real_frames_through_the_host_give_the_outcome_their_own_frames_prove(henv, monkeypatch, run):
+    """Each M8 run's real 2.1.330 frames (sanitised), replayed through the host and the adapter as shipped (VERIFIED,
+    STEER_MODES), S offered and written where the probe wrote it: the outcome is the one the frames themselves prove
+    under ruling A's exact predicates: `in_turn` where N's result lists exactly [N, S]; else `next_turn`, with S's
+    own result's `ok` and its reply's probe word, where a result lists exactly [S] after an `init` listing exactly
+    [S]."""
+    lines = [json.loads(x) for x in (M8_DIR / f"{run}.jsonl").read_text().splitlines()]
+    henv.host = make_host(henv, timeout_minutes=5)
+    henv.host.steer_authority = lambda sess: True
+    s = open_session(henv)
+    henv.host.send(SID, "N", message_id="1")
+    henv.host.tick()
+    child = henv.spawner.children[-1]
+    n = uuid_of(child)
+
+    def real(f):
+        text = json.dumps(f).replace(M8_N, n).replace(M8_S, S).replace(M8_SID, SID)
+        return json.loads(text)
+    out = []
+    for f in lines:
+        if f.get("probe") == "S":
+            out += henv.host.tick()
+            henv.host.steer_offer(SID, "1", S, TEXT, authorized=True)
+            out += henv.host.tick()
+            assert json.loads(child.stdin.split(b"\n")[-2]).get("uuid") == S, run
+            continue
+        if "probe" in f:
+            continue
+        child.emit(real(f))
+        out += henv.host.tick()
+    [end] = ends(out)
+    n_res = next(f for f in lines if f.get("type") == "result" and M8_N in (f.get("user_message_uuids") or []))
+    s_res = next((f for f in lines if f.get("type") == "result" and f.get("user_message_uuids") == [M8_S]), None)
+    if n_res["user_message_uuids"] == [M8_N, M8_S]:
+        assert end.steer == {"outcome": "in_turn", "why": "answered"}, (run, end.steer)
+    else:
+        assert s_res is not None, run
+        ok = s_res["subtype"] == "success" and s_res["is_error"] is False
+        assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is ok, (run, end.steer)
+        assert end.steer["result"]["text"] == s_res["result"], (run, end.steer)
+    assert end.text == n_res["result"], run

@@ -418,6 +418,8 @@ def step2_named(out: dict) -> None:
         features = (out.get(key) or {}).get("features")
         if isinstance(features, list) and features[-1:] == ["steer"]:
             features.pop()
+            if features[-1:] == ["held"]:
+                features.pop()      # (step 3, part K: Claude steering's checkpoint feature, just before `steer`)
             NAMED.append(("features", key))
     for key in ("records", "seq_records"):
         for k, rec in (out.get(key) or {}).items():

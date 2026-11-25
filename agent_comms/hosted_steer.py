@@ -430,11 +430,25 @@ def extension(ev: Any) -> dict | None:
     return out
 
 
-def turn_fields(x: Any) -> dict | None:
+def claude(r: dict) -> bool:
+    """The session's agent is Claude Code: only its steers can be held, or run as a turn of their own (step 3)."""
+    return r.get("runtime") == "claude-code"
+
+
+def _finite(meta: dict) -> dict:
+    """Optional metadata with every non-finite number left out, so it can never break serialising a report."""
+    import math
+    return {k: v for k, v in meta.items() if not (isinstance(v, float) and not math.isfinite(v))}
+
+
+def turn_fields(x: Any, *, answered: bool = False) -> dict | None:
     """A turn's end as a node sends it (ok, detail, denials, meta, text, answered), checked like an event's, else
-    None. S's own result on `next_turn`, and the checkpoint (`checkpoint`)."""
+    None. S's own result on `next_turn`, and the checkpoint (`checkpoint`: `answered`, true, is required there: N's
+    native end is the provider's own). Non-finite numbers in `meta` are left out."""
     from .hosted import _TOOL_NAME
     if not isinstance(x, dict) or set(x) - {"ok", "detail", "denials", "meta", "text", "answered", "message"}:
+        return None
+    if answered and x.get("answered") is not True:
         return None
     ok, detail, text = x.get("ok"), x.get("detail", ""), x.get("text", "")
     denials, meta, answered = x.get("denials", []), x.get("meta", {}), x.get("answered", False)
@@ -452,7 +466,7 @@ def turn_fields(x: Any) -> dict | None:
                 v is None or isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 200))
             for k, v in meta.items())):
         return None
-    return {"ok": ok, "detail": detail, "denials": list(denials), "meta": dict(meta), "text": text,
+    return {"ok": ok, "detail": detail, "denials": list(denials), "meta": _finite(dict(meta)), "text": text,
             "answered": answered}
 
 
@@ -478,9 +492,11 @@ def checkpoint(c, r: dict, held: Any, now: float, by: str) -> None:
     caller checked), for N delivered and in flight there, with a listed, unsettled steer into it, and never once N is
     settled. Conflict otherwise (the node logs and drops it; it is never resent)."""
     n = held.get("message") if isinstance(held, dict) else None
-    fields = turn_fields(held)
+    fields = turn_fields(held, answered=True)
     if type(n) is not int or n < 1 or fields is None:
         raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="malformed"))
+    if not claude(r):
+        raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="only a Claude session's steer is ever held"))
     m = _get(c, hosted._msg_key(r["session_id"], n))
     s = get(c, r["session_id"], n) if has_steers(r) else None
     why = ("no such message" if not isinstance(m, dict) else
@@ -499,16 +515,29 @@ def checkpoint(c, r: dict, held: Any, now: float, by: str) -> None:
 def settle(c, r: dict, n: Any, ext: dict | None, now: float) -> dict | None:
     """N (message `n` of session `r`) is being settled, in this transaction: its steer, if it has one, is settled by
     the one precedence rule. `ext`: the owning host's extension on N's own end (`extension`), or None on every other
-    path. Returns the steer as settled (or None). None at once, with no read, for a session that never took one."""
+    path. Returns the steer as settled (or None). None at once, with no read, for a session that never took one.
+    `next_turn` is taken only for a Claude session's steer (an impossible shape otherwise: ignored, rule 2)."""
     if not has_steers(r):
         return None
+    if ext is not None and ext.get("outcome") == "next_turn" and not claude(r):
+        ext = None
     s = get(c, r["session_id"], n)
     if s is None or s.get("outcome") is not None:
         return s
     return _settled(c, s, ext, now)
 
 
+def _clear_held(c, session_id: str, n: Any, now: float) -> None:
+    """A checkpoint left on an N that is settled (an older hub settled it during a downgrade): cleared."""
+    m = _get(c, hosted._msg_key(session_id, n)) if type(n) is int else None
+    if isinstance(m, dict) and m.get("state") in hosted.SETTLED and "held" in m:
+        m.pop("held", None)
+        m["updated_at"] = now
+        _put(c, hosted._msg_key(session_id, n), m, "hub", now)
+
+
 def _settled(c, s: dict, ext: dict | None, now: float) -> dict:
+    _clear_held(c, s["session_id"], s.get("into"), now)
     listed = s.get("listed_at") is not None
     if ext is not None and (ext["outcome"] == "not_delivered" or listed):
         outcome, why = ext["outcome"], ext["why"]

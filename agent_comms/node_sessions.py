@@ -97,6 +97,12 @@ from .session_host import STEER_CONTACT_SECONDS, HostEvent, SessionHost, receive
 
 log = logging.getLogger("agent_comms.node_sessions")
 
+
+def _finite(meta: dict) -> dict:
+    """Optional metadata with every non-finite number left out: it could not be serialised in a report."""
+    import math
+    return {k: v for k, v in meta.items() if not (isinstance(v, float) and not math.isfinite(v))}
+
 TICK_SECONDS = 0.2          # between passes while any session has work
 SHUTDOWN_BOUND_MAX = 3600.0     # hosted.SHUTDOWN_BOUND_MAX (named here, so the node does not import the hub's module)
 SYNC_SECONDS = 1.0          # between fetches of the hub's list while any session has work
@@ -139,6 +145,7 @@ SESSION_PROTOCOL = 5        # `tree` on every fetch and hello: 2 spawn, 3 the ho
 STEER_OFFER_AGE = 20.0          # ... and an offer is used only from a fetch younger than this when its answer is read
 STEER_STATUS_SECONDS = 20.0     # while a steer is held, the session's status is posted at least this often
 STEER_MAX_BYTES = 12_288        # hosted_steer.STEER_MAX_BYTES (named here, so the node does not import the hub's module)
+CHECKPOINT_SECONDS = 5.0        # Claude steering: the checkpoint's own call, at most this long (it never waits for more)
 SEQ_FILE = "node-session-seq.json"         # {"seq": the highest report stamp this node has issued}
 WORKTREES_FILE = "node-session-worktrees.json"   # session id -> {path, checkout}: a child session's own worktree
 SWEEP_SECONDS = 3600.0      # how often the worktrees of sessions that are gone are looked at again
@@ -399,6 +406,9 @@ class SessionRunner:
                 d["restarted_by"] = int(e.restarted_by)     # the provider said that restart's interrupt ended it
             if isinstance(e.steer, dict):
                 d["steer"] = dict(e.steer)      # the host's word on the steer into this turn (never waits: `_takes`)
+                if isinstance(d["steer"].get("result"), dict):      # (Claude: S's own result, finite numbers only)
+                    d["steer"]["result"] = dict(d["steer"]["result"]) | {
+                        "meta": _finite(dict(d["steer"]["result"].get("meta") or {}))}
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
@@ -443,26 +453,29 @@ class SessionRunner:
         resent."""
         if e.message_id is None or not e.message_id.isdigit() or e.session_id in self.dropped:
             return
-        if not ("steer" in self.hub_features and self.features_known):
+        if not ("held" in self.hub_features and self.features_known):
+            # (Review round 1, ruling C) A feature of its own: a step-2 hub names `steer` but takes no checkpoint.
             log.info("session %s: the checkpoint of message %s is not sent: the hub has not said it takes it",
                      e.session_id, e.message_id)
             return
         self.checkpoints[e.session_id] = {"message": int(e.message_id), "ok": bool(e.ok), "detail": e.detail[:300],
-                                          "denials": list(e.denials), "meta": dict(e.meta), "text": e.text,
+                                          "denials": list(e.denials), "meta": _finite(dict(e.meta)), "text": e.text,
                                           "answered": bool(e.answered)}
 
-    def _post_checkpoint(self, sid: str) -> None:
-        """One try (the checkpoint's rules above); called once nothing of the session is pending before it."""
-        held = self.checkpoints.pop(sid, None)
-        if held is None:
-            return
-        try:
-            self._call("POST", f"/api/nodes/sessions/{sid}", json={"events": [], "held": held, "seq": self._stamp()},
-                       spare_422=True)
-        except Exception as e:
-            code = getattr(getattr(e, "response", None), "status_code", None)
-            log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent again", sid,
-                        held["message"], code if code is not None else type(e).__name__)
+    def _post_checkpoints(self, ready: dict) -> None:
+        """The checkpoints taken out of the queue by `_flush` (each one's session had nothing pending before it),
+        posted OUTSIDE the report lock, one try each, with CHECKPOINT_SECONDS at most: its own call, so its failure,
+        refusal or stall changes nothing else (no feature knowledge forgotten, no contact renewed, no report of
+        another session stripped or held up longer than that). Ruling C."""
+        for sid, held in ready.items():
+            try:
+                r = self.client.request("POST", f"/api/nodes/sessions/{sid}", json={"events": [], "held": held},
+                                        timeout=CHECKPOINT_SECONDS)
+                r.raise_for_status()
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent again", sid,
+                            held["message"], code if code is not None else type(e).__name__)
 
     def _flush(self, final: bool = False) -> bool:
         """Post what the hub has not taken yet, per session and in order. False: the hub could not be reached (the
@@ -473,7 +486,14 @@ class SessionRunner:
         with self.report_lock:
             if self.stopping.is_set() and not final:
                 return False
-            return self._post_pending()
+            ok = self._post_pending()
+            # (Claude steering) the checkpoints whose sessions have nothing pending before them (part G), taken out
+            # of the queue here and posted after the lock is let go (ruling C)
+            ready = {sid: self.checkpoints.pop(sid) for sid in list(self.checkpoints)
+                     if not any(x == sid for x, _ in self.pending)}
+        if ready:
+            self._post_checkpoints(ready)
+        return ok
 
     wall_ns = staticmethod(time.time_ns)
 
@@ -504,7 +524,6 @@ class SessionRunner:
             if sid not in order:
                 order.append(sid)
         order += [sid for sid, st in self.status.items() if sid not in order and self.reported.get(sid) != st]
-        order += [sid for sid in self.checkpoints if sid not in order]
         sent_items: set[int] = set()
         for sid in order:
             # In order, up to the first event this hub may not take yet (`_takes`): nothing of the session overtakes
@@ -518,8 +537,6 @@ class SessionRunner:
                 mine.append((i, e))
             events = [e for _, e in mine]
             if not events and (self.status.get(sid) is None or self.reported.get(sid) == self.status.get(sid)):
-                if sid in self.checkpoints and not any(x == sid for x, _ in self.pending):
-                    self._post_checkpoint(sid)      # nothing of the session pending before it
                 continue        # only events this hub does not take wait for this session: nothing to post now
             # A field the hub has not named as one it takes (its listing's `features`) is not sent: a hub from
             # before it refuses the whole report, and its turn ends would be lost.
@@ -595,8 +612,6 @@ class SessionRunner:
                 self.reported[sid] = status
                 self.sent[sid] = body["seq"]
             sent_items |= {i for i, _ in mine}
-            if sid in self.checkpoints and all(i in sent_items for i, (x, _) in enumerate(self.pending) if x == sid):
-                self._post_checkpoint(sid)          # after that session's pending events (part G)
         self._drop_sent(sent_items)
         return True
 

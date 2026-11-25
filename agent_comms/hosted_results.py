@@ -628,7 +628,10 @@ def view_one(x: dict, text: bool = False) -> dict:
         if x["steer"].get("outcome") == "next_turn":
             out["steer"] |= {"ok": x["steer"].get("ok"), "detail": x["steer"].get("detail")}
             if text:
+                # (should 3) a claim renders N's raw reply and S's in blocks of their own, S's failure said
                 out["steer"]["reply"] = x["steer"].get("reply") or ""
+                if isinstance(x.get("reply"), str):
+                    out["reply"] = x["reply"]
     if text:
         out["text"] = x.get("text") or ""
     return out

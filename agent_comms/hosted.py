@@ -99,9 +99,10 @@ SHOW_MESSAGES = 20                 # the most recent messages `show` lists
 KEEP_ENDED_SECONDS = 7 * 86400     # an ended session's record is kept this long
 KEEP_SETTLED_SECONDS = 86400       # a settled message's record, in a session that goes on
 NODE_WAIT_MAX = 25                 # seconds one long-poll of a node may wait
-NODE_REPORT_FEATURES = ("answered", "restart", "steer")  # report fields this hub takes beyond the first ones
+NODE_REPORT_FEATURES = ("answered", "restart", "held", "steer")  # report fields this hub takes beyond the first ones
                                                 # (`_listed`); `restart`: `modes`, and `restarted_by` on a turn's end;
                                                 # `steer`: the steer extension on a turn's end (hosted_steer.py)
+                                                # `held`: Claude steering's checkpoint, a report of its own (step 3)
 HUMAN_WAIT_MAX = 30                # ... and one of the human's CLI
 WAIT_POLL_SECONDS = 0.25           # how often a waiting call re-reads the database
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -1591,6 +1592,9 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
             raise NotFound(f"session {session_id} is not hosted on this node")
         removed = (any(ev["kind"] == WORKTREE_REMOVED for ev in events) and r.get("isolation") == "worktree"
                    and r.get("worktree_removed_at") is None)
+        if r["state"] == "ended" and held is not None:
+            from .core import Conflict
+            raise Conflict(f"session {r['session_id']} has ended: no checkpoint is taken for it")
         if r["state"] == "ended":
             # Idempotent: nothing is reported into an ended session. But its node removes a child's own worktree
             # only once the process is gone, which is after the session ended here: that one fact is still taken.
