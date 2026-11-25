@@ -83,6 +83,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -345,7 +346,7 @@ class SessionRunner:
 
     # ------------------------------------------------------------ hub calls
 
-    def _call(self, method: str, path: str, *, gen: int | None = None, **kw) -> Any:
+    def _call(self, method: str, path: str, *, gen: int | None = None, spare_422: bool = False, **kw) -> Any:
         # The contact counts from when the call was SENT: the hub records it at or after that (hosted.note_contact),
         # so the node's self-stop clock never runs behind the hub's (`shutdown_bound`).
         sent = self.clock()
@@ -357,7 +358,9 @@ class SessionRunner:
             # again which report fields it takes, none beyond the first ones are sent (`_for_hub`), and an event that
             # needs one waits (`_takes`). A call made under a listing's features (`gen`: a report carrying a steer
             # outcome) forgets only THOSE: a refusal of it that comes after a newer listing leaves that one's (R4-03).
-            if gen is None or gen == self.features_gen:
+            # `spare_422`: a 422 forgets nothing here; the caller decides what it says (R5-05).
+            code = getattr(getattr(sys.exc_info()[1], "response", None), "status_code", None)
+            if not (spare_422 and code == 422) and (gen is None or gen == self.features_gen):
                 self.hub_features, self.features_known = set(), False
             raise
         self._renew_contact(sent)
@@ -499,7 +502,7 @@ class SessionRunner:
                     gen = self.features_gen
                     first = json.loads(json.dumps(body))
                     try:
-                        answer = self._call("POST", path, json=first, gen=gen)
+                        answer = self._call("POST", path, json=first, gen=gen, spare_422=True)
                     except Exception as e:
                         if getattr(getattr(e, "response", None), "status_code", None) != 422:
                             raise
@@ -509,6 +512,11 @@ class SessionRunner:
                         plain["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
                         sent = self.clock()
                         answer = self._call("POST", path, json=plain, gen=gen)
+                        # (R5-05) The plain retry got through: this hub takes everything else this listing said, so
+                        # only `steer` is forgotten, and only while that listing's features stand. (A failed retry
+                        # forgot every feature in `_call`, as main does for a failed report.)
+                        if gen == self.features_gen:
+                            self.hub_features = self.hub_features - {"steer"}
                 self._ack_report(sid, sent, answer)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
@@ -622,7 +630,7 @@ class SessionRunner:
             # The queue and the stop flags held here may be out of date (the human may just have closed a session):
             # turns already running go on, nothing new is handed over until a fetch has succeeded again.
             self.fresh = False
-        with self.lock:
+        with self.lock, self.host.one_drain_budget():   # (R5-04) one drain deadline for this whole hold of the lock
             if self.stopping.is_set():
                 return ok
             now = self.clock()
@@ -636,8 +644,7 @@ class SessionRunner:
                     self._add(e.session_id, self._event(e))
                 self.watched_steer = []
             if data is not None:
-                with self.host.one_drain_budget():      # every close or cancel in it shares one drain deadline
-                    self._reconcile(data, fetch_sent)
+                self._reconcile(data, fetch_sent)       # (its closes and cancels share the hold's drain deadline)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
                 # above): what waits in an inbox may start again, in `tick` below. Only a listing from a fetch SENT
                 # after the latch was set: one sent before may have been built before the hub decided.
