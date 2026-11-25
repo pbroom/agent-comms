@@ -2736,7 +2736,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     timeouts. Then a drain (every gate open, groups and pipes released). Every process starts as a candidate. Every
     odd seed walks the budget profile: pipes blocked from the start, most new processes verifying at once (their own
     first turn left open, or over), more sends, CLI turns, in-flight results and passes that only let time go by,
-    steps sized for one and two budgets, and before the drain 200 s with every gate open and the pipes still blocked.
+    steps sized for one and two budgets, and before the drain 200 s with every gate open and every pipe as the walk
+    left it (blocked from the start, unless an action of the walk opened it).
     Asserted, at every pass's decision point (a wrapper of `_decide` records what the host decided), against this
     test's OWN reading of both ends of every interval (from the flags it set and the session's plain fields, never
     the host's `_counting`; a host gate closed withholds a staged message too, review round 10):
@@ -2769,8 +2770,10 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     cancel returns is settled (a delivered cancellation's too): a message settles once, and every delivered
     message's turn ends exactly once; a second settlement is an invariant broken. A failure names the seed and every
     step. And the test proves its own reach: over its seeds, minimum numbers of walks in which a budget was earned,
-    a first budget was spent (the 7b), a second one (the HELD failure), a budgeted message met a host-side wait, and
-    a staged earned line's clock switched (counts printed on failure; C9_SEEDS walks another number of seeds)."""
+    a first budget was spent and the 7b observed (the process stopped on the due pass, the message first in the
+    inbox again), a second one and the HELD failure observed (its event, with its exact detail, on the due pass),
+    a budgeted message met a host-side wait, and a staged earned line's clock switched; every due budget must show
+    its outcome (counts printed on failure; C9_SEEDS walks another number of seeds)."""
     import bisect
     import random
     from types import SimpleNamespace
@@ -2778,6 +2781,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     from test_dispatch import FakeProcs, FakeSpawner
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
     T, STEPS = 60.0, [1, 5, 5, 5, 10, 30, 65, 125]
+    HELD_DETAIL = ("not one byte of the message was accepted by the agent's process in two periods of 1 minutes; the "
+                   "message was not written")      # the second budget's failure, word for word (T = 1 minute)
     # The budget profile (every odd seed): steps sized so that one and two budgets of counted time are reached in a
     # few passes, rarely one long enough for an in-flight turn's timeout.
     STEPS_BUDGET = [5, 5, 5, 10, 10, 15, 20, 30, 30, 65]
@@ -2799,7 +2804,14 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
         rec = watch["pre"](m, now) if m is not None else None       # ... and its own reading
         acted, gates = decide(self, s, now, out)
         if rec is not None:
-            rec.update(acted=acted, after=rec["msg"].counted, earned_after=rec["msg"].counted is not None)
+            msg = rec["msg"]
+            rec.update(acted=acted, after=msg.counted, earned_after=msg.counted is not None,
+                       # what the host DID on this pass, as seen from outside: its process stopped here and the
+                       # message first in the inbox again, never written (the 7b); the HELD failure's own event
+                       stopped=(s.stopping_since == now and s.writing is not msg and s.in_flight is not msg
+                                and bool(s.inbox) and s.inbox[0] is msg),
+                       held_event=any(e.kind == "turn_ended" and e.message_id == msg.id and not e.ok
+                                      and not e.delivered and e.detail == HELD_DETAIL for e in out))
             watch["obs"](rec)
         return acted, gates
 
@@ -2946,8 +2958,19 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 extra.append((m, "acted on though not due", total, rec["mine"], rec["earned"], t, dict(flags)))
             if not rec["acted"] and rec["after"] != total:
                 extra.append((m, "the host's count other than the interval (or dropped)", rec["after"], total, t))
-            if rec["acted"]:
-                reach["held" if rec["recovered"] else "restart"] += 1
+            if due and rec["acted"] and not rec["recovered"]:
+                # A due first budget is the 7b, observed: the process stopped on this pass, the message first in
+                # the inbox again, never written; only that counts as reached.
+                if rec["stopped"] and rec["msg"].recovered:
+                    reach["restart"] += 1
+                else:
+                    extra.append((m, "a due first budget without the 7b's stop", t, dict(flags)))
+            if due and rec["acted"] and rec["recovered"]:
+                # A due second budget is the HELD failure, observed: its event, with its exact detail, on this pass.
+                if rec["held_event"]:
+                    reach["held"] += 1
+                else:
+                    extra.append((m, "a due second budget without the HELD failure", t, dict(flags)))
             if rec["acted"] and not rec["recovered"] and rec["msg"].recovered:
                 totals[(m, True)] = 0.0         # its second budget, from nothing
             peak[key] = max(peak.get(key, 0.0), total)
@@ -3118,8 +3141,9 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             flags[key] = True
         henv.groups.clear()
         if budgety:
-            for _ in range(40):                         # the budget profile: 200 s with every gate open, pipes still
-                henv.clock.advance(5)                   # blocked: budgets run out (the 7b, the HELD failure)
+            for _ in range(40):                         # the budget profile: 200 s with every gate open and the
+                henv.clock.advance(5)                   # pipes as the walk left them (blocked unless an action
+                                                        # opened one): budgets run out (the 7b, the HELD failure)
                 chatter()
                 tick()
         start["accept"] = None

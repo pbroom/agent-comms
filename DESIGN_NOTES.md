@@ -9240,9 +9240,9 @@ zero-turn task notification `result` did the same to a turn in flight.
     unattributed bracket, the next message stays in the inbox, unstaged. If a message is staged and not one byte of
     its user line was accepted when the bracket is seen open (`_take_back`, after the pass's reads and, for a line
     with no budget, main's write-timer check (review round 16), before the decision, any other timeout and any
-    write), it is UNSTAGED (`_unstage`): only its own bytes leave the
-    buffer (from `turn_at` on; the rest of a partly written control frame before it stays exactly as it was, and
-    still goes), it goes back FIRST in the inbox, ahead of any successor, its write clock goes with it (its no-progress budget does not), and the
+    write), it is UNSTAGED (`_unstage`): exactly its own line leaves the buffer, the `turn_len` bytes at `turn_at`
+    (the rest of a partly written control frame before it, and anything queued after it, stay exactly as they were,
+    and still go), it goes back FIRST in the inbox, ahead of any successor, its write clock goes with it (its no-progress budget does not), and the
     adapter keeps no trace of it (`unstaged`: no `_current`, no uuid outstanding, so rule 10 cannot fire for it). A
     later staging is a first one, with a fresh uuid and a write clock from that staging. **Once any byte of the line
     is accepted the write owns the message**: main's partial-write rules apply unchanged, its rest is completed
@@ -10390,7 +10390,11 @@ and a `may_start_query` call there).
   Every odd seed now walks a budget profile: pipes blocked from the start; most new processes verifying at once,
   their own first turn left open (the take-back) or over (an earned staged line); more sends, CLI turns, in-flight
   results, the latch and passes that only let time go by; steps of 5 to 30 s, rarely 65; and before the drain 200 s
-  with every gate open and the pipes still blocked, so that budgets run out. The even seeds walk as before. The
+  with every gate open and every pipe as the walk left it (blocked unless an action opened it), so that budgets run
+  out. The 7b and the HELD failure count as reached only when observed (the process stopped on the due pass and the
+  message first in the inbox again; the HELD event with its exact detail on the due pass), and every due budget
+  must show that outcome (Sol's review of a36d77e: removing the first budget's stop, or changing the second's
+  detail, passed the counters that read `_decide`'s return; both fail the property test now). The even seeds walk as before. The
   test asserts minima for each state (30, 25, 20, 30, 6 walks over 200 seeds, scaled for `C9_SEEDS`) and prints the
   counts when one is missed. A new oracle: an earned staged line never times out on a pass at which its budget is
   the clock. Mutations run against the property test alone (scratchpad `correlation/mutate21.py`): main's write
