@@ -68,8 +68,11 @@ from . import FAILED_TURN, Event, cap_reply, number, usage_record, validate_mode
 log = logging.getLogger("agent_comms.providers.codex")
 # Codex's refusals of a `turn/steer` before it admitted it (-32600, measured on 0.171.0): the steer never reached the
 # turn, so it is not delivered.
-STEER_REFUSED = (re.compile(r"no active turn to steer"), re.compile(r"expected active turn id `[^`]*` but found `[^`]*`"),
-                 re.compile(r"expectedTurnId must not be empty"))
+STEER_NO_TURN = "no active turn to steer"
+# "expected active turn id `X` but found `Y`": evidence only when X is the very id that request named.
+STEER_OTHER_TURN = re.compile(r"expected active turn id `([^`]*)` but found `[^`]*`")
+# ("expectedTurnId must not be empty" is Codex's third refusal; this adapter never sends an empty id, so as an answer
+# to one of its requests it is no evidence of anything.)
 THREAD_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 FEATURE_RE = re.compile(r"[A-Za-z0-9_]{1,80}")
@@ -114,6 +117,30 @@ DECLINES = {
     "execCommandApproval": ("commandExecution", {"decision": {"denied": {"rejection": NO_SURFACE}}}),
     "applyPatchApproval": ("fileChange", {"decision": {"denied": {"rejection": NO_SURFACE}}}),
 }
+
+
+def _steer_answer(msg: dict, steer: dict) -> str:
+    """What one answer to a `turn/steer` request is evidence of: "ok" (a success naming the very turn the request
+    named), "refused" (Codex's -32600 refusal of that request), or "other" (anything else, which is no evidence:
+    `unconfirmed`). Only an exclusive, well-formed answer (exactly one of `result` and `error`, nothing else but `id`
+    and a tolerated `jsonrpc`) read after every byte of the request was written; an integer code; a quoted expected
+    id equal to the request's."""
+    if not steer.get("written") or set(msg) - {"id", "result", "error", "jsonrpc"} or ("result" in msg) == (
+            "error" in msg):
+        return "other"
+    if "result" in msg:
+        result = msg["result"]
+        ok = (isinstance(result, dict) and set(result) == {"turnId"} and isinstance(result["turnId"], str)
+              and result["turnId"] == steer["turn"])
+        return "ok" if ok else "other"
+    err = msg["error"]
+    if (not isinstance(err, dict) or type(err.get("code")) is not int or err["code"] != -32600
+            or not isinstance(err.get("message"), str) or set(err) - {"code", "message", "data"}):
+        return "other"
+    if err["message"] == STEER_NO_TURN:
+        return "refused"
+    quoted = STEER_OTHER_TURN.fullmatch(err["message"])
+    return "refused" if quoted is not None and quoted.group(1) == steer["turn"] else "other"
 
 
 def _fresh_id() -> str:
@@ -322,7 +349,8 @@ class CodexSession:
         steer = getattr(self, "_steer", None)
         if steer is not None and self._pending.pop(steer["id"], None) is not None:
             self._retired.add(steer["id"])      # unanswered by the turn's end: an answer that still comes is logged
-        self._steer: dict | None = None         # the turn's one `turn/steer`: {"id", "answer"}
+        self._steer: dict | None = None         # the turn's one `turn/steer`: {"id", "turn", "answer", "written"}
+        self._steer_spent = False               # this turn's steer was taken back: no second request in this turn
         self._answer_turn: str | None = None    # the turn the answer to THIS turn/start named (the proof's T)
         self._owned_in: set[str] = set()        # turns in which a userMessage item with this turn's clientId came
         self._start_id = None
@@ -391,12 +419,17 @@ class CodexSession:
 
     def steer(self, text: str) -> list[bytes] | None:
         """`turn/steer` into the proved turn, once per turn; None while it is not proved (nothing is written)."""
-        if not self.owns() or self._steer is not None or not isinstance(text, str):
+        if not self.owns() or self._steer is not None or self._steer_spent or not isinstance(text, str):
             return None
         data = self._request("turn/steer", {"threadId": self.thread_id, "expectedTurnId": self._answer_turn,
                                             "input": [{"type": "text", "text": text}]})
-        self._steer = {"id": self._next_id, "answer": None}
+        self._steer = {"id": self._next_id, "turn": self._answer_turn, "answer": None, "written": False}
         return [data]
+
+    def steer_written(self) -> None:
+        """The host: every byte of the steer's frame is in the pipe. Only an answer read after this is evidence."""
+        if self._steer is not None:
+            self._steer["written"] = True
 
     def steer_retire(self) -> None:
         """The steer's frame was taken back with not one byte of it written: its request id is retired (never
@@ -405,6 +438,7 @@ class CodexSession:
             self._pending.pop(self._steer["id"], None)
             self._retired.add(self._steer["id"])
             self._steer = None
+            self._steer_spent = True    # never a second request in this turn (a recovered gate writes nothing)
 
     def steer_result(self) -> str | None:
         """What the steer request of the turn that just ended (its `turn/completed`) was answered before that end:
@@ -537,15 +571,8 @@ class CodexSession:
             return [Event("ready", provider_id=tid,
                           mode=kind if isinstance(kind, str) and NAME_RE.fullmatch(kind) else None)], []
         if self._steer is not None and rid == self._steer["id"]:
-            # The steer's own request (`steer`): kept, for N's end. Only a success that names the proved turn is "ok".
-            err = msg.get("error") if isinstance(msg.get("error"), dict) else None
-            if not failed and result.get("turnId") == self._answer_turn and self._answer_turn is not None:
-                self._steer["answer"] = "ok"
-            elif (err is not None and err.get("code") == -32600 and isinstance(err.get("message"), str)
-                  and any(p.fullmatch(err["message"]) for p in STEER_REFUSED)):
-                self._steer["answer"] = "refused"
-            else:
-                self._steer["answer"] = "other"
+            # The steer's own request (`steer`): kept, for N's end (`_steer_answer`).
+            self._steer["answer"] = _steer_answer(msg, self._steer)
             return [], []
         if method == "turn/interrupt" and rid == self._restart_id:
             self._restart_ok = not failed       # the restart's own request: only a success counts (`interrupted`)
