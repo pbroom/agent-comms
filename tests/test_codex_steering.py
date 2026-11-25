@@ -3342,6 +3342,102 @@ def test_model_reach_r6_03_a_second_loop_exit_with_a_queued_successor(tmp_path):
     assert seen.ends and seen.ends[0].steer is not None
 
 
+def test_r6_gap_the_latch_waits_for_a_cuts_check_and_first_act(henv, monkeypatch):
+    """(Found by round 6's mutation check.) A cut is inside its check-then-act (under the latch's lock) when shutdown
+    calls `steer_stopping` on another thread: the stop waits until the cut's first act is done, never sets the latch
+    in the middle of it. Barriers only."""
+    import threading
+    from agent_comms import session_host as sh
+    host, s, child, _ = partial(henv)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    inside, go, stopped = threading.Event(), threading.Event(), threading.Event()
+    real_warning = sh.log.warning
+
+    def warning(msg, *a, **kw):
+        if "could not be written whole" in str(msg) and not inside.is_set():
+            inside.set()
+            assert go.wait(30)
+        return real_warning(msg, *a, **kw)
+    monkeypatch.setattr(sh.log, "warning", warning)
+    lock = _Contended(host._steer_stop_lock)
+    host._steer_stop_lock = lock
+    cutter = threading.Thread(target=host.steer_deadlines)
+    lock.quiet = None
+    cutter.start()
+    assert inside.wait(30), "the cut reached its first act"
+    lock.waiting.clear()
+    lock.quiet = cutter.ident
+
+    def stop():
+        host.steer_stopping()
+        stopped.set()
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    assert lock.waiting.wait(30), "the stop came to the latch's lock"
+    go.set()
+    cutter.join(30)
+    stopper.join(30)
+    assert lock.contended.is_set(), "the latch's lock was free in the middle of the cut's check and first act"
+    assert stopped.is_set() and host.steer_stopped
+
+
+def test_r6_gap_the_latch_waits_for_a_drain_read_in_progress(henv):
+    """(Found by round 6's mutation check.) A drain's read is in progress when shutdown calls `steer_stopping` on
+    another thread: the stop waits for that read to return, never sets the latch in the middle of it; the drain then
+    reads no more. Barriers only."""
+    import threading
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert len(steers_of(child)) == 1
+    child.bytes_read = 0
+    inside, go, stopped, reads = threading.Event(), threading.Event(), threading.Event(), []
+
+    def read():
+        reads.append(host.steer_stopped)        # (whether the latch was already set when this read began)
+        if len(reads) == 1:
+            inside.set()
+            assert go.wait(30)
+        child.bytes_read += 4096
+        return []
+    child.read_lines = read
+    lock = _Contended(host._steer_stop_lock)
+    host._steer_stop_lock = lock
+    lock.quiet = None
+    closer = threading.Thread(target=host.close, args=(SID, "closed"))
+    closer.start()
+    assert inside.wait(30), "the drain's read is in progress"
+    lock.waiting.clear()
+    lock.quiet = closer.ident
+
+    def stop():
+        host.steer_stopping()
+        stopped.set()
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    assert lock.waiting.wait(30), "the stop came to the latch's lock"
+    go.set()
+    closer.join(30)
+    stopper.join(30)
+    assert lock.contended.is_set(), "the latch's lock was free in the middle of a drain's read"
+    assert host.steer_stopped and not any(reads), "no read began once the latch was set"
+
+
+def test_r6_gap_ns_own_end_read_after_the_latch_is_no_evidence_for_s(henv):
+    """(Found by round 6's mutation check.) S written whole, its valid answer and N's own end still in the pipe when
+    the stop latch is set; a pass then reads them. Main's handling of N stands (N ends, ok), but what was read after
+    the cutoff is no evidence for S: `unconfirmed` (`turn_cut`)."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    [req] = steers_of(child)
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    host.steer_stopping()
+    [end] = ended_of(host.tick())
+    assert end.ok and end.text == "native", "main's handling of N"
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
 def test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start():
     """R6-05: the golden's allowance for Codex's echo nulls a stripped id only in the userMessage item's own
     `clientId`, and only for the start it answers in that transcript (that start's thread, the turn this transcript's
@@ -5116,6 +5212,26 @@ class _NoWait(_SignalLock):
 
 
 # ------------------------------------------------------------ review round 4 (R4-01, R4-02, R4-09)
+
+
+class _Contended(_SignalLock):
+    """A lock that also says whether a thread other than `quiet` found it held when it came to take it."""
+
+    def __init__(self, real):
+        import threading
+        super().__init__(real)
+        self.contended = threading.Event()
+
+    def acquire(self, blocking=True, timeout=-1):
+        import threading
+        if threading.get_ident() != self.quiet:
+            if not self.real.acquire(False):
+                self.contended.set()
+                self.waiting.set()
+                return self.real.acquire(blocking, timeout)
+            self.waiting.set()
+            return True
+        return self.real.acquire(blocking, timeout)
 
 
 def test_r4_01_a_gate_seen_closed_after_authorization_is_latched_before_any_frame_exists(env):
