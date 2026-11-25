@@ -1475,26 +1475,19 @@ def test_c7_01_verified_then_downgraded_keeps_the_7b_it_earned(henv, monkeypatch
     assert msg.id == "1" and msg.recovered
 
 
-def test_c7_01_a_verification_and_a_downgrade_read_in_one_pass_still_earn_it(henv, monkeypatch):
-    """The process verifies and is downgraded by frames read in ONE pass (an init that qualifies, then a plain result
-    of the CLI's own turn): a verified process was observed while M held the budget position (evidence, line by
-    line), and at that pass's decision its counted state holds, so it is earned there, and its budget counts from
-    t=10 (review round 14): the 7b restart at t=70 (it was t=60), not main's failure."""
-    run = candidate_run(henv, monkeypatch, {V}, [(10, [vinit(), plain()]), (50, []), (10, [])])
-    s = henv.host.sessions[SID]
-    assert not [e for p in run["passes"] for e in p if e["kind"] == "turn_ended"]
-    msg = s.writing or s.inbox[0]
-    assert run["stops"][0] == 1 and msg.id == "1" and msg.recovered and set(run["stdin"]) == {b""}
-
-def test_c7_01_an_unqualified_runner_never_restarts_for_a_blocked_message_whatever_the_frames(henv, monkeypatch):
-    """The same with frames that would hold a verified process (a bracket opened and closed): a process whose first
-    `init` reports 2.1.329 holds nothing, unstages nothing, and fails M when this tree with VERIFIED empty does
-    (main's, by the golden's case 1)."""
-    script = [(5, [vinit(version="2.1.329")]), (10, [foreign()]), (10, [vinit()]), (35, []), (1, [])]
+def test_c7_01_a_verification_and_a_downgrade_read_in_one_pass_earn_nothing(henv, monkeypatch):
+    """Review round 15 withdrew C7-01's "a verification and a downgrade read in one pass still earn it" (was
+    `..._still_earn_it`, the 7b at t=70): earning is decided from the state at the decision point, and there the
+    process, verified and downgraded within that one drain, is not verified. So M is on main's path: main's write
+    timer times it out at t=60, every pass's events equal to the run with VERIFIED empty. (A downgrade AFTER the
+    earning keeps it: `test_c7_01_verified_then_downgraded_keeps_the_7b_it_earned`.)"""
+    script = [(10, [vinit(), plain()]), (50, []), (10, [])]
     ours = candidate_run(henv, monkeypatch, {V}, script)
     main = candidate_run(henv, monkeypatch, (), script)
     del ours["staged_tracked"], main["staged_tracked"]
-    assert ours == main and ours["stops"] == [1] and ours["inbox"] == []
+    assert ours == main
+    [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended"]
+    assert end["detail"] == henv.host._timeout_detail() and ours["passes"][2] == [end], "at t=60"
 
 
 @pytest.mark.parametrize("frames", [[vinit()], [vinit(), foreign(), vinit()], [vinit(version="2.1.329")], []])
@@ -1703,40 +1696,27 @@ def test_c9_after_a_7b_the_old_process_going_down_counts_nothing(henv, monkeypat
 
 def test_c9_a_message_staged_in_a_verified_process_earned_its_7b_though_the_next_read_downgrades_it(
         henv, monkeypatch):
-    """Staged at t=0, zero bytes, in a verified process: the staging pass's end records the evidence (a verified
-    process while M holds the budget position). The first line read at the next pass downgrades the process (a plain
-    result): the evidence stands, and that pass's decision earns M (its counted state holds), counting from t=5
-    (review round 14: not from the staging): the 7b restart at t=65 (it was t=60), not main's write timer."""
+    """Staged at t=0, zero bytes, in a verified process, and earned at the decision point that follows (a second pass
+    at t=0: the process is verified there and the line is staged with nothing withholding it). The first line read
+    at the next pass downgrades the process (a plain result): a downgrade after the earning keeps it, so the 7b
+    restart at t=60, not main's write timer. (Round 14 earned it at t=5 from evidence, the 7b at t=65; round 15
+    keeps no evidence, so the earning needs a decision while the process is verified.)"""
     short_host(henv, monkeypatch)
     s, child = idle_host(henv)
     child.accept = 0
     henv.host.send(SID, "next", message_id="1")
-    assert henv.host.tick() == [] and s.writing.id == "1" and s.writing.evidence and not s.writing.earned
+    assert henv.host.tick() == [] and s.writing.id == "1" and not s.writing.earned
+    assert henv.host.tick() == [] and s.writing.earned and s.writing.counted == 0
     henv.clock.advance(5)
     child.emit(plain())
     henv.host.tick()
     assert not s.provider.verified and s.writing.id == "1" and s.writing.earned
-    for _ in range(11):
+    for _ in range(10):
         henv.clock.advance(5)
         assert not settled(henv.host.tick(), "1")
-    henv.clock.advance(5)                               # t=65
+    henv.clock.advance(5)                               # t=60
     evs = henv.host.tick()
     assert not settled(evs, "1") and child.terminated == 1 and s.inbox[0].recovered
-
-def test_c9_a_pass_that_first_sees_the_turn_ended_counts_nothing_before_it(henv, monkeypatch):
-    """The rule for the interval between two passes: it counts only if M was held back by the agent at BOTH its
-    ends. M held at t=0; the CLI's result is first read at t=75, with no pass between: the pass at t=75 sees the
-    turn ended, so the 75 s count nothing (they may have been spent after the turn ended), and the same process
-    writes M at t=75 (C6-02's 7b needs a pass while the turn still runs)."""
-    short_host(henv, monkeypatch)
-    s, child = idle_host(henv)
-    emit(henv, child, vinit())
-    henv.host.send(SID, "next", message_id="1")
-    henv.host.tick()
-    henv.clock.advance(75)
-    child.emit(foreign())
-    assert [(e.kind, e.message_id) for e in henv.host.tick()] == [("delivered", "1")]
-    assert child.terminated == 0 and not s.in_flight.recovered and child.turns()[-1] == "next"
 
 
 def test_c9_gate_flapping_ends_within_two_timeouts_of_counted_time(henv, monkeypatch):
@@ -2036,7 +2016,7 @@ def latched_run(henv, monkeypatch, verified, kind, reopen_at=None):
     passes = [[dataclasses.asdict(e) for e in henv.host.tick()]]
     child = henv.spawner.children[-1]
     assert s.writing.id == "1" and child.stdin.count(b'"next"') == 0
-    budgeted = s.writing.evidence
+    budgeted = s.writing.earned
     for k in range(1, 25):
         henv.clock.advance(5)
         if k == 1:
@@ -2058,9 +2038,9 @@ def test_c11_latched_but_not_silent_a_staged_message_keeps_mains_write_timer(hen
     stopped, for a verified 2.1.330 process with a budgeted message, a 2.1.329 one and one that never writes an
     init alike: every pass's events, the stdin (the uuid key aside) and the stops are those of the same run with
     VERIFIED empty (main's, by the golden's case 1). The budget counts nothing meanwhile."""
-    ours, evidence = latched_run(henv, monkeypatch, {V}, kind)
-    main, main_evidence = latched_run(henv, monkeypatch, (), kind)
-    assert evidence == (kind == "verified") and not main_evidence, "evidence for the verified one, never earned"
+    ours, earned = latched_run(henv, monkeypatch, {V}, kind)
+    main, main_earned = latched_run(henv, monkeypatch, (), kind)
+    assert not earned and not main_earned, "never earned: staged after the decision, latched from the next one"
     assert ours == main
     [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended" and e["message_id"] == "1"]
     assert end["delivered"] is False and end["detail"] == henv.host._timeout_detail()
@@ -2080,7 +2060,7 @@ def test_c11_the_latch_closing_and_opening_again_before_the_write_timer_the_budg
     henv.host.send(SID, "next", message_id="1")
     henv.host.tick()
     m = s.writing
-    assert m.counted is None and m.evidence
+    assert m.counted is None
     henv.clock.advance(5)
     henv.host.tick()
     assert m.earned and m.counted == 0
@@ -2260,39 +2240,33 @@ def test_c12_the_gates_are_read_once_per_pass(henv, monkeypatch):
 def test_c13_the_latch_closing_with_a_verifying_init_and_a_downgrade_in_the_first_drain_earns_nothing(
         henv, monkeypatch):
     """Through `tick()`: M staged at t=0 (zero bytes, before any init), passes every 5 s with the latch open; at
-    t=20 the latch closes and the first drain of that tick reads a qualifying init and a downgrade at once. Under
-    review round 14's rule that drain records evidence only (a verified process while M held the budget position);
-    the decision at t=20 reads the gates once, after the drain: the latch is closed, so M is not earned then, nor at
-    any pass while it stays closed: main's write timer is its clock. At t=60 the latch reopens (and the pipe would
-    take the line): that pass's decision finds the evidence and the counted state, so M is earned there, its budget
-    becomes the clock before the write timer is asked, and the line is written at t=60 (with VERIFIED empty main's
-    write timer, overdue at t=60, times it out); main's turn timer, which runs from the staging, then ends the turn
-    at the next pass. Earlier and later frames change nothing; nothing is ever decided from a reading taken in a
-    drain."""
+    t=20 the latch closes and the first drain of that tick reads a qualifying init and a downgrade at once. At every
+    decision from then the process is not verified, so M is never earned (review round 15; round 14 earned it from
+    evidence at t=60 and wrote it), and at t=60, as the latch reopens with a pipe that would take the line, the line
+    is overdue: main's write timer times it out, every pass's events equal to the run with VERIFIED empty (round
+    13's outcome)."""
     script = ([(5, True, False, [])] * 3 + [(5, False, False, [vinit(), plain()])] + [(5, False, False, [])] * 7
               + [(5, True, True, [])] + [(5, True, True, [])])
     ours, s = candidate_latch_run(henv, monkeypatch, {V}, [], script)
     main, _ = candidate_latch_run(henv, monkeypatch, (), [], script)
-    assert not [e for p in ours["passes"][:12] for e in p], "nothing before t=60"
-    assert [e["kind"] for e in ours["passes"][12]] == ["delivered"]
-    [timed] = ours["passes"][13]       # then main's turn timer, which runs from the staging (t=0), ends the turn
-    assert (timed["kind"], timed["delivered"], timed["detail"]) == ("turn_ended", True, henv.host._timeout_detail())
-    [end] = [e for p in main["passes"] for e in p if e["kind"] == "turn_ended"]
-    assert end["detail"] == henv.host._timeout_detail() and main["passes"][12] == [end], "main: at t=60"
+    assert ours == main
+    [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended"]
+    assert end["detail"] == henv.host._timeout_detail() and ours["passes"][12] == [end], "at t=60"
 
 
-def test_c13_the_latch_reopening_with_a_verifying_init_and_a_downgrade_in_the_first_drain_earns_it(
+def test_c13_the_latch_reopening_with_a_verifying_init_and_a_downgrade_in_the_first_drain_earns_nothing(
         henv, monkeypatch):
     """Through `tick()`: M staged at t=0, the latch closed from t=5; at t=20 it reopens and the first drain reads a
-    qualifying init and a downgrade at once. The sample is that tick's (open): the line read under the verified
-    process earns the budget, which governs from then (the downgrade does not take it away): no timeout at t=60; the
-    7b once it holds the timeout of counted time, at t=80 (counted from the end of the pass at t=20). (With the
-    previous tick's sample it was not earned, and timed out at t=60.)"""
+    qualifying init and a downgrade at once. Review round 15: earning is decided from the state at the decision
+    point, and there the process is no longer verified: M is not earned, ever (it was, in rounds 13 and 14: the 7b
+    at t=80), and main's write timer times it out at t=60, every pass's events equal to the run with VERIFIED
+    empty."""
     script = ([(5, False, False, [])] * 3 + [(5, True, False, [vinit(), plain()])] + [(5, True, False, [])] * 13)
     ours, s = candidate_latch_run(henv, monkeypatch, {V}, [], script)
-    assert not [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended"]
-    msg = s.writing or s.inbox[0]
-    assert msg.earned and msg.recovered and ours["stopped_at"] == 16, ("the 7b at t=80", ours["stopped_at"])
+    main, _ = candidate_latch_run(henv, monkeypatch, (), [], script)
+    assert ours == main
+    [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended"]
+    assert end["detail"] == henv.host._timeout_detail() and ours["passes"][12] == [end], "at t=60"
 
 
 @pytest.mark.parametrize("kind", ["other", "no_init", "verified"])
@@ -2329,7 +2303,7 @@ def test_c13_the_budget_never_calls_the_stateful_may_start_more_than_main(henv, 
     main, main_queried = run(())
     assert ours == main and main_queried == []
     if kind != "verified":
-        assert queried == [], "no evidence, no budget: not even the query is read (review round 14)"
+        assert queried == [], "never verified, no budget: not even the query is read (review rounds 14, 15)"
 
 
 def test_c14_tick_is_not_re_entrant(henv, monkeypatch):
@@ -2352,7 +2326,7 @@ def test_c14_tick_is_not_re_entrant(henv, monkeypatch):
     assert child.turns()[-1] == "next", "the outer tick went on"
 
 
-# --- review round 14: evidence while reading, one decision per session per tick, no provisional accounting
+# --- review round 14: one decision per session per tick, no provisional accounting
 
 LIFECYCLE = {"type": "command_lifecycle", "session_id": SID, "command_uuid": "00000000-0000-4000-8000-000000000000",
              "state": "queued"}
@@ -2398,7 +2372,7 @@ def test_c14_a_frame_with_no_evidence_cannot_decide_against_a_closed_parent_gate
 def test_c14_no_extra_callback_for_a_runner_that_never_verifies(henv, monkeypatch, kind):
     """With VERIFIED = {"2.1.330"}, every call of `may_start`, `may_start_query` and the turn gate (how many, when,
     and the turn gate's argument) for a 2.1.329 runner and a no-init runner is the run with VERIFIED empty's, across
-    a blocked pipe, the latch, a closed parent gate and a binding change: no evidence, no budget, no gate read."""
+    a blocked pipe, the latch, a closed parent gate and a binding change: never verified, no budget, no gate read."""
     from test_dispatch import FakeProcs, FakeSpawner
 
     def run(verified):
@@ -2440,6 +2414,157 @@ def test_c14_no_extra_callback_for_a_runner_that_never_verifies(henv, monkeypatc
     assert not [c for c in ours if c[0] == "query"], "the budget machinery read nothing"
 
 
+# --- review round 15: no evidence; earning from the state at the decision point
+
+
+def replacement_run(henv, monkeypatch, verified, kind):
+    """Sol's replacement sequence, timeout 60 s, a pass every 5 s: M waits in the inbox under a verified process,
+    behind the latch (`may_start` false from the start: nothing staged); at t=5 the process exits; at t=10 the latch
+    reopens and a replacement starts, its pipe taking nothing: M staged at t=10. `kind` is what the replacement's
+    first frames say at t=15: "other" (a 2.1.329 init), "no_init" (nothing), "verified" (a qualifying init, its turn
+    over in the same read). Returns what is seen outside, from the replacement's start on, and the session."""
+    import dataclasses
+    from test_dispatch import FakeProcs, FakeSpawner
+    monkeypatch.setattr(claude, "VERIFIED", frozenset(verified))
+    henv.spawner = FakeSpawner(child=FakeSessionChild)
+    henv.procs = FakeProcs(henv.spawner)
+    henv.host = make_host(henv, timeout_minutes=1)
+    flag = {"open": True}
+    henv.host.may_start = lambda: flag["open"]
+    s = open_session(henv)
+    henv.host.send(SID, "zero", message_id="0")
+    henv.host.tick()
+    first = henv.spawner.children[-1]
+    u = uuid_of(first)
+    first.emit(*((vinit(u), owned(u)) if u else (vinit(), plain())))
+    henv.host.tick()
+    flag["open"] = False
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    assert [m.id for m in s.inbox] == ["1"] and s.inbox[0].counted is None
+    henv.spawner.child = _ZeroPipe
+    passes = []
+    for k in range(1, 20):
+        henv.clock.advance(5)
+        if k == 1:
+            first.code = 1                              # the process exits by itself
+        if k == 2:
+            flag["open"] = True
+        if k == 3 and len(henv.spawner.children) == 2:
+            fresh = henv.spawner.children[-1]
+            if kind == "other":
+                fresh.emit(vinit(version="2.1.329"))
+            elif kind == "verified":
+                fresh.emit(vinit(), foreign())
+        evs = [dataclasses.asdict(e) for e in henv.host.tick()]
+        if k >= 2:
+            passes.append(evs)
+    return {"passes": passes, "stdin": [UUID_KEY.sub(b"}\n", c.stdin) for c in henv.spawner.children[1:]],
+            "stops": [c.terminated for c in henv.spawner.children[1:]]}, s
+
+
+@pytest.mark.parametrize("kind", ["other", "no_init"])
+def test_c15_a_replacement_that_does_not_verify_earns_nothing(henv, monkeypatch, kind):
+    """Sol's replacement sequence with a 2.1.329 replacement, and with one that writes no init: nothing is carried
+    from the verified process that went; the replacement is not verified at any decision, so M has no budget and
+    main's write timer from its staging (t=10) times it out at t=70, every pass from the replacement on equal to the
+    run with VERIFIED empty. (With round 14's evidence it earned a budget and was restarted at t=75.)"""
+    ours, s = replacement_run(henv, monkeypatch, {V}, kind)
+    main, _ = replacement_run(henv, monkeypatch, (), kind)
+    assert ours == main
+    [end] = [e for p in ours["passes"] for e in p if e["kind"] == "turn_ended" and e["message_id"] == "1"]
+    assert (end["delivered"], end["detail"]) == (False, henv.host._timeout_detail())
+    assert ours["passes"][12] == [end], "at t=70"
+
+
+def test_c15_a_verified_replacement_earns_from_zero_at_its_own_decision(henv, monkeypatch):
+    """The same with a replacement that verifies (its first init qualifies, its turn over in the same read, at t=15):
+    at that pass's decision it is verified, M is staged with zero bytes and nothing withholds it, so M is earned
+    there and counts from zero; its budget, not its staging's write timer (due at t=70), is its clock: the 7b
+    restart at t=75, nothing failed."""
+    import dataclasses
+    from test_dispatch import FakeProcs, FakeSpawner
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.spawner = FakeSpawner(child=FakeSessionChild)
+    henv.procs = FakeProcs(henv.spawner)
+    henv.host = make_host(henv, timeout_minutes=1)
+    flag = {"open": True}
+    henv.host.may_start = lambda: flag["open"]
+    s = open_session(henv)
+    t0 = henv.clock()
+    henv.host.send(SID, "zero", message_id="0")
+    henv.host.tick()
+    first = henv.spawner.children[-1]
+    u = uuid_of(first)
+    first.emit(vinit(u), owned(u))
+    henv.host.tick()
+    flag["open"] = False
+    henv.host.send(SID, "next", message_id="1")
+    henv.host.tick()
+    henv.spawner.child = _ZeroPipe
+    stopped_at = None
+    for k in range(1, 20):
+        henv.clock.advance(5)
+        if k == 1:
+            first.code = 1
+        if k == 2:
+            flag["open"] = True
+        if k == 3:
+            henv.spawner.children[-1].emit(vinit(), foreign())
+        [dataclasses.asdict(e) for e in henv.host.tick()]
+        if k == 3:
+            assert s.writing.earned and s.writing.counted == 0, "earned at its own decision, from zero"
+        if stopped_at is None and len(henv.spawner.children) > 1 and henv.spawner.children[1].terminated:
+            stopped_at = henv.clock() - t0
+    assert stopped_at == 75
+
+
+@pytest.mark.parametrize("row", [False, True], ids=["no_row", "lifecycle_row"])
+def test_c15_two_results_and_a_downgrade_in_one_drain_with_or_without_a_row_between(henv, monkeypatch, row):
+    """Sol's paired sequence: a verified process, message 1 in flight, message 2 queued (its pipe will take nothing);
+    one drain reads 1's own result, then a downgrade (a plain result of nobody's); with or without a lifecycle row
+    between the two. Earning is decided from the state at the decision point only: the process is not verified
+    there, so 2 is on main's path and times out by main's write timer, at the same pass with or without the row.
+    (With round 14's evidence the row gave 2 a budget, and a restart.)"""
+    short_host(henv, monkeypatch)
+    s, child = idle_host(henv)
+    henv.host.send(SID, "one", message_id="1")
+    henv.host.tick()
+    u = uuid_of(child)
+    henv.host.send(SID, "two", message_id="2")
+    child.accept = 0
+    t0 = henv.clock()
+    henv.clock.advance(5)
+    child.emit(*([vinit(u), owned(u)] + ([LIFECYCLE] if row else []) + [plain()]))
+    henv.host.tick()
+    assert not s.provider.verified
+    end = None
+    for _ in range(20):
+        henv.clock.advance(5)
+        for e in settled(henv.host.tick(), "2"):
+            end = (henv.clock() - t0, e.delivered, e.detail)
+    assert end == (65, False, henv.host._timeout_detail()), end
+    assert child.terminated == 1 and not s.writing
+
+
+@pytest.mark.parametrize("at", [60, 55])
+def test_c15_earning_cannot_rescue_an_overdue_line(henv, monkeypatch, at):
+    """The precedence (Sol's choice (ii)): a candidate's line staged at t=0 with zero bytes; the process verifies
+    (its turn over in the same read) in the very pass at which main's write timer is due (t=60): main's timeout, as
+    with VERIFIED empty, before any earning. One pass earlier (t=55): earned there, and from then its budget governs
+    (no timeout at t=60; the 7b at t=115)."""
+    steps = at // 5
+    script = [(5, True, False, [])] * (steps - 1) + [(5, True, False, [vinit(), foreign()])] + [(5, True, False, [])] * 13
+    ours, s = candidate_latch_run(henv, monkeypatch, {V}, [], script)
+    ends = [(i * 5, e) for i, p in enumerate(ours["passes"]) for e in p if e["kind"] == "turn_ended"]
+    if at == 60:
+        main, _ = candidate_latch_run(henv, monkeypatch, (), [], script)
+        assert ours == main
+        assert [(t, e["delivered"], e["detail"]) for t, e in ends] == [(60, False, henv.host._timeout_detail())]
+    else:
+        assert not ends and ours["stopped_at"] == 23, ("the 7b at t=115", ours["stopped_at"])
+
+
 def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     """Seeded random walks (review rounds 6 to 8, and the follow-up after the switch-on) on a host with 2.1.330
     VERIFIED, timeout T = 60 s, over: sends; the live pipe taking nothing, everything, or a few bytes per write; the
@@ -2451,9 +2576,9 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     Asserted, at every pass's budget step (a wrapper of `_budget` records what the host decided), against this
     test's OWN reading of both ends of every interval (from the flags it set and the session's plain fields, never
     the host's `_counting`; a host gate closed withholds a staged message too, review round 10):
-    - a message is earned exactly when this test has the evidence (a verified process while it held the budget
-      position: as each drain begins and after each line read, as the host records it) and reads its counted state at a
-      decision point; before that it has no budget and none of its time counts (review round 14);
+    - a message is earned exactly when, at a decision point, the process is verified right then and this test reads
+      the message's counted state there, unless the line is staged with its write timer due (review round 15:
+      nothing is remembered from reading lines); before that it has no budget and none of its time counts;
     - the host's count equals this test's: an interval is added iff it was counted at both ends, and then whole;
     - the budget acts (the 7b restart, the failure, or the drop of an unearned one) on the FIRST pass at which this
       test's total reaches T, never before and never a pass late; the 7b only for a message seen in a counted state
@@ -2470,9 +2595,11 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     once over all processes, never after a message sent behind it, written iff delivered; its bytes taken by ONE
     process only (the fake's write records which process took each message's first byte, C9-01); and once a byte of
     it was taken, or if it never had a budget, its outcome by P(s + T), s its final staging (main's write timer).
-    And, metamorphic (review round 14): each seed is walked twice, the second time with evidence-free frames written
-    among the others (lifecycle rows, usage reports, assistant text of a turn already attributed), and every
-    message's outcome and its time must be the same. A failure names the seed and every step."""
+    And, metamorphic (review rounds 14 and 15): each seed is walked twice, the second time with frames that change
+    nothing at the end of the reads written among the others, anywhere in a batch, between two results too
+    (lifecycle rows, usage reports; between ticks also assistant text of a turn already attributed), and every
+    message's outcome and its time, and the end of every delivered message's turn, must be the same. The generator
+    also replaces the process by one of another version, one that writes no init, or one that verifies. A failure names the seed and every step."""
     import bisect
     import random
     from types import SimpleNamespace
@@ -2480,17 +2607,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     from test_dispatch import FakeProcs, FakeSpawner
     monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
     T, STEPS = 60.0, [1, 5, 5, 5, 10, 30, 65, 125]
-    feed, decide, read = ClaudeSession.feed, SessionHost._decide, SessionHost._read
-    watch = {"see": lambda: None, "pre": lambda m, now: None, "obs": lambda rec: None, "holder": lambda: None}
-
-    def feeding(self, line):
-        got = feed(self, line)
-        watch["see"]()      # verification is observed line by line, as the host observes it
-        return got
-
-    def reading(self, s, now, out):
-        watch["see"]()      # as every drain begins (the host records evidence there too: nothing in between)
-        return read(self, s, now, out)
+    decide = SessionHost._decide
+    watch = {"pre": lambda m, now: None, "obs": lambda rec: None, "holder": lambda: None}
 
     def deciding(self, s, now, out):
         m = watch["holder"]()       # this test's own choice of the message in the budget position (not `_holder`)
@@ -2501,9 +2619,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             watch["obs"](rec)
         return acted, gates
 
-    monkeypatch.setattr(ClaudeSession, "feed", feeding)
     monkeypatch.setattr(SessionHost, "_decide", deciding)
-    monkeypatch.setattr(SessionHost, "_read", reading)
     lifecycle = {"type": "command_lifecycle", "session_id": SID, "command_uuid": "00000000-0000-4000-8000-0000000000"
                  "00", "state": "queued"}
     usage = {"type": "rate_limit_event", "session_id": SID,
@@ -2511,9 +2627,11 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     talk = {"type": "assistant", "session_id": SID, "message": {"content": [{"type": "text", "text": "..."}]}}
 
     def walk(seed, noise):
-        """One walk; with `noise`, evidence-free frames are written among the others at points drawn from their own
-        generator (drawn alike with or without `noise`): a lifecycle row, a usage report, or assistant text of a turn
-        already attributed (its own bracket). Returns every message's outcome and time."""
+        """One walk; with `noise`, frames that change nothing at the end of the reads are written among the others,
+        at points drawn from their own generator (drawn alike with or without `noise`): a lifecycle row or a usage
+        report anywhere, before, between or after the frames of any batch (between two results too), and, between
+        ticks, assistant text of a turn already attributed (its own bracket). Returns every message's outcome and
+        time, and the end (ok, detail, time) of every delivered message's turn."""
         rnd, rnd_noise = random.Random(seed), random.Random(seed + 7919)
         t0 = henv.clock()
 
@@ -2524,7 +2642,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 return
             if pick == "talk" and not (s.provider.verified and s.provider._bracket == OWN):
                 pick = "lifecycle"
-            p.emit({"lifecycle": lifecycle, "usage": usage, "talk": talk}[pick])
+            FakeSessionChild.emit(p, {"lifecycle": lifecycle, "usage": usage, "talk": talk}[pick])
         start = {"accept": None}
         took = {}                                       # message -> the processes that took bytes of its line
 
@@ -2532,6 +2650,16 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             def __init__(self, pid, exits_on_terminate=True):
                 super().__init__(pid, exits_on_terminate)
                 self.accept = start["accept"]
+
+            def emit(self, *events):
+                framed = []
+                for e in list(events) + [None]:
+                    draw, pick = rnd_noise.random(), rnd_noise.choice(["lifecycle", "usage"])
+                    if noise and draw < 0.3:
+                        framed.append(lifecycle if pick == "lifecycle" else usage)
+                    if e is not None:
+                        framed.append(e)
+                super().emit(*framed)
 
             def write(self, data):
                 tail = self.stdin[self.stdin.rfind(b"\n") + 1:]
@@ -2556,7 +2684,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
         monkeypatch.setattr(henv.host.groups, "blocked", lambda cwd: not flags["groups"])
         s = henv.host.open(SID, agent="claude", runtime="claude-code", project="/work/repo")
         sent, outcome, extra, steps, pass_times = [], {}, [], [], []
-        staged, seen_verified, last_holder, peak, budget_clock = {}, set(), [None], {}, {}
+        staged, last_holder, peak, budget_clock, terminal, pending = {}, [None], {}, {}, {}, {}
         earned_set = set()          # this test's own: earned at a decision point
         progressed, end_state, totals = {}, {}, {}
 
@@ -2576,15 +2704,13 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             return s.writing is None and s.in_flight is None and s.inbox and s.inbox[0] is m and (
                 s.provider.holds_turns())
 
-        def see():
-            """Evidence, as this test reads it: a verified process while a message holds the budget position."""
-            m = holder()
-            if m is not None and s.child is not None and s.provider.verified:
-                seen_verified.add(m.id)
-
         def pre(m, now):
+            """This test's own earning rule (review round 15): earned at a decision iff the process is verified
+            right then and the message is in its counted state there, unless it is a line staged with its write
+            timer due (main's timeout comes first)."""
             mine, earned = counted_state(m), m.id in earned_set
-            earns = not earned and mine and m.id in seen_verified       # earned at this very decision
+            overdue = m is s.writing and m.id in staged and now - staged[m.id] >= T
+            earns = not earned and mine and s.provider.verified and not overdue   # earned at this very decision
             budget_clock[(m.id, now)] = mine and (earned or earns)  # the budget is this pass's clock (else the timer)
             return {"t": now, "id": m.id, "mine": mine, "earned": earned, "earns": earns, "before": m.counted,
                     "recovered": m.recovered, "msg": m}
@@ -2595,7 +2721,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             t, m, key = rec["t"], rec["id"], (rec["id"], rec["recovered"])
             if not rec["earned"]:
                 # No budget before its earning, and none of its time counted (review round 14); earned exactly
-                # when this test has the evidence and reads the counted state, at this decision.
+                # as this test's rule says (`pre`: the process verified and the counted state, at this decision).
                 if rec["before"] is not None or rec["acted"]:
                     extra.append((m, "a budget, or an act, before it was earned", rec["before"], t))
                 if rec["earns"] != (rec["earned_after"] and rec["after"] == 0.0):
@@ -2622,7 +2748,7 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             if rec["acted"] and not rec["recovered"] and rec["msg"].recovered:
                 totals[(m, True)] = 0.0         # its second budget, from nothing
             peak[key] = max(peak.get(key, 0.0), total)
-        watch["see"], watch["pre"], watch["obs"], watch["holder"] = see, pre, observe, holder
+        watch["pre"], watch["obs"], watch["holder"] = pre, observe, holder
 
         def record(mid, kind, detail=""):
             if mid in outcome:
@@ -2639,8 +2765,17 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                     record(e.message_id, "failed", e.detail)
                 elif e.kind == "turn_ended" and outcome.get(e.message_id, ("?",))[0] != "delivered":
                     extra.append((e.message_id, "ended, never delivered", henv.clock()))
+                elif e.kind == "turn_ended":
+                    terminal.setdefault(e.message_id, (e.ok, e.detail, henv.clock() - t0))
                 elif e.kind == "ended":
                     extra.append(("the session", "ended", e.detail, henv.clock()))
+            if pending and len(henv.spawner.children) > pending["after"] and s.child is henv.spawner.children[-1]:
+                fresh = henv.spawner.children[-1]               # the replacement, as its first frames say
+                if pending["kind"] == "other":
+                    fresh.emit(vinit(version="2.1.329"))
+                elif pending["kind"] == "verified":
+                    fresh.emit(vinit())
+                pending.clear()
             if s.writing is not None:
                 if last_holder[0] != (id(s.writing), id(s.child)):
                     staged[s.writing.id] = henv.clock()         # (re)staged in this pass: its write clock starts
@@ -2668,8 +2803,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                 # (a message written whole within the pass that staged it may be earned there unseen: it has no
                 # budget left to matter)
                 if q is not None and q.counted is not None and q.earned != (q.id in earned_set):
-                    # Review rounds 13 and 14: the host earns a budget exactly when this test does: evidence
-                    # (each line read, each drain, decision and pass end) and the counted state at a decision.
+                    # Review rounds 13 to 15: the host earns a budget exactly when this test does: the process
+                    # verified and the counted state, at a decision point.
                     extra.append((q.id, "earned" if q.earned else "not earned", "though this test saw otherwise",
                                   henv.clock(), dict(flags)))
 
@@ -2680,7 +2815,8 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
             p = proc()
             action = rnd.choice(["send", "send", "zero", "open", "partial", "next", "bracket", "bracket", "close",
                                  "downgrade", "own", "other", "bind", "linger", "release", "exit", "broken",
-                                 "cancel", "gate", "may", "slot", "groups", "latch", "latch", "flip", "flip", "flip"])
+                                 "cancel", "gate", "may", "slot", "groups", "latch", "latch", "flip", "flip", "flip",
+                                 "replace", "replace"])
             arg = None
             if action == "send" and len(sent) < 6:
                 arg = f"m{len(sent)}"
@@ -2722,6 +2858,11 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                         record(e.message_id, "failed")
             elif action in flags:
                 flags[action] = arg = not flags[action]
+            elif action == "replace" and p is not None:
+                # The process goes; its replacement is another version, writes no init, or verifies.
+                arg = rnd.choice(["other", "no_init", "verified"])
+                p.code = 1
+                pending.update(kind=arg, after=len(henv.spawner.children))
             elif action == "flip" and p is not None:
                 # Review round 13: the latch changes and, in the same tick's first drain, a qualifying init and a
                 # downgrade arrive together.
@@ -2797,12 +2938,12 @@ def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
                     assert at <= bound, (m, kind, at, "the write timer from", staged[m], "progress", progressed[m])
         except AssertionError as e:
             raise AssertionError(f"seed {seed}: {e}; steps {steps}") from None
-        return {m: (outcome[m][0], outcome[m][1] - t0, outcome[m][2]) for m in sent}, steps
+        return {m: (outcome[m][0], outcome[m][1] - t0, outcome[m][2], terminal.get(m)) for m in sent}, steps
 
     for seed in range(200):
         quiet, steps = walk(seed, False)
         noisy, _ = walk(seed, True)
-        assert quiet == noisy, (f"seed {seed}: evidence-free frames changed an outcome or its time (review round 14)",
+        assert quiet == noisy, (f"seed {seed}: inert frames changed an outcome or its time (review rounds 14, 15)",
                                 quiet, noisy, steps)
 
 # --- the barrier, its bound and its clock, the access check, interrupt readiness

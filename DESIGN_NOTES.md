@@ -9172,29 +9172,32 @@ zero-turn task notification `result` did the same to a turn in flight.
   barrier's own rules (`_barrier`) apply: the next message waits, `park` and the max_live eviction skip the
   session, and
   - **one no-progress budget per message, in COUNTED time, from its earning** (review round 5, C5-01, which
-    replaced C2-03's deadline; counted time since the follow-up after the switch-on; restated in review round 14):
-    - **Evidence and decision are separate.** While the host reads a process's lines (any drain), it records only
-      EVIDENCE on the message in the budget position (first in the inbox with nothing written or in flight, or
-      staged with not one byte accepted): that a verified process was observed while it held that position
-      (`_Message.evidence`, `_evidence`). It records it as each drain begins and after each line,
-      and only then. Every read is preceded by such a moment, the process's verification changes only with a line,
-      and the message's position only between drains (which the next drain's start sees), so a line that carries no
-      evidence (a lifecycle row, a usage report, assistant text of a turn already attributed) adds none. No gate is
-      read while lines are read, by any path.
+    replaced C2-03's deadline; counted time since the follow-up after the switch-on; restated in review rounds 14
+    and 15):
+    - **Nothing is remembered from reading lines** (review round 15; round 14's "evidence" is gone). Reading a
+      process's lines (any drain) decides nothing and reads no gate: what decides is the state as it is at the
+      decision point, after the tick's reads.
     - **One decision point per session per tick** (`_decide`, called from `_steps`): `tick` first drains every
       session's process (its first drain: reads and reaps, in session order), then makes each session's pass in
       session order; a session's pass reads and reaps it again (its second drain), takes back a staged line its
       CLI's new turn holds (`_take_back`), and then decides, before any timeout or write. So the decision follows
       every read and reap of that tick that comes before it: all first drains, the earlier sessions' passes, and its
-      own second drain. There, and only there, the gates are read, once, and only for a message with evidence or a
-      budget (`_read_gates`: the turn gate and `may_start_query`, which never sets the node's latch); that one
+      own second drain. There, and only there, the gates are read, once, and only for a message with a budget, or
+      one that could earn one there because the process is verified right then (`_read_gates`: the turn gate and
+      `may_start_query`, which never sets the node's latch); that one
       reading serves whether the message becomes earned, the budget's interval and comparison (`_spent`), the write
       timer's choice of clock (`_hold_to_timeout`) and the pass's end mark (`_mark`).
-    - **Earned** at a decision point, with evidence, if its counted state holds in that reading. Only then does it
-      have a budget at all (`counted`, from zero; no provisional accounting): an unearned message accumulates no
-      counted time, and the budget machinery reads no gate and asks no callback for it (an other-version or no-init
-      runner, or a verified process not observed while it held the position, gets main's sequence of `may_start` and
-      turn-gate calls, exactly). Its byte span is still tracked for a candidate (a process whose first `init` is not
+    - **Earned** at a decision point if and only if, in that decision's one reading, the session's current process
+      is verified right then (`_correlated`: its first init read, its version in VERIFIED, not downgraded), live and
+      not stopping, and the message is in a counted state; and not if it is a line staged with main's write timer due
+      (`_overdue`: earning cannot rescue an overdue line, review round 15; the order in a decision: main's
+      write-timer check for a line that entered it unearned, then the earning, then the budget). Once earned it stays
+      earned: the budget belongs to the message and survives an unstage, a restage, a downgrade and a replacement
+      process. Only then does it have a budget at all (`counted`, from zero; no provisional accounting): an unearned
+      message accumulates no counted time, and the budget machinery reads no gate and asks no callback for it (an
+      other-version or no-init process gets main's sequence of `may_start` and turn-gate calls, exactly). So a
+      process that verifies and deviates within one drain never earns anything (its messages are on main's path),
+      and a replacement earns only by being verified itself at a decision. Its byte span is still tracked for a candidate (a process whose first `init` is not
       read yet), so the line can be taken back once the process verifies; main's write timer is its one clock
       (review round 12). Kept across unstages, restagings, the end of the CLI's turns and a downgrade; only an
       accepted byte ends it (progress).
@@ -9219,10 +9222,11 @@ zero-turn task notification `result` did the same to a turn in flight.
       budget is the 7b restart (the message stays, or goes back unstaged, first in the inbox; its process is
       stopped; its second budget from nothing); a second fails it as main's `_held` fails it. The pass that acts
       writes nothing else.
-    - **The bound** (review round 14): main's write timer up to the earning, then two budgets of counted time, each
-      plus one pass; never a failure earlier than main's (the 7b needs a whole budget counted after the earning,
-      which is itself no earlier than the staging, and the failure a second). Its wall time is unbounded only by
-      host-side waits, as on main. With VERIFIED empty no message ever has evidence, so none has a budget, and its
+    - **The bound** (review rounds 14 and 15), in COUNTED time: two budgets, each plus one pass (the sampling's
+      overshoot), after the earning; before it, main's write timer for a staged line. In WALL time it also includes
+      the host's own waits (no process, the gates, no slot) and each new staging's ordinary write timer until the
+      message is earned again under a verified process, as on main. Never a failure earlier than main's: the 7b
+      needs a whole budget counted after the earning, and the failure a second. With VERIFIED empty no message ever has evidence, so none has a budget, and its
       path is main's;
   - **the inbox owns the hold: a message is never held while staged** (review round 4). While the adapter reports an
     unattributed bracket, the next message stays in the inbox, unstaged. If a message is staged and not one byte of
@@ -10232,6 +10236,59 @@ verifies late it comes later than before, never earlier than main's write timer.
 | C14 \| ... and the pass's end mark | `test_7b_the_same_sequence_with_7a_disabled_delivers_m_after_the_deadline` (44) |
 | C14 \| tick is not re-entrant | `test_c14_tick_is_not_re_entrant` (1) |
 | C14 \| counting starts from zero at the earning | `test_c10_a_binding_change_and_a_new_turn_early_restart_for_the_binding_once_it_ends` (41) |
+
+#### Review round 15 (Sol, on 6f9b03e: CHANGES, two blockers, both about evidence) and what changed
+
+Sol: round 14's blocker resolved; the decision point and "no provisional accounting" hold. The blockers: (1)
+unearned evidence survived a process replacement (M held behind the latch under a verified process; the process
+exits; the latch reopens: a 2.1.329 or no-init replacement earned M's budget and restarted at t=75 where main's
+timer was due at t=70); (2) an owned result exposes the next queue head after the evidence was collected, so with a
+downgrade later in the same drain a lifecycle row between the results decided whether the successor got evidence.
+Sol's summary: evidence was recorded on frame arrival while ownership changes during event application. Ruling:
+remove evidence altogether; earn only from the state at the decision point (the invariant above); the precedence of
+an overdue unearned line (Sol's choice (ii)). Done: `_Message.evidence` and `_evidence` are gone; `_decide` earns a
+message only with the process verified right then (`_correlated`) and not when its staged line is overdue
+(`_overdue`); `_read_gates` is asked only for a budgeted message or a verified process.
+Consequences, accepted by the coordinator:
+- A process that verifies and deviates within one drain never earns anything; its messages are on main's path.
+  C7-01's "a verification and a downgrade read in one pass still earn it" is withdrawn; "a downgrade after the
+  earning keeps it" stays.
+- A replacement earns only by being verified itself at a decision.
+- No frame that leaves the end-of-reads state unchanged can change any outcome: nothing is read from frames but that
+  state.
+- The gates are read at the decision only for a budgeted message or under a verified process: for an off-version or
+  no-init process, zero callbacks.
+Tests (the replacement pair and the precedence's t=60 case failed on 6f9b03e):
+`test_c15_a_replacement_that_does_not_verify_earns_nothing[other, no_init]` (main's timeout at t=70, every pass from
+the replacement on equal to the VERIFIED-empty run); `test_c15_a_verified_replacement_earns_from_zero_at_its_own_
+decision` (earned at t=15 with 0 counted; the 7b at t=75); `test_c15_two_results_and_a_downgrade_in_one_drain_with_or_
+without_a_row_between[no_row, lifecycle_row]` (main's timeout at t=65 in both; this shape passed on 6f9b03e too,
+because a downgraded process does not track the successor's byte span, so it does not reproduce Sol's exact
+divergence, which the property test's insertions between results now cover); `test_c15_earning_cannot_rescue_an_
+overdue_line[60, 55]` (verifying in the pass at which the write timer is due: main's timeout, as with VERIFIED empty;
+one pass earlier: earned, the 7b at t=115). The property test: no evidence in its model, its earning rule the one
+above from its own flags; inert frames inserted anywhere in a batch, between two results too; the ends of delivered
+messages' turns compared as well; process replacement by another version, a no-init process or a verified one in
+the generator. It catches 6f9b03e at seed 339 (not within the suite's 200); 4000 seeds pass.
+Replays whose expectations changed:
+- `test_c7_01_a_verification_and_a_downgrade_read_in_one_pass_...` (now `..._earn_nothing`): main's timeout at t=60,
+  equal to VERIFIED empty (was the 7b at t=70): not verified at the decision;
+- `test_c9_a_message_staged_in_a_verified_process_earned_*`: a second pass at t=0 earns it (the process verified
+  there); the downgrade at t=5 keeps it; the 7b at t=60 (was t=65, earned at t=5 from evidence);
+- `test_c13_the_latch_reopening_*` (now `..._earns_nothing`): main's timeout at t=60, equal to VERIFIED empty (was the
+  7b at t=80): not verified at the reopening decision;
+- `test_c13_the_latch_closing_*`: main's timeout at t=60, equal to VERIFIED empty (round 13's outcome; round 14 wrote
+  the line at t=60 from evidence): not verified at any decision, and overdue at t=60;
+- `test_c11_latched_but_not_silent_*`: the same outcome; the message is simply never earned (it had evidence).
+
+**Mutation check** (round 15; scratchpad `correlation/mutate18.py`: the rows on the earning's conditions, the changed lines): 4 of 4 caught. Round 14's rows on evidence went with it.
+
+| row or rule | caught by |
+| --- | --- |
+| C15 \| earning needs the process verified at the decision | `test_c13_the_budget_never_calls_the_stateful_may_start_more_than_main` (18) |
+| C15 \| earning cannot rescue an overdue line | `test_c15_earning_cannot_rescue_an_overdue_line` (1) |
+| C15 \| ... overdue exactly when main's write timer is due | `test_c15_earning_cannot_rescue_an_overdue_line` (1) |
+| C14 \| earning needs the counted state | `test_c15_a_replacement_that_does_not_verify_earns_nothing` (7) |
 
 ### Not done
 
