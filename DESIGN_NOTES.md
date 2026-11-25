@@ -9828,6 +9828,17 @@ it, above).
   turn correlation is on for it`, or `... turn correlation is off for it (attributed by order)` (another version,
   `no version`, or no `msg_lifecycle_v1`). After a Claude Code update every process says `off` with the new
   version until that version is verified and added. Never written with VERIFIED empty.
+- Where these lines show (after #113): node.log, `board node`'s stderr under launchd, carries this package's lines
+  at INFO and above, each as `<time> <LEVEL> <logger>: <text>` (`node.log_to_stderr`, called by `node.run`). Before,
+  the INFO line above never reached it: the node configured no logging, so only WARNING and above came out, bare,
+  through Python's last-resort handler. Only the `agent_comms` loggers are set (the root and third-party loggers
+  keep WARNING: httpx's line per request, with its URL, stays out); the package's records do not also go to the
+  root, so each line appears once; a setup already made (tests, an embedding process) is left alone. Nothing the
+  node logs at INFO says message text, prompts, replies, tokens or environment values, or repeats on every pass:
+  the one line that did, a run waiting for a stopping process group (`run <id> waits: ...`, asked again at every
+  poll), is said once per run and then only at DEBUG. The lines to look for: the one above (once per Claude
+  process), `started session <id> for <agent> (pid <n>)`, `started <agent> for thread <n> (run <id>)`, and the
+  WARNINGs below and `hub unreachable: ...`.
 - After enabling, watch the node log (`board node`'s output) for these lines:
   - a downgrade (a process attributed by order from then on), logger `agent_comms.providers.claude`, WARNING:
     `Claude session <id>: this process is attributed by order from now on: <reason>`. An occasional one is the

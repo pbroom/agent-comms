@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,7 @@ class Node:
         from .node_groups import Groups
         self.groups = self.sessions.host.groups if self.sessions is not None else Groups()
         self.running: dict[str, _Local] = {}
+        self.waits_said: set[str] = set()   # runs whose wait for a stopping process group the log has said (once each)
         self.report_usage = False       # the hub's last hello answer asked for usage (account_pools.py)
         self.last_hello = float("-inf")
         self.last_contact = clock()
@@ -282,6 +284,7 @@ class Node:
                 self.hello()
             runs = self._call("GET", "/api/nodes/assignments").get("runs", [])
             listed = set()
+            self.waits_said &= {r.get("run_id") for r in runs if r.get("state") == "assigned"}
             for r in runs:
                 rid = r.get("run_id")
                 if not isinstance(rid, str):
@@ -322,7 +325,7 @@ class Node:
                 # A process group of this node is being stopped in that checkout (a session's or a run's, inside its
                 # kill grace or outliving it): the run waits, assigned, and starts on a later pass. (Asked again,
                 # atomically, at the spawn below; this first look only spares the side effects in between.)
-                log.info("run %s waits: a process group in %s is still being stopped", rid, cwd)
+                self._say_wait(rid, "run %s waits: a process group in %s is still being stopped", cwd)
                 return
             prompt = r.get("prompt")
             if not isinstance(prompt, str) or not prompt:
@@ -384,7 +387,7 @@ class Node:
                 argv, cwd=cwd, env=child_env(agent, self.config, runtime=r.get("runtime")),
                 log_path=self.log_dir / f"{rid}.log"))
             if not started:
-                log.info("run %s waits: a process group in %s is now being stopped", rid, cwd)
+                self._say_wait(rid, "run %s waits: a process group in %s is now being stopped", cwd)
                 if made:
                     self._remove_browser_output(rid, out_dir)
                 return
@@ -394,6 +397,7 @@ class Node:
                 self._remove_browser_output(rid, out_dir)
             self._report(rid, "ended", error=f"{type(e).__name__}: {e}"[:300])
             return
+        self.waits_said.discard(rid)
         local = _Local(rid, child, self.clock(), float(r.get("timeout_seconds") or 1800),
                        float(r.get("kill_grace_seconds") or 10), cwd=cwd, browser_out=str(out_dir) if made else None)
         try:
@@ -406,6 +410,13 @@ class Node:
         if isinstance(ack, dict) and ack.get("state") == "ended":
             self._stop(local, "terminate")    # the hub stopped it while we were starting it
         log.info("started %s for thread %s (run %s)", agent, r.get("thread_id"), rid)
+
+    def _say_wait(self, rid: str, text: str, cwd: str) -> None:
+        """A run that waits for a stopping process group is asked again on every pass (`poll_seconds`): the log says
+        so once for that run (INFO), and on the later passes only at DEBUG."""
+        level = logging.DEBUG if rid in self.waits_said else logging.INFO
+        self.waits_said.add(rid)
+        log.log(level, text, rid, cwd)
 
     def _remove_browser_output(self, run_id: str, out: Any) -> None:
         """Remove one browser output directory this node made for `run_id` (dispatch.remove_browser_output's
@@ -532,8 +543,29 @@ def shut_down(node: Node) -> None:
                 sessions.shutdown()     # its processes are gone: the bookkeeping, then its reports
 
 
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def log_to_stderr() -> None:
+    """`board node`'s log: this package's records at INFO and above to stderr (which launchd writes to node.log),
+    with the time and the level. Only the `agent_comms` loggers: the root logger and third-party ones keep their
+    levels (httpx and httpcore log each request at INFO, with its URL: those stay out). The package's records do not
+    also reach the root's handlers (no line twice, nor bare through Python's last-resort handler). Idempotent, and
+    a logging setup already made (a test, a process that embeds the node: a handler on the root or on the package)
+    is left alone."""
+    pkg = logging.getLogger("agent_comms")
+    if pkg.handlers or logging.getLogger().handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    pkg.addHandler(handler)
+    pkg.setLevel(logging.INFO)
+    pkg.propagate = False
+
+
 def run(hub: str, token: str, *, poll_seconds: float | None = None) -> None:
     from .config import Settings, home
+    log_to_stderr()
     settings = Settings.load()
     config = DispatchConfig.from_dict(settings.dispatch, settings=settings)
     log_dir = home() / "data" / "node-logs"
