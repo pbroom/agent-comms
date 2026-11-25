@@ -641,6 +641,11 @@ class SessionHost:
         self.usage: dict[str, dict] = {}
         self.usage_lock = threading.Lock()
         self._steer_stop_lock = threading.RLock()       # the steering stop latch's (above)
+        # (Review round 2, ruling I) Every event the host publishes goes here at the moment of publication; `tick`,
+        # `close`, `cancel`, `stop_turns` and `stop_all` return it, emptied, when they return. An exception that
+        # escapes one of them leaves it as it is, and the next of them delivers it: exactly once.
+        self._outbox: list[HostEvent] = []
+        self._defer_save = False    # (ruling H) a stop of every turn: held publications persist after every SIGTERM
 
     # ------------------------------------------------------------ local state (survives a host restart)
 
@@ -1165,12 +1170,12 @@ class SessionHost:
 
     def close(self, session_id: str, detail: str = "closed") -> list[HostEvent]:
         """End a session now: its process is terminated, its turn in flight fails, its queue is dropped."""
-        out: list[HostEvent] = []
+        out = self._outbox
         s = self._session(session_id)
         if not s.ended:
             live = self.live_attempt(s)
             self._end(s, detail, self._drain_before_stop(s, self.clock(), out), out, at_signal=live)
-        return out
+        return self._take_outbox()
 
     def forget(self, session_id: str) -> None:
         """Drop an ended session whose process is gone, so its id no longer counts as open here."""
@@ -1198,10 +1203,14 @@ class SessionHost:
         try:
             if not self._recovered:
                 self.recover()
-            out: list[HostEvent] = []
-            self._tick(self.clock(), out)
+            self._tick(self.clock(), self._outbox)
         finally:
             self._in_tick = False
+        return self._take_outbox()
+
+    def _take_outbox(self) -> list[HostEvent]:
+        """What was published since the last delivery, in order, handed over once (ruling I)."""
+        out, self._outbox = self._outbox, []
         return out
 
     def _tick(self, now: float, out: list[HostEvent]) -> None:
@@ -1898,6 +1907,8 @@ class SessionHost:
             if s.child.poll() is None or self.group_alive(s.child.pid):
                 if at_signal:
                     s.stopping_since = self.clock()
+                if s.held is not None and s.held.fenced_at is not None:
+                    s.held.fenced_at = self.clock()     # (shoulds) the bounded publication counts from the SIGTERM
                 s.child.terminate()
 
     def _release_steer(self, s: Session) -> None:
@@ -1947,7 +1958,7 @@ class SessionHost:
         written, fails with `detail` and the process is stopped (the next message starts one that resumes the
         conversation; a turn half written is never completed); one still in the inbox is dropped, never written.
         Anything else (the turn is over, or another one) is left alone."""
-        s, out = self._session(session_id), []
+        s, out = self._session(session_id), self._outbox
         now = self.clock()
         drained = False
         if (s.in_flight is not None and s.in_flight.id == message_id) or (
@@ -1962,20 +1973,20 @@ class SessionHost:
             if not s.restart_written and s.restart_mark is not None:
                 self._unwritten(s)
             self._forget_restart(s)
-            return out
+            return self._take_outbox()
         if (s.in_flight is not None and s.in_flight.id == message_id) or (
                 s.writing is not None and s.writing.id == message_id):
             if s.writing is not None:
                 s.outbuf = bytearray()
             self._fail(s, detail, out)
             self._stop_from(s, now, drained)
-            return out
+            return self._take_outbox()
         for box in (s.inbox,):
             for m in list(box):
                 if m.id == message_id:
                     box.remove(m)
                     out.append(HostEvent(s.session_id, "turn_ended", m.id, ok=False, delivered=False, detail=detail))
-        return out
+        return self._take_outbox()
 
     def _restart_pass(self, s: Session, now: float, out: list[HostEvent]) -> None:
         """Write the interrupt asked for (`interrupt_for`; the module text): while its turn is the one in flight here,
@@ -2240,9 +2251,9 @@ class SessionHost:
                            {"outcome": "not_delivered", "why": "refused"} if said == "refused" else
                            {"outcome": "unconfirmed", "why": "no_answer" if said is None else "other_answer"})
             slot.outcome = outcome
-        done = getattr(s.provider, "steer_done", None)
-        if done is not None:
-            done()      # (Claude: the attempt is retired before any further frame is read)
+            done = getattr(s.provider, "steer_done", None)
+            if done is not None:
+                done()      # (Claude: the attempt is retired before any further frame is read; ruling H: atomically)
         if slot.mark is None or s.child is None:
             s.steer = None      # decided, and nothing of it is left to write
         log.info("session %s: the steer into message %s: %s (%s)", s.session_id, msg_id, outcome["outcome"],
@@ -2276,7 +2287,10 @@ class SessionHost:
         own = ev.turn == "steer"
         if ev.steer is None or slot is None or slot.outcome is not None:
             return own
+        retired = None
         with self._steer_stop_lock:
+            # (Review round 2, ruling H) Only the decision and the adapter's retirement are inside the cutoff lock;
+            # the log line, the event and the state saved come after it.
             if slot.stopping or self.steer_stopped:
                 return own      # after the latch: no evidence counts for S
             if ev.steer == "lost":
@@ -2287,24 +2301,32 @@ class SessionHost:
             if held is None or held.fenced_at is not None:
                 return own      # N's end (n_with_s, n_without_s, s_only) is decided at N's end (`_steer_end`)
             if ev.steer == "s_open" and not held.s_turn:
-                held.s_turn, s.busy_since = True, now     # S's own turn: a fresh clock (part D)
+                # S's own turn: a fresh clock (part D), from the moment its `init` was read (a drain's read is later
+                # than the pass's `now`)
+                held.s_turn, s.busy_since = True, self.clock()
                 facts = getattr(s.provider, "steer_facts", None)
                 if facts is not None:
                     facts(phase="s_turn")
                 return True
             if ev.steer == "s_end" and held.s_turn:
-                self._publish_hold(s, out, {"outcome": "next_turn", "why": "own_turn", "result": {
+                retired = self._retire_hold(s, {"outcome": "next_turn", "why": "own_turn", "result": {
                     "ok": bool(ev.ok), "detail": ev.detail[:300], "denials": list(ev.denials), "meta": dict(ev.meta),
                     "text": ev.text, "answered": bool(ev.answered)}})
-                return True
-            if ev.steer == "s_consumed" and not held.s_turn:
-                self._publish_hold(s, out, {"outcome": "unconfirmed", "why": "consumed"})
-                return own
+                own = True
+            elif ev.steer == "s_consumed" and not held.s_turn:
+                retired = self._retire_hold(s, {"outcome": "unconfirmed", "why": "consumed"})
+        if retired is not None:
+            self._emit_hold(s, out, *retired)
         return own
 
     def _publish_hold(self, s: Session, out: list[HostEvent], steer: dict) -> None:
         """N's end, once: its native end unaltered plus S's outcome (`steer`), then what waited behind it. The
         attempt is retired in the adapter FIRST, before any further frame is read (ruling A)."""
+        self._emit_hold(s, out, *self._retire_hold(s, steer))
+
+    def _retire_hold(self, s: Session, steer: dict) -> tuple:
+        """The decision's state, atomically (under the cutoff lock where the adjudicator calls it, ruling H): the
+        adapter's attempt retired, the hold taken, the slot's outcome set, N no longer in flight. No log, no I/O."""
         done = getattr(s.provider, "steer_done", None)
         if done is not None:
             done()
@@ -2317,10 +2339,18 @@ class SessionHost:
                 s.steer = None
         if s.in_flight is not None and s.in_flight.id == held.end.message_id:
             s.in_flight, s.busy_since = None, None
+        return held, steer
+
+    def _emit_hold(self, s: Session, out: list[HostEvent], held: "_Held", steer: dict) -> None:
+        """The decided hold made public: the log line, N's end and what waited behind it into the host's outbox
+        (ruling I), and the state saved, outside the cutoff lock (ruling H); during a stop of every turn the save
+        waits until every session has its SIGTERM (`stop_turns`, `stop_all`)."""
         log.info("session %s: the steer into message %s: %s (%s)", s.session_id, held.end.message_id,
                  steer["outcome"], steer["why"])
         out.append(dataclasses.replace(held.end, steer=dict(steer)))
         out.extend(held.after)
+        if self._defer_save:
+            return
         try:
             self._save_state()
         except Exception:
@@ -2591,37 +2621,39 @@ class SessionHost:
 
     def stop_turns(self, detail: str) -> list[HostEvent]:
         """Give up on every turn in flight: each is reported failed and its process is stopped (the caller lost the
-        hub, so nobody could see or stop the turn). Idle processes and the sessions themselves stay."""
-        out: list[HostEvent] = []
+        hub, so nobody could see or stop the turn). Idle processes and the sessions themselves stay. (Ruling H) Every
+        session gets its SIGTERM before anything a held publication records is persisted: the state is saved once,
+        after the loop."""
+        out = self._outbox
         now = self.clock()
-        self._at_once = True     # a held end is published here, at main's point (the shutdown simplification)
+        self._at_once = self._defer_save = True     # a held end is published here, at main's point (shutdown simplified)
         try:
             for s in self.sessions.values():
                 if s.child is not None and s.busy and not s.ended:
                     self._fail(s, detail[:300], out)
                     self._stop(s, now)
         finally:
-            self._at_once = False
+            self._at_once = self._defer_save = False
         if out:
             self._save_state()
-        return out
+        return self._take_outbox()
 
     # ------------------------------------------------------------ shutdown
 
     def stop_all(self) -> list[HostEvent]:
         """Shutdown: terminate every session's process group, wait the grace period, kill what remains of each group
         (its leader may be gone while a member is not). A turn in flight is reported failed. Sessions are not ended:
-        a later host may reopen them with resume."""
-        out: list[HostEvent] = []
+        a later host may reopen them with resume. (Ruling H) Every SIGTERM goes before anything is persisted."""
+        out = self._outbox
         now = self.clock()
         live = [s for s in self.sessions.values() if s.child is not None]
-        self._at_once = True     # a held end is published here, at main's point (the shutdown simplification)
+        self._at_once = self._defer_save = True     # a held end is published here, at main's point (shutdown simplified)
         try:
             for s in live:
                 self._fail(s, "the session host shut down", out)
                 self._stop(s, now)
         finally:
-            self._at_once = False
+            self._at_once = self._defer_save = False
         def going(s: Session) -> bool:
             return s.child.poll() is None or self.group_alive(s.child.pid)
         deadline = self.clock() + self.kill_grace
@@ -2645,4 +2677,4 @@ class SessionHost:
         for s in self.sessions.values():
             s.sealed_by = s.confirmed_by = None     # this host is done: what its processes said goes with it
         self._save_state()
-        return out
+        return self._take_outbox()

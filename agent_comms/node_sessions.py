@@ -884,7 +884,7 @@ class SessionRunner:
                 self.dropped.add(sid)
                 self.status.pop(sid, None)
                 self.reported.pop(sid, None)
-                self.host.close(sid, "the hub no longer lists this session")
+                self._emit(self.host.close(sid, "the hub no longer lists this session"))   # (its own: dropped below)
         for sid in [x for x in self.queue if x not in listed]:
             del self.queue[sid]
         self.ending &= set(listed)

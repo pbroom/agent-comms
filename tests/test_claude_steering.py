@@ -1873,6 +1873,209 @@ def test_r2_f_the_retired_set_is_bounded_per_incarnation():
     assert p._retired == set(), "a new incarnation starts with none"
 
 
+
+# ---------------------------------------------------------------- review round 2, rulings H and I
+
+SID2 = "5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6d"
+
+
+def _held_pair(henv, monkeypatch):
+    """Two verified sessions, each with N (message "1") held after a steer written whole: [(session, child)]."""
+    s1, c1, n1 = steered(henv, monkeypatch)
+    c1.emit(owned(n1, text="N1"))
+    henv.host.tick()
+    s2 = open_session(henv, sid=SID2)
+    S2 = "5e7e7e7e-0000-4000-8000-0000000000b2"
+
+    def mine(ev):
+        return ev | {"session_id": SID2}
+    henv.host.send(SID2, "zero", message_id="0")
+    henv.host.tick()
+    c2 = henv.spawner.children[-1]
+    m0 = uuid_of(c2)
+    c2.emit(mine(vinit(m0)), mine(owned(m0)))
+    henv.host.tick()
+    henv.host.send(SID2, "a long turn", message_id="1")
+    henv.host.tick()
+    n2 = uuid_of(c2)
+    c2.emit(mine(vinit(n2)))
+    henv.host.tick()
+    henv.host.steer_offer(SID2, "1", S2, TEXT, authorized=True)
+    henv.host.tick()
+    c2.emit(mine(owned(n2, text="N2")))
+    henv.host.tick()
+    assert s1.held is not None and s2.held is not None
+    return [(s1, c1), (s2, c2)]
+
+
+@pytest.mark.parametrize("stop", ["stop_turns", "stop_all"])
+def test_r2_h_every_sigterm_goes_before_a_held_publication_persists(henv, monkeypatch, stop):
+    """Sol's blocker 4 (ruling H): a stop of every turn publishes every held end at main's point, and every session
+    gets its SIGTERM before anything is persisted: `_save_state` (made to record, as a blocking one would show)
+    is first called only once both processes were signalled."""
+    pair = _held_pair(henv, monkeypatch)
+    terms = []
+    for s, c in pair:
+        real = c.terminate
+
+        def term(real=real):
+            terms.append(1)
+            return real()
+        c.terminate = term
+    saved = []
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: (saved.append(len(terms)), real_save())
+    out = henv.host.stop_turns("lost the hub") if stop == "stop_turns" else henv.host.stop_all()
+    assert len([e for e in out if e.kind == "turn_ended"]) == 2
+    assert saved and saved[0] == 2, (saved, terms)
+
+
+def test_r2_h_the_cutoff_lock_is_not_held_while_a_publication_logs_or_saves(henv, monkeypatch):
+    """Ruling H: S's own end is decided and the attempt retired under the cutoff lock; the state is saved after it
+    is let go (another thread can take it then)."""
+    import threading
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    seen = []
+    real_save = henv.host._save_state
+
+    def probe(got):
+        ok = henv.host._steer_stop_lock.acquire(blocking=False)
+        if ok:
+            henv.host._steer_stop_lock.release()
+        got.append(ok)
+
+    def save():
+        got = []
+        t = threading.Thread(target=probe, args=(got,))
+        t.start()
+        t.join()
+        seen.append(got[0])
+        return real_save()
+    henv.host._save_state = save
+    child.emit(owned(S, text="PINEAPPLE"))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and seen and all(seen), seen
+
+
+def test_r2_i_a_read_error_then_a_raising_sigterm_never_loses_ns_end(henv, monkeypatch):
+    """Sol's blocker 5 (ruling I): N held; a read fails, then the SIGTERM raises and the exception escapes `tick`.
+    N's end was published into the host's outbox: the next tick delivers it, exactly once."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+
+    def broken():
+        raise OSError("read failed")
+
+    def bad_term():
+        raise OSError("terminate failed")
+    child.read_lines, child.terminate = broken, bad_term
+    with pytest.raises(OSError):
+        henv.host.tick()
+    child.read_lines = lambda: []
+    child.terminate = lambda: None
+    out = henv.host.tick()
+    assert [e.text for e in ends(out)] == ["N"]
+    assert not ends(henv.host.tick()), "exactly once"
+
+
+def test_r2_i_a_first_fence_check_that_raises_publishes_at_once_before_any_read(henv, monkeypatch):
+    """Ruling I, the guard `_hold_deadline`'s error publishes at once: the tick's first fence check raises (once);
+    N's end is out before the tick's first read (the second check, in the pass, would come after the reads)."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    henv.host.close(SID, "closed")
+    henv.host.tick()
+    henv.clock.advance(5)                       # before the deadline: only the raising check publishes
+    real_fence = henv.host._hold_fence
+    calls = []
+
+    def fence(sess, now, out):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("the first fence check fails")
+        return real_fence(sess, now, out)
+    henv.host._hold_fence = fence
+    real_read = henv.host._read
+    seen = []
+
+    def read(sess, now, out):
+        seen.append(len(ends(out)))
+        return real_read(sess, now, out)
+    henv.host._read = read
+    out = henv.host.tick()
+    assert len(ends(out)) == 1 and (not seen or seen[0] == 1), seen
+
+
+def test_r2_i_a_host_error_publishes_before_its_stop_is_attempted(henv, monkeypatch):
+    """Ruling I, the guard `_at_once` on the host error's `_end`: N's held end is published BEFORE the stop's
+    SIGTERM is attempted (a stop that blocks or raises cannot hold it back)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    seen = []
+
+    def broken():
+        raise OSError("read failed")
+
+    def term():
+        seen.append(len(ends(henv.host._outbox)))
+        raise OSError("terminate blocked, then failed")
+    child.read_lines, child.terminate = broken, term
+    with pytest.raises(OSError):
+        henv.host.tick()
+    assert seen == [1], "published before the SIGTERM was attempted"
+
+
+def test_r2_i_a_read_error_after_a_close_fenced_n_publishes_at_once(henv, monkeypatch):
+    """Ruling I, the guard `_publish_now` in the host error's `finally`: a close marked the session ended and fenced
+    N (its group lingers); a read error before the grace: `_end` is skipped (already ended), and only the `finally`
+    publishes N's end and `ended`, at once."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    out = henv.host.close(SID, "closed")
+    assert not ends(out) and s.ended
+
+    def broken():
+        raise OSError("read failed")
+    child.read_lines = broken
+    henv.clock.advance(1)
+    out = henv.host.tick()
+    kinds = [(e.kind, e.message_id) for e in out]
+    assert ("turn_ended", "1") in kinds and ("ended", None) in kinds, kinds
+
+
+def test_r2_the_bounded_publication_counts_from_the_sigterm(henv, monkeypatch):
+    """Should: the 2 x kill_grace clock starts when the SIGTERM is sent (a drain before it does not shorten it)."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    real_term = child.terminate
+    stamped = []
+
+    def term():
+        stamped.append(henv.host.clock())
+        return real_term()
+    child.terminate = term
+    real_poll = child.poll
+
+    def slow_poll():
+        henv.clock.advance(2)       # the probe before the SIGTERM takes time
+        return real_poll()
+    child.poll = slow_poll
+    t0 = henv.clock()
+    henv.host.close(SID, "closed")
+    assert stamped and stamped[0] > t0 and s.held is not None and s.held.fenced_at == stamped[0]
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
