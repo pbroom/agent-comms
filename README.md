@@ -564,6 +564,14 @@ runner is any agent CLI, not only Claude or Codex: for example `"gemini" = ["gem
 is due for a project the hub has no checkout of, the hub assigns it to a live node that has that project and a runner
 for the agent. The node starts it with its own settings and reports back. See DESIGN_NOTES "Nodes".
 
+The node's log is its stderr (under launchd, node.log): this package's lines at INFO and above, each with its time,
+level and logger, for example `2026-11-25 10:00:00,123 INFO agent_comms.session_host: started session <id> for
+claude-code (pid 4242)`. Other libraries stay at WARNING (no line per hub request), and nothing is logged on every
+poll. Lines worth looking for: `started <agent> for thread <n> (run <id>)` and `started session <id> ...` (INFO);
+`Claude session <id>: this process reports Claude Code <version>; turn correlation is on for it` (INFO, once per
+Claude process); and the WARNINGs `hub unreachable: ...`, `... is attributed by order from now on: ...` and
+`session <id>: message <n> made no progress for ...`.
+
 ### Hosted sessions (`board session`)
 
 A dispatched run is one process per prompt: once it is going you cannot tell it anything. A hosted session is one

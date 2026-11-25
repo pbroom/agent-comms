@@ -2154,6 +2154,30 @@ def test_r6_rule1_a_node_run_waits_while_a_session_group_of_this_node_is_stopped
     assert len(senv.node.spawner.calls) == 1, "the group is gone: it starts"
 
 
+
+def test_a_run_waiting_for_a_stopping_group_is_said_once_not_on_every_pass(senv, caplog):
+    """The node asks again on every pass (`poll_seconds`) whether a waiting run may start: its log says that it
+    waits once (INFO), and on the later passes only at DEBUG, so node.log gets no line per poll."""
+    import logging
+    caplog.set_level(logging.DEBUG, logger="agent_comms.node")
+    sid = a_root(senv)
+    send(senv, sid, "a long turn")
+    tick(senv)
+    proc = proc_of(senv, sid)[1]
+    proc.exits_on_terminate = False
+    hosted.close_session(senv.board, "human", sid)
+    tick(senv)
+    _assign(senv)
+    for _ in range(4):
+        senv.node.tick()
+    said = [(r.levelname, r.getMessage()) for r in caplog.records if "waits: a process group" in r.getMessage()]
+    assert senv.node.spawner.calls == [] and [lv for lv, _ in said] == ["INFO", "DEBUG", "DEBUG", "DEBUG"], said
+    assert said[0][1].startswith("run node-run-1 waits: a process group in ")
+    senv.clock.advance(senv.node.sessions.host.kill_grace + 1)
+    tick(senv, times=2)
+    senv.node.tick()
+    assert len(senv.node.spawner.calls) == 1 and senv.node.waits_said == set(), "started: nothing left to say"
+
 def test_r6_rule1_a_sessions_process_is_not_started_where_a_run_of_this_node_is_being_stopped(senv):
     """Rule 1, the other way round (the shape exists: a session process starts on a message): not while a run this
     node started in that directory is still being stopped."""
