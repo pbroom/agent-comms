@@ -13006,13 +13006,16 @@ Scratchpad `mutate7.py`: the earlier rows whose lines this round changed, rewrit
 | R5-05 a steer-only 422 spares the features | `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer` |
 | R5-05 only steer forgotten | `test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer` |
 
-### Rebase onto main 06dfe82 (#112, the no-progress budget in counted time)
+### Rebase onto main b70e069 (#112, the no-progress budget in counted time; #113, its property test and names)
 
 - **The rebase.** The backup branch `backup/codex-steering-d6474c1` sits at d6474c1. Then `git rebase origin/main`
-  onto 06dfe82. Main's `providers/claude.py` and `tests/test_claude_correlation.py` are identical here. Of main's
+  onto 06dfe82 (#112), the conflicts below. origin/main then moved to b70e069 (#113: the property test reaches the
+  budget; `_Message.earned` removed, `counted` set being its one record). So the branch, as rebased, went again onto
+  b70e069, with no conflict (backup `backup/codex-steering-b088162`). This round's one test was adjusted for the
+  removed field. Main's `providers/claude.py` and `tests/test_claude_correlation.py` are identical here. Of main's
   `tests/test_structured_results.py`, only the two golden tests carry step 2's `named=True`, as before (K's named
   changes for a run with no steer).
-- **The fixture.** Not re-recorded. Against main's fixture, which #112 did not change, every value main has is
+- **The fixture.** Not re-recorded. Against main's fixture, which neither #112 nor #113 changed, every value main has is
   byte-identical except `transcripts`, with its one Codex echo line as in every round. The added keys are still
   `listing_p5`, `node_bodies` and `zz_parity`.
 - **Conflicts**, each listed with the commit it was in (the commits as they were before the rebase):
@@ -13046,7 +13049,7 @@ Scratchpad `mutate7.py`: the earlier rows whose lines this round changed, rewrit
     for an unearned staged line; `_take_back` (1234); the one decision point `_decide` (1239, defined at 1749);
     timeouts; the stopping branch; `_restart_pass`, `_steer_pass` and `_write`. Then `_mark`.
   - In `_hold_to_timeout`, a live attempt's timeout is fenced right there (1578, 1609, through
-    `_fence_then_decide`, 1617). So are a broken pipe (2300) and a cut in a tick (2104).
+    `_fence_then_decide`, 1617). So are a broken pipe (2303) and a cut in a tick (2107).
   - After both loops comes `_run_deferred` (1202, defined at 1077), within the budget.
 - **Claude and Codex never meet in it.**
   - A slot is made only for a provider whose modes name `steer`. Claude's adapter names none, so a Claude session
@@ -13061,13 +13064,13 @@ Scratchpad `mutate7.py`: the earlier rows whose lines this round changed, rewrit
     the drain; the drain reads only Codex and makes no decision; no gate reading or budget exists for Codex; no
     slot or steer byte exists for Claude.
 
-- **Runs** at bf3d81c (the rebased code with its one test):
-  - `uv run pytest -q -p no:cacheprovider`: 4425 passed, 10 skipped.
-  - The stand-in e2e in full: PASS (165 s, 345 checks).
-  - `--only steering` with stand-ins: PASS (111 s, 57 checks).
-  - `--only correlation` with stand-ins: PASS (12 s, 24 checks).
-  - `--only steering` with the real Codex (codex-cli 0.171.0): PASS (60 s, 27 checks).
-  - `--only steer` with the real Codex: PASS (32 s, 28 checks).
+- **Runs** at 0f0ebec (on b70e069). The same set had also passed at bf3d81c (on 06dfe82), with 4425 tests.
+  - `uv run pytest -q -p no:cacheprovider`: 4428 passed, 10 skipped.
+  - The stand-in e2e in full: PASS (167 s, 345 checks).
+  - `--only steering` with stand-ins: PASS (112 s, 57 checks).
+  - `--only correlation` with stand-ins: PASS (11 s, 24 checks).
+  - `--only steering` with the real Codex (codex-cli 0.171.0): PASS (64 s, 27 checks).
+  - `--only steer` with the real Codex: PASS (33 s, 28 checks).
   - `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (13 s, 23 checks).
   - `~/.codex/config.toml` sha256 unchanged through all of them:
     d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
