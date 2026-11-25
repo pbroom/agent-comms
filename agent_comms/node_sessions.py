@@ -156,6 +156,7 @@ class SessionRunner:
         self.host.turn_gate = self._turn_allowed      # a child's turn is held to its parent when it is WRITTEN, too
         self.host.admit = lambda s: self._admit(s, starting=True)    # every process start takes a slot here
         self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
+        self.host.may_start_query = self._may_start_query   # the same, with no side effect (turn correlation's)
         # session id -> {access, worktree}: what a hub with child sessions is also told about it (never an older one)
         self.tree: dict[str, dict] = {}
         self.parent_of: dict[str, str] = {}           # child session id -> its parent's, as the hub listed it
@@ -1035,6 +1036,12 @@ class SessionRunner:
         its hold, and it waits, failing nothing. A start just BEFORE the deadline is fine: the watchdog stops its turn
         at the deadline, and `shutdown_bound` covers it."""
         return not self._silent() and self.latched_at is None
+
+    def _may_start_query(self) -> bool:
+        """`_may_start`'s answer without its side effect: it never sets the latch (`_silent` does, at the deadline).
+        For the session host's turn-correlation accounting only (SessionHost.may_start_query), which must change no
+        node state main would not; the start gate itself stays `_may_start`, asked where and when main asks it."""
+        return self.latched_at is None and self.clock() < self._self_stop_due()
 
     def _self_stop_detail(self) -> str:
         return f"the node had no hub contact for {self.self_stop_seconds:g} seconds and stopped the turn"

@@ -574,12 +574,17 @@ unless you say so (`--mode`, "Sending", below). Claude runners, and Codex runner
 
 Claude Code 2.1.330 sessions are matched turn by turn: each message's line carries an id that Claude echoes, so a
 turn Claude starts by itself (a background agent finishing after your turn ended) is not reported as your next
-message's, and your message waits while such a turn runs (if nothing of it could be written for a whole turn
-timeout, its process is restarted once and the message goes to the next one; a second such timeout fails it). One
+message's, and your message waits while such a turn runs (if, for a whole turn timeout, such turns, or a pipe
+that takes nothing, keep all of it from being written, its process is restarted once and the message goes to the
+next one; a second such timeout fails it; time in which the node itself holds the message back, as for a slot or a
+parent's turn, does not count). One
 exception: once your message is fully written, an error result that does not name it settles it by order, as
 before, even if that error came from a turn Claude started by itself before it took up your message (an error
 names no message reliably); the process is matched by order from then on. Other Claude Code versions are matched by
-order, as before (DESIGN_NOTES "Claude turn correlation").
+order, as before, with one difference: until a process's first `init` shows its version, the lines staged for it
+carry the `uuid` key too (usually only its first line; every line for one that never writes an `init`), and
+Claude echoes it back in what it writes (DESIGN_NOTES "Claude turn correlation"). The node's log says, for each
+Claude process's first `init`, the version it reports and whether turn correlation is on for it.
 
 Turn it on, per machine, in the node's board.local.toml, and restart `board node`:
 

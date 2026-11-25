@@ -69,8 +69,10 @@ design on branch claude/steer-loose, its part B):
   attributed by order exactly as before (`Event.turn` "order"). Verification is lost for good at the first deviation (a plain `result` where the table falls back to
   order, an error `result` that does not list the turn in flight's line, which is that turn's by order as on main,
   or an `init` that no longer qualifies, inside the turn's own bracket only once that bracket closes). While a verified process runs a turn of its own (an unattributed
-  bracket) it `holds_turns`: the host writes no message for at most the turn timeout (session_host `_held`, as for
-  Codex).
+  bracket) it `holds_turns`: the host keeps the next message in the inbox (session_host `_barrier`), within the
+  message's no-progress budget in counted time: one restart at the first spent budget, the failure at the second
+  (session_host `_budget`, `_spent`). Each process's first `init` is said in the node's log (INFO), with the version
+  it reports and whether turn correlation is on for it, while some version is VERIFIED.
 """
 from __future__ import annotations
 
@@ -95,6 +97,24 @@ MAX_TOOLS = 2000        # tool names taken from one `init`
 INTERRUPT_RECEIPT = "interrupt_receipt_v1"  # an `init` capability: a receipt for the in-band interrupt
 LIFECYCLE = "msg_lifecycle_v1"      # an `init` capability: user lines' uuids are echoed (module text)
 MAX_CAPS = 200
+VERSION_SHOWN = 64      # at most this many characters of a reported version go in a log line (`shown_version`)
+
+
+def shown_version(version) -> str:
+    """A process's reported `claude_code_version` as it may go in a log line: untrusted text, so every character
+    outside printable ASCII (a newline, any control character, anything else) is escaped, and it is capped at
+    VERSION_SHOWN characters (and says how long it was). Not a string: "no version"."""
+    if not isinstance(version, str):
+        return "no version"
+    # Bounded work whatever the init's size: only the first VERSION_SHOWN characters are escaped, then the result
+    # itself is capped (an escape takes up to ten characters).
+    text = re.sub(r"[^\x20-\x7e]", lambda m: "\\u%04x" % ord(m.group()) if ord(m.group()) < 0x10000
+                  else "\\U%08x" % ord(m.group()), version[:VERSION_SHOWN])
+    if len(text) <= VERSION_SHOWN and len(version) <= VERSION_SHOWN:
+        return text
+    return f"{text[:VERSION_SHOWN]}... ({len(version)} characters)"
+
+
 # The Claude Code versions whose processes are attributed by evidence (module text). A version goes in only once the
 # release gates M3, M6 and M7 passed on it (DESIGN_NOTES "Claude turn correlation"): never to make a gate pass.
 VERIFIED: frozenset[str] = frozenset({"2.1.330"})
@@ -347,6 +367,7 @@ class ClaudeSession:
         self._current: str | None = None    # the uuid of the host's turn in flight (written, its result not yet)
         self._written: set[str] = set()     # every uuid the host wrote to this process
         self._verified: bool | None = None  # None until its first `init`; False for good after a deviation
+        self._told = False              # its first `init` was said in the log (while some version is VERIFIED)
         self._bracket: str | None = None    # OWN, UNATTRIBUTED or None (no turn open, by evidence)
         self._competing = False         # an `init` not the turn's own came inside OWN (the steering design's F-4)
         self._lose_later: str | None = None     # a re-init inside OWN no longer qualified: lost when OWN closes
@@ -487,7 +508,7 @@ class ClaudeSession:
     def holds_turns(self) -> bool:
         """A verified process is running a turn of its own (an unattributed bracket): a line written now would be
         taken into that turn or queued behind it, and that turn's frames are no message's. The host keeps the next
-        message until its end, for at most the turn timeout (session_host `_held`: the write barrier)."""
+        message until its end (session_host `_barrier`), within that message's no-progress budget (`_budget`)."""
         return self.verified and self._bracket == UNATTRIBUTED
 
     def takes_interrupt(self) -> bool:
@@ -569,6 +590,13 @@ class ClaudeSession:
                      self.session_id)
             return "other"
         self._caps = caps
+        if VERIFIED and not self._told:
+            # How the owner sees that it is on: one line per process, at its first `init` (never with VERIFIED
+            # empty, so main's logs are untouched).
+            self._told = True
+            log.info("Claude session %s: this process reports Claude Code %s; turn correlation is %s", self.session_id,
+                     shown_version(version),
+                     "on for it" if qualifies and self._verified is None else "off for it (attributed by order)")
         if self._verified is None:
             self._verified = qualifies      # pinned to this incarnation by its first `init`
         elif self._verified and not qualifies:
