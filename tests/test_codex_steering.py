@@ -3423,6 +3423,7 @@ def test_r6_gap_the_latch_waits_for_a_drain_read_in_progress(henv):
     stopper.join(30)
     assert lock.contended.is_set(), "the latch's lock was free in the middle of a drain's read"
     assert host.steer_stopped and not any(reads), "no read began once the latch was set"
+    assert reads == [False], "(R7-04) the waiting stop went ahead of the drain's next batch"
 
 
 def test_r6_gap_ns_own_end_read_after_the_latch_is_no_evidence_for_s(henv):
@@ -3588,6 +3589,102 @@ print(s.stopping_since is not None)
     assert len(outcome) == 1 and re.fullmatch(stamp + r" INFO agent_comms\.session_host: session \S+: the steer into "
                                               r"message a: unconfirmed \(partial\)", outcome[0]), lines
     assert not [x for x in lines if TEXT in x or "PINEAPPLE" in x], "no line carries the steer's text"
+
+
+def _registry_wait(host, henv, seconds):
+    """The node's group registry takes `seconds` to note a stopping group (`groups.stopping`), as a lock wait would."""
+    real = host.groups.stopping
+
+    def stopping(token):
+        henv.clock.advance(seconds)
+        return real(token)
+    host.groups.stopping = stopping
+
+
+def _term_times(child, henv):
+    sent, real = [], child.terminate
+
+    def term():
+        sent.append(henv.clock())
+        return real()
+    child.terminate = term
+    child.exits_on_terminate = False
+    return sent
+
+
+def test_r7_gap_a_drained_stop_is_dated_after_the_registrys_wait(henv):
+    """(Found by round 7's mutation check.) A live attempt's turn times out: its drain, then the stop. The registry
+    takes 5 s to note the stopping group: the stop is dated when its SIGTERM is sent, after that wait, not at the
+    drain's end."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert len(steers_of(child)) == 1
+    henv.clock.advance(31 * 60)
+    host.tick()                                 # the interrupt is written
+    henv.clock.advance(henv.config.kill_grace_seconds)
+    _registry_wait(host, henv, 5)
+    sent = _term_times(child, henv)
+    host.tick()
+    assert sent and s.stopping_since == sent[0], "dated when its SIGTERM was sent"
+
+
+def test_r7_gap_an_ordinary_stop_after_a_steered_process_keeps_mains_dating(henv):
+    """(Found by round 7's mutation check.) A live attempt's process exits (drained, then let go of); the session's
+    next process takes an ordinary turn, which times out: its stop is main's, dated with the pass's time, though the
+    registry takes 5 s."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    assert len(steers_of(child)) == 1
+    child.code = 0
+    host.tick()                                 # exited: drained, N failed, the process let go of
+    assert s.child is None and not s.steer_owned
+    host.send(SID, "next", message_id="b")
+    host.tick()
+    fresh = henv.spawner.children[-1]
+    codex_ready(host, fresh)
+    host.tick()
+    st = last_start(fresh)
+    fresh.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED)
+    host.tick()
+    henv.clock.advance(31 * 60)
+    host.tick()                                 # its interrupt is written
+    henv.clock.advance(henv.config.kill_grace_seconds)
+    _registry_wait(host, henv, 5)
+    sent = _term_times(fresh, henv)
+    t = henv.clock()
+    host.tick()
+    assert sent and s.stopping_since == t, "main's dating: the pass's time"
+
+
+def test_r7_gap_a_drain_that_reads_ns_end_leaves_no_steered_dating_behind(henv):
+    """(Round 7.) The turn's timeout drains a live attempt and reads N's own end there: no stop follows. The same
+    process's next, ordinary turn times out later: its stop is main's, dated with the pass's time."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    [req] = steers_of(child)
+    henv.clock.advance(31 * 60)
+    host.tick()                                 # the interrupt is written
+    henv.clock.advance(henv.config.kill_grace_seconds)
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    _fragmented(child, 2)                       # only the timeout's drain reaches N's end
+    ends = ended_of(host.tick())
+    assert ends and s.stopping_since is None and not s.steer_owned
+    host.send(SID, "next", message_id="b")
+    host.tick()
+    st = last_start(child)
+    child.emit(cx.reply(st["id"], cx.TURN_REPLY), cx.TURN_STARTED)
+    host.tick()
+    henv.clock.advance(31 * 60)
+    host.tick()
+    henv.clock.advance(henv.config.kill_grace_seconds)
+    _registry_wait(host, henv, 5)
+    sent = _term_times(child, henv)
+    t = henv.clock()
+    host.tick()
+    assert sent and s.stopping_since == t, "main's dating: the pass's time"
 
 
 def test_r6_05_the_echo_allowance_takes_only_the_exact_items_own_start():
