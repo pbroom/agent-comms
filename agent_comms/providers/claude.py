@@ -53,7 +53,7 @@ Turn correlation (DESIGN_NOTES "Claude turn correlation (2026-11-24)"; measured 
 design on branch claude/steer-loose, its part B):
 - A user line the host writes carries a fresh random `uuid` beside the same `message` (`_user_line`) only while its
   process can still be verified: some version is VERIFIED and the incarnation's first `init` has not shown that it
-  cannot be, nor has a deviation. With VERIFIED empty (as shipped) no line carries one: the bytes are main's. Claude
+  cannot be, nor has a deviation. With VERIFIED empty no line carries one: the bytes are main's. Claude
   echoes a uuid: the `init` of the turn that took the line lists it in `user_message_uuids`, the turn's `result` in
   `user_message_uuid` and `user_message_uuids` (with every line folded into that turn), its `assistant` and
   `thinking_tokens` frames in `user_message_uuid(s)`, and `command_lifecycle` lines name it (`queued`, `started`,
@@ -65,8 +65,8 @@ design on branch claude/steer-loose, its part B):
 - Only in a VERIFIED process incarnation are frames attributed by that evidence (`_init_turn`, `_result_turn`: the
   bracket table): its first `init` names a `claude_code_version` in VERIFIED and lists `msg_lifecycle_v1`. VERIFIED
   holds the versions that passed the release gates M3 (a resumed process echoes), M6 (compaction) and M7 (failure
-  frames); until one has, it is empty, and every process is attributed by order exactly as before (`Event.turn`
-  "order"). Verification is lost for good at the first deviation (a plain `result` where the table falls back to
+  frames) and review rounds 1 to 5: 2.1.330 since the switch-on. A process reporting any other version is
+  attributed by order exactly as before (`Event.turn` "order"). Verification is lost for good at the first deviation (a plain `result` where the table falls back to
   order, an error `result` that does not list the turn in flight's line, which is that turn's by order as on main,
   or an `init` that no longer qualifies, inside the turn's own bracket only once that bracket closes). While a verified process runs a turn of its own (an unattributed
   bracket) it `holds_turns`: the host writes no message for at most the turn timeout (session_host `_held`, as for
@@ -97,7 +97,7 @@ LIFECYCLE = "msg_lifecycle_v1"      # an `init` capability: user lines' uuids ar
 MAX_CAPS = 200
 # The Claude Code versions whose processes are attributed by evidence (module text). A version goes in only once the
 # release gates M3, M6 and M7 passed on it (DESIGN_NOTES "Claude turn correlation"): never to make a gate pass.
-VERIFIED: frozenset[str] = frozenset()
+VERIFIED: frozenset[str] = frozenset({"2.1.330"})
 MAX_ECHO = 64           # uuids read from one frame's echo fields
 # Brackets (`_bracket`): the turn the process is in, by evidence. OWN: the host's turn in flight (an `init` echoed
 # its uuid); UNATTRIBUTED: a turn no message of the host's is known to have started (an unmarked `init`).

@@ -66,7 +66,11 @@ def test_only_a_claude_runner_and_a_real_session_id_make_an_argv():
         ClaudeSession().argv(SHIPPED, session_id=SID, resume=False, model="--dangerously-skip-permissions")
 
 
-def test_a_turn_is_one_user_line_and_nothing_is_written_on_open():
+def test_a_turn_is_one_user_line_and_nothing_is_written_on_open(monkeypatch):
+    # With no verifiable version the line is main's bytes exactly; with one, the line staged before the process's
+    # first init carries a uuid too (tests/test_claude_correlation.py).
+    from agent_comms.providers import claude
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())
     p, _ = session()
     assert p.on_open() == [] and p.interrupt() is None and p.waits_for_ready is False
     [data] = p.turn("two\nlines")

@@ -147,8 +147,22 @@ def settled_uuid(p, m):
 # --- C1-05: a uuid only while verification is possible
 
 
-def test_verified_ships_empty_and_lines_are_mains_bytes_and_attributed_by_order():
-    assert claude.VERIFIED == frozenset(), "a version goes in only once its release gates passed"
+def test_verified_is_2_1_330_only():
+    """Switched on for Claude Code 2.1.330 after its release gates (M3, M6, M7 and review rounds 1 to 5); a version
+    goes in only once its gates passed."""
+    assert claude.VERIFIED == frozenset({"2.1.330"})
+
+
+def test_another_version_is_attributed_by_order_and_its_lines_after_its_first_init_are_mains(monkeypatch):
+    p = adapter()
+    assert json.loads(p.turn("first")[0]).get("uuid"), "before the first init it may still be verified"
+    assert fed(p, vinit(version="2.1.331")) == [("ready", "order"), ("turn_started", "order")]
+    assert p.turn("hello\nthere") == [b'{"type": "user", "message": {"role": "user", "content": "hello\\nthere"}}\n']
+    assert fed(p, foreign()) == [("turn_ended", "order")] and not p.verified and p.holds_turns() is False
+
+
+def test_with_no_verifiable_version_lines_are_mains_bytes_and_attributed_by_order(monkeypatch):
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())
     p = adapter()
     assert p.turn("hello\nthere") == [b'{"type": "user", "message": {"role": "user", "content": "hello\\nthere"}}\n']
     assert fed(p, vinit()) == [("ready", "order"), ("turn_started", "order")]
@@ -616,8 +630,9 @@ def test_seq_an_unattributed_turn_before_ms_own_pair(henv):
     assert ends(evs, "1")[0].text == "mine"
 
 
-def test_seq_unverified_an_unattributed_turn_before_ms_own_pair_is_mains(henv):
+def test_seq_unverified_an_unattributed_turn_before_ms_own_pair_is_mains(henv, monkeypatch):
     """VERIFIED empty: the same frames are attributed by order, exactly as on main."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())
     s, child, m0 = started(henv, "zero", "0")
     assert m0 is None
     emit(henv, child, vinit(), plain())
@@ -1982,8 +1997,7 @@ def test_real_pipes_a_turn_the_cli_starts_itself_is_no_messages(tmp_path, monkey
     """bg-late through the stand-in: message 1's turn is followed by a turn the CLI starts itself; message 2 is
     written right after 1 ends, before that turn begins, and runs after it. Verified: 2's result is its own. With
     VERIFIED empty (as shipped): main's behaviour, unchanged (the CLI's frames are taken for 2, 2's own dropped)."""
-    if verify:
-        monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V)
+    monkeypatch.setattr(claude, "VERIFIED", STAND_IN_V if verify else frozenset())
     host, s = real_host(tmp_path, monkeypatch, stand_in(), timeout_seconds=30, grace=2)
     try:
         first = host.send(SID, "bg 0.4 0.3 one")
@@ -2092,6 +2106,7 @@ def test_parity_with_verified_empty_the_host_tracks_no_turn_start_and_tells_no_d
     """Sol's round-3 parity residue: with VERIFIED empty the host's write path for Claude is main's (no `turn_at`,
     no `delivered()`), and Codex never gets either."""
     calls = []
+    monkeypatch.setattr(claude, "VERIFIED", frozenset())
     monkeypatch.setattr(ClaudeSession, "delivered", lambda self: calls.append("delivered"))
     henv.spawner.child = _ZeroPipe                      # the pipe takes nothing at first: the turn stays staged
     s = open_session(henv)

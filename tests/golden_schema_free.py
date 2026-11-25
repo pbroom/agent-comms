@@ -9,7 +9,7 @@ source-faithful stream (lifecycle rows and echo fields on init, assistant, think
 line had a uuid, none when it had not: measured on 2.1.330), every process's raw stdin, every raw transcript, the
 host's events in order and the board's log lines. It promises two cases (`record(verified=...)`):
 - no version VERIFIED (production): byte for byte main's, everything, with no allowance at all;
-- a version VERIFIED that these processes do not report (an explicitly unverified baseline): main's but for the
+- the VERIFIED set as shipped (2.1.330), which these processes do not report (OTHER_VERSION): main's but for the
   allowance `allowed` takes out of the raw bytes, exactly: the `uuid` key on the user lines STAGED before each
   process's first `init` (a line staged then may be written after that init, as the zero-byte case's is, still
   carrying the uuid it was staged with), and the echo fields and lifecycle rows the process wrote for them.
@@ -150,6 +150,7 @@ def _run(tmp_path: Path, logs: list, allow: bool) -> dict:
 # ------------------------------------------------------------ Claude turn correlation (DESIGN_NOTES, 2026-11-24)
 
 CAPS = ["msg_lifecycle_v1", "interrupt_receipt_v1"]     # what Claude Code 2.1.330's `init` lists, among others
+OTHER_VERSION = "2.1.329"   # what the sequences' processes report: frames shaped as 2.1.330 writes them
 NOTIFY = {"kind": "task-notification", "producer": "session-task"}
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 # The allowance, on raw bytes (`allowed`): the uuid key a user line carries, last ...
@@ -259,7 +260,9 @@ def _sequences(env, out: dict, allow: bool) -> None:
 
     def init(sid, echo_=True):
         call, proc = proc_of(env, sid)
-        ev = began(sid, *as_started(call["argv"])) | {"claude_code_version": "2.1.330", "capabilities": CAPS}
+        # Another version than the one VERIFIED (2.1.330 since the switch-on), so that the production setting is the
+        # case-2 baseline: a process reporting any version the adapter does not verify.
+        ev = began(sid, *as_started(call["argv"])) | {"claude_code_version": OTHER_VERSION, "capabilities": CAPS}
         u = line_id(proc)
         return ev | ({"user_message_uuids": [u]} if echo_ and u else {})
 
