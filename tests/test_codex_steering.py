@@ -3064,3 +3064,188 @@ def test_model_random_sequences_of_the_node_and_host_write_authority(tmp_path, b
     for k in range(25):
         seed = block * 1000 + k
         _run_model(tmp_path / f"s{seed}", seed)
+
+
+# --- the gaps round 2's mutation check found
+
+
+def test_r2_05_a_drain_that_keeps_making_progress_stops_at_its_time_bound(henv):
+    """A process that writes without end (each read takes bytes and 0.5 s): the drain stops at its 2 s bound, and
+    the stop goes on."""
+    host, s, child, _ = host_n(henv)
+    host.steer_offer(SID, "a", "u1", TEXT, authorized=True)
+    host.tick()
+    reads = []
+    child.bytes_read = 0
+
+    def endless():
+        reads.append(1)
+        henv.clock.advance(0.5)
+        child.bytes_read += 4096
+        return []
+    child.read_lines = endless
+    host.close(SID, "closed")
+    assert len(reads) <= 2.0 / 0.5 + 1, "bounded by time, not only by its read count"
+    assert s.ended
+
+
+def test_r2_05_the_piped_child_counts_the_bytes_a_read_takes_into_a_line_not_complete_yet(tmp_path):
+    import sys
+    import time
+    from agent_comms.dispatch import spawn_piped
+    child = spawn_piped([sys.executable, "-c", "import sys, time; sys.stdout.write('abc'); sys.stdout.flush(); "
+                         "time.sleep(5)"], cwd=str(tmp_path), env={"PATH": "/usr/bin:/bin"},
+                        log_path=tmp_path / "stderr.log")
+    try:
+        deadline = time.monotonic() + 10
+        lines = []
+        while child.bytes_read == 0 and time.monotonic() < deadline:
+            lines += child.read_lines()
+            time.sleep(0.05)
+        assert lines == [] and child.bytes_read == 3, "no line yet, and the read made progress"
+    finally:
+        child.kill()
+        child.proc.wait(10)
+        child.close()
+
+
+def test_r2_07_an_acknowledgement_received_after_the_contact_ran_out_is_a_break_even_during_a_fetch(env):
+    """Contact acknowledged at 0, the fetch sent at 70; a hello SENT at 72 is acknowledged only at 80, after the
+    contact ran out at 75: a break. The offer read at 81 holds no authority, though that hello is under 75 s old."""
+    sid, child = codex_turn_in_flight(env)
+    runner = env.node.sessions
+    t0 = []
+
+    class LateHello:
+        slow = False
+
+        def request(self, method, path, **kw):
+            if method == "GET" and path == "/api/nodes/sessions" and self.slow:
+                env.clock.advance(10)
+                runner.note_hello(t0[0] + 72)       # sent at 72, its acknowledgement read at 80
+                env.clock.advance(1)
+                return env.laptop.request(method, path, **kw)
+            r = env.laptop.request(method, path, **kw)
+            if method == "POST" and path.startswith("/api/nodes/sessions/") and r.status_code == 200:
+                return httpx.Response(200, json=r.json() | {"in_flight": None}, request=r.request)
+            return r
+    client = LateHello()
+    runner.client = client
+    tick(env)
+    runner.report_ack.clear()
+    post_steer(env, sid)
+    env.node.hello()
+    t0.append(env.clock())
+    env.clock.advance(70)
+    client.slow = True
+    tick(env)
+    client.slow = False
+    assert steers_of(child) == [], "the contact broke at 75: no authority"
+
+
+def test_r2_09_a_break_latched_while_the_host_was_busy_is_kept_for_good(env):
+    """A hello SENT at 74 s is acknowledged at 80 s, while the host's lock is held: the break is latched in the ack
+    state (the host is not told then). Later the latest contact is only 6 s old, yet the authority is lost."""
+    sid, child, s = held_slot(env)
+    runner = env.node.sessions
+    t0 = runner.steer_seen[sid]
+    env.clock.advance(80)
+    with runner.lock:                   # busy: the latch cannot reach the host now
+        runner.note_hello(t0 + 74)
+        assert s.steer.revoked is None
+    assert not runner._steer_authority(s) and s.steer.revoked == "contact"
+
+
+def test_r2_10_the_waits_answer_sweeps_first(env):
+    sid, kid, child = codex_child(env)
+    hs.send(env.board, env.p["claude"], bound(env, sid), kid, message=TEXT, mode="steer")
+    entry(env, kid)
+    with hosted.db.write_tx(env.board.conn) as c:     # an older hub settled N; the node is gone since
+        m = hosted._get(c, hosted._msg_key(kid, 1))
+        hosted._put(c, hosted._msg_key(kid, 1), m | {"state": "done", "ok": True}, "x", env.clock())
+        r = hosted._session(c, kid)
+        hosted._put(c, hosted.SESSION_PREFIX + kid, r | {"in_flight": None}, "x", env.clock())
+    out = hs.steer_waited(env.board, sid, kid, 1, None)
+    assert out["steer_status"]["outcome"] == "unconfirmed" and out.get("note") != hs.STEER_UNSETTLED
+
+
+def test_r2_06_no_retry_is_made_with_under_a_second_of_the_budget_left(env):
+    from agent_comms.session_host import HostEvent
+    runner = env.node.sessions
+    sid, child = codex_turn_in_flight(env)
+    timed = _Timed(env, 19.5)
+    runner.client = timed
+    runner.hub_features, runner.features_known = {"answered", "restart", "steer"}, True
+    runner._emit([HostEvent(sid, "turn_ended", "1", ok=True, text="the end", answered=True,
+                            steer={"outcome": "unconfirmed", "why": "turn_cut"})])
+    runner._flush()
+    assert len(timed.calls) == 1, "half a second left: no retry in this flush"
+    assert any(x == sid for x, _ in runner.pending), "kept for the next flush"
+
+
+def _fetch_with(env, during, before=None):
+    """The node's first fetch of an offer of S, sent 70 s after a hello, with `during(t0)` run while it is out; its
+    reports are taken but their answers name no turn (only what the test adds is evidence). Returns the child."""
+    sid, child = codex_turn_in_flight(env)
+    runner = env.node.sessions
+    t0 = []
+
+    class Hub:
+        slow = False
+
+        def request(self, method, path, **kw):
+            if method == "GET" and path == "/api/nodes/sessions" and self.slow:
+                during(t0[0])
+                return env.laptop.request(method, path, **kw)
+            r = env.laptop.request(method, path, **kw)
+            if method == "POST" and path.startswith("/api/nodes/sessions/") and r.status_code == 200:
+                return httpx.Response(200, json=r.json() | {"in_flight": None}, request=r.request)
+            return r
+    hub = Hub()
+    runner.client = hub
+    tick(env)
+    runner.report_ack.clear()
+    post_steer(env, sid)
+    env.node.hello()
+    t0.append(env.clock())
+    if before is not None:
+        before(sid, t0[0])
+    env.clock.advance(70)
+    hub.slow = True
+    tick(env)
+    hub.slow = False
+    return sid, child
+
+
+def test_r2_07_an_acknowledgement_for_another_turn_never_bridges_a_break(env):
+    """While the fetch is out: a report whose answer names ANOTHER turn (sent at 72), then a hello sent at 74 and
+    acknowledged at 80; the answer read at 81 (11 s old). For N the contact ran out at 75: a break, which that report
+    must not bridge."""
+    runner = env.node.sessions
+    sid_ = []
+
+    def during(t0):
+        env.clock.advance(2)
+        runner._ack_report(sid_[0], t0 + 72, {"session_id": sid_[0], "in_flight": 2})
+        env.clock.advance(8)
+        runner.note_hello(t0 + 74)
+        env.clock.advance(1)
+    sid, child = _fetch_with(env, during, before=lambda sid, t0: sid_.append(sid))
+    assert steers_of(child) == []
+
+
+def test_r2_07_what_an_earlier_fetch_saw_never_bridges_a_break_in_this_one(env):
+    """An acknowledgement left from an earlier fetch (a report naming N, at 60, superseded by one naming another turn
+    at 65) must not count in this fetch's walk: the hello acknowledged at 80 still comes after the break at 75."""
+    runner = env.node.sessions
+
+    def before(sid, t0):
+        runner.fetch_acks.append((t0 + 60, t0 + 60, sid, 1))
+        runner.report_ack[sid] = (t0 + 65, 2)
+
+    def during(t0):
+        env.clock.advance(10)
+        runner.note_hello(t0 + 74)
+        env.clock.advance(1)
+    sid, child = _fetch_with(env, during, before=before)
+    assert steers_of(child) == []
