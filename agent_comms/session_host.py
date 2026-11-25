@@ -1304,7 +1304,7 @@ class SessionHost:
 
     def _read_gates(self, s: Session) -> tuple[bool, bool]:
         """The turn gate and `may_start`, read at a decision point (`_decide`), only for a message with a budget, or
-        one that could earn one there (its process verified right then): `may_start` through `may_start_query` (the
+        one that could earn one there (its process verified right then and not stopping): `may_start` through `may_start_query` (the
         node's `may_start` sets its latch at the self-stop deadline; the query never does). The turn gate is the
         node's own question (node_sessions `_turn_allowed`; for a `full` child it polls the parent's process): so
         for an off-version or no-init process with no budgeted message, main's sequence of those calls, exactly."""
@@ -1316,9 +1316,9 @@ class SessionHost:
         round 15): what decides is the state as it is here, after the tick's reads, reaps and the take-back. For the
         message in the budget position (first in the inbox with nothing written or in flight, or staged with not one
         byte accepted):
-        - no budget, and the process not verified right now (`_correlated`), or the line staged with main's write
-          timer due (`_overdue`: earning cannot rescue an overdue line, review round 15): nothing at all, not even a
-          gate read (main's path: its write timer, `_hold_to_timeout`);
+        - no budget, and the process not verified right now (`_correlated`) or going down (review round 17), or the
+          line staged with main's write timer due (`_overdue`: earning cannot rescue an overdue line, review round
+          15): nothing at all, not even a gate read (main's path: its write timer, `_hold_to_timeout`);
         - otherwise the gates are read once (`_read_gates`), and with that reading: with no budget yet it is EARNED
           if its counted state holds now (the process verified, live, not stopping, nothing host-side withholding),
           and its budget starts here, from zero (`counted`; the first interval counts from this pass's end, `_mark`);
@@ -1330,8 +1330,9 @@ class SessionHost:
         message while the host withholds it. Returns (whether it acted, the gate reading or None); when it acted,
         nothing else is written in that pass."""
         msg = self._holder(s)
-        if msg is None or (msg.counted is None and (not self._correlated(s) or self._overdue(s, msg, now))):
-            return False, None
+        if msg is None or (msg.counted is None and (not self._correlated(s) or s.stopping_since is not None
+                                                     or self._overdue(s, msg, now))):
+            return False, None      # (a stopping process earns nothing: no reading could decide anything, round 17)
         gates = self._read_gates(s)
         counting = self._counting(s, msg, gates)
         if msg.counted is None:

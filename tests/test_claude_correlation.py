@@ -2635,6 +2635,52 @@ def test_c16_sols_paired_replay_a_binding_change_then_two_results_and_a_downgrad
     assert end == (61, False, henv.host._timeout_detail()), (end, henv.clock() - t0, s.inbox[0].recovered)
 
 
+def test_c17_after_the_early_timeout_the_queued_successor_reads_no_gate(henv, monkeypatch):
+    """Review round 17: A staged at t=0 (zero bytes, a candidate's: unearned), B queued behind it; at t=60, A's
+    deadline, a qualifying init arrives: main's write-timer check times A out before the take-back and stops the
+    process. B, now in the budget position, has no budget and its process is going down, so the decision reads no
+    gate for it (earning needs a live process that is not stopping: the reading could decide nothing). Every call of
+    `may_start`, `may_start_query` and the turn gate (when, and whether after the stop), and every event, is the
+    VERIFIED-empty run's: after the stop in that pass, only main's own calls (on 81751ab the decision added a turn
+    gate and a `may_start_query` call there)."""
+    from test_dispatch import FakeProcs, FakeSpawner
+
+    def run(verified):
+        monkeypatch.setattr(claude, "VERIFIED", frozenset(verified))
+        henv.spawner = FakeSpawner(child=_ZeroPipe)
+        henv.procs = FakeProcs(henv.spawner)
+        henv.host = make_host(henv, timeout_minutes=1)
+        calls, t0, stopped = [], henv.clock(), {"at": None}
+        def note(name):
+            calls.append((name, henv.clock() - t0, stopped["at"] == henv.clock()))
+        henv.host.may_start = lambda: note("may_start") or True
+        henv.host.may_start_query = lambda: note("query") or True
+        henv.host.turn_gate = lambda sess: note("turn_gate") or True
+        stop = henv.host._stop
+        def stopping(s, now):
+            stopped["at"] = now
+            return stop(s, now)
+        henv.host._stop = stopping
+        s = open_session(henv)
+        henv.host.send(SID, "a", message_id="A")
+        henv.host.send(SID, "b", message_id="B")
+        events = [(0, henv.host.tick())]
+        assert s.writing.id == "A"
+        for k in range(1, 13):
+            henv.clock.advance(5)
+            if k == 12:
+                henv.spawner.children[-1].emit(vinit())
+            events.append((k * 5, henv.host.tick()))
+        return calls, [(t, [(e.kind, e.message_id, e.delivered, e.detail) for e in evs]) for t, evs in events if evs]
+
+    ours, ours_events = run({V})
+    main, main_events = run(())
+    assert ours_events == main_events and ours_events[-1][0] == 60
+    assert ("turn_ended", "A", False, henv.host._timeout_detail()) in ours_events[-1][1]
+    assert ours == main         # after the stop at t=60 only main's own calls (B's next process being started)
+    assert not [c for c in ours if c[0] == "query"], "the decision read no gate for B"
+
+
 def test_c9_property_random_sequences_in_counted_time(henv, monkeypatch):
     """Seeded random walks (review rounds 6 to 8, and the follow-up after the switch-on) on a host with 2.1.330
     VERIFIED, timeout T = 60 s, over: sends; the live pipe taking nothing, everything, or a few bytes per write; the

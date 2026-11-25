@@ -9185,7 +9185,8 @@ zero-turn task notification `result` did the same to a turn in flight.
       any other timeout or write. So the decision follows
       every read and reap of that tick that comes before it: all first drains, the earlier sessions' passes, and its
       own second drain. There, and only there, the gates are read, once, and only for a message with a budget, or
-      one that could earn one there because the process is verified right then (`_read_gates`: the turn gate and
+      one that could earn one there because the process is verified right then and not stopping (review round
+      17) (`_read_gates`: the turn gate and
       `may_start_query`, which never sets the node's latch); that one
       reading serves whether the message becomes earned, the budget's interval and comparison (`_spent`), the write
       timer's choice of clock (`_hold_to_timeout`) and the pass's end mark (`_mark`).
@@ -10345,6 +10346,25 @@ guard dropped) survived, being equivalent (`_hold_to_timeout` acts only when due
 | C16 \| an unearned line's due write timer comes before the take-back | `test_c16_an_unearned_lines_due_write_timer_comes_before_the_take_back[60]`, the property test (2) |
 | C16 \| ... only for an unearned line (an earned one keeps the take-back) | `test_c16_an_earned_line_whose_clis_turn_opens_when_its_timer_is_due_keeps_the_take_back`, `test_c15_earning_cannot_rescue_an_overdue_line[55]` (11) |
 | C16 test \| a delivered cancellation settled twice is caught | the property test (1) |
+
+#### Review round 17 (Sol, on 81751ab: APPROVED, one nit) and what changed
+
+Sol: the round-16 fix holds; safe to merge and deploy. The nit: with a qualifying init arriving at A's deadline and
+B queued, the early timeout stops A's process, and the decision then read the gates once for B against the
+stopping process (the same settlements, extra callbacks). Done: `_decide` reads nothing for a message with no budget
+while the session's process is stopping (earning needs a live process that is not stopping, so the reading could
+decide nothing). A budgeted message on a stopping process is unchanged: its one reading is taken, `_counting` is
+false while the process goes down, so nothing is counted and its end mark is None, as the rule says.
+Test: `test_c17_after_the_early_timeout_the_queued_successor_reads_no_gate` (every `may_start`, `may_start_query`
+and turn-gate call, with its time and whether it came after the stop, and every event, equal to the VERIFIED-empty
+run's; after the stop at t=60 only main's own calls, for B's next process; on 81751ab the decision added a turn-gate
+and a `may_start_query` call there).
+
+**Mutation check** (round 17; scratchpad `correlation/mutate20.py`): 1 of 1 caught.
+
+| row or rule | caught by |
+| --- | --- |
+| C17 \| a stopping process earns nothing: no gate read for an unbudgeted message | `test_c17_after_the_early_timeout_the_queued_successor_reads_no_gate` |
 
 ### Not done
 
