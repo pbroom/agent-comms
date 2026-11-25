@@ -171,6 +171,9 @@ def _run(tmp_path: Path, logs: list, allow: bool, named: bool = False) -> dict:
     out["logs"] = [x for x in logs if not x[2].startswith("HTTP Request:") and not (allow and told(x, REMOVED))]
     # The listing at protocol 5 (step 2's): with no steer, what a protocol-4 fetch gets (main's code answers it so).
     out["listing_p5"] = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json()
+    # Review round 3, the parity rule: with no steer attempt live, a cancel, a shutdown and a flush overlapping it are
+    # main's, event for event and report for report.
+    out["zz_parity"] = _parity(tmp_path)     # (named to sort last: the ids before it keep their placeholders)
     NAMED.clear()
     if named:
         step2_named(out)
@@ -189,6 +192,89 @@ def told(entry: list, removed: list) -> bool:
         removed.append(("log", entry[2]))
         return True
     return False
+def _parity(tmp_path: Path) -> dict:
+    """Three runs with no steer, each on a hub and node of its own, recording every report body the node sends (its
+    wall-clock `seq` zeroed), in order, and what the sessions show after (review round 3, the parity rule):
+    - a parent cancels its child's queued task while the node's watchdog has just stopped the child's turn in flight
+      (R3-07's case: no cancel held here, the watchdog's end not reported yet);
+    - a shutdown with several ordinary sessions, two with a turn in flight and one idle;
+    - a flush under way when shutdown begins (the loop's own flush, then shutdown's)."""
+    from agent_comms import hosted_spawn as hs
+    from agent_comms.session_host import HostEvent
+    from test_hosted_sessions import P2, P3, session_env, show, start, tick
+    from test_hosted_tree import TREE, answer, tree_config
+
+    def recorded(name):
+        env = session_env(tmp_path / f"parity-{name}", dispatch=TREE, config=tree_config)
+        bodies: list = []
+        node_client = env.node.sessions.client
+        real = node_client.request
+
+        def recording(method, url, *args, **kw):
+            if method == "POST" and str(url).startswith("/api/nodes/sessions/"):
+                body = json.loads(json.dumps(kw.get("json")))
+                if isinstance(body, dict) and "seq" in body:
+                    body["seq"] = 0
+                bodies.append([str(url), body])
+            return real(method, url, *args, **kw)
+        node_client.request = recording
+        return env, bodies
+
+    def bound(env, sid):
+        hs.ensure_secret(env.board)
+        return hs.Ident(hosted=sid, key=hs.bind_key(env.board.conn, sid), claimed=True)
+
+    out: dict = {}
+    env, bodies = recorded("cancel")
+    root = start(env, "first")["session_id"]
+    tick(env)
+    answer(env, root, "root reply")
+    project = show(env, root)["project"]
+    env.human.post("/api/spawn-grants", json={"project": project, "agents": ["claude"], "access": "workspace",
+                                              "hours": 1})
+    kid = hs.spawn(env.board, env.p["claude"], bound(env, root), task="the task", agent="claude")["child"]["id"]
+    tick(env)
+    hs.send(env.board, env.p["claude"], bound(env, root), kid, message="a task behind it")
+    runner = env.node.sessions
+    env.clock.advance(runner.self_stop_seconds + 1)
+    runner.enforce_deadlines()          # the watchdog stops the child's turn: its end waits for the loop
+    hs.cancel(env.board, env.p["claude"], bound(env, root), kid)
+    tick(env, times=3)
+    out["cancel"] = {"bodies": bodies, "kid": show(env, kid)["messages"]}
+
+    env, bodies = recorded("shutdown")
+    a = start(env, "one")["session_id"]
+    b = start(env, "two", project=P2)["session_id"]
+    c = start(env, "three", project=P3)["session_id"]
+    tick(env)
+    answer(env, c, "three's reply")
+    runner = env.node.sessions
+    runner.signal()
+    runner.kill()
+    runner.shutdown()
+    out["shutdown"] = {"bodies": bodies, "sessions": [show(env, x)["messages"] for x in (a, b, c)]}
+
+    env, bodies = recorded("overlap")
+    a = start(env, "one")["session_id"]
+    b = start(env, "two", project=P2)["session_id"]
+    tick(env)
+    runner = env.node.sessions
+    real = runner.client.request
+
+    def stops_after_first(method, url, *args, **kw):
+        if method == "POST" and str(url).startswith("/api/nodes/sessions/"):
+            runner.stopping.set()           # shutdown begins while this report is on its way
+        return real(method, url, *args, **kw)
+    runner.client.request = stops_after_first
+    runner._emit([HostEvent(a, "turn_ended", "1", ok=True, text="a's end"),
+                  HostEvent(b, "turn_ended", "1", ok=True, text="b's end")])
+    runner._flush()
+    left = [[x, e] for x, e in runner.pending]
+    runner.client.request = real
+    runner.shutdown()
+    out["overlap"] = {"bodies": bodies, "left_after_the_loops_flush": left,
+                      "sessions": [show(env, x)["messages"] for x in (a, b)]}
+    return out
 
 
 # ------------------------------------------------------------ mid-turn steering, step 2 (the design's K)
@@ -695,6 +781,11 @@ def _host_cases(tmp_path: Path, out: dict, allow: bool) -> None:
 
 def normalized(value, tmp: Path) -> dict:
     """The run's temporary directory and time stamps out (both differ by run), everything else as it is."""
+    if isinstance(value, dict) and "zz_parity" in value:
+        # Round 3's parity runs are normalized on their own, so the placeholders of everything else are what they
+        # were before they were added.
+        rest = normalized({k: v for k, v in value.items() if k != "zz_parity"}, tmp)
+        return rest | {"zz_parity": normalized(value["zz_parity"], tmp)}
     text = json.dumps(value, sort_keys=True)
     for t in sorted({str(tmp), str(tmp.resolve())}, key=len, reverse=True):
         text = text.replace(t, "<tmp>")

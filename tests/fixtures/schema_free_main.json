@@ -9959,5 +9959,566 @@
     "sessions": 4
    }
   ]
+ },
+ "zz_parity": {
+  "cancel": {
+   "bodies": [
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [
+       {
+        "kind": "turn_started",
+        "message": 1
+       },
+       {
+        "answered": true,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {
+         "duration_ms": 2537,
+         "is_error": false,
+         "num_turns": 1,
+         "stop_reason": "end_turn",
+         "subtype": "success",
+         "terminal_reason": "completed"
+        },
+        "ok": true,
+        "text": "root reply"
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000002",
+     {
+      "access": "workspace",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [],
+      "modes": [],
+      "pid": null,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000002",
+     {
+      "access": "workspace",
+      "events": [
+       {
+        "delivered": true,
+        "detail": "the node restarted while this turn was in flight; it was not replayed",
+        "kind": "turn_ended",
+        "message": 1,
+        "ok": false
+       },
+       {
+        "delivered": false,
+        "detail": "cancelled by the session that started it",
+        "kind": "turn_ended",
+        "message": 2,
+        "ok": false
+       },
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the node had no hub contact for 90 seconds and stopped the turn",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000001",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-cancel/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 2
+       }
+      ],
+      "modes": [],
+      "pid": 1002,
+      "resume": true,
+      "seq": 0,
+      "state": "starting"
+     }
+    ]
+   ],
+   "kid": [
+    {
+     "created_at": 0,
+     "delivered_at": 0,
+     "denials": [],
+     "detail": "the node restarted while this turn was in flight; it was not replayed",
+     "ended_at": 0,
+     "kind": "task",
+     "n": 1,
+     "ok": false,
+     "session_id": "00000000-0000-0000-0000-000000000002",
+     "state": "failed"
+    },
+    {
+     "created_at": 0,
+     "delivered_at": null,
+     "denials": [],
+     "detail": "cancelled by the session that started it",
+     "ended_at": 0,
+     "kind": "task",
+     "n": 2,
+     "ok": false,
+     "session_id": "00000000-0000-0000-0000-000000000002",
+     "state": "failed"
+    }
+   ]
+  },
+  "overlap": {
+   "bodies": [
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": true,
+        "text": "a's end"
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": true,
+        "text": "b's end"
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000003",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000004",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-overlap/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ]
+   ],
+   "left_after_the_loops_flush": [],
+   "sessions": [
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": true,
+      "session_id": "00000000-0000-0000-0000-000000000003",
+      "state": "done"
+     }
+    ],
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": true,
+      "session_id": "00000000-0000-0000-0000-000000000004",
+      "state": "done"
+     }
+    ]
+   ]
+  },
+  "shutdown": {
+   "bodies": [
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000005",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1000,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000006",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1001,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "delivered",
+        "message": 1
+       }
+      ],
+      "modes": [],
+      "pid": 1002,
+      "resume": false,
+      "seq": 0,
+      "state": "starting"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "kind": "turn_started",
+        "message": 1
+       },
+       {
+        "answered": true,
+        "delivered": true,
+        "denials": [],
+        "detail": "",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {
+         "duration_ms": 2537,
+         "is_error": false,
+         "num_turns": 1,
+         "stop_reason": "end_turn",
+         "subtype": "success",
+         "terminal_reason": "completed"
+        },
+        "ok": true,
+        "text": "three's reply"
+       }
+      ],
+      "modes": [],
+      "pid": 1002,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000005",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000006",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [
+       {
+        "answered": false,
+        "delivered": true,
+        "denials": [],
+        "detail": "the session host shut down",
+        "kind": "turn_ended",
+        "message": 1,
+        "meta": {},
+        "ok": false,
+        "text": ""
+       }
+      ],
+      "modes": [],
+      "pid": null,
+      "resume": false,
+      "seq": 0,
+      "state": "idle"
+     }
+    ],
+    [
+     "/api/nodes/sessions/00000000-0000-0000-0000-000000000007",
+     {
+      "access": "workspace",
+      "ceiling": "workspace",
+      "checkout": "<tmp>/parity-shutdown/checkout",
+      "events": [],
+      "modes": [],
+      "pid": null,
+      "resume": true,
+      "seq": 0,
+      "state": "idle"
+     }
+    ]
+   ],
+   "sessions": [
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "the session host shut down",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": false,
+      "session_id": "00000000-0000-0000-0000-000000000005",
+      "state": "failed"
+     }
+    ],
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "the session host shut down",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": false,
+      "session_id": "00000000-0000-0000-0000-000000000006",
+      "state": "failed"
+     }
+    ],
+    [
+     {
+      "created_at": 0,
+      "delivered_at": 0,
+      "denials": [],
+      "detail": "",
+      "ended_at": 0,
+      "kind": "user",
+      "n": 1,
+      "ok": true,
+      "session_id": "00000000-0000-0000-0000-000000000007",
+      "state": "done"
+     }
+    ]
+   ]
+  }
  }
 }
