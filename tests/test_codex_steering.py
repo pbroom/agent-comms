@@ -4262,10 +4262,12 @@ def test_sd_one_drain_deadline_per_pass_and_no_ordinary_session_waits_for_it(hen
     assert all(e.steer == {"outcome": "unconfirmed", "why": "turn_cut"} for e in ended_of(events) if e.session_id != plain)
 
 
-def test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass(henv):
+@pytest.mark.parametrize("group", [False, True])
+def test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass(henv, group):
     """Rule 3 / R4-06 across the pass's two loops: a steered session whose process exited while still writing is
     reaped (and drained) in the same pass in which an ordinary session's turn timeout falls due: the ordinary one is
-    stopped at the pass's own time, as on main, before any drain."""
+    stopped at the pass's own time, as on main, before any drain. (Round 5: with its group left behind too, the
+    mutation check's gap: fenced at its discovery, drained after the pass's other work.)"""
     import uuid as uuid_mod
     host, s0 = codex_host(henv)
     host.steer_authority = lambda sess: True
@@ -4287,6 +4289,8 @@ def test_sd_a_reaps_drain_never_delays_an_ordinary_timeout_in_the_same_pass(henv
     plain.terminate = term
     _endless_after_first(ch, henv.clock)
     ch.code = 0                                 # the steered process exited, still writing: its reap drains
+    if group:
+        henv.groups.add(ch.pid)                 # ... leaving members of its group behind
     t = henv.clock()
     events = host.tick()
     assert at.get("plain") == t and host.sessions[SID].stopping_since == t, "the ordinary timeout is main's"
@@ -4724,6 +4728,106 @@ def test_r5_04_a_kill_that_falls_due_during_a_drain_is_sent_then(henv):
     ca.code = 0                                 # A exited, still writing: its reap's drain reads ~2 s
     host.tick()
     assert killed and killed[0] - (t_stop + host.kill_grace) <= 0.5, "killed when due, during the drain"
+
+
+def test_r5_gap_the_watchdogs_cut_does_nothing_once_the_node_is_stopping(henv):
+    """(Found by round 5's mutation check.) The watchdog already past its own stopping check calls `steer_deadlines`
+    after the stop latch was set, with a frame taken in part past its limit: nothing is cut, read or signalled."""
+    host, s, child, _ = partial(henv)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    host.steer_stopping()
+    reads, real = [], child.read_lines
+
+    def read():
+        reads.append(1)
+        return real()
+    child.read_lines = read
+    assert host.steer_deadlines() == []
+    assert reads == [] and not child.terminated and s.stopping_since is None
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length, "the frame stays partial"
+
+
+def test_r5_gap_a_cut_in_a_pass_never_delays_an_ordinary_timeout(henv):
+    """(Found by round 5's mutation check.) A steered frame taken in part runs past its limit in the same pass in
+    which an ordinary session's turn timeout falls due, later in main's order: the cut stops the steered process at
+    its point, its drain waits for the end of the pass, and the ordinary stop is at the pass's own time."""
+    import uuid as uuid_mod
+    host, s0 = codex_host(henv)
+    host.steer_authority = lambda sess: True
+    host.sessions.pop(SID)
+    a = str(uuid_mod.uuid4())
+    ca = _codex_steered_in(host, henv, a, None)
+    plain = _codex_steered_in(host, henv, SID, None)          # opened last: main's order handles it last
+    henv.clock.advance(31 * 60)
+    host.tick()                                 # the plain turn's interrupt is written (and A's)
+    sa = host.sessions[a]
+    sa.busy_since, sa.interrupted_at = henv.clock(), None      # (A's own turn is not timing out: only its cut)
+    ca.accept = 10
+    host.steer_offer(a, "a", "u1", TEXT, authorized=True)
+    henv.clock.advance(henv.config.kill_grace_seconds - STEER_PARTIAL_SECONDS)
+    host.tick()
+    assert 0 < host.sessions[a].steer.sent < host.sessions[a].steer.length
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    plain.exits_on_terminate = False
+    at, real = {}, plain.terminate
+
+    def term():
+        at.setdefault("plain", henv.clock())
+        return real()
+    plain.terminate = term
+    _endless_after_first(ca, henv.clock)
+    t = henv.clock()
+    host.tick()
+    assert at.get("plain") == t and host.sessions[SID].stopping_since == t, "the ordinary timeout is main's"
+    assert host.sessions[a].stopping_since is not None, "the cut stopped A"
+
+
+def test_r5_gap_a_fenced_pipe_stays_open_for_its_drain_when_the_group_goes_in_the_same_pass(henv):
+    """(Found by round 5's mutation check.) The steered leader exits leaving its group (fenced at discovery); the group
+    is gone by the pass's second loop. The pipe is kept open for the pending drain, which still reads N's own end."""
+    host, s, child, req = _steered_answered(henv)
+    child.emit(cx.reply(req["id"], {"turnId": cx.TURN}), cx.message("native"), cx.completed())
+    _fragmented(child, 3)               # the pass's own three reads find no whole line yet
+    real_close, closed = child.close if hasattr(child, "close") else None, []
+    real_read = child.read_lines
+
+    def close():
+        closed.append(1)
+        if real_close is not None:
+            return real_close()
+
+    def read():
+        return [] if closed else real_read()    # a closed pipe gives nothing
+    child.close, child.read_lines = close, read
+    child.code = 0
+    host.group_alive = lambda pid: pid == child.pid and s.stopping_since is None
+    ends = ended_of(host.tick())
+    assert [(e.ok, e.text) for e in ends] == [(True, "native")], "the drain read N's own end before the pipe closed"
+    assert closed, "the pipe is closed after its drain"
+
+
+def test_r5_gap_a_failed_retry_answered_after_a_newer_listing_keeps_that_listings_features(env):
+    """(Found by round 5's mutation check.) The plain retry after a steer-only 422 fails, but only after a newer
+    listing was applied: the failure forgets nothing of that newer listing's features (as main forgets them only for
+    a failure under the features it had)."""
+    runner = env.node.sessions
+    sid, child = codex_turn_in_flight(env)
+    newer = listing(env)
+
+    class Hub:
+        def request(self, method, path, **kw):
+            if method == "POST" and path == f"/api/nodes/sessions/{sid}":
+                if any("steer" in e for e in kw["json"].get("events", [])):
+                    return httpx.Response(422, json={"detail": "extra field"},
+                                          request=httpx.Request(method, "http://hub" + path))
+                runner._reconcile(newer)        # a newer listing is applied while the retry is out
+                return httpx.Response(503, request=httpx.Request(method, "http://hub" + path))
+            return env.laptop.request(method, path, **kw)
+    runner._reconcile(listing(env))
+    runner.client = Hub()
+    runner._emit([_steer_end_event(sid)])
+    assert not runner._flush()
+    assert {"answered", "steer"} <= runner.hub_features and runner.features_known, "the newer listing's features"
 
 
 def test_r5_05_a_steer_only_refusal_retried_plainly_forgets_only_steer(tmp_path):
