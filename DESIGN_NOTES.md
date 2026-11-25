@@ -10802,6 +10802,17 @@ received while it was out are frozen when its answer comes (`last_fetch`); the o
 are judged at receipt, the current authority at the write (R3-03). A hello sent again after an older hub refused a
 field is dated from the attempt that got through.
 
+(Ruled after step 2's review round 4.) **The receipt rule, once:** a receipt time is the clock read AFTER the lock
+that orders it is taken, never a time sampled before waiting for that lock. Both receipts use one helper,
+`session_host.received_under(lock, clock)`: an acknowledgement's receipt in an attempt's record (`SteerSlot.ack`,
+the record's lock) and a listing's receipt (the node's fetch freeze, `ack_lock`, which freezes the fetch's
+acknowledgement history at that receipt) (R4-02). **Every loss after authorization is latched in the record:** a gate
+other than the fence that is seen closed at any time after the attempt was authorized revokes it for good, whether a
+frame was made yet or not (R4-01). **Stopping is a write condition:** the node's stopping flag
+(`node_sessions._Stopping`) marks every held record `stopping` under that record's lock before the flag itself is
+set (`SessionHost.steer_stopping`), and the boundary refuses a record so marked: a steer write either returned before
+the flag was set, or it does not happen (R4-01). Nothing else about shutdown changed in round 4.
+
 **The checkout.** Steering changes nothing in dispatch. A written steer is part of the running turn for checkout
 purposes (A's fourth exception): N is delivered on the hub for as long as its end is held, so main's existing rules
 count the checkout busy exactly as they do for any running turn (`hosted_wake.turn_sessions`), and release it exactly
@@ -10957,7 +10968,9 @@ turn, for `next_turn`) completed, 1 if not, 5 for `not_delivered` (with the text
 for `unconfirmed`. (Ruled after step 2's review round 1:) success only on a terminal steer status; with none (still
 unsettled after N's end, or a receipt-only retry whose steer is no longer kept, which does not wait) it exits 7.
 (R2-10:) so does a wait whose N (with its steer) is no longer kept on the hub when it reads it: the outcome is not
-known; one the send's own answer already said keeps its exit, 5 or 6 (R3-10). The MCP wait's notes point at
+known; one the send's own answer already said keeps its exit, 5 or 6 (R3-10). (R4-09:) when that answer said
+`in_turn` and only N's record was pruned, the note says S's outcome is known (from the send's answer) and that N's
+own result and exit status are not available; the exit stays 7, since 0 or 1 is N's. The MCP wait's notes point at
 `steer_status`, and say the result carries the steer's outcome only when that result record does. A parent's retry and its wait answer sweep first (a steer whose N is settled where it was not is settled
 before it is read), and a result still queued for the parent is said to be queued, not delivered.
 `board session list` marks a session "steer unsettled" while it has one (the drain's check), children's rows too.
@@ -11551,7 +11564,9 @@ review round 3: departure 2 is fully built on the one authority record (a listin
 rejected before it touches anything, R3-02; a fresh re-offer is judged at receipt, R3-03); departure 11 keeps a known
 outcome's exit on a retention miss (R3-10); departure 15 is fully built for steers by the one drain on every failing
 path, the shutdown-wide deadline and the grace from the actual SIGTERM (R3-04, R3-05), and an unheld cancel that
-returned nothing emits nothing, so main's order is kept for a session holding no steer (R3-07).
+returned nothing emits nothing, so main's order is kept for a session holding no steer (R3-07). As of review round
+4, see "One-way authority, after round 4" in the round 4 subsection for what departure 2's one-way rule now covers
+and what is left.
 - F, "N ended with the process: unconfirmed if any byte was written": read literally for every end the HOST makes
   (exit, a timeout it gives up on, cancel, close, self-stop, shutdown, the cut): `unconfirmed` (`turn_cut`), also
   after a valid matched receipt and after a valid refusal. Only Codex's own end of N (`turn/completed`) applies the
@@ -12473,3 +12488,137 @@ Scratchpad `mutate4.py`: round 2's mutations whose lines did not change, and one
 | R3-12 an integer id | `test_r3_12_the_join_probe_records_only_ts_item_and_the_integer_request_id[a_float_id_answer_first]` |
 | R3-12 T's own item | `test_r3_12_the_join_probe_records_only_ts_item_and_the_integer_request_id[a_wrong_turn_item_first]` |
 | R3-12 an answer naming another turn fails | `test_r3_gap_the_join_probe_fails_at_once_on_an_answer_naming_another_turn` (a test added after this run) |
+
+### Review round 4 (on 711e5ee: CHANGES, seven blockers) and what changed
+
+The reviewer judged structure 1 in place (R3-01 and R3-02 resolved; no write outside `_steer_write`; no lock
+inversion). The coordinator split the round: the shutdown-ownership class (R4-03 to R4-08) waits for the owner's
+ruling on whether a steered turn at node shutdown needs more than main's shutdown, and nothing of `_call_by`, the
+flush and report order, `signal`, `drain`, `stop_all`, `stop_turns`, the grace or `node.py`'s shutdown was changed
+in this round. What was done: the rebase, R4-01, R4-02, R4-09 and the model (R3-11, in part). Each finding has a test
+that fails on the rebased pre-fix head (a99bcc1, exported from git, with this round's tests) by its behavioural
+assertion.
+
+**The rebase.** Backup branch `backup/codex-steering-711e5ee` at 711e5ee; `git rebase origin/main` onto 17c43de:
+33 commits, no textual conflicts, so none to resolve; head a99bcc1 before this round's commits. Checked by hand that
+main's Claude behaviour is untouched: `providers/claude.py` is identical to main's; `providers/__init__.py` differs
+in comments only; Claude advertises no steer capability; the owned-turn barrier, `_unstage`, `_spent`, `_earn` and the
+no-progress budget are main's code unchanged. The golden: the merged fixture equals a fresh recording on d4b92e5's
+code with the merged golden, exactly; against main's 17c43de fixture every value main has is byte-identical except
+`transcripts`, which carries this build's one named Codex echo line (as in every earlier round), and the added keys
+are `listing_p5`, `node_bodies` and `zz_parity`. After the rebase: tests/test_claude_correlation.py,
+tests/test_structured_results.py and the steering, host, Claude and restart tests: 688 passed; the full suite: 4331
+passed, 10 skipped; the stand-in `--only correlation`: PASS (12 s); the stand-in `--only steering`: PASS (111 s).
+
+- **R4-01** [blocker] (a) A gate lost after authorization but before any frame exists was not latched: the latch in
+  `_steer_pass` required a frame. It now requires only that the attempt is authorized and nothing was written: a gate
+  other than the fence seen closed at any time after authorization revokes it for good (`revoked = "gate"`, set
+  under the record's lock), and a frame, if one exists, is dropped. Test:
+  `test_r4_01_a_gate_seen_closed_after_authorization_is_latched_before_any_frame_exists` (S authorized while N's turn
+  is not yet proved; a pass sees the parent's gate closed; when the proof and the gate come back nothing is written;
+  on a99bcc1 S is written). (b) "The node is stopping" is one of the record's write conditions: `SteerSlot.stopping`,
+  refused by `_steer_gate_locked`. The node's stopping flag is `node_sessions._Stopping`, an Event whose `set()` first
+  calls `SessionHost.steer_stopping()`, which marks every held record under its lock, and only then sets the flag;
+  `_steer_authority` also refuses once the flag is set. So a write either returned before the flag was set or does
+  not happen. `signal` itself was not edited: setting `stopping` is where it already was; only what setting it does
+  changed. This is the only shutdown-related change of the round. Test:
+  `test_r4_01_a_write_never_comes_after_the_node_began_to_stop` (the flag set just before the boundary takes the
+  record's lock, by `steer_write_hook`, while a pass holds the host's lock; on a99bcc1 S is written). The mutation
+  check found that test did not separate the three parts of (b), each redundant with another there; two tests were
+  added after its run: `test_r4_gap_a_write_checked_after_the_records_were_marked_is_refused_though_the_flag_is_not_set_yet`
+  (inside `set()`, after every record is marked and before the flag is set, a pass on another thread reaches the
+  boundary: the record's mark refuses it, so no write is under way once the flag is set; barriers only) and
+  `test_r4_gap_an_attempt_made_after_the_node_began_to_stop_is_never_written` (the flag set inside a pass already
+  past its own check, just before it applies a fresh offer into a proved turn: the new attempt has no mark, and the
+  node's authority refuses it; on a99bcc1 S is written).
+- **R4-02** [blocker] An acknowledgement's receipt time was read by the caller before the record's lock was taken
+  (`slot.ack(sent, self.clock(), ...)`), so a wait for that lock across the contact's end counted it as a renewal.
+  The receipt is now the clock read inside the lock (`SteerSlot.ack` takes the clock, through `received_under`).
+  The listing receipt uses the same helper under `ack_lock`; it was already read inside that lock on a99bcc1, so that
+  call site changed in form only. The rule is stated once, in part E. Tests:
+  `test_r4_02_an_acknowledgements_receipt_is_read_after_the_records_lock_is_taken` (a hello published at 74.99 s
+  while a write holds the record's lock gets it at 75.01 s: latched, not extended; on a99bcc1 it renews) and
+  `test_r4_02_a_listings_receipt_is_read_after_the_evidence_lock_is_taken` (the answer comes at 0 s but `ack_lock` is
+  held 25 s: the offer is too old to use, and the next fresh one is used; it passes on a99bcc1 too, since that site
+  already read inside the lock: it covers part O's "evidence-lock wait at response receipt", which had no test).
+- **R4-09** [should] (a) The CLI: when the send's answer already said `in_turn` and only N's record was pruned, the
+  note says S's outcome is known from the send's answer and that N's own result and exit status are not available;
+  the exit stays 7. Test: `test_r4_09_a_known_in_turn_with_n_pruned_says_the_outcome_and_that_ns_status_is_unavailable`
+  (on a99bcc1 the note said the steer's outcome was not kept either). (b) The timing tests no longer depend on scheduling: no sleep and no thread join
+  stands for a state. Two test helpers establish the states: `_SignalLock` (a lock that sets an Event when a thread
+  other than its holder comes to acquire it) and `_NoWait` (the host's lock, held by the test's thread, which fails at
+  once on any blocking acquire). Rewritten: `test_r2_09_an_acknowledgement_is_published_while_the_host_is_busy`
+  (published by the thread that holds the host's lock, so a publication that needed that lock fails, not hangs),
+  `test_r3_01_a_break_published_while_the_write_runs_comes_after_it` (the acknowledgement's arrival at the record's
+  lock is signalled by the lock), `test_r3_03_an_answer_received_in_time_is_fresh_however_long_its_reconciliation_waits`
+  and `test_r3_gap_an_answer_received_in_time_stays_fresh_with_acknowledgements_after_it` (the loop's wait for its
+  lock signalled, then the clock advanced), and `test_r3_06_a_report_exchange_has_a_total_deadline_whatever_the_transport_does`
+  (the hub's answer is held on an Event until the flush has returned, which it can do only by its own deadline; no
+  measured time). Each asserts the same outcome as before; R3-06 asserts that the flush returned while the answer
+  was still held, in place of a measured duration. The record tests
+  `test_e_an_acknowledged_report_naming_n_renews_it_and_one_naming_another_turn_does_not` and
+  `test_r7_05_a_late_acknowledgement_cannot_erase_a_stale_interval` pass the receipt as a clock (`SteerSlot.ack`'s new
+  signature), with the same numbers and assertions.
+- **The model (R3-11, in part).** The seeded checker follows every frame the adapter made (`_frame_spans`: each
+  frame's bytes in every write, its own partial-frame and abandonment checks), and fails if bytes of more than one
+  frame were written. Every sequence now ends: after its last step N ends natively if nothing ended it, local passes
+  read it, and the host's end of N is required and checked (it was checked only when a step happened to end N).
+  Concurrent acknowledgement publication is reachable: the `boundary_ack` event arms a one-shot `steer_write_hook`
+  that publishes a hello (sent 0, 10 or 80 s before) at the next write boundary, just before the record's lock is
+  taken or just after it is released; an acknowledgement that arrives while the write runs waits for that lock
+  (R3-01), so these are every order there is. New tests: `test_model_reach_an_acknowledgement_at_the_write_boundary_either_side_of_the_lock[before|after]`,
+  `test_model_every_sequence_ends_with_the_hosts_end_of_n`, `test_model_checker_follows_every_frame_not_only_the_first`
+  (the checker itself, on a hand-made record). Over the 200 seeded sequences: a frame was made in 76; 11 were ended by the new final step
+(their end had not been checked before); a boundary acknowledgement was armed in 188 and published in 16 (it fires
+only at a write of steer bytes); N's end said `not_delivered` in 75, `unconfirmed` in 60, `in_turn` in 10, and no
+steer outcome in 55 (the node never held S: a featureless, wrong or stale listing first). No sequence makes a second frame
+  (the host makes at most one per attempt), so the per-frame checks guard against a regression rather than finding
+  one. The model still cannot reach abandoned HTTP workers, multi-session shutdown or launchd termination (the
+  deferred class). The new model features pass on a99bcc1 as well: none of this round's findings is reachable by them
+  (R4-01 needs an authorization without a proof; R4-02 needs a lock wait across the contact's end).
+
+**One-way authority, after round 4 (departure 2).** With R4-01 and R4-02 closed, every way authority is lost is
+latched in the attempt's one record and never undone: the contact's break (an acknowledgement received after the
+contact ran out, by the receipt rule; expiry seen by any check), an authoritative omission or a refused offer check,
+a gate other than the fence seen closed at any time after authorization (with or without a frame), and the node's
+stopping (set under the record's lock). A fence is the one loss that is not one-way by design (only a fresh offer of
+S for N lifts it, R2-02). So for the node and the host, departure 2's one-way rule is now complete as written. What is
+left is outside this rule: part N's limit (a Codex turn id reused before the old end is seen) is still not tested,
+and the trust boundaries of part H (the assigned node, the authenticated hub) are assumed, not checked. Whether a
+steered turn at shutdown needs more than main's shutdown (R4-03 to R4-08) is the owner's open question.
+
+- **Runs.** After the last code commit (eea5bce): `uv run pytest -q -p no:cacheprovider` 4340 passed, 10 skipped;
+  the stand-in e2e in full: PASS (164 s, 345 checks); `--only steering` with stand-ins: PASS (111 s, 57 checks);
+  `--only correlation` with stand-ins: PASS (12 s, 24 checks); `--only steering` with the real Codex (codex-cli
+  0.171.0, gpt-6-luna): PASS (64 s, 27 checks); `--only steer` with the real Codex: PASS (33 s, 28 checks). After the
+  gap tests (1e081e7, tests only): `uv run pytest -q -p no:cacheprovider` 4342 passed, 10 skipped (the e2e runs
+  use no test file, so they were not repeated). `~/.codex/config.toml` sha256
+  at the start of the round, before, between and after the real runs:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+### Mutation check, review round 4
+
+Scratchpad `mutate5.py`. Round 3's rows stand as recorded there: the lines they mutate did not change, and they were
+not run again, except the six whose catching test was rewritten in this round (run again, below). The one round 3 row
+whose line changed (the clock now passed to the record) was rewritten, and one or more rows were added per change of
+this round. Each was applied alone to an export of eea5bce, then the same tests (-x), the file restored. 11 of 15
+caught on the first run; the 4 missed (all R4-01 (b)) got the two gap tests above and were run again on 1e081e7: all
+4 caught. None is equivalent.
+
+| mutation | caught by |
+| --- | --- |
+| S1 acks reach the records (rewritten: the clock passed to the record) | `test_s2_03_an_ack_sent_before_the_deadline_and_read_after_it_never_revives_authority` |
+| S1 an ack counts only for this session and N (run again) | `test_e_an_acknowledged_report_naming_n_renews_it_and_one_naming_another_turn_does_not` |
+| S1 a late ack latches the break (run again) | `test_r7_05_a_late_acknowledgement_cannot_erase_a_stale_interval` |
+| S1 the check and the write under one lock (run again) | `test_r3_01_a_break_published_while_the_write_runs_comes_after_it` |
+| S1 fresh at receipt (walk) (run again) | `test_r3_gap_an_answer_received_in_time_stays_fresh_with_acknowledgements_after_it` |
+| S1 fresh at receipt (end) (run again) | `test_r3_03_an_answer_received_in_time_is_fresh_however_long_its_reconciliation_waits` |
+| S2 a total deadline (run again) | `test_r3_06_a_report_exchange_has_a_total_deadline_whatever_the_transport_does` |
+| R4-01a the latch needs only authorization (a frame required instead) | `test_r4_01_a_gate_seen_closed_after_authorization_is_latched_before_any_frame_exists` |
+| R4-01a the latch is kept (not set) | `test_r4_01_a_gate_seen_closed_after_authorization_is_latched_before_any_frame_exists` |
+| R4-01b stopping is a write condition (the record's check removed) | `test_r4_gap_a_write_checked_after_the_records_were_marked_is_refused_though_the_flag_is_not_set_yet` (a test added after this run) |
+| R4-01b the flag marks the records (`set()` without `steer_stopping`) | `test_r4_gap_a_write_checked_after_the_records_were_marked_is_refused_though_the_flag_is_not_set_yet` (a test added after this run) |
+| R4-01b every record is marked (none marked) | `test_r4_gap_a_write_checked_after_the_records_were_marked_is_refused_though_the_flag_is_not_set_yet` (a test added after this run) |
+| R4-01b the node's authority knows stopping (its check removed) | `test_r4_gap_an_attempt_made_after_the_node_began_to_stop_is_never_written` (a test added after this run) |
+| R4-02 the receipt after the lock (the helper reads the clock before the lock) | `test_r4_02_an_acknowledgements_receipt_is_read_after_the_records_lock_is_taken` |
+| R4-09 in_turn says the outcome is known (the branch removed) | `test_r4_09_a_known_in_turn_with_n_pruned_says_the_outcome_and_that_ns_status_is_unavailable` |
