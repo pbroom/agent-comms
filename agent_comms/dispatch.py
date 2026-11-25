@@ -1601,6 +1601,7 @@ class PipedChild(PopenChild):
         super().__init__(proc)
         self._buf = b""
         self.eof = False
+        self.bytes_read = 0     # every stdout byte taken so far: a read that completes no line still makes progress
         for f in (proc.stdin, proc.stdout):
             os.set_blocking(f.fileno(), False)
 
@@ -1629,6 +1630,7 @@ class PipedChild(PopenChild):
                 self.eof = True
                 break
             taken += len(chunk)
+            self.bytes_read += len(chunk)
             self._buf += chunk
             if b"\n" in chunk:
                 *lines, self._buf = self._buf.split(b"\n")
