@@ -13435,17 +13435,19 @@ was checked on an export of 2af03c4 with this round's tests.
   - Test: `test_r8_03_a_stop_announced_as_a_batch_is_admitted_stops_the_drain_inside_the_lock`. A wrapped lock sets
     `_stop_pending` as the drain takes it for its second batch, after any check outside. No second batch is read.
     On 2af03c4 a second batch was read.
-  - **The bound, restated.** Once `steer_stopping` is called, `_stop_pending` is set before it takes the latch's
-    lock. From then on no batch is admitted. The latch is set as soon as the lock is free. The setter may wait
-    behind at most one of these short sections already inside the lock:
-    - a batch already admitted: its one non-blocking `read_lines`;
+  - **The bound, restated** (corrected in round 9, R9-03). Once `steer_stopping` is called, `_stop_pending` is set
+    before it takes the latch's lock, and from then on no drain batch is admitted. This is not a hard bound of one
+    section: the lock is not fair, so the setter can also be overtaken by sections that begin after it started
+    waiting. Each of them is short and does nothing that needs the latch to be unset:
+    - a batch already admitted: its one non-blocking `read_lines` (no further batch is admitted);
     - `_steer_end`'s settlement of an outcome;
     - a cut's admission: its check, and its clearing of the buffer;
     - a slot's installation: a few assignments.
-  - The lock gives the setter no priority over a section that has not yet begun. A batch's admission reads the latch
-    and `_stop_pending` once inside the lock, so no batch begins after the stop announced itself. The cut, the
-    settlement and the installation read the latch once inside it. A cut that begins after the latch is set does
-    nothing; a settlement then counts nothing for S; a slot installed then is born stopped.
+  - A batch's admission reads the latch and `_stop_pending` once inside the lock, so no batch begins after the stop
+    announced itself. A cut, a settlement and an installation can still take the lock ahead of the setter; each reads
+    the latch once inside it. A cut that begins after the latch is set does nothing, a settlement then counts nothing
+    for S, and a slot installed then is born stopped. The wait is therefore bounded by how many such short sections
+    other threads start in the meantime, not by one.
   - The setter then marks each held record under that record's lock, waiting for a write already inside one.
 - **R8-04** [should] The rejected-offer diagnostics are said once and outside the evidence lock.
   - `steer_offer` now returns its rejection ("not the held attempt") instead of logging it.
@@ -13534,3 +13536,101 @@ check runs inside `_check`.
 | R8-04 said outside the evidence lock | `test_r8_04_..._outside_the_ack_lock[another_turn]` |
 | R8-04 the 422 warning once per report | `test_r8_04_a_refused_report_retried_again_is_said_once` |
 | R8-04 the another-turn warning once per attempt | `test_r8_04_..._outside_the_ack_lock[another_turn]` |
+
+### Review round 9 (on f7e2025: APPROVED given the simplified shutdown rule; two shoulds, one nit) and what changed
+
+The reviewer judged R8-01 to R8-03 resolved and R8-04 partly resolved, and `_stop_from` sound. The only remaining
+merge condition is the owner's decision on the simplified shutdown rule. The backup branch
+`backup/codex-steering-f7e2025` sits at f7e2025. Each test named below fails on f7e2025's code by its assertion; this
+was checked on an export of f7e2025 with this round's tests.
+
+- **R9-02** [should] Releasing a process releases its steer slot.
+  - A slot now records the process it was taken for (`SteerSlot.process`, set at installation).
+  - `_release_steer` clears `s.steer` wherever the host lets a process go: `stop_all`, and the reap (after N's end
+    on that path settled S). Close, a cancel and the cut stop the process, and its reap then releases the slot. At
+    N's end with the process still up, the slot already goes once nothing of its frame is left to write. A partial
+    frame stays until it is completed or cut, as before.
+  - Only the uuid stays, in `steered`, so the same steer is never taken again.
+  - `_steer_cut` cuts nothing for a slot that is not the current process's own: it drops such a slot and returns.
+  - Before, `stop_all` with S taken in part settled S `unconfirmed` (`partial`) but left the frame mark attached.
+    On a host used again, the replacement was cut before its handshake. Production shutdown discards the host, so
+    this was reachable only on direct reuse.
+  - Test: `test_r9_02_a_host_reused_after_stop_all_with_a_partial_steer_runs_its_next_process_normally`. After
+    `stop_all` the same host starts a replacement: it handshakes, runs its turn, is not cut past the partial
+    deadline, and ends normally. The old uuid offered again into the new turn is not written. On f7e2025 the
+    replacement was signalled before its handshake.
+  - The stop-dating property now also checks provenance. `_record_stops` records each slot with the process it was
+    offered into (wrapping `steer_offer`) and each cut's slot (wrapping `_steer_cut`). A stop issued by a cut whose
+    slot was not taken for the process it stops fails the check.
+    - The 300 host sequences reach the reuse case (`stop_all` letting a partial steer's process go, then a new
+      process) 4 times, and the test asserts it is reached.
+    - On f7e2025 seed 68 fails the check. Cuts at the SIGTERM went from 22 to 16 in the sequences: the 6 removed were
+      cuts of a slot left over from an earlier process.
+- **R9-01** [should] The once-only diagnostics are bounded by construction.
+  - **A held attempt's reasons** ("another turn", "not the held attempt") are kept as session -> (that attempt's
+    uuid, the reasons said). That is at most one entry per open session, with at most two reasons. The entry is
+    pruned at each applied listing once the session holds no slot or holds another, so a new attempt is said
+    afresh.
+  - **A refused report's 422** is kept per set of its steer-carrying events (the queue's own event objects). It is
+    pruned whenever the queue drops events, and at each applied listing. That is at most one entry per such event
+    pending.
+  - **An offer that cannot be taken** (an id too long for the host, an unknown session) is keyed by the session
+    only, not by the uuid offered. It is said at most once per BAD_OFFER_LOG_SECONDS (300 s) per session. That is at
+    most one timestamp per listed session, pruned to open sessions.
+  - Every entry of a closed session goes at the next applied listing.
+  - Tests:
+    - `test_r9_01_a_hundred_fresh_malformed_offers_keep_one_key_and_say_one_line_per_interval`. 100 listings, each
+      with a fresh uuid and a 301-digit `into`, give one key and one line. After 300 s, one more line. Once the
+      session closes, nothing is kept. On f7e2025: 100 keys and 100 lines.
+    - `test_r9_01_a_held_attempts_reasons_go_with_its_slot_and_a_new_attempt_is_said_afresh`. Attempt A's two
+      reasons are said once each. When N ends, A's slot and its entry go. The next turn's attempt B is said afresh.
+      On f7e2025 A's keys stayed.
+    - `test_r8_04_a_refused_report_retried_again_is_said_once` now also takes the report through, and finds its key
+      gone with it. On f7e2025 the key stayed.
+- **R9-03** [nit] The round 8 paragraph "The bound, restated" claimed a hard bound of one section. It is corrected
+  in place. `_stop_pending` blocks fresh drain admissions, but the lock is not fair: a cut, a settlement or an
+  installation can still take it ahead of the setter. Each is short, reads the latch inside the lock, and does
+  nothing for S once it is set. The wait is bounded by how many such sections other threads start meanwhile, not
+  by one.
+
+**Log lines changed this round** (the round 8 list otherwise stands):
+- "session %s: its steer offered for another turn: not taken" and "session %s: a steer offer that is %s: not
+  taken": once per held attempt and reason, for as long as that attempt is held.
+- "the hub refused the report for session %s with a steer outcome (422): ...": once per set of queued steer events,
+  for as long as they are queued.
+- "session %s: a steer offer could not be taken: %s": at most once per 300 s per session, whatever uuid is offered.
+
+**Runs** at 1f6c4d3. The last code commit is e5e8db2; fa0928e and 1f6c4d3 add tests only.
+- `uv run pytest -q -p no:cacheprovider`: 4463 passed, 10 skipped.
+- The stand-in e2e in full: PASS (163 s).
+- `--only steering` with stand-ins: PASS (113 s).
+- `--only correlation` with stand-ins: PASS (11 s).
+- `--only steering` with the real Codex: PASS (59 s).
+- `--only steer` with the real Codex: PASS (38 s).
+- `--only correlation` with the real Claude Code (2.1.330, haiku): PASS (13 s).
+- `~/.codex/config.toml` sha256 unchanged through all of them:
+  d31ff2e56f444e5d0a331c59a9c3ff9c285d30ac7f88e1a800d2a303e239e314.
+
+### Mutation check, review round 9
+
+Scratchpad `mutate11.py`, one row per changed line of this round, on an export of fa0928e. Each row was applied
+alone and the steering test set run with -x, then the file was restored. 11 of 14 were caught on the first run. One
+missed row got a gap test, `test_r9_02_a_cut_is_only_made_for_the_current_processs_own_slot`, and was caught when run
+again. Two are equivalent, as stated.
+
+| mutation | caught by |
+| --- | --- |
+| R9-02 stop_all releases the slot with its process | `test_r9_02_a_host_reused_after_stop_all_...` |
+| R9-02 the reap releases the slot with its process (back to round 8's "decided slots only") | EQUIVALENT: every slot is decided by the time the reap lets its process go. An assertion of that at the reap, in a copy, never fired across test_codex_steering, test_session_host, test_hosted_sessions and test_providers_codex (626 passed) |
+| R9-02 the release clears the slot | `test_r9_02_a_host_reused_after_stop_all_...` |
+| R9-02 a cut only for the current process's slot | `test_r9_02_a_cut_is_only_made_for_the_current_processs_own_slot` (a test added after the first run; with the release in place no stale slot reaches the cut, so the guard is held apart) |
+| R9-02 a slot records its process | `test_s2_02_after_ns_end_the_rest_of_a_half_frame_never_goes_the_process_is_cut` |
+| R9-01 a new held attempt is said afresh | EQUIVALENT given the prune: an attempt's entry is pruned at the end of the listing that no longer holds it, and a new attempt can only be held from a later turn, after such a listing. The reset in `_say_held` is a second guard |
+| R9-01 a held attempt's reason said once | `test_r8_04_..._outside_the_ack_lock[another_turn]` |
+| R9-01 a held attempt's reasons go with its slot | `test_r9_01_a_held_attempts_reasons_go_with_its_slot_...` |
+| R9-01 bad offers throttled per session | `test_r8_04_..._outside_the_ack_lock[overlong]` |
+| R9-01 bad offers said again after the interval | `test_r9_01_a_hundred_fresh_malformed_offers_...` |
+| R9-01 bad-offer entries pruned to open sessions | `test_r9_01_a_hundred_fresh_malformed_offers_...` |
+| R9-01 the 422 said once per report | `test_r8_04_a_refused_report_retried_again_is_said_once` |
+| R9-01 the 422 key goes when its events leave the queue | `test_r8_04_a_refused_report_retried_again_is_said_once` |
+| R9-01 the 422 prune keeps only queued events | `test_r8_04_a_refused_report_retried_again_is_said_once` |
