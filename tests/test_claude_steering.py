@@ -2238,8 +2238,11 @@ def test_r2_k_a_result_is_reported_while_checkpoint_posts_are_stalled(env):
     real = runner.client.request
     release, stalled = threading.Event(), threading.Event()
 
+    posters = []
+
     def request(method, url, *a, **kw):
         if (kw.get("json") or {}).get("held") is not None:
+            posters.append(threading.current_thread())
             stalled.set()
             release.wait(10)
         return real(method, url, *a, **kw)
@@ -2249,6 +2252,7 @@ def test_r2_k_a_result_is_reported_while_checkpoint_posts_are_stalled(env):
         child.emit(cresult(sid, n, text="N's reply"))
         tick(env, times=2)
         assert stalled.wait(5), "the checkpoint is being posted (and stalls)"
+        assert posters and all(t is runner.checkpoint_thread for t in posters), "by the sender's thread only"
         ochild.emit(cresult(other, m, text="the other's reply"))
         t0 = _time.monotonic()
         tick(env)
@@ -2815,7 +2819,8 @@ def test_r3_n_after_the_latch_the_cut_changes_no_state(henv, monkeypatch):
     assert not s.steer.expired and henv.host._drain_deadline is None and not child.terminated
 
 
-def test_r3_n_a_bulk_stop_survives_one_sessions_fault(henv, monkeypatch):
+@pytest.mark.parametrize("stop", ["stop_turns", "stop_all"])
+def test_r3_n_a_bulk_stop_survives_one_sessions_fault(henv, monkeypatch, stop):
     """Ruling N: one session's SIGTERM raising skips neither the other sessions nor the deferred save."""
     pair = _held_pair(henv, monkeypatch)
     (s1, c1), (s2, c2) = pair
@@ -2826,7 +2831,7 @@ def test_r3_n_a_bulk_stop_survives_one_sessions_fault(henv, monkeypatch):
     saved = []
     real_save = henv.host._save_state
     henv.host._save_state = lambda: (saved.append(1), real_save())
-    out = henv.host.stop_turns("lost the hub")
+    out = henv.host.stop_turns("lost the hub") if stop == "stop_turns" else henv.host.stop_all()
     assert c2.terminated and saved
     assert {e.session_id for e in out if e.kind == "turn_ended"} == {SID, SID2}
 
@@ -3010,6 +3015,59 @@ def test_r3_parity_a_codex_turn_survives_a_fault_through_the_outbox(henv):
     restore()
     got = [e for e in host.tick() if e.kind == "turn_ended"]
     assert len(got) == 1 and not [e for e in host.tick() if e.kind == "turn_ended"]
+
+
+
+# ---------------------------------------------------------------- review round 3: the mutation check's misses pinned
+
+
+def test_r3_m_a_long_echo_list_naming_neither_is_still_a_contradiction(henv, monkeypatch):
+    """Ruling L: an echo list longer than MAX_ECHO is a contradiction while an attempt is live, even one that names
+    neither S nor N (it is never read in part)."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    junk = [f"0be7c0de-0000-4000-8000-{i:012d}" for i in range(claude.MAX_ECHO + 1)]
+    child.emit(result(text="long") | {"user_message_uuid": junk[0], "user_message_uuids": junk})
+    henv.host.tick()
+    assert not s.provider.verified
+
+
+def test_r3_m_a_frame_naming_the_live_s_and_a_retired_s_is_the_live_attempts(henv, monkeypatch):
+    """Ruling L (reading 2): a frame naming the live attempt's S and a retired S is classified against the live
+    attempt first (here: S2 not as measured, the loss), never swallowed as the retired S's."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, S, text="N1"))
+    henv.host.tick()
+    henv.host.send(SID, "second", message_id="2")
+    henv.host.tick()
+    n2 = uuid_of(child)
+    child.emit(vinit(n2))
+    henv.host.tick()
+    s2 = "5e7e7e7e-0000-4000-8000-0000000000c2"
+    henv.host.steer_offer(SID, "2", s2, TEXT, authorized=True)
+    henv.host.tick()
+    child.emit(owned(s2, S, text="?"))
+    henv.host.tick()
+    assert not s.provider.verified
+
+
+def test_r3_o_losing_held_resends_a_claude_sessions_modes(env):
+    """Ruling O: a listing that no longer names `held` invalidates a Claude session's reported status (its modes
+    change: the pair goes): its next report says the base modes."""
+    sid = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    child.emit(cinit(sid, written(child)[-1]["uuid"]))
+    tick(env, times=2)
+    assert "held" in hosted._session(env.board.conn, sid)["modes"]
+    runner = env.node.sessions
+    data = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json()
+    data["features"] = [f for f in data["features"] if f != "held"]
+    with runner.lock:
+        runner._reconcile(data)
+    assert sid not in runner.reported, "its status is said again"
+    with runner.lock:
+        runner._flush()
+    assert hosted._session(env.board.conn, sid)["modes"] == ["restart"]
 
 
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
