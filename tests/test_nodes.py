@@ -23,6 +23,14 @@ class Clock:
         return self.env.clock()
 
 
+def fake_os(procs: FakeProcs) -> dict:
+    """A Node's questions about its runs' processes, answered by its fake children (FakeProcs) instead of the OS:
+    their identity, their process groups (a run is let go of only once its group is gone, Node._reap) and the
+    signals to them. Without these a fake pid is put to the machine, where it can be any live process."""
+    return {"probe": procs.probe, "start_of": procs.start, "signal_group": procs.signal_group,
+            "session_group_alive": procs.group_alive}
+
+
 @pytest.fixture
 def nenv(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
@@ -54,7 +62,9 @@ def nenv(tmp_path, monkeypatch):
     node_config = DispatchConfig.from_dict({
         "runners": {"grok": ["grok-fake", "--prompt", "{prompt}", "--dir", "{project}"]},
         "worktrees": {PROJECT: str(node_dir)}, "max_concurrent": 1})
-    env.node = Node(client, node_config, tmp_path / "node-logs", spawner=env.node_spawner, clock=Clock(env))
+    env.node_procs = FakeProcs(env.node_spawner)
+    env.node = Node(client, node_config, tmp_path / "node-logs", spawner=env.node_spawner, clock=Clock(env),
+                    **fake_os(env.node_procs))
     return env
 
 
@@ -93,6 +103,50 @@ def test_a_run_for_a_project_only_a_node_has_is_assigned_to_it_and_started_there
     assert r["status"] == "exited" and r["exit_code"] == 0
     [req] = nenv.board.get_post(nenv.p["human"], post["id"])["requests"]
     assert req["state"] in ("blocked", "queued"), "an unsettled request is settled or requeued as for a local run"
+
+
+def test_a_fake_childs_pid_that_names_a_live_process_group_on_the_machine_does_not_fool_the_node(nenv):
+    """A fake child's pid is only a number, and on this machine the same number can lead a live process group (after
+    a reboot, pid 1000 was macOS's WiFiAgent). Here that collision is forced: the fake run gets the pid of a real
+    group leader this test keeps alive. The node's question about the run's group is answered by the fake child
+    (FakeProcs.group_alive), not by the OS, so the run that exits is let go of and reported ended; only a fake child
+    that says it left members of its group is held and stopped (Node._reap)."""
+    import subprocess
+    import sys
+    leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        from test_dispatch import FakeChild
+        nenv.node_spawner.child = lambda pid: FakeChild(leader.pid)     # the fake run's pid is a live group here
+        nenv.node.hello()
+        allow(nenv, agents=["grok"])
+        first = human_post(nenv, ["grok"])
+        nenv.d.tick()
+        nenv.node.tick()
+        child = nenv.node_spawner.children[0]
+        assert child.pid == leader.pid and leader.poll() is None
+        child.code = 0
+        nenv.node.tick()
+        run_id = f"s{first['seq']}-grok"
+        assert child.terminated == 0, "an exited fake run is not taken for a leader that left its group behind"
+        assert nodes.run(nenv.board, run_id)["state"] == "ended" and nenv.node.running == {}
+        # The fake still answers for its own group: one that says it left members is held and stopped.
+        nenv.d.tick()
+        nenv.clock.advance(5 * 60)
+        nenv.node.hello()
+        human_post(nenv, ["grok"])
+        nenv.d.tick()
+        nenv.node.tick()
+        second = nenv.node_spawner.children[1]
+        second.code, second.left_members = 0, True
+        nenv.node.tick()
+        assert second.terminated == 1 and len(nenv.node.running) == 1, "held, its group stopped"
+        second.left_members = False
+        nenv.node.tick()
+        assert nenv.node.running == {}
+    finally:
+        leader.kill()
+        leader.wait()
 
 
 def test_a_local_checkout_always_wins(nenv, tmp_path):
@@ -250,7 +304,7 @@ def test_a_restarted_node_stops_what_its_predecessor_left_before_reporting(nenv,
         alive.discard(p)
     fresh = Node(nenv.node.client, nenv.node.config, nenv.node.log_dir, spawner=FakeSpawner(), clock=Clock(nenv),
                  probe=lambda p, start: "ours" if p in alive else "dead", start_of=lambda p: "s",
-                 signal_group=signal_group, sleep=lambda s: None)
+                 signal_group=signal_group, sleep=lambda s: None, session_group_alive=lambda p: p in alive)
     import httpx as _httpx
     real = fresh.client.request
 

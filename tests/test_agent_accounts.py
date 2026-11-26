@@ -809,11 +809,19 @@ def test_a_runner_passing_its_variable_through_dispatch_env_is_refused_at_prefli
     assert denv.spawner.calls == [] and "set it one way only" in runs(denv)[0]["error"]
 
 
+def fake_os_host(spawner) -> dict:
+    """A SessionHost's spawner and, for the fake children it hands out, FakeProcs's answers about their processes
+    (identity, process group, signals) instead of the OS's: a fake pid can be any live process on the machine."""
+    procs = FakeProcs(spawner)
+    return {"spawner": spawner, "probe": procs.probe, "start_of": procs.start, "signal_group": procs.signal_group,
+            "group_alive": procs.group_alive}
+
+
 def node_env(tmp_path, home, monkeypatch):
     """A hub whose dispatcher sends codex's work in PROJECT to the node `laptop`, which has a Codex runner with an
     account folder (whose config.toml has a stdio board server)."""
     from agent_comms.node import Node
-    from test_nodes import Clock
+    from test_nodes import Clock, fake_os
     from fastapi.testclient import TestClient
     from agent_comms.api import create_app
     monkeypatch.setattr(dispatch.shutil, "which", lambda executable, **kw: "/fake/" + executable)
@@ -840,7 +848,8 @@ def node_env(tmp_path, home, monkeypatch):
         "runners": {"codex": ["codex", "exec", "{prompt}"]}, "runner_homes": {"codex": str(codex_home)},
         "worktrees": {PROJECT: str(node_dir)}, "max_concurrent": 1})
     spawner = FakeSpawner()
-    node = Node(client, node_config, tmp_path / "node-logs", spawner=spawner, clock=Clock(env))
+    node = Node(client, node_config, tmp_path / "node-logs", spawner=spawner, clock=Clock(env),
+                **fake_os(FakeProcs(spawner)))
     node.hello()
     env.board.create_dispatch_rule(env.p["human"], thread_id=env.tid, agents=["codex"], purpose="p", max_launches=5)
     return env, node, spawner, codex_home
@@ -938,7 +947,7 @@ def test_a_session_whose_run_directory_is_in_an_account_folder_is_refused(tmp_pa
     work.mkdir()
     c = DispatchConfig.from_dict({"runners": {"claude-code": SHIPPED, WORK: SHIPPED}, "runner_homes": {WORK: str(w)},
                                   "worktrees": {PROJECT: str(work)}})
-    host = session_host.SessionHost(c, tmp_path / "logs", spawner=FakeSpawner())
+    host = session_host.SessionHost(c, tmp_path / "logs", **fake_os_host(FakeSpawner()))
     with pytest.raises(LookupError, match="account folder"):     # a child's own worktree, say: any agent's session
         host.open("5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6c", agent="claude", runtime="claude-code", project=PROJECT,
                   cwd=str(w / "wt"))
@@ -1092,7 +1101,7 @@ def _host_with_root(tmp_path, home):
                                   "worktrees": {PROJECT: str(work)}, "sessions": {"enabled": True}})
     c.writable_roots = {PROJECT: [str(w / "shared")]}       # (as if the settings in force said so)
     spawner = FakeSpawner(child=FakeSessionChild)
-    return session_host.SessionHost(c, tmp_path / "logs", spawner=spawner), spawner
+    return session_host.SessionHost(c, tmp_path / "logs", **fake_os_host(spawner)), spawner
 
 
 def test_a_hosted_process_given_a_writable_root_in_an_account_folder_is_refused(tmp_path, home):
@@ -1516,7 +1525,7 @@ def test_the_hosted_check_reads_the_argv_the_provider_will_execute(tmp_path, hom
     c = DispatchConfig.from_dict({"runners": {"claude-code": SHIPPED, WORK: SHIPPED}, "runner_homes": {WORK: str(w)},
                                   "worktrees": {PROJECT: str(work)}})
     spawner = FakeSpawner(child=FakeSessionChild)
-    host = session_host.SessionHost(c, tmp_path / "logs", spawner=spawner)
+    host = session_host.SessionHost(c, tmp_path / "logs", **fake_os_host(spawner))
     sid = "5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6c"
     host.open(sid, agent="claude", runtime="claude-code", project=PROJECT)
     real = host._argv
@@ -1578,7 +1587,7 @@ def test_the_session_host_refuses_a_runner_whose_variable_is_also_passed_through
     work.mkdir()
     c = DispatchConfig.from_dict({"runners": {WORK: SHIPPED}, "runner_homes": {WORK: w},
                                   "env": {"claude-code": ["CLAUDE_CONFIG_DIR"]}, "worktrees": {PROJECT: str(work)}})
-    host = session_host.SessionHost(c, tmp_path / "logs", spawner=FakeSpawner())
+    host = session_host.SessionHost(c, tmp_path / "logs", **fake_os_host(FakeSpawner()))
     with pytest.raises(LookupError, match="set it one way only"):
         host.open("5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6c", agent=WORK, runtime="claude-code", project=PROJECT)
 
@@ -1593,7 +1602,7 @@ def test_a_scoped_session_keeps_its_scoped_command_line_and_gets_the_folder(tmp_
         c = DispatchConfig.from_dict({"runners": {WORK: SHIPPED}, "runner_homes": homes,
                                       "worktrees": {PROJECT: str(work)}, "claude_tool_projects": [PROJECT]})
         spawner = FakeSpawner(child=FakeSessionChild)
-        host = session_host.SessionHost(c, tmp_path / f"logs{len(homes)}", spawner=spawner)
+        host = session_host.SessionHost(c, tmp_path / f"logs{len(homes)}", **fake_os_host(spawner))
         sid = "5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6c"
         host.open(sid, agent=WORK, runtime="claude-code", project=PROJECT)
         host.send(sid, "hello")
@@ -1617,7 +1626,7 @@ def test_a_hosted_codex_session_reads_its_board_server_from_the_accounts_own_con
         c = DispatchConfig.from_dict({"runners": {"codex-cli": CODEX_RUNNER}, "runner_homes": homes,
                                       "worktrees": {PROJECT: str(work)}, "sessions": {"enabled": True, "codex": True}})
         spawner = FakeSpawner(child=FakeSessionChild)
-        host = session_host.SessionHost(c, tmp_path / f"logs{len(homes)}", spawner=spawner)
+        host = session_host.SessionHost(c, tmp_path / f"logs{len(homes)}", **fake_os_host(spawner))
         sid = "5b0c1f2e-7a6d-4e3b-9c8a-1d2e3f4a5b6c"
         host.open(sid, agent="codex", runtime="codex-cli", project=PROJECT, bind="a" * 64)
         host.send(sid, "hello")
