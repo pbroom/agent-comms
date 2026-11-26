@@ -684,10 +684,16 @@ returns. Deploy hubs before nodes, as always.
 The steps above are for a target from before mid-turn steering. **Rolling back to the Codex-only steering hub**
 (step 2: it knows the `steer` switch and session protocol 5, but not Claude steering): keep `steer = false` through
 the node-first rollback exactly as in steps 1-3, but do not remove the key at the cut-over (step 4): that hub reads
-it. Decide then, explicitly, when to set `steer = true` again for Codex. Claude steering needs no step of its own: a
-node offers it (a Claude session's `steer` and `held` modes) and writes a Claude steer only while the hub's own
-listing names `held`, which a step-2 hub never does, so after the cut-over no Claude steer is accepted or written,
-whatever version the nodes run. A Claude steer already accepted settles by the rule above.
+it. Decide then, explicitly, when to set `steer = true` again for Codex. Claude steering needs no step of its own,
+but know what the shared database keeps: a node writes a Claude steer only while the hub's own listing names `held`,
+which a step-2 hub never does, so after the cut-over no Claude steer is WRITTEN, whatever version the nodes run. A
+Claude session's record may still carry the `steer` (and `held`) modes its node last reported to the newer hub, and
+a step-2 hub with `steer = true` can ACCEPT a steer into such a session until the node's next report (which, to a
+hub that does not name `held`, carries neither: the node drops them as a pair, and resends a report the hub refused
+for them without them, so no turn's end is lost). Such a steer is never written: the node fences it, and it settles
+with its turn, `not_delivered` or `unconfirmed` by the rule above. Keeping `steer = false` until every Claude node
+has reported once to the step-2 hub avoids even that. A Claude steer already accepted before the cut-over settles by
+the same rule.
 
 A restart is refused with the reason when no turn is in flight, when the turn in flight is a wake or a
 result-delivery turn (the session finishes those untouched), when it is being cancelled, when other messages are
