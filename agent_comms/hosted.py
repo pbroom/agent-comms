@@ -1578,9 +1578,14 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         raise Invalid("access must be one of " + ", ".join(session_access.LEVELS))
     if ceiling is not None and ceiling not in session_access.LEVELS:
         raise Invalid("ceiling must be one of " + ", ".join(session_access.LEVELS))
-    if modes is not None and (not isinstance(modes, list) or len(modes) > 2
-                              or any(x not in ("steer", "restart") for x in modes) or len(set(modes)) != len(modes)):
-        raise Invalid("modes must list what the session can do with a turn in flight: steer, restart")
+    if modes is not None and (not isinstance(modes, list) or len(modes) > 3
+                              or any(x not in ("steer", "restart", "held") for x in modes)
+                              or len(set(modes)) != len(modes) or ("held" in modes and "steer" not in modes)):
+        raise Invalid("modes must list what the session can do with a turn in flight: steer, restart, held")
+    if held is not None and (events or any(x is not None for x in (
+            state, pid, resume, seq, provider_id, access, worktree, ceiling, checkout, modes))):
+        # (Review round 2, shoulds) a checkpoint is a report of its own: never mixed with an ordinary one
+        raise Invalid("a checkpoint (held) is a report of its own: no events or status with it")
     for what, path in (("worktree", worktree), ("checkout", checkout)):
         if path is not None and (not isinstance(path, str) or not path.startswith("/") or len(path) > 1024
                                  or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)):
@@ -1612,6 +1617,8 @@ def report(board: Board, p: Principal, session_id: Any, events: Any = None, stat
         if held is not None:
             from . import hosted_steer
             hosted_steer.checkpoint(c, r, held, now, p.name)
+            # (ruling K) a checkpoint is no report of the session loop's: the session's report time is not moved
+            return _node_view(r)
         for ev in events:
             _apply(c, r, ev, p.name, now, results=results)
             if r["state"] == "ended":

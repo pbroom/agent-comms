@@ -99,9 +99,18 @@ log = logging.getLogger("agent_comms.node_sessions")
 
 
 def _finite(meta: dict) -> dict:
-    """Optional metadata with every non-finite number left out: it could not be serialised in a report."""
+    """Optional metadata with every non-finite number left out, and every string made valid Unicode (`_clean`): it
+    could not be serialised in a report otherwise."""
     import math
-    return {k: v for k, v in meta.items() if not (isinstance(v, float) and not math.isfinite(v))}
+    return {_clean(k): _clean(v) for k, v in meta.items() if not (isinstance(v, float) and not math.isfinite(v))}
+
+
+def _clean(v):
+    """(Review round 2, shoulds) A string with invalid Unicode (a lone surrogate) made encodable: each such code
+    point replaced. Anything else as it is."""
+    if isinstance(v, str):
+        return v.encode("utf-8", "replace").decode("utf-8") if not v.isascii() else v
+    return v
 
 TICK_SECONDS = 0.2          # between passes while any session has work
 SHUTDOWN_BOUND_MAX = 3600.0     # hosted.SHUTDOWN_BOUND_MAX (named here, so the node does not import the hub's module)
@@ -249,6 +258,11 @@ class SessionRunner:
                              f"and the hub waits at most {SHUTDOWN_BOUND_MAX:g} s")
         self.pending: list[tuple[str, dict]] = []     # (session id, event) not yet taken by the hub, oldest first
         self.checkpoints: dict[str, dict] = {}       # Claude steering: a held end's checkpoint, sent once (`_checkpoint`)
+        # (Review round 2, ruling K) The checkpoint sender's own queue: at most one per session, posted by its own
+        # thread (`_send_checkpoints`), never by the loop that drives ordinary reports. Dropped at shutdown.
+        self.checkpoint_queue: dict[str, dict] = {}
+        self.checkpoint_cond = threading.Condition()
+        self.checkpoint_thread: threading.Thread | None = None
         self.queue: dict[str, list[dict]] = {}        # session id -> the hub's queued messages not yet handed over
         self.handed: dict[str, int] = self._load_handed()
         self.ending: set[str] = set()                 # sessions this node reported (or is reporting) ended
@@ -407,8 +421,10 @@ class SessionRunner:
             if isinstance(e.steer, dict):
                 d["steer"] = dict(e.steer)      # the host's word on the steer into this turn (never waits: `_takes`)
                 if isinstance(d["steer"].get("result"), dict):      # (Claude: S's own result, finite numbers only)
-                    d["steer"]["result"] = dict(d["steer"]["result"]) | {
-                        "meta": _finite(dict(d["steer"]["result"].get("meta") or {}))}
+                    res = d["steer"]["result"]
+                    d["steer"]["result"] = dict(res) | {
+                        "meta": _finite(dict(res.get("meta") or {})), "text": _clean(res.get("text", "")),
+                        "detail": _clean(res.get("detail", ""))}
         elif e.kind == "approval_requested":
             d["denials"] = list(e.denials)
         elif e.kind == "ended":
@@ -458,8 +474,9 @@ class SessionRunner:
             log.info("session %s: the checkpoint of message %s is not sent: the hub has not said it takes it",
                      e.session_id, e.message_id)
             return
-        self.checkpoints[e.session_id] = {"message": int(e.message_id), "ok": bool(e.ok), "detail": e.detail[:300],
-                                          "denials": list(e.denials), "meta": _finite(dict(e.meta)), "text": e.text,
+        self.checkpoints[e.session_id] = {"message": int(e.message_id), "ok": bool(e.ok),
+                                          "detail": _clean(e.detail[:300]), "denials": list(e.denials),
+                                          "meta": _finite(dict(e.meta)), "text": _clean(e.text),
                                           "answered": bool(e.answered)}
 
     def _post_checkpoints(self, ready: dict) -> None:
@@ -491,9 +508,39 @@ class SessionRunner:
             # of the queue here and posted after the lock is let go (ruling C)
             ready = {sid: self.checkpoints.pop(sid) for sid in list(self.checkpoints)
                      if not any(x == sid for x, _ in self.pending)}
-        if ready:
-            self._post_checkpoints(ready)
+        if ready and not self.stopping.is_set():
+            if self.checkpoint_thread is not None:
+                with self.checkpoint_cond:
+                    self.checkpoint_queue.update(ready)     # (at most one per session: a later one replaces it)
+                    self.checkpoint_cond.notify()
+            else:
+                self._post_checkpoints(ready)       # (no sender thread: a node driven pass by pass, as in tests)
         return ok
+
+    def _send_checkpoints(self) -> None:
+        """The checkpoint sender's thread (ruling K): one queued checkpoint at a time, each rechecked at dispatch
+        (`_checkpoint_due`) and posted with its own timeout; ordinary reports never wait for it. Ends with shutdown;
+        what is still queued then is dropped (nothing waits for it)."""
+        while not self.stopping.is_set():
+            with self.checkpoint_cond:
+                if not self.checkpoint_queue:
+                    self.checkpoint_cond.wait(0.5)
+                    continue
+                sid = next(iter(self.checkpoint_queue))
+                held = self.checkpoint_queue.pop(sid)
+            if self._checkpoint_due(sid, held):
+                self._post_checkpoints({sid: held})
+        with self.checkpoint_cond:
+            self.checkpoint_queue.clear()
+
+    def _checkpoint_due(self, sid: str, held: dict) -> bool:
+        """At dispatch (ruling K): the hub's current capability still names `held`, and the session and N are still
+        the ones the checkpoint was made for (hosted here, not dropped, N's end still held). Else it is dropped."""
+        if not ("held" in self.hub_features and self.features_known) or sid in self.dropped:
+            return False
+        s = self.host.sessions.get(sid)
+        h = s.held if s is not None else None
+        return h is not None and h.end.message_id == str(held.get("message"))
 
     wall_ns = staticmethod(time.time_ns)
 
@@ -552,7 +599,11 @@ class SessionRunner:
                 body |= {k: v for k, v in self.tree.get(sid, {}).items() if v is not None}
                 if "restart" in self.hub_features:
                     # what its adapter can do with a turn in flight now (`steer` only to a hub that steers)
-                    body["modes"] = [m for m in status[4] if m != "steer" or "steer" in self.hub_features]
+                    # (Review round 2, ruling J) a Claude session's steering (`steer` with `held`) only to a hub
+                    # whose listing names `held`: a step-2 hub never sees a Claude steer offered
+                    claude = "held" in status[4]
+                    body["modes"] = [m for m in status[4] if (m != "steer" or "steer" in self.hub_features)
+                                     and not (claude and m in ("steer", "held") and "held" not in self.hub_features)]
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
                 sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
@@ -762,6 +813,7 @@ class SessionRunner:
         named = data.get("features")
         features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
         steer_aware = "steer" in features
+        held_aware = "held" in features     # (ruling J) a Claude session's steer is only taken from a hub naming it
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
         # Roots first, then each level under the one above it: a child is only opened under a parent that is open
@@ -871,11 +923,11 @@ class SessionRunner:
                                     "detail": LOST + (FRESH_START if s.fresh_start else ""),
                                     "delivered": m.get("state") == "delivered"})
             self.queue[sid] = queue
-            self._steer_listed(sid, view, fetch_sent, steer_aware)
+            self._steer_listed(sid, view, fetch_sent, steer_aware and (held_aware or not self.host.holds(sid)))
         for sid, s in self.host.sessions.items():
             live = self.host.steer_live(sid)
             if live is not None and sid not in listed:
-                if steer_aware:
+                if steer_aware and (held_aware or not self.host.holds(sid)):
                     self.host.steer_revoke(sid, live[1], "omitted")     # not listed at all: an omission too
                 else:
                     self.host.steer_fence(sid)
@@ -1291,7 +1343,11 @@ class SessionRunner:
         """The host asks this at every write of a steer's bytes, under the attempt's lock: the node is not past its
         self-stop, nor stopping. The contact itself is the attempt's own record (SteerSlot.contact_ok); the record's
         own `stopping` is set under its lock when the node begins to stop (`_Stopping`)."""
-        return not self._silent() and not self.stopping.is_set()
+        if self._silent() or self.stopping.is_set():
+            return False
+        # (Review round 2, ruling J) rechecked at the write itself: a Claude steer (its adapter holds N's end) is
+        # written only while the hub's current listing names `held`
+        return not self.host.holds(s.session_id) or ("held" in self.hub_features and self.features_known)
 
     def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
         """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or
@@ -1473,6 +1529,13 @@ class SessionRunner:
         self.thread.start()
         self.watch_thread = threading.Thread(target=self._watch, name="hosted-sessions-deadlines", daemon=True)
         self.watch_thread.start()
+        self.start_checkpoint_sender()
+
+    def start_checkpoint_sender(self) -> None:
+        """The checkpoint sender's own thread (ruling K)."""
+        self.checkpoint_thread = threading.Thread(target=self._send_checkpoints, name="hosted-sessions-checkpoints",
+                                                  daemon=True)
+        self.checkpoint_thread.start()
 
     def signal(self) -> None:
         """The first step of a shutdown: SIGTERM to every session process, now. No waiting and no reporting, so the

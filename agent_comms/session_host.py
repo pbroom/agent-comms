@@ -1168,6 +1168,13 @@ class SessionHost:
             if outer:
                 self._drain_pass, self._drain_deadline = False, None
 
+    def holds(self, session_id: str) -> bool:
+        """The session's adapter is one whose steers are held (Claude's, `steer_named`): its steering is offered and
+        written only to a hub that names `held` (review round 2, ruling J). Whether its process steers now is
+        `modes`'s."""
+        s = self.sessions.get(session_id)
+        return s is not None and getattr(s.provider, "steer_named", None) is not None
+
     def modes(self, session_id: str) -> tuple[str, ...]:
         """What this session's LIVE process can do with a turn in flight (providers.MODES), as its adapter says now
         (Claude: what this process's `init` said). Nothing while it has no process, or one going down."""

@@ -681,6 +681,14 @@ The older hub reads the same board.local.toml, so the key has to go at the cut-o
 through a downgrade is settled `unconfirmed`, or `not_delivered` if it never reached a node, when the newer hub
 returns. Deploy hubs before nodes, as always.
 
+The steps above are for a target from before mid-turn steering. **Rolling back to the Codex-only steering hub**
+(step 2: it knows the `steer` switch and session protocol 5, but not Claude steering): keep `steer = false` through
+the node-first rollback exactly as in steps 1-3, but do not remove the key at the cut-over (step 4): that hub reads
+it. Decide then, explicitly, when to set `steer = true` again for Codex. Claude steering needs no step of its own: a
+node offers it (a Claude session's `steer` and `held` modes) and writes a Claude steer only while the hub's own
+listing names `held`, which a step-2 hub never does, so after the cut-over no Claude steer is accepted or written,
+whatever version the nodes run. A Claude steer already accepted settles by the rule above.
+
 A restart is refused with the reason when no turn is in flight, when the turn in flight is a wake or a
 result-delivery turn (the session finishes those untouched), when it is being cancelled, when other messages are
 already queued for the session (a restart never jumps them: cancel them or send with queue), when the session's

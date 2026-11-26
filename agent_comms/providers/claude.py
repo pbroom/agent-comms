@@ -411,6 +411,9 @@ class ClaudeSession:
     verifies_mode = True        # ... and says what the turn really runs with: the host's kill switch reads it
 
     steers = _Steers()
+    # (Review round 2, ruling J) The capability the hub records with a steer's attempt: this adapter holds N's end
+    # and may run S as a turn of its own (`held` among a session's modes). Exactly when it steers.
+    holds = _Steers()
 
     @property
     def restarts(self) -> bool:

@@ -58,7 +58,7 @@ EVIDENCE = ("n_with_s", "n_without_s", "s_only", "s_open", "s_end", "s_consumed"
 # What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"; steering:
 # "Mid-turn steering, loose contract"). Codex's adapter steers (`turn/steer` into a turn proved to be the message's);
 # Claude's steers only in a verified process of a version that passed gate M8 (step 3: providers/claude.py STEER_MODES).
-MODES = ("steer", "restart")
+MODES = ("steer", "restart", "held")      # `held`: its steers may be held, S run as a turn of its own (Claude)
 TURN_KINDS = ("user", "wake", "child", "task")   # whose turn a message is (hosted.KINDS), as `turn` is told
 REPLY_MAX_BYTES = 16 * 1024
 REPLY_TRUNCATED = "\n[... reply truncated at 16 KB; the full text is in the session's transcript on its node]"
@@ -262,7 +262,7 @@ class ProviderSession(Protocol):
 
 def modes(provider) -> tuple[str, ...]:
     """What this adapter can do with a turn in flight (MODES), as it says itself: never guessed."""
-    return tuple(m for m, attr in (("steer", "steers"), ("restart", "restarts"))
+    return tuple(m for m, attr in (("steer", "steers"), ("restart", "restarts"), ("held", "holds"))
                  if getattr(provider, attr, False) is True)
 
 

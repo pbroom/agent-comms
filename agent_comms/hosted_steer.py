@@ -251,7 +251,11 @@ def accept(c, r: dict, m: dict, text: str, kind: str, by: dict, who: str, rid: s
     """Store the steer for N (`m`), in the caller's write transaction, with its receipt when it has a request id."""
     s = {"session_id": r["session_id"], "into": m["n"], "kind": kind, "by": by, "created_at": now,
          "uuid": str(uuid.uuid4()), "text": text, "listed_at": None, "cancel": None, "outcome": None, "why": None,
-         "settled_at": None, "withdrawn_at": None, "updated_at": now}
+         "settled_at": None, "withdrawn_at": None, "updated_at": now,
+         # (Review round 2, ruling J) what the attempt is written under: the node said its session's adapter holds
+         # N's end (`held` among its modes, a Claude adapter that steers). Only such an attempt takes a checkpoint
+         # or `next_turn`, whatever the agent's runtime is called.
+         "holds": "held" in (r.get("modes") or [])}
     if rid is not None:
         s |= {"request_id": rid, "sent_by": by}
         keep = {k: v for k, v in (r.get("receipts") or {}).items()
@@ -424,15 +428,26 @@ def extension(ev: Any) -> dict | None:
     out = {"outcome": ev["outcome"], "why": ev["why"]}
     if ev["outcome"] == "next_turn":
         result = turn_fields(ev["result"])
-        if result is None:
+        if result is None or "message" in ev["result"] or not possible_next_turn(ev["why"], result):
             return None
         out["result"] = result
     return out
 
 
-def claude(r: dict) -> bool:
-    """The session's agent is Claude Code: only its steers can be held, or run as a turn of their own (step 3)."""
-    return r.get("runtime") == "claude-code"
+def possible_next_turn(why: str, result: dict) -> bool:
+    """(Review round 2, shoulds) The only `next_turn` shapes a host makes: S's own end (`own_turn`, the provider's
+    own result: `answered`), or S's proved turn cut (`own_turn_cut`: failed, not answered, no reply)."""
+    if why == "own_turn":
+        return result["answered"] is True
+    if why == "own_turn_cut":
+        return result["ok"] is False and result["answered"] is False and result["text"] == ""
+    return False
+
+
+def holds(s: dict | None) -> bool:
+    """The steer's attempt was written under the `held` capability (ruling J): only its N's end can be held, or its
+    S run as a turn of its own."""
+    return isinstance(s, dict) and s.get("holds") is True
 
 
 def _finite(meta: dict) -> dict:
@@ -495,10 +510,10 @@ def checkpoint(c, r: dict, held: Any, now: float, by: str) -> None:
     fields = turn_fields(held, answered=True)
     if type(n) is not int or n < 1 or fields is None:
         raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="malformed"))
-    if not claude(r):
-        raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="only a Claude session's steer is ever held"))
     m = _get(c, hosted._msg_key(r["session_id"], n))
     s = get(c, r["session_id"], n) if has_steers(r) else None
+    if s is not None and not holds(s):
+        raise Conflict(CHECKPOINT_REFUSED.format(n=n, why="its steer was not written under the held capability"))
     why = ("no such message" if not isinstance(m, dict) else
            "it is settled" if m.get("state") in hosted.SETTLED else
            "it is not the turn in flight" if m.get("state") != "delivered" or r.get("in_flight") != n else
@@ -519,9 +534,9 @@ def settle(c, r: dict, n: Any, ext: dict | None, now: float) -> dict | None:
     `next_turn` is taken only for a Claude session's steer (an impossible shape otherwise: ignored, rule 2)."""
     if not has_steers(r):
         return None
-    if ext is not None and ext.get("outcome") == "next_turn" and not claude(r):
-        ext = None
     s = get(c, r["session_id"], n)
+    if ext is not None and ext.get("outcome") == "next_turn" and not holds(s):
+        ext = None
     if s is None or s.get("outcome") is not None:
         return s
     return _settled(c, s, ext, now)
@@ -559,10 +574,12 @@ def stale(conn, session_id: str, r: dict | None = None) -> bool:
     if r is not None and not has_steers(r):
         return False
     for s in steers(conn, session_id):
+        m = _get(conn, hosted._msg_key(session_id, s["into"]))
         if s.get("outcome") is None:
-            m = _get(conn, hosted._msg_key(session_id, s["into"]))
             if not isinstance(m, dict) or m.get("state") in hosted.SETTLED:
                 return True
+        elif isinstance(m, dict) and m.get("state") in hosted.SETTLED and "held" in m:
+            return True     # (shoulds) step 2 settled both N and S during a downgrade: the checkpoint is stale
     return False
 
 
@@ -589,6 +606,8 @@ def settle_unsettled(c, r: dict, now: float) -> None:
             m = _get(c, hosted._msg_key(r["session_id"], s["into"]))
             if not isinstance(m, dict) or m.get("state") in hosted.SETTLED:
                 _settled(c, s, None, now)
+        else:
+            _clear_held(c, r["session_id"], s.get("into"), now)     # (shoulds) both settled by an older hub
 
 
 def cancel(c, session_id: str, n: int, now: float, by: str) -> None:

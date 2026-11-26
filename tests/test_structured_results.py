@@ -840,7 +840,7 @@ def test_the_330_run_is_the_enabled_version_and_step3s_named_changes_are_only_wh
     assert all(raw[k]["features"][-2:] == ["held", "steer"] for k in ("listing", "seq_listing", "listing_p5"))
     claude_recs = {k: r for k, r in raw["seq_records"].items()
                    if k.startswith("host.session.") and r.get("runtime") == "claude-code"}
-    assert any(r["modes"] == ["steer", "restart"] for r in claude_recs.values())
+    assert any(r["modes"] == ["steer", "restart", "held"] for r in claude_recs.values())
     codex = [r for k, r in raw["seq_records"].items() if k.startswith("host.session.") and r["runtime"] == "codex-cli"]
     g.NAMED.clear()
     g.step3_named(raw)
@@ -848,6 +848,25 @@ def test_the_330_run_is_the_enabled_version_and_step3s_named_changes_are_only_wh
     assert kinds == {"features_held", "claude_modes", "claude_report_modes"}
     assert codex and all(r["modes"] == ["steer", "restart"] for r in codex), "Codex's modes are main's: kept"
     assert "\"held\"" not in json.dumps(main)
+
+
+def test_step3_named_takes_steer_and_held_only_from_claude_sessions_with_or_without_restart():
+    """Review round 2, shoulds: the report allowance names Claude sessions explicitly (a session not recorded as
+    Claude's keeps its modes), and the steer-only capability (no restart) is named too."""
+    import golden_schema_free as g
+    cl, cx, other = "c" * 8, "x" * 8, "o" * 8
+    out = {"seq_records": {f"host.session.{cl}": {"runtime": "claude-code", "modes": ["steer", "held"]},
+                           f"host.session.{cx}": {"runtime": "codex-cli", "modes": ["steer", "restart"]}},
+           "node_bodies": [[f"/api/nodes/sessions/{cl}", {"modes": ["steer", "restart", "held"]}],
+                           [f"/api/nodes/sessions/{cl}", {"modes": ["steer", "held"]}],
+                           [f"/api/nodes/sessions/{cx}", {"modes": ["steer", "restart"]}],
+                           [f"/api/nodes/sessions/{other}", {"modes": ["steer", "restart", "held"]}]]}
+    g.NAMED.clear()
+    g.step3_named(out)
+    assert out["seq_records"][f"host.session.{cl}"]["modes"] == []
+    assert out["seq_records"][f"host.session.{cx}"]["modes"] == ["steer", "restart"]
+    assert [b["modes"] for _, b in out["node_bodies"]] == [["restart"], [], ["steer", "restart"],
+                                                           ["steer", "restart", "held"]]
 
 
 def test_added_only_lets_through_added_keys_and_nothing_else():

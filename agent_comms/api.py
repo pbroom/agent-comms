@@ -945,7 +945,10 @@ def create_app(board: Board | None = None, settings: Settings | None = None, *,
                             body.state, body.pid, body.resume, body.seq, provider_id=body.provider_id,
                             access=body.access, worktree=body.worktree, ceiling=body.ceiling,
                             checkout=body.checkout, modes=body.modes, held=body.held)
-        hosted.note_contact(board, p)           # whatever path it took: a successful call of the session loop
+        if body.held is None:
+            # whatever path it took: a successful call of the session loop. A checkpoint is not one (review round 2,
+            # ruling K): its own sender's call never counts as the node's contact.
+            hosted.note_contact(board, p)
         return out
 
     # A session the human opened himself waits here to be woken (interactive_wake.py): any agent, for its own

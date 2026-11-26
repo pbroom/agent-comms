@@ -876,26 +876,45 @@ def normalized(value, tmp: Path) -> dict:
 ADDED: list = []        # the keys the last `added_only` found in ours and not in main's: (where, key)
 
 
+# Step 3's modes for a Claude session whose process steers (review round 2, ruling J: `held` is the capability the
+# hub records with the attempt), and what main reports for the same process: with restart, and steer-only (a
+# process that says msg_lifecycle_v1 but not interrupt_receipt_v1).
+CLAUDE_STEER_MODES = {("steer", "restart", "held"): ["restart"], ("steer", "held"): []}
+
+
+def _claude_sessions(out: dict) -> set:
+    """The session ids the run recorded as CLAUDE sessions (`host.session.<id>` with runtime claude-code): step 3's
+    `modes` allowance is for those only, named explicitly (review round 2, shoulds)."""
+    sids = set()
+    for key in ("records", "seq_records"):
+        for k, rec in (out.get(key) or {}).items():
+            if k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "claude-code":
+                sids.add(k[len("host.session."):])
+    return sids
+
+
 def step3_named(out: dict) -> None:
     """Take step 3's named changes (part K) out of a run, in place, each recorded in NAMED: `held` just before `steer`
-    at the end of a listing's `features` (the checkpoint's own feature, ruling C); and `steer` first in the `modes` of
-    a CLAUDE session (its record, and the node's report for it) whose process reports the version steering is enabled
-    for: ["steer", "restart"] where main has ["restart"]. A Codex session's modes are main's already and stay."""
+    at the end of a listing's `features` (the checkpoint's own feature, ruling C); and in the `modes` of a CLAUDE
+    session (its record, and the node's report for it) whose process reports the version steering is enabled for,
+    `steer` and `held` (CLAUDE_STEER_MODES: with `restart`, or steer-only). A Codex session's modes are main's
+    already and stay; a session not recorded as Claude's is never touched."""
     for key in ("listing", "seq_listing", "listing_p5"):
         features = (out.get(key) or {}).get("features")
         if isinstance(features, list) and features[-2:] == ["held", "steer"]:
             del features[-2]
             NAMED.append(("features_held", key))
-    codex = _codex_sessions(out)
+    claude = _claude_sessions(out)
     for k, rec in (out.get("seq_records") or {}).items():
         if (k.startswith("host.session.") and isinstance(rec, dict) and rec.get("runtime") == "claude-code"
-                and rec.get("modes") == ["steer", "restart"]):
-            rec["modes"] = ["restart"]
+                and isinstance(rec.get("modes"), list) and tuple(rec["modes"]) in CLAUDE_STEER_MODES):
+            rec["modes"] = list(CLAUDE_STEER_MODES[tuple(rec["modes"])])
             NAMED.append(("claude_modes", k))
     for url, body in out.get("node_bodies") or []:
         sid = url[len("/api/nodes/sessions/"):] if url.startswith("/api/nodes/sessions/") else None
-        if sid and sid not in codex and isinstance(body, dict) and body.get("modes") == ["steer", "restart"]:
-            body["modes"] = ["restart"]
+        if (sid in claude and isinstance(body, dict) and isinstance(body.get("modes"), list)
+                and tuple(body["modes"]) in CLAUDE_STEER_MODES):
+            body["modes"] = list(CLAUDE_STEER_MODES[tuple(body["modes"])])
             NAMED.append(("claude_report_modes", url))
 
 

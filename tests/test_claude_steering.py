@@ -558,13 +558,14 @@ def _no_steer_run(henv, monkeypatch, caplog, seed, modes):
 def test_k_with_no_steer_sent_a_claude_session_is_the_build_that_never_steers(henv, monkeypatch, caplog, seed):
     """Part K, the parity rule for step 3: with no steer sent, every Claude frame's handling, host event, stdin byte,
     log line and gate callback is that of the same tree with STEER_MODES empty (no Claude version steers: step 2's
-    Claude, on main at 2b84f42); the one named change is `modes` (a verified 2.1.330 process says `steer`)."""
+    Claude, on main at 2b84f42); the one named change is `modes` (a verified 2.1.330 process says `steer` and
+    `held`, review round 2)."""
     import copy
     ours, our_modes = _no_steer_run(henv, monkeypatch, caplog, seed, copy.deepcopy(claude.STEER_MODES))
     base, base_modes = _no_steer_run(henv, monkeypatch, caplog, seed, {})
     assert ours == base
-    assert all("steer" not in m for m in base_modes)
-    assert [tuple(x for x in m if x != "steer") for m in our_modes] == [tuple(m) for m in base_modes]
+    assert all("steer" not in m and "held" not in m for m in base_modes)
+    assert [tuple(x for x in m if x not in ("steer", "held")) for m in our_modes] == [tuple(m) for m in base_modes]
 
 
 # ---------------------------------------------------------------- rules the mutation check asked a test for
@@ -956,21 +957,22 @@ def test_r1_c_a_step_2_hub_that_names_steer_gets_no_checkpoint(env):
 
 
 def test_r1_c_the_hub_refuses_impossible_checkpoints(env):
-    """Should 1: only a Claude session's steer is held; `answered` true is required; an ended session answers an
-    explicit refusal, not success."""
+    """Should 1: only a steer written under the held capability is held (round 2, ruling J: recorded with the
+    attempt, not a runtime name); `answered` true is required; an ended session answers an explicit refusal."""
     sid, child, n, s_uuid = claude_steered(env)
     held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x"}
     r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held})
     assert r.status_code == 409 and "malformed" in r.text, "answered missing"
-    with hosted.db.write_tx(env.board.conn) as c:
-        rec = hosted._session(c, sid)
-        rec["runtime"] = "codex-cli"
-        hosted._put(c, hosted.SESSION_PREFIX + sid, rec, "hub", env.clock())
+    with hosted.db.write_tx(env.board.conn) as c:       # (round 2, ruling J: by the attempt's capability)
+        st = hosted_steer.get(c, sid, 1)
+        st["holds"] = False
+        hosted._put(c, hosted_steer._key(sid, 1), st, "hub", env.clock())
     r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"answered": True}})
-    assert r.status_code == 409 and "Claude" in r.text
+    assert r.status_code == 409 and "held capability" in r.text
     with hosted.db.write_tx(env.board.conn) as c:
+        st["holds"] = True
+        hosted._put(c, hosted_steer._key(sid, 1), st, "hub", env.clock())
         rec = hosted._session(c, sid)
-        rec["runtime"] = "claude-code"
         hosted._end(c, rec, "closed", "hub", env.clock())
         hosted._put(c, hosted.SESSION_PREFIX + sid, rec, "hub", env.clock())
     r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held | {"answered": True}})
@@ -2154,6 +2156,161 @@ def test_r2_g_runner_signal_during_a_hold_then_shutdown_publishes_n_once(env):
     m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
     rec = hosted_steer.get(env.board.conn, sid, 1)
     assert m["state"] == "done" and (rec["outcome"], rec["why"]) == ("unconfirmed", "turn_cut"), (m, rec)
+
+
+
+# ---------------------------------------------------------------- review round 2, rulings J and K
+
+
+def test_r2_j_a_claude_alias_runtime_steers_end_to_end(env):
+    """Sol's blocker 6 (ruling J): a session whose agent's runtime is another Claude name (here `claude`), with a
+    `claude` runner: S written, N's end held and checkpointed, S's own turn, N settled with `next_turn`: the hub
+    goes by the capability recorded with the attempt (`held`), never by a literal runtime string."""
+    from conftest import PROJECT
+    runners = env.node.sessions.host.config.runners
+    runners["claude"] = runners["claude-code"]      # (the agent's own runner: a `claude` CLI)
+    sid = start(env, "a long turn", project=PROJECT)["session_id"]
+    with hosted.db.write_tx(env.board.conn) as c:
+        rec = hosted._session(c, sid)
+        rec["runtime"] = "claude"
+        hosted._put(c, hosted.SESSION_PREFIX + sid, rec, "hub", env.clock())
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env)
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    assert r.status_code == 200, r.text
+    tick(env)
+    tick(env)
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    assert rec["holds"] is True and any(x.get("uuid") == rec["uuid"] for x in written(child))
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["held"]["text"] == "N's reply"
+    child.emit(cinit(sid, rec["uuid"]), cresult(sid, rec["uuid"], text="PINEAPPLE"))
+    tick(env, times=3)
+    st = hosted_steer.get(env.board.conn, sid, 1)
+    assert (st["outcome"], st["why"]) == ("next_turn", "own_turn") and st["result"]["reply"] == "PINEAPPLE"
+
+
+def test_r2_j_a_step_2_hub_is_never_offered_a_claude_steer(env, monkeypatch):
+    """Ruling J, fail closed: against a hub whose listing names `steer` but not `held` (step 2), the node reports
+    neither `steer` nor `held` for a Claude session (the hub refuses a steer into it), and its write authority for a
+    Claude steer is rechecked at the write: none while the hub does not name `held`."""
+    monkeypatch.setattr(hosted, "NODE_REPORT_FEATURES", ("answered", "restart", "steer"))
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env, times=2)
+    assert "steer" not in (hosted._session(env.board.conn, sid).get("modes") or [])
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    assert r.status_code != 200 and "cannot steer" in r.text
+    runner = env.node.sessions
+    s = runner.host.sessions[sid]
+    assert runner.hub_features == {"answered", "restart", "steer"} and not runner._steer_authority(s)
+
+
+def test_r2_k_a_result_is_reported_while_checkpoint_posts_are_stalled(env):
+    """Sol's blocker 7 (ruling K): checkpoints go through their own sender thread; with its posts stalled, another
+    session's result is reported by the loop at once, without waiting for them."""
+    import threading
+    import time as _time
+    from test_hosted_sessions import P2
+    sid, child, n, s_uuid = claude_steered(env)
+    other = start(env, "an ordinary turn", project=P2)["session_id"]
+    tick(env)
+    ochild = proc_of(env, other)[1]
+    m = written(ochild)[-1]["uuid"]
+    ochild.emit(cinit(other, m))
+    tick(env)
+    runner = env.node.sessions
+    real = runner.client.request
+    release, stalled = threading.Event(), threading.Event()
+
+    def request(method, url, *a, **kw):
+        if (kw.get("json") or {}).get("held") is not None:
+            stalled.set()
+            release.wait(10)
+        return real(method, url, *a, **kw)
+    runner.client.request = request
+    runner.start_checkpoint_sender()
+    try:
+        child.emit(cresult(sid, n, text="N's reply"))
+        tick(env, times=2)
+        assert stalled.wait(5), "the checkpoint is being posted (and stalls)"
+        ochild.emit(cresult(other, m, text="the other's reply"))
+        t0 = _time.monotonic()
+        tick(env)
+        assert _time.monotonic() - t0 < 3, "the loop did not wait for the stalled checkpoint"
+        assert hosted._get(env.board.conn, hosted._msg_key(other, 1))["state"] == "done"
+    finally:
+        release.set()
+        runner.stopping.set()
+        runner.checkpoint_thread.join(5)
+
+
+def test_r2_k_a_checkpoint_is_rechecked_at_dispatch(env):
+    """Ruling K: at dispatch the sender rechecks the hub's capability and that the session's N is still the one held;
+    otherwise the checkpoint is dropped (and nothing else changes)."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    runner = env.node.sessions
+    runner.host.tick()
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    assert runner._checkpoint_due(sid, held)
+    assert not runner._checkpoint_due(sid, held | {"message": 2}), "another N"
+    runner.hub_features = runner.hub_features - {"held"}
+    assert not runner._checkpoint_due(sid, held), "the hub no longer names held"
+
+
+def test_r2_shoulds_the_hub_refuses_a_mixed_checkpoint_report_and_impossible_next_turns(env):
+    """Shoulds: a checkpoint is a report of its own (one mixed with events or status is refused); `next_turn` takes
+    only the shapes a host makes (own_turn answered; own_turn_cut failed, unanswered, no reply)."""
+    sid, child, n, s_uuid = claude_steered(env)
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held, "events": [{"kind": "delivered",
+                                                                                      "message": 1}]})
+    assert r.status_code in (400, 422) and "report of its own" in r.text
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held, "state": "running", "pid": 1})
+    assert r.status_code in (400, 422)
+    base = {"ok": True, "detail": "", "denials": [], "meta": {}, "text": "S", "answered": True}
+    assert hosted_steer.extension({"outcome": "next_turn", "why": "own_turn", "result": base}) is not None
+    for why, res in (("own_turn", base | {"answered": False}), ("own_turn_cut", base),
+                     ("own_turn_cut", base | {"ok": False}), ("whatever", base),
+                     ("own_turn", base | {"message": 1})):
+        assert hosted_steer.extension({"outcome": "next_turn", "why": why, "result": res}) is None, (why, res)
+
+
+def test_r2_shoulds_a_surrogate_in_ss_optional_fields_never_breaks_a_report(env):
+    """Shoulds: invalid Unicode (a lone surrogate) in S's metadata or text is sanitised on the node, so the report
+    still encodes and reaches the hub."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    child.emit(cinit(sid, s_uuid), cresult(sid, s_uuid, text="S \ud800 reply") | {"stop_reason": "x\udfff"})
+    tick(env, times=3)
+    st = hosted_steer.get(env.board.conn, sid, 1)
+    assert st["outcome"] == "next_turn" and "\ud800" not in json.dumps(st)
+
+
+def test_r2_shoulds_a_stale_checkpoint_is_cleared_when_step_2_settled_both(env):
+    """Shoulds: a downgrade to step 2 settled both N and S, leaving N's checkpoint: the re-upgrade sweep clears it."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    with hosted.db.write_tx(env.board.conn) as c:
+        m = hosted._get(c, hosted._msg_key(sid, 1))
+        m["state"] = "done"
+        hosted._put(c, hosted._msg_key(sid, 1), m, "hub", env.clock())
+        st = hosted_steer.get(c, sid, 1)
+        st |= {"outcome": "unconfirmed", "why": "no_word", "settled_at": env.clock()}
+        hosted._put(c, hosted_steer._key(sid, 1), st, "hub", env.clock())
+    assert "held" in hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    hosted_steer.sweep(env.board, hosted._session(env.board.conn, sid))
+    assert "held" not in hosted._get(env.board.conn, hosted._msg_key(sid, 1))
 
 
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
