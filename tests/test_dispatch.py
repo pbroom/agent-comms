@@ -30,6 +30,7 @@ class FakeChild:
         self.exits_on_terminate = exits_on_terminate
         self.terminated = 0
         self.killed = 0
+        self.left_members = False   # it exited and left members of its process group (only a test sets this)
 
     def poll(self):
         return self.code
@@ -65,14 +66,26 @@ class FakeSpawner:
 
 
 class FakeProcs:
-    """Process identity for tests: a fake child is 'ours' while it runs; `external` adds other live pids."""
+    """Process identity for tests: a fake child is 'ours' while it runs; `external` adds other live pids. A fake
+    child's pid is only a number: every question about it (its identity, its process group, a signal to it) is
+    answered here and never asked of the OS, where the same number can be any live process on the machine."""
 
     def __init__(self, spawner):
         self.spawner = spawner
         self.external: dict[int, str | None] = {}   # pid -> start time (None: alive but unverifiable)
+        self.signals: list[tuple[int, int]] = []    # (pid, signal) sent to a process group through `signal_group`
 
     def start(self, pid):
         return f"start-{pid}"
+
+    def group_alive(self, pgid):
+        """The fake child answers for its own process group: alive while the child runs, and after it exits only if
+        the test says it left members (`left_members`). Any other number is no group of ours."""
+        return any(c.pid == pgid and (c.code is None or getattr(c, "left_members", False))
+                   for c in self.spawner.children)
+
+    def signal_group(self, pid, sig):
+        self.signals.append((pid, sig))
 
     def probe(self, pid, recorded_start):
         if any(c.pid == pid and c.code is None for c in self.spawner.children) or pid in self.external:

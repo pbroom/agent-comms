@@ -17,7 +17,7 @@ from agent_comms.session_host import SessionHost
 from conftest import PROJECT
 from test_dispatch import denv, allow, human_post  # noqa: F401  (denv is a fixture)
 from test_hosted_sessions import UNKNOWN, node_config, senv  # noqa: F401  (senv is a fixture)
-from test_nodes import nenv  # noqa: F401  (a fixture)
+from test_nodes import fake_os, nenv  # noqa: F401  (nenv is a fixture)
 from test_runner_preflight import configure
 from test_session_host import SHIPPED, value_after
 
@@ -315,7 +315,7 @@ def test_a_node_run_is_told_its_commands_and_to_block_the_request(nenv):
     nenv.node = Node(nenv.node.client, DispatchConfig.from_dict({
         "runners": {"grok": ["claude", "-p", "{prompt}", "--permission-mode", "acceptEdits"]},
         "worktrees": {PROJECT: nenv.node_dir}, "max_concurrent": 1, "claude_tool_projects": [PROJECT]}),
-        nenv.node.log_dir, spawner=nenv.node_spawner, clock=nenv.node.clock)
+        nenv.node.log_dir, spawner=nenv.node_spawner, clock=nenv.node.clock, **fake_os(nenv.node_procs))
     nenv.node.hello()
     rule = allow(nenv, agents=["grok"])
     post = human_post(nenv, ["grok"])

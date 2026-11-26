@@ -134,7 +134,7 @@ def test_a_restarted_node_reports_the_checkout_of_a_run_it_stopped(nenv):
     open(f"{nenv.node_dir}/half-done.txt", "w").write("x")
     fresh = Node(nenv.node.client, nenv.node.config, nenv.node.log_dir, spawner=FakeSpawner(), clock=Clock(nenv),
                  probe=lambda p, start: "dead", start_of=lambda p: "s", signal_group=lambda p, s: None,
-                 sleep=lambda s: None)
+                 sleep=lambda s: None, session_group_alive=lambda p: False)
     assert fresh.recover() == [run_id]
     fresh.tick()
     r = nodes.run(nenv.board, run_id)
