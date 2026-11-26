@@ -1,0 +1,146 @@
+# The output of scripts/steering-mutation-check.py (review round 4), on exports of the branch, in three runs.
+# Run 1: all 100 rows on efe7ec7. One row was BROKEN there, not caught: "T no save on the watchdog's boundary"
+# (its replacement cut a comment: a SyntaxError, pytest exit 2, which the script then counted as caught; the row
+# and the script are fixed: a mutant that does not run is now reported BROKEN).
+# Run 2: the 15 rows missed in run 1 and the broken one, on a3f2ee1, after the misses got tests.
+# Run 3: the two watchdog-save rows on 35e8ec0 (the cut's deferred save, which run 2's miss showed, and its new row).
+# Not caught at the end: 7 rows, each equivalent (DESIGN_NOTES, step 3, review round 4, "Mutation check").
+
+## Run 1
+commit efe7ec7
+CAUGHT  F init naming S in N's bracket is a contradiction  test_model_claude_steer_walks_against_an_independent_reference
+CAUGHT  F S's init: no origin  test_r1_b2_only_the_exact_init_opens_ss_own_turn[notification]
+CAUGHT  F S's init: no scalar  test_r2_m_an_s_init_with_a_scalar_echo_is_a_contradiction
+CAUGHT  F rule 10: no echo field at all  test_r2_f_rule_10_needs_an_error_with_no_echo_field_and_no_origin[malformed_dict]
+CAUGHT  F a result naming N in the hold is a contradiction  test_r2_m_a_late_result_naming_only_n_in_the_hold_is_a_contradiction
+CAUGHT  F consumed: the measured origin  test_r2_m_consumed_needs_the_notification_origin_measured
+MISSED  F echo shape: the scalar is the first  
+MISSED  F echo shape: strings only  
+CAUGHT  G expiry not masked by an omission  test_r2_g_an_omission_never_masks_the_contact_running_out[held]
+CAUGHT  G the watchdog's boundary cuts a full hold  test_r2_g_an_omission_never_masks_the_contact_running_out[held]
+CAUGHT  H the adjudicator publishes outside the lock  test_r2_h_the_cutoff_lock_is_not_held_while_a_publication_logs_or_saves
+CAUGHT  H stop_all saves after every SIGTERM  test_r2_h_every_sigterm_goes_before_a_held_publication_persists[stop_all]
+CAUGHT  H the retirement inside _steer_end's lock  test_model_claude_steer_walks_against_an_independent_reference
+CAUGHT  I the outbox survives an exception  test_in_turn_n_s_result_lists_its_own_uuid_and_s
+CAUGHT  I a deadline error publishes at once  test_r2_i_a_first_fence_check_that_raises_publishes_at_once_before_any_read
+CAUGHT  I a host error's end is at once  test_r2_i_a_host_error_publishes_before_its_stop_is_attempted
+CAUGHT  I a host error publishes in its finally  test_r2_i_a_read_error_after_a_close_fenced_n_publishes_at_once
+CAUGHT  I the deadline first in every tick  test_r1_m_the_deadline_is_published_before_any_read_of_the_tick
+CAUGHT  J the attempt records its capability  test_r2_m_a_codex_attempt_is_recorded_without_the_held_capability
+CAUGHT  J a checkpoint needs the capability  test_r1_c_the_hub_refuses_impossible_checkpoints
+CAUGHT  J next_turn needs the capability  test_r1_c_next_turn_is_taken_only_for_a_claude_steer
+CAUGHT  J the write gate asks the capability  test_r2_m_the_write_gate_asks_the_hubs_capability
+CAUGHT  J the capability is never the attempt's authority  test_r2_j_a_step_2_hub_is_never_offered_a_claude_steer
+CAUGHT  J the listing's offer needs held  test_r2_m_a_listing_without_held_takes_no_claude_steer_offer
+CAUGHT  J the adapter says held  test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply
+CAUGHT  K checkpoints go to the sender  test_r2_k_a_result_is_reported_while_checkpoint_posts_are_stalled
+CAUGHT  K a checkpoint is no contact  test_r2_m_a_checkpoint_is_not_the_nodes_contact
+CAUGHT  S a mixed checkpoint report is refused  test_r2_shoulds_the_hub_refuses_a_mixed_checkpoint_report_and_impossible_next_turns
+CAUGHT  S impossible next_turn shapes  test_r2_shoulds_the_hub_refuses_a_mixed_checkpoint_report_and_impossible_next_turns
+CAUGHT  S valid Unicode  test_r2_shoulds_a_surrogate_in_ss_optional_fields_never_breaks_a_report
+CAUGHT  S a stale checkpoint after both settled  test_r2_shoulds_a_stale_checkpoint_is_cleared_when_step_2_settled_both
+CAUGHT  S the grace from the SIGTERM  test_r2_the_bounded_publication_counts_from_the_sigterm
+CAUGHT  S S's clock from its read  test_r2_o_an_s_init_read_only_by_the_timeout_drain_gets_its_clock_from_the_read
+CAUGHT  L n_unproved downgrades S  test_a_plain_result_after_a_steer_is_never_ns_by_order
+CAUGHT  L s_end needs the measured terminal  test_r3_l_ss_end_needs_the_measured_terminal[subtype]
+CAUGHT  L consumed needs the measured terminal  test_r3_l_a_zero_turn_notification_naming_s_is_not_consumption
+CAUGHT  L terminal: one turn or more  test_r3_l_a_zero_turn_notification_naming_s_is_not_consumption
+CAUGHT  L no origin key, not a null one  test_model_claude_steer_walks_against_an_independent_reference
+MISSED  L no eviction: the bound refuses  
+CAUGHT  L the whole echo list is read  test_r4_q_retired_s_first_and_live_n_past_the_cap
+CAUGHT  L an init naming neither in S's turn is no loss  test_model_claude_steer_walks_against_an_independent_reference
+CAUGHT  L the live attempt first  test_r3_m_a_frame_naming_the_live_s_and_a_retired_s_is_the_live_attempts
+CAUGHT  L the three-outcome rule per bracket  test_r3_l_the_three_outcome_origin_rule_is_its_own_brackets
+CAUGHT  L retired S checked first  test_model_claude_steer_walks_against_an_independent_reference
+CAUGHT  L retired kept at retirement  test_model_claude_steer_walks_against_an_independent_reference
+CAUGHT  L n_with_s needs the verified incarnation  test_a_plain_result_after_a_steer_is_never_ns_by_order
+CAUGHT  L n_with_s needs no origin  test_r2_f_a_notification_origin_n_s_result_is_not_in_turn
+CAUGHT  L s_end needs no origin  test_model_claude_steer_walks_against_an_independent_reference
+CAUGHT  L N named without its identity is a contradiction  test_r1_m_ns_result_with_s_is_exactly_n_then_s[reversed]
+CAUGHT  H stop_turns saves after every SIGTERM (round 3's line)  test_r2_h_every_sigterm_goes_before_a_held_publication_persists[stop_turns]
+MISSED  M forget purges  
+MISSED  M the incarnation tag  
+CAUGHT  M ended despite a raising stop  test_r3_m_ended_is_published_even_when_the_stop_raises
+CAUGHT  M the held end before its log line  test_r3_m_a_raising_log_handler_loses_no_held_end
+CAUGHT  M shutdown delivers on a fault  test_r3_m_shutdown_delivers_what_stop_all_decided_before_it_raised
+CAUGHT  N the held timeout through the cutoff stop  test_r3_n_the_held_timeout_after_the_latch_starts_no_stop
+CAUGHT  N stop_turns per session  test_r3_n_a_bulk_stop_survives_one_sessions_fault[stop_turns]
+CAUGHT  N stop_all per session  test_r3_n_a_bulk_stop_survives_one_sessions_fault[stop_all]
+CAUGHT  N the watchdog publishes a due fence  test_r3_n_the_watchdog_publishes_a_due_fence_with_no_loop_tick
+CAUGHT  O held's change resends the modes  test_r3_o_losing_held_resends_a_claude_sessions_modes
+CAUGHT  O next_turn only with N's answered end  test_r3_o_next_turn_only_with_ns_answered_end
+CAUGHT  P the sender before the driving thread  test_r3_p_the_checkpoint_sender_starts_before_the_driving_thread
+CAUGHT  P never once shutdown began  test_r3_p_a_checkpoint_is_bound_to_its_incarnation_and_the_stop_flag
+CAUGHT  parity a revoked Codex attempt's contact  test_r3_parity_a_revoked_codex_attempt_keeps_mains_contact
+CAUGHT  parity a Claude slot holds  test_r2_m_an_acknowledgement_after_an_omission_still_keeps_the_contact
+CAUGHT  Q the terminal check is total  test_r4_q_an_identified_ns_result_with_an_unhashable_subtype_is_ns[subtype0]
+CAUGHT  Q N's identity before the cap  test_r4_q_ns_identity_wins_over_the_length_cap
+CAUGHT  Q rule 10 only while S's init is the last  test_r4_q_rule_10_only_while_ss_init_is_the_last_init
+CAUGHT  Q another init in S's bracket ends rule 10  test_r4_q_rule_10_only_while_ss_init_is_the_last_init
+CAUGHT  Q no steering advertised at RETIRED_MAX  test_r4_q_at_retired_max_the_pair_is_not_advertised
+CAUGHT  R a rejection forgets no feature  test_r4_r_a_rollback_refusal_of_one_report_never_strips_anothers_outcome
+CAUGHT  R rung (ii) keeps a Codex extension  test_r4_r_one_ladder_reaches_a_payload_without_both_modes_and_extension
+CAUGHT  R rung (ii) removes the Claude pair  test_r4_r_one_ladder_reaches_a_payload_without_both_modes_and_extension
+CAUGHT  R a fallback asks for a fresh listing  test_r4_r_a_rollback_refusal_of_one_report_never_strips_anothers_outcome
+MISSED  R the write gate asks the pair  
+MISSED  R the checkpoint gate asks the pair  
+CAUGHT  S the self-stop takes only its own  test_r4_s_a_buffered_native_end_never_goes_behind_lost
+MISSED  S a self-stop's own events kept on a fault  
+CAUGHT  V the outbox is drained event by event  test_r4_v_the_outbox_to_dispatch_handoff_loses_and_duplicates_nothing
+CAUGHT  V the watched handoff requeues  test_r4_v_the_watched_handoff_loses_and_duplicates_nothing
+CAUGHT  T a Claude steering session is the bulk stop's after the latch  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[cancel]
+CAUGHT  T the claim checks the latch  test_r3_n_the_held_timeout_after_the_latch_starts_no_stop
+CAUGHT  T nothing logged under the cutoff lock  test_r4_t_nothing_logs_or_saves_under_the_cutoff_lock
+MISSED  T nothing saved under the cutoff lock  
+MISSED  T a reap after the latch registers only  
+CAUGHT  T the cut's decision is claimed  test_r4_t_the_cut_whose_drain_meets_the_latch_decides_nothing
+MISSED  T a host error decides nothing new after the latch  
+CAUGHT  T the under-lock latch check in the hold cut  test_r4_t_a_latch_between_the_first_check_and_the_expiry_changes_no_state
+CAUGHT  T stop_all's steps apart  test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal
+MISSED  T stop_all's final save in a finally  
+MISSED  T the watchdog's steps apart  
+MISSED  T no save on the watchdog's self-stop  
+CAUGHT  T no save on the watchdog's boundary  (exit 2)
+CAUGHT  U the entry's own generation  test_r3_p_a_checkpoint_is_bound_to_its_incarnation_and_the_stop_flag
+CAUGHT  V the loop's own handoff event by event  test_r4_v_the_emit_handoff_of_watched_loses_and_duplicates_nothing
+CAUGHT  T a close, a fatal frame, a host error claimed  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[close]
+CAUGHT  T a cancel claimed  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[cancel]
+CAUGHT  T the interrupted timeout's cutoff  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[interrupted_timeout]
+CAUGHT  T the broken pipe's cutoff  test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[broken_pipe]
+MISSED  T a reap with survivors claimed  
+rows: 100
+stale: []
+missed: ['F echo shape: the scalar is the first', 'F echo shape: strings only', 'L no eviction: the bound refuses', 'M forget purges', 'M the incarnation tag', 'R the write gate asks the pair', 'R the checkpoint gate asks the pair', "S a self-stop's own events kept on a fault", 'T nothing saved under the cutoff lock', 'T a reap after the latch registers only', 'T a host error decides nothing new after the latch', "T stop_all's final save in a finally", "T the watchdog's steps apart", "T no save on the watchdog's self-stop", 'T a reap with survivors claimed']
+exit 0
+
+## Run 2
+commit a3f2ee1
+MISSED  F echo shape: the scalar is the first  
+MISSED  F echo shape: strings only  
+MISSED  L no eviction: the bound refuses  
+MISSED  M forget purges  
+MISSED  M the incarnation tag  
+CAUGHT  R the write gate asks the pair  test_r4_r_the_write_gate_asks_the_pair
+CAUGHT  R the checkpoint gate asks the pair  test_r4_r_the_checkpoint_gates_ask_the_pair
+CAUGHT  S a self-stop's own events kept on a fault  test_r4_s_a_self_stop_that_raises_keeps_its_own_events
+MISSED  T nothing saved under the cutoff lock  
+MISSED  T a reap after the latch registers only  
+CAUGHT  T a host error decides nothing new after the latch  test_r4_t_a_host_error_of_a_held_end_after_the_latch_decides_nothing
+CAUGHT  T stop_all's final save in a finally  test_r4_t_stop_all_saves_even_when_its_traversal_raises
+CAUGHT  T the watchdog's steps apart  test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running
+CAUGHT  T no save on the watchdog's self-stop  test_r4_t_the_watchdogs_self_stop_saves_nothing_on_its_thread
+MISSED  T no save on the watchdog's boundary  
+CAUGHT  T a reap with survivors claimed  test_r4_t_a_reap_whose_drain_meets_the_latch_decides_nothing
+rows: 16
+stale or broken: []
+missed: ['F echo shape: the scalar is the first', 'F echo shape: strings only', 'L no eviction: the bound refuses', 'M forget purges', 'M the incarnation tag', 'T nothing saved under the cutoff lock', 'T a reap after the latch registers only', "T no save on the watchdog's boundary"]
+exit 0
+
+## Run 3
+commit 35e8ec0
+CAUGHT  T no save on the watchdog's boundary  test_r4_t_the_watchdogs_boundary_saves_nothing[cut]
+CAUGHT  T no save on the watchdog's cut  test_r4_t_the_watchdogs_boundary_saves_nothing[cut]
+rows: 2
+stale or broken: []
+missed: []
+exit 0

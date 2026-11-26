@@ -14855,3 +14855,232 @@ Rebased onto main e6b421f (#117, the fake-pid test fix) mid-round, with no confl
 - L's "names neither ... cannot end or fail S" against rule 10: rule 10's echo-less, origin-less error still fails
   S at once (the echo-loss policy, unchanged).
 - An S echo loss is still not provoked on real frames.
+
+### Review round 4 (on 803e4aa: CHANGES, four blockers, one should; M8 evidence sufficient) and what changed
+
+Backup branch `backup/claude-steering-803e4aa`. Sol judged round 3's two readings: SIGTERM dating is sound (kept);
+the anonymous-error fallback (rule 10) is unsound once another init is seen in S's bracket (Q4 below). Each of Sol's
+sequences is a test written first, against an export of 803e4aa with this tree's tests (counting each parametrized case: 35 in all, 27 failing there); the 8 that pass there are named as pins. Each ruling has ONE owner, named with its callers.
+
+#### Q. The adapter is total (the adapter)
+
+- **Owner.** `ClaudeSession._steer_frame` (callers `_init_turn`, `_result_turn`), with `_terminal`, `_echo_shape`,
+  `_named`, `_too_long` and the new `_identifies(ev, n)`; the step-1 table (`_feed`'s `result` branch) for a frame
+  it passes on.
+- **Total.** No field they read raises on any JSON value (null, bool, number, string, array, object, missing):
+  `_terminal` asks `isinstance(sub, str)` before the dict lookup (an array `subtype` raised `TypeError` there); every
+  other comparison was already by equality or `isinstance`. A field of the wrong type is "not the measured shape",
+  nothing more.
+- **Identity, validity and evidence apart.** `_identifies(ev, n)`: scalar N and N first in the list (only element 0
+  is read). It is asked BEFORE the length cap (`_too_long`'s contradiction is skipped for a result of the live
+  attempt in phase n with N's identity), and before the retired shortcut only for the live attempt (a frame naming
+  the live attempt is classified against it first). N with its identity intact and fields that are invalid gets
+  ONE defined fallback: N's turn ends with `ok` = (`subtype` == "success" and `is_error` is false), else failed;
+  `text` = `cap_reply(result)`, "" when not a string; denials and meta as on main (each already total); S is
+  downgraded to `unconfirmed` (`n_unproved`; `unproved` once the incarnation is verified). The session never ends
+  through the host-error path for such a frame.
+- **Rule 10, its residual.** An echo-less, origin-less measured error inside S's bracket fails S at once only while
+  S's init is the last init seen there (`_s_init_last`: set when S's turn opens, cleared by any later init in the
+  bracket). After any other init it is no evidence for S: S runs to its bound (`unconfirmed`, `turn_cut`). Residual,
+  documented as fallback policy: with S's init still the last one, an anonymous error is taken as S's by order (the
+  echo-loss policy); no M8 fixture shows another source of such an error there.
+- **At RETIRED_MAX** the incarnation stops advertising steering: `steers` (and `holds`, through `_Steers`) is false
+  once 256 S are retired, so the next report's modes drop the pair and the hub stops accepting offers that could
+  only be refused.
+- **Tests** (all fail on 803e4aa unless "pin"): `test_r4_q_an_identified_ns_result_with_an_unhashable_subtype_is_ns`
+  (Sol's blocker, array and object), `test_r4_q_an_exact_s_result_with_an_unhashable_subtype_never_ends_the_session`,
+  `test_r4_q_ns_identity_wins_over_the_length_cap` (the should), `test_r4_q_retired_s_first_and_live_n_past_the_cap`
+  (pin: Sol's disputed mutation row, now a test), `test_r4_q_rule_10_only_while_ss_init_is_the_last_init` (init[S], an
+  unmarked init, an anonymous error), `test_r4_q_property_every_field_every_json_type_never_raises[n|held|s_turn]`
+  (every field of a result and of an init through every JSON type; never raises, never ends the session, a frame with
+  N's identity always yields N's end or N's held end; `held` is a pin), `test_r4_q_at_retired_max_the_pair_is_not_advertised`.
+
+#### R. One capability fallback, per report (the node)
+
+- **Owner.** `SessionRunner._post_report(sid, body, events)`, with `_rungs(body)`. Caller: `_post_pending` (the one
+  path; its success and failure bookkeeping is the same code for the first try and a retry).
+- **The ladder**, each rung computed from the ORIGINAL body and strictly smaller than the one before (an equal rung
+  is skipped): (i) as built; (ii) without the Claude pair (`steer` and `held` in a Claude session's modes) and
+  without a Claude `next_turn` extension, keeping what the step-2 contract takes (a Codex `steer` extension
+  included); (iii) main's plain retry (no steer extension, no `steer` or `held` mode). A 400/422 before the last rung
+  moves down one rung (`_call(..., spare=True)`: no feature forgotten); the last rung's failure is main's handling.
+- **Feature knowledge.** A rejection changes nothing the node believes; it only sets `last_sync = -inf`, so the next
+  pass refetches the listing, and the listing says what the hub takes. Main's R5-05 (a 422 on a steer extension
+  forgets `steer`) is kept only where main had it: when rung (iii) succeeded after the extension was stripped and the
+  incarnation is unchanged. No other session's report in the same flush or a later one is changed by a rejection.
+- **One pair predicate.** `SessionRunner._pair(features)` ("steer" and "held" both) is asked by the write gate
+  (`_steer_capable`), the checkpoint gates (`_checkpoint`, `_checkpoint_due`), the report projection (`_modes_for`)
+  and `held_aware`; nothing checks `held` alone or drops `steer` alone for a Claude session.
+- **Tests** (through the runner's real report code): `test_r4_r_a_rollback_refusal_of_one_report_never_strips_anothers_outcome`
+  (Sol's blocker: main d11ff99's validator verbatim; A's Claude end refused and resent at rung ii; B's Codex `in_turn`
+  in the same flush still carries its extension and settles `in_turn`), `test_r4_r_the_new_hub_strips_nothing`
+  (pin), `test_r4_r_one_ladder_reaches_a_payload_without_both_modes_and_extension` (a hub refusing both the modes and
+  the extension: rung iii), `test_r4_r_a_pre_steering_responder_gets_the_plain_rung` (pin),
+  `test_r4_r_a_retrys_success_bookkeeping_is_a_first_trys` (pin); from the mutation check:
+  `test_r4_r_the_write_gate_asks_the_pair`, `test_r4_r_the_checkpoint_gates_ask_the_pair`.
+
+#### S. The split at publication (the host and the node)
+
+- **Owner.** `SessionHost.stop_turns(detail, own=True)` (caller: the watchdog's self-stop, `enforce_deadlines`).
+  What this stop publishes goes into an outbox of its own and is all it returns (into `watched`, after
+  reconciliation, as on main); entries already in the outbox stay there and the loop's pre-reconciliation handoff
+  delivers them. If the stop raises, its own events are put back behind the retained ones (recoverable). The same
+  rule holds before `forget` (`_after_tick`) and at shutdown (`stop_all`'s events are taken by `shutdown` as before).
+  The deadline watchdog's `steer_deadlines` still returns the whole outbox into `watched_steer`: that list is
+  delivered BEFORE reconciliation, in order, so nothing goes behind a LOST.
+- **Tests.** `test_r4_s_a_buffered_native_end_never_goes_behind_lost` (Sol's blocker: A's native end published, the
+  tick raises, the watchdog self-stops; the next pass reports A's own end, once);
+  `test_r4_s_a_self_stop_that_raises_keeps_its_own_events` (from the mutation check).
+
+#### T. Two phases: the claim under the cutoff lock, the signal outside it (the host)
+
+- **Owner.** `SessionHost._claim(s, decide)`: under the cutoff lock, the latch checked and the decision made and
+  frozen (`decide`: N failed, S decided, the fence stamped); nothing logged (`_say` defers each line to after the
+  lock) and nothing saved (`_emit_hold` sets `_save_due`; the loop's next tick saves) under it. After the latch it
+  decides nothing and returns False: the bulk stop owns the session. `_cutoff_stop` is `_claim` then `_stop` (the
+  SIGTERM, outside the lock, its grace from the SIGTERM: R8-01). `_steering(s)`: a held end, or a Claude attempt
+  whose outcome is open (`slot.holds`); a Codex attempt keeps step 2's rule (R6-01: a close whose drain met the latch
+  decides N by what was read before it, pinned by tests/test_codex_steering.py).
+- **The ordering limit.** A stop claimed before the latch may signal after it: the same SIGTERM shutdown sends; the
+  bulk stop recognises the claim (N decided once, by the claim): `test_r4_t_a_stop_claimed_before_the_latch_may_signal_after_it` (pin).
+- **Every single-session path** of a steering session, after the latch:
+
+| path | how it meets the latch | test |
+| --- | --- | --- |
+| cancel (`cancel`) | `_claim` (the decision and the `outbuf` clear); False: nothing, no signal | `..._signals_or_decides[cancel]` |
+| close (`close` → `_end`) | `_end`'s decision through `_claim`; False: nothing; `ended` still published in its `finally` | `[close]` |
+| fatal frame (`_feed` → `_end`) | as close | `[fatal]` |
+| host error (read raises → `_host_error`: `_end`, `_publish_now`) | `_end` as close; `_publish_now` decides and publishes nothing for an undecided held end after the latch | `[host_error]`, `test_r4_t_a_host_error_of_a_held_end_after_the_latch_decides_nothing` |
+| reap with group survivors (`_reap`) | after the latch the group is only registered as stopping (`groups.stopping`, nothing starts beside it), nothing decided or signalled; before it, `_went_by_itself` through `_claim`, and a latch during its drain: registered only | `[reap_with_survivors]`, `test_r4_t_a_reap_whose_drain_meets_the_latch_decides_nothing` |
+| interrupted-timeout branch (`_hold_to_timeout`) | `_cutoff_stop` | `[interrupted_timeout]` (fails on 803e4aa; a Claude session's `interrupt()` is None, so the test sets `interrupted_at`; a Codex attempt: as main) |
+| broken pipe (`_write`) | `_cutoff_stop` | `[broken_pipe]` (fails on 803e4aa; R5-02 already keeps a steer frame in the buffer after the latch, so the test writes other bytes) |
+| partial-write cut (`_steer_cut`) | the decision through `_claim`; the latch during its drain: nothing | `test_r4_t_the_cut_whose_drain_meets_the_latch_decides_nothing` |
+| hold expiry and contact loss (`_hold_cut`) | the latch checked again UNDER the lock with the expiry's own state change; then `_cutoff_stop` | `test_r4_t_a_latch_between_the_first_check_and_the_expiry_changes_no_state` |
+| turn timeout, held one included (`_hold_to_timeout`) | `_cutoff_stop` (round 3) | `test_r3_n_the_held_timeout_after_the_latch_starts_no_stop` |
+| pre-hold timeout (`_steer_end`) | its log through `_say`, its save left to the loop | `test_r4_t_nothing_logs_or_saves_under_the_cutoff_lock` |
+
+  A session with no steering slot and no held end takes main e6b421f's path on each of these, unchanged (as main).
+- **Bulk stops.** `stop_all`'s whole traversal is per session and per step (TERM, the poll `going()`: a failing probe
+  counts as still going, kill, read, close, the transcript fd, the group record), with the final save in a
+  `finally`: `test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal`,
+  `test_r4_t_stop_all_saves_even_when_its_traversal_raises`.
+- **The watchdog, independent of persistence.** `enforce_deadlines` runs each step in its own `try` (the self-stop,
+  the due SIGKILLs, the steer watch and deadlines); nothing on its path saves: the self-stop and `steer_deadlines`
+  (its fence publication and its cut of a frame taken in part, `_steer_cut`, which saved there until the mutation
+  check showed it) leave the save to the loop's next tick (`_save_due`). `test_r4_t_the_watchdog_runs_its_deadlines_whatever_the_save_does`
+  (a save that always raises, then one that stalls: the SIGKILLs are reached, the pass returns promptly),
+  `test_r4_t_the_watchdogs_self_stop_saves_nothing_on_its_thread` (the self-stop of a turn in flight with a
+  stalled save: no save on that thread; the loop's next tick saves),
+  `test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running`,
+  `test_r4_t_the_watchdogs_boundary_saves_nothing[cut|fence]` (`cut` fails on a3f2ee1).
+- **Other tests** `test_r4_t_after_the_latch_no_single_session_path_signals_or_decides[...]` (Sol's blocker: the
+  cancel); from the mutation check: `test_r4_t_a_host_error_of_a_held_end_after_the_latch_decides_nothing`,
+  `test_r4_t_a_reap_whose_drain_meets_the_latch_decides_nothing`.
+
+#### U. The checkpoint's identity in its entry (the node and the hub)
+
+- **Owner.** `node_sessions.Checkpoint(sid, gen, n, payload)`, immutable, made by `_checkpoint`; `_post_checkpoints`
+  posts its payload and `_checkpoint_due(entry)` checks the stop flag, the pair, the session, its incarnation
+  (`s.gen == entry.gen`) and N against the entry itself. The side map `checkpoint_gen` is gone.
+- **The residual.** A POST already in flight when the session, N or the incarnation changes can still arrive. The
+  hub's checkpoint is write-once and refused (409) once N is settled, so a late POST replaces neither an accepted
+  checkpoint nor a terminal end: `test_r4_u_a_late_checkpoint_post_replaces_nothing` (pin: the hub already did).
+- Older tests now build `Checkpoint` entries (`test_r2_k_...`, `test_r3_p_...`, `test_r1_c_...`).
+
+#### V. Every queue handoff, under faults (the node and the host)
+
+- **Owners.** `SessionHost.drain_outbox(take)` (event by event: an event leaves the outbox only once `take` returned;
+  on a raise it and the rest go back, in order) and `requeue`; `SessionRunner._hand(events)` (a list the pass took:
+  each to `_dispatch` alone; on a raise it and the rest go to the FRONT of the host's outbox). Callers: `pass_once`
+  (`watched_steer` through `_hand`; the retained outbox through `drain_outbox`), `_after_tick` (before forget),
+  `_emit` (the loop's own events and `watched`, through `_hand`). The checkpoint queue: `_dispatch` puts a held end's
+  checkpoint into it under the runner lock, and the sender pops it under its condition; a sender fault drops that
+  one checkpoint (logged, never resent: ruling C), and N's end is never dropped with it.
+- **Retry bookkeeping** is the first try's (R: `_post_pending`'s one path).
+- **The watchdog thread's calls, and why each is bounded:**
+
+| call | bound |
+| --- | --- |
+| `runner.lock` | the loop holds it only for local work, never across a hub call (as on main); a deadline met late is logged (limit e). Residual, as on main: a save that stalls inside the loop's own tick holds this lock, and the watchdog waits for it |
+| `_silent`, `_self_stop_due` | in memory |
+| `host.stop_turns(own=True)` | SIGTERMs (`os.killpg`), in-memory decisions; no save (`_save_due`), no hub I/O |
+| `host.kill_due` | SIGKILLs, in memory |
+| `_steer_watch` | in memory (the contact clock) |
+| `host.steer_deadlines` | in-memory decisions and SIGTERMs; one drain budget for every cut (bounded reads of pipes already open); no save (the cut's included) |
+| logging | the node's handlers (files): as main |
+
+  No call on this thread waits on the hub or makes a save. Tests: `test_r4_t_the_watchdog_runs_its_deadlines_whatever_the_save_does`
+  (a stalled save), `test_r4_v_the_watchdog_never_waits_on_a_stalled_post` (pin: a report POST stalls on the loop's
+  flush outside the runner lock; the watchdog's pass returns at once).
+- **Tests** `test_r4_v_the_outbox_to_dispatch_handoff_loses_and_duplicates_nothing`,
+  `test_r4_v_the_watched_handoff_loses_and_duplicates_nothing` (`watched_steer`),
+  `test_r4_v_the_emit_handoff_of_watched_loses_and_duplicates_nothing` (`watched`), and U's stale in-flight request.
+
+#### Codex under faults (the shared paths)
+
+With no fault, Codex behaviour is main's. Under a fault the shared paths change it as follows, each with its test:
+- the outbox and its handoffs (M, S, V): a Codex end left by a raising tick is delivered once, before
+  reconciliation (`test_r3_parity_a_codex_turn_survives_a_fault_through_the_outbox`, `test_r4_v_...`);
+- the fallback (R): a Codex report in a flush where another session's report is refused keeps its extension
+  (`test_r4_r_a_rollback_refusal_of_one_report_never_strips_anothers_outcome`); a Codex report refused itself goes to
+  rung (iii), main's retry, and main's R5-05 forget (tests/test_codex_steering.py R8-04, unchanged);
+- the watchdog (T): its steps run apart, and its self-stop saves nothing on that thread (the loop saves on its next
+  tick): `test_r4_t_the_watchdog_runs_its_deadlines_whatever_the_save_does`;
+- `stop_all`'s per-step traversal (T4);
+- not changed: a Codex attempt's close, cancel, reap or timeout after the latch (R6-01's rule; `_steering` is false
+  for it).
+
+#### Where rulings needed reading
+
+- T against R6-01: "after the latch no single-session path decides a steer" would change a Codex close whose drain
+  meets the latch, which R6-01 (tests/test_codex_steering.py, unchanged) pins as deciding N by what was read. The
+  claim is scoped to Claude attempts and held ends (`_steering`); the Codex rule stays step 2's.
+- R+ against main's R5-05: "a rejection changes no feature knowledge" against main's forget of `steer` on a 422 of an
+  extension. Kept only at rung (iii) (main's own retry, the extension stripped, incarnation unchanged), which is what
+  tests/test_codex_steering.py pins.
+- T's broken pipe and interrupted timeout: neither is reached by a Claude steering session in normal operation (R5-02
+  keeps a steer frame in the buffer after the latch, and a Claude session never sets `interrupted_at`); both take
+  `_cutoff_stop` anyway, and their tests set the state directly. For Codex both are main's.
+
+#### Mutation check, review round 4
+
+In the repo this time: `scripts/steering-mutation-check.py` (every row as data: round 2's and round 3's rows whose
+lines still stand, and 36 of round 4's: Q, R, S, T, U, V), run on an export (`git archive`), one change per row,
+tests/test_claude_steering.py first and, only if that did not catch it, the correlation, Codex steering, restart, hub
+restart, golden, hosted-session and host tests; a mutant that does not run is reported BROKEN.
+`scripts/steering-mutation-results.txt` is the output. 101 rows, none stale:
+- run 1 (efe7ec7, 100 rows): 84 caught, 15 missed, 1 broken (the boundary row's replacement cut a comment; fixed);
+- the misses got tests (a3f2ee1): the pair at the write gate and at the checkpoint gate, a self-stop that raises, a
+  held end's host error after the latch, `stop_all`'s save when its traversal raises, a failing self-stop, the
+  self-stop's save with a stalled save, a latch during a reap's drain;
+- run 2 (a3f2ee1, those 16): 8 more caught; the boundary row, now running, missed: the watchdog's cut of a frame
+  taken in part still saved on its thread. Fixed (35e8ec0, `_steer_cut` defers under `_defer_save`), with a test and
+  a row of its own;
+- run 3 (35e8ec0): both caught.
+
+94 caught; 7 not, each equivalent here:
+
+| row | why it cannot be caught |
+| --- | --- |
+| F echo shape: the scalar is the first | every predicate also names the scalar it needs (Sol agreed in round 3) |
+| F echo shape: strings only | every predicate compares whole lists with lists of the host's uuids (Sol agreed) |
+| L no eviction: the bound refuses | since Q6, `steers` is false at RETIRED_MAX, and `steer_named` asks `steers` first: its own bound check is a backstop behind it |
+| M forget purges | the incarnation tag never delivers an entry whose session is gone or opened again (Sol agreed for delivery) |
+| M the incarnation tag | the purge removes a forgotten session's entries before an id can be opened again (Sol agreed for this lifecycle) |
+| T nothing saved under the cutoff lock (`_emit_hold`) | under a claim a held end is only fenced, never published (`_finalize_hold` publishes at once only with the process gone, in a bulk stop, or after the latch, and a claim is none of these), so `_emit_hold` never runs under the lock; the branch is a backstop |
+| T a reap after the latch registers only | the claim's refusal registers the group the same way; the early branch only spares the reads, and with N's own result written before the reap both end the same (the bulk stop decides once: compared on an export) |
+
+Round 3's disputed "whole-list read" row is now a test (`test_r4_q_retired_s_first_and_live_n_past_the_cap`) and
+caught.
+
+#### Runs
+
+After the last code commit (35e8ec0), on 26 November:
+- `uv run pytest -q -p no:cacheprovider`: 4800 passed, 10 skipped, 0 failed.
+- The stand-in e2e in full: PASS (395 checks).
+- `--only steering` with stand-ins: PASS (115 checks).
+- `--only correlation` with stand-ins: PASS.
+- `--only steering` with the real CLIs (Claude Code 2.1.330; codex-cli 0.172.0): PASS (54 checks).
+- `--only correlation` with the real CLIs: PASS.
+- `~/.codex/config.toml` sha256 18fcebe0d94018f8 before, between and after the real runs (round 3's runs saw
+  be07f3845d522521: the file changed between the rounds, before any run of this one).
