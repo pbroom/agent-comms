@@ -2357,7 +2357,10 @@ class SessionHost:
                 return      # (ruling T) the latch came during the drain: the bulk stop owns it now
         s.steer = None
         self._stop(s, now, at_signal=True)      # (R8-01) the cut's own stop, with or without a drain
-        self._save_state()
+        if self._defer_save:
+            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing: the loop's next tick does
+        else:
+            self._save_state()
 
     def _steer_end(self, s: Session, msg_id: str, native: bool, evidence: str | None = None) -> dict | None:
         """N (`msg_id`) ended, natively (the provider's own end of it) or not (the host gave it up): the outcome of the

@@ -3665,6 +3665,32 @@ def test_r4_t_the_watchdog_runs_its_deadlines_whatever_the_save_does(env):
     t.join(5)
 
 
+@pytest.mark.parametrize("what", ["cut", "fence"])
+def test_r4_t_the_watchdogs_boundary_saves_nothing(henv, monkeypatch, what):
+    """Ruling T5 (a mutation row): the watchdog's boundary (`steer_deadlines`) cuts a frame taken in part, or
+    publishes a fenced hold whose deadline passed: no save on that path; the loop's next tick saves."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    if what == "cut":
+        s.steer.mark, s.steer.sent = (0, 10), 5      # (a frame taken in part)
+        s.steer.cover_until = henv.clock() + 1
+        henv.clock.advance(2)
+    else:
+        child.exits_on_terminate = False
+        child.emit(owned(n, text="N"))
+        henv.host.tick()
+        henv.groups.add(child.pid)
+        henv.host.close(SID, "closed")
+        henv.clock.advance(21)
+    saves = []
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: saves.append(1)
+    out = henv.host.steer_deadlines()
+    assert ends(out) and child.terminated and not saves, "nothing saved on the watchdog's path"
+    henv.host.tick()
+    assert saves, "the loop's next tick saves"
+    henv.host._save_state = real_save
+
+
 def test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running(env):
     """Ruling T5 (a mutation row): the self-stop raises: the due SIGKILLs and the steer deadlines still run."""
     sid, child, m = _ordinary_turn_in_flight(env)

@@ -114,7 +114,8 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', 'T a cancel claimed', '            if self._steering(s):\n                # (ruling T) a steering session: the claim', '            if False:\n                # (ruling T) a steering session: the claim'),
     ('H', "T the interrupted timeout's cutoff", '                if self._steering(s):\n                    self._cutoff_stop(s, self._timeout_detail(), now, out)      # (ruling T)', '                if False:\n                    self._cutoff_stop(s, self._timeout_detail(), now, out)      # (ruling T)'),
     ('H', "T the broken pipe's cutoff", '            elif self._steering(s):\n                self._cutoff_stop(s, detail, now, out)', '            elif False:\n                self._cutoff_stop(s, detail, now, out)'),
-    ('H', 'T a reap with survivors claimed', '                if self._steering(s):\n                    if not self._claim(s, lambda: self._went_by_itself', '                if False:\n                    if not self._claim(s, lambda: self._went_by_itself')]
+    ('H', 'T a reap with survivors claimed', '                if self._steering(s):\n                    if not self._claim(s, lambda: self._went_by_itself', '                if False:\n                    if not self._claim(s, lambda: self._went_by_itself'),
+    ('H', "T no save on the watchdog's cut", "        if self._defer_save:\n            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing", "        if False:\n            self._save_due = True       # (ruling T) the watchdog's boundary persists nothing")]
 FIRST = ["tests/test_claude_steering.py"]
 REST = ["tests/test_claude_correlation.py", "tests/test_codex_steering.py", "tests/test_session_restart.py",
         "tests/test_session_restart_hub.py", "tests/test_structured_results.py", "tests/test_hosted_sessions.py",
