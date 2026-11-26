@@ -2430,6 +2430,121 @@ def test_r2_j_a_failed_fetch_never_cuts_a_hold(env):
     assert not child.terminated and s.held is not None and s.held.fenced_at is None
 
 
+
+# ---------------------------------------------------------------- review round 2: the mutation check's misses pinned
+
+
+def test_r2_m_an_s_init_with_a_scalar_echo_is_a_contradiction(henv, monkeypatch):
+    """An `init` has no scalar echo (M8): [S] with `user_message_uuid` S opens no S turn: the loss, `unconfirmed`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(S) | {"user_message_uuid": S}, owned(S, text="S"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"} and not s.provider.verified
+
+
+def test_r2_m_a_late_result_naming_only_n_in_the_hold_is_a_contradiction(henv, monkeypatch):
+    """Ruling F: N's result came; a later result naming N alone is not the measured shape: the loss at once."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(owned(n, text="again"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r2_m_consumed_needs_the_notification_origin_measured(henv, monkeypatch):
+    """`s_consumed` is a CLI-started turn's terminal [S] with the origin M8 measured (`task-notification`); the same
+    [S] with no origin inside the CLI's bracket is a contradiction (the loss), never `consumed`."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    child.emit(vinit(), owned(S, text="no origin"))
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r2_m_an_acknowledgement_after_an_omission_still_keeps_the_contact(henv, monkeypatch):
+    """Ruling G: the contact clock is its own: an acknowledgement after an omission (writing revoked) still extends
+    it, so a held attempt is not cut at the old deadline."""
+    from agent_comms.session_host import STEER_CONTACT_SECONDS
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.steer_revoke(SID, S, "omitted")
+    henv.clock.advance(10)
+    s.steer.ack(henv.clock(), henv.clock, SID, 1)
+    assert s.steer.cover_until == henv.clock() + STEER_CONTACT_SECONDS
+    henv.clock.advance(15)                          # past the old deadline, inside the new one
+    henv.host.steer_deadlines()
+    assert not child.terminated and s.held is not None and not s.steer.expired
+
+
+def test_r2_m_the_write_gate_asks_the_hubs_capability(henv, monkeypatch):
+    """Ruling J: the write gate asks `steer_capable` at the write: while it says no, not one byte of S is written."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    henv.host.steer_authority = lambda sess: True
+    henv.host.steer_capable = lambda sess: False
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a long turn", message_id="1")
+    henv.host.tick()
+    child.emit(vinit(uuid_of(child)))
+    henv.host.tick()
+    henv.host.steer_offer(SID, "1", S, TEXT, authorized=True)
+    henv.host.tick()
+    assert S.encode() not in child.stdin
+
+
+def test_r2_m_a_listing_without_held_takes_no_claude_steer_offer(env):
+    """Ruling J: a listing that offers a Claude session's steer but does not name `held` (a step-2 hub's) is not
+    taken: no attempt is made from it."""
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env)
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    assert r.status_code == 200, r.text
+    data = env.laptop.get("/api/nodes/sessions", params={"tree": 5}).json()
+    assert any(v.get("steer") for v in data["sessions"] if v.get("session_id") == sid), "the listing offers it"
+    data["features"] = [f for f in data["features"] if f != "held"]
+    runner = env.node.sessions
+    with runner.lock:
+        runner._reconcile(data)
+    assert runner.host.steer_slot(sid) is None, "no attempt taken from a listing without held"
+
+
+def test_r2_m_a_codex_attempt_is_recorded_without_the_held_capability(env):
+    """Ruling J: the hub records the capability the attempt is written under: a Codex steer's record has `holds`
+    False (its node never says `held`), so it never takes a checkpoint or `next_turn`."""
+    from test_codex_steering import codex_turn_in_flight, post_steer
+    from test_hosted_sessions import P3
+    sid, child = codex_turn_in_flight(env, project=P3)
+    post_steer(env, sid)
+    assert hosted_steer.get(env.board.conn, sid, 1)["holds"] is False
+
+
+def test_r2_m_a_checkpoint_is_not_the_nodes_contact(env):
+    """Ruling K: the hub does not count a checkpoint-only report as the node loop's contact."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    with env.node.sessions.lock:
+        env.node.sessions.host.tick()           # N held; nothing reported yet
+    before = hosted._loop(env.board.conn, "laptop").get("contact")
+    env.clock.advance(hosted.LOOP_CONTACT_EVERY + 5)
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "N's reply", "answered": True}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": held})
+    assert r.status_code == 200, r.text
+    assert hosted._loop(env.board.conn, "laptop").get("contact") == before
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
