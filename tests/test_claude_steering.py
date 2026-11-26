@@ -2672,6 +2672,346 @@ def test_r3_l_a_frame_naming_the_current_n_and_a_retired_s_is_the_live_attempts(
     assert end.text == "N2's own" and end.steer == {"outcome": "unconfirmed", "why": "unproved"}
 
 
+
+# ---------------------------------------------------------------- review round 3, rulings M, N, O, P; step 2 parity
+
+
+def _tick_raising_after(host):
+    """The host's next tick publishes, then raises (a fault after publication)."""
+    real = host._tick
+
+    def bad(now, out):
+        real(now, out)
+        raise RuntimeError("a fault after publication")
+    host._tick = bad
+    return lambda: setattr(host, "_tick", real)
+
+
+def test_r3_m_a_recovered_checkpoint_goes_through_the_one_dispatcher(env):
+    """Sol's blocker (ruling M): N held (its checkpoint published), the tick raises; the watchdog takes the backlog;
+    the next pass delivers it through the one dispatcher: the checkpoint to the sender, never `kind: held` in an
+    ordinary report (a step-3 hub refuses such a batch)."""
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    child.emit(cresult(sid, n, text="N's reply"))
+    restore = _tick_raising_after(runner.host)
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    restore()
+    runner.enforce_deadlines()          # the watchdog: whatever it takes, it delivers nothing itself
+    tick(env, times=2)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert m["held"]["text"] == "N's reply", m
+    assert all(e.get("kind") != "held" for _, e in runner.pending)
+
+
+def test_r3_m_the_outbox_is_drained_before_reconciliation_can_invent_lost(env):
+    """Sol's blocker (ruling M): N's native end (`in_turn`) published, then the tick raises; the next pass reconciles
+    a listing first: the native end, retained in the host's outbox, is dispatched before any LOST is made up."""
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    child.emit(cresult(sid, n, s_uuid, text="N and S"))
+    restore = _tick_raising_after(runner.host)
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    restore()
+    tick(env, times=2)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    st = hosted_steer.get(env.board.conn, sid, 1)
+    assert m["state"] == "done" and not str(m.get("detail")).startswith(node_sessions.LOST), m
+    assert (st["outcome"], st["why"]) == ("in_turn", "answered")
+
+
+def test_r3_m_ended_is_published_even_when_the_stop_raises(henv, monkeypatch):
+    """Ruling M: a close whose SIGTERM raises still publishes `ended` (and N's end) into the outbox; the next host
+    call delivers them."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, S, text="N"))
+    henv.host.tick()
+
+    def bad_term():
+        raise OSError("terminate failed")
+    child.terminate = bad_term
+    with pytest.raises(OSError):
+        henv.host.close(SID, "closed")
+    child.terminate = lambda: None
+    kinds = [e.kind for e in henv.host.tick()]
+    assert "ended" in kinds
+
+
+def test_r3_m_a_raising_log_handler_loses_no_held_end(henv, monkeypatch):
+    """Ruling M: `_emit_hold` puts N's end into the outbox before it logs: a log handler that raises loses nothing."""
+    from agent_comms import session_host
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    real = session_host.log.info
+
+    def bad(msg, *a, **k):
+        if "the steer into message" in msg:
+            raise RuntimeError("the log handler failed")
+        return real(msg, *a, **k)
+    monkeypatch.setattr(session_host.log, "info", bad)
+    child.emit(owned(S, text="PINEAPPLE"))
+    [end] = ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn"
+
+
+def test_r3_m_shutdown_delivers_what_stop_all_decided_before_it_raised(env):
+    """Ruling M: shutdown's `stop_all` raises part way (here its final save): what it had decided is in the host's
+    outbox, and shutdown delivers it all the same."""
+    sid = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    child.emit(cinit(sid, written(child)[-1]["uuid"]))
+    tick(env)
+    runner = env.node.sessions
+
+    def bad_save():
+        raise OSError("the disk is full")
+    runner.host._save_state = bad_save
+    runner.signal()
+    runner.kill()
+    runner.shutdown()
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert m["state"] == "failed" and "shut down" in m["detail"], m
+
+
+def test_r3_m_an_old_event_never_reaches_a_reopened_session(henv, monkeypatch):
+    """Ruling M: entries carry the session's incarnation: one published for a session that is then forgotten and
+    opened again under the same id is never delivered to the new one."""
+    from agent_comms.session_host import HostEvent
+    s = open_session(henv)
+    henv.host._outbox.append(HostEvent(SID, "turn_ended", "9", ok=True, text="old"))
+    s.ended = True
+    henv.host.forget(SID)
+    open_session(henv)
+    henv.host._outbox.append(HostEvent(SID, "delivered", "1"))
+    assert [(e.kind, e.message_id) for e in henv.host.take_outbox()] == [("delivered", "1")]
+
+
+def test_r3_n_the_held_timeout_after_the_latch_starts_no_stop(henv, monkeypatch):
+    """Sol's blocker (ruling N): N held, the latch set, then the hold's bound inside the next tick: no single-session
+    stop (no SIGTERM); the stop of every turn publishes N's end once."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.steer_stopping()
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    assert not child.terminated and not ends(out) and s.stopping_since is None
+    [end] = ends(henv.host.stop_all())
+    assert end.text == "N" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r3_n_after_the_latch_the_cut_changes_no_state(henv, monkeypatch):
+    """Ruling N: the first latch check is what keeps an expired hold's state as it is after the latch: no contact
+    latched (`expired`), no drain deadline reserved."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.host.steer_stopping()
+    henv.clock.advance(21)
+    henv.host.steer_deadlines()
+    assert not s.steer.expired and henv.host._drain_deadline is None and not child.terminated
+
+
+def test_r3_n_a_bulk_stop_survives_one_sessions_fault(henv, monkeypatch):
+    """Ruling N: one session's SIGTERM raising skips neither the other sessions nor the deferred save."""
+    pair = _held_pair(henv, monkeypatch)
+    (s1, c1), (s2, c2) = pair
+
+    def bad():
+        raise OSError("terminate failed")
+    c1.terminate = bad
+    saved = []
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: (saved.append(1), real_save())
+    out = henv.host.stop_turns("lost the hub")
+    assert c2.terminated and saved
+    assert {e.session_id for e in out if e.kind == "turn_ended"} == {SID, SID2}
+
+
+def test_r3_n_the_watchdog_publishes_a_due_fence_with_no_loop_tick(henv, monkeypatch):
+    """Ruling N: a fenced hold whose deadline passed is published by the watchdog's boundary (`steer_deadlines`),
+    into the outbox, with no loop tick."""
+    s, child, n = steered(henv, monkeypatch, grace=10)
+    child.exits_on_terminate = False
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.groups.add(child.pid)
+    henv.host.close(SID, "closed")
+    henv.clock.advance(21)
+    out = henv.host.steer_deadlines()
+    assert [e.text for e in ends(out)] == ["N"] and "ended" in [e.kind for e in out]
+
+
+def test_r3_n_the_sigterm_is_sent_outside_the_cutoff_lock(henv, monkeypatch):
+    """Ruling N: the decision and the fence under the cutoff lock; the group registry and the SIGTERM after it."""
+    import threading
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    seen = []
+
+    def probe(got):
+        ok = henv.host._steer_stop_lock.acquire(blocking=False)
+        if ok:
+            henv.host._steer_stop_lock.release()
+        got.append(ok)
+    real_term = child.terminate
+
+    def term():
+        got = []
+        t = threading.Thread(target=probe, args=(got,))
+        t.start()
+        t.join()
+        seen.append(got[0])
+        return real_term()
+    child.terminate = term
+    henv.clock.advance(21)
+    henv.host.steer_deadlines()
+    assert seen == [True]
+
+
+def _old_hub_validator(monkeypatch):
+    """main d11ff99's `modes` check in hosted.report, verbatim (the step-2 hub a rollback goes back to)."""
+    from agent_comms.core import Invalid
+    real = hosted.report
+
+    def report(board, p, session_id, events=None, state=None, pid=None, resume=None, seq=None, provider_id=None,
+               access=None, worktree=None, ceiling=None, checkout=None, modes=None, held=None):
+        if modes is not None and (not isinstance(modes, list) or len(modes) > 2
+                                  or any(x not in ("steer", "restart") for x in modes) or len(set(modes)) != len(modes)):
+            raise Invalid("modes must list what the session can do with a turn in flight: steer, restart")
+        return real(board, p, session_id, events, state, pid, resume, seq, provider_id=provider_id, access=access,
+                    worktree=worktree, ceiling=ceiling, checkout=checkout, modes=modes, held=held)
+    monkeypatch.setattr(hosted, "report", report)
+
+
+def test_r3_o_a_native_end_survives_a_rollback_hubs_refusal_of_held(env, monkeypatch):
+    """Sol's blocker (ruling O): the node still holds the last step-3 capabilities; the hub, rolled back, refuses
+    `held` in `modes` (400, main d11ff99's validator): the node drops the pair and sends the report again with the
+    base modes: the ordinary Claude turn's native end is recorded, never discarded."""
+    sid = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    m_uuid = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, m_uuid))
+    tick(env)
+    _old_hub_validator(monkeypatch)
+    child.emit(cresult(sid, m_uuid, text="the reply"))
+    tick(env, times=2)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert m["state"] == "done" and show(env, sid)["reply"] == "the reply", m
+
+
+def test_r3_o_capabilities_go_as_a_pair(env):
+    """Ruling O: after a refusal forgot `steer` alone, a Claude session's report never says `["restart", "held"]`
+    (which the new hub refuses): `steer` and `held` go together or not at all."""
+    runner = env.node.sessions
+    assert runner._modes_for(("steer", "restart", "held"), {"steer", "held", "restart"}) == ["steer", "restart", "held"]
+    assert runner._modes_for(("steer", "restart", "held"), {"held", "restart"}) == ["restart"]
+    assert runner._modes_for(("steer", "restart", "held"), {"steer", "restart"}) == ["restart"]
+    assert runner._modes_for(("steer", "restart"), {"steer", "restart"}) == ["steer", "restart"], "Codex: as before"
+
+
+def test_r3_o_next_turn_only_with_ns_answered_end(env):
+    """Sol's should (ruling O): a well-shaped `next_turn` on an N end that is not answered (no checkpoint either)
+    is ignored: S settles by the rule (`unconfirmed`), never `next_turn`."""
+    sid, child, n, s_uuid = claude_steered(env)
+    ext = {"outcome": "next_turn", "why": "own_turn", "result": {"ok": True, "detail": "", "denials": [], "meta": {},
+                                                                  "text": "S", "answered": True}}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"events": [
+        {"kind": "turn_ended", "message": 1, "ok": False, "detail": "given up", "answered": False, "steer": ext}]})
+    assert r.status_code == 200, r.text
+    st = hosted_steer.get(env.board.conn, sid, 1)
+    assert st["outcome"] != "next_turn", st
+
+
+def test_r3_p_the_checkpoint_sender_starts_before_the_driving_thread(env, monkeypatch):
+    """Ruling P: the sender's thread exists before the loop's thread runs (no production window for the inline
+    fallback)."""
+    runner = env.node.sessions
+    seen = []
+    monkeypatch.setattr(runner, "run_forever", lambda: seen.append(runner.checkpoint_thread is not None))
+    monkeypatch.setattr(runner, "_watch", lambda: None)
+    runner.start()
+    runner.thread.join(5)
+    runner.stopping.set()
+    runner.checkpoint_thread.join(5)
+    assert seen == [True]
+
+
+def test_r3_p_a_checkpoint_is_bound_to_its_incarnation_and_the_stop_flag(env):
+    """Ruling P: rechecked right before the POST: never once shutdown began, never for another incarnation."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    runner = env.node.sessions
+    runner.host.tick()
+    held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
+    s = runner.host.sessions[sid]
+    runner.checkpoint_gen[sid] = s.gen
+    assert runner._checkpoint_due(sid, held)
+    runner.checkpoint_gen[sid] = s.gen + 1
+    assert not runner._checkpoint_due(sid, held), "another incarnation"
+    runner.checkpoint_gen[sid] = s.gen
+    runner.stopping.set()
+    assert not runner._checkpoint_due(sid, held), "shutdown began"
+
+
+def test_r3_parity_a_revoked_codex_attempt_keeps_mains_contact(henv):
+    """Step 2 parity: a Codex attempt (its adapter holds nothing) whose writing an omission revoked takes no more
+    acknowledgements on its contact clock, as on main; a Claude one (`holds`) still does (ruling G)."""
+    from agent_comms.session_host import SteerSlot
+    for holds, moves in ((False, False), (True, True)):
+        slot = SteerSlot("u", "1", "t", session_id=SID, cover_until=henv.clock() + 20)
+        slot.holds, slot.revoked = holds, "omitted"
+        before = slot.cover_until
+        slot.ack(henv.clock(), henv.clock, SID, 1)
+        assert (slot.cover_until != before) is moves, holds
+
+
+def test_r3_parity_an_ordinary_claude_turn_survives_a_fault_through_the_outbox(henv, monkeypatch):
+    """Step 2 parity, ruling I's outbox for ordinary events: an ordinary (never steered) Claude turn's end published,
+    the tick raising after it: the next tick delivers it, once."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a turn", message_id="1")
+    henv.host.tick()
+    m = uuid_of(child)
+    child.emit(vinit(m), owned(m, text="M"))
+    restore = _tick_raising_after(henv.host)
+    with pytest.raises(RuntimeError):
+        henv.host.tick()
+    restore()
+    assert [e.text for e in ends(henv.host.tick())] == ["M"] and not ends(henv.host.tick())
+
+
+def test_r3_parity_a_codex_turn_survives_a_fault_through_the_outbox(henv):
+    """Step 2 parity, ruling I's outbox for Codex: a Codex turn's end published, the tick raising after it: the next
+    tick delivers it, once."""
+    from test_session_host import codex_host, codex_ready
+    import test_providers_codex as cx
+    host, s = codex_host(henv)
+    host.send(SID, "a codex turn", message_id="1")
+    host.tick()
+    child = henv.spawner.children[-1]
+    codex_ready(host, child)
+    host.tick()
+    start = [json.loads(x) for x in child.stdin.split(b"\n") if x and b'"turn/start"' in x][-1]
+    child.emit(cx.reply(start["id"], cx.TURN_REPLY), cx.TURN_STARTED)
+    host.tick()
+    child.emit(cx.completed())
+    restore = _tick_raising_after(host)
+    with pytest.raises(RuntimeError):
+        host.tick()
+    restore()
+    got = [e for e in host.tick() if e.kind == "turn_ended"]
+    assert len(got) == 1 and not [e for e in host.tick() if e.kind == "turn_ended"]
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
