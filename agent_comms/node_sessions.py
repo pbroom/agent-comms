@@ -1632,48 +1632,57 @@ class SessionRunner:
 
         (Review round 5, ruling W) On the watchdog's thread this only reads clocks and memory, takes the cutoff lock,
         makes a claim, sends signals and appends events already built (the host defers every save, transcript line
-        and log line made there to the loop). The due SIGKILLs come first and take NO lock (not the runner lock, not
-        the cutoff lock): a loop stalled while holding its lock never holds up a SIGKILL. The self-stop and the steer
-        deadlines then take the runner lock, waiting for it at most one watch interval (a loop stalled longer: they
+        and log line made there to the loop). The due SIGKILLs take NO lock (not the runner lock, not the cutoff lock):
+        a loop stalled while holding its lock delays them by one bounded wait at most. The self-stop and the steer
+        deadlines take the runner lock, waiting for it at most one watch interval each (a loop stalled longer: they
         wait for a later pass, said in the log). Each step is on its own: one that raises never keeps the next from
         running, on this pass or the next."""
         if self.stopping.is_set():
             return          # shutdown stops everything itself
         now = self.clock()
         allowed = self.watch_seconds + LOCK_SLACK_SECONDS
+        # Main's order (R4-06): the self-stop, the due SIGKILLs, then the steer deadlines. The two locked steps each
+        # take the runner lock with a timeout of one watch; the kills take none, so a loop stalled while holding its
+        # lock delays them by that one wait at most, never longer; and a loop that kept its lock that long is not
+        # waited for again in this pass.
+        locked = self.lock.acquire(timeout=self.watch_seconds)
+        if not locked:
+            log.warning("hosted sessions: the session loop holds its lock: the self-stop and the steer deadlines wait "
+                        "for the next watch (limit e)")
+        else:
+            try:
+                if not self.stopping.is_set():
+                    due = self._self_stop_due()
+                    if self._silent(now):
+                        # (rulings S and X) its own events only, put into `watched` (their lane) inside the call,
+                        # before anything here can raise: what the outbox held stays there for the loop's handoff
+                        stopped = self.host.stop_turns(self._self_stop_detail(), own=True, into=self.watched)
+                        if stopped and now - due > allowed:
+                            log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session "
+                                        "loop held its lock that long (limit e)", now - due)
+            except Exception:
+                log.exception("hosted sessions: the self-stop failed")
+            finally:
+                self.lock.release()
         try:
             for sid, at in self.host.kill_due():
                 if now - at > allowed:
-                    log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline (limit e)",
-                                sid, now - at)
+                    log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the "
+                                "session loop held its lock that long (limit e)", sid, now - at)
         except Exception:
             log.exception("hosted sessions: the due SIGKILLs failed")
-        if not self.lock.acquire(timeout=self.watch_seconds):
-            log.warning("hosted sessions: the session loop holds its lock: the self-stop and the steer deadlines wait "
-                        "for the next watch (limit e)")
+        if not locked or not self.lock.acquire(timeout=self.watch_seconds):
             return
         try:
             if self.stopping.is_set():
                 return
-            due = self._self_stop_due()
-            try:
-                if self._silent(now):
-                    # (rulings S and X) its own events only, put into `watched` (their lane) inside the call, before
-                    # anything here can raise: what the outbox held stays there for the loop's handoff
-                    stopped = self.host.stop_turns(self._self_stop_detail(), own=True, into=self.watched)
-                    if stopped and now - due > allowed:
-                        log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop "
-                                    "held its lock that long (limit e)", now - due)
-            except Exception:
-                log.exception("hosted sessions: the self-stop failed")
             # Then, after every deadline of main's has been met (a cut's drain must never delay them, R4-06): loss
             # is one-way, and a half-written steer frame past its limit is cut (a Codex one: main's step 2; a Claude
             # one is left to the loop, which reads N's end first: ruling W).
-            try:
-                self._steer_watch(now)
-                self.host.steer_deadlines(into=self.watched_steer, watchdog=True)
-            except Exception:
-                log.exception("hosted sessions: the steer deadlines failed")
+            self._steer_watch(now)
+            self.host.steer_deadlines(into=self.watched_steer, watchdog=True)
+        except Exception:
+            log.exception("hosted sessions: the steer deadlines failed")
         finally:
             self.lock.release()
 
