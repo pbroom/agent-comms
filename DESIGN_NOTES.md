@@ -14419,3 +14419,255 @@ After the last code commit (b3207c1):
   not an e2e: pruning on the hub takes its retention time.
 - An S echo lost could not be provoked on 2.1.330 (36 runs); the rule for it (departure 4) is tested on frames only.
 - Checkout hardening (Q) and the node-local journal (L), as the design says.
+
+### Review round 2 (on e9e4489: CHANGES, seven blockers; M8 evidence sufficient) and what changed
+
+Backup branch `backup/claude-steering-e9e4489`. The coordinator's rulings F-K remove the blockers as classes. Each of
+Sol's sequences is a test that fails on e9e4489 (run on an export of it with this tree's tests) and passes now;
+tests that only close a coverage row are said to be so.
+
+#### F. One qualification of a steer frame (blockers 1, 2)
+
+- **Sequences.** (1) After `init` [S], a notification `init`, then a notification terminal echoing [S]: `next_turn`
+  with the notification's text. (2) `n_with_s` on a notification-origin [N, S]. (3) `s_end` (rule 10) on an
+  echo-less error with an explicit human origin, or with a malformed echo field. (4) After a successful S, an error
+  echoing S between `init` [M] and M's result failed M by order with S's old failure text.
+- **Structure.** `ClaudeSession._steer_frame(ev, kind, caps)` is THE one qualification (callers: `_init_turn` and
+  `_result_turn`, each first, before step 1's table). It alone sets every typed steer event (`n_with_s`,
+  `n_without_s`, `s_only`, `s_open`, `s_end`, `s_consumed`, and rule 10's echo-less error); `_lose` types a loss
+  `lost` (the existing loss path). It enforces M8's measured shape: `_echo_shape` (the list a list of strings, in
+  order; a result's scalar its first element; an init has no scalar; a malformed field is not "empty"), the measured
+  origin (none for the host's lines; `task-notification` for a turn the CLI started, which `s_consumed` needs; none
+  for the three-outcome mode's own [S] bracket), the phase (`n`, `held`, `s_turn`), the verified incarnation and its
+  version and capability. A frame that names S, or N once N's own result came, in any other shape contradicts it:
+  `_contradict` (the loss of verification for the attempt, `lost`), never "ignored": an init naming S inside N's
+  bracket, any init while S owns its bracket, a non-measured [S] init, N's result not exactly [N] or [N, S] with
+  scalar N and no origin, an [S] result not as measured, anything naming N during the hold. Rule 10 inside S's
+  proved bracket needs an error with NO echo field at all and NO `origin` key (an explicit human origin, or a
+  malformed field, is not S's failure: no evidence; S's turn goes on to its bound). A frame that names neither S
+  nor N is step 1's, unchanged.
+- **Retired attempts.** `steer_done` keeps every decided S a byte of which went (`_retired`, `_retired_order`, at most
+  RETIRED_MAX = 256 per process incarnation, oldest forgotten: one attempt per turn, so the last 256 turns' steers;
+  a new incarnation starts with none). `_steer_frame` checks a frame naming a retired S FIRST, before any ordinary
+  fallback (rule 10, order, the settled-uuid class): it is no message's, ends, fails and supplies text for nothing,
+  and M's turn goes on to its own result. (Not a loss of verification: the retired S is known, and its late frame
+  says nothing about M.)
+- **Round 1's expectations that F changes** (each test rewritten, its docstring saying why): an [S, X] init in the
+  hold, a late [N, S] in the hold, an [S] result not as measured in S's turn: the loss at once (the finalizer,
+  `unconfirmed`, or `next_turn` cut in S's own turn), no longer "no evidence, to the bound"; N's result as [S, N],
+  [N, S, X] or [N, S] with scalar S: not N's result (N fails at its bound, part A's third exception); after a
+  deviation in N's bracket an exact [N, S] is N's own result with S `unconfirmed`, no longer `in_turn` (typed
+  evidence needs the verified incarnation).
+- **Tests.** `test_r2_f_a_notification_in_ss_own_bracket_never_becomes_ss_reply`,
+  `test_r2_f_a_notification_terminal_echoing_s_in_ss_bracket_is_a_contradiction`,
+  `test_r2_f_a_notification_origin_n_s_result_is_not_in_turn`,
+  `test_r2_f_rule_10_needs_an_error_with_no_echo_field_and_no_origin[human_origin|malformed_dict|null_list|nonstring_scalar]`,
+  `test_r2_f_a_retired_ss_error_never_fails_the_successor`, `test_r2_f_the_retired_set_is_bounded_per_incarnation`
+  (all fail on e9e4489); `test_r2_f_a_retired_ss_result_never_supplies_the_successors_text` (coverage). The model
+  (`test_model_claude_steer_walks_against_an_independent_reference`, now 900 walks) gains re-inits and
+  notification-origin terminals while S owns the bracket, an [S] init inside N's bracket, and late frames of a
+  retired S (an error and a result naming it) during a successor, with that row in its reach.
+
+#### G. Authority through a full hold; one stop boundary (blocker 3)
+
+- **Sequences.** An authoritative omission (`revoked = "omitted"`) masked the contact running out later: the hold
+  ran on. The real watchdog cut only partial frames, never a full hold. `_hold_pass` could start a single-session
+  stop after the global latch.
+- **Structure.** `SteerSlot.expired` is the contact clock's own latch (`_expire`, called by `contact_ran_out`,
+  `contact_ok` and `ack`), apart from write revocation (`revoked`, whose first reason stays); an acknowledgement still
+  extends the contact of an attempt whose writing an omission revoked. `SessionHost._hold_cut` is THE cut of a held
+  end (callers: `_hold_pass` in the loop's pass, and `steer_deadlines`, the deadline watchdog's boundary, the very
+  one step 2 uses for a partial frame: `SessionRunner.enforce_deadlines`, which runs while the loop is blocked on
+  hub I/O). It checks the latch first, drains, then re-checks the latch UNDER its lock and makes the decision and
+  the SIGTERM there: after the latch nothing single-session is started; the stop of every turn publishes from what
+  was processed (Shutdown simplified).
+- **Tests.** `test_r2_g_an_omission_never_masks_the_contact_running_out[held|s_turn]`,
+  `test_r2_g_after_the_latch_the_hold_pass_initiates_no_stop`,
+  `test_r2_g_the_real_watchdog_cuts_a_full_hold_while_the_loop_is_blocked` (fail on e9e4489);
+  `test_r2_g_runner_signal_during_a_hold_then_shutdown_publishes_n_once` (through `SessionRunner.signal`; coverage).
+
+#### H. The cutoff lock covers the decision only (blocker 4)
+
+- **Sequence.** The adjudicator held the global latch lock through the log line and `_save_state()`; `stop_turns`
+  saved inside a held publication before the next sessions had their SIGTERM.
+- **Structure.** `_publish_hold` is now `_retire_hold` (the decision's state, atomically: the adapter's retirement,
+  the hold taken, the slot's outcome, N no longer in flight; no log, no I/O) then `_emit_hold` (the log line, the
+  events into the outbox, the save). `_steer_adjudicate` calls `_retire_hold` under `_steer_stop_lock` and
+  `_emit_hold` after it; `_steer_end` retires the adapter's attempt inside its lock too. `stop_turns` and `stop_all`
+  set `_defer_save`. **The order**: for every session in turn, its held end (if any) decided and its events emitted,
+  then its SIGTERM; once every session has its SIGTERM, the state is saved, once.
+- **Tests.** `test_r2_h_every_sigterm_goes_before_a_held_publication_persists[stop_turns|stop_all]` (`_save_state`
+  recording, as a blocking one would show), `test_r2_h_the_cutoff_lock_is_not_held_while_a_publication_logs_or_saves`
+  (fail on e9e4489).
+
+#### I. Published events cannot be lost by a later fault (blocker 5)
+
+- **Sequence.** N held; a read fails, then the SIGTERM raises: the publication had gone into the tick's local list,
+  the exception escaped `tick()`, and the next tick emitted nothing.
+- **Structure.** `SessionHost._outbox`: every event is published into it at the moment of publication; `tick`,
+  `close`, `cancel`, `stop_turns`, `stop_all` and `steer_deadlines` hand it over, emptied, when they return
+  (`_take_outbox`); an exception escaping one of them leaves it intact, and the next of them delivers it: exactly
+  once. (The node's close of a session the hub no longer lists now emits what it returns, so nothing of another
+  session waiting in the outbox is dropped there; the closed session's own events are dropped as before.)
+- **The three guards Sol disputed**, each with the fault that makes it matter: the first fence check raising once
+  (`test_r2_i_a_first_fence_check_that_raises_publishes_at_once_before_any_read`), a stop that blocks or raises
+  (`test_r2_i_a_host_error_publishes_before_its_stop_is_attempted`: N is out before the SIGTERM is attempted), and
+  a close then a read error before the grace (`test_r2_i_a_read_error_after_a_close_fenced_n_publishes_at_once`).
+- **Tests.** `test_r2_i_a_read_error_then_a_raising_sigterm_never_loses_ns_end`,
+  `test_r2_i_a_host_error_publishes_before_its_stop_is_attempted` (fail on e9e4489); the other two pin guards that
+  were already there.
+
+#### J. The hub identifies a Claude attempt by capability (blocker 6)
+
+- **Sequence.** A Claude agent whose runtime has another Claude name, with a `claude` runner: S written, then the
+  checkpoint refused and S `unconfirmed`, because the hub compared a literal runtime string.
+- **Structure.** A capability of its own: the adapter says `held` (`ClaudeSession.holds`, exactly when it steers;
+  `providers.modes`, MODES ("steer", "restart", "held")); the node reports it among a session's modes; the hub
+  accepts `held` (only with `steer`) and records it WITH THE ATTEMPT at acceptance (`hosted_steer.accept`: `holds`).
+  `hosted_steer.holds(s)` decides a checkpoint (`checkpoint`) and `next_turn` (`settle`); `claude(r)` is gone.
+  **Fail closed across versions**: the node reports a Claude session's `steer` and `held` only to a hub whose listing
+  names `held` (`_post_pending`'s modes); a listing without `held` only fences a Claude session's steer
+  (`_reconcile`, `_steer_listed`'s `aware`, by `SessionHost.holds(sid)`); and the write itself rechecks it
+  (`NodeSessions._steer_capable`, set as `SessionHost.steer_capable` and asked in the write gate `_steer_gate_locked`
+  beside the fence, under the attempt's lock: the existing check-and-write boundary). It is never part of the
+  attempt's authority: a first build put it in `_steer_authority`, which the hold cut also reads, and the e2e's Z7
+  showed a failed fetch (the hub's features forgotten for a while) cutting a hold after 22 s;
+  `test_r2_j_a_failed_fetch_never_cuts_a_hold` pins it. A step-2 hub therefore never sees a Claude steer offered or
+  written. The README says what a rollback to step 2 needs (keep `steer = false` through the node-first rollback,
+  do not remove the key at the cut-over, decide when to re-enable Codex steering); the #116 steps stay for a
+  pre-steering target.
+- **Tests.** `test_r2_j_a_claude_alias_runtime_steers_end_to_end`, `test_r2_j_a_step_2_hub_is_never_offered_a_claude_steer`
+  (fail on e9e4489); `test_r2_j_a_failed_fetch_never_cuts_a_hold` (a regression of this round's first build).
+
+#### K. Checkpoints never delay ordinary reports (blocker 7)
+
+- **Sequence.** A result arriving during three ready checkpoint POSTs waited behind all three on the loop's thread.
+- **Structure.** `NodeSessions._send_checkpoints`, the checkpoint sender's own thread (`start_checkpoint_sender`,
+  from `start`): its own queue (`checkpoint_queue`, at most one per session), its own timeout (CHECKPOINT_SECONDS),
+  never on the loop's thread: `_flush` (after the session's pending events) only queues. At dispatch
+  `_checkpoint_due` rechecks the hub's current capability (`held`, features known) and that the session and N are
+  still the ones it was made for (hosted here, not dropped, N's end still held); else it is dropped. A dropped or
+  failed checkpoint changes nothing else. A node driven pass by pass with no sender thread (the tests' fake node)
+  posts inline, as before.
+- **Shutdown** drops a queued checkpoint (the sender ends with `stopping`; nothing waits for it). **Without a
+  checkpoint the hub settles N** on the node's own end by that end's fields (S from its extension); on a replacement
+  node's LOST, a hub close, cascade or orphan, or node loss by main's failure, S `unconfirmed` (listed) or
+  `not_delivered` (never listed).
+- **Contact.** Deliberately not contact on either side: the node posts a checkpoint through the client directly, not
+  `_call` (no node contact renewed, no feature knowledge changed), and the hub neither notes the node's contact
+  (`api`: `note_contact` only for a report with no `held`) nor moves the session's report time for a checkpoint-only
+  report. Contact is the session loop's liveness; the checkpoint sender is not the loop.
+- **Tests.** `test_r2_k_a_result_is_reported_while_checkpoint_posts_are_stalled`,
+  `test_r2_k_a_checkpoint_is_rechecked_at_dispatch` (fail on e9e4489).
+
+#### The shoulds
+
+- The hub refuses a report mixing `held` with events or status (`hosted.report`) and the impossible `next_turn`
+  shapes (`hosted_steer.possible_next_turn`: `own_turn` answered; `own_turn_cut` failed, unanswered, no reply; no
+  `message` key): `test_r2_shoulds_the_hub_refuses_a_mixed_checkpoint_report_and_impossible_next_turns`.
+- Invalid Unicode (a lone surrogate) in S's text, detail and metadata and in a checkpoint's is made encodable on the
+  node (`node_sessions._clean`): `test_r2_shoulds_a_surrogate_in_ss_optional_fields_never_breaks_a_report`.
+- A stale checkpoint is cleared also when step 2 settled both N and S (`hosted_steer.stale`, `settle_unsettled`):
+  `test_r2_shoulds_a_stale_checkpoint_is_cleared_when_step_2_settled_both`.
+- The 2 x kill_grace clock starts at the SIGTERM (`_stop` stamps `fenced_at` there):
+  `test_r2_the_bounded_publication_counts_from_the_sigterm`; the timeout drain stamps a newly found S `init` with
+  the time it was read (`_steer_adjudicate`: `self.clock()`):
+  `test_r2_o_an_s_init_read_only_by_the_timeout_drain_gets_its_clock_from_the_read`.
+- **The bound, restated as what the host guarantees** (decision time, on the host): from N's native end, at most one
+  turn timeout until S's own turn opens; then at most one turn timeout from the moment S's `init` was read; then the
+  SIGTERM, and at most 2 x kill_grace from it to N's end being published into the host's outbox, the deadline
+  checked at the start of every tick (the next tick is TICK_SECONDS away while a session has work, plus whatever the
+  loop's previous pass spent on its own hub calls). **Not part of it**: the report's delivery and the hub's
+  acknowledgement (a report waits for the hub's answer, is retried while the hub cannot be reached, and a lost node
+  is settled by the hub's own loss rules); the checkpoint, which never delays it.
+- The golden's report allowance names Claude sessions explicitly (`_claude_sessions`) and covers the steer-only
+  capability (`CLAUDE_STEER_MODES`): `test_step3_named_takes_steer_and_held_only_from_claude_sessions_with_or_without_restart`.
+- Part O's Partly rows: a drain-only read finding S's start
+  (`test_r2_o_an_s_init_read_only_by_the_timeout_drain_gets_its_clock_from_the_read`); `SessionRunner.signal` before
+  and during a hold (`test_r2_o_runner_signal_before_ns_end_publishes_n_once`,
+  `test_r2_g_runner_signal_during_a_hold_then_shutdown_publishes_n_once`); the watchdog through a full hold
+  (`test_r2_g_the_real_watchdog_cuts_a_full_hold_while_the_loop_is_blocked`); a listing omission at each byte phase
+  followed by contact expiry (`test_r2_o_an_omission_at_each_byte_phase_then_the_contact_running_out[zero|partial|whole]`);
+  step 2's settlement of both records (`test_r2_shoulds_a_stale_checkpoint_is_cleared_when_step_2_settled_both`); a
+  crash after a dropped checkpoint (`test_r2_o_a_crash_after_a_dropped_checkpoint_settles_n_by_its_own_end`). e2e:
+  Z12 a crash restart (SIGKILL) with a committed checkpoint, Z11 a partition with none (`--only steering`).
+- The M8 MANIFEST says which fields the projection drops (the init's tool and environment lists; assistant and user
+  frames' contents, replay markers and parent ids; usage; rate-limit, stream and status frames) and why none touches
+  the ownership predicates.
+
+#### Mutation check, review round 2
+
+Scratchpad `steer3/mutate_r2.py` (rebuilt after the crash, see below), one change per row applied alone to an export
+of the branch, tests/test_claude_steering.py first and, only if that did not catch it, the correlation, Codex
+steering, restart, hub restart, golden, hosted-session and host tests; the file restored. 48 rows on F (the
+qualification and the retired set), G (expiry, the watchdog's cut, the latch), H (the lock, the save order), I (the
+outbox and its three guards), J (the recorded capability, the node's gates), K (the sender, its recheck, contact)
+and the shoulds. On 63d3fe9: 37 caught, 11 missed. The misses got tests (`test_r2_m_*`, ef27f84) and the 11 ran
+again on ef27f84: 8 caught, 3 not, each equivalent here, given:
+
+| row | caught by, or why it cannot be |
+| --- | --- |
+| I a deadline error publishes at once (disputed) | `test_r2_i_a_first_fence_check_that_raises_publishes_at_once_before_any_read` |
+| I a host error's end is at once (disputed) | `test_r2_i_a_host_error_publishes_before_its_stop_is_attempted` |
+| I a host error publishes in its finally (disputed) | `test_r2_i_a_read_error_after_a_close_fenced_n_publishes_at_once` |
+| I the outbox survives an exception | `test_in_turn_n_s_result_lists_its_own_uuid_and_s` (and every test after a fault) |
+| F an init's scalar echo; a late [N] in the hold; consumed's origin | `test_r2_m_an_s_init_with_a_scalar_echo_is_a_contradiction`, `test_r2_m_a_late_result_naming_only_n_in_the_hold_is_a_contradiction`, `test_r2_m_consumed_needs_the_notification_origin_measured` |
+| G an ack after an omission keeps the contact | `test_r2_m_an_acknowledgement_after_an_omission_still_keeps_the_contact` |
+| J the attempt records its capability; the write gate asks it; a listing without held | `test_r2_m_a_codex_attempt_is_recorded_without_the_held_capability`, `test_r2_m_the_write_gate_asks_the_hubs_capability`, `test_r2_m_a_listing_without_held_takes_no_claude_steer_offer` |
+| K a checkpoint is no contact | `test_r2_m_a_checkpoint_is_not_the_nodes_contact` |
+| F echo shape: the scalar is the first | equivalent: every predicate also names the scalar it needs (`scalar == n`, `scalar == s_`, `scalar is None` for an init) |
+| F echo shape: strings only | equivalent: every predicate compares the whole list for equality with lists of the host's uuids, which a non-string never equals; the frame then names S or N not as measured and contradicts all the same |
+| G the hold cut checks the latch first | equivalent: the same check is made again under the latch's lock before the decision and the SIGTERM, and the drain between them reads nothing once the latch is set |
+
+The other 33 caught on the first run, by row: the retired set (kept, checked first), an init naming S in N's
+bracket, any init in S's turn, S's end's origin and the retirement inside `_steer_end`'s lock (the model); S's
+init's origin (`test_r1_b2_only_the_exact_init_opens_ss_own_turn[notification]`); `n_with_s`'s origin
+(`test_r2_f_a_notification_origin_n_s_result_is_not_in_turn`) and its verified incarnation
+(`test_a_plain_result_after_a_steer_is_never_ns_by_order`); N's result not as measured
+(`test_r1_m_ns_result_with_s_is_exactly_n_then_s[reversed]`); rule 10's origin key
+(`test_r1_o_a_zero_turn_error_notification_in_the_hold_and_in_ss_own_bracket_is_inert[s_turn]`) and its echo fields
+(`test_r2_f_rule_10_needs_an_error_with_no_echo_field_and_no_origin[malformed_dict]`); expiry not masked and the
+watchdog's cut (`test_r2_g_an_omission_never_masks_the_contact_running_out[held]`); the publication outside the lock
+(`test_r2_h_the_cutoff_lock_is_not_held_while_a_publication_logs_or_saves`); the save after every SIGTERM
+(`test_r2_h_every_sigterm_goes_before_a_held_publication_persists[stop_turns|stop_all]`); the deadline first
+(`test_r1_m_the_deadline_is_published_before_any_read_of_the_tick`); a checkpoint and `next_turn` need the capability
+(`test_r1_c_the_hub_refuses_impossible_checkpoints`, `test_r1_c_next_turn_is_taken_only_for_a_claude_steer`); the
+node's report and write gates (`test_r2_j_a_step_2_hub_is_never_offered_a_claude_steer`); the adapter says held
+(`test_e2e_in_process_next_turn_checkpoint_then_ns_native_end_with_ss_reply`); checkpoints go to the sender
+(`test_the_end_to_end_script_passes_with_the_stand_in`); the recheck at dispatch
+(`test_r2_k_a_checkpoint_is_rechecked_at_dispatch`); and each should's own test.
+
+#### Runs
+
+After the last code commit (ef27f84), on 26 November (after the main laptop's reboot):
+- `uv run pytest -q -p no:cacheprovider`: 4699 passed, 10 skipped, 21 failed. The 21 are node-run tests
+  (tests/test_nodes.py, test_node_checkout_takeover.py, test_agent_accounts.py, test_signed_in_profiles.py), none of
+  steering: their fake processes' pids start at 1000, and since the reboot pid 1000 is a live process-group leader
+  on this machine (WiFiAgent), so the node's real group probe sees "members left". The same 17 failures of
+  tests/test_nodes.py and test_node_checkout_takeover.py occur on an export of main d11ff99, and of e9e4489, 2965968
+  and 56265d8. Not touched here.
+- The stand-in e2e in full: PASS (395 checks).
+- `--only steering` with stand-ins: PASS (115 checks: Q0-Q8, Z0-Z12, Z7 and Z11 included).
+- `--only correlation` with stand-ins: PASS.
+- `--only steering` with the real CLIs (Claude Code 2.1.330, haiku; codex-cli 0.172.0): PASS (54 checks).
+- `--only correlation` with the real CLIs: PASS.
+- `~/.codex/config.toml` sha256 be07f3845d522521 before, between and after the real runs.
+- Earlier in the round (before the crash), two stand-in steering runs failed for the machine, not the code: once the
+  Mac entered clamshell sleep on battery for 15 minutes during Z8 (the pmset log: "Entering Sleep state due to
+  'Clamshell Sleep'", 19:13:48), so the hub settled N by node loss; once Z5's child turn (3 s) ended before the
+  parent's MCP call reached it (now 6 s). And one failure was the code's: Z7 showed ruling J's first build cutting a
+  hold on a failed fetch (above, J).
+
+#### Not done, and where a ruling needed reading
+
+- An S echo loss is still not provoked on real frames (M8's 39 runs); the failure policy is tested on frames.
+- F's "explicit human origin" contradiction applies to frames that name S or N; an echo-less error with a human
+  origin inside S's bracket names neither, so it is no evidence (S's turn runs to its bound), not a loss. This
+  reading keeps "a frame that names neither is step 1's" intact. Say if a loss is wanted there instead.
+- A retired S's late frame is no evidence and NOT a loss of verification (F says it can never end, fail or supply
+  text for another message; it does not say lose). Same caveat.
+- K's sender posts inline when no sender thread was started (a node driven pass by pass); every production node
+  starts it (`start`).
+- The main laptop crashed at about 21:08 on 25 November and /private/tmp was cleared: nothing committed was lost;
+  the scratchpad (the mutation scripts, the round's logs, the raw M8 runs, the review texts) was. The mutation
+  script was rebuilt from the session's record and run again on the committed head.
