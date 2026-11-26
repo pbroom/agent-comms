@@ -1494,6 +1494,11 @@ def _apply(c, r: dict, ev: dict, by: str, now: float, results: bool = False) -> 
             # the owning host's word on S (this end's extension) is taken from the event.
             ev = hosted_steer.held_end(m) | {"steer": ev.get("steer")}
             m.pop("held", None)
+        if (isinstance(ev.get("steer"), dict) and ev["steer"].get("outcome") == "next_turn"
+                and ev.get("answered") is not True):
+            # (Review round 3, ruling O) `next_turn` only with N's native end, answered, or its committed checkpoint
+            # (whose fields stand in for it, above): an impossible extension is ignored, N's end taken
+            ev = ev | {"steer": None}
         ok = ev["ok"] is True
         detail = ev["detail"] or ("" if ok else "the agent reported that the turn failed"
                                   + (f" ({ev['meta']['subtype']})" if isinstance(ev["meta"].get("subtype"), str) else ""))

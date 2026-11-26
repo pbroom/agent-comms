@@ -220,6 +220,9 @@ class SteerSlot:
     # first reason stays) and contact expiry are tracked apart, so an authoritative omission never masks the contact
     # running out later (a fully written attempt's hold is still cut then).
     expired: bool = False
+    # (Round 3, step 2 parity) The attempt is a Claude one (its adapter holds N's end): only its contact clock is kept
+    # after an omission revoked its writing; a Codex attempt's is main's.
+    holds: bool = False
 
     def _expire(self, now: float) -> None:
         """(Under `lock`.) Past the contact clock: expired for good, and never written from then on."""
@@ -244,8 +247,8 @@ class SteerSlot:
         flight. It counts for this attempt only if it is evidence for exactly this session and N; received after the
         contact ran out, it latches the break for good instead (S2-03, R2-07)."""
         with received_under(self.lock, clock) as received:
-            if self.cover_until is None or self.expired:
-                return
+            if self.cover_until is None or self.expired or (self.revoked is not None and not self.holds):
+                return      # (round 3, step 2 parity: a revoked Codex attempt's contact is main's: not extended)
             if about is not None and not (about == self.session_id and type(n) is int and str(n) == self.into):
                 return
             if received >= self.cover_until:
@@ -260,6 +263,37 @@ class SteerSlot:
         with self.lock:
             self._expire(now)
             return self.revoked is None
+
+
+
+class _Outbox(list):
+    """(Review round 3, ruling M) The host's outbox: published events in order, each tagged with the incarnation
+    of its session when it was published, so an id opened again never receives an old event, and a forgotten
+    session's entries are purged. A list of HostEvent to every reader."""
+
+    def __init__(self, host: "SessionHost"):
+        super().__init__()
+        self._host, self._gens = host, []
+
+    def _gen(self, ev: HostEvent):
+        s = self._host.sessions.get(ev.session_id)
+        return s.gen if s is not None else None
+
+    def append(self, ev: HostEvent) -> None:
+        super().append(ev)
+        self._gens.append(self._gen(ev))
+
+    def extend(self, evs) -> None:
+        for ev in evs:
+            self.append(ev)
+
+    def purge(self, session_id: str) -> None:
+        keep = [(e, g) for e, g in zip(self, self._gens) if e.session_id != session_id]
+        self[:] = [e for e, _ in keep]
+        self._gens = [g for _, g in keep]
+
+    def current(self) -> list[HostEvent]:
+        return [e for e, g in zip(self, self._gens) if g is None or g == self._gen(e)]
 
 
 @dataclass
@@ -317,6 +351,7 @@ class Session:
     outbuf: bytearray = field(default_factory=bytearray)
     busy_since: float | None = None     # when the turn (or a handshake the provider waits for) began
     held_since: float | None = None     # since when the next message waits for a turn of the provider's own
+    gen: int = 0                        # (ruling M) this session's incarnation on this host (`_Outbox`)
     # Turn correlation (a verified Claude incarnation only): where the staged turn starts in `outbuf` while none of
     # it is accepted, and how many bytes it is (only for an adapter that asks, `barrier_before_first_byte`).
     turn_at: int | None = None
@@ -654,7 +689,8 @@ class SessionHost:
         # (Review round 2, ruling I) Every event the host publishes goes here at the moment of publication; `tick`,
         # `close`, `cancel`, `stop_turns` and `stop_all` return it, emptied, when they return. An exception that
         # escapes one of them leaves it as it is, and the next of them delivers it: exactly once.
-        self._outbox: list[HostEvent] = []
+        self._outbox: _Outbox = _Outbox(self)
+        self._gens = itertools.count(1)     # (ruling M) each opened session's incarnation, for the outbox's entries
         self._defer_save = False    # (ruling H) a stop of every turn: held publications persist after every SIGTERM
 
     # ------------------------------------------------------------ local state (survives a host restart)
@@ -846,6 +882,7 @@ class SessionHost:
         s = Session(session_id, agent, runtime, project, cwd, template, factory(), model=model,
                     thread_id=int(thread_id), resume=bool(resume), asked=access, access=label, effort=effort,
                     seal=seal, bind=bind)
+        s.gen = next(self._gens)
         runs_in = getattr(s.provider, "runs_in", None)
         if runs_in is not None:
             runs_in(cwd)        # a child's own worktree when it has one: the process, and so the thread, works there
@@ -1018,6 +1055,7 @@ class SessionHost:
             slot = SteerSlot(uuid, into, text, authorized=bool(authorized) and refused is None, refused=refused,
                              session_id=s.session_id, cover_until=cover_until, process=s.child)
             slot.stopping = self.steer_stopped
+            slot.holds = getattr(s.provider, "steer_named", None) is not None     # (round 3, step 2 parity)
             s.steer = slot
             s.steered.add(uuid)
             if hook is not None:
@@ -1093,8 +1131,11 @@ class SessionHost:
                     self._steer_cut(s, self.clock(), out)
                 elif s.held is not None:
                     # (Review round 2, ruling G) the same boundary cuts a fully written hold whose contact ran out
-                    # or whose authority is gone, also while the loop is blocked on hub I/O
+                    # or whose authority is gone, also while the loop is blocked on hub I/O; and (round 3, ruling
+                    # N) publishes a fenced one whose deadline passed, into the outbox, with no loop tick needed
                     self._hold_cut(s, self.clock(), out)
+                    if s.held is not None:
+                        self._hold_deadline(s, self.clock(), out)
         return self._take_outbox()
 
     def live_attempt(self, s: Session) -> bool:
@@ -1204,6 +1245,7 @@ class SessionHost:
         if not s.ended or s.child is not None:
             raise ValueError("session has not ended, or its process is still stopping")
         del self.sessions[session_id]
+        self._outbox.purge(session_id)      # (ruling M) nothing of it is delivered once it is forgotten
         self._record_provider_id(session_id, None)
         self._drop_files(session_id)    # a read-only session's board-only MCP config, a merged settings file
 
@@ -1230,9 +1272,15 @@ class SessionHost:
         return self._take_outbox()
 
     def _take_outbox(self) -> list[HostEvent]:
-        """What was published since the last delivery, in order, handed over once (ruling I)."""
-        out, self._outbox = self._outbox, []
-        return out
+        """What was published since the last delivery, in order, handed over once (ruling I); an entry whose session
+        is gone or was opened again since (another incarnation of the id) is never delivered (ruling M)."""
+        out, self._outbox = self._outbox, _Outbox(self)
+        return out.current()
+
+    def take_outbox(self) -> list[HostEvent]:
+        """(Review round 3, ruling M) What waits in the outbox now, for the node's ONE dispatcher: drained before a
+        reconciliation can synthesise LOST for a session, and before a session is forgotten."""
+        return self._take_outbox()
 
     def _tick(self, now: float, out: list[HostEvent]) -> None:
         # Main's pass, in main's order, at the pass's `now`, for every session. A live steer attempt's turn end is
@@ -1690,9 +1738,13 @@ class SessionHost:
                     and now - s.busy_since < self.timeout_minutes * 60):
                 return      # the drain found S's own turn begun: its fresh clock holds (part D)
         if s.held is None and s.steer is not None and s.steer.lost and s.steer.outcome is None:
-            self._fail(s, STEER_UNATTRIBUTED, out)  # (part A's third exception: N's result was never attributed)
+            detail = STEER_UNATTRIBUTED     # (part A's third exception: N's result was never attributed)
         else:
-            self._fail(s, self._timeout_detail(), out)
+            detail = self._timeout_detail()
+        if live or s.held is not None:
+            self._cutoff_stop(s, detail, now, out)      # (ruling N: the held timeout too; nothing after the latch)
+            return
+        self._fail(s, detail, out)
         self._stop_from(s, now, live)
 
     def _unwritten(self, s: Session) -> None:
@@ -1951,12 +2003,15 @@ class SessionHost:
         self._fail(s, f"session ended: {detail}"[:300], out)
         undelivered = tuple(m.id for m in s.inbox)
         s.inbox.clear()
-        self._stop_from(s, now, at_signal)
-        ended = HostEvent(s.session_id, "ended", detail=s.error, undelivered=undelivered)
-        if s.held is not None and s.held.fenced_at is not None:
-            s.held.after.append(ended)      # N's held end comes first, once the bounded stop is over (part D)
-        else:
-            out.append(ended)
+        try:
+            self._stop_from(s, now, at_signal)
+        finally:
+            # (Review round 3, ruling M) the decided `ended` is transferred whatever the stop did (it may raise)
+            ended = HostEvent(s.session_id, "ended", detail=s.error, undelivered=undelivered)
+            if s.held is not None and s.held.fenced_at is not None:
+                s.held.after.append(ended)      # N's held end comes first, once the bounded stop is over (part D)
+            else:
+                out.append(ended)
 
     # ------------------------------------------------------------ starting and writing
 
@@ -2370,14 +2425,13 @@ class SessionHost:
         """The decided hold made public: the log line, N's end and what waited behind it into the host's outbox
         (ruling I), and the state saved, outside the cutoff lock (ruling H); during a stop of every turn the save
         waits until every session has its SIGTERM (`stop_turns`, `stop_all`)."""
-        log.info("session %s: the steer into message %s: %s (%s)", s.session_id, held.end.message_id,
-                 steer["outcome"], steer["why"])
         out.append(dataclasses.replace(held.end, steer=dict(steer)))
-        out.extend(held.after)
-        if self._defer_save:
-            return
+        out.extend(held.after)      # (ruling M: the events first; a raising log handler or save loses nothing)
         try:
-            self._save_state()
+            log.info("session %s: the steer into message %s: %s (%s)", s.session_id, held.end.message_id,
+                     steer["outcome"], steer["why"])
+            if not self._defer_save:
+                self._save_state()
         except Exception:
             log.exception("session %s: could not record the sessions' state after a held end", s.session_id)
 
@@ -2437,11 +2491,23 @@ class SessionHost:
         if why is None:
             return
         now = self._drain_before_stop(s, now, out)
+        if s.held is held:
+            self._cutoff_stop(s, why, now, out)
+
+    def _cutoff_stop(self, s: Session, why: str, now: float, out: list[HostEvent]) -> bool:
+        """THE single-session stop of a session holding a live steer attempt or a held end (review round 3, ruling N;
+        callers: `_hold_cut`, and the turn timeout `_hold_to_timeout`, the held one included). The decision and the
+        fence are made under the cutoff lock; after the global latch it does nothing (the stop of every turn is the
+        one that acts, Shutdown simplified). The group registry and the SIGTERM come after the lock is let go (a
+        stop decided before the latch whose signal lands after it is the same signal shutdown sends). False: it did
+        nothing."""
+        slot = s.steer
         with self._steer_stop_lock:
-            if self.steer_stopped or (slot is not None and slot.stopping) or s.held is not held:
-                return      # the latch came during the drain: the stop of every turn is the one that acts
+            if self.steer_stopped or (slot is not None and slot.stopping):
+                return False
             self._fail(s, why, out)
-            self._stop(s, now, at_signal=True)
+        self._stop(s, now, at_signal=True)      # (dated at its SIGTERM: R8-01)
+        return True
 
     def _spawn(self, s: Session, now: float, out: list[HostEvent]) -> None:
         try:
@@ -2665,14 +2731,17 @@ class SessionHost:
         now = self.clock()
         self._at_once = self._defer_save = True     # a held end is published here, at main's point (shutdown simplified)
         try:
-            for s in self.sessions.values():
+            for s in list(self.sessions.values()):
                 if s.child is not None and s.busy and not s.ended:
-                    self._fail(s, detail[:300], out)
-                    self._stop(s, now)
+                    try:        # (ruling N) one session's fault never skips the others
+                        self._fail(s, detail[:300], out)
+                        self._stop(s, now)
+                    except Exception:
+                        log.exception("session %s: could not stop its turn", s.session_id)
         finally:
             self._at_once = self._defer_save = False
-        if out:
-            self._save_state()
+            if out:
+                self._save_state()
         return self._take_outbox()
 
     # ------------------------------------------------------------ shutdown
@@ -2687,8 +2756,11 @@ class SessionHost:
         self._at_once = self._defer_save = True     # a held end is published here, at main's point (shutdown simplified)
         try:
             for s in live:
-                self._fail(s, "the session host shut down", out)
-                self._stop(s, now)
+                try:        # (ruling N) one session's fault never skips the others
+                    self._fail(s, "the session host shut down", out)
+                    self._stop(s, now)
+                except Exception:
+                    log.exception("session %s: could not stop it at shutdown", s.session_id)
         finally:
             self._at_once = self._defer_save = False
         def going(s: Session) -> bool:
