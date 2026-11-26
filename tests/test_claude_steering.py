@@ -2313,6 +2313,106 @@ def test_r2_shoulds_a_stale_checkpoint_is_cleared_when_step_2_settled_both(env):
     assert "held" not in hosted._get(env.board.conn, hosted._msg_key(sid, 1))
 
 
+
+# ---------------------------------------------------------------- review round 2: part O's Partly rows, the shoulds
+
+
+def test_r2_o_an_s_init_read_only_by_the_timeout_drain_gets_its_clock_from_the_read(henv, monkeypatch):
+    """Part O (a drain-only read) and the should on its stamp: the hold's bound comes; S's `init` arrives only
+    during the timeout's drain (the pass's own read saw nothing); it is honoured, and S's clock starts when it was
+    read (a drain's read is later than the pass's `now`)."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    henv.clock.advance(61)
+    t_pass = henv.clock()
+    fed = []
+
+    def hook(sess):
+        if not fed:
+            fed.append(1)
+            henv.clock.advance(1)
+            child.emit(vinit(S))
+    henv.host.steer_drain_hook = hook
+    out = henv.host.tick()
+    assert fed and not ends(out) and s.held is not None and s.held.s_turn
+    assert s.busy_since == t_pass + 1, "S's clock from the moment its init was read"
+
+
+@pytest.mark.parametrize("phase", ["zero", "partial", "whole"])
+def test_r2_o_an_omission_at_each_byte_phase_then_the_contact_running_out(henv, monkeypatch, phase):
+    """Part O (R11-03 then contact expiry): the listing omits the steer (its writing revoked) with no byte, part or
+    all of S written; then the attempt's contact runs out (the watchdog's boundary). No byte: nothing more, N's end
+    `not_delivered`. Part: the frame is cut (`unconfirmed`, partial). All: the hold is cut (`unconfirmed`)."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    henv.host.steer_authority = lambda sess: True
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a long turn", message_id="1")
+    henv.host.tick()
+    n = uuid_of(child)
+    child.emit(vinit(n))
+    henv.host.tick()
+    child.accept = {"zero": 0, "partial": 7, "whole": None}[phase]
+    henv.host.steer_offer(SID, "1", S, TEXT, authorized=True, cover_until=henv.clock() + 20)
+    henv.host.tick()
+    if phase == "whole":
+        child.emit(owned(n, text="N"))
+        henv.host.tick()
+        assert s.held is not None
+    henv.host.steer_revoke(SID, S, "omitted")
+    henv.clock.advance(21)
+    out = henv.host.steer_deadlines()
+    child.accept = None
+    if phase == "zero":
+        child.emit(owned(n, text="N"))
+    out += henv.host.tick() + henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    want = {"zero": "not_delivered", "partial": "unconfirmed", "whole": "unconfirmed"}[phase]
+    assert end.steer["outcome"] == want, end.steer
+    if phase == "partial":
+        assert end.steer["why"] == "partial"
+
+
+def test_r2_o_runner_signal_before_ns_end_publishes_n_once(env):
+    """Part O, `SessionRunner.signal` before the hold: S written, N in flight; the node's signal; N's own result then
+    read counts for nothing about S: shutdown publishes N's end once, S `unconfirmed`."""
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    runner.signal()
+    child.emit(cresult(sid, n, text="N's reply"))
+    runner.kill()
+    runner.shutdown()
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] in ("done", "failed")
+    assert rec["outcome"] == "unconfirmed", rec
+
+
+def test_r2_o_a_crash_after_a_dropped_checkpoint_settles_n_by_its_own_end(env):
+    """Part O, a crash after a dropped checkpoint: the hub refuses N's checkpoint (dropped, never resent); then the
+    process crashes during the hold: N's held native end is published at once and the hub settles N by it (its
+    reply), S `unconfirmed`; nothing else was changed by the dropped checkpoint."""
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    real = runner.client.request
+
+    def refuse(method, url, *a, **kw):
+        if (kw.get("json") or {}).get("held") is not None:
+            raise httpx.HTTPStatusError("refused", request=httpx.Request("POST", "http://x"),
+                                        response=httpx.Response(409))
+        return real(method, url, *a, **kw)
+    runner.client.request = refuse
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    assert "held" not in hosted._get(env.board.conn, hosted._msg_key(sid, 1)), "the checkpoint was dropped"
+    child.code = -9
+    tick(env, times=3)
+    m = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    rec = hosted_steer.get(env.board.conn, sid, 1)
+    assert m["state"] == "done" and show(env, sid)["reply"] == "N's reply", m
+    assert rec["outcome"] == "unconfirmed", rec
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
