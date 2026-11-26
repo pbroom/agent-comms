@@ -1382,6 +1382,7 @@ class SessionRunner:
             if s.ended and s.child is None:
                 self._deliver(late=False)       # (ruling M) before it is forgotten
                 self.host.forget(sid)
+                self.receipts = {r for r in self.receipts if r[0] != sid}     # (ruling X: its sources are gone)
                 for d in (self.status, self.reported, self.acked_modes, self.last_busy, self.queue, self.sent, self.tree,
                           self.parent_of):
                     d.pop(sid, None)
