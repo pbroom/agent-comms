@@ -3294,6 +3294,448 @@ def test_r5_y_main_forgets_steer_only_on_its_own_legacy_path(env, code):
         assert "steer" in runner.hub_features, "a 400 is not main's legacy rejection: nothing is forgotten"
 
 
+def _on_watchdog(runner, fn=None):
+    """Run the runner's watchdog pass (or `fn`) on a thread registered as the watchdog's, as `_watch` registers its
+    own: (thread, done, [ident], [error])."""
+    import threading
+    from agent_comms import session_host
+    done, ident, err = threading.Event(), [], []
+
+    def run():
+        ident.append(threading.get_ident())
+        reg = getattr(session_host, "WATCH_THREADS", None)
+        if reg is not None:
+            reg.add(ident[0])
+        try:
+            (fn or runner.enforce_deadlines)()
+        except BaseException as e:      # noqa: BLE001 (the thread's own; the test reads it)
+            err.append(e)
+        finally:
+            if reg is not None:
+                reg.discard(ident[0])
+            done.set()
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t, done, ident, err
+
+
+def _forbid(host, children, calls):
+    """Record (name, thread) for every call that reads a pipe, drains, writes a transcript or saves state."""
+    import threading
+    for name in ("_read", "_drain_before_stop", "_save_state", "_tee"):
+        real = getattr(host, name)
+
+        def wrap(*a, _r=real, _n=name, **k):
+            calls.append((_n, threading.get_ident()))
+            return _r(*a, **k)
+        setattr(host, name, wrap)
+    for c in children:
+        real = c.read_lines
+
+        def read(_r=real):
+            calls.append(("read_lines", threading.get_ident()))
+            return _r()
+        c.read_lines = read
+
+
+def _claude_partial_with_n_buffered(env):
+    """A Claude session: N in flight, S taken in part by the pipe past its limit, N's own result buffered unread."""
+    from agent_comms.session_host import STEER_PARTIAL_SECONDS
+    sid = start(env, "a long turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    n = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, n))
+    tick(env)
+    child.accept = 10
+    r = env.human.post(f"/api/hosted-sessions/{sid}/messages", json={"message": TEXT, "mode": "steer"})
+    assert r.status_code == 200, r.text
+    tick(env, times=2)
+    s = env.node.sessions.host.sessions[sid]
+    assert s.steer is not None and 0 < s.steer.sent < s.steer.length, "the pipe took part of S"
+    child.emit(cresult(sid, n, text="N's own"))
+    env.clock.advance(STEER_PARTIAL_SECONDS + 1)
+    return sid, child, n, s
+
+
+@pytest.mark.parametrize("what", ["partial", "hold", "self_stop", "self_stop_raising"])
+def test_r5_w_the_watchdog_thread_makes_no_forbidden_call(env, what):
+    """Sol's blocker 2 (ruling W): on the watchdog's thread nothing reads a pipe, drains, writes a transcript or
+    saves: a Claude cut of a frame taken in part with N's result buffered; a Claude hold whose contact ran out with
+    S's frames buffered; the self-stop; the self-stop's exceptional exit. What needs those waits for the loop."""
+    runner = env.node.sessions
+    host = runner.host
+    if what == "partial":
+        sid, child, n, s = _claude_partial_with_n_buffered(env)
+    elif what == "hold":
+        sid, child, n, s_uuid = claude_steered(env)
+        child.emit(cresult(sid, n, text="N's reply"))
+        tick(env)
+        s = host.sessions[sid]
+        assert s.held is not None
+        child.emit(cinit(sid, s_uuid))
+        s.steer.cover_until = env.clock() - 1
+    else:
+        sid, child, m = _ordinary_turn_in_flight(env)
+        if what == "self_stop_raising":
+            from test_hosted_sessions import P2
+            sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
+        child.emit(cresult(sid, m, text="buffered"))
+        env.clock.advance(runner.self_stop_seconds + 1)
+        if what == "self_stop_raising":
+            real, calls_ = host._stop, []
+
+            class Abort(BaseException):
+                pass
+
+            def stop(sess, now, **kw):
+                calls_.append(1)
+                if len(calls_) == 2:
+                    raise Abort()
+                return real(sess, now, **kw)
+            host._stop = stop
+    calls = []
+    _forbid(host, [c for c in env.node.session_spawner.children], calls)
+    t, done, ident, err = _on_watchdog(runner)
+    assert done.wait(5)
+    bad = [name for name, th in calls if th == ident[0]]
+    assert not bad, f"on the watchdog's thread: {bad}"
+
+
+def test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_save(env):
+    """Ruling W5: a Claude cut pending with N's result buffered, a session due for its SIGKILL, and a save that
+    always raises, then one that stalls: the watchdog's pass returns promptly and sends the due SIGKILL."""
+    import threading
+    from test_hosted_sessions import P2
+    runner = env.node.sessions
+    host = runner.host
+    sid, child, n, s = _claude_partial_with_n_buffered(env)
+    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
+    s2 = host.sessions[sid2]
+    c2.exits_on_terminate = False
+    with runner.lock:
+        host._stop(s2, env.clock())
+    env.clock.advance(host.kill_grace + 1)
+    stall = threading.Event()
+    for save in (lambda: (_ for _ in ()).throw(OSError("the disk is full")), lambda: stall.wait(10)):
+        host._save_state = save
+        c2.killed = getattr(c2, "killed", False)
+        s2.killed = False
+        t, done, ident, err = _on_watchdog(runner)
+        assert done.wait(3), "the watchdog's pass returned"
+        assert s2.killed, "the due SIGKILL was sent"
+    stall.set()
+
+
+def test_r5_w_the_kill_step_takes_no_lock(env):
+    """Ruling W+: the runner lock and the cutoff lock are held elsewhere (a stalled loop): the due SIGKILL is sent."""
+    import threading
+    runner = env.node.sessions
+    host = runner.host
+    sid, child, m = _ordinary_turn_in_flight(env)
+    s = host.sessions[sid]
+    child.exits_on_terminate = False
+    with runner.lock:
+        host._stop(s, env.clock())
+    env.clock.advance(host.kill_grace + 1)
+    release, held = threading.Event(), threading.Event()
+
+    def stalled_loop():
+        with runner.lock, host._steer_stop_lock:
+            held.set()
+            release.wait(10)
+    threading.Thread(target=stalled_loop, daemon=True).start()
+    assert held.wait(3)
+    t, done, ident, err = _on_watchdog(runner)
+    try:
+        for _ in range(60):
+            if s.killed:
+                break
+            import time as _time
+            _time.sleep(0.05)
+        assert s.killed, "the kill needs no lock"
+    finally:
+        release.set()
+        done.wait(5)
+
+
+def test_r5_w_a_stalled_loop_with_a_partial_write_pending(env):
+    """Ruling W+ and W6 (the residual, literally): the loop holds the runner lock in a stalled save while a Claude
+    frame taken in part is past its limit: no further byte is written, the watchdog's pass still sends a due
+    SIGKILL; once the loop goes on, its next pass cuts the frame (nothing more of it) and reports N's own end."""
+    import threading
+    import time as _time
+    from test_hosted_sessions import P2
+    runner = env.node.sessions
+    host = runner.host
+    sid, child, n, s = _claude_partial_with_n_buffered(env)
+    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
+    s2 = host.sessions[sid2]
+    c2.exits_on_terminate = False
+    with runner.lock:
+        host._stop(s2, env.clock())
+    env.clock.advance(host.kill_grace + 1)
+    before = len(child.stdin)
+    child.accept = None
+    release, held = threading.Event(), threading.Event()
+
+    def stalled_loop():
+        with runner.lock:
+            held.set()
+            release.wait(10)        # (a save stalled inside the loop's own tick)
+    threading.Thread(target=stalled_loop, daemon=True).start()
+    assert held.wait(3)
+    t, done, ident, err = _on_watchdog(runner)
+    for _ in range(60):
+        if s2.killed:
+            break
+        _time.sleep(0.05)
+    assert s2.killed, "kills go on while the loop is stalled"
+    assert len(child.stdin) == before, "no further byte of S while the loop is stalled"
+    release.set()
+    assert done.wait(5)
+    tick(env)
+    assert len(child.stdin) == before, "the loop cuts: no further byte of S"
+    assert s.stopping_since is not None or s.child is None
+    tick(env, times=2)
+    assert show(env, sid)["reply"] == "N's own"
+
+
+def test_r5_x_a_raise_after_the_consumer_committed_duplicates_nothing(env):
+    """Sol's V1 (ruling X): the report queue takes A's end and the handoff raises after that: one pending copy."""
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    child.emit(cresult(sid, m, text="A's own"))
+    real, calls = runner._add, []
+
+    def add(*a, **k):
+        r = real(*a, **k)
+        if not calls:
+            calls.append(1)
+            raise RuntimeError("after the commit")
+        return r
+    runner._add = add
+    runner._flush = lambda final=False: True
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    runner._add = real
+    runner.pass_once()
+    ends_ = [e for x, e in runner.pending if x == sid and e.get("kind") == "turn_ended"]
+    assert len(ends_) == 1, ends_
+
+
+def test_r5_x_a_raise_between_the_self_stop_and_watched_loses_nothing(env, monkeypatch):
+    """Sol's V1 (ruling X3): the watchdog's warning (a late self-stop) raises between the self-stop and `watched`:
+    what the self-stop published is not lost."""
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    env.clock.advance(runner.self_stop_seconds + runner.watch_seconds + node_sessions.LOCK_SLACK_SECONDS + 5)
+
+    def boom(*a, **k):
+        raise RuntimeError("a log handler failed")
+    monkeypatch.setattr(node_sessions.log, "warning", boom)
+    try:
+        runner.enforce_deadlines()
+    except RuntimeError:
+        pass
+    monkeypatch.undo()
+    assert any(e.session_id == sid and e.kind == "turn_ended" for e in runner.watched), "kept for the loop"
+
+
+def test_r5_x_a_failed_handoff_keeps_its_lane(env):
+    """Ruling X+: a handoff of the self-stop's failure that fails leaves it in `watched` (its lane), never ahead of a
+    native end published before it."""
+    from agent_comms.session_host import HostEvent
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    runner.watched.append(HostEvent(sid, "turn_ended", "1", ok=False, detail="stopped"))
+    name = "_put" if hasattr(runner, "_put") else "_dispatch"     # (the taker; 0cf1300's was `_dispatch`)
+    real, calls = getattr(runner, name), []
+
+    def flaky(x):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("the dispatcher failed")
+        return real(x)
+    setattr(runner, name, flaky)
+    with pytest.raises(RuntimeError):
+        with runner.lock:
+            runner._emit([])
+    setattr(runner, name, real)
+    assert [e.detail for e in runner.watched] == ["stopped"] and not runner.host._outbox, "its lane kept"
+
+
+def test_r5_z_a_kill_that_raises_keeps_the_group_owned_and_recorded(henv, monkeypatch):
+    """Sol's blocker 3 (ruling Z): at shutdown a TERM-ignoring child whose KILL raises keeps its handle and its
+    group entry; its sibling is stopped; the final save records it; a later kill can stop it."""
+    import json as _json
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    c1.exits_on_terminate = False
+    real_kill = c1.kill
+
+    def bad():
+        raise OSError("kill failed")
+    c1.kill = bad
+    token = s1.group_token
+    host.stop_all()
+    assert s2.child is None, "the sibling is stopped"
+    assert s1.child is c1 and s1.group_token == token, "the failed group is still owned"
+    assert any(token in g for g in host.groups.entries.values()), "its checkout reservation is kept"
+    state = _json.loads(host._state_path().read_text())
+    assert s1.session_id in state and state[s1.session_id]["pid"] == c1.pid, "recorded for a restart"
+    c1.kill = real_kill
+    henv.clock.advance(host.kill_grace + 1)
+    host.kill_due()
+    assert c1.killed or getattr(c1, "kills", 0), "a later kill stops it"
+
+
+def test_r5_z_a_failed_final_save_keeps_the_earlier_record(henv, monkeypatch):
+    """Ruling Z+: the final save fails: the earlier recoverable record is left as it was (never truncated)."""
+    import json as _json
+    from agent_comms import session_host
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    host = henv.host
+    host._save_state()
+    before = _json.loads(host._state_path().read_text())
+    assert s1.session_id in before
+
+    def bad_write(fd, data):
+        raise OSError("the disk is full")
+    monkeypatch.setattr(session_host.os, "write", bad_write)
+    with pytest.raises(OSError):
+        host.stop_all()
+    monkeypatch.undo()
+    assert _json.loads(host._state_path().read_text()) == before
+
+
+def test_r5_z_a_survivor_registered_after_the_latch_is_no_sigterm_time(henv, monkeypatch):
+    """Ruling Z2, Z+: a steering session's leader exits after the latch, its group survives: registered as stopping,
+    but no SIGKILL comes from that registration; the bulk stop sends the SIGTERM, and the SIGKILL comes only after
+    the grace from it."""
+    s, child, n = steered(henv, monkeypatch)
+    host = henv.host
+    host.steer_stopping()
+    child.code = 0
+    child.exits_on_terminate = False
+    henv.groups.add(child.pid)
+    host.tick()
+    assert not child.terminated
+    henv.clock.advance(host.kill_grace + 1)
+    host.kill_due()
+    assert not s.killed, "no SIGKILL without a SIGTERM"
+    real_sleep = host.sleep
+    host.sleep = lambda x: henv.clock.advance(x)
+    host.stop_all()
+    host.sleep = real_sleep
+    assert child.terminated == 1, "the bulk stop sent the SIGTERM"
+
+
+def test_r5_small_emit_hold_saves_nothing_under_a_claim(henv, monkeypatch):
+    """Sol's disputed row (`_emit_hold`'s deferral under a claim): a held end's host error sets `_at_once`, and
+    `_end` publishes the hold inside its claim: nothing is saved while the cutoff lock is held."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N's own"))
+    henv.host.tick()
+    assert s.held is not None
+    lock = henv.host._steer_stop_lock
+    held_while = []
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: (held_while.append(lock._is_owned()), real_save())[1]
+
+    def broken():
+        raise OSError("read failed")
+    child.read_lines = broken
+    out = henv.host.tick()
+    child.read_lines = lambda: []
+    assert ends(out) and ends(out)[0].text == "N's own"
+    assert not any(held_while), "nothing saved under the cutoff lock"
+    henv.host.tick()
+    assert held_while and not any(held_while), "the loop's next tick saves"
+
+
+def test_r5_small_an_early_reap_after_the_latch_reads_nothing(henv, monkeypatch):
+    """Sol's disputed row (the early reap after the latch): the leader exited, its group survives, and N's result
+    with S arrives between the pass's read and the reap's own (the extra read): the reap reads, decides and signals
+    nothing; the bulk stop decides once."""
+    s, child, n = steered(henv, monkeypatch)
+    host = henv.host
+    host.steer_stopping()
+    child.code = 0
+    henv.groups.add(child.pid)
+    real, reads = child.read_lines, []
+
+    def read():
+        reads.append(1)
+        if len(reads) == 1:
+            return []           # the pass's own read: nothing yet
+        child.emit(owned(n, S, text="N's own")) if len(reads) == 2 else None
+        return real()
+    child.read_lines = read
+    out = host.tick()
+    child.read_lines = real
+    assert not child.terminated and getattr(s, "parked", True), "the reap signals nothing: the bulk stop owns the group"
+    out += host.stop_all()
+    assert len(ends(out)) == 1 and child.terminated == 1, "N decided once; the one SIGTERM is the bulk stop's"
+
+
+def test_r5_small_a_codex_partial_cut_at_the_latch_is_mains(henv):
+    """Ruling (smaller): the latch comes during a Codex partial cut's drain: as main e6b421f, the cut goes on (N
+    decided by the cut, the process stopped); the claim is for Claude attempts and held ends."""
+    from test_codex_steering import partial, ended_of
+    from agent_comms.session_host import STEER_PARTIAL_SECONDS
+    host, s, child, _ = partial(henv)
+    henv.clock.advance(STEER_PARTIAL_SECONDS)
+    host.steer_drain_hook = lambda sess: host.steer_stopping()
+    events = host.steer_deadlines()
+    host.steer_drain_hook = None
+    assert s.stopping_since is not None, "the cut stopped the process, as main"
+    assert [e.message_id for e in ended_of(events)] == ["a"], "N decided once by the cut"
+
+
+def test_r5_small_a_broken_pipe_through_the_write_path(henv, monkeypatch):
+    """Ruling (smaller): a steering session's process closes its stdin while S is taken in part (the write path):
+    the claim decides N once and the SIGTERM goes once."""
+    monkeypatch.setattr(claude, "VERIFIED", frozenset({V}))
+    henv.host = make_host(henv, timeout_minutes=1)
+    henv.host.steer_authority = lambda sess: True
+    s, child = idle_host(henv)
+    henv.host.send(SID, "a long turn", message_id="1")
+    henv.host.tick()
+    n = uuid_of(child)
+    emit(henv, child, vinit(n))
+    child.accept = 10
+    henv.host.steer_offer(SID, "1", S, TEXT, authorized=True)
+    henv.host.tick()
+    assert s.steer is not None and 0 < s.steer.sent
+    child.accept = None
+    child.broken = True
+    out = henv.host.tick() + henv.host.tick()
+    assert len(ends(out)) == 1 and child.terminated == 1
+
+
+def test_r5_known_limit_a_raising_log_handler_between_a_claim_and_its_signal(henv, monkeypatch):
+    """Known limit (round 5, pinned as it is today): on the LOOP thread a log handler raises while a claim's deferred
+    line is written (after the cutoff lock, before the SIGTERM): the decision stands, made once; the raise ends that
+    session's pass (the host-error path), which sends the stop; N is reported once."""
+    from agent_comms import session_host
+    s, child, n = steered(henv, monkeypatch)
+    real, raised = session_host.log.log, []
+
+    def log(level, msg, *args, **kw):
+        if "the steer into message" in msg and not raised:
+            raised.append(1)
+            raise RuntimeError("a log handler failed")
+        return real(level, msg, *args, **kw)
+    monkeypatch.setattr(session_host.log, "log", log)
+    henv.clock.advance(61)          # N's turn times out (the pre-hold timeout: `_steer_end` decides S)
+    out = henv.host.tick() + henv.host.tick() + henv.host.tick()
+    assert raised, "the handler raised"
+    assert len(ends(out)) == 1, "N decided and reported once"
+    assert child.terminated >= 1, "the stop went (by the host-error path)"
+
+
 RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",
                  "permission_denials", "terminal_reason", "stop_reason", "duration_ms", "total_cost_usd"]
 INIT_FIELDS = ["claude_code_version", "capabilities", "permissionMode", "tools", "user_message_uuids", "origin",
@@ -3612,7 +4054,8 @@ def test_r4_t_a_reap_whose_drain_meets_the_latch_decides_nothing(henv, monkeypat
     out = henv.host.tick()
     henv.host.steer_drain_hook = None
     assert henv.host.steer_stopped and not ends(out) and not child.terminated
-    assert s.steer is not None and s.steer.outcome is None and s.stopping_since is not None
+    # (review round 5, ruling Z2: registered as stopping for the bulk stop, `parked`; no SIGTERM time is invented)
+    assert s.steer is not None and s.steer.outcome is None and s.parked and s.stopping_since is None
     [end] = ends(henv.host.stop_all())
     assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
@@ -3720,7 +4163,8 @@ def test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal(henv, mon
     real_save = henv.host._save_state
     henv.host._save_state = lambda: (saved.append(1), real_save())
     henv.host.stop_all()
-    assert s2.child is None and s1.child is None and saved
+    # (review round 5, ruling Z: s1's kill failed and its group may still be there: it stays owned and recorded)
+    assert s2.child is None and s1.child is c1 and saved
 
 
 def test_r4_t_stop_all_saves_even_when_its_traversal_raises(henv, monkeypatch):
@@ -3828,7 +4272,7 @@ def test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running(env)
     host.stop_turns = fails
     real_kill_due, real_deadlines = host.kill_due, host.steer_deadlines
     host.kill_due = lambda: (reached.append("kill_due"), real_kill_due())[1]
-    host.steer_deadlines = lambda: (reached.append("steer_deadlines"), real_deadlines())[1]
+    host.steer_deadlines = lambda **kw: (reached.append("steer_deadlines"), real_deadlines(**kw))[1]
     env.clock.advance(runner.self_stop_seconds + 1)
     runner.enforce_deadlines()
     assert reached == ["kill_due", "steer_deadlines"]
@@ -3899,18 +4343,18 @@ def test_r4_v_the_outbox_to_dispatch_handoff_loses_and_duplicates_nothing(env):
     with pytest.raises(RuntimeError):
         runner.pass_once()
     restore()
-    real = runner._dispatch
+    real = runner._put
     calls = []
 
-    def flaky(events):
+    def flaky(event):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("the dispatcher failed")
-        return real(events)
-    runner._dispatch = flaky
+        return real(event)
+    runner._put = flaky
     with pytest.raises(RuntimeError):
         runner.pass_once()
-    runner._dispatch = real
+    runner._put = real
     tick(env, times=2)
     ends_queued = [e for x, e in runner.pending if x == sid and e.get("kind") == "turn_ended"]
     assert not ends_queued
@@ -3919,51 +4363,54 @@ def test_r4_v_the_outbox_to_dispatch_handoff_loses_and_duplicates_nothing(env):
 
 
 def test_r4_v_the_watched_handoff_loses_and_duplicates_nothing(env):
-    """Ruling V1: the watchdog's steer list handed to the dispatcher, which raises on its first event: the events
-    go back to the host's outbox and are delivered once on the next pass."""
+    """Ruling V1 (review round 5, ruling X: the handoff is put, then removal from the source): the watchdog's steer
+    list handed to the dispatcher, which raises on its first event: the event stays in its source, in its lane
+    (`watched_steer`), and is delivered once on the next pass."""
     from agent_comms.session_host import HostEvent
     sid, child, m = _ordinary_turn_in_flight(env)
     runner = env.node.sessions
-    runner.watched_steer = [HostEvent(sid, "turn_ended", "1", ok=True, text="A's own", answered=True)]
-    real = runner._dispatch
+    runner.watched_steer = [HostEvent(sid, "turn_ended", "1", ok=True, text="A's own", answered=True,
+                                      ident=(sid, 1, 0))]
+    real = runner._put
     calls = []
 
-    def flaky(events):
+    def flaky(event):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("the dispatcher failed")
-        return real(events)
-    runner._dispatch = flaky
+        return real(event)
+    runner._put = flaky
     with pytest.raises(RuntimeError):
         runner.pass_once()
-    runner._dispatch = real
-    assert [e.text for e in runner.host._outbox] == ["A's own"]
+    runner._put = real
+    assert [e.text for e in runner.watched_steer] == ["A's own"] and not runner.host._outbox
     tick(env)
     assert len([e for x, e in runner.pending if x == sid]) <= 1
     assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] == "done"
 
 
 def test_r4_v_the_emit_handoff_of_watched_loses_and_duplicates_nothing(env):
-    """Ruling V1 (the late list): the self-stop's `watched` list handed to the dispatcher by `_emit`, which raises on
-    its first event: the events go back to the host's outbox and are delivered once on the next pass."""
+    """Ruling V1 (the late list; review round 5, ruling X): the self-stop's `watched` list handed to the dispatcher
+    by `_emit`, which raises on its first event: the event stays in `watched` (its lane) and is delivered once on
+    the next pass."""
     from agent_comms.session_host import HostEvent
     sid, child, m = _ordinary_turn_in_flight(env)
     runner = env.node.sessions
-    runner.watched = [HostEvent(sid, "turn_ended", "1", ok=True, text="A's own", answered=True)]
-    real = runner._dispatch
+    runner.watched = [HostEvent(sid, "turn_ended", "1", ok=True, text="A's own", answered=True, ident=(sid, 1, 0))]
+    real = runner._put
     calls = []
 
-    def flaky(events):
+    def flaky(event):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("the dispatcher failed")
-        return real(events)
-    runner._dispatch = flaky
+        return real(event)
+    runner._put = flaky
     with pytest.raises(RuntimeError):
         with runner.lock:
             runner._emit([])
-    runner._dispatch = real
-    assert not runner.watched and [e.text for e in runner.host._outbox] == ["A's own"]
+    runner._put = real
+    assert [e.text for e in runner.watched] == ["A's own"] and not runner.host._outbox
     tick(env)
     assert len([e for x, e in runner.pending if x == sid]) <= 1
     assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] == "done"

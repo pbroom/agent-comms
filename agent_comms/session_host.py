@@ -102,7 +102,73 @@ from .dispatch import (DispatchConfig, _signal_group, _within, child_env, probe_
                        render_argv, spawn_piped, stop_verified, with_writable_roots)
 from .providers import Event, ProviderSession, validate_model, validate_session_id
 
-log = logging.getLogger("agent_comms.session_host")
+# (Review round 5, ruling W) The threads that run the node's deadline watchdog (node_sessions registers its own). On
+# them the host only reads clocks and memory, takes the cutoff lock, makes a claim, sends signals and appends events
+# already built: a state save is left for the loop (`_save_due`), a transcript line waits in memory (`tee_pending`),
+# and a log line is kept in memory (`WatchLog`) until the loop's next pass writes it.
+WATCH_THREADS: set[int] = set()
+_WATCH_LINES: deque = deque(maxlen=2000)
+
+
+def on_watch() -> bool:
+    return threading.get_ident() in WATCH_THREADS
+
+
+class WatchLog:
+    """A module logger that, on a watchdog thread, never raises and never blocks: the line is kept in memory (a
+    bounded queue: the oldest goes first if the loop is away that long) and written by the loop (`flush_watch_logs`).
+    On any other thread it is the logger itself."""
+
+    def __init__(self, logger: logging.Logger):
+        self._logger = logger
+
+    def log(self, level: int, msg: str, *args, exc_info: Any = None, stacklevel: int = 2, **kw) -> None:
+        if not on_watch():
+            self._logger.log(level, msg, *args, exc_info=exc_info, stacklevel=stacklevel, **kw)
+            return
+        try:
+            if exc_info:
+                import traceback
+                msg = msg + "\n" + traceback.format_exc()
+            _WATCH_LINES.append((self._logger, level, msg, args))
+        except Exception:       # (never raises on the watchdog's thread)
+            pass
+
+    def debug(self, msg, *a, **k):
+        self.log(logging.DEBUG, msg, *a, stacklevel=3, **k)
+
+    def info(self, msg, *a, **k):
+        self.log(logging.INFO, msg, *a, stacklevel=3, **k)
+
+    def warning(self, msg, *a, **k):
+        self.log(logging.WARNING, msg, *a, stacklevel=3, **k)
+
+    def error(self, msg, *a, **k):
+        self.log(logging.ERROR, msg, *a, stacklevel=3, **k)
+
+    def exception(self, msg, *a, **k):
+        self.log(logging.ERROR, msg, *a, exc_info=True, stacklevel=3, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
+def flush_watch_logs() -> None:
+    """The loop writes what the watchdog's thread logged (called at the start of its pass and of a host tick)."""
+    if on_watch():
+        return
+    while _WATCH_LINES:
+        try:
+            logger, level, msg, args = _WATCH_LINES.popleft()
+        except IndexError:
+            return
+        try:
+            logger.log(level, msg, *args)
+        except Exception:
+            pass
+
+
+log = WatchLog(logging.getLogger("agent_comms.session_host"))
 
 STATE_FILE = "node-sessions.json"   # session id -> {pid, proc_start, ...}: what a restarted host must clean up
 PROVIDER_FILE = "node-session-providers.json"   # session id -> the provider's own id for it (Codex's thread id)
@@ -180,6 +246,9 @@ class HostEvent:
     restarted_by: str | None = None     # turn_ended: the restart whose interrupt the provider said ended this turn
     # turn_ended: the outcome of the steer into this turn, decided here once ({"outcome", "why"}); None: it took none
     steer: dict | None = None
+    # (Review round 5, ruling X) the event's identity, given when it is published into an outbox: (session id, the
+    # session's incarnation, the host's publication sequence). Every queue that receives it takes it by this.
+    ident: tuple | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -280,8 +349,11 @@ class _Outbox(list):
         return s.gen if s is not None else None
 
     def append(self, ev: HostEvent) -> None:
+        gen = self._gen(ev)
+        if ev.ident is None:        # (ruling X) its identity, at publication
+            ev = dataclasses.replace(ev, ident=(ev.session_id, gen, next(self._host._pub_seq)))
         super().append(ev)
-        self._gens.append(self._gen(ev))
+        self._gens.append(gen)
 
     def extend(self, evs) -> None:
         for ev in evs:
@@ -294,6 +366,14 @@ class _Outbox(list):
 
     def current(self) -> list[HostEvent]:
         return [e for e, g in zip(self, self._gens) if g is None or g == self._gen(e)]
+
+    def remove_ident(self, ident: tuple) -> None:
+        """(Ruling X) The source's half of a handoff: the entry with this identity leaves, once its taker has it."""
+        for i, e in enumerate(self):
+            if e.ident == ident:
+                del self[i]
+                del self._gens[i]
+                return
 
 
 @dataclass
@@ -358,6 +438,10 @@ class Session:
     turn_len: int = 0
     fresh_start: bool = False           # the provider refused to resume its session: the next process starts a new one
     interrupted_at: float | None = None
+    # (Review round 5, ruling Z2) its leader went after the stop latch, leaving its group: registered as stopping for
+    # the bulk stop, which owns it; no SIGTERM was sent for it (so no SIGKILL may come of this)
+    parked: bool = False
+    tee_pending: list = field(default_factory=list)     # (ruling W) transcript lines the watchdog's thread read
     stopping_since: float | None = None
     killed: bool = False
     waiting: bool = False
@@ -689,6 +773,10 @@ class SessionHost:
         # (Review round 2, ruling I) Every event the host publishes goes here at the moment of publication; `tick`,
         # `close`, `cancel`, `stop_turns` and `stop_all` return it, emptied, when they return. An exception that
         # escapes one of them leaves it as it is, and the next of them delivers it: exactly once.
+        self._pub_seq = itertools.count(1)      # (ruling X) the publication sequence of every event
+        # (Ruling X) True for a host driven by a node (SessionRunner): a public call returns what the outbox holds and
+        # leaves it there; the node takes each event (put, by its identity) and only then removes it (`ack`).
+        self.keep_outbox = False
         self._outbox: _Outbox = _Outbox(self)
         self._defer_logs: list | None = None      # (ruling T) log lines held while a claim holds the cutoff lock
         self._claimer: int | None = None            # ... and the thread making that claim
@@ -716,6 +804,11 @@ class SessionHost:
             return {}
 
     def _save_state(self) -> None:
+        if on_watch():
+            # (Review round 5, ruling W) never on the watchdog's thread, whatever path reached here: the loop's next
+            # tick saves (a stalled or failing disk cannot hold up a due SIGKILL or fence)
+            self._save_due = True
+            return
         self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         data = {s.session_id: {"pid": getattr(s.child, "pid", None), "proc_start": s.proc_start, "cwd": s.cwd,
                                "resume": s.resume, "turn": (s.in_flight or s.writing).id if s.busy else None}
@@ -1120,34 +1213,44 @@ class SessionHost:
             return None
         return s.steer.into, s.steer.uuid
 
-    def steer_deadlines(self) -> list[HostEvent]:
+    def steer_deadlines(self, into: list | None = None, watchdog: bool = False) -> list[HostEvent]:
         """A partial steer frame whose authority is gone or whose time is up is cut now (`_steer_pass`), also between
         passes: the node's deadline watchdog calls this."""
+        # (Review round 5, rulings S and X) What this boundary publishes goes into an outbox of its own: put into
+        # `into` (the node's `watched_steer`) in a `finally`, before anything can raise past it; what the outbox held
+        # before stays there. `watchdog` (ruling W, the node's watchdog thread): a Claude attempt's frame taken in
+        # part is not cut here (no drain off the loop: the write gate already fences it and the loop's next pass cuts
+        # it, reading N's end first), and a held end's cut decides from what was read so far (no drain).
+        retained, self._outbox = self._outbox, _Outbox(self)
         out = self._outbox
         now = self.clock()
-        before = len(out)
         self._defer_save = True     # (ruling T) the watchdog's path persists nothing: the loop's next tick does
         try:
-            self._steer_deadlines(now, out)
+            self._steer_deadlines(now, out, watchdog)
         finally:
             self._defer_save = False
-            if len(self._outbox) != before or out is not self._outbox:
+            mine, self._outbox = self._outbox, retained
+            if mine:
                 self._save_due = True
-        return self._take_outbox()
+                if into is not None:
+                    into.extend(mine.current())
+                else:
+                    self._outbox.extend(mine.current())
+        return mine.current() if into is not None else self._take_outbox()
 
-    def _steer_deadlines(self, now: float, out: list[HostEvent]) -> None:
+    def _steer_deadlines(self, now: float, out: list[HostEvent], watchdog: bool = False) -> None:
         with self.one_drain_budget():      # one drain deadline for every cut in this call
             for s in list(self.sessions.values()):
                 slot = s.steer
                 if (slot is not None and slot.mark is not None and slot.sent > 0 and s.child is not None
                         and s.stopping_since is None and not self._steer_stopped(slot)
-                        and not self._steer_gate(s, slot, now)):
+                        and not (watchdog and slot.holds) and not self._steer_gate(s, slot, now)):
                     self._steer_cut(s, self.clock(), out)
                 elif s.held is not None:
                     # (Review round 2, ruling G) the same boundary cuts a fully written hold whose contact ran out
                     # or whose authority is gone, also while the loop is blocked on hub I/O; and (round 3, ruling
                     # N) publishes a fenced one whose deadline passed, into the outbox, with no loop tick needed
-                    self._hold_cut(s, self.clock(), out)
+                    self._hold_cut(s, self.clock(), out, drain=not watchdog)
                     if s.held is not None:
                         self._hold_deadline(s, self.clock(), out)
 
@@ -1279,6 +1382,9 @@ class SessionHost:
         try:
             if not self._recovered:
                 self.recover()
+            flush_watch_logs()      # (ruling W) what the watchdog's thread logged, written here
+            for s in list(self.sessions.values()):
+                self._flush_tee(s)
             if self._save_due:      # (ruling T) what the watchdog's path published is persisted here, by the loop
                 self._save_due = False
                 self._save_state()
@@ -1289,35 +1395,28 @@ class SessionHost:
 
     def _take_outbox(self) -> list[HostEvent]:
         """What was published since the last delivery, in order, handed over once (ruling I); an entry whose session
-        is gone or was opened again since (another incarnation of the id) is never delivered (ruling M)."""
+        is gone or was opened again since (another incarnation of the id) is never delivered (ruling M). (Review round
+        5, ruling X) For a node's host (`keep_outbox`) nothing is detached: the events stay until the node acks each
+        one (`ack`), after it took it."""
+        if self.keep_outbox:
+            return self._outbox.current()
         out, self._outbox = self._outbox, _Outbox(self)
         return out.current()
+
+    def outbox_head(self) -> HostEvent | None:
+        """(Ruling X) The oldest event the outbox holds for delivery, or None."""
+        cur = self._outbox.current()
+        return cur[0] if cur else None
+
+    def ack(self, ev: HostEvent) -> None:
+        """(Ruling X) The node took this event (by its identity): it leaves the outbox."""
+        if ev.ident is not None:
+            self._outbox.remove_ident(ev.ident)
 
     def take_outbox(self) -> list[HostEvent]:
         """(Review round 3, ruling M) What waits in the outbox now, for the node's ONE dispatcher: drained before a
         reconciliation can synthesise LOST for a session, and before a session is forgotten."""
         return self._take_outbox()
-
-    def drain_outbox(self, take: Callable[[HostEvent], None]) -> None:
-        """(Review round 4, rulings S and V) The handoff of what the outbox retains, event by event: each leaves
-        the outbox only once `take` has owned it (returned). If `take` raises, that event and every one after it stay
-        in the outbox, in order, for the next handoff: none is lost, none taken twice."""
-        current = self._outbox.current()
-        self._outbox = _Outbox(self)
-        for i, ev in enumerate(current):
-            try:
-                take(ev)
-            except BaseException:
-                self.requeue(current[i:])
-                raise
-
-    def requeue(self, events: list[HostEvent]) -> None:
-        """(Ruling V) Events handed over and not owned (the taker raised) go back to the FRONT of the outbox, in
-        order, ahead of anything published since."""
-        later = self._outbox
-        self._outbox = _Outbox(self)
-        self._outbox.extend(events)
-        self._outbox.extend(later.current())
 
     def _tick(self, now: float, out: list[HostEvent]) -> None:
         # Main's pass, in main's order, at the pass's `now`, for every session. A live steer attempt's turn end is
@@ -1616,10 +1715,13 @@ class SessionHost:
         if code is None:
             return
         if self.group_alive(s.child.pid):
-            if s.stopping_since is None and self.steer_stopped and self._steering(s):
+            if s.stopping_since is None and self.steer_stopped and (s.parked or self._steering(s)):
                 # (ruling T) after the latch the bulk stop owns a steering session: nothing decided or signalled
-                # here; its group is only registered as stopping, so nothing starts beside it
-                s.stopping_since = now
+                # here; its group is only registered as stopping, so nothing starts beside it. (Review round 5,
+                # ruling Z2) That registration is no SIGTERM: `stopping_since` stays unset, so no SIGKILL can come
+                # of it; the bulk stop sends the SIGTERM (`_stop`) and the SIGKILL follows the grace from it. Parked:
+                # what a later read settles changes nothing here (no ordinary path after the latch for it).
+                s.parked = True
                 self.groups.stopping(s.group_token)
                 return
             if s.stopping_since is None:
@@ -1631,7 +1733,7 @@ class SessionHost:
                     self._correct_start_mode(s)
                 if self._steering(s):
                     if not self._claim(s, lambda: self._went_by_itself(s, code, s.ready, s.checking, out)):
-                        s.stopping_since = now      # (the latch came meanwhile: registered only, as above)
+                        s.parked = True     # (the latch came meanwhile: registered only, as above)
                         self.groups.stopping(s.group_token)
                         return
                 else:
@@ -1652,6 +1754,7 @@ class SessionHost:
         s.group_token = None
         s.sealed_by = s.confirmed_by = None     # what that process said went with it
         stopped, s.stopping_since, s.killed, s.interrupted_at = s.stopping_since is not None, None, False, None
+        s.parked = False
         s.outbuf.clear()
         if s.steer is not None and s.steer.outcome is not None:
             s.steer = None          # its turn is decided and its process is gone: nothing more of it is written
@@ -2353,7 +2456,9 @@ class SessionHost:
                     s.session_id)       # (R7-04: outside the latch's lock)
         now = self._drain_before_stop(s, now, out)    # across reads while they make progress (R2-05); never raises
         if s.in_flight is not None and slot is not None and s.in_flight.id == slot.into:
-            if not self._claim(s, lambda: self._fail(s, STEER_CUT, out)):
+            if not self._steering(s):
+                self._fail(s, STEER_CUT, out)       # (a Codex attempt: main's step 2, R6-01, unchanged)
+            elif not self._claim(s, lambda: self._fail(s, STEER_CUT, out)):
                 return      # (ruling T) the latch came during the drain: the bulk stop owns it now
         s.steer = None
         self._stop(s, now, at_signal=True)      # (R8-01) the cut's own stop, with or without a drain
@@ -2546,7 +2651,7 @@ class SessionHost:
         (`steer_deadlines`, ruling G)."""
         self._hold_cut(s, now, out)
 
-    def _hold_cut(self, s: Session, now: float, out: list[HostEvent]) -> None:
+    def _hold_cut(self, s: Session, now: float, out: list[HostEvent], drain: bool = True) -> None:
         """THE cut of a held end (review round 2, ruling G; callers: `_hold_pass` in the loop's pass, and
         `steer_deadlines`, the deadline watchdog's boundary). After the global stop latch it initiates nothing: the
         latch is checked under its lock, which is held across the decision and the SIGTERM, so a stop of every turn
@@ -2569,7 +2674,8 @@ class SessionHost:
                 why = "the steer's contact with the hub ran out"
         if why is None:
             return
-        now = self._drain_before_stop(s, now, out)
+        if drain:       # (ruling W: never on the watchdog's thread; S is then decided from what was read so far)
+            now = self._drain_before_stop(s, now, out)
         if s.held is held:
             self._cutoff_stop(s, why, now, out)
 
@@ -2594,7 +2700,7 @@ class SessionHost:
             finally:
                 logs, self._defer_logs, self._claimer = self._defer_logs, None, None
         for level, msg, args in logs:
-            log.log(level, msg, *args)
+            log.log(level, msg, *args)      # (ruling W: `log` keeps it in memory on the watchdog's thread)
         return True
 
     def _say(self, level: int, msg: str, *args) -> None:
@@ -2665,12 +2771,27 @@ class SessionHost:
     def _tee(self, s: Session, line: bytes) -> None:
         if s.transcript_fd is None:
             return
+        if on_watch():
+            s.tee_pending.append(line)      # (ruling W) written by the loop, in order, before its next line
+            return
+        self._flush_tee(s)
         try:
             os.write(s.transcript_fd, line + b"\n")
         except OSError as e:
             if not s.tee_failed:
                 s.tee_failed = True
                 log.warning("session %s: could not write its transcript (%s)", s.session_id, e)
+
+    def _flush_tee(self, s: Session) -> None:
+        """(Ruling W) What the watchdog's thread read is written to the transcript here, on the loop's thread."""
+        while s.tee_pending and s.transcript_fd is not None:
+            line = s.tee_pending.pop(0)
+            try:
+                os.write(s.transcript_fd, line + b"\n")
+            except OSError as e:
+                if not s.tee_failed:
+                    s.tee_failed = True
+                    log.warning("session %s: could not write its transcript (%s)", s.session_id, e)
 
     def _write(self, s: Session, now: float, out: list[HostEvent]) -> None:
         if s.child is None:
@@ -2832,7 +2953,7 @@ class SessionHost:
         return [(s.session_id, s.stopping_since + self.kill_grace) for s in list(self.sessions.values())
                 if self._kill_if_due(s, now)]
 
-    def stop_turns(self, detail: str, own: bool = False) -> list[HostEvent]:
+    def stop_turns(self, detail: str, own: bool = False, into: list | None = None) -> list[HostEvent]:
         """Give up on every turn in flight: each is reported failed and its process is stopped (the caller lost the
         hub, so nobody could see or stop the turn). Idle processes and the sessions themselves stay. (Ruling H) Every
         session gets its SIGTERM before anything a held publication records is persisted: the state is saved once,
@@ -2846,6 +2967,7 @@ class SessionHost:
         out = self._outbox
         now = self.clock()
         self._at_once = self._defer_save = True     # a held end is published here, at main's point (shutdown simplified)
+        done = False
         try:
             for s in list(self.sessions.values()):
                 if s.child is not None and s.busy and not s.ended:
@@ -2854,18 +2976,20 @@ class SessionHost:
                         self._stop(s, now)
                     except Exception:
                         log.exception("session %s: could not stop its turn", s.session_id)
-        except BaseException:
-            if own:     # (ruling V) what this stop published is kept, after what was there, for the next handoff
-                mine, self._outbox = self._outbox, retained
-                self._outbox.extend(mine.current())
-                own = False
-            raise
+            done = True
         finally:
             self._at_once = self._defer_save = False
             if own:
+                # (Review round 5, rulings W and X) whether the stop returned or raised: what it published is put
+                # into `into` (the node's `watched`, its lane) before anything else can raise, or kept behind what
+                # the outbox held; and nothing is saved on this path (the loop's next tick saves)
                 mine, self._outbox = self._outbox, retained
-                if out:
-                    self._save_due = True       # (ruling T) no save on the watchdog's path: the loop saves
+                if into is not None:
+                    into.extend(mine.current())
+                elif not done:
+                    self._outbox.extend(mine.current())     # (raised: kept behind what the outbox held)
+                if mine:
+                    self._save_due = True
             elif out:
                 self._save_state()
         if own:
@@ -2901,18 +3025,28 @@ class SessionHost:
             while any(going(s) for s in live) and self.clock() < deadline:
                 self.sleep(0.2)
             for s in live:
+                self._flush_tee(s)
                 # (Review round 4, ruling T) every step of the traversal per session: one session's fault (its
                 # kill, read, close or cleanup) skips no other, and the final save runs in the `finally`
                 steps = (lambda: s.child.kill() if going(s) else None,
                          lambda: self._read(s, now, out),     # the transcript keeps what was written until the end
                          lambda: (getattr(s.child, "close", None) or (lambda: None))(),
                          lambda: (os.close(s.transcript_fd) if s.transcript_fd is not None else None))
+                failed = False
                 for step in steps:
                     try:
                         step()
                     except Exception:
+                        failed = True
                         log.exception("session %s: a step of its shutdown failed", s.session_id)
                 s.transcript_fd = None
+                if failed and going(s):
+                    # (Review round 5, ruling Z) a step failed and its group may still be there: the session keeps
+                    # its process handle, its SIGTERM's time and its group's entry (no checkout is given away under
+                    # it), and the final save below records it, so a later kill (`kill_due`) or the next node
+                    # process's recovery stops it. Its siblings go on.
+                    log.warning("session %s: its process group may still be running after shutdown: kept", s.session_id)
+                    continue
                 s.child, s.proc_start, s.ready, s.stopping_since, s.killed = None, None, False, None, False
                 try:
                     self.groups.gone(s.group_token)

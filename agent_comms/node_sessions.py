@@ -93,9 +93,10 @@ import httpx
 
 from . import session_access, session_worktrees
 from .dispatch import DispatchConfig
-from .session_host import STEER_CONTACT_SECONDS, HostEvent, SessionHost, received_under
+from .session_host import (STEER_CONTACT_SECONDS, WATCH_THREADS, HostEvent, SessionHost, WatchLog, flush_watch_logs,
+                           received_under)
 
-log = logging.getLogger("agent_comms.node_sessions")
+log = WatchLog(logging.getLogger("agent_comms.node_sessions"))     # (ruling W: never raises or blocks on the watchdog)
 
 
 def _finite(meta: dict) -> dict:
@@ -214,6 +215,11 @@ class SessionRunner:
         self.client, self.log_dir, self.clock = client, Path(log_dir), clock
         self.config = config
         self.host = host or SessionHost(config, self.log_dir, clock=clock, **host_kw)
+        # (Review round 5, ruling X) the host keeps what it published until this node took it (`_deliver`): every
+        # handoff is a put by the event's identity, then the source's removal; `receipts` are the identities taken
+        # and not yet removed from their source (a second put of one is a no-op)
+        self.host.keep_outbox = True
+        self.receipts: set = set()
         self.host.turn_gate = self._turn_allowed      # a child's turn is held to its parent when it is WRITTEN, too
         self.host.admit = lambda s: self._admit(s, starting=True)    # every process start takes a slot here
         self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
@@ -418,7 +424,9 @@ class SessionRunner:
         self._renew_contact(sent)
         return r.json()
 
-    def _add(self, session_id: str, event: dict) -> None:
+    def _add(self, session_id: str, event: dict, ident: tuple | None = None) -> None:
+        if ident is not None:
+            self.receipts.add(ident)        # (ruling X) the receipt and the queue entry, together
         if session_id not in self.dropped:
             self.pending.append((session_id, event))
 
@@ -465,35 +473,63 @@ class SessionRunner:
         return "restarted_by" not in event or "restart" in self.hub_features or self.features_known
 
     def _emit(self, events: list[HostEvent]) -> None:
-        if self.watched_steer:  # (a steer attempt's watched ends first, as in `pass_once`)
-            events, self.watched_steer = self.watched_steer + list(events), []
-        if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
-            events, self.watched = self.watched + list(events), []
-        self._hand(events)      # (ruling V: event by event; what is not owned goes back to the host's outbox)
+        """Everything published and not yet taken, in publication order, across the host's outbox and the
+        watchdog's lists (`_deliver`), then any event given here that no outbox published (no source to remove it
+        from). An event a host call returned is in the host's outbox: it is taken from there, once."""
+        self._deliver(late=True)
+        for e in events:
+            if e.ident is None:
+                self._put(e)
 
-    def _hand(self, events: list[HostEvent]) -> None:
-        """(Review round 4, ruling V) A handoff of events this pass took from the host or the watchdog's lists:
-        each is owned by the dispatcher one by one; if it raises, that event and the rest go back to the host's
-        outbox, in order, for the next handoff (none lost, none taken twice)."""
-        for i, e in enumerate(events):
-            try:
-                self._dispatch([e])
-            except BaseException:
-                self.host.requeue(events[i:])
-                raise
+    def _deliver(self, late: bool) -> None:
+        """(Review round 5, ruling X) THE handoff from every source to the report queue: the host's outbox, the
+        watchdog's `watched_steer` and (`late`: after the listing is reconciled, as on main) its `watched`. Always
+        the event published first, whatever its lane; each is put (`_put`, by its identity: a second put is a
+        no-op), then removed from its source, then its receipt is forgotten. An exception anywhere leaves the event
+        in its source, in its lane; a retry puts nothing twice."""
+        while True:
+            heads = []
+            e = self.host.outbox_head()
+            if e is not None:
+                heads.append((e.ident[2], 0, e))
+            if self.watched_steer:
+                heads.append((self.watched_steer[0].ident[2] if self.watched_steer[0].ident else 0, 1,
+                              self.watched_steer[0]))
+            if late and self.watched:
+                heads.append((self.watched[0].ident[2] if self.watched[0].ident else 0, 2, self.watched[0]))
+            if not heads:
+                return
+            _, src, e = min(heads, key=lambda h: (h[0], h[1]))
+            self._put(e)
+            if src == 0:
+                self.host.ack(e)
+            elif src == 1:
+                self.watched_steer.pop(0)
+            else:
+                self.watched.pop(0)
+            if e.ident is not None:
+                self.receipts.discard(e.ident)
 
     def _dispatch(self, events: list[HostEvent]) -> None:
-        """(Review round 3, ruling M) THE one way a host event reaches the hub, whatever its source (the loop's tick,
-        the watchdog's lists, a close, a cancel, a stop of every turn, shutdown, what a failed tick left in the
-        host's outbox): a checkpoint (`held`) to the checkpoint sender, every other event into the report queue."""
         for e in events:
-            if e.kind == "held":
-                self._checkpoint(e)     # (Claude steering: a report of its own, never one of the events)
-                continue
-            if e.kind == "ended":
-                self.ending.add(e.session_id)
-                self.queue.pop(e.session_id, None)
-            self._add(e.session_id, self._event(e))
+            self._put(e)
+
+    def _put(self, e: HostEvent) -> None:
+        """(Review round 3, ruling M; round 5, ruling X) THE one way a host event reaches the hub: a checkpoint
+        (`held`) to the checkpoint sender, every other event into the report queue; taken by its identity: one
+        already taken (its receipt is held until its source removed it) is not taken again."""
+        if e.ident is not None and e.ident in self.receipts:
+            return
+        if e.kind == "held":
+            self._checkpoint(e)     # (Claude steering: a report of its own, never one of the events)
+            if e.ident is not None:
+                self.receipts.add(e.ident)
+            return
+        item = self._event(e)
+        if e.kind == "ended":
+            self.ending.add(e.session_id)
+            self.queue.pop(e.session_id, None)
+        self._add(e.session_id, item, e.ident)
 
     def _checkpoint(self, e: HostEvent) -> None:
         """The checkpoint of a held end (Claude steering, part G): sent alone, in a report of its own, after that
@@ -865,19 +901,16 @@ class SessionRunner:
             # The queue and the stop flags held here may be out of date (the human may just have closed a session):
             # turns already running go on, nothing new is handed over until a fetch has succeeded again.
             self.fresh = False
+        flush_watch_logs()      # (ruling W) what the watchdog's thread logged
         with self.lock, self.host.one_drain_budget():   # (R5-04) one drain deadline for this whole hold of the lock
             if self.stopping.is_set():
                 return ok
             now = self.clock()
-            if self.watched_steer:
-                # What the watchdog drained or decided about a steer attempt (N's native end, a cut) goes into the
-                # report queue BEFORE the listing is reconciled, so no synthetic LOST of N can come ahead of it (S2-06),
-                # through the one dispatcher (ruling M: a checkpoint among them goes to the sender, as from a tick).
-                events, self.watched_steer = self.watched_steer, []
-                self._hand(events)
-            # (Ruling M) What the host published and nobody took (a tick that raised after publishing) goes before
-            # the listing is reconciled too: no LOST is synthesised for a turn whose native end is already decided.
-            self.host.drain_outbox(lambda e: self._dispatch([e]))     # (rulings S, V: event by event)
+            # What the watchdog drained or decided about a steer attempt (N's native end, a cut: `watched_steer`)
+            # and what the host published and nobody took (a tick that raised after publishing) go into the report
+            # queue BEFORE the listing is reconciled, so no synthetic LOST of N can come ahead of them (S2-06, ruling
+            # M), in publication order, each put by its identity before its source lets it go (ruling X).
+            self._deliver(late=False)
             if data is not None:
                 self._reconcile(data, fetch_sent)       # (its closes and cancels share the hold's drain deadline)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
@@ -1347,7 +1380,7 @@ class SessionRunner:
             if s.busy or s.inbox:
                 self.last_busy[sid] = now
             if s.ended and s.child is None:
-                self.host.drain_outbox(lambda e: self._dispatch([e]))     # (ruling M) before it is forgotten
+                self._deliver(late=False)       # (ruling M) before it is forgotten
                 self.host.forget(sid)
                 for d in (self.status, self.reported, self.acked_modes, self.last_busy, self.queue, self.sent, self.tree,
                           self.parent_of):
@@ -1592,49 +1625,68 @@ class SessionRunner:
     def enforce_deadlines(self) -> None:
         """The node's two deadlines without the hub, whatever the loop is doing: its self-stop (SIGTERM to every
         turn's process group once `self_stop_seconds` have passed since its last successful hub call) and the
-        SIGKILL after each grace. Under the loop's lock, which the loop holds only for local work, never across a
-        hub call. What the self-stop reports waits in `watched` for the loop's next `_emit`. A deadline met later than
-        `shutdown_bound` allows it (the watch interval plus LOCK_SLACK_SECONDS: the loop held its lock for longer,
-        limit e) is said in the log, once, with how late it was."""
-        with self.lock:
+        SIGKILL after each grace. What the self-stop reports waits in `watched` for the loop's next `_emit`. A deadline
+        met later than `shutdown_bound` allows it (the watch interval plus LOCK_SLACK_SECONDS: the loop held its lock
+        for longer, limit e) is said in the log, once, with how late it was.
+
+        (Review round 5, ruling W) On the watchdog's thread this only reads clocks and memory, takes the cutoff lock,
+        makes a claim, sends signals and appends events already built (the host defers every save, transcript line
+        and log line made there to the loop). The due SIGKILLs come first and take NO lock (not the runner lock, not
+        the cutoff lock): a loop stalled while holding its lock never holds up a SIGKILL. The self-stop and the steer
+        deadlines then take the runner lock, waiting for it at most one watch interval (a loop stalled longer: they
+        wait for a later pass, said in the log). Each step is on its own: one that raises never keeps the next from
+        running, on this pass or the next."""
+        if self.stopping.is_set():
+            return          # shutdown stops everything itself
+        now = self.clock()
+        allowed = self.watch_seconds + LOCK_SLACK_SECONDS
+        try:
+            for sid, at in self.host.kill_due():
+                if now - at > allowed:
+                    log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline (limit e)",
+                                sid, now - at)
+        except Exception:
+            log.exception("hosted sessions: the due SIGKILLs failed")
+        if not self.lock.acquire(timeout=self.watch_seconds):
+            log.warning("hosted sessions: the session loop holds its lock: the self-stop and the steer deadlines wait "
+                        "for the next watch (limit e)")
+            return
+        try:
             if self.stopping.is_set():
-                return          # shutdown stops everything itself
-            now = self.clock()
-            allowed = self.watch_seconds + LOCK_SLACK_SECONDS
+                return
             due = self._self_stop_due()
-            # (Review round 4, ruling T) Each step on its own: one that fails never keeps the next from running (the
-            # due SIGKILLs above all), and nothing on this path persists or waits on the hub (the host defers its
-            # saves to the loop's next tick).
             try:
                 if self._silent(now):
-                    stopped = self.host.stop_turns(self._self_stop_detail(), own=True)     # (ruling S: its own only)
+                    # (rulings S and X) its own events only, put into `watched` (their lane) inside the call, before
+                    # anything here can raise: what the outbox held stays there for the loop's handoff
+                    stopped = self.host.stop_turns(self._self_stop_detail(), own=True, into=self.watched)
                     if stopped and now - due > allowed:
                         log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop "
                                     "held its lock that long (limit e)", now - due)
-                    self.watched += stopped     # (main's, a steer's end too: the shutdown simplification)
             except Exception:
                 log.exception("hosted sessions: the self-stop failed")
-            try:
-                for sid, at in self.host.kill_due():
-                    if now - at > allowed:
-                        log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the "
-                                    "session loop held its lock that long (limit e)", sid, now - at)
-            except Exception:
-                log.exception("hosted sessions: the due SIGKILLs failed")
             # Then, after every deadline of main's has been met (a cut's drain must never delay them, R4-06): loss
-            # is one-way, and a half-written steer frame past its limit is cut.
+            # is one-way, and a half-written steer frame past its limit is cut (a Codex one: main's step 2; a Claude
+            # one is left to the loop, which reads N's end first: ruling W).
             try:
                 self._steer_watch(now)
-                self.watched_steer += self.host.steer_deadlines()
+                self.host.steer_deadlines(into=self.watched_steer, watchdog=True)
             except Exception:
                 log.exception("hosted sessions: the steer deadlines failed")
+        finally:
+            self.lock.release()
 
     def _watch(self) -> None:
-        while not self.stopping.wait(self.watch_seconds):
-            try:
-                self.enforce_deadlines()
-            except Exception:
-                log.exception("hosted sessions: the deadline watchdog failed a pass")
+        me = threading.get_ident()
+        WATCH_THREADS.add(me)       # (ruling W) the host defers every save, transcript line and log line made here
+        try:
+            while not self.stopping.wait(self.watch_seconds):
+                try:
+                    self.enforce_deadlines()
+                except Exception:
+                    log.exception("hosted sessions: the deadline watchdog failed a pass")
+        finally:
+            WATCH_THREADS.discard(me)
 
     # ------------------------------------------------------------ the thread
 

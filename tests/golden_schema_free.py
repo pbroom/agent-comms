@@ -43,6 +43,16 @@ import uuid
 from pathlib import Path
 
 
+def _fields(e) -> dict:
+    """A host event's values as main has them. (Review round 5, ruling X) `ident`, the identity an outbox gives an
+    event at publication for the node's handoffs, is the node's own bookkeeping: it is never sent to the hub, and main
+    has no such field."""
+    import dataclasses
+    d = dataclasses.asdict(e)
+    d.pop("ident", None)
+    return d
+
+
 def record(tmp_path: Path, verified=None, allow: bool = False, named: bool = False, version=None) -> dict:
     """`verified`: the Claude adapter's VERIFIED for this run (set on main's adapter too, which has no use for it).
     `allow`: take the allowance out of the raw stdin and transcripts before anything is normalized (`allowed`).
@@ -115,7 +125,7 @@ def _run(tmp_path: Path, logs: list, allow: bool, named: bool = False) -> dict:
 
     def recorded_tick():
         got = real_tick()
-        events.append([dataclasses.asdict(e) for e in got])     # one list per pass: the tick boundaries kept
+        events.append([_fields(e) for e in got])     # one list per pass: the tick boundaries kept
         return got
 
     host.tick = recorded_tick
@@ -757,7 +767,7 @@ def _host_cases(tmp_path: Path, out: dict, allow: bool) -> None:
         passes = []
         for action in script:
             action()
-            passes.append([dataclasses.asdict(e) for e in host.tick()])
+            passes.append([_fields(e) for e in host.tick()])
         cases[name] = {"passes": passes,
                        "stdin": [raw_lines("stdin", c.stdin, allow) for c in henv.spawner.children]}
 
