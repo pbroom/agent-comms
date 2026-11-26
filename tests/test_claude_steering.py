@@ -3253,6 +3253,16 @@ def test_r5_y_a_next_turn_fallback_never_strips_a_codex_outcome(env):
     assert "steer" in nxt, "the next flush's Codex outcome keeps its extension"
 
 
+def test_r5_y_a_422_of_more_than_the_extensions_forgets_nothing(env):
+    """Ruling Y+ (a mutation row): a hub refuses A's report with 422 for its modes (the pair), and takes rung (ii),
+    which also lost A's `next_turn`: that 422 was not about the extension alone, so `steer` is not forgotten."""
+    a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
+    _posts(runner, lambda path, body: 422 if "held" in (body.get("modes") or []) else None)
+    with runner.lock:
+        assert runner._flush()
+    assert "steer" in runner.hub_features, "the 422 was about the modes: nothing forgotten"
+
+
 def test_r5_y_the_acknowledged_modes_are_recorded_and_corrected_explicitly(env):
     """Ruling Y1, Y+: what the node records as A's reported modes is what the accepted rung sent; after a refetch
     with the same features (the hub takes the pair again), A, quiet, is reported again for that purpose with its
@@ -3402,6 +3412,80 @@ def test_r5_w_the_watchdog_thread_makes_no_forbidden_call(env, what):
     assert not bad, f"on the watchdog's thread: {bad}"
 
 
+def test_r5_w_a_codex_cut_on_the_watchdog_writes_nothing_to_disk(env, monkeypatch, tmp_path):
+    """Ruling W (a mutation row; the Codex reading): main's watchdog cut of a Codex frame taken in part still reads
+    the pipe, with N's native end in it; nothing it reaches writes the state file or a transcript on that thread
+    (the loop does, at its next tick)."""
+    import threading
+    from test_codex_steering import codex_turn_in_flight, post_steer
+    from agent_comms import session_host
+    from agent_comms.session_host import STEER_PARTIAL_SECONDS
+    from agent_comms.providers import codex as cx_mod  # noqa: F401
+    import test_codex_steering as tcs
+    sid, child = codex_turn_in_flight(env)
+    child.accept = 10
+    post_steer(env, sid)
+    tick(env)
+    s = env.node.sessions.host.sessions[sid]
+    [req] = [json.loads(x) for x in bytes(s.steer.frame).splitlines()]
+    child.emit(tcs.cx.reply(req["id"], {"turnId": tcs.cx.TURN}), tcs.cx.message("native"), tcs.cx.completed())
+    env.clock.advance(STEER_PARTIAL_SECONDS)
+    import os as _os
+    s.transcript_fd = _os.open(tmp_path / "transcript", _os.O_WRONLY | _os.O_CREAT, 0o600)   # (a transcript kept)
+    writes = []
+    real_write, real_replace = session_host.os.write, session_host.os.replace
+
+    def write(fd, data):
+        writes.append(("write", threading.get_ident()))
+        return real_write(fd, data)
+
+    def replace(a, b):
+        writes.append(("replace", threading.get_ident()))
+        return real_replace(a, b)
+    monkeypatch.setattr(session_host.os, "write", write)
+    monkeypatch.setattr(session_host.os, "replace", replace)
+    t, done, ident, err = _on_watchdog(env.node.sessions)
+    assert done.wait(5) and not err, err
+    monkeypatch.undo()
+    assert s.stopping_since is not None, "main's cut, on the watchdog"
+    assert not [w for w, th in writes if th == ident[0]], "nothing written to disk on the watchdog's thread"
+    tick(env)
+    assert show(env, sid)["reply"] == "native"
+    assert b"native" in (tmp_path / "transcript").read_bytes(), "the loop wrote what the watchdog's thread read"
+
+
+def test_r5_w_no_log_handler_runs_on_the_watchdogs_thread(env):
+    """Ruling W3 (a mutation row): a log handler that raises: the watchdog's pass logs (a self-stop past its
+    deadline) and no handler runs on its thread; the loop's next pass writes the line."""
+    import logging
+    import threading
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    env.clock.advance(runner.self_stop_seconds + runner.watch_seconds + node_sessions.LOCK_SLACK_SECONDS + 5)
+    seen = []
+
+    class Raising(logging.Handler):
+        def emit(self, record):
+            seen.append((record.getMessage(), threading.get_ident()))
+            if "after its deadline" in record.getMessage():
+                raise RuntimeError("a handler failed")
+    h = Raising()
+    logger = logging.getLogger("agent_comms.node_sessions")
+    logger.addHandler(h)
+    try:
+        t, done, ident, err = _on_watchdog(runner)
+        assert done.wait(5) and not err, err
+        assert not [x for x, th in seen if th == ident[0]], "no handler on the watchdog's thread"
+        assert any(e.session_id == sid for e in runner.watched), "the self-stop happened"
+        try:
+            runner.pass_once()
+        except RuntimeError:
+            pass
+        assert any("after its deadline" in x for x, th in seen), "the loop wrote the watchdog's line"
+    finally:
+        logger.removeHandler(h)
+
+
 def test_r5_w_kills_and_fences_with_a_drain_pending_and_a_raising_or_stalling_save(env):
     """Ruling W5: a Claude cut pending with N's result buffered, a session due for its SIGKILL, and a save that
     always raises, then one that stalls: the watchdog's pass returns promptly and sends the due SIGKILL."""
@@ -3492,8 +3576,8 @@ def test_r5_w_a_stalled_loop_with_a_partial_write_pending(env):
         _time.sleep(0.05)
     assert s2.killed, "kills go on while the loop is stalled"
     assert len(child.stdin) == before, "no further byte of S while the loop is stalled"
+    assert done.wait(runner.watch_seconds + 3), "the pass waits for the loop's lock one watch at most, then returns"
     release.set()
-    assert done.wait(5)
     tick(env)
     assert len(child.stdin) == before, "the loop cuts: no further byte of S"
     assert s.stopping_since is not None or s.child is None
@@ -3522,6 +3606,76 @@ def test_r5_x_a_raise_after_the_consumer_committed_duplicates_nothing(env):
     runner.pass_once()
     ends_ = [e for x, e in runner.pending if x == sid and e.get("kind") == "turn_ended"]
     assert len(ends_) == 1, ends_
+
+
+def test_r5_x_both_sides_forget_once_the_source_removed_it(env):
+    """Ruling X+ (a mutation row): once the source removed a taken event, the receipt goes too: after a handoff
+    that completed, no receipt is left (and after a failed one, exactly the event's)."""
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    child.emit(cresult(sid, m, text="A's own"))
+    real, calls = runner.host.ack, []
+
+    def ack(e):
+        if not calls:
+            calls.append(1)
+            raise RuntimeError("the source failed to let it go")
+        return real(e)
+    runner.host.ack = ack
+    runner._flush = lambda final=False: True
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    assert len(runner.receipts) == 1, "taken, not yet removed: its receipt is held"
+    runner.host.ack = real
+    runner.pass_once()
+    assert not runner.receipts, "removed: both sides forgot it"
+    assert len([e for x, e in runner.pending if x == sid and e.get("kind") == "turn_ended"]) == 1
+
+
+def test_r5_x_the_handoff_keeps_publication_order_across_lanes(env):
+    """Ruling X+ (a mutation row): an event the watchdog published first (in `watched_steer`) goes before one the
+    host published after it (in its outbox), whatever the lanes: the handoff takes the earliest published."""
+    from agent_comms.session_host import HostEvent
+    from test_hosted_sessions import P2
+    a, ca, ma = _ordinary_turn_in_flight(env)
+    b, cb, mb = _ordinary_turn_in_flight(env, project=P2)
+    runner = env.node.sessions
+    host = runner.host
+    first = HostEvent(b, "turn_ended", "1", ok=False, detail="the watchdog's, first", ident=(b, host.sessions[b].gen, 0))
+    runner.watched_steer.append(first)
+    ca.emit(cresult(a, ma, text="the host's, after"))
+    host._tick(env.clock(), host._outbox)
+    runner._flush = lambda final=False: True
+    with runner.lock:
+        runner._deliver(late=False)
+    order = [e.get("detail") or e.get("text") for x, e in runner.pending if e.get("kind") == "turn_ended"]
+    assert order == ["the watchdog's, first", "the host's, after"], order
+
+
+def test_r5_x_a_self_stop_that_raises_puts_what_it_published_into_watched(env):
+    """Ruling X3 (a mutation row): the watchdog's self-stop publishes one failure, then raises on the next session:
+    what it published is in `watched` (its lane), not lost and not in the outbox."""
+    from test_hosted_sessions import P2
+    sid1, c1, m1 = _ordinary_turn_in_flight(env)
+    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
+    runner = env.node.sessions
+    host = runner.host
+    real, calls = host._stop, []
+
+    class Abort(BaseException):
+        pass
+
+    def stop(sess, now, **kw):
+        calls.append(sess.session_id)
+        if len(calls) == 2:
+            raise Abort()
+        return real(sess, now, **kw)
+    host._stop = stop
+    with pytest.raises(Abort):
+        host.stop_turns("the node lost the hub", own=True, into=runner.watched)
+    host._stop = real
+    assert [(e.session_id, e.kind) for e in runner.watched] == [(c, "turn_ended") for c in calls], "all it published"
+    assert not [e for e in host._outbox if e.kind == "turn_ended"], "none of it in the outbox"
 
 
 def test_r5_x_a_raise_between_the_self_stop_and_watched_loses_nothing(env, monkeypatch):
