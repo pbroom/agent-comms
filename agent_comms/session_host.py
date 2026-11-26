@@ -639,6 +639,9 @@ class SessionHost:
         # drain's reads (`_drain_reads`). None in production.
         self.steer_cut_hook: Callable[[Session], None] | None = None
         self.steer_drain_hook: Callable[[Session], None] | None = None
+        # (Review round 2, ruling J) asked at every write of a steer's bytes, in the write gate only: the hub can take
+        # this session's steer (a Claude one: the hub names `held`). Never part of the attempt's authority.
+        self.steer_capable: Callable[[Session], bool] | None = None
         self._recovered = False
         self._next_message = 0
         # Runner key -> window -> the latest plan usage a session of that runner's provider reported for it (`usage`
@@ -2054,7 +2057,8 @@ class SessionHost:
     def _steer_gate_locked(self, s: Session, slot: SteerSlot, fence: bool) -> bool:
         """(The attempt's lock held.) Every rule; the two clocks LAST, on one reading taken after every callback has
         returned (R2-03, R3-01): the contact (whose expiry latches the break) and the 5 s of a frame taken in part."""
-        if not (slot.revoked is None and slot.refused is None and (not fence or not slot.fenced)
+        if not (slot.revoked is None and slot.refused is None
+                and (not fence or (not slot.fenced and (self.steer_capable is None or self.steer_capable(s))))
                 and slot.outcome is None and not slot.stopping and not self.steer_stopped
                 and s.in_flight is not None and s.in_flight.id == slot.into and s.child is not None
                 and s.stopping_since is None and not s.ended and not s.unbound

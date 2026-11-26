@@ -2210,7 +2210,8 @@ def test_r2_j_a_step_2_hub_is_never_offered_a_claude_steer(env, monkeypatch):
     assert r.status_code != 200 and "cannot steer" in r.text
     runner = env.node.sessions
     s = runner.host.sessions[sid]
-    assert runner.hub_features == {"answered", "restart", "steer"} and not runner._steer_authority(s)
+    assert runner.hub_features == {"answered", "restart", "steer"} and not runner._steer_capable(s)
+    assert runner._steer_authority(s), "the capability gates writes only, never the attempt's authority"
 
 
 def test_r2_k_a_result_is_reported_while_checkpoint_posts_are_stalled(env):
@@ -2411,6 +2412,22 @@ def test_r2_o_a_crash_after_a_dropped_checkpoint_settles_n_by_its_own_end(env):
     rec = hosted_steer.get(env.board.conn, sid, 1)
     assert m["state"] == "done" and show(env, sid)["reply"] == "N's reply", m
     assert rec["outcome"] == "unconfirmed", rec
+
+
+
+def test_r2_j_a_failed_fetch_never_cuts_a_hold(env):
+    """Ruling J's write-time recheck is the write gate's, never the attempt's authority: a failed hub call forgets
+    the hub's features for a while; a held N is not cut for it (the e2e's Z7 found this)."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    runner = env.node.sessions
+    s = runner.host.sessions[sid]
+    assert s.held is not None
+    runner.hub_features, runner.features_known = set(), False      # (what `_call` does after a failed call)
+    runner.enforce_deadlines()
+    runner.host.tick()
+    assert not child.terminated and s.held is not None and s.held.fenced_at is None
 
 
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)

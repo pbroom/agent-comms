@@ -210,6 +210,7 @@ class SessionRunner:
         self.host.may_start = self._may_start       # ... and none, nor any new turn, past the self-stop deadline
         self.host.may_start_query = self._may_start_query   # the same, with no side effect (turn correlation's)
         self.host.steer_authority = self._steer_authority     # ... and no steer byte without the node's write authority
+        self.host.steer_capable = self._steer_capable         # ... nor a Claude one unless the hub names `held`
         # The node's acknowledged EVIDENCE (the module text): when the last hub-acknowledged hello was SENT (node.py
         # says it, `note_hello`), per session the send time of the last acknowledged report and the turn in flight its
         # answer named, and every acknowledgement in order (`ack_log`: seq, sent, received, the session a report was
@@ -1343,10 +1344,12 @@ class SessionRunner:
         """The host asks this at every write of a steer's bytes, under the attempt's lock: the node is not past its
         self-stop, nor stopping. The contact itself is the attempt's own record (SteerSlot.contact_ok); the record's
         own `stopping` is set under its lock when the node begins to stop (`_Stopping`)."""
-        if self._silent() or self.stopping.is_set():
-            return False
-        # (Review round 2, ruling J) rechecked at the write itself: a Claude steer (its adapter holds N's end) is
-        # written only while the hub's current listing names `held`
+        return not self._silent() and not self.stopping.is_set()
+
+    def _steer_capable(self, s) -> bool:
+        """(Review round 2, ruling J) Asked at every write of a steer's bytes (the write gate only, never as the
+        attempt's authority: a hold is not cut because a fetch failed and the features are unknown for a while): a
+        Claude steer (its adapter holds N's end) is written only while the hub's current listing names `held`."""
         return not self.host.holds(s.session_id) or ("held" in self.hub_features and self.features_known)
 
     def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
