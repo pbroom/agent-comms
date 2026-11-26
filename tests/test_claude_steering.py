@@ -646,7 +646,7 @@ def test_g_the_checkpoint_goes_only_to_a_hub_that_names_steer(env):
     assert runner.checkpoints == {}
     runner.hub_features = {"answered", "restart", "steer", "held"}
     runner._emit([HostEvent("5e551011-0000-4000-8000-000000000000", "held", "1", ok=True, text="x")])
-    assert runner.checkpoints["5e551011-0000-4000-8000-000000000000"]["text"] == "x"
+    assert runner.checkpoints["5e551011-0000-4000-8000-000000000000"].payload["text"] == "x"
     assert runner.pending == [], "the checkpoint is no event of the session's"
 
 
@@ -942,7 +942,8 @@ def test_r1_c_the_checkpoint_has_its_own_short_call_outside_the_report_lock(env)
     real = runner.client
     runner.client = Client()
     try:
-        runner._post_checkpoints({"5e551011-0000-4000-8000-000000000000": {"message": 1}})
+        runner._post_checkpoints({"5e551011-0000-4000-8000-000000000000": node_sessions.Checkpoint(
+            "5e551011-0000-4000-8000-000000000000", None, 1, {"message": 1})})
     finally:
         runner.client = real
     assert seen == [("/api/nodes/sessions/5e551011-0000-4000-8000-000000000000", node_sessions.CHECKPOINT_SECONDS,
@@ -2272,10 +2273,11 @@ def test_r2_k_a_checkpoint_is_rechecked_at_dispatch(env):
     runner = env.node.sessions
     runner.host.tick()
     held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
-    assert runner._checkpoint_due(sid, held)
-    assert not runner._checkpoint_due(sid, held | {"message": 2}), "another N"
+    gen = runner.host.sessions[sid].gen
+    assert runner._checkpoint_due(node_sessions.Checkpoint(sid, gen, 1, held))
+    assert not runner._checkpoint_due(node_sessions.Checkpoint(sid, gen, 2, held)), "another N"
     runner.hub_features = runner.hub_features - {"held"}
-    assert not runner._checkpoint_due(sid, held), "the hub no longer names held"
+    assert not runner._checkpoint_due(node_sessions.Checkpoint(sid, gen, 1, held)), "the hub no longer names held"
 
 
 def test_r2_shoulds_the_hub_refuses_a_mixed_checkpoint_report_and_impossible_next_turns(env):
@@ -2956,13 +2958,10 @@ def test_r3_p_a_checkpoint_is_bound_to_its_incarnation_and_the_stop_flag(env):
     runner.host.tick()
     held = {"message": 1, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True}
     s = runner.host.sessions[sid]
-    runner.checkpoint_gen[sid] = s.gen
-    assert runner._checkpoint_due(sid, held)
-    runner.checkpoint_gen[sid] = s.gen + 1
-    assert not runner._checkpoint_due(sid, held), "another incarnation"
-    runner.checkpoint_gen[sid] = s.gen
+    assert runner._checkpoint_due(node_sessions.Checkpoint(sid, s.gen, 1, held))
+    assert not runner._checkpoint_due(node_sessions.Checkpoint(sid, s.gen + 1, 1, held)), "another incarnation"
     runner.stopping.set()
-    assert not runner._checkpoint_due(sid, held), "shutdown began"
+    assert not runner._checkpoint_due(node_sessions.Checkpoint(sid, s.gen, 1, held)), "shutdown began"
 
 
 def test_r3_parity_a_revoked_codex_attempt_keeps_mains_contact(henv):
@@ -3085,8 +3084,8 @@ def test_r3_p_the_sender_drops_a_checkpoint_no_longer_due_at_the_post(env):
     runner.start_checkpoint_sender()
     try:
         with runner.checkpoint_cond:
-            runner.checkpoint_queue[sid] = {"message": 2, "ok": True, "detail": "", "denials": [], "meta": {},
-                                            "text": "x", "answered": True}
+            runner.checkpoint_queue[sid] = node_sessions.Checkpoint(sid, runner.host.sessions[sid].gen, 2, {
+                "message": 2, "ok": True, "detail": "", "denials": [], "meta": {}, "text": "x", "answered": True})
             runner.checkpoint_cond.notify()
         import time as _time
         deadline = _time.monotonic() + 3
@@ -3351,6 +3350,306 @@ def test_r4_r_a_retrys_success_bookkeeping_is_a_first_trys(env):
     assert not [x for x, _ in runner.pending if x in (a, b)]
     assert runner.reported.get(a) == runner.status.get(a) and a not in runner.refused
     assert a in runner.report_ack and b in runner.report_ack
+
+
+
+# ---------------------------------------------------------------- review round 4, rulings S, T, U, V
+
+
+def _ordinary_turn_in_flight(env):
+    sid = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    child = proc_of(env, sid)[1]
+    m = written(child)[-1]["uuid"]
+    child.emit(cinit(sid, m))
+    tick(env)
+    return sid, child, m
+
+
+def test_r4_s_a_buffered_native_end_never_goes_behind_lost(env):
+    """Sol's blocker (ruling S): A's native end is published, the tick raises; the watchdog self-stops before the
+    next pass; the next pass reports A's native end (not LOST), exactly once."""
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    child.emit(cresult(sid, m, text="A's own"))
+    restore = _tick_raising_after(runner.host)
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    restore()
+    env.clock.advance(runner.self_stop_seconds + 1)
+    runner.enforce_deadlines()          # the watchdog's self-stop
+    assert all(e.session_id != sid or e.kind != "turn_ended" for e in runner.watched), "never moved behind LOST"
+    runner._renew_contact(env.clock())
+    tick(env, times=2)
+    msg = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert msg["state"] == "done" and show(env, sid)["reply"] == "A's own", msg
+
+
+@pytest.mark.parametrize("path", ["cancel", "close", "fatal", "host_error", "reap_with_survivors"])
+def test_r4_t_after_the_latch_no_single_session_path_signals_or_decides(henv, monkeypatch, path):
+    """Sol's blocker (ruling T): after the global latch, a cancel, a close, a fatal frame, a host error or a reap
+    with group survivors of a steering session sends no signal and decides no steer: the bulk stop owns it and
+    decides once."""
+    s, child, n = steered(henv, monkeypatch)
+    henv.host.steer_stopping()
+    if path == "cancel":
+        henv.host.cancel(SID, "1", "cancelled")
+    elif path == "close":
+        henv.host.close(SID, "closed")
+    elif path == "fatal":
+        child.emit(vinit(n) | {"session_id": "another-session"})
+        henv.host.tick()
+    elif path == "host_error":
+        def broken():
+            raise OSError("read failed")
+        child.read_lines = broken
+        henv.host.tick()
+        child.read_lines = lambda: []
+    else:
+        child.code = 0
+        henv.groups.add(child.pid)
+        henv.host.tick()
+    assert not child.terminated, "no SIGTERM after the latch"
+    assert s.steer is not None and s.steer.outcome is None, "no steer decided after the latch"
+    out = henv.host.stop_all()
+    assert len(ends(out)) == 1 and ends(out)[0].steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r4_t_the_cut_whose_drain_meets_the_latch_decides_nothing(henv, monkeypatch):
+    """Ruling T (the partial-write cut): the latch comes during the cut's drain: the cut decides nothing (the claim
+    refuses); the bulk stop owns N."""
+    s, child, n = steered(henv, monkeypatch)
+    henv.host.steer_drain_hook = lambda sess: henv.host.steer_stopping()
+    s.steer.mark, s.steer.sent = (0, 10), 5      # (a frame taken in part)
+    henv.host._steer_cut(s, henv.clock(), henv.host._outbox)
+    assert not ends(henv.host._outbox) and not child.terminated
+
+
+def test_r4_t_a_latch_between_the_first_check_and_the_expiry_changes_no_state(henv, monkeypatch):
+    """Ruling T2: the latch arrives after `_hold_cut`'s first check and before the expiry: no state changes (the
+    check under the lock is the one that matters)."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    host = henv.host
+
+    real = host._steer_stop_lock
+
+    class Arriving:
+        """The cutoff lock, as another thread's `steer_stopping` would find it: the latch lands just before the
+        `_hold_cut` takes it (after its first check)."""
+        armed = True
+
+        def __enter__(self):
+            if Arriving.armed:
+                Arriving.armed = False
+                host._steer_stop_lock = real
+                host.steer_stopping()
+                host._steer_stop_lock = self
+            real.acquire()
+            return self
+
+        def __exit__(self, *a):
+            real.release()
+    henv.clock.advance(21)
+    host._steer_stop_lock = Arriving()
+    try:
+        host._hold_cut(s, henv.clock(), host._outbox)
+    finally:
+        host._steer_stop_lock = real
+    assert host.steer_stopped and not s.steer.expired and not child.terminated
+
+
+def test_r4_t_nothing_logs_or_saves_under_the_cutoff_lock(henv, monkeypatch):
+    """Ruling T3: the pre-hold timeout (a live attempt's N times out: `_steer_end` decides S) logs and saves nothing
+    while the cutoff lock is held."""
+    from agent_comms import session_host
+    s, child, n = steered(henv, monkeypatch)
+    lock = henv.host._steer_stop_lock
+    held_while = []
+    real_log = session_host.log.log
+
+    def probe(*a, **k):
+        held_while.append(lock._is_owned())
+        return real_log(*a, **k)
+    monkeypatch.setattr(session_host.log, "log", probe)
+    for name in ("info", "warning", "error", "exception"):
+        real = getattr(session_host.log, name)
+        monkeypatch.setattr(session_host.log, name,
+                            lambda *a, _r=real, **k: (held_while.append(lock._is_owned()), _r(*a, **k))[1])
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: (held_while.append(lock._is_owned()), real_save())[1]
+    henv.clock.advance(61)
+    out = henv.host.tick() + henv.host.tick()
+    assert ends(out) and held_while and not any(held_while), held_while
+
+
+def test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal(henv, monkeypatch):
+    """Ruling T4: one session's kill, read and close raising skip no other session's cleanup; the final save runs."""
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    c1.exits_on_terminate = False
+
+    def bad():
+        raise OSError("failed")
+    c1.kill = bad
+    c1.read_lines = bad
+    saved = []
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: (saved.append(1), real_save())
+    henv.host.stop_all()
+    assert s2.child is None and s1.child is None and saved
+
+
+def test_r4_t_a_stop_claimed_before_the_latch_may_signal_after_it(henv, monkeypatch):
+    """Ruling T+ (the ordering limit): a stop claimed before the latch signals after it: the same SIGTERM shutdown
+    sends, once; the bulk stop recognises the claim (N's end decided once, by the claim)."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N"))
+    henv.host.tick()
+    real_stop = henv.host._stop
+
+    def stop(sess, now, at_signal=False):
+        henv.host.steer_stopping()          # the latch lands between the claim and the signal
+        return real_stop(sess, now, at_signal=at_signal)
+    henv.host._stop = stop
+    henv.clock.advance(21)
+    henv.host.steer_deadlines()
+    assert child.terminated == 1 and s.held is not None and s.held.decided is not None
+    decided = dict(s.held.decided)
+    henv.host._stop = real_stop
+    [end] = ends(henv.host.stop_all())
+    assert end.steer == decided, "the bulk stop made no competing decision"
+
+
+def test_r4_t_the_watchdog_runs_its_deadlines_whatever_the_save_does(env):
+    """Ruling T5: a state save that always raises, then one that stalls: the watchdog's pass still reaches the due
+    SIGKILLs, and returns promptly (nothing on its path saves)."""
+    import threading
+    import time as _time
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    host = runner.host
+    reached = []
+    real_kill_due = host.kill_due
+    host.kill_due = lambda: (reached.append(1), real_kill_due())[1]
+
+    def raises():
+        raise OSError("the disk is full")
+    host._save_state = raises
+    env.clock.advance(runner.self_stop_seconds + 1)
+    runner.enforce_deadlines()
+    assert reached, "the SIGKILLs were reached"
+    stall = threading.Event()
+    host._save_state = lambda: stall.wait(10)
+    done = threading.Event()
+    t = threading.Thread(target=lambda: (runner.enforce_deadlines(), done.set()))
+    t0 = _time.monotonic()
+    t.start()
+    assert done.wait(3) and _time.monotonic() - t0 < 3, "a stalled save never holds the watchdog"
+    stall.set()
+    t.join(5)
+
+
+def test_r4_v_the_watchdog_never_waits_on_a_stalled_post(env):
+    """Ruling V3: a report POST stalls on the loop's flush (outside the runner lock); the watchdog's pass runs and
+    returns promptly meanwhile."""
+    import threading
+    import time as _time
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    real = runner.client.request
+    release, entered = threading.Event(), threading.Event()
+
+    def request(method, path, *a, **kw):
+        if method == "POST":
+            entered.set()
+            release.wait(10)
+        return real(method, path, *a, **kw)
+    runner.client.request = request
+    child.emit(cresult(sid, m, text="A"))
+    with runner.lock:
+        runner._emit(runner.host.tick())
+    t = threading.Thread(target=runner._flush)
+    t.start()
+    assert entered.wait(3)
+    t0 = _time.monotonic()
+    runner.enforce_deadlines()
+    assert _time.monotonic() - t0 < 2
+    release.set()
+    t.join(10)
+
+
+def test_r4_v_the_outbox_to_dispatch_handoff_loses_and_duplicates_nothing(env):
+    """Ruling V1: the dispatcher raises on the first event it is handed from the retained outbox: that event and
+    the rest stay recoverable; the next pass delivers each exactly once."""
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    child.emit(cresult(sid, m, text="A's own"))
+    restore = _tick_raising_after(runner.host)
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    restore()
+    real = runner._dispatch
+    calls = []
+
+    def flaky(events):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("the dispatcher failed")
+        return real(events)
+    runner._dispatch = flaky
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    runner._dispatch = real
+    tick(env, times=2)
+    ends_queued = [e for x, e in runner.pending if x == sid and e.get("kind") == "turn_ended"]
+    assert not ends_queued
+    msg = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    assert msg["state"] == "done" and show(env, sid)["reply"] == "A's own"
+
+
+def test_r4_v_the_watched_handoff_loses_and_duplicates_nothing(env):
+    """Ruling V1: the watchdog's steer list handed to the dispatcher, which raises on its first event: the events
+    go back to the host's outbox and are delivered once on the next pass."""
+    from agent_comms.session_host import HostEvent
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    runner.watched_steer = [HostEvent(sid, "turn_ended", "1", ok=True, text="A's own", answered=True)]
+    real = runner._dispatch
+    calls = []
+
+    def flaky(events):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("the dispatcher failed")
+        return real(events)
+    runner._dispatch = flaky
+    with pytest.raises(RuntimeError):
+        runner.pass_once()
+    runner._dispatch = real
+    assert [e.text for e in runner.host._outbox] == ["A's own"]
+    tick(env)
+    assert len([e for x, e in runner.pending if x == sid]) <= 1
+    assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] == "done"
+
+
+def test_r4_u_a_late_checkpoint_post_replaces_nothing(env):
+    """Ruling U+: a checkpoint POST that lands late (after an accepted checkpoint, or after N's terminal end) is
+    refused: it replaces neither."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    tick(env, times=2)
+    first = hosted._get(env.board.conn, hosted._msg_key(sid, 1))["held"]
+    late = {"message": 1, "ok": False, "detail": "late", "denials": [], "meta": {}, "text": "late", "answered": True}
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": late})
+    assert r.status_code == 409 and hosted._get(env.board.conn, hosted._msg_key(sid, 1))["held"] == first
+    child.emit(cinit(sid, s_uuid), cresult(sid, s_uuid, text="S"))
+    tick(env, times=3)
+    before = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
+    r = env.laptop.post(f"/api/nodes/sessions/{sid}", json={"held": late})
+    assert r.status_code == 409 and hosted._get(env.board.conn, hosted._msg_key(sid, 1)) == before
 
 
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)

@@ -87,7 +87,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, NamedTuple, Callable
 
 import httpx
 
@@ -197,6 +197,15 @@ class _Stopping(threading.Event):
         super().set()
 
 
+class Checkpoint(NamedTuple):
+    """(Review round 4, ruling U) A queued checkpoint, immutable: the session, its incarnation on the host, N, and
+    the payload posted. Its identity lives in the entry, never in a side map."""
+    sid: str
+    gen: Any
+    n: int
+    payload: dict
+
+
 class SessionRunner:
     def __init__(self, client: httpx.Client, config: DispatchConfig, log_dir: Path, *, host: SessionHost | None = None,
                  clock: Callable[[], float] = time.monotonic, self_stop_seconds: float = 90.0,
@@ -262,7 +271,6 @@ class SessionRunner:
         # (Review round 2, ruling K) The checkpoint sender's own queue: at most one per session, posted by its own
         # thread (`_send_checkpoints`), never by the loop that drives ordinary reports. Dropped at shutdown.
         self.checkpoint_queue: dict[str, dict] = {}
-        self.checkpoint_gen: dict[str, Any] = {}      # (ruling P) the session incarnation each checkpoint was made in
         self.checkpoint_cond = threading.Condition()
         self.checkpoint_thread: threading.Thread | None = None
         self.queue: dict[str, list[dict]] = {}        # session id -> the hub's queued messages not yet handed over
@@ -460,6 +468,17 @@ class SessionRunner:
             events, self.watched = self.watched + list(events), []
         self._dispatch(events)
 
+    def _hand(self, events: list[HostEvent]) -> None:
+        """(Review round 4, ruling V) A handoff of events this pass took from the host or the watchdog's lists:
+        each is owned by the dispatcher one by one; if it raises, that event and the rest go back to the host's
+        outbox, in order, for the next handoff (none lost, none taken twice)."""
+        for i, e in enumerate(events):
+            try:
+                self._dispatch([e])
+            except BaseException:
+                self.host.requeue(events[i:])
+                raise
+
     def _dispatch(self, events: list[HostEvent]) -> None:
         """(Review round 3, ruling M) THE one way a host event reaches the hub, whatever its source (the loop's tick,
         the watchdog's lists, a close, a cancel, a stop of every turn, shutdown, what a failed tick left in the
@@ -486,28 +505,28 @@ class SessionRunner:
                      e.session_id, e.message_id)
             return
         s = self.host.sessions.get(e.session_id)
-        self.checkpoint_gen[e.session_id] = s.gen if s is not None else None    # (ruling P) its incarnation
-        self.checkpoints[e.session_id] = {"message": int(e.message_id), "ok": bool(e.ok),
+        self.checkpoints[e.session_id] = Checkpoint(e.session_id, s.gen if s is not None else None, int(e.message_id), {
+                                          "message": int(e.message_id), "ok": bool(e.ok),
                                           "detail": _clean(e.detail[:300]), "denials": list(e.denials),
                                           "meta": _finite(dict(e.meta)), "text": _clean(e.text),
-                                          "answered": bool(e.answered)}
+                                          "answered": bool(e.answered)})
 
     def _post_checkpoints(self, ready: dict) -> None:
         """The checkpoints taken out of the queue by `_flush` (each one's session had nothing pending before it),
         posted OUTSIDE the report lock, one try each, with CHECKPOINT_SECONDS at most: its own call, so its failure,
         refusal or stall changes nothing else (no feature knowledge forgotten, no contact renewed, no report of
         another session stripped or held up longer than that). Ruling C."""
-        for sid, held in ready.items():
-            if self.checkpoint_thread is not None and not self._checkpoint_due(sid, held):
+        for sid, entry in ready.items():
+            if self.checkpoint_thread is not None and not self._checkpoint_due(entry):
                 continue        # (ruling P) rechecked immediately before the POST
             try:
-                r = self.client.request("POST", f"/api/nodes/sessions/{sid}", json={"events": [], "held": held},
-                                        timeout=CHECKPOINT_SECONDS)
+                r = self.client.request("POST", f"/api/nodes/sessions/{entry.sid}",
+                                        json={"events": [], "held": dict(entry.payload)}, timeout=CHECKPOINT_SECONDS)
                 r.raise_for_status()
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
-                log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent again", sid,
-                            held["message"], code if code is not None else type(e).__name__)
+                log.warning("session %s: the checkpoint of message %s was not taken (%s); it is not sent again",
+                            entry.sid, entry.n, code if code is not None else type(e).__name__)
 
     def _flush(self, final: bool = False) -> bool:
         """Post what the hub has not taken yet, per session and in order. False: the hub could not be reached (the
@@ -627,17 +646,19 @@ class SessionRunner:
         with self.checkpoint_cond:
             self.checkpoint_queue.clear()
 
-    def _checkpoint_due(self, sid: str, held: dict) -> bool:
-        """At dispatch (ruling K): the hub's current capability still names `held`, and the session and N are still
-        the ones the checkpoint was made for (hosted here, not dropped, N's end still held). Else it is dropped."""
+    def _checkpoint_due(self, entry: "Checkpoint") -> bool:
+        """At dispatch (rulings K, P, U): the hub's current capability still names the pair, and the session, its
+        incarnation and N are still the ones the queued entry itself was made for (hosted here, not dropped, N's end
+        still held). Else it is dropped. (A POST already under way when these change can still arrive: the hub's
+        checkpoint is write-once and refused once N is settled, so it can replace neither an accepted checkpoint nor
+        a terminal end.)"""
         if self.stopping.is_set():
             return False        # (ruling P) never once shutdown began
-        if not (self._pair(self.hub_features) and self.features_known) or sid in self.dropped:
+        if not (self._pair(self.hub_features) and self.features_known) or entry.sid in self.dropped:
             return False
-        s = self.host.sessions.get(sid)
+        s = self.host.sessions.get(entry.sid)
         h = s.held if s is not None else None
-        return (h is not None and h.end.message_id == str(held.get("message"))
-                and self.checkpoint_gen.get(sid, s.gen) == s.gen)
+        return h is not None and h.end.message_id == str(entry.n) and s.gen == entry.gen
 
     wall_ns = staticmethod(time.time_ns)
 
@@ -840,12 +861,10 @@ class SessionRunner:
                 # report queue BEFORE the listing is reconciled, so no synthetic LOST of N can come ahead of it (S2-06),
                 # through the one dispatcher (ruling M: a checkpoint among them goes to the sender, as from a tick).
                 events, self.watched_steer = self.watched_steer, []
-                self._dispatch(events)
+                self._hand(events)
             # (Ruling M) What the host published and nobody took (a tick that raised after publishing) goes before
             # the listing is reconciled too: no LOST is synthesised for a turn whose native end is already decided.
-            retained = self.host.take_outbox()
-            if retained:
-                self._dispatch(retained)
+            self.host.drain_outbox(lambda e: self._dispatch([e]))     # (rulings S, V: event by event)
             if data is not None:
                 self._reconcile(data, fetch_sent)       # (its closes and cancels share the hold's drain deadline)
                 # Contact is back and a listing is applied (a close or a cancel the hub decided meanwhile has been,
@@ -1308,9 +1327,7 @@ class SessionRunner:
             if s.busy or s.inbox:
                 self.last_busy[sid] = now
             if s.ended and s.child is None:
-                retained = self.host.take_outbox()     # (ruling M) delivered before the session is forgotten
-                if retained:
-                    self._dispatch(retained)
+                self.host.drain_outbox(lambda e: self._dispatch([e]))     # (ruling M) before it is forgotten
                 self.host.forget(sid)
                 for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree,
                           self.parent_of):
@@ -1565,20 +1582,32 @@ class SessionRunner:
             now = self.clock()
             allowed = self.watch_seconds + LOCK_SLACK_SECONDS
             due = self._self_stop_due()
-            if self._silent(now):
-                stopped = self.host.stop_turns(self._self_stop_detail())
-                if stopped and now - due > allowed:
-                    log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop held "
-                                "its lock that long (limit e)", now - due)
-                self.watched += stopped     # (main's, a steer's end too: the shutdown simplification)
-            for sid, at in self.host.kill_due():
-                if now - at > allowed:
-                    log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the session "
-                                "loop held its lock that long (limit e)", sid, now - at)
+            # (Review round 4, ruling T) Each step on its own: one that fails never keeps the next from running (the
+            # due SIGKILLs above all), and nothing on this path persists or waits on the hub (the host defers its
+            # saves to the loop's next tick).
+            try:
+                if self._silent(now):
+                    stopped = self.host.stop_turns(self._self_stop_detail(), own=True)     # (ruling S: its own only)
+                    if stopped and now - due > allowed:
+                        log.warning("hosted sessions: the self-stop came %.1f s after its deadline: the session loop "
+                                    "held its lock that long (limit e)", now - due)
+                    self.watched += stopped     # (main's, a steer's end too: the shutdown simplification)
+            except Exception:
+                log.exception("hosted sessions: the self-stop failed")
+            try:
+                for sid, at in self.host.kill_due():
+                    if now - at > allowed:
+                        log.warning("hosted sessions: session %s: its SIGKILL came %.1f s after its deadline: the "
+                                    "session loop held its lock that long (limit e)", sid, now - at)
+            except Exception:
+                log.exception("hosted sessions: the due SIGKILLs failed")
             # Then, after every deadline of main's has been met (a cut's drain must never delay them, R4-06): loss
             # is one-way, and a half-written steer frame past its limit is cut.
-            self._steer_watch(now)
-            self.watched_steer += self.host.steer_deadlines()
+            try:
+                self._steer_watch(now)
+                self.watched_steer += self.host.steer_deadlines()
+            except Exception:
+                log.exception("hosted sessions: the steer deadlines failed")
 
     def _watch(self) -> None:
         while not self.stopping.wait(self.watch_seconds):
