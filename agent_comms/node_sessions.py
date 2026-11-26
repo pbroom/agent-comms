@@ -384,7 +384,8 @@ class SessionRunner:
 
     # ------------------------------------------------------------ hub calls
 
-    def _call(self, method: str, path: str, *, gen: int | None = None, spare_422: bool = False, **kw) -> Any:
+    def _call(self, method: str, path: str, *, gen: int | None = None, spare_422: bool = False, spare: bool = False,
+              **kw) -> Any:
         # The contact counts from when the call was SENT: the hub records it at or after that (hosted.note_contact),
         # so the node's self-stop clock never runs behind the hub's (`shutdown_bound`).
         sent = self.clock()
@@ -398,7 +399,9 @@ class SessionRunner:
             # outcome) forgets only THOSE: a refusal of it that comes after a newer listing leaves that one's (R4-03).
             # `spare_422`: a 422 forgets nothing here; the caller decides what it says (R5-05).
             code = getattr(getattr(sys.exc_info()[1], "response", None), "status_code", None)
-            if not (spare_422 and code == 422) and (gen is None or gen == self.features_gen):
+            # `spare` (ruling R): a 400 or 422 that a report's fallback will answer with less forgets nothing.
+            if (not (spare_422 and code == 422) and not (spare and code in (400, 422))
+                    and (gen is None or gen == self.features_gen)):
                 self.hub_features, self.features_known = set(), False
             raise
         self._renew_contact(sent)
@@ -477,7 +480,7 @@ class SessionRunner:
         resent."""
         if e.message_id is None or not e.message_id.isdigit() or e.session_id in self.dropped:
             return
-        if not ("held" in self.hub_features and self.features_known):
+        if not (self._pair(self.hub_features) and self.features_known):
             # (Review round 1, ruling C) A feature of its own: a step-2 hub names `steer` but takes no checkpoint.
             log.info("session %s: the checkpoint of message %s is not sent: the hub has not said it takes it",
                      e.session_id, e.message_id)
@@ -530,22 +533,84 @@ class SessionRunner:
         return ok
 
     @staticmethod
+    def _pair(features) -> bool:
+        """(Review round 4, ruling R) THE one predicate of Claude steering's capability: the hub names `steer` AND
+        `held`. The report projection (`_modes_for`), the write gate (`_steer_capable`) and the checkpoint gates
+        (`_checkpoint`, `_checkpoint_due`) all ask this, never `held` alone."""
+        return "steer" in features and "held" in features
+
+    @staticmethod
     def _modes_for(modes, features) -> list:
         """What the session's modes say to a hub with these features (review round 3, ruling O): `steer` only to a
         hub that steers; a Claude session's `steer` and `held` (its adapter holds N's end) as a PAIR, both or
         neither, and only to a hub that names both: never `["restart", "held"]`."""
         claude = "held" in modes
-        pair = "steer" in features and "held" in features
+        pair = SessionRunner._pair(features)
         return [m for m in modes if (m not in ("steer", "held") if claude and not pair
                                      else m != "steer" or "steer" in features)]
 
     @staticmethod
-    def _base_modes(body: dict) -> list | None:
-        """The report's modes without the steering capabilities (`steer`, `held`), when it had any; else None."""
-        modes = body.get("modes")
-        if not isinstance(modes, list) or not ({"steer", "held"} & set(modes)):
-            return None
-        return [m for m in modes if m not in ("steer", "held")]
+    def _rungs(body: dict) -> list[dict]:
+        """(Review round 4, ruling R) The payloads one report may go as, each computed from the ORIGINAL body and each
+        removing strictly more than the one before: (i) as built; (ii) without what only a hub that names `held`
+        understands: a Claude session's `steer` and `held` modes (the pair) and a `next_turn` extension, keeping what
+        step 2's contract takes (a Codex `steer` extension included); (iii) main's plain retry: no steer extension
+        at all, no steering modes. A rung that would remove nothing more is not tried."""
+        def without(events_pred, modes_pred):
+            out = {k: v for k, v in body.items() if k not in ("events", "modes")}
+            out["events"] = [{k: v for k, v in e.items() if not (k == "steer" and events_pred(v))} for e in body["events"]]
+            if "modes" in body:
+                out["modes"] = [m for m in body["modes"] if not modes_pred(m)]
+            return out
+        claude = "held" in (body.get("modes") or [])
+        two = without(lambda x: isinstance(x, dict) and x.get("outcome") == "next_turn",
+                      lambda m: m == "held" or (claude and m == "steer"))
+        three = without(lambda x: True, lambda m: m in ("steer", "held"))
+        rungs = [body]
+        for r in (two, three):
+            if r != rungs[-1]:
+                rungs.append(r)
+        return rungs
+
+    def _post_report(self, sid: str, body: dict, events: list) -> tuple[float, Any]:
+        """(Review round 4, ruling R) THE one fallback for a report the hub rejects (400, 422): its rungs
+        (`_rungs`), in order, each tried at once, keeping the report's events (their identity in the queue: what is
+        sent is dropped only after an acknowledgement, by the caller). A rejection changes nothing the node believes
+        about the hub: no feature is forgotten (it only asks for a fresh listing); the one exception is main's own
+        step-2 rule for rung (iii) (R5-05: a steer-only refusal retried plainly forgets `steer` for that listing's
+        features). The success of any rung is reported to the caller exactly as a first attempt's: (sent, answer).
+        All rejected: the last rejection is raised."""
+        path = f"/api/nodes/sessions/{sid}"
+        gen = self.features_gen
+        rungs = self._rungs(body)
+        for k, payload in enumerate(rungs):
+            sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
+            last = k == len(rungs) - 1
+            try:
+                answer = self._call("POST", path, json=json.loads(json.dumps(payload)), gen=gen,
+                                    spare=not last)
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if last or code not in (400, 422):
+                    if k:
+                        self.last_sync = float("-inf")      # (ruling R) ask the hub again what it takes
+                    raise
+                if any("steer" in x for x in payload["events"]):
+                    # (said once per report, as main says it: R8-04)
+                    self._say_422(sid, tuple(e for e, x in zip(events, body["events"]) if "steer" in x))
+                else:
+                    log.warning("the hub refused the report for session %s (%s) with its steering modes: sending it "
+                                "again without them", sid, code)
+                continue
+            if k:
+                self.last_sync = float("-inf")      # (ruling R) a fresh listing says what the hub takes now
+                if (any("steer" in x for x in body["events"]) and not any("steer" in x for x in payload["events"])
+                        and gen == self.features_gen):
+                    # (R5-05, main's step-2 rule) the plain retry got through: only `steer` is forgotten, for that
+                    # listing's features
+                    self.hub_features = self.hub_features - {"steer"}
+            return sent, answer
+        raise AssertionError("no rung")   # (unreachable: the last rung raises or returns)
 
     def _send_checkpoints(self) -> None:
         """The checkpoint sender's thread (ruling K): one queued checkpoint at a time, each rechecked at dispatch
@@ -567,7 +632,7 @@ class SessionRunner:
         the ones the checkpoint was made for (hosted here, not dropped, N's end still held). Else it is dropped."""
         if self.stopping.is_set():
             return False        # (ruling P) never once shutdown began
-        if not ("held" in self.hub_features and self.features_known) or sid in self.dropped:
+        if not (self._pair(self.hub_features) and self.features_known) or sid in self.dropped:
             return False
         s = self.host.sessions.get(sid)
         h = s.held if s is not None else None
@@ -636,54 +701,10 @@ class SessionRunner:
                     body["modes"] = self._modes_for(status[4], self.hub_features)
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
-                sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
-                path = f"/api/nodes/sessions/{sid}"
-                if not any("steer" in x for x in body["events"]):
-                    answer = self._call("POST", path, json=body)        # main's call
-                else:
-                    # A report carrying a steer outcome: main's call, and after a 422 (a hub that named `steer`
-                    # refuses it now: rolled back) one plain retry at once, in this very flush, synchronous, with
-                    # main's per-call timeout (S2-07, R4-03). Each attempt has its own payload, built from `body`,
-                    # which neither changes; both are made under this listing's features (`gen`), so a refusal
-                    # never forgets those of a newer listing. In the final flush exactly the same.
-                    gen = self.features_gen
-                    first = json.loads(json.dumps(body))
-                    try:
-                        answer = self._call("POST", path, json=first, gen=gen, spare_422=True)
-                    except Exception as e:
-                        if getattr(getattr(e, "response", None), "status_code", None) != 422:
-                            raise
-                        self._say_422(sid, tuple(e for e, x in zip(events, body["events"]) if "steer" in x))
-                        plain = {k: v for k, v in body.items() if k != "events"}
-                        plain["events"] = [{k: v for k, v in x.items() if k != "steer"} for x in body["events"]]
-                        sent = self.clock()
-                        answer = self._call("POST", path, json=plain, gen=gen)
-                        # (R5-05) The plain retry got through: this hub takes everything else this listing said, so
-                        # only `steer` is forgotten, and only while that listing's features stand. (A failed retry
-                        # forgot every feature in `_call`, as main does for a failed report.)
-                        if gen == self.features_gen:
-                            self.hub_features = self.hub_features - {"steer"}
+                sent, answer = self._post_report(sid, body, events)
                 self._ack_report(sid, sent, answer)
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
-                base = self._base_modes(body)
-                if code in (400, 422) and base is not None:
-                    # (Review round 3, ruling O) The hub rejected what the report said the session can do (a hub
-                    # rolled back to step 2 refuses `held`): the capabilities are dropped as a pair and the report,
-                    # its native ends with it, is sent again at once with the base modes. Never discarded for that.
-                    log.warning("the hub refused the report for session %s (%s) with its steering modes: sending it "
-                                "again without them", sid, code)
-                    self.hub_features = self.hub_features - {"steer", "held"}
-                    try:
-                        sent = self.clock()
-                        answer = self._call("POST", f"/api/nodes/sessions/{sid}", json=dict(body, modes=base))
-                        self._ack_report(sid, sent, answer)
-                        sent_items.update(i for i, _ in mine)
-                        if status is not None:
-                            self.reported[sid] = status
-                        continue
-                    except Exception as e2:
-                        e, code = e2, getattr(getattr(e2, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
                     log.warning("could not report session %s: %s", sid, e)
                     self._drop_sent(sent_items)
@@ -863,7 +884,7 @@ class SessionRunner:
         named = data.get("features")
         features = {f for f in named if isinstance(f, str)} if isinstance(named, list) else set()
         steer_aware = "steer" in features
-        held_aware = "held" in features     # (ruling J) a Claude session's steer is only taken from a hub naming it
+        held_aware = self._pair(features)   # (rulings J, R) a Claude session's steer only from a hub naming the pair
         listed = {v["session_id"]: v for v in data["sessions"]
                   if isinstance(v, dict) and isinstance(v.get("session_id"), str)}
         # Roots first, then each level under the one above it: a child is only opened under a parent that is open
@@ -1403,7 +1424,7 @@ class SessionRunner:
         """(Review round 2, ruling J) Asked at every write of a steer's bytes (the write gate only, never as the
         attempt's authority: a hold is not cut because a fetch failed and the features are unknown for a while): a
         Claude steer (its adapter holds N's end) is written only while the hub's current listing names `held`."""
-        return not self.host.holds(s.session_id) or ("held" in self.hub_features and self.features_known)
+        return not self.host.holds(s.session_id) or (self._pair(self.hub_features) and self.features_known)
 
     def _steer_listed(self, sid: str, view: dict, fetch_sent: float | None, aware: bool = True) -> None:
         """The listing's word on this session's steer: an offer (passed on, with whether authority held for it) or

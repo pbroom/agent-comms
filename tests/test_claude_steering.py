@@ -3218,6 +3218,141 @@ def test_r4_q_at_retired_max_the_pair_is_not_advertised(henv, monkeypatch):
     assert "steer" not in henv.host.modes(SID) and "held" not in henv.host.modes(SID)
 
 
+
+# ---------------------------------------------------------------- review round 4, ruling R: one fallback per report
+
+
+def _claude_end_and_codex_steer_pending(env):
+    """A: a Claude 2.1.330 session (modes steer, restart, held) whose ordinary turn ended; B: a Codex session with a
+    steer listed into its turn and its end `in_turn`. Both ends are in the node's report queue, A's first."""
+    from test_codex_steering import codex_turn_in_flight, post_steer
+    from test_hosted_sessions import P3
+    from agent_comms.session_host import HostEvent
+    a = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    ca = proc_of(env, a)[1]
+    ma = written(ca)[-1]["uuid"]
+    ca.emit(cinit(a, ma))
+    tick(env)
+    b, cb = codex_turn_in_flight(env, project=P3)
+    post_steer(env, b)
+    tick(env)
+    runner = env.node.sessions
+    ca.emit(cresult(a, ma, text="A's reply"))
+    with runner.lock:
+        runner._emit(runner.host.tick())
+        runner._emit([HostEvent(b, "turn_ended", "1", ok=True, text="B's reply", answered=True,
+                                steer={"outcome": "in_turn", "why": "answered"})])
+    return a, b, runner
+
+
+def _posts(runner, refuse):
+    """Every report POST the runner makes, through `refuse(path, body)` (an httpx status to answer, or None)."""
+    real, seen = runner.client, []
+
+    class Hub:
+        def request(self, method, path, **kw):
+            body = kw.get("json") or {}
+            if method == "POST" and path.startswith("/api/nodes/sessions/") and "held" not in body:
+                seen.append((path.rsplit("/", 1)[-1], json.loads(json.dumps(body))))
+                code = refuse(path, body)
+                if code is not None:
+                    return httpx.Response(code, json={"detail": "refused"}, request=httpx.Request(method, "http://h" + path))
+            return real.request(method, path, **kw)
+    runner.client = Hub()
+    return seen
+
+
+def _step2_refuses(path, body):
+    """main d11ff99's `modes` check (verbatim in effect: only steer and restart, at most two): 400."""
+    modes = body.get("modes")
+    if modes is not None and (len(modes) > 2 or any(x not in ("steer", "restart") for x in modes)):
+        return 400
+    return None
+
+
+def test_r4_r_a_rollback_refusal_of_one_report_never_strips_anothers_outcome(env):
+    """Sol's blocker (ruling R): in one flush, A's Claude end is refused by a step-2 hub (400, `held` in modes) and
+    sent again without the pair; B's valid Codex `in_turn` after it still goes WITH its steer extension and settles
+    `in_turn`. Feature knowledge is not changed by A's refusal."""
+    a, b, runner = _claude_end_and_codex_steer_pending(env)
+    features = set(runner.hub_features)
+    seen = _posts(runner, _step2_refuses)
+    with runner.lock:
+        assert runner._flush()
+    assert hosted._get(env.board.conn, hosted._msg_key(a, 1))["state"] == "done"
+    st = hosted_steer.get(env.board.conn, b, 1)
+    assert (st["outcome"], st["why"]) == ("in_turn", "answered"), st
+    assert [x for x, _ in seen].count(b) == 1 and any("steer" in e for e in dict(seen)[b]["events"])
+    assert runner.hub_features == features and runner.features_known, "no feature forgotten by a rejection"
+    assert runner.last_sync == float("-inf"), "it asks for a fresh listing"
+
+
+def test_r4_r_the_new_hub_strips_nothing(env):
+    """Ruling R: against the new hub, both reports go once, as built."""
+    a, b, runner = _claude_end_and_codex_steer_pending(env)
+    seen = _posts(runner, lambda path, body: None)
+    with runner.lock:
+        assert runner._flush()
+    assert sorted(x for x, _ in seen) == sorted([a, b])
+    assert "held" in dict(seen)[a]["modes"] and any("steer" in e for e in dict(seen)[b]["events"])
+
+
+def test_r4_r_one_ladder_reaches_a_payload_without_both_modes_and_extension(env):
+    """Ruling R+: a hub that refuses both the steering modes (400) and any steer extension (422): ONE ladder, from
+    the original report, ends at a payload without both, and the end is recorded."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, s_uuid, text="N and S"))
+    runner = env.node.sessions
+    with runner.lock:
+        runner._emit(runner.host.tick())
+
+    def refuse(path, body):
+        if any("steer" in e for e in body.get("events", [])):
+            return 422
+        return _step2_refuses(path, body)
+    seen = _posts(runner, refuse)
+    with runner.lock:
+        assert runner._flush()
+    mine = [body for x, body in seen if x == sid]
+    assert len(mine) == 3, mine
+    assert "held" not in mine[-1].get("modes", []) and not any("steer" in e for e in mine[-1]["events"])
+    assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] == "done"
+
+
+def test_r4_r_a_pre_steering_responder_gets_the_plain_rung(env):
+    """Ruling R: a responder from before steering (it refuses any steer extension, 422): a Codex steer end goes by
+    rung (iii), main's plain retry; N's end is recorded."""
+    from test_codex_steering import codex_turn_in_flight, post_steer
+    from test_hosted_sessions import P3
+    from agent_comms.session_host import HostEvent
+    b, cb = codex_turn_in_flight(env, project=P3)
+    post_steer(env, b)
+    tick(env)
+    runner = env.node.sessions
+    with runner.lock:
+        runner._emit([HostEvent(b, "turn_ended", "1", ok=True, text="B's reply", answered=True,
+                                steer={"outcome": "in_turn", "why": "answered"})])
+    seen = _posts(runner, lambda path, body: 422 if any("steer" in e for e in body.get("events", [])) else None)
+    with runner.lock:
+        assert runner._flush()
+    mine = [body for x, body in seen if x == b]
+    assert len(mine) == 2 and not any("steer" in e for e in mine[-1]["events"])
+    assert hosted._get(env.board.conn, hosted._msg_key(b, 1))["state"] == "done"
+
+
+def test_r4_r_a_retrys_success_bookkeeping_is_a_first_trys(env):
+    """Ruling R+, V2: the state after a report that went at the second rung is the state after a first-try
+    success: the report left the queue, its status recorded as reported, its refusal mark cleared, its ack taken."""
+    a, b, runner = _claude_end_and_codex_steer_pending(env)
+    _posts(runner, _step2_refuses)
+    with runner.lock:
+        assert runner._flush()
+    assert not [x for x, _ in runner.pending if x in (a, b)]
+    assert runner.reported.get(a) == runner.status.get(a) and a not in runner.refused
+    assert a in runner.report_ack and b in runner.report_ack
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
