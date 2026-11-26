@@ -466,7 +466,7 @@ class SessionRunner:
             events, self.watched_steer = self.watched_steer + list(events), []
         if self.watched:        # (under the lock, like every caller of this: what the watchdog stopped comes first)
             events, self.watched = self.watched + list(events), []
-        self._dispatch(events)
+        self._hand(events)      # (ruling V: event by event; what is not owned goes back to the host's outbox)
 
     def _hand(self, events: list[HostEvent]) -> None:
         """(Review round 4, ruling V) A handoff of events this pass took from the host or the watchdog's lists:

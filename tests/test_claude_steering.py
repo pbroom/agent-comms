@@ -3385,7 +3385,8 @@ def test_r4_s_a_buffered_native_end_never_goes_behind_lost(env):
     assert msg["state"] == "done" and show(env, sid)["reply"] == "A's own", msg
 
 
-@pytest.mark.parametrize("path", ["cancel", "close", "fatal", "host_error", "reap_with_survivors"])
+@pytest.mark.parametrize("path", ["cancel", "close", "fatal", "host_error", "reap_with_survivors",
+                                  "interrupted_timeout", "broken_pipe"])
 def test_r4_t_after_the_latch_no_single_session_path_signals_or_decides(henv, monkeypatch, path):
     """Sol's blocker (ruling T): after the global latch, a cancel, a close, a fatal frame, a host error or a reap
     with group survivors of a steering session sends no signal and decides no steer: the bulk stop owns it and
@@ -3405,10 +3406,20 @@ def test_r4_t_after_the_latch_no_single_session_path_signals_or_decides(henv, mo
         child.read_lines = broken
         henv.host.tick()
         child.read_lines = lambda: []
-    else:
+    elif path == "reap_with_survivors":
         child.code = 0
         henv.groups.add(child.pid)
         henv.host.tick()
+    elif path == "interrupted_timeout":
+        # (a Claude session's own interrupt is never sent: `interrupt()` is None; the branch is reached only if
+        # `interrupted_at` is set, as a Codex session's is)
+        s.interrupted_at = henv.clock() - henv.host.kill_grace - 1
+        henv.host.tick()
+    else:
+        s.outbuf = bytearray(b"x")
+        child.broken = True
+        henv.host.tick()
+        child.broken = False
     assert not child.terminated, "no SIGTERM after the latch"
     assert s.steer is not None and s.steer.outcome is None, "no steer decided after the latch"
     out = henv.host.stop_all()
@@ -3630,6 +3641,32 @@ def test_r4_v_the_watched_handoff_loses_and_duplicates_nothing(env):
         runner.pass_once()
     runner._dispatch = real
     assert [e.text for e in runner.host._outbox] == ["A's own"]
+    tick(env)
+    assert len([e for x, e in runner.pending if x == sid]) <= 1
+    assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] == "done"
+
+
+def test_r4_v_the_emit_handoff_of_watched_loses_and_duplicates_nothing(env):
+    """Ruling V1 (the late list): the self-stop's `watched` list handed to the dispatcher by `_emit`, which raises on
+    its first event: the events go back to the host's outbox and are delivered once on the next pass."""
+    from agent_comms.session_host import HostEvent
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    runner.watched = [HostEvent(sid, "turn_ended", "1", ok=True, text="A's own", answered=True)]
+    real = runner._dispatch
+    calls = []
+
+    def flaky(events):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("the dispatcher failed")
+        return real(events)
+    runner._dispatch = flaky
+    with pytest.raises(RuntimeError):
+        with runner.lock:
+            runner._emit([])
+    runner._dispatch = real
+    assert not runner.watched and [e.text for e in runner.host._outbox] == ["A's own"]
     tick(env)
     assert len([e for x, e in runner.pending if x == sid]) <= 1
     assert hosted._get(env.board.conn, hosted._msg_key(sid, 1))["state"] == "done"
