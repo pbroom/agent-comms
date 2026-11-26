@@ -333,6 +333,14 @@ def _named(ev: dict) -> set[str]:
     return out
 
 
+def _identifies(ev: dict, n: str) -> bool:
+    """(Ruling Q, identity) The frame is N's own result: its scalar is N and its list starts with N. Only the first
+    element is read; the other fields' types and the list's length do not matter here (validity and evidence are
+    asked apart)."""
+    listed = ev.get("user_message_uuids")
+    return ev.get("user_message_uuid") == n and isinstance(listed, list) and bool(listed) and listed[0] == n
+
+
 def _too_long(ev: dict) -> bool:
     """An echo list longer than MAX_ECHO (ruling L: never read in part)."""
     v = ev.get("user_message_uuids")
@@ -343,8 +351,8 @@ def _terminal(ev: dict) -> bool:
     """(Ruling L) A terminal of the measured shape: a measured subtype with its `is_error`, and one turn or more (a
     zero-turn notification is no turn's end)."""
     sub, turns = ev.get("subtype"), ev.get("num_turns")
-    return (sub in MEASURED_TERMINALS and ev.get("is_error") is MEASURED_TERMINALS[sub]
-            and isinstance(turns, int) and not isinstance(turns, bool) and turns >= 1)
+    return (isinstance(sub, str) and sub in MEASURED_TERMINALS and ev.get("is_error") is MEASURED_TERMINALS[sub]
+            and isinstance(turns, int) and not isinstance(turns, bool) and turns >= 1)     # (total: ruling Q)
 
 
 def _echo_shape(ev: dict) -> tuple[list | None, str | None, bool]:
@@ -420,7 +428,8 @@ class _Steers:
     def __get__(self, obj, owner=None) -> bool:
         if obj is None:
             return False
-        return obj.verified and obj._steer_mode is not None
+        # (Ruling Q6) at RETIRED_MAX it takes no more steers, so it no longer says it does
+        return obj.verified and obj._steer_mode is not None and len(obj._retired) < RETIRED_MAX
 
 
 class ClaudeSession:
@@ -481,6 +490,7 @@ class ClaudeSession:
         self._attempt: dict | None = None
         self._evidence: str | None = None   # the evidence of the frame being read (`feed` puts it on its event)
         self._s_named = False               # the open UNATTRIBUTED bracket was opened by an init naming S (THREE)
+        self._s_init_last = False           # (ruling Q4) S's own init is the last init seen inside S's bracket
 
     def configure(self, *, access: str | None = None, effort: str | None = None) -> None:
         """What the host decided for this session (session_access.prepare), before any `argv`. `access` "full":
@@ -685,6 +695,7 @@ class ClaudeSession:
             self._attempt["phase"] = phase
             if phase == "s_turn":
                 self._bracket, self._competing, self._activity = STEER_BRACKET, False, False
+                self._s_init_last = True        # (ruling Q4) S's own init is the last init seen in its bracket
 
     def steer_done(self) -> None:
         """The host decided S (or gave the attempt up): the attempt is retired at once, before any further frame is
@@ -748,7 +759,11 @@ class ClaudeSession:
             log.info("Claude session %s: a frame of a steer already settled (nothing is taken from it)",
                      self.session_id)
             return True, "other"
-        if _too_long(ev) and (a is not None or self._retired):
+        if _too_long(ev) and (a is not None or self._retired) and not (
+                kind == "result" and a is not None and a["phase"] == "n" and a["bytes"] > 0
+                and self._current == a["n"] and _identifies(ev, a["n"])):
+            # (Ruling Q) N's identity is checked first: a result whose scalar is N and whose list starts with N is
+            # N's own whatever the list's length (below); any other list past the cap is a contradiction.
             self._contradict("an echo list longer than the measured ones")
             return True, "other"
         if a is None:
@@ -764,6 +779,7 @@ class ClaudeSession:
                     return True, "other"
                 return False, None
             if phase == "s_turn":
+                self._s_init_last = False       # (ruling Q4) rule 10 no longer holds for S in this bracket
                 if names_s or names_n:
                     self._contradict("an init naming the steer or the held turn inside the steer's own turn")
                 else:
@@ -802,7 +818,7 @@ class ClaudeSession:
             if a["bytes"] == 0:
                 return False, None      # no byte of this attempt went: the process is as without a steer
             if names_n and self._current == n:
-                if isinstance(listed, list) and listed and listed[0] == n and scalar == n:
+                if _identifies(ev, n):
                     # N's identity is intact: N's own result, whatever else it carries (ruling L).
                     measured = shaped and quiet and _terminal(ev) and self._verified is True
                     if measured and listed == [n, s_]:
@@ -848,7 +864,7 @@ class ClaudeSession:
                 self._contradict("a result naming the steer in its own turn not in the measured shape")
                 return True, "other"
             if (ev.get("is_error") is True and "user_message_uuid" not in ev and "user_message_uuids" not in ev
-                    and "origin" not in ev and self._verified is True and _terminal(ev)):
+                    and "origin" not in ev and self._verified is True and _terminal(ev) and self._s_init_last):
                 # Step 1's rule 10 for a fully written turn (the echo-loss policy): S's own turn failed with this
                 # error, by order, and the incarnation is unverified from now on. Only an error with no echo field
                 # at all and no origin key, of a measured terminal shape.

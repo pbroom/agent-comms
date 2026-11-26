@@ -3099,6 +3099,125 @@ def test_r3_p_the_sender_drops_a_checkpoint_no_longer_due_at_the_post(env):
         runner.checkpoint_thread.join(5)
 
 
+
+# ---------------------------------------------------------------- review round 4, ruling Q: the adapter is total
+
+JSON_VALUES = [None, True, False, 0, 1, -1, 2.5, "", "x", "success", [], [1], ["success"], {}, {"kind": "x"}]
+
+
+@pytest.mark.parametrize("subtype", [["success"], {"a": 1}])
+def test_r4_q_an_identified_ns_result_with_an_unhashable_subtype_is_ns(henv, monkeypatch, subtype):
+    """Sol's blocker (Q1, Q2): N's result with N's identity intact and an array- or object-valued `subtype`: never a
+    raise; N's own result (S `unconfirmed`), the session goes on."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, text="N's own") | {"subtype": subtype})
+    [end] = ends(henv.host.tick())
+    assert end.text == "N's own" and end.steer["outcome"] == "unconfirmed" and not s.ended
+
+
+@pytest.mark.parametrize("subtype", [["success"], {"a": 1}])
+def test_r4_q_an_exact_s_result_with_an_unhashable_subtype_never_ends_the_session(henv, monkeypatch, subtype):
+    """Sol's blocker (Q1): an exact [S] terminal with a malformed subtype inside S's own turn is not the measured
+    shape: no host error, the session goes on; S is cut, never S's end with that frame."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    child.emit(owned(S, text="malformed") | {"subtype": subtype})
+    out = henv.host.tick() + henv.host.tick()
+    [end] = ends(out)
+    assert not s.ended and end.steer["outcome"] == "next_turn" and end.steer["result"]["text"] != "malformed"
+
+
+def test_r4_q_ns_identity_wins_over_the_length_cap(henv, monkeypatch):
+    """Q2: N's identity is checked before the length cap: scalar N and N first, with a list longer than MAX_ECHO,
+    is N's own result (S `unconfirmed`)."""
+    s, child, n = steered(henv, monkeypatch)
+    junk = [f"0be7c0de-0000-4000-8000-{i:012d}" for i in range(claude.MAX_ECHO + 5)]
+    child.emit(owned(n, text="N's own") | {"user_message_uuids": [n] + junk})
+    [end] = ends(henv.host.tick())
+    assert end.text == "N's own" and end.steer == {"outcome": "unconfirmed", "why": "unproved"}
+
+
+def test_r4_q_retired_s_first_and_live_n_past_the_cap(henv, monkeypatch):
+    """Q3: a list with a retired S first and the live N past the cap names the live attempt: classified against it
+    (N without N's identity: the loss), never swallowed as the retired S's frame."""
+    s, child, n = steered(henv, monkeypatch)
+    child.emit(owned(n, S, text="N1"))
+    henv.host.tick()
+    henv.host.send(SID, "second", message_id="2")
+    henv.host.tick()
+    n2 = uuid_of(child)
+    child.emit(vinit(n2))
+    henv.host.tick()
+    henv.host.steer_offer(SID, "2", "5e7e7e7e-0000-4000-8000-0000000000c2", TEXT, authorized=True)
+    henv.host.tick()
+    junk = [f"0be7c0de-0000-4000-8000-{i:012d}" for i in range(claude.MAX_ECHO + 2)]
+    child.emit(result(text="?") | {"user_message_uuid": S, "user_message_uuids": [S] + junk + [n2]})
+    henv.host.tick()
+    assert not s.provider.verified
+
+
+def test_r4_q_rule_10_only_while_ss_init_is_the_last_init(henv, monkeypatch):
+    """Q4 (deviation b narrowed): `init` [S], then an unmarked init inside S's bracket, then an echo-less,
+    origin-less error: no evidence for S (another init was seen); S runs to its bound (`next_turn` cut), the error
+    never published as S's own."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    child.emit(vinit(), plain(text="whose error", subtype="error_during_execution", is_error=True))
+    out = henv.host.tick()
+    assert not ends(out) and s.held is not None and s.held.s_turn
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    [end] = ends(out) or ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+    assert end.steer["result"]["text"] != "whose error"
+
+
+RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",
+                 "permission_denials", "terminal_reason", "stop_reason", "duration_ms", "total_cost_usd"]
+INIT_FIELDS = ["claude_code_version", "capabilities", "permissionMode", "tools", "user_message_uuids", "origin",
+               "user_message_uuid"]
+
+
+@pytest.mark.parametrize("phase", ["n", "held", "s_turn"])
+def test_r4_q_property_every_field_every_json_type_never_raises(henv, monkeypatch, phase):
+    """Q5: for a result and an init frame, every field the adapter reads takes every JSON type, in each phase of
+    an attempt: the adapter never raises, the session never ends through the host-error path, and a result whose
+    N identity is intact (phase n) always ends N with N's own result."""
+    for kind, fields in (("result", RESULT_FIELDS), ("init", INIT_FIELDS)):
+        for field in fields:
+            for value in JSON_VALUES:
+                henv.spawner = __import__("test_dispatch").FakeSpawner(child=__import__("test_session_host")
+                                                                        .FakeSessionChild)
+                henv.procs = __import__("test_dispatch").FakeProcs(henv.spawner)
+                s, child, n = steered(henv, monkeypatch)
+                if phase != "n":
+                    child.emit(owned(n, text="N"))
+                    henv.host.tick()
+                if phase == "s_turn":
+                    child.emit(vinit(S))
+                    henv.host.tick()
+                base = owned(n, text="N's own") if (kind == "result" and phase == "n") else (
+                    owned(S, text="S") if kind == "result" else vinit(S))
+                frame = dict(base)
+                frame[field] = value
+                child.emit(frame)
+                out = henv.host.tick()
+                assert not s.ended, (kind, field, value, s.error)
+                if kind == "result" and phase == "n" and field not in ("user_message_uuid", "user_message_uuids"):
+                    # N's identity intact: N's own result, ended (S downgraded) or held (the measured shape)
+                    mine = [e for e in out if e.kind in ("turn_ended", "held") and e.message_id == "1"]
+                    want = "N's own" if field != "result" else (value if isinstance(value, str) else "")
+                    assert mine and mine[0].text == want, (field, value, out)
+
+
+def test_r4_q_at_retired_max_the_pair_is_not_advertised(henv, monkeypatch):
+    """Q6: at RETIRED_MAX the incarnation no longer says `steer` and `held` (its next report drops them)."""
+    s, child, n = steered(henv, monkeypatch)
+    p = s.provider
+    assert "held" in henv.host.modes(SID)
+    for i in range(claude.RETIRED_MAX):
+        p._retired.add(f"5e7e7e7e-0000-4000-8000-{i:012d}")
+    assert "steer" not in henv.host.modes(SID) and "held" not in henv.host.modes(SID)
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
