@@ -54,7 +54,7 @@ OWNERS = ("order", "own", "other", "steer")
 # `_steer_adjudicate`): what ONE frame proves about S, given the attempt's facts, never more. N's own result with S
 # in it, or without; the S-only result inside N's own bracket; S's own turn opened, or ended (with its result); S
 # consumed by another bracket's terminal result; verification lost while the attempt is live.
-EVIDENCE = ("n_with_s", "n_without_s", "s_only", "s_open", "s_end", "s_consumed", "lost")
+EVIDENCE = ("n_with_s", "n_without_s", "n_unproved", "s_only", "s_open", "s_end", "s_consumed", "lost")
 # What a provider may say it can do with a turn in flight (`modes`, DESIGN_NOTES "Restarting a running turn"; steering:
 # "Mid-turn steering, loose contract"). Codex's adapter steers (`turn/steer` into a turn proved to be the message's);
 # Claude's steers only in a verified process of a version that passed gate M8 (step 3: providers/claude.py STEER_MODES).

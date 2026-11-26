@@ -2265,6 +2265,9 @@ class SessionHost:
                     outcome = {"outcome": "in_turn", "why": "answered"}
                 elif evidence == "s_only":
                     outcome = {"outcome": "unconfirmed", "why": "s_only"}
+                elif evidence == "n_unproved":
+                    # (ruling L) N's own result with N's identity intact, in a shape that proves nothing about S
+                    outcome = {"outcome": "unconfirmed", "why": "unproved"}
                 else:
                     return HOLD
             else:
