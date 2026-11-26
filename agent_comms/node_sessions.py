@@ -558,8 +558,7 @@ class SessionRunner:
                     continue
                 sid = next(iter(self.checkpoint_queue))
                 held = self.checkpoint_queue.pop(sid)
-            if self._checkpoint_due(sid, held):
-                self._post_checkpoints({sid: held})
+            self._post_checkpoints({sid: held})     # (rechecked there, immediately before the POST: ruling P)
         with self.checkpoint_cond:
             self.checkpoint_queue.clear()
 

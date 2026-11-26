@@ -3070,6 +3070,35 @@ def test_r3_o_losing_held_resends_a_claude_sessions_modes(env):
     assert hosted._session(env.board.conn, sid)["modes"] == ["restart"]
 
 
+
+def test_r3_p_the_sender_drops_a_checkpoint_no_longer_due_at_the_post(env):
+    """Ruling P: the sender's thread rechecks a queued checkpoint immediately before its POST: one whose N is no
+    longer held (another message, here) is dropped, nothing posted."""
+    sid, child, n, s_uuid = claude_steered(env)
+    child.emit(cresult(sid, n, text="N's reply"))
+    runner = env.node.sessions
+    runner.host.tick()
+    posted = []
+    real = runner.client.request
+    runner.client.request = lambda m, u, *a, **kw: (posted.append(kw.get("json")) if (kw.get("json") or {}).get(
+        "held") is not None else None, real(m, u, *a, **kw))[1]
+    runner.start_checkpoint_sender()
+    try:
+        with runner.checkpoint_cond:
+            runner.checkpoint_queue[sid] = {"message": 2, "ok": True, "detail": "", "denials": [], "meta": {},
+                                            "text": "x", "answered": True}
+            runner.checkpoint_cond.notify()
+        import time as _time
+        deadline = _time.monotonic() + 3
+        while runner.checkpoint_queue and _time.monotonic() < deadline:
+            _time.sleep(0.05)
+        _time.sleep(0.2)
+        assert not runner.checkpoint_queue and posted == [], posted
+    finally:
+        runner.stopping.set()
+        runner.checkpoint_thread.join(5)
+
+
 # ---------------------------------------------------------------- gate M8's real frames (review round 1, ruling E)
 
 M8_DIR = __import__("pathlib").Path(__file__).parent / "fixtures" / "m8_2.1.330"
