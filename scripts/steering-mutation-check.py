@@ -107,7 +107,7 @@ ROWS = [('A', "F init naming S in N's bracket is a contradiction", '            
     ('H', "T stop_all's final save in a finally", '        finally:\n            self._save_state()\n        return self._take_outbox()', '        finally:\n            pass\n        self._save_state()\n        return self._take_outbox()'),
     ('NS', "T the watchdog's steps apart", '            except Exception:\n                log.exception("hosted sessions: the self-stop failed")', '            except ZeroDivisionError:\n                log.exception("hosted sessions: the self-stop failed")'),
     ('H', "T no save on the watchdog's self-stop", "                    self._save_due = True       # (ruling T) no save on the watchdog's path: the loop saves", '                    self._save_state()'),
-    ('H', "T no save on the watchdog's boundary", "        self._defer_save = True     # (ruling T) the watchdog's path persists nothing", '        self._defer_save = False'),
+    ('H', "T no save on the watchdog's boundary", "        self._defer_save = True     # (ruling T) the watchdog's path persists nothing", "        self._defer_save = False     # (ruling T) the watchdog's path persists nothing"),
     ('NS', "U the entry's own generation", ' and s.gen == entry.gen\n', '\n'),
     ('NS', "V the loop's own handoff event by event", "        self._hand(events)      # (ruling V: event by event; what is not owned goes back to the host's outbox)", '        self._dispatch(events)'),
     ('H', 'T a close, a fatal frame, a host error claimed', '        if self._steering(s):\n            # (ruling T) a close, a fatal frame', '        if False:\n            # (ruling T) a close, a fatal frame'),
@@ -141,16 +141,23 @@ def main() -> int:
                 r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-x", *sel],
                                    cwd=root, capture_output=True, text=True, timeout=1800)
                 failed = sorted(set(re.findall(r"^FAILED (\S+)", r.stdout, re.M)))
-                if failed or r.returncode not in (0, 5):
-                    failed = failed or [f"(exit {r.returncode})"]
+                if r.returncode not in (0, 1, 5):
+                    failed = None       # (the mutant did not run: a collection error or an interruption)
+                    break
+                if failed or r.returncode == 1:
+                    failed = failed or ["(exit 1)"]
                     break
         finally:
             path.write_text(text)
+        if failed is None:
+            print(f"BROKEN  {name}  (the mutant did not run)", flush=True)
+            results.append((name, None))
+            continue
         results.append((name, failed))
         print(f"{'CAUGHT' if failed else 'MISSED'}  {name}  {failed[0].split('::', 1)[-1] if failed else ''}",
               flush=True)
     print("rows:", len(results), flush=True)
-    print("stale:", [n for n, f in results if f is None], flush=True)
+    print("stale or broken:", [n for n, f in results if f is None], flush=True)
     print("missed:", [n for n, f in results if f == []], flush=True)
     return 0
 

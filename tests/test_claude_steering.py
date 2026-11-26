@@ -3340,6 +3340,29 @@ def test_r4_r_a_pre_steering_responder_gets_the_plain_rung(env):
     assert hosted._get(env.board.conn, hosted._msg_key(b, 1))["state"] == "done"
 
 
+def test_r4_r_the_write_gate_asks_the_pair(env):
+    """Ruling R3 (a mutation row): the write gate of a Claude steer asks the pair, never `held` alone: a listing that
+    names `held` without `steer` writes nothing of it."""
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    s = runner.host.sessions[sid]
+    assert runner.host.holds(sid) and runner.features_known and runner._steer_capable(s)
+    runner.hub_features = set(runner.hub_features) - {"steer"}
+    assert "held" in runner.hub_features and not runner._steer_capable(s)
+
+
+def test_r4_r_the_checkpoint_gates_ask_the_pair(env):
+    """Ruling R3 (a mutation row): the checkpoint is queued, and posted, only for a listing naming the pair, never
+    `held` alone."""
+    from agent_comms.session_host import HostEvent
+    sid, child, n, s_uuid = claude_steered(env)
+    runner = env.node.sessions
+    runner.hub_features = set(runner.hub_features) - {"steer"}
+    assert "held" in runner.hub_features and runner.features_known
+    runner._checkpoint(HostEvent(sid, "held", "1", ok=True, text="N's reply", answered=True))
+    assert sid not in runner.checkpoints, "no checkpoint queued for `held` alone"
+
+
 def test_r4_r_a_retrys_success_bookkeeping_is_a_first_trys(env):
     """Ruling R+, V2: the state after a report that went at the second rung is the state after a first-try
     success: the report left the queue, its status recorded as reported, its refusal mark cleared, its ack taken."""
@@ -3356,8 +3379,8 @@ def test_r4_r_a_retrys_success_bookkeeping_is_a_first_trys(env):
 # ---------------------------------------------------------------- review round 4, rulings S, T, U, V
 
 
-def _ordinary_turn_in_flight(env):
-    sid = start(env, "an ordinary turn")["session_id"]
+def _ordinary_turn_in_flight(env, project=None):
+    sid = start(env, "an ordinary turn", **({"project": project} if project else {}))["session_id"]
     tick(env)
     child = proc_of(env, sid)[1]
     m = written(child)[-1]["uuid"]
@@ -3383,6 +3406,33 @@ def test_r4_s_a_buffered_native_end_never_goes_behind_lost(env):
     tick(env, times=2)
     msg = hosted._get(env.board.conn, hosted._msg_key(sid, 1))
     assert msg["state"] == "done" and show(env, sid)["reply"] == "A's own", msg
+
+
+def test_r4_s_a_self_stop_that_raises_keeps_its_own_events(env):
+    """Ruling S with V (a mutation row): the self-stop publishes one session's failure, then a BaseException escapes
+    on the next session: what it published stays in the host's outbox, after what was already there."""
+    from agent_comms.session_host import HostEvent
+    from test_hosted_sessions import P2
+    sid1, c1, m1 = _ordinary_turn_in_flight(env)
+    sid2, c2, m2 = _ordinary_turn_in_flight(env, project=P2)
+    host = env.node.sessions.host
+    host._outbox.append(HostEvent(sid1, "delivered", "1"))      # (what was there before)
+    real, calls = host._stop, []
+
+    class Abort(BaseException):
+        pass
+
+    def stop(sess, now, **kw):
+        calls.append(sess.session_id)
+        if len(calls) == 2:
+            raise Abort()
+        return real(sess, now, **kw)
+    host._stop = stop
+    with pytest.raises(Abort):
+        host.stop_turns("the node lost the hub", own=True)
+    host._stop = real
+    kinds = [(e.session_id, e.kind) for e in host._outbox]
+    assert kinds[0] == (sid1, "delivered") and (calls[0], "turn_ended") in kinds[1:], kinds
 
 
 @pytest.mark.parametrize("path", ["cancel", "close", "fatal", "host_error", "reap_with_survivors",
@@ -3424,6 +3474,42 @@ def test_r4_t_after_the_latch_no_single_session_path_signals_or_decides(henv, mo
     assert s.steer is not None and s.steer.outcome is None, "no steer decided after the latch"
     out = henv.host.stop_all()
     assert len(ends(out)) == 1 and ends(out)[0].steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r4_t_a_reap_whose_drain_meets_the_latch_decides_nothing(henv, monkeypatch):
+    """Ruling T (a mutation row): the process went, leaving members of its group; the latch comes during the reap's
+    drain (after the first check): the claim refuses, nothing is decided or signalled, the group is registered as
+    stopping; the bulk stop decides once."""
+    s, child, n = steered(henv, monkeypatch)
+    henv.host.steer_drain_hook = lambda sess: henv.host.steer_stopping()
+    child.code = 0
+    henv.groups.add(child.pid)
+    out = henv.host.tick()
+    henv.host.steer_drain_hook = None
+    assert henv.host.steer_stopped and not ends(out) and not child.terminated
+    assert s.steer is not None and s.steer.outcome is None and s.stopping_since is not None
+    [end] = ends(henv.host.stop_all())
+    assert end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
+
+
+def test_r4_t_a_host_error_of_a_held_end_after_the_latch_decides_nothing(henv, monkeypatch):
+    """Ruling T (a mutation row): N's end is held; after the latch a read raises: the host error neither decides S
+    nor publishes N's end (`_publish_now`); the bulk stop decides once."""
+    s, child, n = steered(henv, monkeypatch)
+    s.steer.cover_until = henv.clock() + 20
+    child.emit(owned(n, text="N's own"))
+    henv.host.tick()
+    assert s.held is not None and s.held.decided is None
+    henv.host.steer_stopping()
+
+    def broken():
+        raise OSError("read failed")
+    child.read_lines = broken
+    out = henv.host.tick()
+    child.read_lines = lambda: []
+    assert not ends(out) and s.held is not None and s.held.decided is None and not child.terminated
+    [end] = ends(henv.host.stop_all())
+    assert end.text == "N's own" and end.steer == {"outcome": "unconfirmed", "why": "turn_cut"}
 
 
 def test_r4_t_the_cut_whose_drain_meets_the_latch_decides_nothing(henv, monkeypatch):
@@ -3512,6 +3598,22 @@ def test_r4_t_stop_all_survives_a_fault_in_every_step_of_its_traversal(henv, mon
     assert s2.child is None and s1.child is None and saved
 
 
+def test_r4_t_stop_all_saves_even_when_its_traversal_raises(henv, monkeypatch):
+    """Ruling T4 (a mutation row): the wait for the groups raises (its sleep): the final save still runs."""
+    (s1, c1), (s2, c2) = _held_pair(henv, monkeypatch)
+    c1.exits_on_terminate = False
+
+    def bad(_):
+        raise OSError("failed")
+    henv.host.sleep = bad
+    saved = []
+    real_save = henv.host._save_state
+    henv.host._save_state = lambda: (saved.append(1), real_save())
+    with pytest.raises(OSError):
+        henv.host.stop_all()
+    assert saved
+
+
 def test_r4_t_a_stop_claimed_before_the_latch_may_signal_after_it(henv, monkeypatch):
     """Ruling T+ (the ordering limit): a stop claimed before the latch signals after it: the same SIGTERM shutdown
     sends, once; the bulk stop recognises the claim (N's end decided once, by the claim)."""
@@ -3561,6 +3663,50 @@ def test_r4_t_the_watchdog_runs_its_deadlines_whatever_the_save_does(env):
     assert done.wait(3) and _time.monotonic() - t0 < 3, "a stalled save never holds the watchdog"
     stall.set()
     t.join(5)
+
+
+def test_r4_t_a_failing_self_stop_keeps_no_later_watchdog_step_from_running(env):
+    """Ruling T5 (a mutation row): the self-stop raises: the due SIGKILLs and the steer deadlines still run."""
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    host = runner.host
+    reached = []
+
+    def fails(*a, **k):
+        raise OSError("the self-stop failed")
+    host.stop_turns = fails
+    real_kill_due, real_deadlines = host.kill_due, host.steer_deadlines
+    host.kill_due = lambda: (reached.append("kill_due"), real_kill_due())[1]
+    host.steer_deadlines = lambda: (reached.append("steer_deadlines"), real_deadlines())[1]
+    env.clock.advance(runner.self_stop_seconds + 1)
+    runner.enforce_deadlines()
+    assert reached == ["kill_due", "steer_deadlines"]
+
+
+def test_r4_t_the_watchdogs_self_stop_saves_nothing_on_its_thread(env):
+    """Ruling T5 (a mutation row): the self-stop of a turn in flight, with a save that stalls: the watchdog's pass
+    makes no save and returns promptly; the loop's next tick saves."""
+    import threading
+    import time as _time
+    sid, child, m = _ordinary_turn_in_flight(env)
+    runner = env.node.sessions
+    host = runner.host
+    stall, saves = threading.Event(), []
+    real_save = host._save_state
+    host._save_state = lambda: (saves.append(threading.get_ident()), stall.wait(10))
+    env.clock.advance(runner.self_stop_seconds + 1)
+    done = threading.Event()
+    t = threading.Thread(target=lambda: (runner.enforce_deadlines(), done.set()))
+    t0 = _time.monotonic()
+    t.start()
+    assert done.wait(3) and _time.monotonic() - t0 < 3 and not saves, "no save on the watchdog's thread"
+    assert any(e.session_id == sid for e in runner.watched), "the turn was stopped"
+    stall.set()
+    t.join(5)
+    host._save_state = lambda: saves.append("loop")
+    host.tick()
+    assert saves and saves[0] == "loop", "the loop's next tick saves"
+    host._save_state = real_save
 
 
 def test_r4_v_the_watchdog_never_waits_on_a_stalled_post(env):
