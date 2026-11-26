@@ -280,6 +280,9 @@ class SessionRunner:
         # session id -> (state, pid, resume, the provider's own id when it is not the session id) as of the last pass
         self.status: dict[str, tuple] = {}
         self.reported: dict[str, tuple] = {}          # ... as the hub last took it
+        # (Review round 5, ruling Y) the modes the hub acknowledged for each session (the accepted rung's), which a
+        # fallback may have sent with less than the session wants: corrected by an explicit report after a listing
+        self.acked_modes: dict[str, list] = {}
         self.last_busy: dict[str, float] = {}         # session id -> when it last had a turn or a message
         self.recovered: dict[str, dict] = {}
         self.version: str | None = None
@@ -573,8 +576,9 @@ class SessionRunner:
         """(Review round 4, ruling R) The payloads one report may go as, each computed from the ORIGINAL body and each
         removing strictly more than the one before: (i) as built; (ii) without what only a hub that names `held`
         understands: a Claude session's `steer` and `held` modes (the pair) and a `next_turn` extension, keeping what
-        step 2's contract takes (a Codex `steer` extension included); (iii) main's plain retry: no steer extension
-        at all, no steering modes. A rung that would remove nothing more is not tried."""
+        step 2's contract takes (a Codex `steer` extension included); (iii) main's plain retry (review round 5,
+        ruling Y): rung (ii) without any steer extension, its modes as rung (ii)'s, exactly as main retries a
+        refused steer report. A rung that would remove nothing more is not tried."""
         def without(events_pred, modes_pred):
             out = {k: v for k, v in body.items() if k not in ("events", "modes")}
             out["events"] = [{k: v for k, v in e.items() if not (k == "steer" and events_pred(v))} for e in body["events"]]
@@ -584,24 +588,27 @@ class SessionRunner:
         claude = "held" in (body.get("modes") or [])
         two = without(lambda x: isinstance(x, dict) and x.get("outcome") == "next_turn",
                       lambda m: m == "held" or (claude and m == "steer"))
-        three = without(lambda x: True, lambda m: m in ("steer", "held"))
+        three = {k: v for k, v in two.items() if k != "events"} | {
+            "events": [{k: v for k, v in e.items() if k != "steer"} for e in two["events"]]}
         rungs = [body]
         for r in (two, three):
             if r != rungs[-1]:
                 rungs.append(r)
         return rungs
 
-    def _post_report(self, sid: str, body: dict, events: list) -> tuple[float, Any]:
+    def _post_report(self, sid: str, body: dict, events: list) -> tuple[float, Any, dict]:
         """(Review round 4, ruling R) THE one fallback for a report the hub rejects (400, 422): its rungs
         (`_rungs`), in order, each tried at once, keeping the report's events (their identity in the queue: what is
         sent is dropped only after an acknowledgement, by the caller). A rejection changes nothing the node believes
         about the hub: no feature is forgotten (it only asks for a fresh listing); the one exception is main's own
-        step-2 rule for rung (iii) (R5-05: a steer-only refusal retried plainly forgets `steer` for that listing's
-        features). The success of any rung is reported to the caller exactly as a first attempt's: (sent, answer).
-        All rejected: the last rejection is raised."""
+        step-2 rule, on main's own path only (R5-05; review round 5, ruling Y+): a 422 of a payload that differs from
+        the accepted one ONLY by its steer extensions, under the same listing, forgets `steer`. The success of any
+        rung is reported to the caller exactly as a first attempt's, with the payload the hub acknowledged:
+        (sent, answer, payload). All rejected: the last rejection is raised."""
         path = f"/api/nodes/sessions/{sid}"
         gen = self.features_gen
         rungs = self._rungs(body)
+        refused: tuple[dict, Any] | None = None     # the last rejected payload and its status
         for k, payload in enumerate(rungs):
             sent = self.clock()     # its SEND time: a hub-acknowledged report renews the write authority from it
             last = k == len(rungs) - 1
@@ -620,15 +627,19 @@ class SessionRunner:
                 else:
                     log.warning("the hub refused the report for session %s (%s) with its steering modes: sending it "
                                 "again without them", sid, code)
+                refused = (payload, code)
                 continue
             if k:
                 self.last_sync = float("-inf")      # (ruling R) a fresh listing says what the hub takes now
-                if (any("steer" in x for x in body["events"]) and not any("steer" in x for x in payload["events"])
-                        and gen == self.features_gen):
-                    # (R5-05, main's step-2 rule) the plain retry got through: only `steer` is forgotten, for that
+                if refused is not None and refused[1] == 422 and gen == self.features_gen and (
+                        any("steer" in x for x in refused[0]["events"])
+                        and {**refused[0], "events": [{f: v for f, v in x.items() if f != "steer"}
+                                                      for x in refused[0]["events"]]} == payload):
+                    # (R5-05, main's step-2 rule, on main's path only: ruling Y+) a 422 of exactly this report with
+                    # its steer extensions, and the plain retry got through: only `steer` is forgotten, for that
                     # listing's features
                     self.hub_features = self.hub_features - {"steer"}
-            return sent, answer
+            return sent, answer, payload
         raise AssertionError("no rung")   # (unreachable: the last rung raises or returns)
 
     def _send_checkpoints(self) -> None:
@@ -722,8 +733,10 @@ class SessionRunner:
                     body["modes"] = self._modes_for(status[4], self.hub_features)
             named = bool(self.hub_features)     # (a failed call forgets them: `_call`)
             try:
-                sent, answer = self._post_report(sid, body, events)
+                sent, answer, taken = self._post_report(sid, body, events)
                 self._ack_report(sid, sent, answer)
+                if "modes" in taken:
+                    self.acked_modes[sid] = list(taken["modes"])    # (ruling Y) what the hub acknowledged
             except Exception as e:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if code not in (400, 404, 422):
@@ -1053,6 +1066,13 @@ class SessionRunner:
             for sid, st in self.status.items():
                 if self._modes_for(st[4], features) != self._modes_for(st[4], self.hub_features):
                     self.reported.pop(sid, None)
+        for sid, st in self.status.items():
+            # (Review round 5, ruling Y+) the hub acknowledged LESS than this listing's features say the session has
+            # (a fallback sent less): a report is sent for that purpose, the session quiet or not. (A listing that
+            # names less than before changes nothing here, as on main: what it no longer takes is fenced.)
+            if sid in self.acked_modes and "restart" in features and (
+                    set(self.acked_modes[sid]) < set(self._modes_for(st[4], features))):
+                self.reported.pop(sid, None)
         self.hub_features, self.features_known = features, True
         self.features_gen += 1
         for sid in [x for x in self.report_ack if x not in self.host.sessions]:
@@ -1329,7 +1349,7 @@ class SessionRunner:
             if s.ended and s.child is None:
                 self.host.drain_outbox(lambda e: self._dispatch([e]))     # (ruling M) before it is forgotten
                 self.host.forget(sid)
-                for d in (self.status, self.reported, self.last_busy, self.queue, self.sent, self.tree,
+                for d in (self.status, self.reported, self.acked_modes, self.last_busy, self.queue, self.sent, self.tree,
                           self.parent_of):
                     d.pop(sid, None)
                 with self.ack_lock:

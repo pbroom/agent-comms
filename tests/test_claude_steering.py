@@ -3169,6 +3169,131 @@ def test_r4_q_rule_10_only_while_ss_init_is_the_last_init(henv, monkeypatch):
     assert end.steer["result"]["text"] != "whose error"
 
 
+# ---------------------------------------------------------------- review round 5
+
+
+def test_r5_q7_a_retired_init_inside_ss_bracket_ends_rule_10(henv, monkeypatch):
+    """Sol's blocker 4 (ruling Q7): S1 retired, S2's bracket open, a delayed `init` [S1] (the retired shortcut), then
+    an echo-less, origin-less error: never S2's. Any init that is not S's own live init clears the marker, before
+    any shortcut."""
+    s, child, n = _s_turn_open(henv, monkeypatch)
+    s1 = "5e7e7e7e-0000-4000-8000-0000000000a1"
+    s.provider._retired.add(s1)
+    s.provider._written.add(s1)
+    child.emit(vinit(s1), plain(text="whose error", subtype="error_during_execution", is_error=True))
+    out = henv.host.tick()
+    assert not ends(out) and s.held is not None and s.held.s_turn
+    henv.clock.advance(61)
+    out = henv.host.tick()
+    [end] = ends(out) or ends(henv.host.tick())
+    assert end.steer["outcome"] == "next_turn" and end.steer["result"]["ok"] is False
+    assert end.steer["result"]["text"] != "whose error"
+
+
+class _Invalid(Exception):
+    pass
+
+
+def _d11ff99_report(path, body):
+    """main d11ff99's report checks a step-2 hub applies to these reports, verbatim (hosted.py 1563-1565, the
+    `modes` check: `Invalid`, a 400): an extension is never refused there (hosted_steer.extension ignores one it does
+    not take, `next_turn` included)."""
+    modes = body.get("modes")
+    try:
+        if modes is not None and (not isinstance(modes, list) or len(modes) > 2
+                                  or any(x not in ("steer", "restart") for x in modes) or len(set(modes)) != len(modes)):
+            raise _Invalid("modes must list what the session can do with a turn in flight: steer, restart")
+    except _Invalid:
+        return 400
+    return None
+
+
+def _claude_next_turn_and_codex_steer_pending(env):
+    """As `_claude_end_and_codex_steer_pending`, but A's end carries an actual `next_turn` (S's own turn ran)."""
+    from test_codex_steering import codex_turn_in_flight, post_steer
+    from test_hosted_sessions import P3
+    from agent_comms.session_host import HostEvent
+    a = start(env, "an ordinary turn")["session_id"]
+    tick(env)
+    ca = proc_of(env, a)[1]
+    ma = written(ca)[-1]["uuid"]
+    ca.emit(cinit(a, ma))
+    tick(env)
+    b, cb = codex_turn_in_flight(env, project=P3)
+    post_steer(env, b)
+    tick(env)
+    runner = env.node.sessions
+    with runner.lock:
+        runner._emit([HostEvent(a, "turn_ended", "1", ok=True, text="A's reply", answered=True,
+                                steer={"outcome": "next_turn", "why": "own_turn", "result": {
+                                    "ok": True, "detail": "", "denials": [], "meta": {}, "text": "S",
+                                    "answered": True}}),
+                      HostEvent(b, "turn_ended", "1", ok=True, text="B's reply", answered=True,
+                                steer={"outcome": "in_turn", "why": "answered"})])
+    return a, b, runner
+
+
+def test_r5_y_a_next_turn_fallback_never_strips_a_codex_outcome(env):
+    """Sol's blocker 1 (ruling Y): A carries an actual `next_turn`; a step-2 hub (main d11ff99's validator) refuses
+    A's report (400) and takes it at rung (ii); B's valid Codex `in_turn` in the same flush goes WITH its extension
+    and settles `in_turn`; no feature is forgotten, so B's next end keeps its extension too."""
+    from agent_comms.session_host import HostEvent
+    a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
+    features = set(runner.hub_features)
+    seen = _posts(runner, _d11ff99_report)
+    with runner.lock:
+        assert runner._flush()
+    assert hosted._get(env.board.conn, hosted._msg_key(a, 1))["state"] == "done"
+    st = hosted_steer.get(env.board.conn, b, 1)
+    assert (st["outcome"], st["why"]) == ("in_turn", "answered"), st
+    assert any("steer" in e for e in dict(seen)[b]["events"])
+    assert runner.hub_features == features, "a rung (ii) success changes no feature knowledge"
+    nxt = runner._for_hub(runner._event(HostEvent(b, "turn_ended", "2", ok=True, steer={"outcome": "in_turn",
+                                                                                          "why": "answered"})))
+    assert "steer" in nxt, "the next flush's Codex outcome keeps its extension"
+
+
+def test_r5_y_the_acknowledged_modes_are_recorded_and_corrected_explicitly(env):
+    """Ruling Y1, Y+: what the node records as A's reported modes is what the accepted rung sent; after a refetch
+    with the same features (the hub takes the pair again), A, quiet, is reported again for that purpose with its
+    full modes: the hub's record is not left stale."""
+    a, b, runner = _claude_next_turn_and_codex_steer_pending(env)
+    orig = runner.client
+    _posts(runner, _d11ff99_report)
+    with runner.lock:
+        assert runner._flush()
+    assert hosted._session(env.board.conn, a)["modes"] == ["restart"]
+    assert runner.acked_modes[a] == ["restart"]
+    runner.client = orig
+    seen2 = _posts(runner, lambda path, body: None)     # the hub takes the pair again
+    tick(env, times=2)
+    assert any(x == a and "held" in (bd.get("modes") or []) for x, bd in seen2), "an explicit correction"
+    assert "held" in hosted._session(env.board.conn, a)["modes"]
+
+
+@pytest.mark.parametrize("code", [422, 400])
+def test_r5_y_main_forgets_steer_only_on_its_own_legacy_path(env, code):
+    """Ruling Y+ (Codex only): a step-2 hub that refuses a Codex report's steer extension with 422 takes it plainly:
+    `steer` is forgotten, as on main e6b421f; refused with 400 instead (another field), nothing is forgotten."""
+    from test_codex_steering import codex_turn_in_flight, post_steer
+    from agent_comms.session_host import HostEvent
+    b, cb = codex_turn_in_flight(env)
+    post_steer(env, b)
+    tick(env)
+    runner = env.node.sessions
+    end = HostEvent(b, "turn_ended", "1", ok=True, text="B's reply", answered=True,
+                    steer={"outcome": "in_turn", "why": "answered"})
+    with runner.lock:
+        runner._emit([end])
+    _posts(runner, lambda path, body: code if any("steer" in e for e in body["events"]) else None)
+    with runner.lock:
+        assert runner._flush()
+    if code == 422:
+        assert "steer" not in runner.hub_features, "main's own path: the plain retry forgets `steer`"
+    else:
+        assert "steer" in runner.hub_features, "a 400 is not main's legacy rejection: nothing is forgotten"
+
+
 RESULT_FIELDS = ["subtype", "is_error", "num_turns", "origin", "user_message_uuid", "user_message_uuids", "result",
                  "permission_denials", "terminal_reason", "stop_reason", "duration_ms", "total_cost_usd"]
 INIT_FIELDS = ["claude_code_version", "capabilities", "permissionMode", "tools", "user_message_uuids", "origin",

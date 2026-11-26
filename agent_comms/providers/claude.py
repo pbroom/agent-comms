@@ -751,6 +751,10 @@ class ClaudeSession:
           current N or S is classified against the live attempt first.
         - An echo list longer than MAX_ECHO is never read in part: a contradiction while an attempt is live or a
           retired S could be in it."""
+        if kind == "init":
+            # (Review round 5, ruling Q7) ANY init clears rule 10's marker, before any shortcut: only the host's own
+            # word that S's bracket opened sets it again (`steer_facts(phase="s_turn")`, after S's own init)
+            self._s_init_last = False
         named = _named(ev)
         a = self._attempt
         live = a is not None and (a["s"] in named or a["n"] in named)
@@ -779,7 +783,6 @@ class ClaudeSession:
                     return True, "other"
                 return False, None
             if phase == "s_turn":
-                self._s_init_last = False       # (ruling Q4) rule 10 no longer holds for S in this bracket
                 if names_s or names_n:
                     self._contradict("an init naming the steer or the held turn inside the steer's own turn")
                 else:
